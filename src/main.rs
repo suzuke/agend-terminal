@@ -61,8 +61,9 @@ async fn main() -> Result<()> {
                 eprintln!("Usage: agend-terminal inject <session_id> <text>");
                 std::process::exit(1);
             }
+            let data = unescape(&text);
             let sock = socket_path();
-            client::inject(&sock, session_id, text.as_bytes()).await?;
+            client::inject(&sock, session_id, &data).await?;
         }
         _ => {
             eprintln!(
@@ -79,4 +80,29 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn unescape(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push(b'\n'),
+                Some('t') => out.push(b'\t'),
+                Some('r') => out.push(b'\r'),
+                Some('\\') => out.push(b'\\'),
+                Some(other) => {
+                    out.push(b'\\');
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
+                }
+                None => out.push(b'\\'),
+            }
+        } else {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    out
 }

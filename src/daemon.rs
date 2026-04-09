@@ -151,17 +151,41 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             };
             match session {
                 Some(session) => {
+                    if !session.is_running().await {
+                        send_response(
+                            &mut stream,
+                            &Response::Error {
+                                message: format!("Session {session_id} has exited"),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     let len = data.len();
-                    session.write_input(&data).await?;
-                    info!("Injected {len} bytes into session {session_id}");
-                    send_response(
-                        &mut stream,
-                        &Response::Injected {
-                            session_id,
-                            bytes_written: len,
-                        },
-                    )
-                    .await?;
+                    match session.write_input(&data).await {
+                        Ok(()) => {
+                            info!("Injected {len} bytes into session {session_id}");
+                            send_response(
+                                &mut stream,
+                                &Response::Injected {
+                                    session_id,
+                                    bytes_written: len,
+                                },
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            send_response(
+                                &mut stream,
+                                &Response::Error {
+                                    message: format!(
+                                        "Write to session {session_id} failed: {e}"
+                                    ),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 None => {
                     send_response(
