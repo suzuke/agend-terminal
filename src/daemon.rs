@@ -202,6 +202,7 @@ async fn spawn_session(
     rows: u16,
     env: Option<&HashMap<String, String>>,
     ready_pattern: Option<&str>,
+    working_dir: Option<&Path>,
 ) -> Result<(u32, Arc<PtySession>)> {
     let (id, log_dir) = {
         let mut st = state.lock().await;
@@ -210,7 +211,7 @@ async fn spawn_session(
         (id, st.log_dir.clone())
     };
     let session = Arc::new(PtySession::spawn(
-        id, name, command, args, cols, rows, env, ready_pattern, &log_dir,
+        id, name, command, args, cols, rows, env, ready_pattern, &log_dir, working_dir,
     )?);
     {
         let mut st = state.lock().await;
@@ -253,6 +254,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 rows,
                 env.as_ref(),
                 ready_pattern.as_deref(),
+                None,
             )
             .await?;
             send_response(&mut stream, &Response::Spawned { session_id: id }).await?;
@@ -421,6 +423,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                 resolved.rows.unwrap_or(40),
                                 Some(&resolved.env),
                                 resolved.ready_pattern.as_deref(),
+                                resolved.working_directory.as_deref(),
                             )
                             .await
                             {
@@ -532,14 +535,13 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                     }
 
                     // Inject notification into target PTY
-                    let notification = format!(
-                        "\n[from:{sender_name}] {}\n",
-                        if text.len() > 200 {
-                            format!("{}... (Run: agend-terminal inbox)", &text[..200])
-                        } else {
-                            text
-                        }
-                    );
+                    let display_text = if text.chars().count() > 200 {
+                        let truncated: String = text.chars().take(200).collect();
+                        format!("{truncated}... (Run: agend-terminal inbox)")
+                    } else {
+                        text.clone()
+                    };
+                    let notification = format!("\n[from:{sender_name}] {display_text}\n");
                     let _ = target_session.write_input(notification.as_bytes()).await;
 
                     info!("[{sender_name} → {target}] message delivered");

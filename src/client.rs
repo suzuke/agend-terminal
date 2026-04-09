@@ -133,10 +133,11 @@ pub async fn list_sessions(socket_path: &Path) -> Result<()> {
                 println!("No active sessions.");
             } else {
                 println!(
-                    "{:<6} {:<10} {:<6} {:<10} {}",
-                    "ID", "STATUS", "READY", "SIZE", "COMMAND"
+                    "{:<6} {:<14} {:<10} {:<6} {:<10} {}",
+                    "ID", "NAME", "STATUS", "READY", "SIZE", "COMMAND"
                 );
                 for s in sessions {
+                    let name = s.name.as_deref().unwrap_or("-");
                     let status = if s.running {
                         "running".to_string()
                     } else {
@@ -150,8 +151,8 @@ pub async fn list_sessions(socket_path: &Path) -> Result<()> {
                     let ready = if s.ready { "yes" } else { "no" };
                     let size = format!("{}x{}", s.cols, s.rows);
                     println!(
-                        "{:<6} {:<10} {:<6} {:<10} {}",
-                        s.id, status, ready, size, s.command
+                        "{:<6} {:<14} {:<10} {:<6} {:<10} {}",
+                        s.id, name, status, ready, size, s.command
                     );
                 }
             }

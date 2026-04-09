@@ -40,7 +40,6 @@ async fn main() -> Result<()> {
             let mut cols: Option<u16> = None;
             let mut rows: Option<u16> = None;
             let mut ready_pattern: Option<String> = None;
-            let mut _name: Option<String> = None;
             let mut command: Option<String> = None;
             let mut command_args: Vec<String> = Vec::new();
             let mut past_flags = false;
@@ -72,10 +71,6 @@ async fn main() -> Result<()> {
                     "--ready-pattern" => {
                         i += 1;
                         ready_pattern = args.get(i).cloned();
-                    }
-                    "--name" => {
-                        i += 1;
-                        _name = args.get(i).cloned();
                     }
                     "--" => {
                         past_flags = true;
