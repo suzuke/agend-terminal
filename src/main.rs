@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
                    --cols N             Initial terminal columns\n  \
                    --rows N             Initial terminal rows\n  \
                    --ready-pattern RE   Regex to detect when CLI is ready\n\n\
-                 Detach: Ctrl+] d"
+                 Detach: Ctrl+B d"
             );
         }
     }
