@@ -227,6 +227,11 @@ impl PtySession {
         }
     }
 
+    /// Access the child lock (for daemon shutdown).
+    pub async fn child_lock(&self) -> tokio::sync::MutexGuard<'_, Box<dyn portable_pty::Child + Send>> {
+        self.child.lock().await
+    }
+
     pub async fn get_exit_code(&self) -> Option<i32> {
         *self.exit_status.lock().await
     }
