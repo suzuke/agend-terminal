@@ -263,7 +263,7 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
         }
     });
 
-    // Task: stdin → daemon (with Ctrl+B d detection)
+    // Task: stdin → daemon (with Ctrl+] d detection)
     let sw = stream_writer.clone();
     let mut stdin_handle = tokio::spawn(async move {
         let mut stdin = io::stdin();
@@ -289,7 +289,7 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
                         let _ = sw.lock().await.write_all(&frame).await;
                         return true;
                     }
-                    let data = vec![0x02, buf[i]];
+                    let data = vec![0x1D, buf[i]];
                     let req = Request::Write { data };
                     let json =
                         serde_json::to_vec(&req).expect("Write serialization is infallible");
@@ -298,12 +298,12 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
                         return false;
                     }
                     i += 1;
-                } else if buf[i] == 0x02 {
+                } else if buf[i] == 0x1D {
                     ctrl_b_pressed = true;
                     i += 1;
                 } else {
                     let start = i;
-                    while i < n && buf[i] != 0x02 {
+                    while i < n && buf[i] != 0x1D {
                         i += 1;
                     }
                     let req = Request::Write {
