@@ -93,6 +93,27 @@ PTY slave (child stdout) → master fd → drainer thread (spawn_blocking)
 
 The drainer runs independently of attach state. Output is always captured.
 
+### Concurrent Attach Behavior
+
+- **Multi-attach read**: Supported. Broadcast channel fans output to all subscribers.
+- **Multi-attach write**: Undefined — interleaved keystrokes from multiple clients. Production should add an "active writer" mode: one client writes, others are read-only viewers.
+
+### Graceful Daemon Shutdown
+
+**Status: Implemented.**
+
+1. SIGTERM/SIGINT registered via `tokio::signal`.
+2. Accept loop uses `tokio::select!` with signal channels.
+3. On signal: kill all sessions in parallel (`child.kill()`), poll up to 5 seconds for exit.
+4. Clean up socket file.
+5. Attached clients receive connection close (EOF on their UDS read).
+
+### Output Log Rotation
+
+Single-session log (`output.log`) is append-only. For long-running sessions:
+- **Context rotation**: Archives old log, starts fresh (see Module 6).
+- **Size-based rotation**: When `output.log` exceeds 10 MB, rename to `output.log.1` and start new file. Keep at most 3 rotated logs per session.
+
 ---
 
 ## Module 2: Fleet — Multi-Agent Manager
@@ -155,8 +176,7 @@ pub struct FleetManager {
 pub struct ManagedSession {
     session: Arc<PtySession>,
     config: InstanceConfig,
-    restart_state: RestartState,      // retry count, backoff timer
-    health: HealthState,              // last output time, crash count
+    health: HealthState,              // Owns all lifecycle state (see Module 5)
 }
 ```
 
@@ -292,6 +312,46 @@ Agent CLI ─────────▶│              │──────�
 
 The router maintains a mapping: `instance_name → (session_id, channel_config)`.
 
+### Message Delivery Semantics
+
+**Known limitation:** When an agent is busy (executing a tool call), multiple injected messages accumulate in the PTY stdin buffer. The agent reads them as a single block of text after finishing its current turn, potentially treating multiple messages as one.
+
+MCP does not have this problem because each message is a discrete tool call with structured boundaries.
+
+**Mitigation — Notification + Pull model (recommended):**
+
+Instead of injecting the full message text, inject a short notification:
+
+```
+[New message from user:alice. Run: agend-terminal inbox]
+```
+
+The agent then calls `agend-terminal inbox` to retrieve all pending messages as structured data. This ensures:
+- Each message is individually addressable
+- Agent processes messages one at a time
+- No parsing ambiguity from concatenated messages
+
+The daemon maintains a per-session message queue (bounded, in-memory). `inbox` drains the queue and returns structured JSON.
+
+```rust
+struct MessageQueue {
+    messages: VecDeque<InboxMessage>,
+    max_size: usize,  // drop oldest when full
+}
+```
+
+**Fallback — Delimiter protocol:**
+
+If direct inject is needed (e.g., for simpler agents), wrap each message:
+
+```
+---AGEND_MSG---
+[user:alice] Do task A
+---AGEND_MSG---
+```
+
+Agent system prompt teaches it to split on `---AGEND_MSG---`.
+
 ---
 
 ## Module 4: Channel — Communication Platform Adapters
@@ -368,22 +428,40 @@ Same `ChannelAdapter` trait, different implementation. Discord threads map to in
 
 ## Module 5: Health — Process Lifecycle
 
-### Crash Detection
+### Ownership: Health Monitor replaces Reaper
+
+In Phase 1 (current), `spawn_session_reaper` handles session exit — it simply removes the session from the HashMap. **In Phase 4, Health Monitor takes over as the sole session exit handler.** The reaper is removed.
+
+Decision flow on session exit:
+```
+session exits → Health Monitor receives drainer_done
+  → Check restart policy (from Fleet config)
+  → If should_restart:
+      → Increment crash_count, calculate backoff
+      → Wait backoff delay
+      → Spawn new session (same config), update HashMap
+  → If not (max_retries exceeded, or manual kill):
+      → Remove from HashMap, log reaped
+```
+
+### Data Model
 
 ```rust
-pub struct HealthMonitor {
-    sessions: Arc<Mutex<HashMap<u32, HealthState>>>,
-}
-
+/// Owned by Health Monitor — single source of truth for lifecycle state.
 pub struct HealthState {
-    last_output: Instant,           // From drainer timestamps
+    last_output: Instant,
     crash_count: u32,
     last_crash: Option<Instant>,
-    restart_state: RestartState,
+    policy: RestartPolicy,          // Set by Fleet Manager
+    stable_since: Option<Instant>,  // For crash count reset
 }
 ```
 
-**Event-driven detection** — no polling:
+Fleet Manager sets the `RestartPolicy` (max_retries, backoff params). Health Monitor owns the execution state (crash_count, last_crash). No duplication.
+
+### Crash Detection
+
+**Event-driven** — no polling:
 
 ```
 Drainer EOF → drainer_done.notify()
@@ -454,8 +532,20 @@ pub struct ContextMonitor {
     usage_threshold: f32,           // 0.0-1.0, trigger at this usage level
     cooldown: Duration,             // Min time between rotations
     last_rotation: Option<Instant>,
-    usage_pattern: Regex,           // Match context usage from output
+    usage_pattern: Regex,           // Configurable per-backend in fleet.yaml
 }
+```
+
+The `usage_pattern` regex is configurable per instance in `fleet.yaml` via `context_pattern`, since different backends (Claude Code, Codex, Gemini CLI) output context usage in different formats:
+
+```yaml
+instances:
+  general:
+    context_rotation:
+      context_pattern: "Context:\\s+(\\d+)%"   # Claude Code format
+  codex-agent:
+    context_rotation:
+      context_pattern: "tokens:\\s+(\\d+)/(\\d+)"  # Codex format
 ```
 
 ### Rotation Flow
@@ -560,9 +650,9 @@ All communication goes through a single Unix domain socket.
 
 ### Request Routing
 
-The daemon identifies the caller:
-- **External CLI** (user typed `agend-terminal ls`): No session context.
-- **Agent CLI** (agent's Bash tool ran `agend-terminal reply`): The daemon knows which session spawned this process by checking the process's parent PID or using a session token passed via environment variable (`AGEND_SESSION_ID`).
+The daemon identifies the caller via session token:
+- **External CLI** (user typed `agend-terminal ls`): No `AGEND_SESSION_ID` env var → no session context.
+- **Agent CLI** (agent's Bash tool ran `agend-terminal reply`): `AGEND_SESSION_ID` env var identifies the session → daemon routes accordingly.
 
 ### Session Token
 
@@ -576,6 +666,8 @@ cmd.env("AGEND_SESSION_ID", id.to_string());
 let session_id = std::env::var("AGEND_SESSION_ID")
     .context("Not running inside an agend-terminal session")?;
 ```
+
+**Security note:** `AGEND_SESSION_ID` is inherited by all child processes within the session. Any process can read it and impersonate the agent via `agend-terminal reply`. This is acceptable for a single-user local tool. For multi-host deployments (Phase 5), a stronger auth mechanism (e.g., per-session HMAC token verified by the daemon) would be needed.
 
 ---
 
@@ -634,6 +726,7 @@ Agent A (blog-writer) runs: `agend-terminal send general "PR ready"`
 - [ ] Topic-to-instance mapping
 
 ### Phase 4: Health + Context
+- [ ] Health Monitor replaces `spawn_session_reaper`
 - [ ] Event-driven crash detection
 - [ ] Restart policy (exponential backoff)
 - [ ] Context usage parsing
