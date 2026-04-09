@@ -253,7 +253,6 @@ async fn main() -> Result<()> {
                    --env KEY=VALUE      Set environment variable (repeatable)\n  \
                    --cols N / --rows N  Terminal size\n  \
                    --ready-pattern RE   Regex to detect CLI ready\n  \
-                   --name NAME          Instance name\n\n\
                  Detach: Ctrl+B d"
             );
         }
