@@ -4,22 +4,29 @@ use nix::sys::termios;
 use std::path::Path;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
 
-/// Enter raw mode and return the original termios for restoration.
-fn enter_raw_mode() -> Result<termios::Termios> {
-    let stdin = std::io::stdin();
-    let orig = termios::tcgetattr(&stdin).context("tcgetattr failed")?;
-    let mut raw = orig.clone();
-    termios::cfmakeraw(&mut raw);
-    termios::tcsetattr(&stdin, termios::SetArg::TCSANOW, &raw)
-        .context("tcsetattr failed")?;
-    Ok(orig)
+/// RAII guard that restores terminal on drop (handles panic + signals).
+struct RawModeGuard(termios::Termios);
+
+impl RawModeGuard {
+    fn enter() -> Result<Self> {
+        let stdin = std::io::stdin();
+        let orig = termios::tcgetattr(&stdin).context("tcgetattr failed")?;
+        let mut raw = orig.clone();
+        termios::cfmakeraw(&mut raw);
+        termios::tcsetattr(&stdin, termios::SetArg::TCSANOW, &raw)
+            .context("tcsetattr failed")?;
+        Ok(Self(orig))
+    }
 }
 
-fn restore_terminal(orig: &termios::Termios) {
-    let stdin = std::io::stdin();
-    let _ = termios::tcsetattr(&stdin, termios::SetArg::TCSANOW, orig);
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let stdin = std::io::stdin();
+        let _ = termios::tcsetattr(&stdin, termios::SetArg::TCSANOW, &self.0);
+    }
 }
 
 async fn send_request(stream: &mut UnixStream, req: &Request) -> Result<()> {
@@ -123,35 +130,47 @@ pub async fn list_sessions(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Main attach loop: bridge terminal stdin/stdout to daemon.
 async fn run_attach_loop(stream: UnixStream) -> Result<()> {
-    // Enter raw mode
-    let orig_termios = enter_raw_mode()?;
-
+    let _guard = RawModeGuard::enter()?;
     let result = attach_bridge(stream).await;
-    restore_terminal(&orig_termios);
+    // _guard dropped here, restoring terminal
     println!();
-
     result
 }
 
 async fn attach_bridge(stream: UnixStream) -> Result<()> {
-    let (mut stream_reader, mut stream_writer) = stream.into_split();
+    let (mut stream_reader, stream_writer) = stream.into_split();
+    let stream_writer = std::sync::Arc::new(tokio::sync::Mutex::new(stream_writer));
     let mut stdout = io::stdout();
-
-    let (detach_tx, mut detach_rx) = tokio::sync::oneshot::channel::<()>();
-    let detach_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(detach_tx)));
 
     // Send initial resize
     if let Some((cols, rows)) = term_size() {
         let req = Request::Resize { cols, rows };
-        let json = serde_json::to_vec(&req).unwrap();
+        let json = serde_json::to_vec(&req).expect("Resize serialization is infallible");
         let frame = protocol::encode(&json);
-        let _ = stream_writer.write_all(&frame).await;
+        let _ = stream_writer.lock().await.write_all(&frame).await;
     }
 
+    // SIGWINCH handler
+    let sw = stream_writer.clone();
+    let winch_handle = tokio::spawn(async move {
+        let mut sigwinch = match signal(SignalKind::window_change()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        while sigwinch.recv().await.is_some() {
+            if let Some((cols, rows)) = term_size() {
+                let req = Request::Resize { cols, rows };
+                let json = serde_json::to_vec(&req).expect("Resize serialization is infallible");
+                let frame = protocol::encode(&json);
+                let _ = sw.lock().await.write_all(&frame).await;
+            }
+        }
+    });
+
     // Task: stdin → daemon (with Ctrl+B d detection)
-    let stdin_handle = tokio::spawn(async move {
+    let sw = stream_writer.clone();
+    let mut stdin_handle = tokio::spawn(async move {
         let mut stdin = io::stdin();
         let mut buf = [0u8; 1024];
         let mut ctrl_b_pressed = false;
@@ -168,30 +187,26 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
                 if ctrl_b_pressed {
                     ctrl_b_pressed = false;
                     if buf[i] == b'd' {
-                        // Detach
                         let req = Request::Detach;
-                        let json = serde_json::to_vec(&req).unwrap();
+                        let json =
+                            serde_json::to_vec(&req).expect("Detach serialization is infallible");
                         let frame = protocol::encode(&json);
-                        let _ = stream_writer.write_all(&frame).await;
-                        if let Some(tx) = detach_tx.lock().await.take() {
-                            let _ = tx.send(());
-                        }
-                        return;
+                        let _ = sw.lock().await.write_all(&frame).await;
+                        return true; // signal detach
                     }
-                    // Not 'd' — send Ctrl+B + current byte
                     let data = vec![0x02, buf[i]];
                     let req = Request::Write { data };
-                    let json = serde_json::to_vec(&req).unwrap();
+                    let json =
+                        serde_json::to_vec(&req).expect("Write serialization is infallible");
                     let frame = protocol::encode(&json);
-                    if stream_writer.write_all(&frame).await.is_err() {
-                        return;
+                    if sw.lock().await.write_all(&frame).await.is_err() {
+                        return false;
                     }
                     i += 1;
                 } else if buf[i] == 0x02 {
                     ctrl_b_pressed = true;
                     i += 1;
                 } else {
-                    // Batch contiguous normal bytes
                     let start = i;
                     while i < n && buf[i] != 0x02 {
                         i += 1;
@@ -199,18 +214,20 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
                     let req = Request::Write {
                         data: buf[start..i].to_vec(),
                     };
-                    let json = serde_json::to_vec(&req).unwrap();
+                    let json =
+                        serde_json::to_vec(&req).expect("Write serialization is infallible");
                     let frame = protocol::encode(&json);
-                    if stream_writer.write_all(&frame).await.is_err() {
-                        return;
+                    if sw.lock().await.write_all(&frame).await.is_err() {
+                        return false;
                     }
                 }
             }
         }
+        false
     });
 
     // Task: daemon output → stdout
-    let output_handle = tokio::spawn(async move {
+    let mut output_handle = tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
         loop {
             if stream_reader.read_exact(&mut len_buf).await.is_err() {
@@ -255,10 +272,10 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
     });
 
     tokio::select! {
-        _ = stdin_handle => {},
-        _ = output_handle => {},
-        _ = &mut detach_rx => {},
+        _ = &mut stdin_handle => { output_handle.abort(); },
+        _ = &mut output_handle => { stdin_handle.abort(); },
     }
+    winch_handle.abort();
 
     Ok(())
 }

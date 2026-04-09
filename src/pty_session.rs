@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 pub struct PtySession {
     pub id: u32,
@@ -11,6 +11,10 @@ pub struct PtySession {
     reader: Arc<Mutex<Box<dyn Read + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
+    /// Cached exit status — once try_wait/wait returns, we store it here.
+    exit_status: Arc<Mutex<Option<i32>>>,
+    /// Notified when the child exits.
+    pub exit_notify: Arc<Notify>,
 }
 
 impl PtySession {
@@ -47,22 +51,22 @@ impl PtySession {
             reader: Arc::new(Mutex::new(reader)),
             writer: Arc::new(Mutex::new(writer)),
             child: Arc::new(Mutex::new(child)),
+            exit_status: Arc::new(Mutex::new(None)),
+            exit_notify: Arc::new(Notify::new()),
         })
     }
 
-    /// Read output from PTY. Returns data in a Vec to avoid lifetime issues.
-    pub async fn read_output(&self, buf: &mut Vec<u8>) -> Result<usize> {
+    /// Read output from PTY. Returns bytes read.
+    pub async fn read_output(&self) -> Result<Vec<u8>> {
         let reader = self.reader.clone();
-        let mut tmp = vec![0u8; buf.len()];
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
+            let mut buf = vec![0u8; 4096];
             let mut r = reader.blocking_lock();
-            let n = r.read(&mut tmp).context("PTY read failed")?;
-            Ok::<(Vec<u8>, usize), anyhow::Error>((tmp, n))
+            let n = r.read(&mut buf).context("PTY read failed")?;
+            buf.truncate(n);
+            Ok(buf)
         })
-        .await??;
-        let (tmp, n) = result;
-        buf[..n].copy_from_slice(&tmp[..n]);
-        Ok(n)
+        .await?
     }
 
     /// Write input to PTY master fd. This is the atomic write path.
@@ -90,25 +94,40 @@ impl PtySession {
             .context("PTY resize failed")
     }
 
-    /// Check if the child process is still running.
+    /// Check if the child process is still running. Caches exit status.
     pub async fn is_running(&self) -> bool {
+        // Check cache first
+        if self.exit_status.lock().await.is_some() {
+            return false;
+        }
         let mut child = self.child.lock().await;
         match child.try_wait() {
-            Ok(Some(_)) => false,
+            Ok(Some(status)) => {
+                *self.exit_status.lock().await = Some(status.exit_code() as i32);
+                false
+            }
             Ok(None) => true,
             Err(_) => false,
         }
     }
 
-    /// Wait for the child to exit and return exit code.
-    pub async fn wait(&self) -> Result<Option<i32>> {
+    /// Get cached exit code, or wait for child to exit.
+    pub async fn wait_exit_code(&self) -> Result<i32> {
+        // Return cached if available
+        if let Some(code) = *self.exit_status.lock().await {
+            return Ok(code);
+        }
         let child = self.child.clone();
-        tokio::task::spawn_blocking(move || {
+        let exit_status = self.exit_status.clone();
+        let code = tokio::task::spawn_blocking(move || {
             let mut c = child.blocking_lock();
             let status = c.wait().context("Failed to wait for child")?;
-            // portable_pty ExitStatus::exit_code() returns u32
-            Ok(Some(status.exit_code() as i32))
+            let code = status.exit_code() as i32;
+            *exit_status.blocking_lock() = Some(code);
+            Ok::<i32, anyhow::Error>(code)
         })
-        .await?
+        .await??;
+        self.exit_notify.notify_waiters();
+        Ok(code)
     }
 }

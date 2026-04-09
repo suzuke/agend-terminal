@@ -24,7 +24,14 @@ impl DaemonState {
 }
 
 pub async fn run(socket_path: &Path) -> Result<()> {
+    // Check if another daemon is alive before removing socket
     if socket_path.exists() {
+        if UnixStream::connect(socket_path).await.is_ok() {
+            anyhow::bail!(
+                "Another daemon is already running on {:?}",
+                socket_path
+            );
+        }
         std::fs::remove_file(socket_path)?;
     }
     if let Some(parent) = socket_path.parent() {
@@ -79,16 +86,22 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
 
     match req {
         Request::Spawn { command, args } => {
-            let (session_id, session) = {
+            // Allocate ID under lock, spawn outside lock to avoid blocking
+            let id = {
                 let mut st = state.lock().await;
                 let id = st.next_id;
                 st.next_id += 1;
-                let session = Arc::new(PtySession::spawn(id, &command, &args, 80, 24)?);
-                st.sessions.insert(id, session.clone());
-                (id, session)
+                id
             };
-            info!("Spawned session {session_id}: {command}");
-            send_response(&mut stream, &Response::Spawned { session_id }).await?;
+            let session = Arc::new(PtySession::spawn(id, &command, &args, 80, 24)?);
+            {
+                let mut st = state.lock().await;
+                st.sessions.insert(id, session.clone());
+            }
+            // Spawn background reaper for this session
+            spawn_session_reaper(id, session.clone(), state.clone());
+            info!("Spawned session {id}: {command}");
+            send_response(&mut stream, &Response::Spawned { session_id: id }).await?;
             attach_loop(stream, session, state.clone()).await?;
         }
         Request::Attach { session_id } => {
@@ -138,27 +151,39 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
     Ok(())
 }
 
+/// Background task that waits for a session's child to exit, then removes it from state.
+fn spawn_session_reaper(id: u32, session: Arc<PtySession>, state: Arc<Mutex<DaemonState>>) {
+    tokio::spawn(async move {
+        // Wait for exit notification
+        session.exit_notify.notified().await;
+        // Also try waiting directly in case exit_notify was missed
+        let _ = session.wait_exit_code().await;
+        let mut st = state.lock().await;
+        if st.sessions.remove(&id).is_some() {
+            info!("Reaped session {id}");
+        }
+    });
+}
+
 /// Main attach loop: bridge PTY output to client, client input to PTY.
 async fn attach_loop(
     stream: UnixStream,
     session: Arc<PtySession>,
-    state: Arc<Mutex<DaemonState>>,
+    _state: Arc<Mutex<DaemonState>>,
 ) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let session_r = session.clone();
     let session_id = session.id;
 
     // Task: PTY output → client
-    let output_handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; 4096];
+    let mut output_handle = tokio::spawn(async move {
         loop {
-            match session_r.read_output(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let resp = Response::Output {
-                        data: buf[..n].to_vec(),
-                    };
-                    let json = serde_json::to_vec(&resp).unwrap();
+            match session_r.read_output().await {
+                Ok(data) if data.is_empty() => break,
+                Ok(data) => {
+                    let resp = Response::Output { data };
+                    let json = serde_json::to_vec(&resp)
+                        .expect("Response serialization is infallible");
                     let frame = protocol::encode(&json);
                     if writer.write_all(&frame).await.is_err() {
                         break;
@@ -168,17 +193,19 @@ async fn attach_loop(
             }
         }
         // Session exited
+        let exit_code = session_r.wait_exit_code().await.ok();
         let resp = Response::SessionExited {
             session_id,
-            exit_code: session_r.wait().await.ok().flatten(),
+            exit_code,
         };
-        let json = serde_json::to_vec(&resp).unwrap();
+        let json =
+            serde_json::to_vec(&resp).expect("Response serialization is infallible");
         let frame = protocol::encode(&json);
         let _ = writer.write_all(&frame).await;
     });
 
     // Task: client input → PTY
-    let input_handle = tokio::spawn(async move {
+    let mut input_handle = tokio::spawn(async move {
         loop {
             let mut len_buf = [0u8; 4];
             if reader.read_exact(&mut len_buf).await.is_err() {
@@ -212,19 +239,8 @@ async fn attach_loop(
     });
 
     tokio::select! {
-        _ = output_handle => {},
-        _ = input_handle => {},
-    }
-
-    // Clean up dead sessions
-    {
-        let mut st = state.lock().await;
-        if let Some(s) = st.sessions.get(&session_id) {
-            if !s.is_running().await {
-                st.sessions.remove(&session_id);
-                info!("Cleaned up session {session_id}");
-            }
-        }
+        _ = &mut output_handle => { input_handle.abort(); },
+        _ = &mut input_handle => { output_handle.abort(); },
     }
 
     Ok(())

@@ -47,6 +47,7 @@ pub struct SessionInfo {
 
 /// Frame protocol: 4-byte big-endian length prefix + JSON payload.
 pub fn encode(msg: &[u8]) -> Vec<u8> {
+    assert!(msg.len() <= u32::MAX as usize, "Frame payload exceeds 4GB");
     let len = msg.len() as u32;
     let mut frame = Vec::with_capacity(4 + msg.len());
     frame.extend_from_slice(&len.to_be_bytes());
