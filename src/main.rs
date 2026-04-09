@@ -88,7 +88,7 @@ fn unescape(s: &str) -> Vec<u8> {
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('n') => out.push(b'\n'),
+                Some('n') => out.push(b'\r'), // PTY raw mode: Enter = \r (0x0D)
                 Some('t') => out.push(b'\t'),
                 Some('r') => out.push(b'\r'),
                 Some('\\') => out.push(b'\\'),
