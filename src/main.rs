@@ -61,7 +61,8 @@ async fn main() -> Result<()> {
                 eprintln!("Usage: agend-terminal inject <session_id> <text>");
                 std::process::exit(1);
             }
-            let data = unescape(&text);
+            let mut data = unescape(&text);
+            data.push(b'\r'); // Auto-append Enter (CR), like typing + pressing Enter
             let sock = socket_path();
             client::inject(&sock, session_id, &data).await?;
         }
