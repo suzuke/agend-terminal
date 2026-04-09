@@ -10,6 +10,7 @@ use tracing::info;
 
 pub struct PtySession {
     pub id: u32,
+    pub name: Option<String>,
     pub command: String,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -31,6 +32,7 @@ pub struct PtySession {
 impl PtySession {
     pub fn spawn(
         id: u32,
+        name: Option<&str>,
         command: &str,
         args: &[String],
         cols: u16,
@@ -38,6 +40,7 @@ impl PtySession {
         env: Option<&HashMap<String, String>>,
         ready_pattern: Option<&str>,
         log_dir: &std::path::Path,
+        working_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -52,6 +55,12 @@ impl PtySession {
         let mut cmd = CommandBuilder::new(command);
         cmd.args(args);
 
+        // Set working directory
+        if let Some(dir) = working_dir {
+            cmd.cwd(dir);
+        }
+
+        // Base env
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("FORCE_COLOR", "1");
@@ -59,10 +68,17 @@ impl PtySession {
             cmd.env("LANG", "en_US.UTF-8");
         }
 
+        // User env (from config) — set before system env so it can't override
         if let Some(env_map) = env {
             for (k, v) in env_map {
                 cmd.env(k, v);
             }
+        }
+
+        // System env — set last, cannot be overridden by user config
+        cmd.env("AGEND_SESSION_ID", id.to_string());
+        if let Some(n) = name {
+            cmd.env("AGEND_INSTANCE_NAME", n);
         }
 
         let child = pair.slave.spawn_command(cmd).context("Failed to spawn")?;
@@ -110,6 +126,7 @@ impl PtySession {
 
         Ok(Self {
             id,
+            name: name.map(|s| s.to_string()),
             command: command.to_string(),
             master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(writer)),

@@ -1,5 +1,6 @@
 mod client;
 mod daemon;
+mod fleet;
 mod protocol;
 mod pty_session;
 
@@ -11,6 +12,12 @@ fn socket_path() -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| format!("/tmp/agend-terminal-{}", nix::unistd::getuid()));
     PathBuf::from(runtime_dir).join("agend-terminal.sock")
+}
+
+fn session_id_from_env() -> Option<u32> {
+    std::env::var("AGEND_SESSION_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
 }
 
 #[tokio::main]
@@ -29,7 +36,6 @@ async fn main() -> Result<()> {
             daemon::run(&sock).await?;
         }
         "spawn" => {
-            // Parse flags: --env KEY=VALUE, --cols N, --rows N, --ready-pattern REGEX
             let mut env_map: HashMap<String, String> = HashMap::new();
             let mut cols: Option<u16> = None;
             let mut rows: Option<u16> = None;
@@ -81,31 +87,16 @@ async fn main() -> Result<()> {
             }
 
             let command = command.as_deref().unwrap_or("/bin/bash");
-            let env = if env_map.is_empty() {
-                None
-            } else {
-                Some(env_map)
-            };
+            let env = if env_map.is_empty() { None } else { Some(env_map) };
             let sock = socket_path();
-            client::spawn_and_attach(
-                &sock,
-                command,
-                &command_args,
-                env,
-                ready_pattern,
-                cols,
-                rows,
-            )
-            .await?;
+            client::spawn_and_attach(&sock, command, &command_args, env, ready_pattern, cols, rows)
+                .await?;
         }
         "attach" => {
-            let session_id: u32 = args
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| {
-                    eprintln!("Usage: agend-terminal attach <session_id>");
-                    std::process::exit(1);
-                });
+            let session_id: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("Usage: agend-terminal attach <session_id>");
+                std::process::exit(1);
+            });
             let sock = socket_path();
             client::attach(&sock, session_id).await?;
         }
@@ -114,13 +105,10 @@ async fn main() -> Result<()> {
             client::list_sessions(&sock).await?;
         }
         "inject" => {
-            let session_id: u32 = args
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| {
-                    eprintln!("Usage: agend-terminal inject <session_id> <text>");
-                    std::process::exit(1);
-                });
+            let session_id: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("Usage: agend-terminal inject <session_id> <text>");
+                std::process::exit(1);
+            });
             let text = args.get(3..).unwrap_or_default().join(" ");
             if text.is_empty() {
                 eprintln!("Usage: agend-terminal inject <session_id> <text>");
@@ -131,13 +119,10 @@ async fn main() -> Result<()> {
             client::inject(&sock, session_id, &data).await?;
         }
         "kill" => {
-            let session_id: u32 = args
-                .get(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| {
-                    eprintln!("Usage: agend-terminal kill <session_id> [--quit-cmd CMD] [--grace N]");
-                    std::process::exit(1);
-                });
+            let session_id: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                eprintln!("Usage: agend-terminal kill <session_id> [--quit-cmd CMD] [--grace N]");
+                std::process::exit(1);
+            });
             let mut quit_command: Option<String> = None;
             let mut grace_seconds: Option<u32> = None;
             let mut i = 3;
@@ -158,21 +143,116 @@ async fn main() -> Result<()> {
             let sock = socket_path();
             client::kill_session(&sock, session_id, quit_command, grace_seconds).await?;
         }
+
+        // --- Fleet commands ---
+        "fleet" => {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("help");
+            let sock = socket_path();
+            match subcmd {
+                "start" => {
+                    let config_path = args
+                        .get(3)
+                        .map(|s| s.as_str())
+                        .unwrap_or("fleet.yaml");
+                    let names: Vec<String> = args.get(4..).unwrap_or_default().to_vec();
+                    client::fleet_start(&sock, config_path, names).await?;
+                }
+                "stop" => {
+                    let names: Vec<String> = args.get(3..).unwrap_or_default().to_vec();
+                    client::fleet_stop(&sock, names).await?;
+                }
+                _ => {
+                    eprintln!(
+                        "Fleet commands:\n  \
+                           agend-terminal fleet start [config.yaml] [name...]\n  \
+                           agend-terminal fleet stop [name...]"
+                    );
+                }
+            }
+        }
+
+        // --- Agent communication (reads AGEND_SESSION_ID from env) ---
+        "reply" => {
+            let session_id = session_id_from_env().unwrap_or_else(|| {
+                eprintln!("Error: AGEND_SESSION_ID not set. This command is for agents.");
+                std::process::exit(1);
+            });
+            let text = args.get(2..).unwrap_or_default().join(" ");
+            if text.is_empty() {
+                eprintln!("Usage: agend-terminal reply <text>");
+                std::process::exit(1);
+            }
+            let sock = socket_path();
+            client::reply(&sock, session_id, &text).await?;
+        }
+        "send" => {
+            let session_id = session_id_from_env().unwrap_or_else(|| {
+                eprintln!("Error: AGEND_SESSION_ID not set. This command is for agents.");
+                std::process::exit(1);
+            });
+            let target = args.get(2).cloned().unwrap_or_else(|| {
+                eprintln!("Usage: agend-terminal send <target> <text> [--kind K] [--correlation-id ID]");
+                std::process::exit(1);
+            });
+            // Parse optional flags and text
+            let mut text_parts: Vec<String> = Vec::new();
+            let mut kind: Option<String> = None;
+            let mut correlation_id: Option<String> = None;
+            let mut i = 3;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--kind" => {
+                        i += 1;
+                        kind = args.get(i).cloned();
+                    }
+                    "--correlation-id" => {
+                        i += 1;
+                        correlation_id = args.get(i).cloned();
+                    }
+                    other => {
+                        text_parts.push(other.to_string());
+                    }
+                }
+                i += 1;
+            }
+            let text = text_parts.join(" ");
+            if text.is_empty() {
+                eprintln!("Usage: agend-terminal send <target> <text>");
+                std::process::exit(1);
+            }
+            let sock = socket_path();
+            client::send_message(&sock, session_id, &target, &text, kind, correlation_id).await?;
+        }
+        "inbox" => {
+            let session_id = session_id_from_env().unwrap_or_else(|| {
+                eprintln!("Error: AGEND_SESSION_ID not set. This command is for agents.");
+                std::process::exit(1);
+            });
+            let sock = socket_path();
+            client::inbox(&sock, session_id).await?;
+        }
+
         _ => {
             eprintln!(
-                "AgEnD Terminal MVP\n\n\
-                 Usage:\n  \
+                "AgEnD Terminal\n\n\
+                 Session management:\n  \
                    agend-terminal daemon\n  \
                    agend-terminal spawn [flags] [cmd] [-- args...]\n  \
                    agend-terminal attach <id>\n  \
                    agend-terminal list\n  \
                    agend-terminal inject <id> <text>\n  \
                    agend-terminal kill <id> [--quit-cmd CMD] [--grace N]\n\n\
+                 Fleet management:\n  \
+                   agend-terminal fleet start [config.yaml] [name...]\n  \
+                   agend-terminal fleet stop [name...]\n\n\
+                 Agent communication (requires AGEND_SESSION_ID):\n  \
+                   agend-terminal reply <text>\n  \
+                   agend-terminal send <target> <text> [--kind K]\n  \
+                   agend-terminal inbox\n\n\
                  Spawn flags:\n  \
                    --env KEY=VALUE      Set environment variable (repeatable)\n  \
-                   --cols N             Initial terminal columns\n  \
-                   --rows N             Initial terminal rows\n  \
-                   --ready-pattern RE   Regex to detect when CLI is ready\n\n\
+                   --cols N / --rows N  Terminal size\n  \
+                   --ready-pattern RE   Regex to detect CLI ready\n  \
                  Detach: Ctrl+B d"
             );
         }

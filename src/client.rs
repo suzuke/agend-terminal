@@ -77,6 +77,7 @@ pub async fn spawn_and_attach(
             rows: Some(rows.unwrap_or(default_rows)),
             env,
             ready_pattern,
+            name: None,
         },
     )
     .await?;
@@ -132,10 +133,11 @@ pub async fn list_sessions(socket_path: &Path) -> Result<()> {
                 println!("No active sessions.");
             } else {
                 println!(
-                    "{:<6} {:<10} {:<6} {:<10} {}",
-                    "ID", "STATUS", "READY", "SIZE", "COMMAND"
+                    "{:<6} {:<14} {:<10} {:<6} {:<10} {}",
+                    "ID", "NAME", "STATUS", "READY", "SIZE", "COMMAND"
                 );
                 for s in sessions {
+                    let name = s.name.as_deref().unwrap_or("-");
                     let status = if s.running {
                         "running".to_string()
                     } else {
@@ -149,8 +151,8 @@ pub async fn list_sessions(socket_path: &Path) -> Result<()> {
                     let ready = if s.ready { "yes" } else { "no" };
                     let size = format!("{}x{}", s.cols, s.rows);
                     println!(
-                        "{:<6} {:<10} {:<6} {:<10} {}",
-                        s.id, status, ready, size, s.command
+                        "{:<6} {:<14} {:<10} {:<6} {:<10} {}",
+                        s.id, name, status, ready, size, s.command
                     );
                 }
             }
@@ -220,6 +222,154 @@ pub async fn kill_session(
             println!("Session {session_id} killed");
         }
         Response::Error { message } => anyhow::bail!("Kill failed: {message}"),
+        _ => anyhow::bail!("Unexpected response"),
+    }
+
+    Ok(())
+}
+
+pub async fn fleet_start(
+    socket_path: &Path,
+    config_path: &str,
+    names: Vec<String>,
+) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .context("Failed to connect to daemon. Is it running?")?;
+
+    send_request(
+        &mut stream,
+        &Request::FleetStart {
+            config_path: config_path.to_string(),
+            names,
+        },
+    )
+    .await?;
+
+    let resp = read_response(&mut stream)
+        .await?
+        .context("No response from daemon")?;
+    match resp {
+        Response::FleetStarted { started } => {
+            println!("Started {} instance(s): {}", started.len(), started.join(", "));
+        }
+        Response::Error { message } => anyhow::bail!("Fleet start failed: {message}"),
+        _ => anyhow::bail!("Unexpected response"),
+    }
+
+    Ok(())
+}
+
+pub async fn fleet_stop(socket_path: &Path, names: Vec<String>) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .context("Failed to connect to daemon. Is it running?")?;
+
+    send_request(&mut stream, &Request::FleetStop { names }).await?;
+
+    let resp = read_response(&mut stream)
+        .await?
+        .context("No response from daemon")?;
+    match resp {
+        Response::FleetStopped { stopped } => {
+            println!("Stopped {} instance(s): {}", stopped.len(), stopped.join(", "));
+        }
+        Response::Error { message } => anyhow::bail!("Fleet stop failed: {message}"),
+        _ => anyhow::bail!("Unexpected response"),
+    }
+
+    Ok(())
+}
+
+pub async fn reply(socket_path: &Path, session_id: u32, text: &str) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .context("Failed to connect to daemon. Is it running?")?;
+
+    send_request(
+        &mut stream,
+        &Request::Reply {
+            session_id,
+            text: text.to_string(),
+        },
+    )
+    .await?;
+
+    let resp = read_response(&mut stream)
+        .await?
+        .context("No response from daemon")?;
+    match resp {
+        Response::Sent => {}
+        Response::Error { message } => anyhow::bail!("Reply failed: {message}"),
+        _ => anyhow::bail!("Unexpected response"),
+    }
+
+    Ok(())
+}
+
+pub async fn send_message(
+    socket_path: &Path,
+    session_id: u32,
+    target: &str,
+    text: &str,
+    kind: Option<String>,
+    correlation_id: Option<String>,
+) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .context("Failed to connect to daemon. Is it running?")?;
+
+    send_request(
+        &mut stream,
+        &Request::SendMessage {
+            session_id,
+            target: target.to_string(),
+            text: text.to_string(),
+            kind,
+            correlation_id,
+        },
+    )
+    .await?;
+
+    let resp = read_response(&mut stream)
+        .await?
+        .context("No response from daemon")?;
+    match resp {
+        Response::Sent => {}
+        Response::Error { message } => anyhow::bail!("Send failed: {message}"),
+        _ => anyhow::bail!("Unexpected response"),
+    }
+
+    Ok(())
+}
+
+pub async fn inbox(socket_path: &Path, session_id: u32) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .context("Failed to connect to daemon. Is it running?")?;
+
+    send_request(&mut stream, &Request::Inbox { session_id }).await?;
+
+    let resp = read_response(&mut stream)
+        .await?
+        .context("No response from daemon")?;
+    match resp {
+        Response::Messages { messages } => {
+            if messages.is_empty() {
+                println!("No pending messages.");
+            } else {
+                for msg in &messages {
+                    let kind_str = msg
+                        .kind
+                        .as_deref()
+                        .map(|k| format!(" ({k})"))
+                        .unwrap_or_default();
+                    println!("[from:{}]{} {}", msg.from, kind_str, msg.text);
+                }
+                println!("---\n{} message(s) total.", messages.len());
+            }
+        }
+        Response::Error { message } => anyhow::bail!("Inbox failed: {message}"),
         _ => anyhow::bail!("Unexpected response"),
     }
 

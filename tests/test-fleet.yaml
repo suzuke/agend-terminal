@@ -1,0 +1,14 @@
+defaults:
+  command: /bin/bash
+  ready_pattern: "bash"
+
+instances:
+  agent-a:
+    role: "Test agent A"
+    env:
+      MY_VAR: hello_from_a
+
+  agent-b:
+    role: "Test agent B"
+    env:
+      MY_VAR: hello_from_b

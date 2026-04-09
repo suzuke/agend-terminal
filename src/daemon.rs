@@ -1,28 +1,68 @@
-use crate::protocol::{self, Request, Response, SessionInfo};
+use crate::fleet::FleetConfig;
+use crate::protocol::{self, InboxMessage, Request, Response, SessionInfo};
 use crate::pty_session::PtySession;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-struct DaemonState {
-    sessions: HashMap<u32, Arc<PtySession>>,
-    next_id: u32,
-    log_dir: PathBuf,
+const MAX_INBOX_SIZE: usize = 100;
+
+pub struct DaemonState {
+    pub sessions: HashMap<u32, Arc<PtySession>>,
+    /// Instance name → session ID mapping.
+    pub name_to_id: HashMap<String, u32>,
+    pub next_id: u32,
+    pub log_dir: PathBuf,
+    /// Per-session message queue for notification+pull.
+    pub inboxes: HashMap<u32, VecDeque<InboxMessage>>,
+    /// Loaded fleet config (if any).
+    pub fleet_config: Option<FleetConfig>,
 }
 
 impl DaemonState {
     fn new(log_dir: PathBuf) -> Self {
         Self {
             sessions: HashMap::new(),
+            name_to_id: HashMap::new(),
             next_id: 1,
             log_dir,
+            inboxes: HashMap::new(),
+            fleet_config: None,
         }
+    }
+
+    fn find_session_by_name(&self, name: &str) -> Option<(u32, Arc<PtySession>)> {
+        let id = self.name_to_id.get(name)?;
+        let session = self.sessions.get(id)?;
+        Some((*id, session.clone()))
+    }
+
+    fn find_name_by_id(&self, id: u32) -> Option<String> {
+        self.name_to_id
+            .iter()
+            .find(|(_, &sid)| sid == id)
+            .map(|(name, _)| name.clone())
+    }
+
+    fn enqueue_message(&mut self, session_id: u32, msg: InboxMessage) {
+        let queue = self.inboxes.entry(session_id).or_default();
+        if queue.len() >= MAX_INBOX_SIZE {
+            queue.pop_front();
+        }
+        queue.push_back(msg);
+    }
+
+    fn drain_inbox(&mut self, session_id: u32) -> Vec<InboxMessage> {
+        self.inboxes
+            .get_mut(&session_id)
+            .map(|q| q.drain(..).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -52,7 +92,6 @@ pub async fn run(socket_path: &Path) -> Result<()> {
 
     let state = Arc::new(Mutex::new(DaemonState::new(log_dir)));
 
-    // Set up signal handlers for graceful shutdown
     let mut sigterm = signal(SignalKind::terminate()).context("Failed to register SIGTERM")?;
     let mut sigint = signal(SignalKind::interrupt()).context("Failed to register SIGINT")?;
 
@@ -93,8 +132,6 @@ async fn graceful_shutdown(state: &Arc<Mutex<DaemonState>>, socket_path: &Path) 
         info!("No active sessions, exiting.");
     } else {
         info!("Killing {} session(s)...", sessions.len());
-
-        // Phase 1: SIGTERM all sessions via kill (no quit command, just signal)
         for (id, session) in &sessions {
             if session.is_running().await {
                 let mut child = session.child_lock().await;
@@ -103,7 +140,6 @@ async fn graceful_shutdown(state: &Arc<Mutex<DaemonState>>, socket_path: &Path) 
             }
         }
 
-        // Phase 2: Wait up to 5 seconds for all to exit
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let mut all_exited = true;
@@ -125,7 +161,6 @@ async fn graceful_shutdown(state: &Arc<Mutex<DaemonState>>, socket_path: &Path) 
         }
     }
 
-    // Clean up socket file
     if let Err(e) = std::fs::remove_file(socket_path) {
         warn!("Failed to remove socket: {e}");
     } else {
@@ -157,6 +192,41 @@ async fn read_request(stream: &mut UnixStream) -> Result<Option<Request>> {
     Ok(Some(req))
 }
 
+/// Spawn a session and register it in state. Returns (id, session).
+async fn spawn_session(
+    state: &Arc<Mutex<DaemonState>>,
+    name: Option<&str>,
+    command: &str,
+    args: &[String],
+    cols: u16,
+    rows: u16,
+    env: Option<&HashMap<String, String>>,
+    ready_pattern: Option<&str>,
+    working_dir: Option<&Path>,
+) -> Result<(u32, Arc<PtySession>)> {
+    let (id, log_dir) = {
+        let mut st = state.lock().await;
+        let id = st.next_id;
+        st.next_id += 1;
+        (id, st.log_dir.clone())
+    };
+    let session = Arc::new(PtySession::spawn(
+        id, name, command, args, cols, rows, env, ready_pattern, &log_dir, working_dir,
+    )?);
+    {
+        let mut st = state.lock().await;
+        st.sessions.insert(id, session.clone());
+        if let Some(n) = name {
+            st.name_to_id.insert(n.to_string(), id);
+        }
+        st.inboxes.insert(id, VecDeque::new());
+    }
+    spawn_session_reaper(id, session.clone(), state.clone());
+    info!("Spawned session {id}{}: {command}",
+        name.map(|n| format!(" ({n})")).unwrap_or_default());
+    Ok((id, session))
+}
+
 async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -> Result<()> {
     let req = match read_request(&mut stream).await? {
         Some(r) => r,
@@ -171,31 +241,22 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             rows,
             env,
             ready_pattern,
+            name,
         } => {
             let cols = cols.unwrap_or(80);
             let rows = rows.unwrap_or(24);
-            let (id, log_dir) = {
-                let mut st = state.lock().await;
-                let id = st.next_id;
-                st.next_id += 1;
-                (id, st.log_dir.clone())
-            };
-            let session = Arc::new(PtySession::spawn(
-                id,
+            let (id, session) = spawn_session(
+                &state,
+                name.as_deref(),
                 &command,
                 &args,
                 cols,
                 rows,
                 env.as_ref(),
                 ready_pattern.as_deref(),
-                &log_dir,
-            )?);
-            {
-                let mut st = state.lock().await;
-                st.sessions.insert(id, session.clone());
-            }
-            spawn_session_reaper(id, session.clone(), state.clone());
-            info!("Spawned session {id}: {command}");
+                None,
+            )
+            .await?;
             send_response(&mut stream, &Response::Spawned { session_id: id }).await?;
             attach_loop(stream, session).await?;
         }
@@ -228,6 +289,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 let (cols, rows) = s.get_size().await;
                 sessions.push(SessionInfo {
                     id: s.id,
+                    name: s.name.clone(),
                     command: s.command.clone(),
                     running,
                     exit_code: s.get_exit_code().await,
@@ -272,9 +334,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                             send_response(
                                 &mut stream,
                                 &Response::Error {
-                                    message: format!(
-                                        "Write to session {session_id} failed: {e}"
-                                    ),
+                                    message: format!("Write failed: {e}"),
                                 },
                             )
                             .await?;
@@ -304,26 +364,20 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             match session {
                 Some(session) => {
                     if !session.is_running().await {
-                        send_response(&mut stream, &Response::Killed { session_id })
-                            .await?;
+                        send_response(&mut stream, &Response::Killed { session_id }).await?;
                         return Ok(());
                     }
                     let grace = grace_seconds.unwrap_or(5);
                     match session.kill(quit_command.as_deref(), grace).await {
                         Ok(()) => {
-                            send_response(
-                                &mut stream,
-                                &Response::Killed { session_id },
-                            )
-                            .await?;
+                            send_response(&mut stream, &Response::Killed { session_id })
+                                .await?;
                         }
                         Err(e) => {
                             send_response(
                                 &mut stream,
                                 &Response::Error {
-                                    message: format!(
-                                        "Kill session {session_id} failed: {e}"
-                                    ),
+                                    message: format!("Kill failed: {e}"),
                                 },
                             )
                             .await?;
@@ -341,6 +395,177 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 }
             }
         }
+
+        // --- Fleet operations ---
+        Request::FleetStart { config_path, names } => {
+            match FleetConfig::load(Path::new(&config_path)) {
+                Ok(config) => {
+                    let instance_names = if names.is_empty() {
+                        config.instance_names()
+                    } else {
+                        names
+                    };
+
+                    let mut started = Vec::new();
+                    {
+                        let mut st = state.lock().await;
+                        st.fleet_config = Some(config.clone());
+                    }
+
+                    for name in &instance_names {
+                        if let Some(resolved) = config.resolve_instance(name) {
+                            match spawn_session(
+                                &state,
+                                Some(name),
+                                &resolved.command,
+                                &resolved.args,
+                                resolved.cols.unwrap_or(120),
+                                resolved.rows.unwrap_or(40),
+                                Some(&resolved.env),
+                                resolved.ready_pattern.as_deref(),
+                                resolved.working_directory.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(_) => {
+                                    started.push(name.clone());
+                                }
+                                Err(e) => {
+                                    error!("Failed to start {name}: {e:#}");
+                                }
+                            }
+                            // Staggered startup: 500ms between instances
+                            if instance_names.len() > 1 {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            }
+                        } else {
+                            warn!("Instance {name} not found in config");
+                        }
+                    }
+
+                    send_response(&mut stream, &Response::FleetStarted { started }).await?;
+                }
+                Err(e) => {
+                    send_response(
+                        &mut stream,
+                        &Response::Error {
+                            message: format!("Failed to load config: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        Request::FleetStop { names } => {
+            let sessions_to_stop: Vec<(u32, String, Arc<PtySession>)> = {
+                let st = state.lock().await;
+                if names.is_empty() {
+                    st.sessions
+                        .iter()
+                        .map(|(id, s)| {
+                            let name = st.find_name_by_id(*id).unwrap_or_else(|| id.to_string());
+                            (*id, name, s.clone())
+                        })
+                        .collect()
+                } else {
+                    names
+                        .iter()
+                        .filter_map(|n| {
+                            st.find_session_by_name(n)
+                                .map(|(id, s)| (id, n.clone(), s))
+                        })
+                        .collect()
+                }
+            };
+
+            let mut stopped = Vec::new();
+            for (_, name, session) in &sessions_to_stop {
+                if session.is_running().await {
+                    let _ = session.kill(None, 5).await;
+                }
+                stopped.push(name.clone());
+            }
+
+            send_response(&mut stream, &Response::FleetStopped { stopped }).await?;
+        }
+
+        // --- Agent communication ---
+        Request::Reply { session_id, text } => {
+            // For now, log the reply. Channel adapters (Phase 3) will route to Telegram etc.
+            let sender_name = {
+                let st = state.lock().await;
+                st.find_name_by_id(session_id)
+                    .unwrap_or_else(|| format!("session-{session_id}"))
+            };
+            info!("[reply from {sender_name}] {text}");
+            send_response(&mut stream, &Response::Sent).await?;
+        }
+        Request::SendMessage {
+            session_id,
+            target,
+            text,
+            kind,
+            correlation_id,
+        } => {
+            let sender_name = {
+                let st = state.lock().await;
+                st.find_name_by_id(session_id)
+                    .unwrap_or_else(|| format!("session-{session_id}"))
+            };
+
+            // Find target session
+            let target_info = {
+                let st = state.lock().await;
+                st.find_session_by_name(&target)
+            };
+
+            match target_info {
+                Some((target_id, target_session)) => {
+                    // Enqueue message in target's inbox
+                    let msg = InboxMessage {
+                        from: sender_name.clone(),
+                        text: text.clone(),
+                        kind: kind.clone(),
+                        correlation_id,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    {
+                        let mut st = state.lock().await;
+                        st.enqueue_message(target_id, msg);
+                    }
+
+                    // Inject notification into target PTY
+                    let display_text = if text.chars().count() > 200 {
+                        let truncated: String = text.chars().take(200).collect();
+                        format!("{truncated}... (Run: agend-terminal inbox)")
+                    } else {
+                        text.clone()
+                    };
+                    let notification = format!("\n[from:{sender_name}] {display_text}\n");
+                    let _ = target_session.write_input(notification.as_bytes()).await;
+
+                    info!("[{sender_name} → {target}] message delivered");
+                    send_response(&mut stream, &Response::Sent).await?;
+                }
+                None => {
+                    send_response(
+                        &mut stream,
+                        &Response::Error {
+                            message: format!("Target instance '{target}' not found"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+        Request::Inbox { session_id } => {
+            let messages = {
+                let mut st = state.lock().await;
+                st.drain_inbox(session_id)
+            };
+            send_response(&mut stream, &Response::Messages { messages }).await?;
+        }
+
         _ => {
             send_response(
                 &mut stream,
@@ -360,14 +585,15 @@ fn spawn_session_reaper(id: u32, session: Arc<PtySession>, state: Arc<Mutex<Daem
         let _ = session.wait_exit_code().await;
         let mut st = state.lock().await;
         if st.sessions.remove(&id).is_some() {
+            // Also clean up name mapping
+            st.name_to_id.retain(|_, sid| *sid != id);
+            st.inboxes.remove(&id);
             info!("Reaped session {id}");
         }
     });
 }
 
-/// Attach loop: subscribe to PTY output broadcast, forward client input to PTY.
 async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()> {
-    // Trigger redraw: resize to current size sends SIGWINCH to child
     let (cols, rows) = session.get_size().await;
     let _ = session.resize(cols, rows).await;
 
@@ -375,11 +601,9 @@ async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()>
     let session_r = session.clone();
     let session_id = session.id;
 
-    // Subscribe to output broadcast
     let mut output_rx = session.subscribe_output();
     let drainer_done = session.drainer_done.clone();
 
-    // Task: PTY output (via broadcast) → client
     let mut output_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -403,7 +627,6 @@ async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()>
                     }
                 }
                 _ = drainer_done.notified() => {
-                    // Drainer exited (PTY EOF) — drain remaining messages
                     while let Ok(data) = output_rx.try_recv() {
                         let resp = Response::Output { data };
                         let json = serde_json::to_vec(&resp)
@@ -417,19 +640,16 @@ async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()>
                 }
             }
         }
-        // Session exited
         let exit_code = session_r.wait_exit_code().await.ok();
         let resp = Response::SessionExited {
             session_id,
             exit_code,
         };
-        let json =
-            serde_json::to_vec(&resp).expect("Response serialization is infallible");
+        let json = serde_json::to_vec(&resp).expect("Response serialization is infallible");
         let frame = protocol::encode(&json);
         let _ = writer.write_all(&frame).await;
     });
 
-    // Task: client input → PTY
     let mut input_handle = tokio::spawn(async move {
         loop {
             let mut len_buf = [0u8; 4];
