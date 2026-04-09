@@ -61,7 +61,8 @@ async fn main() -> Result<()> {
                 eprintln!("Usage: agend-terminal inject <session_id> <text>");
                 std::process::exit(1);
             }
-            let data = unescape(&text);
+            let mut data = unescape(&text);
+            data.push(b'\r'); // Auto-append Enter (CR), like typing + pressing Enter
             let sock = socket_path();
             client::inject(&sock, session_id, &data).await?;
         }
@@ -88,7 +89,7 @@ fn unescape(s: &str) -> Vec<u8> {
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('n') => out.push(b'\r'), // PTY raw mode: Enter = \r (0x0D)
+                Some('n') => out.push(b'\n'),
                 Some('t') => out.push(b'\t'),
                 Some('r') => out.push(b'\r'),
                 Some('\\') => out.push(b'\\'),
