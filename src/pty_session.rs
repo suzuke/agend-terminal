@@ -117,22 +117,26 @@ impl PtySession {
         }
     }
 
-    /// Get cached exit code, or wait for child to exit.
+    /// Get cached exit code, or poll for child to exit.
+    /// Uses try_wait in a loop to avoid holding the child lock during a blocking wait,
+    /// which would deadlock with is_running().
     pub async fn wait_exit_code(&self) -> Result<i32> {
-        // Return cached if available
-        if let Some(code) = *self.exit_status.lock().await {
-            return Ok(code);
+        loop {
+            // Check cache
+            if let Some(code) = *self.exit_status.lock().await {
+                return Ok(code);
+            }
+            // Brief lock: try_wait is non-blocking
+            {
+                let mut child = self.child.lock().await;
+                if let Ok(Some(status)) = child.try_wait() {
+                    let code = status.exit_code() as i32;
+                    *self.exit_status.lock().await = Some(code);
+                    return Ok(code);
+                }
+            }
+            // Lock released — other callers (is_running, etc.) can proceed
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let child = self.child.clone();
-        let exit_status = self.exit_status.clone();
-        let code = tokio::task::spawn_blocking(move || {
-            let mut c = child.blocking_lock();
-            let status = c.wait().context("Failed to wait for child")?;
-            let code = status.exit_code() as i32;
-            *exit_status.blocking_lock() = Some(code);
-            Ok::<i32, anyhow::Error>(code)
-        })
-        .await??;
-        Ok(code)
     }
 }
