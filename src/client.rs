@@ -1,6 +1,7 @@
 use crate::protocol::{self, Request, Response};
 use anyhow::{Context, Result};
 use nix::sys::termios;
+use std::collections::HashMap;
 use std::path::Path;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -53,19 +54,29 @@ async fn read_response(stream: &mut UnixStream) -> Result<Option<Response>> {
     Ok(Some(resp))
 }
 
-pub async fn spawn_and_attach(socket_path: &Path, command: &str, args: &[String]) -> Result<()> {
+pub async fn spawn_and_attach(
+    socket_path: &Path,
+    command: &str,
+    args: &[String],
+    env: Option<HashMap<String, String>>,
+    ready_pattern: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path)
         .await
         .context("Failed to connect to daemon. Is it running?")?;
 
-    let (cols, rows) = term_size().unwrap_or((80, 24));
+    let (default_cols, default_rows) = term_size().unwrap_or((80, 24));
     send_request(
         &mut stream,
         &Request::Spawn {
             command: command.to_string(),
             args: args.to_vec(),
-            cols: Some(cols),
-            rows: Some(rows),
+            cols: Some(cols.unwrap_or(default_cols)),
+            rows: Some(rows.unwrap_or(default_rows)),
+            env,
+            ready_pattern,
         },
     )
     .await?;
@@ -120,10 +131,27 @@ pub async fn list_sessions(socket_path: &Path) -> Result<()> {
             if sessions.is_empty() {
                 println!("No active sessions.");
             } else {
-                println!("{:<6} {:<10} {}", "ID", "STATUS", "COMMAND");
+                println!(
+                    "{:<6} {:<10} {:<6} {:<10} {}",
+                    "ID", "STATUS", "READY", "SIZE", "COMMAND"
+                );
                 for s in sessions {
-                    let status = if s.running { "running" } else { "exited" };
-                    println!("{:<6} {:<10} {}", s.id, status, s.command);
+                    let status = if s.running {
+                        "running".to_string()
+                    } else {
+                        format!(
+                            "exit({})",
+                            s.exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or("?".into())
+                        )
+                    };
+                    let ready = if s.ready { "yes" } else { "no" };
+                    let size = format!("{}x{}", s.cols, s.rows);
+                    println!(
+                        "{:<6} {:<10} {:<6} {:<10} {}",
+                        s.id, status, ready, size, s.command
+                    );
                 }
             }
         }
@@ -164,10 +192,43 @@ pub async fn inject(socket_path: &Path, session_id: u32, data: &[u8]) -> Result<
     Ok(())
 }
 
+pub async fn kill_session(
+    socket_path: &Path,
+    session_id: u32,
+    quit_command: Option<String>,
+    grace_seconds: Option<u32>,
+) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .context("Failed to connect to daemon. Is it running?")?;
+
+    send_request(
+        &mut stream,
+        &Request::Kill {
+            session_id,
+            quit_command,
+            grace_seconds,
+        },
+    )
+    .await?;
+
+    let resp = read_response(&mut stream)
+        .await?
+        .context("No response from daemon")?;
+    match resp {
+        Response::Killed { session_id } => {
+            println!("Session {session_id} killed");
+        }
+        Response::Error { message } => anyhow::bail!("Kill failed: {message}"),
+        _ => anyhow::bail!("Unexpected response"),
+    }
+
+    Ok(())
+}
+
 async fn run_attach_loop(stream: UnixStream) -> Result<()> {
     let _guard = RawModeGuard::enter()?;
     let result = attach_bridge(stream).await;
-    // _guard dropped here, restoring terminal
     println!();
     result
 }
@@ -226,7 +287,7 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
                             serde_json::to_vec(&req).expect("Detach serialization is infallible");
                         let frame = protocol::encode(&json);
                         let _ = sw.lock().await.write_all(&frame).await;
-                        return true; // signal detach
+                        return true;
                     }
                     let data = vec![0x02, buf[i]];
                     let req = Request::Write { data };
