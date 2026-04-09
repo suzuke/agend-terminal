@@ -85,7 +85,14 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
     };
 
     match req {
-        Request::Spawn { command, args } => {
+        Request::Spawn {
+            command,
+            args,
+            cols,
+            rows,
+        } => {
+            let cols = cols.unwrap_or(80);
+            let rows = rows.unwrap_or(24);
             // Allocate ID under lock, spawn outside lock to avoid blocking
             let id = {
                 let mut st = state.lock().await;
@@ -93,7 +100,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 st.next_id += 1;
                 id
             };
-            let session = Arc::new(PtySession::spawn(id, &command, &args, 80, 24)?);
+            let session = Arc::new(PtySession::spawn(id, &command, &args, cols, rows)?);
             {
                 let mut st = state.lock().await;
                 st.sessions.insert(id, session.clone());
@@ -136,6 +143,36 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 });
             }
             send_response(&mut stream, &Response::Sessions { sessions }).await?;
+        }
+        Request::Inject { session_id, data } => {
+            let session = {
+                let st = state.lock().await;
+                st.sessions.get(&session_id).cloned()
+            };
+            match session {
+                Some(session) => {
+                    let len = data.len();
+                    session.write_input(&data).await?;
+                    info!("Injected {len} bytes into session {session_id}");
+                    send_response(
+                        &mut stream,
+                        &Response::Injected {
+                            session_id,
+                            bytes_written: len,
+                        },
+                    )
+                    .await?;
+                }
+                None => {
+                    send_response(
+                        &mut stream,
+                        &Response::Error {
+                            message: format!("Session {session_id} not found"),
+                        },
+                    )
+                    .await?;
+                }
+            }
         }
         _ => {
             send_response(

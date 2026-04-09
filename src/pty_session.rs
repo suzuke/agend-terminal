@@ -30,6 +30,15 @@ impl PtySession {
         let mut cmd = CommandBuilder::new(command);
         cmd.args(args);
 
+        // Set environment for TUI frameworks (Ink, Bubble Tea, etc.)
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        cmd.env("FORCE_COLOR", "1");
+        // Ensure locale is set for unicode rendering
+        if std::env::var("LANG").is_err() {
+            cmd.env("LANG", "en_US.UTF-8");
+        }
+
         let child = pair.slave.spawn_command(cmd).context("Failed to spawn")?;
         drop(pair.slave);
 

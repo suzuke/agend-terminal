@@ -48,14 +48,31 @@ async fn main() -> Result<()> {
             let sock = socket_path();
             client::list_sessions(&sock).await?;
         }
+        "inject" => {
+            let session_id: u32 = args
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| {
+                    eprintln!("Usage: agend-terminal inject <session_id> <text>");
+                    std::process::exit(1);
+                });
+            let text = args.get(3..).unwrap_or_default().join(" ");
+            if text.is_empty() {
+                eprintln!("Usage: agend-terminal inject <session_id> <text>");
+                std::process::exit(1);
+            }
+            let sock = socket_path();
+            client::inject(&sock, session_id, text.as_bytes()).await?;
+        }
         _ => {
             eprintln!(
-                "AgEnD Terminal PoC\n\n\
+                "AgEnD Terminal MVP\n\n\
                  Usage:\n  \
-                   agend-terminal daemon          Start the daemon\n  \
-                   agend-terminal spawn [cmd]     Spawn a new session (default: /bin/bash)\n  \
-                   agend-terminal attach <id>     Attach to existing session\n  \
-                   agend-terminal list            List sessions\n\n\
+                   agend-terminal daemon              Start the daemon\n  \
+                   agend-terminal spawn [cmd]         Spawn a new session (default: /bin/bash)\n  \
+                   agend-terminal attach <id>         Attach to existing session\n  \
+                   agend-terminal list                List sessions\n  \
+                   agend-terminal inject <id> <text>  Send text to session (atomic write)\n\n\
                  Detach: Ctrl+B d"
             );
         }

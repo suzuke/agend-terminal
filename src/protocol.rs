@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type")]
 pub enum Request {
     /// Spawn a new PTY session.
-    Spawn { command: String, args: Vec<String> },
+    Spawn {
+        command: String,
+        args: Vec<String>,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    },
     /// Attach to an existing session.
     Attach { session_id: u32 },
     /// List all sessions.
@@ -16,6 +21,8 @@ pub enum Request {
     Resize { cols: u16, rows: u16 },
     /// Detach from current session.
     Detach,
+    /// Inject data into a session's PTY without attaching.
+    Inject { session_id: u32, data: Vec<u8> },
 }
 
 /// Messages from daemon to client.
@@ -36,6 +43,8 @@ pub enum Response {
     Error { message: String },
     /// Detached confirmation.
     Detached,
+    /// Inject acknowledged.
+    Injected { session_id: u32, bytes_written: usize },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

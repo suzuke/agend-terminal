@@ -58,11 +58,14 @@ pub async fn spawn_and_attach(socket_path: &Path, command: &str, args: &[String]
         .await
         .context("Failed to connect to daemon. Is it running?")?;
 
+    let (cols, rows) = term_size().unwrap_or((80, 24));
     send_request(
         &mut stream,
         &Request::Spawn {
             command: command.to_string(),
             args: args.to_vec(),
+            cols: Some(cols),
+            rows: Some(rows),
         },
     )
     .await?;
@@ -124,6 +127,37 @@ pub async fn list_sessions(socket_path: &Path) -> Result<()> {
                 }
             }
         }
+        _ => anyhow::bail!("Unexpected response"),
+    }
+
+    Ok(())
+}
+
+pub async fn inject(socket_path: &Path, session_id: u32, data: &[u8]) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .context("Failed to connect to daemon. Is it running?")?;
+
+    send_request(
+        &mut stream,
+        &Request::Inject {
+            session_id,
+            data: data.to_vec(),
+        },
+    )
+    .await?;
+
+    let resp = read_response(&mut stream)
+        .await?
+        .context("No response from daemon")?;
+    match resp {
+        Response::Injected {
+            session_id,
+            bytes_written,
+        } => {
+            println!("Injected {bytes_written} bytes into session {session_id}");
+        }
+        Response::Error { message } => anyhow::bail!("Inject failed: {message}"),
         _ => anyhow::bail!("Unexpected response"),
     }
 
