@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 pub struct PtySession {
     pub id: u32,
@@ -13,8 +13,6 @@ pub struct PtySession {
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     /// Cached exit status — once try_wait/wait returns, we store it here.
     exit_status: Arc<Mutex<Option<i32>>>,
-    /// Notified when the child exits.
-    pub exit_notify: Arc<Notify>,
 }
 
 impl PtySession {
@@ -52,7 +50,6 @@ impl PtySession {
             writer: Arc::new(Mutex::new(writer)),
             child: Arc::new(Mutex::new(child)),
             exit_status: Arc::new(Mutex::new(None)),
-            exit_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -127,7 +124,6 @@ impl PtySession {
             Ok::<i32, anyhow::Error>(code)
         })
         .await??;
-        self.exit_notify.notify_waiters();
         Ok(code)
     }
 }

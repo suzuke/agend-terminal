@@ -154,9 +154,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
 /// Background task that waits for a session's child to exit, then removes it from state.
 fn spawn_session_reaper(id: u32, session: Arc<PtySession>, state: Arc<Mutex<DaemonState>>) {
     tokio::spawn(async move {
-        // Wait for exit notification
-        session.exit_notify.notified().await;
-        // Also try waiting directly in case exit_notify was missed
+        // Directly wait for child exit — works regardless of attach state
         let _ = session.wait_exit_code().await;
         let mut st = state.lock().await;
         if st.sessions.remove(&id).is_some() {
