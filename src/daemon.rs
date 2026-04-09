@@ -302,26 +302,42 @@ async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()>
 
     // Subscribe to output broadcast
     let mut output_rx = session.subscribe_output();
+    let drainer_done = session.drainer_done.clone();
 
     // Task: PTY output (via broadcast) → client
     let mut output_handle = tokio::spawn(async move {
         loop {
-            match output_rx.recv().await {
-                Ok(data) => {
-                    let resp = Response::Output { data };
-                    let json = serde_json::to_vec(&resp)
-                        .expect("Response serialization is infallible");
-                    let frame = protocol::encode(&json);
-                    if writer.write_all(&frame).await.is_err() {
-                        break;
+            tokio::select! {
+                msg = output_rx.recv() => {
+                    match msg {
+                        Ok(data) => {
+                            let resp = Response::Output { data };
+                            let json = serde_json::to_vec(&resp)
+                                .expect("Response serialization is infallible");
+                            let frame = protocol::encode(&json);
+                            if writer.write_all(&frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            info!("Session {session_id} output: client lagged {n} messages");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    // Missed some messages, continue
-                    info!("Session {session_id} output: client lagged {n} messages");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    // PTY closed — session exited
+                _ = drainer_done.notified() => {
+                    // Drainer exited (PTY EOF) — drain remaining messages
+                    while let Ok(data) = output_rx.try_recv() {
+                        let resp = Response::Output { data };
+                        let json = serde_json::to_vec(&resp)
+                            .expect("Response serialization is infallible");
+                        let frame = protocol::encode(&json);
+                        if writer.write_all(&frame).await.is_err() {
+                            break;
+                        }
+                    }
                     break;
                 }
             }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 use tracing::info;
 
 pub struct PtySession {
@@ -21,6 +21,8 @@ pub struct PtySession {
     ready: Arc<AtomicBool>,
     /// Broadcast channel for PTY output — attach clients subscribe here.
     output_tx: broadcast::Sender<Vec<u8>>,
+    /// Notified when the output drainer exits (PTY EOF).
+    pub drainer_done: Arc<Notify>,
     /// Process ID for signaling.
     #[allow(dead_code)]
     child_pid: Option<u32>,
@@ -93,17 +95,17 @@ impl PtySession {
 
         let ready = Arc::new(AtomicBool::new(ready_pattern.is_none()));
 
-        // Spawn background output drainer
-        let drainer_tx = output_tx.clone();
-        let drainer_ready = ready.clone();
-        let drainer_id = id;
+        let drainer_done = Arc::new(Notify::new());
+
+        // Spawn background output drainer — owns a clone of output_tx
         Self::spawn_output_drainer(
             reader,
             log_file,
-            drainer_tx,
+            output_tx.clone(),
             ready_regex,
-            drainer_ready,
-            drainer_id,
+            ready.clone(),
+            id,
+            drainer_done.clone(),
         );
 
         Ok(Self {
@@ -116,32 +118,32 @@ impl PtySession {
             size: Arc::new(Mutex::new((cols, rows))),
             ready,
             output_tx,
+            drainer_done,
             child_pid,
         })
     }
 
     /// Background task: reads PTY output, writes to log, broadcasts to subscribers.
     fn spawn_output_drainer(
-        reader: Box<dyn Read + Send>,
+        mut reader: Box<dyn Read + Send>,
         mut log_file: std::fs::File,
         tx: broadcast::Sender<Vec<u8>>,
         ready_regex: Option<Regex>,
         ready: Arc<AtomicBool>,
         session_id: u32,
+        drainer_done: Arc<Notify>,
     ) {
-        let reader = Arc::new(std::sync::Mutex::new(reader));
         tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; 4096];
             let mut ready_buf = String::new();
             loop {
-                let n = match reader.lock().unwrap().read(&mut buf) {
+                let n = match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => n,
                     Err(_) => break,
                 };
                 let data = &buf[..n];
 
-                // Write to log file
                 let _ = log_file.write_all(data);
                 let _ = log_file.flush();
 
@@ -150,7 +152,10 @@ impl PtySession {
                     if let Some(ref re) = ready_regex {
                         ready_buf.push_str(&String::from_utf8_lossy(data));
                         if ready_buf.len() > 8192 {
-                            let start = ready_buf.len() - 8192;
+                            let mut start = ready_buf.len() - 8192;
+                            while !ready_buf.is_char_boundary(start) {
+                                start += 1;
+                            }
                             ready_buf = ready_buf[start..].to_string();
                         }
                         if re.is_match(&ready_buf) {
@@ -160,9 +165,10 @@ impl PtySession {
                     }
                 }
 
-                // Broadcast to attached clients (ignore if no receivers)
                 let _ = tx.send(data.to_vec());
             }
+            // Signal that drainer has exited (PTY EOF)
+            drainer_done.notify_waiters();
         });
     }
 
