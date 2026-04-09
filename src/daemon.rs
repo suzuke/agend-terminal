@@ -7,7 +7,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tokio::signal::unix::{signal, SignalKind};
+use tracing::{error, info, warn};
 
 struct DaemonState {
     sessions: HashMap<u32, Arc<PtySession>>,
@@ -51,14 +52,84 @@ pub async fn run(socket_path: &Path) -> Result<()> {
 
     let state = Arc::new(Mutex::new(DaemonState::new(log_dir)));
 
+    // Set up signal handlers for graceful shutdown
+    let mut sigterm = signal(SignalKind::terminate()).context("Failed to register SIGTERM")?;
+    let mut sigint = signal(SignalKind::interrupt()).context("Failed to register SIGINT")?;
+
+    let socket_path_owned = socket_path.to_path_buf();
+
     loop {
-        let (stream, _) = listener.accept().await?;
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, state).await {
-                error!("Client handler error: {e:#}");
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = result?;
+                let state = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_client(stream, state).await {
+                        error!("Client handler error: {e:#}");
+                    }
+                });
             }
-        });
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down...");
+                graceful_shutdown(&state, &socket_path_owned).await;
+                return Ok(());
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT, shutting down...");
+                graceful_shutdown(&state, &socket_path_owned).await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn graceful_shutdown(state: &Arc<Mutex<DaemonState>>, socket_path: &Path) {
+    let sessions: Vec<(u32, Arc<PtySession>)> = {
+        let st = state.lock().await;
+        st.sessions.iter().map(|(id, s)| (*id, s.clone())).collect()
+    };
+
+    if sessions.is_empty() {
+        info!("No active sessions, exiting.");
+    } else {
+        info!("Killing {} session(s)...", sessions.len());
+
+        // Phase 1: SIGTERM all sessions via kill (no quit command, just signal)
+        for (id, session) in &sessions {
+            if session.is_running().await {
+                let mut child = session.child_lock().await;
+                let _ = child.kill();
+                info!("Sent SIGKILL to session {id}");
+            }
+        }
+
+        // Phase 2: Wait up to 5 seconds for all to exit
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut all_exited = true;
+            for (_, session) in &sessions {
+                if session.is_running().await {
+                    all_exited = false;
+                    break;
+                }
+            }
+            if all_exited {
+                info!("All sessions exited.");
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!("Grace period expired, forcing exit.");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    // Clean up socket file
+    if let Err(e) = std::fs::remove_file(socket_path) {
+        warn!("Failed to remove socket: {e}");
+    } else {
+        info!("Cleaned up socket: {}", socket_path.display());
     }
 }
 
