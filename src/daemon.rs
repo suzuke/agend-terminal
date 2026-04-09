@@ -296,6 +296,10 @@ fn spawn_session_reaper(id: u32, session: Arc<PtySession>, state: Arc<Mutex<Daem
 
 /// Attach loop: subscribe to PTY output broadcast, forward client input to PTY.
 async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()> {
+    // Trigger redraw: resize to current size sends SIGWINCH to child
+    let (cols, rows) = session.get_size().await;
+    let _ = session.resize(cols, rows).await;
+
     let (mut reader, mut writer) = stream.into_split();
     let session_r = session.clone();
     let session_id = session.id;
