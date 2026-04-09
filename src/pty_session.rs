@@ -10,6 +10,7 @@ use tracing::info;
 
 pub struct PtySession {
     pub id: u32,
+    pub name: Option<String>,
     pub command: String,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -31,6 +32,7 @@ pub struct PtySession {
 impl PtySession {
     pub fn spawn(
         id: u32,
+        name: Option<&str>,
         command: &str,
         args: &[String],
         cols: u16,
@@ -55,6 +57,10 @@ impl PtySession {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("FORCE_COLOR", "1");
+        cmd.env("AGEND_SESSION_ID", id.to_string());
+        if let Some(n) = name {
+            cmd.env("AGEND_INSTANCE_NAME", n);
+        }
         if std::env::var("LANG").is_err() {
             cmd.env("LANG", "en_US.UTF-8");
         }
@@ -110,6 +116,7 @@ impl PtySession {
 
         Ok(Self {
             id,
+            name: name.map(|s| s.to_string()),
             command: command.to_string(),
             master: Arc::new(Mutex::new(pair.master)),
             writer: Arc::new(Mutex::new(writer)),

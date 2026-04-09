@@ -11,10 +11,10 @@ pub enum Request {
         args: Vec<String>,
         cols: Option<u16>,
         rows: Option<u16>,
-        /// Extra environment variables to set.
         env: Option<HashMap<String, String>>,
-        /// Regex pattern to detect when the CLI is ready.
         ready_pattern: Option<String>,
+        /// Instance name (for fleet-managed sessions).
+        name: Option<String>,
     },
     /// Attach to an existing session.
     Attach { session_id: u32 },
@@ -28,13 +28,43 @@ pub enum Request {
     Detach,
     /// Inject data into a session's PTY without attaching.
     Inject { session_id: u32, data: Vec<u8> },
-    /// Kill a session (graceful then force).
+    /// Kill a session.
     Kill {
         session_id: u32,
-        /// Optional quit command to inject before sending SIGTERM.
         quit_command: Option<String>,
-        /// Seconds to wait after quit command before SIGTERM.
         grace_seconds: Option<u32>,
+    },
+
+    // --- Fleet operations ---
+    /// Start fleet from config.
+    FleetStart {
+        config_path: String,
+        /// Only start these instances (empty = all).
+        names: Vec<String>,
+    },
+    /// Stop fleet sessions.
+    FleetStop {
+        /// Only stop these instances (empty = all).
+        names: Vec<String>,
+    },
+
+    // --- Agent communication ---
+    /// Agent replies to the user (routed via session_id).
+    Reply {
+        session_id: u32,
+        text: String,
+    },
+    /// Agent sends a message to another instance.
+    SendMessage {
+        session_id: u32,
+        target: String,
+        text: String,
+        kind: Option<String>,
+        correlation_id: Option<String>,
+    },
+    /// Agent reads pending messages.
+    Inbox {
+        session_id: u32,
     },
 }
 
@@ -42,41 +72,52 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Response {
-    /// Session spawned successfully.
     Spawned { session_id: u32 },
-    /// Attached to session.
     Attached { session_id: u32 },
-    /// Session list.
     Sessions { sessions: Vec<SessionInfo> },
-    /// PTY output data.
     Output { data: Vec<u8> },
-    /// Session exited.
     SessionExited {
         session_id: u32,
         exit_code: Option<i32>,
     },
-    /// Error.
     Error { message: String },
-    /// Detached confirmation.
     Detached,
-    /// Inject acknowledged.
     Injected {
         session_id: u32,
         bytes_written: usize,
     },
-    /// Kill acknowledged.
     Killed { session_id: u32 },
+
+    // --- Fleet responses ---
+    FleetStarted { started: Vec<String> },
+    FleetStopped { stopped: Vec<String> },
+
+    // --- Communication responses ---
+    /// Reply/send acknowledged.
+    Sent,
+    /// Inbox messages.
+    Messages { messages: Vec<InboxMessage> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: u32,
+    pub name: Option<String>,
     pub command: String,
     pub running: bool,
     pub exit_code: Option<i32>,
     pub ready: bool,
     pub cols: u16,
     pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboxMessage {
+    pub from: String,
+    pub text: String,
+    pub kind: Option<String>,
+    pub correlation_id: Option<String>,
+    pub timestamp: String,
 }
 
 /// Frame protocol: 4-byte big-endian length prefix + JSON payload.
