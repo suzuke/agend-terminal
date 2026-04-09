@@ -2,7 +2,7 @@ use crate::protocol::{self, Request, Response, SessionInfo};
 use crate::pty_session::PtySession;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -12,19 +12,20 @@ use tracing::{error, info};
 struct DaemonState {
     sessions: HashMap<u32, Arc<PtySession>>,
     next_id: u32,
+    log_dir: PathBuf,
 }
 
 impl DaemonState {
-    fn new() -> Self {
+    fn new(log_dir: PathBuf) -> Self {
         Self {
             sessions: HashMap::new(),
             next_id: 1,
+            log_dir,
         }
     }
 }
 
 pub async fn run(socket_path: &Path) -> Result<()> {
-    // Check if another daemon is alive before removing socket
     if socket_path.exists() {
         if UnixStream::connect(socket_path).await.is_ok() {
             anyhow::bail!(
@@ -38,10 +39,17 @@ pub async fn run(socket_path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    let log_dir = socket_path
+        .parent()
+        .unwrap_or(Path::new("/tmp"))
+        .join("sessions");
+    std::fs::create_dir_all(&log_dir)?;
+
     let listener = UnixListener::bind(socket_path).context("Failed to bind UDS")?;
     info!("Daemon listening on {:?}", socket_path);
+    info!("Session logs: {:?}", log_dir);
 
-    let state = Arc::new(Mutex::new(DaemonState::new()));
+    let state = Arc::new(Mutex::new(DaemonState::new(log_dir)));
 
     loop {
         let (stream, _) = listener.accept().await?;
@@ -90,26 +98,35 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             args,
             cols,
             rows,
+            env,
+            ready_pattern,
         } => {
             let cols = cols.unwrap_or(80);
             let rows = rows.unwrap_or(24);
-            // Allocate ID under lock, spawn outside lock to avoid blocking
-            let id = {
+            let (id, log_dir) = {
                 let mut st = state.lock().await;
                 let id = st.next_id;
                 st.next_id += 1;
-                id
+                (id, st.log_dir.clone())
             };
-            let session = Arc::new(PtySession::spawn(id, &command, &args, cols, rows)?);
+            let session = Arc::new(PtySession::spawn(
+                id,
+                &command,
+                &args,
+                cols,
+                rows,
+                env.as_ref(),
+                ready_pattern.as_deref(),
+                &log_dir,
+            )?);
             {
                 let mut st = state.lock().await;
                 st.sessions.insert(id, session.clone());
             }
-            // Spawn background reaper for this session
             spawn_session_reaper(id, session.clone(), state.clone());
             info!("Spawned session {id}: {command}");
             send_response(&mut stream, &Response::Spawned { session_id: id }).await?;
-            attach_loop(stream, session, state.clone()).await?;
+            attach_loop(stream, session).await?;
         }
         Request::Attach { session_id } => {
             let session = {
@@ -119,7 +136,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             match session {
                 Some(session) => {
                     send_response(&mut stream, &Response::Attached { session_id }).await?;
-                    attach_loop(stream, session, state.clone()).await?;
+                    attach_loop(stream, session).await?;
                 }
                 None => {
                     send_response(
@@ -136,10 +153,16 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             let st = state.lock().await;
             let mut sessions = Vec::new();
             for (_, s) in &st.sessions {
+                let running = s.is_running().await;
+                let (cols, rows) = s.get_size().await;
                 sessions.push(SessionInfo {
                     id: s.id,
                     command: s.command.clone(),
-                    running: s.is_running().await,
+                    running,
+                    exit_code: s.get_exit_code().await,
+                    ready: s.is_ready(),
+                    cols,
+                    rows,
                 });
             }
             send_response(&mut stream, &Response::Sessions { sessions }).await?;
@@ -198,6 +221,55 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 }
             }
         }
+        Request::Kill {
+            session_id,
+            quit_command,
+            grace_seconds,
+        } => {
+            let session = {
+                let st = state.lock().await;
+                st.sessions.get(&session_id).cloned()
+            };
+            match session {
+                Some(session) => {
+                    if !session.is_running().await {
+                        send_response(&mut stream, &Response::Killed { session_id })
+                            .await?;
+                        return Ok(());
+                    }
+                    let grace = grace_seconds.unwrap_or(5);
+                    match session.kill(quit_command.as_deref(), grace).await {
+                        Ok(()) => {
+                            send_response(
+                                &mut stream,
+                                &Response::Killed { session_id },
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            send_response(
+                                &mut stream,
+                                &Response::Error {
+                                    message: format!(
+                                        "Kill session {session_id} failed: {e}"
+                                    ),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                None => {
+                    send_response(
+                        &mut stream,
+                        &Response::Error {
+                            message: format!("Session {session_id} not found"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
         _ => {
             send_response(
                 &mut stream,
@@ -212,10 +284,8 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
     Ok(())
 }
 
-/// Background task that waits for a session's child to exit, then removes it from state.
 fn spawn_session_reaper(id: u32, session: Arc<PtySession>, state: Arc<Mutex<DaemonState>>) {
     tokio::spawn(async move {
-        // Directly wait for child exit — works regardless of attach state
         let _ = session.wait_exit_code().await;
         let mut st = state.lock().await;
         if st.sessions.remove(&id).is_some() {
@@ -224,21 +294,19 @@ fn spawn_session_reaper(id: u32, session: Arc<PtySession>, state: Arc<Mutex<Daem
     });
 }
 
-/// Main attach loop: bridge PTY output to client, client input to PTY.
-async fn attach_loop(
-    stream: UnixStream,
-    session: Arc<PtySession>,
-    _state: Arc<Mutex<DaemonState>>,
-) -> Result<()> {
+/// Attach loop: subscribe to PTY output broadcast, forward client input to PTY.
+async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let session_r = session.clone();
     let session_id = session.id;
 
-    // Task: PTY output → client
+    // Subscribe to output broadcast
+    let mut output_rx = session.subscribe_output();
+
+    // Task: PTY output (via broadcast) → client
     let mut output_handle = tokio::spawn(async move {
         loop {
-            match session_r.read_output().await {
-                Ok(data) if data.is_empty() => break,
+            match output_rx.recv().await {
                 Ok(data) => {
                     let resp = Response::Output { data };
                     let json = serde_json::to_vec(&resp)
@@ -248,7 +316,14 @@ async fn attach_loop(
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Missed some messages, continue
+                    info!("Session {session_id} output: client lagged {n} messages");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // PTY closed — session exited
+                    break;
+                }
             }
         }
         // Session exited

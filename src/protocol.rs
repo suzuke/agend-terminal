@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Messages from client to daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -10,6 +11,10 @@ pub enum Request {
         args: Vec<String>,
         cols: Option<u16>,
         rows: Option<u16>,
+        /// Extra environment variables to set.
+        env: Option<HashMap<String, String>>,
+        /// Regex pattern to detect when the CLI is ready.
+        ready_pattern: Option<String>,
     },
     /// Attach to an existing session.
     Attach { session_id: u32 },
@@ -23,6 +28,14 @@ pub enum Request {
     Detach,
     /// Inject data into a session's PTY without attaching.
     Inject { session_id: u32, data: Vec<u8> },
+    /// Kill a session (graceful then force).
+    Kill {
+        session_id: u32,
+        /// Optional quit command to inject before sending SIGTERM.
+        quit_command: Option<String>,
+        /// Seconds to wait after quit command before SIGTERM.
+        grace_seconds: Option<u32>,
+    },
 }
 
 /// Messages from daemon to client.
@@ -38,13 +51,21 @@ pub enum Response {
     /// PTY output data.
     Output { data: Vec<u8> },
     /// Session exited.
-    SessionExited { session_id: u32, exit_code: Option<i32> },
+    SessionExited {
+        session_id: u32,
+        exit_code: Option<i32>,
+    },
     /// Error.
     Error { message: String },
     /// Detached confirmation.
     Detached,
     /// Inject acknowledged.
-    Injected { session_id: u32, bytes_written: usize },
+    Injected {
+        session_id: u32,
+        bytes_written: usize,
+    },
+    /// Kill acknowledged.
+    Killed { session_id: u32 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,6 +73,10 @@ pub struct SessionInfo {
     pub id: u32,
     pub command: String,
     pub running: bool,
+    pub exit_code: Option<i32>,
+    pub ready: bool,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Frame protocol: 4-byte big-endian length prefix + JSON payload.
