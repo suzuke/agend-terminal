@@ -74,6 +74,7 @@ async fn main() -> Result<()> {
     load_dotenv();
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter("agend_terminal=info")
         .init();
 
