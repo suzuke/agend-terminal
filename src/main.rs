@@ -8,10 +8,16 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+fn home_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("AGEND_TERMINAL_HOME") {
+        return PathBuf::from(home);
+    }
+    let base = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(base).join(".agend-terminal")
+}
+
 fn socket_path() -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/tmp/agend-terminal-{}", nix::unistd::getuid()));
-    PathBuf::from(runtime_dir).join("agend-terminal.sock")
+    home_dir().join("agend-terminal.sock")
 }
 
 fn session_id_from_env() -> Option<u32> {
