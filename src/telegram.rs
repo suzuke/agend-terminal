@@ -1,8 +1,223 @@
-//! Telegram adapter — stub for Phase 2.
-//! Full implementation requires tokio runtime + teloxide integration
-//! with the v2 sync agent architecture.
+//! Telegram adapter — runs in dedicated thread with tokio runtime.
 //!
-//! TODO: Implement inbound (Telegram → agent inject) and outbound (reply → Telegram send).
+//! Inbound: Telegram message → inbox + PTY notification
+//! Outbound: reply(text) → Telegram send_message to topic
 
-/// Placeholder — Telegram integration is not yet migrated to v2 architecture.
-pub fn _placeholder() {}
+use crate::fleet::ChannelConfig;
+use crate::inbox::{self, InboxMessage};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use teloxide::prelude::*;
+use teloxide::types::{MessageId, ThreadId};
+
+pub struct TelegramState {
+    pub bot: Bot,
+    #[allow(dead_code)]
+    pub group_id: ChatId,
+    pub topic_to_instance: HashMap<i32, String>,
+    #[allow(dead_code)]
+    pub instance_to_topic: HashMap<String, i32>,
+    pub home: PathBuf,
+    /// Submit key per instance (for PTY notification injection).
+    pub submit_keys: HashMap<String, String>,
+}
+
+impl TelegramState {
+    pub fn new(
+        token: &str,
+        group_id: i64,
+        topic_map: HashMap<String, i32>,
+        home: PathBuf,
+        submit_keys: HashMap<String, String>,
+    ) -> Self {
+        let topic_to_instance: HashMap<i32, String> = topic_map
+            .iter()
+            .map(|(name, &tid)| (tid, name.clone()))
+            .collect();
+        Self {
+            bot: Bot::new(token),
+            group_id: ChatId(group_id),
+            topic_to_instance,
+            instance_to_topic: topic_map,
+            home,
+            submit_keys,
+        }
+    }
+
+    /// Send a message to an instance's Telegram topic.
+    #[allow(dead_code)]
+    pub async fn send_to_topic(&self, instance_name: &str, text: &str) -> anyhow::Result<()> {
+        let topic_id = self
+            .instance_to_topic
+            .get(instance_name)
+            .ok_or_else(|| anyhow::anyhow!("No topic for '{instance_name}'"))?;
+
+        if *topic_id == 1 {
+            // General topic — no message_thread_id
+            self.bot.send_message(self.group_id, text).await?;
+        } else {
+            self.bot
+                .send_message(self.group_id, text)
+                .message_thread_id(ThreadId(MessageId(*topic_id)))
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// Start Telegram polling in a dedicated thread with its own tokio runtime.
+pub fn start_polling(
+    state: Arc<Mutex<TelegramState>>,
+) {
+    std::thread::Builder::new()
+        .name("telegram".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            rt.block_on(async {
+                let bot = {
+                    let s = state.lock().unwrap();
+                    s.bot.clone()
+                };
+
+                let state2 = Arc::clone(&state);
+                let handler = Update::filter_message().endpoint(
+                    move |_bot: Bot, msg: Message| {
+                        let state = Arc::clone(&state2);
+                        async move {
+                            handle_message(&state, &msg);
+                            respond(())
+                        }
+                    },
+                );
+
+                eprintln!("[telegram] polling started");
+                Dispatcher::builder(bot, handler)
+                    .build()
+                    .dispatch()
+                    .await;
+            });
+        })
+        .expect("telegram thread");
+}
+
+fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
+    // Detect topic closure
+    if msg.forum_topic_closed().is_some() {
+        eprintln!("[telegram] topic closed");
+        return;
+    }
+
+    let text = match msg.text() {
+        Some(t) => t,
+        None => return,
+    };
+
+    let username = msg
+        .from
+        .as_ref()
+        .and_then(|u| u.username.as_deref())
+        .unwrap_or("unknown");
+
+    let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
+
+    let (instance_name, home, submit_key) = {
+        let s = state.lock().unwrap();
+        let name = thread_id
+            .and_then(|tid| s.topic_to_instance.get(&tid).cloned())
+            .unwrap_or_else(|| "general".to_string());
+        let sk = s.submit_keys.get(&name).cloned().unwrap_or_else(|| "\r".to_string());
+        (name, s.home.clone(), sk)
+    };
+
+    eprintln!("[telegram] {username} → {instance_name}: {text}");
+
+    // Enqueue in inbox
+    let msg_obj = InboxMessage {
+        from: format!("user:{username}"),
+        text: text.to_string(),
+        kind: Some("telegram".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let _ = inbox::enqueue(&home, &instance_name, msg_obj);
+
+    // Notify agent PTY
+    inbox::notify_agent(
+        &home,
+        &instance_name,
+        &format!("user:{username} via telegram"),
+        text,
+        &submit_key,
+    );
+}
+
+/// Send a reply from an agent to Telegram (called from MCP reply tool).
+#[allow(dead_code)]
+pub fn send_reply(state: &Arc<Mutex<TelegramState>>, instance_name: &str, text: &str) -> anyhow::Result<()> {
+    let s = state.lock().unwrap();
+    let bot = s.bot.clone();
+    let group_id = s.group_id;
+    let topic_id = s.instance_to_topic.get(instance_name).copied();
+    drop(s);
+
+    // Use a short-lived tokio runtime for the send
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        if let Some(tid) = topic_id {
+            if tid == 1 {
+                bot.send_message(group_id, text).await?;
+            } else {
+                bot.send_message(group_id, text)
+                    .message_thread_id(ThreadId(MessageId(tid)))
+                    .await?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// Initialize Telegram from fleet config.
+pub fn init_from_config(
+    config: &crate::fleet::FleetConfig,
+    home: &Path,
+    submit_keys: HashMap<String, String>,
+) -> Option<Arc<Mutex<TelegramState>>> {
+    let channel = config.channel.as_ref()?;
+    match channel {
+        ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        } => {
+            let token = match std::env::var(bot_token_env) {
+                Ok(t) => t,
+                Err(_) => {
+                    eprintln!("[telegram] bot token env '{bot_token_env}' not set, skipping");
+                    return None;
+                }
+            };
+            let topic_map: HashMap<String, i32> = config
+                .instances
+                .iter()
+                .filter_map(|(name, inst)| inst.topic_id.map(|tid| (name.clone(), tid)))
+                .collect();
+
+            let state = Arc::new(Mutex::new(TelegramState::new(
+                &token,
+                *group_id,
+                topic_map,
+                home.to_path_buf(),
+                submit_keys,
+            )));
+
+            start_polling(Arc::clone(&state));
+            Some(state)
+        }
+    }
+}

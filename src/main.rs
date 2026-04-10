@@ -3,14 +3,13 @@ mod backend;
 mod daemon;
 mod fleet;
 mod framing;
+mod inbox;
 mod instructions;
 mod mcp;
 mod mcp_config;
+mod telegram;
 mod tui;
 mod vterm;
-
-// Telegram requires tokio — conditionally included
-mod telegram;
 
 use std::path::PathBuf;
 
@@ -208,6 +207,16 @@ fn start_with_fleet(home: &std::path::Path, fleet_path: &std::path::Path) -> any
         eprintln!("No instances found in fleet.yaml");
         std::process::exit(1);
     }
+
+    // Initialize Telegram if configured
+    let submit_keys: std::collections::HashMap<String, String> = config
+        .instances
+        .keys()
+        .filter_map(|name| {
+            config.resolve_instance(name).map(|r| (name.clone(), r.submit_key))
+        })
+        .collect();
+    let _telegram = telegram::init_from_config(&config, home, submit_keys);
 
     daemon::run(home, agents)?;
     Ok(())
