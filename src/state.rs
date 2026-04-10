@@ -129,6 +129,8 @@ impl StatePatterns {
             Backend::Codex => vec![
                 // [文件] Requires OPENAI_API_KEY env
                 (AgentState::AuthError, r"OPENAI_API_KEY|api.?key"),
+                // [実測 v0.118.0] Quota exhausted message
+                (AgentState::UsageLimit, r"hit your usage limit|try again at"),
                 // [文件] HTTP 429 handling
                 (AgentState::RateLimit, r"rate.?limit|429"),
                 // [文件] Context overflow error
