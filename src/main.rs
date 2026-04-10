@@ -123,8 +123,12 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("Usage: agend-terminal inject <name> <text>");
                 std::process::exit(1);
             }
+            // Look up submit_key from API
+            let submit_key = get_submit_key_for(&home, name);
+            let mut data = text.into_bytes();
+            data.extend_from_slice(submit_key.as_bytes());
             let sock = daemon::agent_socket_path(&home, name);
-            inject(&sock, text.as_bytes())?;
+            inject(&sock, &data)?;
         }
         "list" | "ls" => {
             for entry in std::fs::read_dir(&home)?.flatten() {
@@ -258,6 +262,22 @@ fn get_instance_name() -> String {
         eprintln!("Error: AGEND_INSTANCE_NAME not set. MCP server must run inside a session.");
         std::process::exit(1);
     })
+}
+
+/// Look up submit_key for an agent via API socket.
+fn get_submit_key_for(home: &std::path::Path, name: &str) -> String {
+    if let Ok(resp) = api::call(home, &serde_json::json!({"method": "list"})) {
+        if let Some(agents) = resp["result"]["agents"].as_array() {
+            for a in agents {
+                if a["name"].as_str() == Some(name) {
+                    if let Some(sk) = a["submit_key"].as_str() {
+                        return sk.to_string();
+                    }
+                }
+            }
+        }
+    }
+    "\r".to_string() // default
 }
 
 fn inject(socket_path: &str, data: &[u8]) -> anyhow::Result<()> {
