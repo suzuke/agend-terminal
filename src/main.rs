@@ -29,8 +29,42 @@ fn session_id_from_env() -> Option<u32> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Load .env file from AGEND_TERMINAL_HOME, setting vars into process env.
+fn load_dotenv() {
+    let env_path = home_dir().join(".env");
+    if !env_path.exists() {
+        return;
+    }
+    let content = match std::fs::read_to_string(&env_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Strip optional "export " prefix
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            // Strip surrounding quotes from value
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"').and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value);
+            if !key.is_empty() {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    load_dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter("agend_terminal=info")
         .init();
@@ -159,10 +193,12 @@ async fn main() -> Result<()> {
             let sock = socket_path();
             match subcmd {
                 "start" => {
+                    let default_config = home_dir().join("fleet.yaml");
+                    let default_str = default_config.to_string_lossy().to_string();
                     let config_path = args
                         .get(3)
                         .map(|s| s.as_str())
-                        .unwrap_or("fleet.yaml");
+                        .unwrap_or(&default_str);
                     let names: Vec<String> = args.get(4..).unwrap_or_default().to_vec();
                     client::fleet_start(&sock, config_path, names).await?;
                 }

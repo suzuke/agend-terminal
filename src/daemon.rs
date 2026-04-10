@@ -462,7 +462,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                     {
                         match std::env::var(bot_token_env) {
                             Ok(token) => {
-                                // Build topic map from instances
+                                // Build topic map from instances with existing topic_id
                                 let topic_map: HashMap<String, i32> = config
                                     .instances
                                     .iter()
@@ -474,6 +474,42 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                 let channel = Arc::new(Mutex::new(TelegramChannel::new(
                                     &token, group_id, topic_map,
                                 )));
+
+                                // Auto-create topics for instances without topic_id
+                                let mut config_updated = false;
+                                for (name, inst) in config.instances.iter() {
+                                    if inst.topic_id.is_none() && name != "general" {
+                                        let mut ch = channel.lock().await;
+                                        match ch.create_topic(name).await {
+                                            Ok(tid) => {
+                                                // Update config in memory for write-back
+                                                // (actual write-back below)
+                                                info!("Auto-created topic for {name}: {tid}");
+                                                config_updated = true;
+                                            }
+                                            Err(e) => {
+                                                warn!("Failed to create topic for {name}: {e:#}");
+                                            }
+                                        }
+                                    }
+                                    // General instance uses General topic (1)
+                                    if name == "general" && inst.topic_id.is_none() {
+                                        let mut ch = channel.lock().await;
+                                        ch.register_topic("general", 1);
+                                    }
+                                }
+
+                                // Write back updated topic_ids to fleet.yaml
+                                if config_updated {
+                                    let ch = channel.lock().await;
+                                    if let Err(e) = write_back_topic_ids(
+                                        Path::new(&config_path),
+                                        &ch,
+                                    ) {
+                                        warn!("Failed to write back topic IDs: {e:#}");
+                                    }
+                                }
+
                                 {
                                     let mut st = state.lock().await;
                                     st.telegram = Some(channel.clone());
@@ -625,7 +661,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         text.clone()
                     };
                     let submit = if target_session.command.contains("gemini") { "\n\r" } else { "\r" };
-                    let notification = format!("\n[from:{sender_name}] {display_text}{submit}");
+                    let notification = format!("[from:{sender_name}] {display_text}{submit}");
                     let _ = target_session.write_input(notification.as_bytes()).await;
 
                     info!("[{sender_name} → {target}] message delivered");
@@ -661,6 +697,32 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
         }
     }
 
+    Ok(())
+}
+
+/// Write auto-created topic IDs back to fleet.yaml.
+fn write_back_topic_ids(config_path: &Path, channel: &TelegramChannel) -> Result<()> {
+    let content = std::fs::read_to_string(config_path)?;
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
+
+    if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
+        for (name, topic_id) in channel.get_topic_map() {
+            let key = serde_yaml::Value::String(name.clone());
+            if let Some(inst) = instances.get_mut(&key).and_then(|v| v.as_mapping_mut()) {
+                let tid_key = serde_yaml::Value::String("topic_id".to_string());
+                if !inst.contains_key(&tid_key) {
+                    inst.insert(
+                        tid_key,
+                        serde_yaml::Value::Number(serde_yaml::Number::from(*topic_id)),
+                    );
+                }
+            }
+        }
+    }
+
+    let yaml = serde_yaml::to_string(&doc)?;
+    std::fs::write(config_path, yaml)?;
+    info!("Updated fleet.yaml with topic IDs");
     Ok(())
 }
 
