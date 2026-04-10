@@ -148,6 +148,30 @@ async fn handle_telegram_message(
     state: &Arc<Mutex<DaemonState>>,
     msg: &Message,
 ) -> Result<()> {
+    // Detect topic deletion (forum_topic_closed or service message)
+    if msg.forum_topic_closed().is_some() {
+        let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
+        if let Some(tid) = thread_id {
+            let instance_name = {
+                let ch = channel.lock().await;
+                ch.topic_to_instance.get(&tid).cloned()
+            };
+            if let Some(name) = instance_name {
+                warn!("Telegram topic closed for instance '{name}' (topic {tid})");
+                // Kill the session
+                let session = {
+                    let st = state.lock().await;
+                    st.find_session_by_name(&name).map(|(_, s)| s)
+                };
+                if let Some(s) = session {
+                    let _ = s.kill(None, 5).await;
+                    info!("Killed instance '{name}' due to topic closure");
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let text = match msg.text() {
         Some(t) => t,
         None => return Ok(()), // Ignore non-text messages

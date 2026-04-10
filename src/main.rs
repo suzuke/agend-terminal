@@ -11,7 +11,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-fn home_dir() -> PathBuf {
+pub fn home_dir() -> PathBuf {
     if let Ok(home) = std::env::var("AGEND_TERMINAL_HOME") {
         return PathBuf::from(home);
     }
@@ -78,10 +78,16 @@ async fn main() -> Result<()> {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     match cmd {
+        "start" => {
+            let sock = socket_path();
+            let fleet_config = home_dir().join("fleet.yaml");
+            println!("Starting agend-terminal, socket: {}", sock.display());
+            daemon::run(&sock, Some(&fleet_config)).await?;
+        }
         "daemon" => {
             let sock = socket_path();
             println!("Starting daemon, socket: {}", sock.display());
-            daemon::run(&sock).await?;
+            daemon::run(&sock, None).await?;
         }
         "spawn" => {
             let mut env_map: HashMap<String, String> = HashMap::new();
@@ -341,7 +347,8 @@ async fn main() -> Result<()> {
             eprintln!(
                 "AgEnD Terminal\n\n\
                  Session management:\n  \
-                   agend-terminal daemon\n  \
+                   agend-terminal start                    Start daemon + fleet\n  \
+                   agend-terminal daemon                   Start daemon only\n  \
                    agend-terminal spawn [flags] [cmd] [-- args...]\n  \
                    agend-terminal attach <id>\n  \
                    agend-terminal list\n  \
