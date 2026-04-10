@@ -243,14 +243,11 @@ async fn handle_telegram_message(
     }
 
     // Inject notification into PTY
-    // Determine submit key based on command (gemini needs \n\r, others \r)
     let submit_key = {
         let st = state.lock().await;
-        if let Some((_, s)) = st.find_session_by_name(&instance_name) {
-            if s.command.contains("gemini") { "\n\r" } else { "\r" }
-        } else {
-            "\r"
-        }
+        st.find_session_by_name(&instance_name)
+            .map(|(_, s)| s.submit_key.clone())
+            .unwrap_or_else(|| "\r".to_string())
     };
     let notification = format!(
         "[user:{username} via telegram] {}{submit_key}",

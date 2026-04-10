@@ -1,3 +1,4 @@
+mod backend;
 mod client;
 mod daemon;
 mod fleet;
@@ -166,6 +167,7 @@ async fn main() -> Result<()> {
         }
         "create-instance" => {
             let mut name: Option<String> = None;
+            let mut backend_name: Option<String> = None;
             let mut command: Option<String> = None;
             let mut cmd_args: Vec<String> = Vec::new();
             let mut env_map: HashMap<String, String> = HashMap::new();
@@ -179,6 +181,7 @@ async fn main() -> Result<()> {
             while i < args.len() {
                 match args[i].as_str() {
                     "--name" => { i += 1; name = args.get(i).cloned(); }
+                    "--backend" => { i += 1; backend_name = args.get(i).cloned(); }
                     "--command" => { i += 1; command = args.get(i).cloned(); }
                     "--args" => {
                         i += 1;
@@ -204,8 +207,23 @@ async fn main() -> Result<()> {
                 i += 1;
             }
 
+            // Apply backend preset if specified
+            if let Some(ref bn) = backend_name {
+                let backend: Option<backend::Backend> = serde_json::from_str(&format!("\"{bn}\"")).ok();
+                if let Some(b) = backend {
+                    let preset = b.preset();
+                    if command.is_none() { command = Some(preset.command.to_string()); }
+                    if cmd_args.is_empty() {
+                        cmd_args = preset.args.iter().map(|s| s.to_string()).collect();
+                    }
+                    if ready_pattern.is_none() {
+                        ready_pattern = Some(preset.ready_pattern.to_string());
+                    }
+                }
+            }
+
             let name = name.unwrap_or_else(|| {
-                eprintln!("Usage: agend-terminal create-instance --name NAME --command CMD [options]");
+                eprintln!("Usage: agend-terminal create-instance --name NAME (--backend B | --command C) [options]");
                 std::process::exit(1);
             });
             let command = command.unwrap_or_else(|| {
