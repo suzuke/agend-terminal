@@ -594,6 +594,7 @@ fn spawn_session_reaper(id: u32, session: Arc<PtySession>, state: Arc<Mutex<Daem
 }
 
 async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()> {
+    // Resize to trigger SIGWINCH for redraw
     let (cols, rows) = session.get_size().await;
     let _ = session.resize(cols, rows).await;
 
@@ -601,7 +602,15 @@ async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()>
     let session_r = session.clone();
     let session_id = session.id;
 
-    let mut output_rx = session.subscribe_output();
+    // Atomically subscribe + dump to avoid losing output between the two
+    let (mut output_rx, screen_dump) = session.subscribe_with_dump();
+    if !screen_dump.is_empty() {
+        let resp = Response::Output { data: screen_dump };
+        let json = serde_json::to_vec(&resp).expect("Response serialization is infallible");
+        let frame = protocol::encode(&json);
+        let _ = writer.write_all(&frame).await;
+    }
+
     let drainer_done = session.drainer_done.clone();
 
     let mut output_handle = tokio::spawn(async move {

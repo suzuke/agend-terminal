@@ -3,6 +3,7 @@ mod daemon;
 mod fleet;
 mod protocol;
 mod pty_session;
+mod vterm;
 
 use anyhow::Result;
 use std::collections::HashMap;
