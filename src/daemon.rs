@@ -2,8 +2,7 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::framing::{self, TAG_DATA, TAG_RESIZE};
-#[allow(unused_imports)]
-use std::io::Read;
+
 use portable_pty::PtySize;
 use std::collections::HashMap;
 use std::io::Write;
@@ -174,8 +173,16 @@ pub fn run(
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
-    // Cleanup sockets
+    // Kill child processes + cleanup sockets
     eprintln!("[daemon] cleaning up...");
+    {
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, agent) in reg.iter() {
+            let mut child = agent.child.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = child.kill();
+            eprintln!("[daemon] killed {name}");
+        }
+    }
     for (name, _, _, _, _, _) in &agents {
         let sock = agent_socket_path(home, name);
         let _ = std::fs::remove_file(&sock);

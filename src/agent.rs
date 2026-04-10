@@ -15,7 +15,8 @@ pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Core state for one agent — protected by a single Mutex for atomic operations.
 pub struct AgentCore {
     pub vterm: VTerm,
-    pub output_tx: crossbeam::channel::Sender<Vec<u8>>,
+    /// Per-subscriber senders — each subscriber gets its own channel.
+    pub subscribers: Vec<crossbeam::channel::Sender<Vec<u8>>>,
 }
 
 /// Handle to interact with an agent.
@@ -26,8 +27,7 @@ pub struct AgentHandle {
     pub pty_writer: PtyWriter,
     pub pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub core: Arc<Mutex<AgentCore>>,
-    /// Template receiver — clone to create new subscribers.
-    pub output_rx_template: crossbeam::channel::Receiver<Vec<u8>>,
+    pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     pub submit_key: String,
 }
 
@@ -129,7 +129,7 @@ pub fn spawn_agent(
         cmd.cwd(dir);
     }
 
-    let _child = pair
+    let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| anyhow::anyhow!("Failed to spawn '{command}': {e}"))?;
@@ -146,11 +146,9 @@ pub fn spawn_agent(
         .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
     let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
-    let (output_tx, output_rx) = crossbeam::channel::unbounded::<Vec<u8>>();
-
     let core = Arc::new(Mutex::new(AgentCore {
         vterm: VTerm::new(cols, rows),
-        output_tx: output_tx.clone(),
+        subscribers: Vec::new(),
     }));
 
     // Register in registry
@@ -164,7 +162,7 @@ pub fn spawn_agent(
                 pty_writer: Arc::clone(&pty_writer),
                 pty_master: Arc::clone(&pty_master),
                 core: Arc::clone(&core),
-                output_rx_template: output_rx,
+                child: Arc::new(Mutex::new(child)),
                 submit_key: submit_key.to_string(),
             },
         );
@@ -210,12 +208,14 @@ pub fn spawn_agent(
                             }
                         }
 
-                        // Feed VTerm + broadcast (under same lock = atomic)
+                        // Feed VTerm + broadcast to all subscribers (under same lock = atomic)
                         {
                             let mut core =
                                 core2.lock().unwrap_or_else(|e| e.into_inner());
                             core.vterm.process(data);
-                            let _ = core.output_tx.send(data.to_vec());
+                            // Send to each subscriber, remove dead ones
+                            core.subscribers
+                                .retain(|tx| tx.send(data.to_vec()).is_ok());
                         }
                     }
                     Err(_) => break,
@@ -254,9 +254,11 @@ pub fn resize_agent(agent: &AgentHandle, cols: u16, rows: u16) -> anyhow::Result
 }
 
 /// Get atomic subscribe + screen dump (under core lock — no output gap).
+/// Creates a new per-subscriber channel. Each subscriber gets ALL output (broadcast).
 pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam::channel::Receiver<Vec<u8>>, Vec<u8>) {
-    let core = agent.core.lock().unwrap_or_else(|e| e.into_inner());
+    let mut core = agent.core.lock().unwrap_or_else(|e| e.into_inner());
     let dump = core.vterm.dump_screen();
-    let rx = agent.output_rx_template.clone();
+    let (tx, rx) = crossbeam::channel::unbounded();
+    core.subscribers.push(tx);
     (rx, dump)
 }
