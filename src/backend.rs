@@ -66,7 +66,7 @@ impl Backend {
                 command: "opencode",
                 args: &[],
                 ready_pattern: "Ask anything|tab agents", // [実測]
-                submit_key: "\r",
+                submit_key: "\n", // [実測] OpenCode uses LF (0x0A) not CR
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
@@ -76,7 +76,7 @@ impl Backend {
                 command: "gemini",
                 args: &["--yolo"],
                 ready_pattern: "Type your message|YOLO", // [実測]
-                submit_key: "\r",
+                submit_key: "\n\r", // [実測 v1] Gemini needs LF+CR
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",

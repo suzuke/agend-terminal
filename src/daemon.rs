@@ -197,6 +197,15 @@ pub fn run(
     }
     let _ = std::fs::remove_file(crate::api::api_socket_path(home));
 
+    // Clear registry so subscriber channels close → TUI output threads exit → client sockets close
+    {
+        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        reg.clear();
+    }
+
+    // Give time for socket cleanup to propagate to attached clients
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     eprintln!("[daemon] exiting.");
     // Force exit — listener threads block on accept() and can't be interrupted gracefully
     std::process::exit(0);
