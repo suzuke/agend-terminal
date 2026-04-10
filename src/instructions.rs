@@ -1,6 +1,5 @@
 use anyhow::Result;
 use std::path::Path;
-use tracing::{info, warn};
 
 const INSTRUCTIONS_VERSION: &str = "v3-mcp";
 
@@ -57,7 +56,7 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, content)?;
-    info!("Generated instructions: {}", path.display());
+    eprintln!("[info] Generated instructions: {}", path.display());
     Ok(())
 }
 
@@ -86,7 +85,7 @@ fn write_with_marker(path: &Path, content: &str) -> Result<()> {
         format!("{existing}\n\n{content}")
     };
     std::fs::write(path, new_content)?;
-    info!("Updated instructions: {}", path.display());
+    eprintln!("[info] Updated instructions: {}", path.display());
     Ok(())
 }
 
@@ -132,7 +131,7 @@ fn generate_opencode(working_dir: &Path) -> Result<()> {
                         "instructions/agend.md".to_string(),
                     ));
                     std::fs::write(&json_path, serde_json::to_string_pretty(&val)?)?;
-                    info!("Updated opencode.json instructions array");
+                    eprintln!("[info] Updated opencode.json instructions array");
                 }
             }
         }
@@ -158,6 +157,6 @@ pub fn generate(working_dir: &Path, command: &str) {
     };
 
     if let Err(e) = result {
-        warn!("Failed to generate instructions: {e:#}");
+        eprintln!("[warn] Failed to generate instructions: {e:#}");
     }
 }

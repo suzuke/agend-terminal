@@ -3,7 +3,6 @@
 use anyhow::Result;
 use serde_json::json;
 use std::path::Path;
-use tracing::{info, warn};
 
 /// Get the agend-terminal binary path for MCP server config.
 fn binary_path() -> String {
@@ -47,7 +46,7 @@ fn upsert_mcp_servers(path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
-    info!("Configured MCP: {}", path.display());
+    eprintln!("[info] Configured MCP: {}", path.display());
     Ok(())
 }
 
@@ -111,6 +110,6 @@ pub fn configure(working_dir: &Path, command: &str) {
     };
 
     if let Err(e) = result {
-        warn!("Failed to configure MCP: {e:#}");
+        eprintln!("[warn] Failed to configure MCP: {e:#}");
     }
 }
