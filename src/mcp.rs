@@ -385,7 +385,13 @@ pub async fn run(socket_path: &Path) -> Result<()> {
                 })),
                 error: None,
             },
-            "notifications/initialized" => continue, // No response needed
+            "notifications/initialized" => continue,
+            "ping" => JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id,
+                result: Some(json!({})),
+                error: None,
+            },
             "tools/list" => JsonRpcResponse {
                 jsonrpc: "2.0".to_string(),
                 id,
