@@ -60,7 +60,7 @@ impl Backend {
                 command: "codex",
                 args: &["--full-auto"],
                 ready_pattern: "OpenAI Codex|›", // [実測]
-                submit_key: "\r",
+                submit_key: "\n", // [実測] Codex uses LF to submit
                 inject_prefix: "",
                 quit_command: "exit", // Ctrl+C based
                 instructions_path: "AGENTS.md",
