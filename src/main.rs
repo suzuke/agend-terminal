@@ -8,6 +8,7 @@ mod inbox;
 mod instructions;
 mod mcp;
 mod mcp_config;
+mod state;
 mod telegram;
 mod tui;
 mod verify;
@@ -185,13 +186,46 @@ fn main() -> anyhow::Result<()> {
             let sock = daemon::agent_socket_path(&home, &get_instance_name());
             mcp::run(&sock)?;
         }
+        "capture" => {
+            let backend_name = args.iter()
+                .position(|a| a == "--backend")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| s.as_str())
+                .unwrap_or_else(|| {
+                    eprintln!("Usage: agend-terminal capture --backend <name> [--seconds N]");
+                    eprintln!("Backends: claude-code, kiro-cli, codex, open-code, gemini");
+                    std::process::exit(1);
+                });
+            let seconds: u64 = args.iter()
+                .position(|a| a == "--seconds")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(15);
+
+            let b: backend::Backend = serde_json::from_str(&format!("\"{backend_name}\""))
+                .unwrap_or_else(|_| {
+                    eprintln!("Unknown backend: {backend_name}");
+                    std::process::exit(1);
+                });
+
+            if !b.is_installed() {
+                eprintln!("{} ({}) not found in PATH", backend_name, b.preset().command);
+                std::process::exit(1);
+            }
+
+            capture_backend(&b, seconds)?;
+        }
         "test" => {
             let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("all");
             run_tests(subcmd, &home)?;
         }
         "verify" => {
             let json = args.iter().any(|a| a == "--json");
-            verify::run(&home, json)?;
+            let backend_filter = args.iter()
+                .find(|a| a.starts_with("--backend"))
+                .and_then(|_| args.iter().skip_while(|a| !a.starts_with("--backend")).nth(1))
+                .map(|s| s.as_str());
+            verify::run(&home, json, backend_filter)?;
         }
         "doctor" => {
             run_doctor(&home)?;
@@ -230,6 +264,64 @@ fn inject(socket_path: &str, data: &[u8]) -> anyhow::Result<()> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
     framing::write_frame(&mut stream, data)?;
     println!("Injected {} bytes", data.len());
+    Ok(())
+}
+
+fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
+    let preset = b.preset();
+    let name = format!("capture-{}", b.name());
+    let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
+
+    eprintln!("[capture] Spawning {} ({} {}) for {}s...",
+        b.name(), preset.command, args.join(" "), seconds);
+
+    let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    agent::spawn_agent(
+        &name, preset.command, &args, 120, 40, None, None,
+        preset.submit_key, &registry, None,
+    )?;
+
+    eprintln!("[capture] Waiting {}s for output...", seconds);
+    std::thread::sleep(std::time::Duration::from_secs(seconds));
+
+    // Dump VTerm screen (raw ANSI)
+    let (_raw_dump, stripped) = {
+        let reg = registry.lock().unwrap();
+        match reg.get(&name) {
+            Some(handle) => {
+                let core = handle.core.lock().unwrap();
+                let raw = core.vterm.dump_screen();
+                let raw_str = String::from_utf8_lossy(&raw).to_string();
+                let stripped = crate::agent::strip_ansi_pub(&raw_str);
+                (raw_str, stripped)
+            }
+            None => {
+                eprintln!("[capture] Agent exited before capture");
+                return Ok(());
+            }
+        }
+    };
+
+    // Kill
+    {
+        let reg = registry.lock().unwrap();
+        if let Some(handle) = reg.get(&name) {
+            let mut child = handle.child.lock().unwrap();
+            let _ = child.kill();
+        }
+    }
+
+    // Print results
+    println!("=== {} VTerm Screen (ANSI stripped, {}x40) ===", b.name(), 120);
+    for (i, line) in stripped.lines().enumerate() {
+        let trimmed = line.trim_end();
+        if !trimmed.is_empty() {
+            println!("{:>3}| {}", i + 1, trimmed);
+        }
+    }
+    println!("=== End {} ===", b.name());
+
     Ok(())
 }
 

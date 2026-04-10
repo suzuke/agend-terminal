@@ -20,6 +20,13 @@ pub struct BackendPreset {
     pub args: &'static [&'static str],
     pub ready_pattern: &'static str,
     pub submit_key: &'static str,
+    pub quit_command: &'static str,
+    /// Relative path for instructions file from working dir.
+    pub instructions_path: &'static str,
+    /// Relative path for MCP config file from working dir.
+    pub mcp_config_path: &'static str,
+    /// Timeout in seconds for ready detection.
+    pub ready_timeout_secs: u64,
 }
 
 impl Backend {
@@ -28,33 +35,52 @@ impl Backend {
             Backend::ClaudeCode => BackendPreset {
                 command: "claude",
                 args: &["--dangerously-skip-permissions"],
-                // Claude Code shows this after loading MCP servers / tools
                 ready_pattern: "Type your",
                 submit_key: "\r",
+                quit_command: "/exit",
+                instructions_path: ".claude/rules/agend.md",
+                mcp_config_path: ".claude/settings.json",
+                ready_timeout_secs: 30,
             },
             Backend::KiroCli => BackendPreset {
                 command: "kiro-cli",
                 args: &["chat", "--trust-all-tools"],
                 ready_pattern: "ready|chat|>",
                 submit_key: "\r",
+                quit_command: "/exit",
+                instructions_path: ".kiro/steering/agend.md",
+                mcp_config_path: ".kiro/settings/mcp.json",
+                ready_timeout_secs: 30,
             },
             Backend::Codex => BackendPreset {
                 command: "codex",
                 args: &["--full-auto"],
                 ready_pattern: ">|codex",
                 submit_key: "\r",
+                quit_command: "/exit",
+                instructions_path: "AGENTS.md",
+                mcp_config_path: "opencode.json", // codex doesn't have file-based MCP config
+                ready_timeout_secs: 20,
             },
             Backend::OpenCode => BackendPreset {
                 command: "opencode",
                 args: &[],
                 ready_pattern: "opencode|>",
                 submit_key: "\r",
+                quit_command: "/exit",
+                instructions_path: "instructions/agend.md",
+                mcp_config_path: "opencode.json",
+                ready_timeout_secs: 20,
             },
             Backend::Gemini => BackendPreset {
                 command: "gemini",
                 args: &["--yolo"],
                 ready_pattern: ">|gemini",
                 submit_key: "\r",
+                quit_command: "/exit",
+                instructions_path: "GEMINI.md",
+                mcp_config_path: ".gemini/settings.json",
+                ready_timeout_secs: 20,
             },
         }
     }
@@ -78,9 +104,41 @@ impl Backend {
         }
     }
 
-    /// Get all known backend names.
+    /// Get all backends.
+    pub fn all() -> &'static [Backend] {
+        &[
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+        ]
+    }
+
+    /// Get all known backend names (kebab-case).
     #[allow(dead_code)]
     pub fn all_names() -> &'static [&'static str] {
         &["claude-code", "kiro-cli", "codex", "open-code", "gemini"]
+    }
+
+    /// Kebab-case name for this backend.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Backend::ClaudeCode => "claude-code",
+            Backend::KiroCli => "kiro-cli",
+            Backend::Codex => "codex",
+            Backend::OpenCode => "open-code",
+            Backend::Gemini => "gemini",
+        }
+    }
+
+    /// Check if the backend binary is in PATH.
+    pub fn is_installed(&self) -> bool {
+        let preset = self.preset();
+        std::process::Command::new("which")
+            .arg(preset.command)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 }
