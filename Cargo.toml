@@ -1,21 +1,34 @@
 [package]
 name = "agend-terminal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-portable-pty = "0.8"
+# PTY
+portable-pty = "0.9"
+
+# Terminal
+crossterm = "0.28"
+alacritty_terminal = "0.26"
+
+# Concurrency
+crossbeam = "0.8"
+
+# Async (for Telegram + daemon UDS)
 tokio = { version = "1", features = ["full"] }
-nix = { version = "0.29", features = ["term", "signal", "process", "user"] }
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-regex = "1"
 serde_yaml = "0.9"
-chrono = { version = "0.4", features = ["serde"] }
-alacritty_terminal = "0.26"
+
+# Telegram
 teloxide = { version = "0.13", features = ["macros"] }
-crossterm = "0.28"
+
+# Utilities
+anyhow = "1"
+nix = { version = "0.29", features = ["term", "signal", "process", "user"] }
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ctrlc = "3"
 log = "0.4"
