@@ -164,15 +164,19 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path) {
                 };
                 let _ = crate::inbox::enqueue(home, target, msg);
 
-                // Get target submit_key
-                let submit_key = {
-                    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-                    reg.get(target)
-                        .map(|h| h.submit_key.clone())
-                        .unwrap_or_else(|| "\r".to_string())
-                };
-
-                crate::inbox::notify_agent(home, target, &format!("from:{from}"), text, &submit_key);
+                // Direct write to PTY (daemon has registry — no API loop)
+                let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(handle) = reg.get(target) {
+                    let submit_key = &handle.submit_key;
+                    let display_text = if text.chars().count() > 200 {
+                        let truncated: String = text.chars().take(200).collect();
+                        format!("{truncated}... (use inbox tool)")
+                    } else {
+                        text.to_string()
+                    };
+                    let notification = format!("[from:{from}] {display_text}{submit_key}");
+                    let _ = agent::write_to_agent(handle, notification.as_bytes());
+                }
                 json!({"ok": true})
             }
             _ => json!({"ok": false, "error": format!("unknown method: {method}")}),
