@@ -17,4 +17,5 @@ serde_yaml = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 alacritty_terminal = "0.26"
 teloxide = { version = "0.13", features = ["macros"] }
+crossterm = "0.28"
 log = "0.4"
