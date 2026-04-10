@@ -2,6 +2,8 @@ mod client;
 mod daemon;
 mod fleet;
 mod instructions;
+mod mcp;
+mod mcp_config;
 mod protocol;
 mod pty_session;
 mod telegram;
@@ -78,6 +80,10 @@ async fn main() -> Result<()> {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     match cmd {
+        "mcp" => {
+            let sock = socket_path();
+            mcp::run(&sock).await?;
+        }
         "start" => {
             let sock = socket_path();
             let fleet_config = home_dir().join("fleet.yaml");
