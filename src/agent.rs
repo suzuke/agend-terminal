@@ -281,8 +281,7 @@ pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> anyhow::Result<()> {
 }
 
 /// Write data to an agent's PTY byte-by-byte with small delays.
-/// Simulates keyboard typing for TUI frameworks (bubbletea, Gemini)
-/// that process input per-byte/per-event.
+#[allow(dead_code)]
 pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> anyhow::Result<()> {
     let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
     for byte in data {
@@ -290,6 +289,40 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> anyhow::Result<
         w.flush()?;
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    Ok(())
+}
+
+/// Inject text + submit to agent PTY. Splits text from submit_key with a delay
+/// so TUI frameworks process them as separate events.
+/// - typed=false: write_all(prefix+text), delay, write_all(submit_key)
+/// - typed=true: per-byte(prefix+text), delay, write_all(submit_key)
+pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> anyhow::Result<()> {
+    let prefix = agent.inject_prefix.as_bytes();
+    let submit = agent.submit_key.as_bytes();
+    let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Write prefix + text
+    if agent.typed_inject {
+        for byte in prefix.iter().chain(text.iter()) {
+            w.write_all(&[*byte])?;
+            w.flush()?;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    } else {
+        if !prefix.is_empty() {
+            w.write_all(prefix)?;
+            w.flush()?;
+        }
+        w.write_all(text)?;
+        w.flush()?;
+    }
+
+    // Delay before submit
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // Write submit key
+    w.write_all(submit)?;
+    w.flush()?;
     Ok(())
 }
 
