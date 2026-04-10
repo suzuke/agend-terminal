@@ -68,6 +68,22 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
         .join(".kiro")
         .join("settings")
         .join("mcp.json");
+
+    // Clean up old format: remove top-level "agend-terminal" key (pre-mcpServers era)
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
+                if config.get("agend-terminal").is_some() && config.get("mcpServers").is_none() {
+                    // Old format — remove top-level key, will be re-created under mcpServers
+                    if let Some(obj) = config.as_object_mut() {
+                        obj.remove("agend-terminal");
+                        let _ = std::fs::write(&path, serde_json::to_string_pretty(&config)?);
+                    }
+                }
+            }
+        }
+    }
+
     upsert_mcp_servers(&path)
 }
 
