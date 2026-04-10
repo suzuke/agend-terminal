@@ -56,6 +56,30 @@ impl TelegramChannel {
         }
     }
 
+    /// Create a forum topic for an instance. Returns the topic_id.
+    pub async fn create_topic(&mut self, instance_name: &str) -> Result<i32> {
+        let result = self.bot
+            .create_forum_topic(self.group_id, instance_name, 0x6FB9F0, "")
+            .await
+            .context("Failed to create forum topic")?;
+        let topic_id = result.thread_id.0 .0; // ThreadId(MessageId(i32))
+        self.topic_to_instance.insert(topic_id, instance_name.to_string());
+        self.instance_to_topic.insert(instance_name.to_string(), topic_id);
+        info!("Created Telegram topic '{instance_name}' → {topic_id}");
+        Ok(topic_id)
+    }
+
+    /// Register an existing topic mapping.
+    pub fn register_topic(&mut self, instance_name: &str, topic_id: i32) {
+        self.topic_to_instance.insert(topic_id, instance_name.to_string());
+        self.instance_to_topic.insert(instance_name.to_string(), topic_id);
+    }
+
+    /// Get the instance → topic_id mapping.
+    pub fn get_topic_map(&self) -> &HashMap<String, i32> {
+        &self.instance_to_topic
+    }
+
     /// Send a message to a specific instance's Telegram topic.
     pub async fn send_to_topic(&self, instance_name: &str, text: &str) -> Result<()> {
         let topic_id = self
