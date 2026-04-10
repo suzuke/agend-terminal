@@ -81,53 +81,100 @@ pub struct StatePatterns {
 }
 
 impl StatePatterns {
+    /// Pattern sources: [実測] = verified from real capture, [文件] = from docs/source, [推測] = estimated
     pub fn for_backend(backend: &Backend) -> Self {
         let patterns = match backend {
             Backend::ClaudeCode => vec![
-                (AgentState::AuthError, r"API key|authentication failed"),
+                // [文件] Claude Code SDK error handling
+                (AgentState::AuthError, r"API key|authentication failed|unauthorized"),
+                // [文件] SDK retry logic for 429/overloaded
                 (AgentState::RateLimit, r"overloaded|rate.?limit|429"),
-                (AgentState::ContextFull, r"compacting context|context.*(full|limit|window)"),
-                (AgentState::PermissionPrompt, r"Allow once|Allow always|approve this"),
+                // [文件] Auto-compaction on context limit
+                (AgentState::ContextFull, r"compacting context|context.*(full|limit)"),
+                // [推測] Ink select component for permissions
+                (AgentState::PermissionPrompt, r"Allow once|Allow always|approve"),
+                // [推測] Ink render during processing
                 (AgentState::Thinking, r"Thinking"),
+                // [推測] Tool name with spinner/status icon prefix
                 (AgentState::ToolUse, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●].*(Read|Bash|Edit|Write|Grep|Glob)"),
+                // [実測] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
-                (AgentState::Ready, r"bypass permissions|Type your"),
+                // [実測] Shown after startup with --dangerously-skip-permissions
+                (AgentState::Ready, r"bypass permissions"),
             ],
             Backend::KiroCli => vec![
+                // [文件] Kiro auth error messages
                 (AgentState::AuthError, r"Not authenticated|AccessDenied|denied access"),
+                // [文件] AWS quota errors
                 (AgentState::UsageLimit, r"ServiceQuotaExceeded|InsufficientModelCapacity"),
+                // [文件] HTTP 429 handling
                 (AgentState::RateLimit, r"Too Many Requests|ThrottlingError|429"),
+                // [文件] Context overflow triggers compaction
                 (AgentState::ContextFull, r"context window overflow|/compact"),
+                // [文件] Trust-based permission system
                 (AgentState::PermissionPrompt, r"Allow this action|y/n/t"),
+                // [文件] Processing indicator
                 (AgentState::Thinking, r"Generating"),
+                // [文件] Tool names in output
                 (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
+                // [実測] Idle prompt with percentage
+                (AgentState::Idle, r"\d+%\s*!>"),
+                // [実測] Trust dialog completion
                 (AgentState::Ready, r"All tools are now trusted"),
             ],
             Backend::Codex => vec![
-                (AgentState::AuthError, r"OPENAI_API_KEY"),
+                // [文件] Requires OPENAI_API_KEY env
+                (AgentState::AuthError, r"OPENAI_API_KEY|api.?key"),
+                // [文件] HTTP 429 handling
                 (AgentState::RateLimit, r"rate.?limit|429"),
+                // [文件] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
+                // [文件] Permission approval flow
                 (AgentState::PermissionPrompt, r"Request approval|approve|deny"),
+                // [推測] Processing state
                 (AgentState::Thinking, r"Thinking"),
+                // [推測] Patch tool
                 (AgentState::ToolUse, r"apply_patch"),
-                (AgentState::Ready, r"(?i)idle|codex"),
+                // [実測] Prompt symbol + model info in status
+                (AgentState::Idle, r"›"),
+                // [実測] Version + model display
+                (AgentState::Ready, r"OpenAI Codex|gpt-.*left"),
             ],
             Backend::OpenCode => vec![
+                // [文件] HTTP error handling
                 (AgentState::RateLimit, r"rate.?limit|429"),
+                // [文件] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
+                // [文件] Permission UI
                 (AgentState::PermissionPrompt, r"Permission required|Allow once|Allow always"),
+                // [文件] Busy text
                 (AgentState::Thinking, r"Working"),
-                (AgentState::Ready, r"(?i)idle|opencode"),
+                // [実測] Update dialog that may block
+                (AgentState::PermissionPrompt, r"Update Available|Skip\s+Confirm"),
+                // [実測] Input prompt text
+                (AgentState::Idle, r"Ask anything"),
+                // [実測] Ready state with keybinding hints
+                (AgentState::Ready, r"Ask anything|tab agents"),
             ],
             Backend::Gemini => vec![
+                // [文件] OAuth errors from API
                 (AgentState::AuthError, r"OAuth not authenticated|OAuth expired|UNAUTHENTICATED|check API key"),
+                // [文件] Usage limit messages
                 (AgentState::UsageLimit, r"Usage limit reached|Access resets at"),
+                // [文件] API resource exhaustion
                 (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|429"),
+                // [文件] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
+                // [文件] Permission select options
                 (AgentState::PermissionPrompt, r"Allow once|Allow for this session|suggest changes"),
+                // [推測] Processing indicator
                 (AgentState::Thinking, r"Thinking"),
+                // [推測] MCP tool execution
                 (AgentState::ToolUse, r"tool.*call|MCP.*tool"),
-                (AgentState::Ready, r"(?i)idle|gemini"),
+                // [実測] Input prompt text
+                (AgentState::Idle, r"Type your message"),
+                // [実測] Full ready prompt + YOLO mode
+                (AgentState::Ready, r"Type your message|YOLO"),
             ],
         };
 
