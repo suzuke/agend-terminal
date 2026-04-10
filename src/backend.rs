@@ -66,7 +66,7 @@ impl Backend {
                 command: "opencode",
                 args: &[],
                 ready_pattern: "Ask anything|tab agents", // [実測]
-                submit_key: "\n", // [実測] OpenCode uses LF (0x0A) not CR
+                submit_key: "\r", // crossterm Enter sends CR (0x0D)
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
