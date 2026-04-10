@@ -1,34 +1,12 @@
 use crate::protocol::{self, Request, Response};
 use anyhow::{Context, Result};
-use nix::sys::termios;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
-
-/// RAII guard that restores terminal on drop (handles panic + signals).
-struct RawModeGuard(termios::Termios);
-
-impl RawModeGuard {
-    fn enter() -> Result<Self> {
-        let stdin = std::io::stdin();
-        let orig = termios::tcgetattr(&stdin).context("tcgetattr failed")?;
-        let mut raw = orig.clone();
-        termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(&stdin, termios::SetArg::TCSANOW, &raw)
-            .context("tcsetattr failed")?;
-        Ok(Self(orig))
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        let stdin = std::io::stdin();
-        let _ = termios::tcsetattr(&stdin, termios::SetArg::TCSANOW, &self.0);
-    }
-}
 
 async fn send_request(stream: &mut UnixStream, req: &Request) -> Result<()> {
     let json = serde_json::to_vec(req)?;
@@ -67,7 +45,7 @@ pub async fn spawn_and_attach(
         .await
         .context("Failed to connect to daemon. Is it running?")?;
 
-    let (default_cols, default_rows) = term_size().unwrap_or((80, 24));
+    let (default_cols, default_rows) = terminal::size().unwrap_or((80, 24));
     send_request(
         &mut stream,
         &Request::Spawn {
@@ -432,8 +410,9 @@ pub async fn inbox(socket_path: &Path, session_id: u32) -> Result<()> {
 }
 
 async fn run_attach_loop(stream: UnixStream) -> Result<()> {
-    let _guard = RawModeGuard::enter()?;
+    terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let result = attach_bridge(stream).await;
+    terminal::disable_raw_mode().ok();
     println!();
     result
 }
@@ -444,89 +423,74 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
     let mut stdout = io::stdout();
 
     // Send initial resize
-    if let Some((cols, rows)) = term_size() {
+    if let Ok((cols, rows)) = terminal::size() {
         let req = Request::Resize { cols, rows };
         let json = serde_json::to_vec(&req).expect("Resize serialization is infallible");
         let frame = protocol::encode(&json);
         let _ = stream_writer.lock().await.write_all(&frame).await;
     }
 
-    // SIGWINCH handler
+    // Input task: crossterm events → daemon
+    // Uses spawn_blocking because crossterm::event::read() is blocking
     let sw = stream_writer.clone();
-    let winch_handle = tokio::spawn(async move {
-        let mut sigwinch = match signal(SignalKind::window_change()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        while sigwinch.recv().await.is_some() {
-            if let Some((cols, rows)) = term_size() {
-                let req = Request::Resize { cols, rows };
-                let json = serde_json::to_vec(&req).expect("Resize serialization is infallible");
-                let frame = protocol::encode(&json);
-                let _ = sw.lock().await.write_all(&frame).await;
-            }
-        }
-    });
-
-    // Task: stdin → daemon (with Ctrl+B d detection)
-    let sw = stream_writer.clone();
-    let mut stdin_handle = tokio::spawn(async move {
-        let mut stdin = io::stdin();
-        let mut buf = [0u8; 1024];
-        let mut ctrl_b_pressed = false;
-
+    let mut input_handle = tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
         loop {
-            let n = match stdin.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-
-            let mut i = 0;
-            while i < n {
-                if ctrl_b_pressed {
-                    ctrl_b_pressed = false;
-                    if buf[i] == b'd' {
-                        let req = Request::Detach;
-                        let json =
-                            serde_json::to_vec(&req).expect("Detach serialization is infallible");
-                        let frame = protocol::encode(&json);
-                        let _ = sw.lock().await.write_all(&frame).await;
-                        return true;
+            // Poll with timeout to allow task cancellation
+            if !event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
+                continue;
+            }
+            match event::read() {
+                Ok(Event::Key(KeyEvent { code, modifiers, .. })) => {
+                    // Ctrl+D to detach
+                    if code == KeyCode::Char('d') && modifiers.contains(KeyModifiers::CONTROL) {
+                        let sw = sw.clone();
+                        rt.block_on(async {
+                            let req = Request::Detach;
+                            let json = serde_json::to_vec(&req).expect("infallible");
+                            let frame = protocol::encode(&json);
+                            let _ = sw.lock().await.write_all(&frame).await;
+                        });
+                        return true; // detached
                     }
-                    let data = vec![0x02, buf[i]];
-                    let req = Request::Write { data };
-                    let json =
-                        serde_json::to_vec(&req).expect("Write serialization is infallible");
-                    let frame = protocol::encode(&json);
-                    if sw.lock().await.write_all(&frame).await.is_err() {
-                        return false;
-                    }
-                    i += 1;
-                } else if buf[i] == 0x02 {
-                    ctrl_b_pressed = true;
-                    i += 1;
-                } else {
-                    let start = i;
-                    while i < n && buf[i] != 0x02 {
-                        i += 1;
-                    }
-                    let req = Request::Write {
-                        data: buf[start..i].to_vec(),
-                    };
-                    let json =
-                        serde_json::to_vec(&req).expect("Write serialization is infallible");
-                    let frame = protocol::encode(&json);
-                    if sw.lock().await.write_all(&frame).await.is_err() {
-                        return false;
+                    let bytes = key_to_bytes(code, modifiers);
+                    if !bytes.is_empty() {
+                        let sw = sw.clone();
+                        let ok = rt.block_on(async {
+                            let req = Request::Write { data: bytes };
+                            let json = serde_json::to_vec(&req).expect("infallible");
+                            let frame = protocol::encode(&json);
+                            sw.lock().await.write_all(&frame).await.is_ok()
+                        });
+                        if !ok { return false; }
                     }
                 }
+                Ok(Event::Paste(text)) => {
+                    let sw = sw.clone();
+                    let ok = rt.block_on(async {
+                        let req = Request::Write { data: text.into_bytes() };
+                        let json = serde_json::to_vec(&req).expect("infallible");
+                        let frame = protocol::encode(&json);
+                        sw.lock().await.write_all(&frame).await.is_ok()
+                    });
+                    if !ok { return false; }
+                }
+                Ok(Event::Resize(cols, rows)) => {
+                    let sw = sw.clone();
+                    rt.block_on(async {
+                        let req = Request::Resize { cols, rows };
+                        let json = serde_json::to_vec(&req).expect("infallible");
+                        let frame = protocol::encode(&json);
+                        let _ = sw.lock().await.write_all(&frame).await;
+                    });
+                }
+                Ok(_) => {}
+                Err(_) => return false,
             }
         }
-        false
     });
 
-    // Task: daemon output → stdout
+    // Output task: daemon → stdout
     let mut output_handle = tokio::spawn(async move {
         let mut len_buf = [0u8; 4];
         loop {
@@ -571,37 +535,59 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
         }
     });
 
-    // Also listen for SIGINT/SIGTERM to ensure clean exit from raw mode
-    let mut sigint = signal(SignalKind::interrupt()).ok();
-    let mut sigterm = signal(SignalKind::terminate()).ok();
-
     tokio::select! {
-        _ = &mut stdin_handle => { output_handle.abort(); },
-        _ = &mut output_handle => { stdin_handle.abort(); },
-        _ = async { if let Some(ref mut s) = sigint { s.recv().await } else { std::future::pending().await } } => {
-            stdin_handle.abort();
-            output_handle.abort();
-            eprintln!("\r\n[Interrupted]");
-        },
-        _ = async { if let Some(ref mut s) = sigterm { s.recv().await } else { std::future::pending().await } } => {
-            stdin_handle.abort();
-            output_handle.abort();
-            eprintln!("\r\n[Terminated]");
-        },
+        _ = &mut input_handle => { output_handle.abort(); },
+        _ = &mut output_handle => { input_handle.abort(); },
     }
-    winch_handle.abort();
 
     Ok(())
 }
 
-fn term_size() -> Option<(u16, u16)> {
-    use nix::libc::{ioctl, winsize, TIOCGWINSZ};
-    use std::os::fd::AsRawFd;
-    let mut ws: winsize = unsafe { std::mem::zeroed() };
-    let ret = unsafe { ioctl(std::io::stdout().as_raw_fd(), TIOCGWINSZ as _, &mut ws) };
-    if ret == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
-        Some((ws.ws_col, ws.ws_row))
-    } else {
-        None
+/// Convert crossterm KeyEvent to terminal bytes.
+fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    match code {
+        KeyCode::Char(c) if ctrl => vec![(c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1)],
+        KeyCode::Char(c) if alt => {
+            let mut v = vec![0x1b];
+            let mut b = [0u8; 4];
+            v.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+            v
+        }
+        KeyCode::Char(c) => {
+            let mut b = [0u8; 4];
+            c.encode_utf8(&mut b).as_bytes().to_vec()
+        }
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        KeyCode::F(n) => match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => vec![],
+        },
+        _ => vec![],
     }
 }
