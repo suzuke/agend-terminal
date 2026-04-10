@@ -224,14 +224,17 @@ pub fn spawn_agent(
                                 dialog_dismissed = true;
                                 detect_buf.clear();
                             }
-                            // OpenCode update dialog: dismiss with Skip (Tab + Enter) or Escape
-                            if clean.contains("Update Available") || clean.contains("Skip  Confirm") {
+                            // OpenCode update/restart dialogs: dismiss with Enter/Escape
+                            if clean.contains("Update Available")
+                                || clean.contains("Skip  Confirm")
+                                || clean.contains("Update Complete")
+                                || clean.contains("Please restart")
+                            {
                                 eprintln!("[{n}] auto-dismissing update dialog");
-                                // Try multiple dismiss methods: Escape, then Tab+Enter (Skip)
                                 let _ = pw
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
-                                    .write_all(b"\x1b\r"); // Escape + Enter (select Skip if focused)
+                                    .write_all(b"\r"); // Enter to press ok/skip
                                 detect_buf.clear();
                             }
                         }
