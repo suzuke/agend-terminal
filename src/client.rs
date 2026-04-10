@@ -409,10 +409,19 @@ pub async fn inbox(socket_path: &Path, session_id: u32) -> Result<()> {
     Ok(())
 }
 
+/// RAII guard for crossterm raw mode — restores on drop (incl. panic).
+struct RawModeGuard;
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        terminal::disable_raw_mode().ok();
+    }
+}
+
 async fn run_attach_loop(stream: UnixStream) -> Result<()> {
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
+    let _guard = RawModeGuard;
     let result = attach_bridge(stream).await;
-    terminal::disable_raw_mode().ok();
+    // _guard dropped here (or on panic)
     println!();
     result
 }
@@ -432,26 +441,48 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
 
     // Input task: crossterm events → daemon
     // Uses spawn_blocking because crossterm::event::read() is blocking
+    // Detach: Ctrl+B then d (two-key combo, doesn't conflict with shell/REPL)
     let sw = stream_writer.clone();
     let mut input_handle = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
+        let mut ctrl_b_pressed = false;
         loop {
-            // Poll with timeout to allow task cancellation
             if !event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
                 continue;
             }
             match event::read() {
                 Ok(Event::Key(KeyEvent { code, modifiers, .. })) => {
-                    // Ctrl+D to detach
-                    if code == KeyCode::Char('d') && modifiers.contains(KeyModifiers::CONTROL) {
-                        let sw = sw.clone();
-                        rt.block_on(async {
-                            let req = Request::Detach;
-                            let json = serde_json::to_vec(&req).expect("infallible");
-                            let frame = protocol::encode(&json);
-                            let _ = sw.lock().await.write_all(&frame).await;
-                        });
-                        return true; // detached
+                    // Ctrl+B d combo for detach
+                    if ctrl_b_pressed {
+                        ctrl_b_pressed = false;
+                        if code == KeyCode::Char('d') && modifiers.is_empty() {
+                            let sw = sw.clone();
+                            rt.block_on(async {
+                                let req = Request::Detach;
+                                let json = serde_json::to_vec(&req).expect("infallible");
+                                let frame = protocol::encode(&json);
+                                let _ = sw.lock().await.write_all(&frame).await;
+                            });
+                            return true; // detached
+                        }
+                        // Not 'd' — send the buffered Ctrl+B and current key
+                        let mut bytes = vec![0x02]; // Ctrl+B
+                        bytes.extend(key_to_bytes(code, modifiers));
+                        if !bytes.is_empty() {
+                            let sw = sw.clone();
+                            let ok = rt.block_on(async {
+                                let req = Request::Write { data: bytes };
+                                let json = serde_json::to_vec(&req).expect("infallible");
+                                let frame = protocol::encode(&json);
+                                sw.lock().await.write_all(&frame).await.is_ok()
+                            });
+                            if !ok { return false; }
+                        }
+                        continue;
+                    }
+                    if code == KeyCode::Char('b') && modifiers.contains(KeyModifiers::CONTROL) {
+                        ctrl_b_pressed = true;
+                        continue;
                     }
                     let bytes = key_to_bytes(code, modifiers);
                     if !bytes.is_empty() {
