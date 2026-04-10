@@ -234,8 +234,9 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             };
             let _ = crate::inbox::enqueue(&home, target, msg);
 
-            // Notify target PTY
-            crate::inbox::notify_agent(&home, target, &format!("from:{instance_name}"), text, "\r");
+            // Notify target PTY — look up submit_key from fleet config
+            let submit_key = get_submit_key(&home, target);
+            crate::inbox::notify_agent(&home, target, &format!("from:{instance_name}"), text, &submit_key);
 
             json!({"status": "sent", "target": target})
         }
@@ -256,53 +257,50 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 Some(c) => c,
                 None => return json!({"error": "missing 'command'"}),
             };
-            let cmd_args: Vec<String> = args
-                .get("args")
-                .and_then(|v| v.as_str())
-                .map(|s| s.split_whitespace().map(String::from).collect())
-                .unwrap_or_default();
 
-            // Create working directory
+            // Create working directory + generate instructions/MCP config
             let work_dir = args
                 .get("working_directory")
                 .and_then(|v| v.as_str())
-                .map(|d| std::path::PathBuf::from(d))
+                .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| home.join("workspaces").join(name));
             std::fs::create_dir_all(&work_dir).ok();
-
-            // Generate instructions + MCP config
             crate::instructions::generate(&work_dir, command);
             crate::mcp_config::configure(&work_dir, command);
 
-            // Spawn agent
-            let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-            match crate::agent::spawn_agent(
-                name, command, &cmd_args, 120, 40, None, Some(work_dir.as_path()), "\r", &registry,
-            ) {
-                Ok(()) => {
-                    // Start TUI socket
-                    let sock = crate::daemon::agent_socket_path(&home, name);
-                    let reg = std::sync::Arc::clone(&registry);
-                    let n = name.to_string();
-                    std::thread::Builder::new()
-                        .name(format!("{n}_tui"))
-                        .spawn(move || crate::daemon::serve_agent_tui(&n, &sock, &reg))
-                        .ok();
+            // Config-only: MCP can't spawn into daemon's registry.
+            // Write a pending file for daemon to pick up on next restart.
+            let pending_dir = home.join("pending");
+            std::fs::create_dir_all(&pending_dir).ok();
+            let pending = json!({
+                "name": name,
+                "command": command,
+                "args": args.get("args").and_then(|v| v.as_str()).unwrap_or(""),
+                "working_directory": work_dir.display().to_string(),
+            });
+            let _ = std::fs::write(
+                pending_dir.join(format!("{name}.json")),
+                serde_json::to_string_pretty(&pending).unwrap_or_default(),
+            );
 
-                    json!({"status": "created", "name": name})
-                }
-                Err(e) => json!({"error": format!("spawn failed: {e}")}),
-            }
+            json!({
+                "status": "configured",
+                "name": name,
+                "note": "Instance configured. Restart fleet to activate.",
+                "working_directory": work_dir.display().to_string()
+            })
         }
         "delete_instance" => {
             let name = match args["name"].as_str() {
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
-            // Remove socket to trigger disconnect
+            // Remove socket + pending config
             let sock = crate::daemon::agent_socket_path(&home, name);
             let _ = std::fs::remove_file(&sock);
-            json!({"status": "deleted", "name": name})
+            let pending = home.join("pending").join(format!("{name}.json"));
+            let _ = std::fs::remove_file(&pending);
+            json!({"status": "deleted", "name": name, "note": "Socket removed. Process will exit when PTY closes."})
         }
         _ => json!({"error": format!("unknown tool: {tool}")}),
     }
@@ -345,4 +343,15 @@ fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<()> {
         }
         None => anyhow::bail!("No Telegram channel configured"),
     }
+}
+
+/// Look up submit_key for a target instance from fleet config.
+fn get_submit_key(home: &std::path::Path, target: &str) -> String {
+    let fleet_path = home.join("fleet.yaml");
+    if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {
+        if let Some(resolved) = config.resolve_instance(target) {
+            return resolved.submit_key;
+        }
+    }
+    "\r".to_string()
 }
