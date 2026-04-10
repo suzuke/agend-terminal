@@ -440,6 +440,23 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
                 }
             }
 
+            // On timeout, dump VTerm for debugging
+            if !ready {
+                let reg = registry.lock().unwrap();
+                if let Some(handle) = reg.get(&agent_name) {
+                    let core = handle.core.lock().unwrap();
+                    let dump = core.vterm.dump_screen();
+                    let stripped = crate::agent::strip_ansi_pub(&String::from_utf8_lossy(&dump));
+                    eprintln!("[debug] {name} VTerm at timeout:");
+                    for (i, line) in stripped.lines().enumerate() {
+                        let t = line.trim_end();
+                        if !t.is_empty() {
+                            eprintln!("  {:>3}| {}", i + 1, t);
+                        }
+                    }
+                }
+            }
+
             results.push(TestResult {
                 name: format!("backend:{name}:spawn_ready"),
                 passed: ready,
