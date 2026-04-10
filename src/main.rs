@@ -10,6 +10,7 @@ mod mcp;
 mod mcp_config;
 mod telegram;
 mod tui;
+mod verify;
 mod vterm;
 
 use std::path::PathBuf;
@@ -188,6 +189,10 @@ fn main() -> anyhow::Result<()> {
             let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("all");
             run_tests(subcmd, &home)?;
         }
+        "verify" => {
+            let json = args.iter().any(|a| a == "--json");
+            verify::run(&home, json)?;
+        }
         "doctor" => {
             run_doctor(&home)?;
         }
@@ -203,7 +208,8 @@ fn main() -> anyhow::Result<()> {
                  MCP server:\n  \
                    agend-terminal mcp                      Start MCP stdio server\n\n\
                  QA tools:\n  \
-                   agend-terminal test [mcp|attach|all]    Run tests\n  \
+                   agend-terminal verify [--json]          Full E2E verification\n  \
+                   agend-terminal test [mcp|attach|all]    Run individual tests\n  \
                    agend-terminal doctor                   Health check\n\n\
                  Detach: Ctrl+B d"
             );
