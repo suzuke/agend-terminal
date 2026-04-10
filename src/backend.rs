@@ -70,7 +70,7 @@ impl Backend {
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
-                ready_timeout_secs: 30, // May be blocked by update dialog
+                ready_timeout_secs: 45, // May be blocked by update dialog
             },
             Backend::Gemini => BackendPreset {
                 command: "gemini",
