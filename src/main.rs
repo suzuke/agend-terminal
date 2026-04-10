@@ -191,7 +191,11 @@ fn main() -> anyhow::Result<()> {
         }
         "verify" => {
             let json = args.iter().any(|a| a == "--json");
-            verify::run(&home, json)?;
+            let backend_filter = args.iter()
+                .find(|a| a.starts_with("--backend"))
+                .and_then(|_| args.iter().skip_while(|a| !a.starts_with("--backend")).nth(1))
+                .map(|s| s.as_str());
+            verify::run(&home, json, backend_filter)?;
         }
         "doctor" => {
             run_doctor(&home)?;

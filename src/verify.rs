@@ -2,7 +2,7 @@
 //!
 //! `agend-terminal verify` runs all tests with auto daemon lifecycle.
 
-use crate::{agent, api, daemon, inbox, instructions, mcp_config};
+use crate::{agent, api, backend, daemon, inbox, instructions, mcp_config};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,7 +14,7 @@ struct TestResult {
     detail: String,
 }
 
-pub fn run(home: &Path, json_output: bool) -> anyhow::Result<()> {
+pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyhow::Result<()> {
     let test_home = home.join("_verify_tmp");
     std::fs::create_dir_all(&test_home)?;
 
@@ -78,6 +78,16 @@ pub fn run(home: &Path, json_output: bool) -> anyhow::Result<()> {
 
     // Telegram test (optional — needs AGEND_BOT_TOKEN)
     results.push(test_telegram());
+
+    // --- Per-backend tests ---
+    for b in backend::Backend::all() {
+        if let Some(filter) = backend_filter {
+            if b.name() != filter {
+                continue;
+            }
+        }
+        results.extend(test_backend(b, &test_home));
+    }
 
     // --- Cleanup ---
     // Kill test agents
@@ -336,4 +346,168 @@ fn test_telegram() -> TestResult {
         passed: true,
         detail: "SKIP — live Telegram test not implemented".into(),
     }
+}
+
+/// Per-backend verification: spawn, ready, instructions, MCP config, inject, quit.
+fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
+    let name = backend.name();
+    let preset = backend.preset();
+    let mut results = Vec::new();
+
+    // Skip if binary not installed
+    if !backend.is_installed() {
+        results.push(TestResult {
+            name: format!("backend:{name}"),
+            passed: true,
+            detail: format!("SKIP — {} not in PATH", preset.command),
+        });
+        return results;
+    }
+
+    let test_dir = home.join(format!("verify-backend-{name}"));
+    std::fs::create_dir_all(&test_dir).ok();
+
+    // 1. Instructions generation
+    crate::instructions::generate(&test_dir, preset.command);
+    let instr_path = test_dir.join(preset.instructions_path);
+    let instr_ok = instr_path.exists() && {
+        let c = std::fs::read_to_string(&instr_path).unwrap_or_default();
+        c.contains("v3-mcp") && c.contains("reply")
+    };
+    results.push(TestResult {
+        name: format!("backend:{name}:instructions"),
+        passed: instr_ok,
+        detail: if instr_ok { format!("{}", preset.instructions_path) } else { "missing or invalid".into() },
+    });
+
+    // 2. MCP config generation
+    crate::mcp_config::configure(&test_dir, preset.command);
+    let mcp_path = test_dir.join(preset.mcp_config_path);
+    let mcp_ok = if mcp_path.exists() {
+        let c = std::fs::read_to_string(&mcp_path).unwrap_or_default();
+        c.contains("mcpServers") && c.contains("agend-terminal") && c.contains("AGEND_TERMINAL_HOME")
+    } else {
+        // Some backends (codex) don't have file-based MCP config
+        name == "codex"
+    };
+    results.push(TestResult {
+        name: format!("backend:{name}:mcp_config"),
+        passed: mcp_ok,
+        detail: if mcp_ok { format!("{}", preset.mcp_config_path) } else { "missing mcpServers/env".into() },
+    });
+
+    // 3. Spawn + ready detection
+    let registry = Arc::new(Mutex::new(HashMap::new()));
+    let agent_name = format!("verify-{name}");
+    let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
+
+    let spawn_result = agent::spawn_agent(
+        &agent_name,
+        preset.command,
+        &args,
+        120,
+        40,
+        None,
+        Some(test_dir.as_path()),
+        preset.submit_key,
+        &registry,
+        None,
+    );
+
+    match spawn_result {
+        Ok(()) => {
+            // Wait for ready pattern (with timeout)
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(preset.ready_timeout_secs);
+            let mut ready = false;
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let reg = registry.lock().unwrap();
+                if let Some(handle) = reg.get(&agent_name) {
+                    let core = handle.core.lock().unwrap();
+                    let screen = String::from_utf8_lossy(&core.vterm.dump_screen()).to_string();
+                    let re = regex::Regex::new(preset.ready_pattern).unwrap_or_else(|_| regex::Regex::new(".").unwrap());
+                    if re.is_match(&screen) {
+                        ready = true;
+                        break;
+                    }
+                } else {
+                    break; // Agent was reaped
+                }
+            }
+
+            results.push(TestResult {
+                name: format!("backend:{name}:spawn_ready"),
+                passed: ready,
+                detail: if ready {
+                    format!("ready in <{}s", preset.ready_timeout_secs)
+                } else {
+                    format!("timeout after {}s (pattern: {})", preset.ready_timeout_secs, preset.ready_pattern)
+                },
+            });
+
+            // 4. Inject + submit test (only if ready)
+            if ready {
+                let reg = registry.lock().unwrap();
+                if let Some(handle) = reg.get(&agent_name) {
+                    let test_msg = format!("echo BACKEND_VERIFY_OK{}", preset.submit_key);
+                    let inject_ok = agent::write_to_agent(handle, test_msg.as_bytes()).is_ok();
+                    results.push(TestResult {
+                        name: format!("backend:{name}:inject"),
+                        passed: inject_ok,
+                        detail: if inject_ok { "inject accepted".into() } else { "write failed".into() },
+                    });
+                }
+                drop(reg);
+
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+
+            // 5. Graceful quit
+            {
+                let reg = registry.lock().unwrap();
+                if let Some(handle) = reg.get(&agent_name) {
+                    let quit_msg = format!("{}{}", preset.quit_command, preset.submit_key);
+                    let _ = agent::write_to_agent(handle, quit_msg.as_bytes());
+                }
+            }
+
+            // Wait for quit (max 10s)
+            let quit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut quit_ok = false;
+            while std::time::Instant::now() < quit_deadline {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let reg = registry.lock().unwrap();
+                if !reg.contains_key(&agent_name) {
+                    quit_ok = true;
+                    break;
+                }
+            }
+
+            if !quit_ok {
+                // Force kill
+                let reg = registry.lock().unwrap();
+                if let Some(handle) = reg.get(&agent_name) {
+                    let mut child = handle.child.lock().unwrap();
+                    let _ = child.kill();
+                }
+            }
+
+            results.push(TestResult {
+                name: format!("backend:{name}:quit"),
+                passed: quit_ok,
+                detail: if quit_ok { "graceful exit".into() } else { "force killed (quit cmd didn't work)".into() },
+            });
+        }
+        Err(e) => {
+            results.push(TestResult {
+                name: format!("backend:{name}:spawn_ready"),
+                passed: false,
+                detail: format!("spawn failed: {e}"),
+            });
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&test_dir);
+    results
 }
