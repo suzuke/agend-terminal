@@ -23,6 +23,8 @@ pub struct PtySession {
     pub drainer_done: Arc<Notify>,
     /// Virtual terminal for screen state tracking.
     vterm: Arc<std::sync::Mutex<VTerm>>,
+    /// Submit key for this backend (e.g., "\r" or "\n\r").
+    pub submit_key: String,
     #[allow(dead_code)]
     child_pid: Option<u32>,
 }
@@ -38,6 +40,7 @@ impl PtySession {
         env: Option<&HashMap<String, String>>,
         ready_pattern: Option<&str>,
         log_dir: &std::path::Path,
+        submit_key: Option<&str>,
         working_dir: Option<&std::path::Path>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
@@ -145,6 +148,7 @@ impl PtySession {
             vterm,
             output_tx,
             drainer_done,
+            submit_key: submit_key.unwrap_or("\r").to_string(),
             child_pid,
         })
     }

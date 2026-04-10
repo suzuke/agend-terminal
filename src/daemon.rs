@@ -175,6 +175,7 @@ async fn auto_fleet_start(
                 Some(&resolved.env),
                 resolved.ready_pattern.as_deref(),
                 resolved.working_directory.as_deref(),
+                Some(resolved.submit_key.as_str()),
             )
             .await
             {
@@ -312,6 +313,7 @@ async fn spawn_session(
     env: Option<&HashMap<String, String>>,
     ready_pattern: Option<&str>,
     working_dir: Option<&Path>,
+    submit_key: Option<&str>,
 ) -> Result<(u32, Arc<PtySession>)> {
     let (id, log_dir) = {
         let mut st = state.lock().await;
@@ -320,7 +322,7 @@ async fn spawn_session(
         (id, st.log_dir.clone())
     };
     let session = Arc::new(PtySession::spawn(
-        id, name, command, args, cols, rows, env, ready_pattern, &log_dir, working_dir,
+        id, name, command, args, cols, rows, env, ready_pattern, &log_dir, submit_key, working_dir,
     )?);
     {
         let mut st = state.lock().await;
@@ -363,6 +365,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 rows,
                 env.as_ref(),
                 ready_pattern.as_deref(),
+                None,
                 None,
             )
             .await?;
@@ -539,6 +542,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                 Some(&resolved.env),
                                 resolved.ready_pattern.as_deref(),
                                 resolved.working_directory.as_deref(),
+                                Some(resolved.submit_key.as_str()),
                             )
                             .await
                             {
@@ -738,6 +742,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 env.as_ref(),
                 ready_pattern.as_deref(),
                 Some(work_dir.as_path()),
+                None, // submit_key auto-detected from command
             )
             .await
             {
@@ -887,7 +892,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                     } else {
                         text.clone()
                     };
-                    let submit = if target_session.command.contains("gemini") { "\n\r" } else { "\r" };
+                    let submit = &target_session.submit_key;
                     let notification = format!("[from:{sender_name}] {display_text}{submit}");
                     let _ = target_session.write_input(notification.as_bytes()).await;
 

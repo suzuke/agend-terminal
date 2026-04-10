@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -36,6 +37,8 @@ fn default_mode() -> String {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceDefaults {
+    /// Backend preset name (e.g., "claude-code", "kiro-cli").
+    pub backend: Option<Backend>,
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -50,6 +53,8 @@ pub struct InstanceDefaults {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstanceConfig {
     pub role: Option<String>,
+    /// Backend preset name — overrides defaults.backend.
+    pub backend: Option<Backend>,
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -59,7 +64,6 @@ pub struct InstanceConfig {
     pub env: HashMap<String, String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
-    /// Telegram topic/thread ID for this instance.
     pub topic_id: Option<i32>,
 }
 
@@ -78,21 +82,32 @@ impl FleetConfig {
         Ok(config)
     }
 
-    /// Resolve an instance config by merging with defaults.
+    /// Resolve an instance config by merging with defaults + backend preset.
     pub fn resolve_instance(&self, name: &str) -> Option<ResolvedInstance> {
         let inst = self.instances.get(name)?;
         let defaults = &self.defaults;
 
+        // Backend preset: instance > defaults
+        let backend = inst.backend.as_ref().or(defaults.backend.as_ref());
+        let preset = backend.map(|b| b.preset());
+
+        // Command: instance > defaults > preset > "claude"
         let command = inst
             .command
             .clone()
             .or_else(|| defaults.command.clone())
+            .or_else(|| preset.as_ref().map(|p| p.command.to_string()))
             .unwrap_or_else(|| "claude".to_string());
 
-        let args = if inst.args.is_empty() {
-            defaults.args.clone()
-        } else {
+        // Args: instance > defaults > preset
+        let args = if !inst.args.is_empty() {
             inst.args.clone()
+        } else if !defaults.args.is_empty() {
+            defaults.args.clone()
+        } else if let Some(ref p) = preset {
+            p.args.iter().map(|s| s.to_string()).collect()
+        } else {
+            Vec::new()
         };
 
         // Merge env: defaults first, then instance overrides
@@ -100,10 +115,18 @@ impl FleetConfig {
         env.extend(inst.env.clone());
         env.insert("AGEND_INSTANCE_NAME".to_string(), name.to_string());
 
+        // Ready pattern: instance > defaults > preset
         let ready_pattern = inst
             .ready_pattern
             .clone()
-            .or_else(|| defaults.ready_pattern.clone());
+            .or_else(|| defaults.ready_pattern.clone())
+            .or_else(|| preset.as_ref().map(|p| p.ready_pattern.to_string()));
+
+        // Submit key: from preset or default \r
+        let submit_key = preset
+            .as_ref()
+            .map(|p| p.submit_key.to_string())
+            .unwrap_or_else(|| "\r".to_string());
 
         let working_directory = inst.working_directory.as_ref().map(|d| {
             // Expand ~ to home directory
@@ -125,6 +148,7 @@ impl FleetConfig {
             env,
             working_directory,
             ready_pattern,
+            submit_key,
             role: inst.role.clone(),
             cols,
             rows,
@@ -147,6 +171,7 @@ pub struct ResolvedInstance {
     pub env: HashMap<String, String>,
     pub working_directory: Option<PathBuf>,
     pub ready_pattern: Option<String>,
+    pub submit_key: String,
     pub role: Option<String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
