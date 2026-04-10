@@ -158,21 +158,24 @@ pub fn run(
         }
     }
 
-    // Start API socket server
+    // Graceful shutdown flag
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Start API socket server (needs shutdown flag for "shutdown" method)
     let api_reg = Arc::clone(&registry);
     let api_home = home.to_path_buf();
+    let api_shutdown = Arc::clone(&shutdown);
     std::thread::Builder::new()
         .name("api_server".into())
-        .spawn(move || crate::api::serve(&api_home, api_reg))?;
-
-    // Graceful shutdown
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        .spawn(move || crate::api::serve(&api_home, api_reg, api_shutdown))?;
     let shutdown2 = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || {
+    match ctrlc::set_handler(move || {
         eprintln!("\n[daemon] shutting down...");
         shutdown2.store(true, std::sync::atomic::Ordering::Relaxed);
-    })
-    .ok();
+    }) {
+        Ok(()) => {}
+        Err(e) => eprintln!("[daemon] warning: Ctrl+C handler failed: {e}. Use `kill` or `fleet stop`."),
+    }
 
     eprintln!("[daemon] running. Ctrl+C to stop.");
 

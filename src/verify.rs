@@ -60,7 +60,10 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
         let api_home = daemon_home.clone();
         std::thread::Builder::new()
             .name("verify_api".into())
-            .spawn(move || api::serve(&api_home, api_reg))
+            .spawn(move || {
+                let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                api::serve(&api_home, api_reg, shutdown)
+            })
             .ok();
 
         std::thread::sleep(std::time::Duration::from_secs(1));
