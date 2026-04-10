@@ -87,6 +87,7 @@ pub fn spawn_agent(
     working_dir: Option<&std::path::Path>,
     submit_key: &str,
     registry: &AgentRegistry,
+    home: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -168,9 +169,11 @@ pub fn spawn_agent(
         );
     }
 
-    // PTY read thread — feeds VTerm + broadcasts + auto-dismiss trust dialog
+    // PTY read thread — feeds VTerm + broadcasts + auto-dismiss trust dialog + session reaper
     let core2 = Arc::clone(&core);
     let pw = Arc::clone(&pty_writer);
+    let reg_for_reaper = Arc::clone(registry);
+    let home_for_reaper = home.map(|p| p.to_path_buf());
     let n = name.to_string();
     std::thread::Builder::new()
         .name(format!("{n}_pty_read"))
@@ -181,7 +184,15 @@ pub fn spawn_agent(
             loop {
                 match pty_reader.read(&mut buf) {
                     Ok(0) => {
-                        eprintln!("[{n}] PTY closed");
+                        eprintln!("[{n}] PTY closed — reaping session");
+                        // Session reaper: remove from registry + cleanup socket
+                        if let Ok(mut reg) = reg_for_reaper.lock() {
+                            reg.remove(&n);
+                        }
+                        if let Some(ref home) = home_for_reaper {
+                            let sock = crate::daemon::agent_socket_path(home, &n);
+                            let _ = std::fs::remove_file(&sock);
+                        }
                         break;
                     }
                     Ok(n_bytes) => {

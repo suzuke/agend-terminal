@@ -54,6 +54,34 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     messages
 }
 
+const INLINE_THRESHOLD: usize = 500;
+
+/// Deliver a message: short messages (≤500 chars) inject directly to PTY,
+/// long messages store to inbox + inject truncated notification.
+pub fn deliver(
+    home: &Path,
+    agent_name: &str,
+    from: &str,
+    text: &str,
+    submit_key: &str,
+    kind: Option<String>,
+) {
+    if text.chars().count() <= INLINE_THRESHOLD {
+        // Short message — inject directly, no file I/O
+        notify_agent(home, agent_name, from, text, submit_key);
+    } else {
+        // Long message — store to inbox + truncated notification
+        let msg = InboxMessage {
+            from: from.to_string(),
+            text: text.to_string(),
+            kind,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        let _ = enqueue(home, agent_name, msg);
+        notify_agent(home, agent_name, from, text, submit_key);
+    }
+}
+
 /// Inject a notification into an agent's PTY via TUI socket.
 pub fn notify_agent(
     home: &Path,

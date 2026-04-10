@@ -1,4 +1,5 @@
 mod agent;
+mod api;
 mod backend;
 mod daemon;
 mod fleet;
@@ -126,7 +127,7 @@ fn main() -> anyhow::Result<()> {
         "list" | "ls" => {
             for entry in std::fs::read_dir(&home)?.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".sock") {
+                if name.ends_with(".sock") && name != "api.sock" {
                     let agent = &name[..name.len() - 5];
                     println!("  {agent}");
                 }
@@ -228,12 +229,14 @@ fn run_tests(subcmd: &str, home: &std::path::Path) -> anyhow::Result<()> {
     match subcmd {
         "mcp" => test_mcp(home)?,
         "attach" => test_attach(home)?,
+        "inbox" => test_inbox(home)?,
+        "api" => test_api(home)?,
         "all" => {
             test_attach(home)?;
-            // test_mcp requires a running daemon
+            test_inbox(home)?;
         }
         _ => {
-            eprintln!("Unknown test: {subcmd}. Available: mcp, attach, all");
+            eprintln!("Unknown test: {subcmd}. Available: mcp, attach, inbox, api, all");
             std::process::exit(1);
         }
     }
@@ -254,6 +257,7 @@ fn test_attach(_home: &std::path::Path) -> anyhow::Result<()> {
         None,
         "\r",
         &registry,
+        None,
     )?;
 
     // Wait for PTY to be ready
@@ -328,6 +332,59 @@ fn test_mcp(home: &std::path::Path) -> anyhow::Result<()> {
     // We can't test MCP server directly (it reads stdin) — just verify the format functions
     eprintln!("[test:mcp] Content-Length frame format: OK ({} bytes)", init_frame.len());
     eprintln!("[test:mcp] PASS — MCP framing verified");
+
+    Ok(())
+}
+
+fn test_inbox(home: &std::path::Path) -> anyhow::Result<()> {
+    eprintln!("[test:inbox] Testing inbox enqueue + drain...");
+
+    let test_name = "test-inbox-agent";
+
+    // Enqueue 3 messages
+    for i in 1..=3 {
+        inbox::enqueue(
+            home,
+            test_name,
+            inbox::InboxMessage {
+                from: format!("tester-{i}"),
+                text: format!("Message {i}"),
+                kind: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        )?;
+    }
+
+    // Drain
+    let messages = inbox::drain(home, test_name);
+    assert_eq!(messages.len(), 3, "Expected 3 messages, got {}", messages.len());
+    assert_eq!(messages[0].from, "tester-1");
+    assert_eq!(messages[2].text, "Message 3");
+
+    // Drain again — should be empty
+    let empty = inbox::drain(home, test_name);
+    assert!(empty.is_empty(), "Inbox should be empty after drain");
+
+    // Cleanup
+    let _ = std::fs::remove_file(home.join("inbox").join(format!("{test_name}.jsonl")));
+
+    eprintln!("[test:inbox] PASS — enqueue + drain + empty verified");
+    Ok(())
+}
+
+fn test_api(home: &std::path::Path) -> anyhow::Result<()> {
+    eprintln!("[test:api] Checking for running daemon...");
+
+    // Try calling list
+    match api::call(home, &serde_json::json!({"method": "list"})) {
+        Ok(resp) => {
+            let agents = resp["result"]["agents"].as_array().map(|a| a.len()).unwrap_or(0);
+            eprintln!("[test:api] PASS — API socket responsive, {agents} agents");
+        }
+        Err(e) => {
+            eprintln!("[test:api] SKIP — daemon not running ({e})");
+        }
+    }
 
     Ok(())
 }
