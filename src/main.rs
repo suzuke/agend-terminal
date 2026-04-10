@@ -50,10 +50,15 @@ fn load_dotenv() {
             let key = key.trim();
             // Strip surrounding quotes from value
             let value = value.trim();
-            let value = value
+            let value = if let Some(quoted) = value
                 .strip_prefix('"').and_then(|v| v.strip_suffix('"'))
                 .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-                .unwrap_or(value);
+            {
+                quoted // Quoted: preserve everything including #
+            } else {
+                // Unquoted: strip inline comments
+                value.split('#').next().unwrap_or(value).trim()
+            };
             if !key.is_empty() {
                 std::env::set_var(key, value);
             }
