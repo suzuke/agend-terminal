@@ -3,6 +3,7 @@ mod daemon;
 mod fleet;
 mod protocol;
 mod pty_session;
+mod telegram;
 mod vterm;
 
 use anyhow::Result;
