@@ -36,6 +36,9 @@ pub struct AgentHandle {
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
 
 /// ANSI escape sequence stripper for dialog detection.
+/// Public ANSI strip for capture command.
+pub fn strip_ansi_pub(s: &str) -> String { strip_ansi(s) }
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
