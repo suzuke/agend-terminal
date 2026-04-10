@@ -229,7 +229,7 @@ async fn handle_telegram_message(
         }
     };
     let notification = format!(
-        "\n[user:{username} via telegram] {}{submit_key}",
+        "[user:{username} via telegram] {}{submit_key}",
         if text.chars().count() > 200 {
             let truncated: String = text.chars().take(200).collect();
             format!("{truncated}... (Run: agend-terminal inbox)")

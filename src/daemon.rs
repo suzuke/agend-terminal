@@ -661,7 +661,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         text.clone()
                     };
                     let submit = if target_session.command.contains("gemini") { "\n\r" } else { "\r" };
-                    let notification = format!("\n[from:{sender_name}] {display_text}{submit}");
+                    let notification = format!("[from:{sender_name}] {display_text}{submit}");
                     let _ = target_session.write_input(notification.as_bytes()).await;
 
                     info!("[{sender_name} → {target}] message delivered");
