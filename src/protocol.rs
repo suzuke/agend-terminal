@@ -47,6 +47,18 @@ pub enum Request {
         /// Only stop these instances (empty = all).
         names: Vec<String>,
     },
+    /// Dynamically create a new instance.
+    CreateInstance {
+        name: String,
+        command: String,
+        args: Vec<String>,
+        env: Option<HashMap<String, String>>,
+        working_directory: Option<String>,
+        topic_name: Option<String>,
+        ready_pattern: Option<String>,
+        cols: Option<u16>,
+        rows: Option<u16>,
+    },
 
     // --- Agent communication ---
     /// Agent replies to the user (routed via session_id).
@@ -91,6 +103,13 @@ pub enum Response {
     // --- Fleet responses ---
     FleetStarted { started: Vec<String> },
     FleetStopped { stopped: Vec<String> },
+
+    /// Instance created dynamically.
+    InstanceCreated {
+        name: String,
+        session_id: u32,
+        topic_id: Option<i32>,
+    },
 
     // --- Communication responses ---
     /// Reply/send acknowledged.

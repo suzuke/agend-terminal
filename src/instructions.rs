@@ -26,6 +26,10 @@ agend-terminal inbox
 - Messages appear in your terminal as `[user:NAME via telegram] text` or `[from:INSTANCE] text`.
 - For long messages, run `agend-terminal inbox` to see the full content.
 - Keep replies concise and direct.
+- To create a new agent instance dynamically:
+  ```bash
+  agend-terminal create-instance --name NAME --command CMD --working-directory /path [--topic-name "Topic"]
+  ```
 "#;
 
 const AGEND_MARKER: &str = "<!-- agend-terminal instructions -->";

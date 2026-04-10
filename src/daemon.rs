@@ -585,6 +585,122 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             send_response(&mut stream, &Response::FleetStopped { stopped }).await?;
         }
 
+        Request::CreateInstance {
+            name,
+            command,
+            args,
+            env,
+            working_directory,
+            topic_name,
+            ready_pattern,
+            cols,
+            rows,
+        } => {
+            let cols = cols.unwrap_or(120);
+            let rows = rows.unwrap_or(40);
+
+            // Resolve working directory
+            let work_dir = working_directory.as_ref().map(|d| {
+                let d = if d.starts_with("~/") {
+                    std::env::var("HOME")
+                        .map(|h| format!("{}/{}", h, &d[2..]))
+                        .unwrap_or_else(|_| d.clone())
+                } else {
+                    d.clone()
+                };
+                PathBuf::from(d)
+            });
+
+            // Generate instructions
+            if let Some(ref dir) = work_dir {
+                instructions::generate(dir, &command);
+            }
+
+            // Spawn session
+            match spawn_session(
+                &state,
+                Some(&name),
+                &command,
+                &args,
+                cols,
+                rows,
+                env.as_ref(),
+                ready_pattern.as_deref(),
+                work_dir.as_deref(),
+            )
+            .await
+            {
+                Ok((session_id, _session)) => {
+                    // Auto-create Telegram topic if channel configured
+                    let mut topic_id: Option<i32> = None;
+                    let telegram = {
+                        let st = state.lock().await;
+                        st.telegram.clone()
+                    };
+                    if let Some(tg) = telegram {
+                        let tname = topic_name.as_deref().unwrap_or(&name);
+                        let mut ch = tg.lock().await;
+                        match ch.create_topic(tname).await {
+                            Ok(tid) => {
+                                topic_id = Some(tid);
+                                info!("Created topic '{tname}' → {tid} for {name}");
+                            }
+                            Err(e) => {
+                                warn!("Failed to create topic for {name}: {e:#}");
+                            }
+                        }
+                    }
+
+                    // Write back to fleet.yaml if we have a config path
+                    {
+                        let st = state.lock().await;
+                        if st.fleet_config.is_some() {
+                            // Find config path from env or default
+                            let config_path = std::env::var("AGEND_TERMINAL_HOME")
+                                .map(|h| PathBuf::from(h).join("fleet.yaml"))
+                                .unwrap_or_else(|_| {
+                                    let home = std::env::var("HOME").unwrap_or_default();
+                                    PathBuf::from(home)
+                                        .join(".agend-terminal")
+                                        .join("fleet.yaml")
+                                });
+                            if config_path.exists() {
+                                if let Err(e) = append_instance_to_fleet(
+                                    &config_path,
+                                    &name,
+                                    &command,
+                                    &args,
+                                    work_dir.as_deref(),
+                                    topic_id,
+                                ) {
+                                    warn!("Failed to update fleet.yaml: {e:#}");
+                                }
+                            }
+                        }
+                    }
+
+                    send_response(
+                        &mut stream,
+                        &Response::InstanceCreated {
+                            name: name.clone(),
+                            session_id,
+                            topic_id,
+                        },
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    send_response(
+                        &mut stream,
+                        &Response::Error {
+                            message: format!("Failed to create instance: {e}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+
         // --- Agent communication ---
         Request::Reply { session_id, text } => {
             let sender_name = {
@@ -724,6 +840,68 @@ fn write_back_topic_ids(config_path: &Path, channel: &TelegramChannel) -> Result
     let yaml = format!("# Auto-updated by agend-terminal (topic_ids added)\n# Original comments were not preserved during write-back\n{yaml}");
     std::fs::write(config_path, yaml)?;
     info!("Updated fleet.yaml with topic IDs");
+    Ok(())
+}
+
+/// Append a new instance to fleet.yaml.
+fn append_instance_to_fleet(
+    config_path: &Path,
+    name: &str,
+    command: &str,
+    args: &[String],
+    working_dir: Option<&Path>,
+    topic_id: Option<i32>,
+) -> Result<()> {
+    let content = std::fs::read_to_string(config_path)?;
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)?;
+
+    let instances = doc
+        .get_mut("instances")
+        .and_then(|v| v.as_mapping_mut())
+        .context("No instances section in fleet.yaml")?;
+
+    let key = serde_yaml::Value::String(name.to_string());
+    if instances.contains_key(&key) {
+        return Ok(()); // Already exists
+    }
+
+    let mut inst = serde_yaml::Mapping::new();
+    inst.insert(
+        serde_yaml::Value::String("command".to_string()),
+        serde_yaml::Value::String(command.to_string()),
+    );
+    if !args.is_empty() {
+        let args_val: Vec<serde_yaml::Value> = args
+            .iter()
+            .map(|a| serde_yaml::Value::String(a.clone()))
+            .collect();
+        inst.insert(
+            serde_yaml::Value::String("args".to_string()),
+            serde_yaml::Value::Sequence(args_val),
+        );
+    }
+    if let Some(dir) = working_dir {
+        inst.insert(
+            serde_yaml::Value::String("working_directory".to_string()),
+            serde_yaml::Value::String(dir.display().to_string()),
+        );
+    }
+    if let Some(tid) = topic_id {
+        inst.insert(
+            serde_yaml::Value::String("topic_id".to_string()),
+            serde_yaml::Value::Number(serde_yaml::Number::from(tid)),
+        );
+    }
+
+    instances.insert(key, serde_yaml::Value::Mapping(inst));
+
+    let yaml = serde_yaml::to_string(&doc)?;
+    let yaml = format!(
+        "# Auto-updated by agend-terminal (instance '{name}' added)\n\
+         # Original comments were not preserved during write-back\n{yaml}"
+    );
+    std::fs::write(config_path, yaml)?;
+    info!("Added instance '{name}' to fleet.yaml");
     Ok(())
 }
 

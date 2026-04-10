@@ -152,6 +152,61 @@ async fn main() -> Result<()> {
             let sock = socket_path();
             client::list_sessions(&sock).await?;
         }
+        "create-instance" => {
+            let mut name: Option<String> = None;
+            let mut command: Option<String> = None;
+            let mut cmd_args: Vec<String> = Vec::new();
+            let mut env_map: HashMap<String, String> = HashMap::new();
+            let mut working_dir: Option<String> = None;
+            let mut topic_name: Option<String> = None;
+            let mut ready_pattern: Option<String> = None;
+            let mut cols: Option<u16> = None;
+            let mut rows: Option<u16> = None;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--name" => { i += 1; name = args.get(i).cloned(); }
+                    "--command" => { i += 1; command = args.get(i).cloned(); }
+                    "--args" => {
+                        i += 1;
+                        if let Some(a) = args.get(i) {
+                            cmd_args = a.split_whitespace().map(|s| s.to_string()).collect();
+                        }
+                    }
+                    "--env" => {
+                        i += 1;
+                        if let Some(kv) = args.get(i) {
+                            if let Some((k, v)) = kv.split_once('=') {
+                                env_map.insert(k.to_string(), v.to_string());
+                            }
+                        }
+                    }
+                    "--working-directory" => { i += 1; working_dir = args.get(i).cloned(); }
+                    "--topic-name" => { i += 1; topic_name = args.get(i).cloned(); }
+                    "--ready-pattern" => { i += 1; ready_pattern = args.get(i).cloned(); }
+                    "--cols" => { i += 1; cols = args.get(i).and_then(|s| s.parse().ok()); }
+                    "--rows" => { i += 1; rows = args.get(i).and_then(|s| s.parse().ok()); }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            let name = name.unwrap_or_else(|| {
+                eprintln!("Usage: agend-terminal create-instance --name NAME --command CMD [options]");
+                std::process::exit(1);
+            });
+            let command = command.unwrap_or_else(|| {
+                eprintln!("Usage: agend-terminal create-instance --name NAME --command CMD [options]");
+                std::process::exit(1);
+            });
+            let env = if env_map.is_empty() { None } else { Some(env_map) };
+            let sock = socket_path();
+            client::create_instance(
+                &sock, &name, &command, &cmd_args, env,
+                working_dir, topic_name, ready_pattern, cols, rows,
+            ).await?;
+        }
         "inject" => {
             let session_id: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
                 eprintln!("Usage: agend-terminal inject <session_id> <text>");
@@ -294,7 +349,8 @@ async fn main() -> Result<()> {
                    agend-terminal kill <id> [--quit-cmd CMD] [--grace N]\n\n\
                  Fleet management:\n  \
                    agend-terminal fleet start [config.yaml] [name...]\n  \
-                   agend-terminal fleet stop [name...]\n\n\
+                   agend-terminal fleet stop [name...]\n  \
+                   agend-terminal create-instance --name N --command C [opts]\n\n\
                  Agent communication (requires AGEND_SESSION_ID):\n  \
                    agend-terminal reply <text>\n  \
                    agend-terminal send <target> <text> [--kind K]\n  \
