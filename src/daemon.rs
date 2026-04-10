@@ -71,7 +71,7 @@ impl DaemonState {
     }
 }
 
-pub async fn run(socket_path: &Path) -> Result<()> {
+pub async fn run(socket_path: &Path, auto_fleet: Option<&Path>) -> Result<()> {
     if socket_path.exists() {
         if UnixStream::connect(socket_path).await.is_ok() {
             anyhow::bail!(
@@ -96,6 +96,23 @@ pub async fn run(socket_path: &Path) -> Result<()> {
     info!("Session logs: {:?}", log_dir);
 
     let state = Arc::new(Mutex::new(DaemonState::new(log_dir)));
+
+    // Auto-start fleet if config provided
+    if let Some(config_path) = auto_fleet {
+        if config_path.exists() {
+            info!("Auto-starting fleet from {:?}", config_path);
+            match FleetConfig::load(config_path) {
+                Ok(config) => {
+                    auto_fleet_start(&state, &config, config_path).await;
+                }
+                Err(e) => {
+                    error!("Failed to load fleet config: {e:#}");
+                }
+            }
+        } else {
+            warn!("Fleet config not found: {:?}", config_path);
+        }
+    }
 
     let mut sigterm = signal(SignalKind::terminate()).context("Failed to register SIGTERM")?;
     let mut sigint = signal(SignalKind::interrupt()).context("Failed to register SIGINT")?;
@@ -123,6 +140,91 @@ pub async fn run(socket_path: &Path) -> Result<()> {
                 graceful_shutdown(&state, &socket_path_owned).await;
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Auto-start fleet instances from config (used by `start` command).
+async fn auto_fleet_start(
+    state: &Arc<Mutex<DaemonState>>,
+    config: &FleetConfig,
+    _config_path: &Path,
+) {
+    let instance_names = config.instance_names();
+    {
+        let mut st = state.lock().await;
+        st.fleet_config = Some(config.clone());
+    }
+
+    let mut started = Vec::new();
+    for name in &instance_names {
+        if let Some(resolved) = config.resolve_instance(name) {
+            if let Some(ref dir) = resolved.working_directory {
+                instructions::generate(dir, &resolved.command);
+            }
+
+            match spawn_session(
+                state,
+                Some(name),
+                &resolved.command,
+                &resolved.args,
+                resolved.cols.unwrap_or(120),
+                resolved.rows.unwrap_or(40),
+                Some(&resolved.env),
+                resolved.ready_pattern.as_deref(),
+                resolved.working_directory.as_deref(),
+            )
+            .await
+            {
+                Ok(_) => started.push(name.clone()),
+                Err(e) => error!("Failed to start {name}: {e:#}"),
+            }
+            if instance_names.len() > 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    info!("Fleet started: {} instance(s): {}", started.len(), started.join(", "));
+
+    // Set up Telegram channel
+    if let Some(ChannelConfig::Telegram {
+        ref bot_token_env,
+        group_id,
+        ..
+    }) = config.channel
+    {
+        if let Ok(token) = std::env::var(bot_token_env) {
+            let topic_map: HashMap<String, i32> = config
+                .instances
+                .iter()
+                .filter_map(|(name, inst)| inst.topic_id.map(|tid| (name.clone(), tid)))
+                .collect();
+
+            let channel = Arc::new(Mutex::new(TelegramChannel::new(&token, group_id, topic_map)));
+
+            // Auto-create topics for instances without topic_id
+            for (name, inst) in config.instances.iter() {
+                if inst.topic_id.is_none() && name != "general" {
+                    let mut ch = channel.lock().await;
+                    match ch.create_topic(name).await {
+                        Ok(tid) => info!("Auto-created topic for {name}: {tid}"),
+                        Err(e) => warn!("Failed to create topic for {name}: {e:#}"),
+                    }
+                }
+                if name == "general" && inst.topic_id.is_none() {
+                    let mut ch = channel.lock().await;
+                    ch.register_topic("general", 1);
+                }
+            }
+
+            {
+                let mut st = state.lock().await;
+                st.telegram = Some(channel.clone());
+            }
+            TelegramChannel::start_polling(channel, state.clone());
+            info!("Telegram channel configured (group_id: {group_id})");
+        } else {
+            warn!("Telegram bot token env '{bot_token_env}' not set, skipping");
         }
     }
 }
@@ -599,8 +701,8 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             let cols = cols.unwrap_or(120);
             let rows = rows.unwrap_or(40);
 
-            // Resolve working directory
-            let work_dir = working_directory.as_ref().map(|d| {
+            // Resolve working directory — auto-create if not specified
+            let work_dir = if let Some(ref d) = working_directory {
                 let d = if d.starts_with("~/") {
                     std::env::var("HOME")
                         .map(|h| format!("{}/{}", h, &d[2..]))
@@ -609,12 +711,17 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                     d.clone()
                 };
                 PathBuf::from(d)
-            });
+            } else {
+                // Default: {AGEND_TERMINAL_HOME}/workspaces/{name}/
+                let home = crate::home_dir();
+                home.join("workspaces").join(&name)
+            };
+            if let Err(e) = std::fs::create_dir_all(&work_dir) {
+                warn!("Failed to create working directory: {e}");
+            }
 
             // Generate instructions
-            if let Some(ref dir) = work_dir {
-                instructions::generate(dir, &command);
-            }
+            instructions::generate(&work_dir, &command);
 
             // Spawn session
             match spawn_session(
@@ -626,7 +733,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 rows,
                 env.as_ref(),
                 ready_pattern.as_deref(),
-                work_dir.as_deref(),
+                Some(work_dir.as_path()),
             )
             .await
             {
@@ -670,7 +777,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                     &name,
                                     &command,
                                     &args,
-                                    work_dir.as_deref(),
+                                    Some(work_dir.as_path()),
                                     topic_id,
                                 ) {
                                     warn!("Failed to update fleet.yaml: {e:#}");
