@@ -1,17 +1,13 @@
-//! MCP (Model Context Protocol) stdio server.
-//! Translates JSON-RPC requests to daemon UDS protocol.
+//! MCP stdio server — Content-Length framed JSON-RPC 2.0.
+//!
+//! Translates MCP tool calls to agent PTY writes via TUI socket.
+//! Runs synchronously (no tokio needed).
 
-use crate::protocol::{self, Request, Response};
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use crate::framing;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tracing::{error, info};
-
-// --- JSON-RPC types ---
+use std::os::unix::net::UnixStream;
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -23,37 +19,16 @@ struct JsonRpcRequest {
     params: Value,
 }
 
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i32,
-    message: String,
-}
-
-// --- MCP tool definitions ---
-
 fn tool_definitions() -> Value {
     json!({
         "tools": [
             {
                 "name": "reply",
-                "description": "Reply to the user who sent you a message. Use this to respond to [user:... via telegram] messages.",
+                "description": "Reply to the user who sent you a message via Telegram.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "The reply text to send back to the user"
-                        }
+                        "text": { "type": "string", "description": "Reply text" }
                     },
                     "required": ["text"]
                 }
@@ -64,324 +39,99 @@ fn tool_definitions() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "target": {
-                            "type": "string",
-                            "description": "Name of the target instance (e.g., 'general', 'blog-writer')"
-                        },
-                        "text": {
-                            "type": "string",
-                            "description": "Message text to send"
-                        },
-                        "kind": {
-                            "type": "string",
-                            "enum": ["query", "task", "report", "update"],
-                            "description": "Message type/intent"
-                        },
-                        "correlation_id": {
-                            "type": "string",
-                            "description": "ID to link request-response pairs"
-                        }
+                        "target": { "type": "string", "description": "Target instance name" },
+                        "text": { "type": "string", "description": "Message text" },
+                        "kind": { "type": "string", "enum": ["query", "task", "report", "update"] }
                     },
                     "required": ["target", "text"]
                 }
             },
             {
                 "name": "inbox",
-                "description": "Check and retrieve pending messages from other agents or users.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
+                "description": "Check pending messages.",
+                "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "list_instances",
-                "description": "List all active agent instances in the fleet.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "create_instance",
-                "description": "Create a new agent instance dynamically.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Instance name"
-                        },
-                        "command": {
-                            "type": "string",
-                            "description": "Command to run (e.g., 'claude', 'codex')"
-                        },
-                        "args": {
-                            "type": "string",
-                            "description": "Space-separated command arguments"
-                        },
-                        "working_directory": {
-                            "type": "string",
-                            "description": "Working directory path"
-                        },
-                        "topic_name": {
-                            "type": "string",
-                            "description": "Telegram topic name (defaults to instance name)"
-                        }
-                    },
-                    "required": ["name", "command"]
-                }
-            },
-            {
-                "name": "delete_instance",
-                "description": "Stop and remove an agent instance.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Instance name to delete"
-                        }
-                    },
-                    "required": ["name"]
-                }
+                "description": "List all active agent instances.",
+                "inputSchema": { "type": "object", "properties": {} }
             }
         ]
     })
 }
 
-// --- Daemon communication ---
-
-async fn send_to_daemon(socket_path: &Path, req: &Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .context("Failed to connect to daemon")?;
-
-    let json = serde_json::to_vec(req)?;
-    let frame = protocol::encode(&json);
-    stream.write_all(&frame).await?;
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    let resp: Response = serde_json::from_slice(&buf)?;
-    Ok(resp)
-}
-
-// --- Tool handlers ---
-
-async fn handle_tool_call(
-    socket_path: &Path,
-    session_id: u32,
-    tool_name: &str,
-    args: &Value,
-) -> Result<Value> {
-    match tool_name {
-        "reply" => {
-            let text = args["text"].as_str().context("Missing 'text'")?;
-            let resp = send_to_daemon(
-                socket_path,
-                &Request::Reply {
-                    session_id,
-                    text: text.to_string(),
-                },
-            )
-            .await?;
-            match resp {
-                Response::Sent => Ok(json!({"status": "sent"})),
-                Response::Error { message } => Ok(json!({"error": message})),
-                _ => Ok(json!({"error": "unexpected response"})),
-            }
+/// Read a Content-Length framed message.
+fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<String>> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
         }
-        "send" => {
-            let target = args["target"].as_str().context("Missing 'target'")?;
-            let text = args["text"].as_str().context("Missing 'text'")?;
-            let kind = args.get("kind").and_then(|v| v.as_str()).map(String::from);
-            let correlation_id = args
-                .get("correlation_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let resp = send_to_daemon(
-                socket_path,
-                &Request::SendMessage {
-                    session_id,
-                    target: target.to_string(),
-                    text: text.to_string(),
-                    kind,
-                    correlation_id,
-                },
-            )
-            .await?;
-            match resp {
-                Response::Sent => Ok(json!({"status": "sent"})),
-                Response::Error { message } => Ok(json!({"error": message})),
-                _ => Ok(json!({"error": "unexpected response"})),
-            }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
         }
-        "inbox" => {
-            let resp =
-                send_to_daemon(socket_path, &Request::Inbox { session_id }).await?;
-            match resp {
-                Response::Messages { messages } => {
-                    Ok(json!({"messages": messages}))
-                }
-                Response::Error { message } => Ok(json!({"error": message})),
-                _ => Ok(json!({"error": "unexpected response"})),
-            }
+        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+            content_length = val.trim().parse().ok();
         }
-        "list_instances" => {
-            let resp = send_to_daemon(socket_path, &Request::List).await?;
-            match resp {
-                Response::Sessions { sessions } => {
-                    let instances: Vec<Value> = sessions
-                        .iter()
-                        .map(|s| {
-                            json!({
-                                "id": s.id,
-                                "name": s.name,
-                                "command": s.command,
-                                "running": s.running,
-                                "ready": s.ready,
-                            })
-                        })
-                        .collect();
-                    Ok(json!({"instances": instances}))
-                }
-                Response::Error { message } => Ok(json!({"error": message})),
-                _ => Ok(json!({"error": "unexpected response"})),
-            }
-        }
-        "create_instance" => {
-            let name = args["name"].as_str().context("Missing 'name'")?;
-            let command = args["command"].as_str().context("Missing 'command'")?;
-            let cmd_args: Vec<String> = args
-                .get("args")
-                .and_then(|v| v.as_str())
-                .map(|s| s.split_whitespace().map(String::from).collect())
-                .unwrap_or_default();
-            let working_directory = args
-                .get("working_directory")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let topic_name = args
-                .get("topic_name")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-
-            let resp = send_to_daemon(
-                socket_path,
-                &Request::CreateInstance {
-                    name: name.to_string(),
-                    command: command.to_string(),
-                    args: cmd_args,
-                    env: None,
-                    working_directory,
-                    topic_name,
-                    ready_pattern: None,
-                    cols: None,
-                    rows: None,
-                },
-            )
-            .await?;
-            match resp {
-                Response::InstanceCreated {
-                    name,
-                    session_id,
-                    topic_id,
-                } => Ok(json!({
-                    "status": "created",
-                    "name": name,
-                    "session_id": session_id,
-                    "topic_id": topic_id,
-                })),
-                Response::Error { message } => Ok(json!({"error": message})),
-                _ => Ok(json!({"error": "unexpected response"})),
-            }
-        }
-        "delete_instance" => {
-            let name = args["name"].as_str().context("Missing 'name'")?;
-            // Find session by name first via list, then kill
-            let list_resp = send_to_daemon(socket_path, &Request::List).await?;
-            if let Response::Sessions { sessions } = list_resp {
-                let session = sessions.iter().find(|s| {
-                    s.name.as_deref() == Some(name)
-                });
-                match session {
-                    Some(s) => {
-                        let kill_resp = send_to_daemon(
-                            socket_path,
-                            &Request::Kill {
-                                session_id: s.id,
-                                quit_command: None,
-                                grace_seconds: Some(5),
-                            },
-                        )
-                        .await?;
-                        match kill_resp {
-                            Response::Killed { session_id } => {
-                                Ok(json!({"status": "deleted", "name": name, "session_id": session_id}))
-                            }
-                            Response::Error { message } => Ok(json!({"error": message})),
-                            _ => Ok(json!({"error": "unexpected response"})),
-                        }
-                    }
-                    None => Ok(json!({"error": format!("Instance '{name}' not found")})),
-                }
-            } else {
-                Ok(json!({"error": "failed to list instances"}))
-            }
-        }
-        _ => Ok(json!({"error": format!("Unknown tool: {tool_name}")})),
     }
+    let len = match content_length {
+        Some(l) => l,
+        None => return Ok(None),
+    };
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(Some(String::from_utf8(body)?))
 }
 
-// --- Main MCP server loop ---
+/// Write a Content-Length framed message.
+fn write_message(stdout: &mut io::Stdout, json: &str) -> anyhow::Result<()> {
+    write!(stdout, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
+    stdout.flush()?;
+    Ok(())
+}
 
-pub async fn run(socket_path: &Path) -> Result<()> {
-    // Resolve session_id: try AGEND_SESSION_ID first, then lookup by AGEND_INSTANCE_NAME
-    let session_id: u32 = if let Ok(id) = std::env::var("AGEND_SESSION_ID") {
-        id.parse().context("Invalid AGEND_SESSION_ID")?
-    } else if let Ok(name) = std::env::var("AGEND_INSTANCE_NAME") {
-        // Resolve instance name → session_id via daemon List
-        let resp = send_to_daemon(socket_path, &Request::List).await?;
-        if let Response::Sessions { sessions } = resp {
-            sessions
-                .iter()
-                .find(|s| s.name.as_deref() == Some(&name))
-                .map(|s| s.id)
-                .with_context(|| format!("Instance '{name}' not found in daemon"))?
-        } else {
-            anyhow::bail!("Failed to list sessions for name resolution");
+/// Write data to agent's PTY via TUI socket.
+fn write_to_agent(socket_path: &str, data: &[u8]) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(socket_path)?;
+    framing::write_frame(&mut stream, data)?;
+    Ok(())
+}
+
+/// List agent sockets in home directory.
+fn list_agents() -> Vec<String> {
+    let home = crate::home_dir();
+    let mut agents = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&home) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".sock") {
+                agents.push(name[..name.len() - 5].to_string());
+            }
         }
-    } else {
-        anyhow::bail!(
-            "Neither AGEND_SESSION_ID nor AGEND_INSTANCE_NAME set — \
-             MCP server must run inside an agend-terminal session"
-        );
-    };
+    }
+    agents
+}
 
-    info!("MCP server starting (session_id: {session_id})");
+pub fn run(agent_socket: &str) -> anyhow::Result<()> {
+    let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
+    eprintln!("[mcp] server starting for '{instance_name}'");
 
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut stdout = io::stdout();
 
     loop {
-        // Read Content-Length framed message from stdin
-        let body = match read_content_length_message(&mut reader) {
-            Ok(Some(b)) => b,
-            Ok(None) => break, // EOF
-            Err(e) => {
-                error!("Read error: {e}");
-                break;
-            }
+        let body = match read_message(&mut reader)? {
+            Some(b) => b,
+            None => break,
         };
 
         let req: JsonRpcRequest = match serde_json::from_str(&body) {
             Ok(r) => r,
             Err(e) => {
-                error!("Invalid JSON-RPC: {e}");
+                eprintln!("[mcp] invalid JSON-RPC: {e}");
                 continue;
             }
         };
@@ -389,125 +139,78 @@ pub async fn run(socket_path: &Path) -> Result<()> {
         let id = req.id.clone().unwrap_or(Value::Null);
 
         let response = match req.method.as_str() {
-            "initialize" => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(json!({
+            "initialize" => json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
                     "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": "agend-terminal",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                })),
-                error: None,
-            },
-            "notifications/initialized" => continue,
-            "ping" => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(json!({})),
-                error: None,
-            },
-            "tools/list" => JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id,
-                result: Some(tool_definitions()),
-                error: None,
-            },
-            "tools/call" => {
-                let tool_name = req.params["name"]
-                    .as_str()
-                    .unwrap_or("");
-                let arguments = req.params.get("arguments").cloned().unwrap_or(json!({}));
-
-                match handle_tool_call(socket_path, session_id, tool_name, &arguments).await
-                {
-                    Ok(result) => {
-                        let is_error = result.get("error").is_some();
-                        JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id,
-                            result: Some(json!({
-                                "content": [{
-                                    "type": "text",
-                                    "text": serde_json::to_string_pretty(&result).unwrap_or_default()
-                                }],
-                                "isError": is_error
-                            })),
-                            error: None,
-                        }
-                    }
-                    Err(e) => JsonRpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id,
-                        result: Some(json!({
-                            "content": [{
-                                "type": "text",
-                                "text": format!("Error: {e}")
-                            }],
-                            "isError": true
-                        })),
-                        error: None,
-                    },
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "agend-terminal", "version": env!("CARGO_PKG_VERSION") }
                 }
+            }),
+            "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            "notifications/initialized" | "notifications/cancelled" => continue,
+            "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": tool_definitions() }),
+            "tools/call" => {
+                let tool = req.params["name"].as_str().unwrap_or("");
+                let args = &req.params["arguments"];
+                let result = handle_tool(tool, args, agent_socket);
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
+                        "isError": result.get("error").is_some()
+                    }
+                })
             }
             method => {
                 if method.starts_with("notifications/") {
-                    continue; // Ignore notifications
+                    continue;
                 }
-                JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id,
-                    error: Some(JsonRpcError {
-                        code: -32601,
-                        message: format!("Method not found: {method}"),
-                    }),
-                    result: None,
-                }
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "error": { "code": -32601, "message": format!("Method not found: {method}") }
+                })
             }
         };
 
-        let json = serde_json::to_string(&response)?;
-        write_content_length_message(&mut stdout, &json)?;
+        write_message(&mut stdout, &response.to_string())?;
     }
 
-    info!("MCP server exiting");
+    eprintln!("[mcp] server exiting");
     Ok(())
 }
 
-/// Read a Content-Length framed message from a BufReader.
-/// Format: `Content-Length: N\r\n\r\n{json body of N bytes}`
-fn read_content_length_message(reader: &mut BufReader<io::StdinLock>) -> Result<Option<String>> {
-    // Read headers until empty line
-    let mut content_length: Option<usize> = None;
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(None); // EOF
+fn handle_tool(tool: &str, args: &Value, agent_socket: &str) -> Value {
+    match tool {
+        "reply" => {
+            let text = args["text"].as_str().unwrap_or("");
+            // For now, log the reply. Telegram integration will route it.
+            eprintln!("[mcp] reply: {text}");
+            json!({"status": "sent"})
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break; // End of headers
+        "send" => {
+            let target = match args["target"].as_str() {
+                Some(t) => t,
+                None => return json!({"error": "missing 'target'"}),
+            };
+            let text = args["text"].as_str().unwrap_or("");
+            let home = crate::home_dir();
+            let target_sock = crate::daemon::agent_socket_path(&home, target);
+            let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
+            let msg = format!("[from:{instance_name}] {text}\r");
+            match write_to_agent(&target_sock, msg.as_bytes()) {
+                Ok(()) => json!({"status": "sent", "target": target}),
+                Err(e) => json!({"error": format!("send failed: {e}")}),
+            }
         }
-        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-            content_length = val.trim().parse().ok();
+        "inbox" => {
+            // Placeholder — will be implemented with message queue
+            json!({"messages": []})
         }
+        "list_instances" => {
+            let agents = list_agents();
+            json!({"instances": agents})
+        }
+        _ => json!({"error": format!("unknown tool: {tool}")}),
     }
-
-    let len = content_length.context("Missing Content-Length header")?;
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body)?;
-    let s = String::from_utf8(body).context("Invalid UTF-8 in message body")?;
-    Ok(Some(s))
-}
-
-/// Write a Content-Length framed message to stdout.
-fn write_content_length_message(stdout: &mut io::Stdout, json: &str) -> Result<()> {
-    write!(stdout, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
-    stdout.flush()?;
-    Ok(())
 }

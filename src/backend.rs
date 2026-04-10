@@ -81,6 +81,6 @@ impl Backend {
     /// Get all known backend names.
     #[allow(dead_code)]
     pub fn all_names() -> &'static [&'static str] {
-        &["claude-code", "kiro-cli", "codex", "opencode", "gemini"]
+        &["claude-code", "kiro-cli", "codex", "open-code", "gemini"]
     }
 }
