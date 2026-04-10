@@ -87,17 +87,33 @@ impl VTerm {
 
         for line_idx in 0..rows {
             if line_idx > 0 {
-                out.extend_from_slice(b"\r\n");
+                // Reset before newline to prevent bg color bleeding into margins
+                out.extend_from_slice(b"\x1b[0m\r\n");
+                last_fg = None;
+                last_bg = None;
+                last_flags = Flags::empty();
             }
 
-            // Find last non-empty column to avoid trailing spaces
+            // Find last non-empty column.
+            // If any cell on this line has a non-default bg (e.g., statusline),
+            // emit the full line width to preserve bg color layout.
             let mut last_col = 0;
-            for col in (0..cols).rev() {
+            let mut line_has_bg = false;
+            for col in 0..cols {
                 let cell = &grid[Point::new(Line(line_idx as i32), Column(col))];
-                if cell.c != ' ' || !cell.flags.is_empty() || cell.fg != Color::Named(NamedColor::Foreground) || cell.bg != Color::Named(NamedColor::Background) {
-                    last_col = col + 1;
-                    break;
+                if cell.bg != Color::Named(NamedColor::Background) {
+                    line_has_bg = true;
                 }
+                if cell.c != ' '
+                    || !cell.flags.is_empty()
+                    || cell.fg != Color::Named(NamedColor::Foreground)
+                    || cell.bg != Color::Named(NamedColor::Background)
+                {
+                    last_col = col + 1;
+                }
+            }
+            if line_has_bg {
+                last_col = cols;
             }
 
             for col in 0..last_col {
