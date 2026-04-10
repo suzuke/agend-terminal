@@ -721,6 +721,7 @@ fn write_back_topic_ids(config_path: &Path, channel: &TelegramChannel) -> Result
     }
 
     let yaml = serde_yaml::to_string(&doc)?;
+    let yaml = format!("# Auto-updated by agend-terminal (topic_ids added)\n# Original comments were not preserved during write-back\n{yaml}");
     std::fs::write(config_path, yaml)?;
     info!("Updated fleet.yaml with topic IDs");
     Ok(())
