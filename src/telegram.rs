@@ -187,8 +187,17 @@ async fn handle_telegram_message(
     }
 
     // Inject notification into PTY
+    // Determine submit key based on command (gemini needs \n\r, others \r)
+    let submit_key = {
+        let st = state.lock().await;
+        if let Some((_, s)) = st.find_session_by_name(&instance_name) {
+            if s.command.contains("gemini") { "\n\r" } else { "\r" }
+        } else {
+            "\r"
+        }
+    };
     let notification = format!(
-        "\n[user:{username} via telegram] {}\n",
+        "\n[user:{username} via telegram] {}{submit_key}",
         if text.chars().count() > 200 {
             let truncated: String = text.chars().take(200).collect();
             format!("{truncated}... (Run: agend-terminal inbox)")
