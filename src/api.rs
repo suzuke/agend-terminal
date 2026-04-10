@@ -71,15 +71,20 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let agents: Vec<Value> = reg
                     .iter()
                     .map(|(name, handle)| {
-                        let state = handle.core.lock()
-                            .map(|mut c| c.state.get_state().display_name().to_string())
-                            .unwrap_or_else(|_| "unknown".into());
+                        let (agent_state, health_state) = handle.core.lock()
+                            .map(|mut c| {
+                                let as_ = c.state.get_state().display_name().to_string();
+                                let hs = c.health.state.display_name().to_string();
+                                (as_, hs)
+                            })
+                            .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
                         json!({
                             "name": name,
                             "command": handle.command,
                             "submit_key": handle.submit_key,
                             "inject_prefix": handle.inject_prefix,
-                            "state": state,
+                            "agent_state": agent_state,
+                            "health_state": health_state,
                         })
                     })
                     .collect();
