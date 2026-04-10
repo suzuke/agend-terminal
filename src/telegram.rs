@@ -69,6 +69,38 @@ impl TelegramChannel {
         Ok(topic_id)
     }
 
+    /// Verify a topic exists. If deleted, recreate and return new topic_id.
+    pub async fn verify_or_recreate_topic(
+        &mut self,
+        instance_name: &str,
+        old_topic_id: i32,
+    ) -> Result<i32> {
+        // General topic (1) always exists
+        if old_topic_id == 1 {
+            self.register_topic(instance_name, 1);
+            return Ok(1);
+        }
+        // Try sending a test message to verify topic exists
+        let test = self.bot
+            .send_message(self.group_id, ".")
+            .message_thread_id(ThreadId(MessageId(old_topic_id)))
+            .await;
+        match test {
+            Ok(msg) => {
+                // Topic exists — delete the test message and register
+                let _ = self.bot.delete_message(self.group_id, msg.id).await;
+                self.register_topic(instance_name, old_topic_id);
+                Ok(old_topic_id)
+            }
+            Err(_) => {
+                // Topic doesn't exist — recreate
+                warn!("Topic {old_topic_id} for '{instance_name}' not found, recreating");
+                let new_id = self.create_topic(instance_name).await?;
+                Ok(new_id)
+            }
+        }
+    }
+
     /// Register an existing topic mapping.
     pub fn register_topic(&mut self, instance_name: &str, topic_id: i32) {
         self.topic_to_instance.insert(topic_id, instance_name.to_string());
