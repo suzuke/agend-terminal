@@ -4,6 +4,7 @@
 //! Single Mutex on AgentCore ensures atomic subscribe+dump.
 
 use crate::backend::Backend;
+use crate::health::{HealthState, HealthTracker};
 use crate::state::StateTracker;
 use crate::vterm::VTerm;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -19,6 +20,7 @@ pub struct AgentCore {
     pub vterm: VTerm,
     pub subscribers: Vec<crossbeam::channel::Sender<Vec<u8>>>,
     pub state: StateTracker,
+    pub health: HealthTracker,
 }
 
 /// Handle to interact with an agent.
@@ -84,6 +86,9 @@ fn strip_ansi(s: &str) -> String {
 }
 
 /// Spawn an agent with PTY and register in registry.
+/// Channel for crash events from reaper to daemon.
+pub type CrashChannel = crossbeam::channel::Sender<String>;
+
 pub fn spawn_agent(
     name: &str,
     command: &str,
@@ -95,6 +100,7 @@ pub fn spawn_agent(
     submit_key: &str,
     registry: &AgentRegistry,
     home: Option<&std::path::Path>,
+    crash_tx: Option<CrashChannel>,
 ) -> anyhow::Result<()> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -159,6 +165,7 @@ pub fn spawn_agent(
         vterm: VTerm::new(cols, rows),
         subscribers: Vec::new(),
         state: StateTracker::new(detected_backend.as_ref()),
+        health: HealthTracker::new(),
     }));
 
     // Register in registry
@@ -191,6 +198,7 @@ pub fn spawn_agent(
     let pw = Arc::clone(&pty_writer);
     let reg_for_reaper = Arc::clone(registry);
     let home_for_reaper = home.map(|p| p.to_path_buf());
+    let crash_tx_for_reaper = crash_tx;
     let n = name.to_string();
     std::thread::Builder::new()
         .name(format!("{n}_pty_read"))
@@ -201,14 +209,18 @@ pub fn spawn_agent(
             loop {
                 match pty_reader.read(&mut buf) {
                     Ok(0) => {
-                        eprintln!("[{n}] PTY closed — reaping session");
-                        // Session reaper: remove from registry + cleanup socket
+                        eprintln!("[{n}] PTY closed");
+                        // Remove from registry + cleanup socket
                         if let Ok(mut reg) = reg_for_reaper.lock() {
                             reg.remove(&n);
                         }
                         if let Some(ref home) = home_for_reaper {
                             let sock = crate::daemon::agent_socket_path(home, &n);
                             let _ = std::fs::remove_file(&sock);
+                        }
+                        // Signal crash to daemon for auto-respawn
+                        if let Some(ref tx) = crash_tx_for_reaper {
+                            let _ = tx.send(n.clone());
                         }
                         break;
                     }
