@@ -94,11 +94,21 @@ fn main() -> anyhow::Result<()> {
             let agents: Vec<_> = args[2..]
                 .iter()
                 .map(|a| {
-                    if let Some((name, cmd)) = a.split_once(':') {
-                        (name.to_string(), cmd.to_string(), Vec::new(), None, None, "\r".to_string())
+                    let (name, cmd) = if let Some((n, c)) = a.split_once(':') {
+                        (n.to_string(), c.to_string())
                     } else {
-                        (a.to_string(), a.to_string(), Vec::new(), None, None, "\r".to_string())
-                    }
+                        (a.to_string(), a.to_string())
+                    };
+                    // Auto-detect backend preset for submit_key + args
+                    let detected = backend::Backend::from_command(&cmd);
+                    let (preset_args, submit_key) = match detected {
+                        Some(ref b) => {
+                            let p = b.preset();
+                            (p.args.iter().map(|s| s.to_string()).collect(), p.submit_key.to_string())
+                        }
+                        None => (Vec::new(), "\r".to_string()),
+                    };
+                    (name, cmd, preset_args, None, None, submit_key)
                 })
                 .collect();
             let agents = if agents.is_empty() {
