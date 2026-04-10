@@ -593,21 +593,22 @@ fn run_doctor(home: &std::path::Path) -> anyhow::Result<()> {
         println!("    (none)");
     }
 
-    // Check backend binaries
+    // Check backend binaries + versions
     println!("\n  Backend binaries:");
-    for name in backend::Backend::all_names() {
-        let backend: backend::Backend = serde_json::from_str(&format!("\"{name}\"")).unwrap();
-        let preset = backend.preset();
-        let cmd = preset.command;
-        let found = std::process::Command::new("which")
-            .arg(cmd)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if found {
-            println!("    {name} ({cmd}) ✓");
+    for b in backend::Backend::all() {
+        let name = b.name();
+        let preset = b.preset();
+        if b.is_installed() {
+            let version = b.get_version().unwrap_or_else(|| "?".into());
+            let calibrated = b.calibrated_version();
+            let version_note = if version != calibrated {
+                format!(" (calibrated: {calibrated}, patterns may need update)")
+            } else {
+                String::new()
+            };
+            println!("    {name} ({}) v{version} ✓{version_note}", preset.command);
         } else {
-            println!("    {name} ({cmd}) - (not in PATH)");
+            println!("    {name} ({}) - (not in PATH)", preset.command);
         }
     }
 

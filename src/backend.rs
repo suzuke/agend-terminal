@@ -141,4 +141,41 @@ impl Backend {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+
+    /// Get installed version via --version. Returns None if not installed.
+    pub fn get_version(&self) -> Option<String> {
+        let preset = self.preset();
+        let output = std::process::Command::new(preset.command)
+            .arg("--version")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() {
+            return None;
+        }
+        // Extract version number from various formats
+        // "2.1.89 (Claude Code)" → "2.1.89"
+        // "kiro-cli 1.29.6" → "1.29.6"
+        // "codex-cli 0.118.0" → "0.118.0"
+        // "1.3.10" → "1.3.10"
+        // "0.37.1" → "0.37.1"
+        let version = text
+            .split_whitespace()
+            .find(|w| w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+            .unwrap_or(&text)
+            .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
+            .to_string();
+        Some(version)
+    }
+
+    /// Version used when patterns were last calibrated.
+    pub fn calibrated_version(&self) -> &'static str {
+        match self {
+            Backend::ClaudeCode => "2.1.89",
+            Backend::KiroCli => "1.29.6",
+            Backend::Codex => "0.118.0",
+            Backend::OpenCode => "1.4.0",
+            Backend::Gemini => "0.37.1",
+        }
+    }
 }
