@@ -133,15 +133,13 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("Usage: agend-terminal inject <name> <text>");
                 std::process::exit(1);
             }
-            // Inject via API socket (not TUI socket — avoids kicking attach client)
-            let (inject_prefix, submit_key) = get_inject_keys(&home, name);
-            let data = format!("{inject_prefix}{text}{submit_key}");
+            // Inject via API — text only, prefix+submit handled by inject_to_agent
             match api::call(&home, &serde_json::json!({
                 "method": "inject",
-                "params": {"name": name, "data": data}
+                "params": {"name": name, "data": text}
             })) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    println!("Injected {} bytes", data.len());
+                    println!("Injected: {text}");
                 }
                 Ok(resp) => {
                     eprintln!("Inject failed: {}", resp["error"].as_str().unwrap_or("unknown"));
@@ -294,21 +292,6 @@ fn get_instance_name() -> String {
     })
 }
 
-/// Look up inject_prefix + submit_key for an agent via API socket.
-fn get_inject_keys(home: &std::path::Path, name: &str) -> (String, String) {
-    if let Ok(resp) = api::call(home, &serde_json::json!({"method": "list"})) {
-        if let Some(agents) = resp["result"]["agents"].as_array() {
-            for a in agents {
-                if a["name"].as_str() == Some(name) {
-                    let prefix = a["inject_prefix"].as_str().unwrap_or("").to_string();
-                    let submit = a["submit_key"].as_str().unwrap_or("\r").to_string();
-                    return (prefix, submit);
-                }
-            }
-        }
-    }
-    (String::new(), "\r".to_string())
-}
 
 fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
     let preset = b.preset();

@@ -88,13 +88,16 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
             "inject" => {
                 let name = params["name"].as_str().unwrap_or("");
                 let data = params["data"].as_str().unwrap_or("");
+                // "raw" flag: send bytes as-is (for attach-like paths)
+                let raw = params["raw"].as_bool().unwrap_or(false);
                 let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 match reg.get(name) {
                     Some(handle) => {
-                        let result = if handle.typed_inject {
-                            agent::write_to_agent_typed(handle, data.as_bytes())
-                        } else {
+                        let result = if raw {
                             agent::write_to_agent(handle, data.as_bytes())
+                        } else {
+                            // Smart inject: text only, prefix+submit added by inject_to_agent
+                            agent::inject_to_agent(handle, data.as_bytes())
                         };
                         match result {
                             Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
@@ -177,20 +180,14 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 // Direct write to PTY (daemon has registry — no API loop)
                 let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(handle) = reg.get(target) {
-                    let prefix = &handle.inject_prefix;
-                    let submit_key = &handle.submit_key;
                     let display_text = if text.chars().count() > 200 {
                         let truncated: String = text.chars().take(200).collect();
                         format!("{truncated}... (use inbox tool)")
                     } else {
                         text.to_string()
                     };
-                    let notification = format!("{prefix}[from:{from}] {display_text}{submit_key}");
-                    if handle.typed_inject {
-                        let _ = agent::write_to_agent_typed(handle, notification.as_bytes());
-                    } else {
-                        let _ = agent::write_to_agent(handle, notification.as_bytes());
-                    }
+                    let notification = format!("[from:{from}] {display_text}");
+                    let _ = agent::inject_to_agent(handle, notification.as_bytes());
                 }
                 json!({"ok": true})
             }
