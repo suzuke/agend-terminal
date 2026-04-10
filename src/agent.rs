@@ -266,12 +266,25 @@ pub fn spawn_agent(
     Ok(())
 }
 
-/// Write data to an agent's PTY (atomic write).
+/// Write data to an agent's PTY (atomic write — for attach path).
 #[allow(dead_code)]
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> anyhow::Result<()> {
     let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
     w.write_all(data)?;
     w.flush()?;
+    Ok(())
+}
+
+/// Write data to an agent's PTY byte-by-byte with small delays.
+/// Simulates keyboard typing for TUI frameworks (bubbletea, Gemini)
+/// that process input per-byte/per-event.
+pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> anyhow::Result<()> {
+    let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
+    for byte in data {
+        w.write_all(&[*byte])?;
+        w.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     Ok(())
 }
 

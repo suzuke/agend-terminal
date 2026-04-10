@@ -90,7 +90,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let data = params["data"].as_str().unwrap_or("");
                 let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 match reg.get(name) {
-                    Some(handle) => match agent::write_to_agent(handle, data.as_bytes()) {
+                    Some(handle) => match agent::write_to_agent_typed(handle, data.as_bytes()) {
                         Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
                         Err(e) => json!({"ok": false, "error": format!("{e}")}),
                     },
@@ -179,7 +179,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                         text.to_string()
                     };
                     let notification = format!("{prefix}[from:{from}] {display_text}{submit_key}");
-                    let _ = agent::write_to_agent(handle, notification.as_bytes());
+                    let _ = agent::write_to_agent_typed(handle, notification.as_bytes());
                 }
                 json!({"ok": true})
             }
