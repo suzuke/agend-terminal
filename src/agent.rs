@@ -31,6 +31,7 @@ pub struct AgentHandle {
     pub core: Arc<Mutex<AgentCore>>,
     pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     pub submit_key: String,
+    pub inject_prefix: String,
 }
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
@@ -172,6 +173,10 @@ pub fn spawn_agent(
                 core: Arc::clone(&core),
                 child: Arc::new(Mutex::new(child)),
                 submit_key: submit_key.to_string(),
+                inject_prefix: detected_backend
+                    .as_ref()
+                    .map(|b| b.preset().inject_prefix.to_string())
+                    .unwrap_or_default(),
             },
         );
     }

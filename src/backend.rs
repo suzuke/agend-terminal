@@ -20,6 +20,8 @@ pub struct BackendPreset {
     pub args: &'static [&'static str],
     pub ready_pattern: &'static str,
     pub submit_key: &'static str,
+    /// Prefix sent before inject text to activate input field.
+    pub inject_prefix: &'static str,
     pub quit_command: &'static str,
     /// Relative path for instructions file from working dir.
     pub instructions_path: &'static str,
@@ -37,6 +39,7 @@ impl Backend {
                 args: &["--dangerously-skip-permissions"],
                 ready_pattern: "bypass permissions|❯", // [実測]
                 submit_key: "\r",
+                inject_prefix: "",
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
                 mcp_config_path: ".claude/settings.json",
@@ -47,6 +50,7 @@ impl Backend {
                 args: &["chat", "--trust-all-tools"],
                 ready_pattern: "All tools are now trusted|!>", // [実測]
                 submit_key: "\r",
+                inject_prefix: "",
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
                 mcp_config_path: ".kiro/settings/mcp.json",
@@ -57,6 +61,7 @@ impl Backend {
                 args: &["--full-auto"],
                 ready_pattern: "OpenAI Codex|›", // [実測]
                 submit_key: "\r",
+                inject_prefix: "",
                 quit_command: "exit", // Ctrl+C based
                 instructions_path: "AGENTS.md",
                 mcp_config_path: "opencode.json", // codex doesn't have file-based MCP config
@@ -66,7 +71,8 @@ impl Backend {
                 command: "opencode",
                 args: &[],
                 ready_pattern: "Ask anything|tab agents", // [実測]
-                submit_key: "\r", // crossterm Enter sends CR (0x0D)
+                submit_key: "\r",
+                inject_prefix: "\r", // Activate input field before text
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
@@ -77,6 +83,7 @@ impl Backend {
                 args: &["--yolo"],
                 ready_pattern: "Type your message|YOLO", // [実測]
                 submit_key: "\n\r", // [実測 v1] Gemini needs LF+CR
+                inject_prefix: "\r", // Activate input field before text
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",

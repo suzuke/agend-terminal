@@ -78,6 +78,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                             "name": name,
                             "command": handle.command,
                             "submit_key": handle.submit_key,
+                            "inject_prefix": handle.inject_prefix,
                             "state": state,
                         })
                     })
@@ -169,6 +170,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 // Direct write to PTY (daemon has registry — no API loop)
                 let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(handle) = reg.get(target) {
+                    let prefix = &handle.inject_prefix;
                     let submit_key = &handle.submit_key;
                     let display_text = if text.chars().count() > 200 {
                         let truncated: String = text.chars().take(200).collect();
@@ -176,7 +178,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                     } else {
                         text.to_string()
                     };
-                    let notification = format!("[from:{from}] {display_text}{submit_key}");
+                    let notification = format!("{prefix}[from:{from}] {display_text}{submit_key}");
                     let _ = agent::write_to_agent(handle, notification.as_bytes());
                 }
                 json!({"ok": true})
