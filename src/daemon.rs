@@ -205,18 +205,42 @@ async fn auto_fleet_start(
 
             let channel = Arc::new(Mutex::new(TelegramChannel::new(&token, group_id, topic_map)));
 
-            // Auto-create topics for instances without topic_id
+            // Verify existing topics + create missing ones
+            let mut config_updated = false;
             for (name, inst) in config.instances.iter() {
-                if inst.topic_id.is_none() && name != "general" {
-                    let mut ch = channel.lock().await;
-                    match ch.create_topic(name).await {
-                        Ok(tid) => info!("Auto-created topic for {name}: {tid}"),
-                        Err(e) => warn!("Failed to create topic for {name}: {e:#}"),
+                let mut ch = channel.lock().await;
+                match inst.topic_id {
+                    Some(tid) => {
+                        // Verify topic exists, recreate if deleted
+                        match ch.verify_or_recreate_topic(name, tid).await {
+                            Ok(new_tid) if new_tid != tid => {
+                                info!("Recreated topic for {name}: {tid} → {new_tid}");
+                                config_updated = true;
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("Failed to verify topic for {name}: {e:#}"),
+                        }
+                    }
+                    None if name == "general" => {
+                        ch.register_topic("general", 1);
+                    }
+                    None => {
+                        match ch.create_topic(name).await {
+                            Ok(tid) => {
+                                info!("Auto-created topic for {name}: {tid}");
+                                config_updated = true;
+                            }
+                            Err(e) => warn!("Failed to create topic for {name}: {e:#}"),
+                        }
                     }
                 }
-                if name == "general" && inst.topic_id.is_none() {
-                    let mut ch = channel.lock().await;
-                    ch.register_topic("general", 1);
+            }
+
+            // Write back updated topic_ids if any changed
+            if config_updated {
+                let ch = channel.lock().await;
+                if let Err(e) = write_back_topic_ids(_config_path, &ch) {
+                    warn!("Failed to write back topic IDs: {e:#}");
                 }
             }
 
@@ -584,27 +608,33 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                                     &token, group_id, topic_map,
                                 )));
 
-                                // Auto-create topics for instances without topic_id
+                                // Verify existing topics + create missing ones
                                 let mut config_updated = false;
                                 for (name, inst) in config.instances.iter() {
-                                    if inst.topic_id.is_none() && name != "general" {
-                                        let mut ch = channel.lock().await;
-                                        match ch.create_topic(name).await {
-                                            Ok(tid) => {
-                                                // Update config in memory for write-back
-                                                // (actual write-back below)
-                                                info!("Auto-created topic for {name}: {tid}");
-                                                config_updated = true;
-                                            }
-                                            Err(e) => {
-                                                warn!("Failed to create topic for {name}: {e:#}");
+                                    let mut ch = channel.lock().await;
+                                    match inst.topic_id {
+                                        Some(tid) => {
+                                            match ch.verify_or_recreate_topic(name, tid).await {
+                                                Ok(new_tid) if new_tid != tid => {
+                                                    info!("Recreated topic for {name}: {tid} → {new_tid}");
+                                                    config_updated = true;
+                                                }
+                                                Ok(_) => {}
+                                                Err(e) => warn!("Failed to verify topic for {name}: {e:#}"),
                                             }
                                         }
-                                    }
-                                    // General instance uses General topic (1)
-                                    if name == "general" && inst.topic_id.is_none() {
-                                        let mut ch = channel.lock().await;
-                                        ch.register_topic("general", 1);
+                                        None if name == "general" => {
+                                            ch.register_topic("general", 1);
+                                        }
+                                        None => {
+                                            match ch.create_topic(name).await {
+                                                Ok(tid) => {
+                                                    info!("Auto-created topic for {name}: {tid}");
+                                                    config_updated = true;
+                                                }
+                                                Err(e) => warn!("Failed to create topic for {name}: {e:#}"),
+                                            }
+                                        }
                                     }
                                 }
 

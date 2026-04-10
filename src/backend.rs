@@ -60,6 +60,7 @@ impl Backend {
     }
 
     /// Try to detect backend from a command string.
+    #[allow(dead_code)]
     pub fn from_command(command: &str) -> Option<Backend> {
         let cmd = command.to_lowercase();
         if cmd.contains("claude") {
@@ -78,6 +79,7 @@ impl Backend {
     }
 
     /// Get all known backend names.
+    #[allow(dead_code)]
     pub fn all_names() -> &'static [&'static str] {
         &["claude-code", "kiro-cli", "codex", "opencode", "gemini"]
     }
