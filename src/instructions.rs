@@ -6,30 +6,24 @@ const AGEND_RULES: &str = r#"# AgEnD Terminal Communication
 
 ## How to respond to messages
 
-When you see messages like `[user:NAME via telegram]` or `[from:INSTANCE]`, respond using Bash:
+When you see messages like `[user:NAME via telegram]` or `[from:INSTANCE]`, use the **agend-terminal MCP tools** to respond.
 
-```bash
-# Reply to the user who messaged you
-agend-terminal reply "Your response here"
+## Available MCP Tools
 
-# Send a message to another agent instance
-agend-terminal send TARGET "Message text"
-
-# Check for pending messages
-agend-terminal inbox
-```
+- **reply** — Reply to the user who messaged you. Use when you see `[user:... via telegram]`.
+- **send** — Send a message to another agent instance. Specify target name and text.
+- **inbox** — Check for pending messages. Use when notification says "Run: agend-terminal inbox".
+- **list_instances** — List all active agent instances in the fleet.
+- **create_instance** — Create a new agent instance dynamically.
+- **delete_instance** — Stop and remove an agent instance.
 
 ## Rules
 
-- **Always use `agend-terminal reply`** to respond to `[user:... via telegram]` messages. Do NOT use the `reply` MCP tool.
-- **Always use `agend-terminal send`** to communicate with other instances. Do NOT use `send_to_instance` MCP tool.
+- **Always use the `reply` MCP tool** to respond to `[user:... via telegram]` messages.
+- **Always use the `send` MCP tool** to communicate with other instances.
 - Messages appear in your terminal as `[user:NAME via telegram] text` or `[from:INSTANCE] text`.
-- For long messages, run `agend-terminal inbox` to see the full content.
+- For long messages, use the `inbox` tool to see the full content.
 - Keep replies concise and direct.
-- To create a new agent instance dynamically:
-  ```bash
-  agend-terminal create-instance --name NAME --command CMD --working-directory /path [--topic-name "Topic"]
-  ```
 "#;
 
 const AGEND_MARKER: &str = "<!-- agend-terminal instructions -->";

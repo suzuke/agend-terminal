@@ -1,5 +1,6 @@
 use crate::fleet::{ChannelConfig, FleetConfig};
 use crate::instructions;
+use crate::mcp_config;
 use crate::protocol::{self, InboxMessage, Request, Response, SessionInfo};
 use crate::pty_session::PtySession;
 use crate::telegram::TelegramChannel;
@@ -161,6 +162,7 @@ async fn auto_fleet_start(
         if let Some(resolved) = config.resolve_instance(name) {
             if let Some(ref dir) = resolved.working_directory {
                 instructions::generate(dir, &resolved.command);
+                mcp_config::configure(dir, &resolved.command);
             }
 
             match spawn_session(
@@ -524,6 +526,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                             // Generate instructions before spawn
                             if let Some(ref dir) = resolved.working_directory {
                                 instructions::generate(dir, &resolved.command);
+                mcp_config::configure(dir, &resolved.command);
                             }
 
                             match spawn_session(
@@ -722,6 +725,7 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
 
             // Generate instructions
             instructions::generate(&work_dir, &command);
+            mcp_config::configure(&work_dir, &command);
 
             // Spawn session
             match spawn_session(
