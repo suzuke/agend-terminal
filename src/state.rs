@@ -82,8 +82,10 @@ pub struct StatePatterns {
 
 impl StatePatterns {
     /// Pattern sources: [実測] = verified from real capture, [文件] = from docs/source, [推測] = estimated
+    /// Tested versions: Claude v2.1.89, Codex v0.118.0, OpenCode v1.4.0, Gemini v0.37.1
     pub fn for_backend(backend: &Backend) -> Self {
         let patterns = match backend {
+            // Claude Code v2.1.89
             Backend::ClaudeCode => vec![
                 // [文件] Claude Code SDK error handling
                 (AgentState::AuthError, r"API key|authentication failed|unauthorized"),
@@ -102,6 +104,7 @@ impl StatePatterns {
                 // [実測] Shown after startup with --dangerously-skip-permissions
                 (AgentState::Ready, r"bypass permissions"),
             ],
+            // Kiro CLI (version TBD)
             Backend::KiroCli => vec![
                 // [文件] Kiro auth error messages
                 (AgentState::AuthError, r"Not authenticated|AccessDenied|denied access"),
@@ -122,6 +125,7 @@ impl StatePatterns {
                 // [実測] Trust dialog completion
                 (AgentState::Ready, r"All tools are now trusted"),
             ],
+            // Codex v0.118.0
             Backend::Codex => vec![
                 // [文件] Requires OPENAI_API_KEY env
                 (AgentState::AuthError, r"OPENAI_API_KEY|api.?key"),
@@ -140,6 +144,7 @@ impl StatePatterns {
                 // [実測] Version + model display
                 (AgentState::Ready, r"OpenAI Codex|gpt-.*left"),
             ],
+            // OpenCode v1.4.0
             Backend::OpenCode => vec![
                 // [文件] HTTP error handling
                 (AgentState::RateLimit, r"rate.?limit|429"),
@@ -156,6 +161,7 @@ impl StatePatterns {
                 // [実測] Ready state with keybinding hints
                 (AgentState::Ready, r"Ask anything|tab agents"),
             ],
+            // Gemini CLI v0.37.1
             Backend::Gemini => vec![
                 // [文件] OAuth errors from API
                 (AgentState::AuthError, r"OAuth not authenticated|OAuth expired|UNAUTHENTICATED|check API key"),
