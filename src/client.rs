@@ -163,6 +163,61 @@ pub async fn list_sessions(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub async fn create_instance(
+    socket_path: &Path,
+    name: &str,
+    command: &str,
+    args: &[String],
+    env: Option<HashMap<String, String>>,
+    working_directory: Option<String>,
+    topic_name: Option<String>,
+    ready_pattern: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .context("Failed to connect to daemon. Is it running?")?;
+
+    send_request(
+        &mut stream,
+        &Request::CreateInstance {
+            name: name.to_string(),
+            command: command.to_string(),
+            args: args.to_vec(),
+            env,
+            working_directory,
+            topic_name,
+            ready_pattern,
+            cols,
+            rows,
+        },
+    )
+    .await?;
+
+    let resp = read_response(&mut stream)
+        .await?
+        .context("No response from daemon")?;
+    match resp {
+        Response::InstanceCreated {
+            name,
+            session_id,
+            topic_id,
+        } => {
+            println!(
+                "Created instance '{name}' (session {session_id}{})",
+                topic_id
+                    .map(|t| format!(", topic {t}"))
+                    .unwrap_or_default()
+            );
+        }
+        Response::Error { message } => anyhow::bail!("Create instance failed: {message}"),
+        _ => anyhow::bail!("Unexpected response"),
+    }
+
+    Ok(())
+}
+
 pub async fn inject(socket_path: &Path, session_id: u32, data: &[u8]) -> Result<()> {
     let mut stream = UnixStream::connect(socket_path)
         .await
