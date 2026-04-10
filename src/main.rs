@@ -133,6 +133,53 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        "fleet" => {
+            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("help");
+            match subcmd {
+                "stop" => {
+                    // Kill all agents via API socket
+                    match api::call(&home, &serde_json::json!({"method": "list"})) {
+                        Ok(resp) => {
+                            if let Some(agents) = resp["result"]["agents"].as_array() {
+                                for agent in agents {
+                                    let name = agent["name"].as_str().unwrap_or("");
+                                    let _ = api::call(&home, &serde_json::json!({"method": "kill", "params": {"name": name}}));
+                                    println!("  Stopped {name}");
+                                }
+                                println!("Fleet stopped ({} agents)", agents.len());
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+                    }
+                }
+                "start" => {
+                    let config_path = args.get(3).map(|s| s.as_str());
+                    let fleet_path = config_path
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| home.join("fleet.yaml"));
+                    start_with_fleet(&home, &fleet_path)?;
+                }
+                _ => {
+                    eprintln!("Fleet commands:\n  agend-terminal fleet start [config.yaml]\n  agend-terminal fleet stop");
+                }
+            }
+        }
+        "kill" => {
+            let name = args.get(2).unwrap_or_else(|| {
+                eprintln!("Usage: agend-terminal kill <name>");
+                std::process::exit(1);
+            });
+            match api::call(&home, &serde_json::json!({"method": "kill", "params": {"name": name}})) {
+                Ok(resp) => {
+                    if resp["ok"].as_bool() == Some(true) {
+                        println!("Killed {name}");
+                    } else {
+                        eprintln!("Kill failed: {}", resp["error"].as_str().unwrap_or("unknown"));
+                    }
+                }
+                Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+            }
+        }
         "mcp" => {
             let sock = daemon::agent_socket_path(&home, &get_instance_name());
             mcp::run(&sock)?;
