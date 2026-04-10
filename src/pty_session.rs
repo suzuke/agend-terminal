@@ -196,8 +196,21 @@ impl PtySession {
     }
 
     /// Subscribe to PTY output broadcast.
+    #[allow(dead_code)]
     pub fn subscribe_output(&self) -> broadcast::Receiver<Vec<u8>> {
         self.output_tx.subscribe()
+    }
+
+    /// Atomically subscribe and dump screen — no output lost between dump and subscribe.
+    /// Holds vterm lock during both operations so drainer can't send output in between.
+    pub fn subscribe_with_dump(&self) -> (broadcast::Receiver<Vec<u8>>, Vec<u8>) {
+        let vt = self.vterm.lock().unwrap_or_else(|e| {
+            tracing::warn!("VTerm poisoned: {e}");
+            e.into_inner()
+        });
+        let rx = self.output_tx.subscribe();
+        let dump = vt.dump_screen();
+        (rx, dump)
     }
 
     /// Write input to PTY master fd. This is the atomic write path.
@@ -231,8 +244,15 @@ impl PtySession {
     }
 
     /// Dump the current virtual terminal screen as ANSI escape sequences.
+    #[allow(dead_code)]
     pub fn dump_screen(&self) -> Vec<u8> {
-        self.vterm.lock().map(|vt| vt.dump_screen()).unwrap_or_default()
+        self.vterm
+            .lock()
+            .map(|vt| vt.dump_screen())
+            .unwrap_or_else(|e| {
+                tracing::warn!("VTerm poisoned: {e}");
+                Vec::new()
+            })
     }
 
     pub async fn get_size(&self) -> (u16, u16) {

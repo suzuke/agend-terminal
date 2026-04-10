@@ -602,8 +602,8 @@ async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()>
     let session_r = session.clone();
     let session_id = session.id;
 
-    // Send full screen dump before streaming new output
-    let screen_dump = session.dump_screen();
+    // Atomically subscribe + dump to avoid losing output between the two
+    let (mut output_rx, screen_dump) = session.subscribe_with_dump();
     if !screen_dump.is_empty() {
         let resp = Response::Output { data: screen_dump };
         let json = serde_json::to_vec(&resp).expect("Response serialization is infallible");
@@ -611,7 +611,6 @@ async fn attach_loop(stream: UnixStream, session: Arc<PtySession>) -> Result<()>
         let _ = writer.write_all(&frame).await;
     }
 
-    let mut output_rx = session.subscribe_output();
     let drainer_done = session.drainer_done.clone();
 
     let mut output_handle = tokio::spawn(async move {

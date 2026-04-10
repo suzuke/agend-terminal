@@ -42,7 +42,8 @@ pub struct VTerm {
 impl VTerm {
     pub fn new(cols: u16, rows: u16) -> Self {
         let size = VTermSize { cols, rows };
-        let config = Config::default();
+        let mut config = Config::default();
+        config.scrolling_history = 0; // No scrollback — only visible screen needed
         let term = term::Term::new(config, &size, NoopListener);
         Self {
             term,
@@ -101,6 +102,11 @@ impl VTerm {
 
             for col in 0..last_col {
                 let cell = &grid[Point::new(Line(line_idx as i32), Column(col))];
+
+                // Skip wide char spacer cells — the wide char already occupies 2 columns
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
 
                 // Emit SGR if attributes changed
                 let need_sgr = last_fg != Some(cell.fg)
