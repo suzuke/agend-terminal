@@ -142,6 +142,7 @@ pub fn run(
             submit_key,
             &registry,
             Some(home),
+            None, // TODO: pass crash_tx for auto-respawn
         )?;
 
         // Start TUI socket server for this agent in a new thread

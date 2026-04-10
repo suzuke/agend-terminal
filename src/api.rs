@@ -146,7 +146,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
 
                 match agent::spawn_agent(
                     name, command, &args, cols, rows, None,
-                    Some(work_dir.as_path()), "\r", registry, Some(home),
+                    Some(work_dir.as_path()), "\r", registry, Some(home), None,
                 ) {
                     Ok(()) => {
                         // Start TUI socket

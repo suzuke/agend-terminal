@@ -1,0 +1,297 @@
+//! Health monitoring: auto-respawn, backoff, hang detection, error loop.
+//!
+//! Two-layer state:
+//! - AgentState: instant PTY output detection (Thinking, Idle, RateLimit...)
+//! - HealthState: cumulative lifecycle (Healthy, Recovering, Unstable, Failed...)
+
+use crate::state::AgentState;
+use serde::Serialize;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+const CRASH_WINDOW: Duration = Duration::from_secs(600); // 10 minutes
+const NOTIFY_COOLDOWN: Duration = Duration::from_secs(300); // 5 min between same notifications
+const DEFAULT_MAX_RETRIES: u32 = 5;
+const BACKOFF_BASE: Duration = Duration::from_secs(5);
+const BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthState {
+    Healthy,
+    Recovering,
+    Unstable,
+    Failed,
+    Hung,
+    ErrorLoop,
+}
+
+impl HealthState {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Recovering => "recovering",
+            Self::Unstable => "unstable",
+            Self::Failed => "failed",
+            Self::Hung => "hung",
+            Self::ErrorLoop => "error_loop",
+        }
+    }
+}
+
+/// Tracks health for one agent.
+pub struct HealthTracker {
+    pub state: HealthState,
+    crash_times: VecDeque<Instant>,
+    total_crashes: u32,
+    max_retries: u32,
+    last_notification: Option<Instant>,
+    error_events: VecDeque<(Instant, AgentState)>,
+    pub last_output: Instant,
+}
+
+impl HealthTracker {
+    pub fn new() -> Self {
+        Self {
+            state: HealthState::Healthy,
+            crash_times: VecDeque::new(),
+            total_crashes: 0,
+            max_retries: DEFAULT_MAX_RETRIES,
+            last_notification: None,
+            error_events: VecDeque::new(),
+            last_output: Instant::now(),
+        }
+    }
+
+    /// Record a crash event. Returns (should_respawn, respawn_delay, should_notify).
+    pub fn record_crash(&mut self) -> (bool, Duration, bool) {
+        let now = Instant::now();
+        self.crash_times.push_back(now);
+        self.total_crashes += 1;
+
+        // Clean old crashes outside window
+        while let Some(front) = self.crash_times.front() {
+            if now.duration_since(*front) > CRASH_WINDOW {
+                self.crash_times.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let recent = self.crash_times.len();
+        let delay = self.backoff_delay();
+
+        // Check max retries
+        if self.total_crashes >= self.max_retries {
+            self.state = HealthState::Failed;
+            return (false, Duration::ZERO, true); // Don't respawn, do notify
+        }
+
+        let should_notify = recent >= 2 && self.should_notify();
+
+        if recent >= 3 {
+            self.state = HealthState::Unstable;
+        } else if recent >= 1 {
+            self.state = HealthState::Recovering;
+        }
+
+        if should_notify {
+            self.last_notification = Some(now);
+        }
+
+        (true, delay, should_notify)
+    }
+
+    /// Mark successful respawn.
+    pub fn respawn_ok(&mut self) {
+        if self.state == HealthState::Recovering {
+            self.state = HealthState::Healthy;
+        }
+        // Unstable stays until crash window clears
+    }
+
+    /// Calculate exponential backoff delay.
+    fn backoff_delay(&self) -> Duration {
+        if self.total_crashes == 0 {
+            return BACKOFF_BASE;
+        }
+        let exp = (self.total_crashes - 1).min(10);
+        let delay = BACKOFF_BASE.mul_f64(2.0_f64.powi(exp as i32));
+        delay.min(BACKOFF_MAX)
+    }
+
+    /// Check if we should send a notification (rate limiting).
+    fn should_notify(&self) -> bool {
+        match self.last_notification {
+            Some(last) => last.elapsed() >= NOTIFY_COOLDOWN,
+            None => true,
+        }
+    }
+
+    /// Check for hang based on agent state and output timeout.
+    pub fn check_hang(&mut self, agent_state: AgentState, last_output: Instant) -> bool {
+        let silent = last_output.elapsed();
+        let is_hang = match agent_state {
+            AgentState::Idle => false,                              // Waiting for input
+            AgentState::Starting => silent > Duration::from_secs(120),
+            AgentState::Thinking | AgentState::ToolUse => silent > Duration::from_secs(600),
+            _ => silent > Duration::from_secs(120),
+        };
+
+        if is_hang && self.state != HealthState::Hung {
+            self.state = HealthState::Hung;
+            return true; // First hang detection
+        }
+        if !is_hang && self.state == HealthState::Hung {
+            self.state = HealthState::Healthy;
+        }
+        false
+    }
+
+    /// Record an error state. Returns true if error loop detected (3x in 10min).
+    pub fn record_error(&mut self, state: AgentState) -> bool {
+        let now = Instant::now();
+        self.error_events.push_back((now, state));
+
+        // Clean old events
+        while let Some((t, _)) = self.error_events.front() {
+            if now.duration_since(*t) > CRASH_WINDOW {
+                self.error_events.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let count = self.error_events.iter()
+            .filter(|(_, s)| *s == state)
+            .count();
+
+        if count >= 3 {
+            self.state = HealthState::ErrorLoop;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get crash reason string for inject hint.
+    pub fn crash_reason(&self) -> &'static str {
+        match self.state {
+            HealthState::Recovering => "crash",
+            HealthState::Unstable => "repeated crashes",
+            HealthState::Failed => "too many crashes",
+            HealthState::ErrorLoop => "error loop",
+            _ => "unknown",
+        }
+    }
+
+    /// Reset health state (e.g., after manual restart).
+    pub fn reset(&mut self) {
+        self.state = HealthState::Healthy;
+        self.crash_times.clear();
+        self.total_crashes = 0;
+        self.error_events.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_first_crash_silent() {
+        let mut h = HealthTracker::new();
+        let (respawn, _delay, notify) = h.record_crash();
+        assert!(respawn);
+        assert!(!notify); // 1st crash = silent
+        assert_eq!(h.state, HealthState::Recovering);
+    }
+
+    #[test]
+    fn test_second_crash_notifies() {
+        let mut h = HealthTracker::new();
+        h.record_crash();
+        let (respawn, _delay, notify) = h.record_crash();
+        assert!(respawn);
+        assert!(notify); // 2nd crash = notify
+    }
+
+    #[test]
+    fn test_unstable_after_three() {
+        let mut h = HealthTracker::new();
+        h.record_crash();
+        h.record_crash();
+        h.record_crash();
+        assert_eq!(h.state, HealthState::Unstable);
+    }
+
+    #[test]
+    fn test_failed_after_max_retries() {
+        let mut h = HealthTracker::new();
+        for _ in 0..5 {
+            h.record_crash();
+        }
+        assert_eq!(h.state, HealthState::Failed);
+        let (respawn, _, _) = h.record_crash();
+        assert!(!respawn); // Failed state = no more respawn
+    }
+
+    #[test]
+    fn test_backoff_exponential() {
+        let mut h = HealthTracker::new();
+        h.record_crash();
+        assert_eq!(h.backoff_delay(), Duration::from_secs(5));
+        h.record_crash();
+        assert_eq!(h.backoff_delay(), Duration::from_secs(10));
+        h.record_crash();
+        assert_eq!(h.backoff_delay(), Duration::from_secs(20));
+        h.record_crash();
+        assert_eq!(h.backoff_delay(), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn test_error_loop() {
+        let mut h = HealthTracker::new();
+        assert!(!h.record_error(AgentState::RateLimit));
+        assert!(!h.record_error(AgentState::RateLimit));
+        assert!(h.record_error(AgentState::RateLimit)); // 3rd = loop
+        assert_eq!(h.state, HealthState::ErrorLoop);
+    }
+
+    #[test]
+    fn test_hang_idle_exempt() {
+        let mut h = HealthTracker::new();
+        let old = Instant::now() - Duration::from_secs(300);
+        assert!(!h.check_hang(AgentState::Idle, old)); // Idle never hangs
+    }
+
+    #[test]
+    fn test_hang_thinking_long_timeout() {
+        let mut h = HealthTracker::new();
+        let recent = Instant::now() - Duration::from_secs(100);
+        assert!(!h.check_hang(AgentState::Thinking, recent)); // 100s < 600s
+
+        let old = Instant::now() - Duration::from_secs(700);
+        assert!(h.check_hang(AgentState::Thinking, old)); // 700s > 600s
+    }
+
+    #[test]
+    fn test_notification_rate_limit() {
+        let mut h = HealthTracker::new();
+        h.record_crash();
+        let (_, _, notify1) = h.record_crash();
+        assert!(notify1); // First notification
+
+        let (_, _, notify2) = h.record_crash();
+        assert!(!notify2); // Rate limited (< 5 min)
+    }
+
+    #[test]
+    fn test_respawn_ok_recovers() {
+        let mut h = HealthTracker::new();
+        h.record_crash();
+        assert_eq!(h.state, HealthState::Recovering);
+        h.respawn_ok();
+        assert_eq!(h.state, HealthState::Healthy);
+    }
+}

@@ -4,6 +4,8 @@ mod backend;
 mod daemon;
 mod fleet;
 mod framing;
+#[allow(dead_code)]
+mod health;
 mod inbox;
 mod instructions;
 mod mcp;
@@ -305,7 +307,7 @@ fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
 
     agent::spawn_agent(
         &name, preset.command, &args, 120, 40, None, None,
-        preset.submit_key, &registry, None,
+        preset.submit_key, &registry, None, None,
     )?;
 
     eprintln!("[capture] Waiting {}s for output...", seconds);
@@ -428,6 +430,7 @@ fn test_attach(_home: &std::path::Path) -> anyhow::Result<()> {
         None,
         "\r",
         &registry,
+        None,
         None,
     )?;
 
