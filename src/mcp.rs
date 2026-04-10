@@ -339,10 +339,27 @@ async fn handle_tool_call(
 // --- Main MCP server loop ---
 
 pub async fn run(socket_path: &Path) -> Result<()> {
-    let session_id: u32 = std::env::var("AGEND_SESSION_ID")
-        .context("AGEND_SESSION_ID not set — MCP server must run inside an agend-terminal session")?
-        .parse()
-        .context("Invalid AGEND_SESSION_ID")?;
+    // Resolve session_id: try AGEND_SESSION_ID first, then lookup by AGEND_INSTANCE_NAME
+    let session_id: u32 = if let Ok(id) = std::env::var("AGEND_SESSION_ID") {
+        id.parse().context("Invalid AGEND_SESSION_ID")?
+    } else if let Ok(name) = std::env::var("AGEND_INSTANCE_NAME") {
+        // Resolve instance name → session_id via daemon List
+        let resp = send_to_daemon(socket_path, &Request::List).await?;
+        if let Response::Sessions { sessions } = resp {
+            sessions
+                .iter()
+                .find(|s| s.name.as_deref() == Some(&name))
+                .map(|s| s.id)
+                .with_context(|| format!("Instance '{name}' not found in daemon"))?
+        } else {
+            anyhow::bail!("Failed to list sessions for name resolution");
+        }
+    } else {
+        anyhow::bail!(
+            "Neither AGEND_SESSION_ID nor AGEND_INSTANCE_NAME set — \
+             MCP server must run inside an agend-terminal session"
+        );
+    };
 
     info!("MCP server starting (session_id: {session_id})");
 
