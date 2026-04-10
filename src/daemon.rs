@@ -141,6 +141,7 @@ pub fn run(
             working_dir.as_deref(),
             submit_key,
             &registry,
+            Some(home),
         )?;
 
         // Start TUI socket server for this agent in a new thread
@@ -156,6 +157,13 @@ pub fn run(
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
+
+    // Start API socket server
+    let api_reg = Arc::clone(&registry);
+    let api_home = home.to_path_buf();
+    std::thread::Builder::new()
+        .name("api_server".into())
+        .spawn(move || crate::api::serve(&api_home, api_reg))?;
 
     // Graceful shutdown
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -187,6 +195,7 @@ pub fn run(
         let sock = agent_socket_path(home, name);
         let _ = std::fs::remove_file(&sock);
     }
+    let _ = std::fs::remove_file(crate::api::api_socket_path(home));
 
     Ok(())
 }

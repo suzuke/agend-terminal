@@ -225,20 +225,27 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             };
             let text = args["text"].as_str().unwrap_or("");
 
-            // Enqueue in target's inbox
-            let msg = crate::inbox::InboxMessage {
-                from: format!("from:{instance_name}"),
-                text: text.to_string(),
-                kind: args.get("kind").and_then(|v| v.as_str()).map(String::from),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            };
-            let _ = crate::inbox::enqueue(&home, target, msg);
-
-            // Notify target PTY — look up submit_key from fleet config
-            let submit_key = get_submit_key(&home, target);
-            crate::inbox::notify_agent(&home, target, &format!("from:{instance_name}"), text, &submit_key);
-
-            json!({"status": "sent", "target": target})
+            // Route through daemon API socket for logging/visibility
+            match crate::api::call(&home, &json!({
+                "method": "send",
+                "params": {
+                    "from": instance_name,
+                    "target": target,
+                    "text": text,
+                    "kind": args.get("kind").and_then(|v| v.as_str()),
+                }
+            })) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    json!({"status": "sent", "target": target})
+                }
+                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
+                Err(e) => {
+                    // Fallback: direct delivery if API socket not available
+                    let submit_key = get_submit_key(&home, target);
+                    crate::inbox::deliver(&home, target, &format!("from:{instance_name}"), text, &submit_key, None);
+                    json!({"status": "sent_direct", "target": target, "note": format!("API unavailable: {e}")})
+                }
+            }
         }
         "inbox" => {
             let messages = crate::inbox::drain(&home, &instance_name);
@@ -257,47 +264,46 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 Some(c) => c,
                 None => return json!({"error": "missing 'command'"}),
             };
-
-            // Create working directory + generate instructions/MCP config
+            let cmd_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
             let work_dir = args
                 .get("working_directory")
                 .and_then(|v| v.as_str())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| home.join("workspaces").join(name));
-            std::fs::create_dir_all(&work_dir).ok();
-            crate::instructions::generate(&work_dir, command);
-            crate::mcp_config::configure(&work_dir, command);
+                .map(String::from)
+                .unwrap_or_else(|| home.join("workspaces").join(name).display().to_string());
 
-            // Config-only: MCP can't spawn into daemon's registry.
-            // Write a pending file for daemon to pick up on next restart.
-            let pending_dir = home.join("pending");
-            std::fs::create_dir_all(&pending_dir).ok();
-            let pending = json!({
-                "name": name,
-                "command": command,
-                "args": args.get("args").and_then(|v| v.as_str()).unwrap_or(""),
-                "working_directory": work_dir.display().to_string(),
-            });
-            let _ = std::fs::write(
-                pending_dir.join(format!("{name}.json")),
-                serde_json::to_string_pretty(&pending).unwrap_or_default(),
-            );
+            // Generate instructions + MCP config
+            let wd = std::path::PathBuf::from(&work_dir);
+            std::fs::create_dir_all(&wd).ok();
+            crate::instructions::generate(&wd, command);
+            crate::mcp_config::configure(&wd, command);
 
-            json!({
-                "status": "configured",
-                "name": name,
-                "note": "Instance configured. Restart fleet to activate.",
-                "working_directory": work_dir.display().to_string()
-            })
+            // Spawn via daemon API socket
+            match crate::api::call(&home, &json!({
+                "method": "spawn",
+                "params": {
+                    "name": name,
+                    "command": command,
+                    "args": cmd_args,
+                    "working_directory": work_dir,
+                }
+            })) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    json!({"status": "created", "name": name})
+                }
+                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("spawn failed")}),
+                Err(e) => json!({"error": format!("API unavailable: {e}")}),
+            }
         }
         "delete_instance" => {
             let name = match args["name"].as_str() {
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
-            // Remove socket + pending config
-            let sock = crate::daemon::agent_socket_path(&home, name);
-            let _ = std::fs::remove_file(&sock);
+            // Kill via daemon API socket
+            match crate::api::call(&home, &json!({"method": "kill", "params": {"name": name}})) {
+                Ok(_) => {}
+                Err(_) => {}
+            }
             let pending = home.join("pending").join(format!("{name}.json"));
             let _ = std::fs::remove_file(&pending);
             json!({"status": "deleted", "name": name, "note": "Socket removed. Process will exit when PTY closes."})
