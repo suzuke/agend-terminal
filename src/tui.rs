@@ -2,10 +2,10 @@
 //!
 //! Ctrl+B d to detach. Agent keeps running.
 
-use crate::framing::{self, TAG_DATA, TAG_RESIZE};
+use crate::framing::{self, TAG_DATA};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 
 /// RAII guard for crossterm raw mode.

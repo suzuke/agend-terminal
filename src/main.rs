@@ -12,7 +12,6 @@ mod vterm;
 // Telegram requires tokio — conditionally included
 mod telegram;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub fn home_dir() -> PathBuf {
@@ -232,7 +231,7 @@ fn run_tests(subcmd: &str, home: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn test_attach(home: &std::path::Path) -> anyhow::Result<()> {
+fn test_attach(_home: &std::path::Path) -> anyhow::Result<()> {
     eprintln!("[test:attach] Spawning bash...");
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 

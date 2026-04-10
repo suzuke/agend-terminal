@@ -180,13 +180,13 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_tool(tool: &str, args: &Value, agent_socket: &str) -> Value {
+fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
     match tool {
         "reply" => {
             let text = args["text"].as_str().unwrap_or("");
             // For now, log the reply. Telegram integration will route it.
             eprintln!("[mcp] reply: {text}");
-            json!({"status": "sent"})
+            json!({"status": "logged_only", "note": "Telegram not connected — reply logged but not delivered"})
         }
         "send" => {
             let target = match args["target"].as_str() {
@@ -205,7 +205,7 @@ fn handle_tool(tool: &str, args: &Value, agent_socket: &str) -> Value {
         }
         "inbox" => {
             // Placeholder — will be implemented with message queue
-            json!({"messages": []})
+            json!({"messages": [], "note": "Inbox not yet implemented in v2"})
         }
         "list_instances" => {
             let agents = list_agents();
