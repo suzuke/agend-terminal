@@ -17,6 +17,8 @@ pub struct TelegramChannel {
     topic_to_instance: HashMap<i32, String>,
     /// instance name → topic_id.
     instance_to_topic: HashMap<String, i32>,
+    /// Shutdown token for stopping the polling dispatcher.
+    shutdown_token: Option<teloxide::dispatching::ShutdownToken>,
 }
 
 impl TelegramChannel {
@@ -35,6 +37,22 @@ impl TelegramChannel {
             group_id: ChatId(group_id),
             topic_to_instance,
             instance_to_topic: topic_map,
+            shutdown_token: None,
+        }
+    }
+
+    /// Stop the polling dispatcher.
+    pub async fn shutdown(&self) {
+        if let Some(ref token) = self.shutdown_token {
+            match token.shutdown() {
+                Ok(f) => {
+                    f.await;
+                    info!("Telegram polling shutdown complete");
+                }
+                Err(_) => {
+                    warn!("Telegram shutdown token already used");
+                }
+            }
         }
     }
 
@@ -66,6 +84,7 @@ impl TelegramChannel {
                 ch.bot.clone()
             };
 
+            let channel_for_token = channel.clone();
             let handler = Update::filter_message().endpoint(
                 move |_bot: Bot, msg: Message| {
                     let channel = channel.clone();
@@ -80,10 +99,14 @@ impl TelegramChannel {
             );
 
             info!("Telegram polling started");
-            Dispatcher::builder(bot, handler)
-                .build()
-                .dispatch()
-                .await;
+            let mut dispatcher = Dispatcher::builder(bot, handler).build();
+            // Store shutdown token so fleet stop can terminate polling
+            {
+                let mut ch = channel_for_token.lock().await;
+                ch.shutdown_token = Some(dispatcher.shutdown_token());
+            }
+            dispatcher.dispatch().await;
+            info!("Telegram polling stopped");
         });
     }
 }
@@ -166,7 +189,7 @@ async fn handle_telegram_message(
     // Inject notification into PTY
     let notification = format!(
         "\n[user:{username} via telegram] {}\n",
-        if text.len() > 200 {
+        if text.chars().count() > 200 {
             let truncated: String = text.chars().take(200).collect();
             format!("{truncated}... (Run: agend-terminal inbox)")
         } else {

@@ -526,6 +526,20 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                 stopped.push(name.clone());
             }
 
+            // Stop Telegram polling if all sessions stopped
+            if names.is_empty() {
+                let telegram = {
+                    let st = state.lock().await;
+                    st.telegram.clone()
+                };
+                if let Some(tg) = telegram {
+                    let ch = tg.lock().await;
+                    ch.shutdown().await;
+                    let mut st = state.lock().await;
+                    st.telegram = None;
+                }
+            }
+
             send_response(&mut stream, &Response::FleetStopped { stopped }).await?;
         }
 
@@ -545,8 +559,19 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
             };
             if let Some(tg) = telegram {
                 let ch = tg.lock().await;
-                if let Err(e) = ch.send_to_topic(&sender_name, &text).await {
-                    warn!("Telegram send failed: {e:#}");
+                match ch.send_to_topic(&sender_name, &text).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!("Telegram send failed: {e:#}");
+                        send_response(
+                            &mut stream,
+                            &Response::Error {
+                                message: format!("Telegram send failed: {e}"),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                 }
             }
 
