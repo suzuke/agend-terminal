@@ -63,11 +63,19 @@ impl TelegramChannel {
             .get(instance_name)
             .with_context(|| format!("No topic mapped for instance '{instance_name}'"))?;
 
-        self.bot
-            .send_message(self.group_id, text)
-            .message_thread_id(ThreadId(MessageId(*topic_id)))
-            .await
-            .context("Failed to send Telegram message")?;
+        // General topic (topic_id=1) doesn't accept message_thread_id
+        if *topic_id == 1 {
+            self.bot
+                .send_message(self.group_id, text)
+                .await
+                .context("Failed to send Telegram message")?;
+        } else {
+            self.bot
+                .send_message(self.group_id, text)
+                .message_thread_id(ThreadId(MessageId(*topic_id)))
+                .await
+                .context("Failed to send Telegram message")?;
+        }
 
         Ok(())
     }
