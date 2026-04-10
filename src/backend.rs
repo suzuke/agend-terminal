@@ -76,7 +76,7 @@ impl Backend {
                 command: "gemini",
                 args: &["--yolo"],
                 ready_pattern: "Type your message|YOLO", // [実測]
-                submit_key: "\r",
+                submit_key: "\n\r", // [実測 v1] Gemini needs LF+CR
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",
