@@ -79,6 +79,14 @@ impl PtySession {
             cmd.env("AGEND_INSTANCE_NAME", n);
         }
 
+        // Add agend-terminal binary dir to PATH so agents can run it
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(bin_dir) = exe.parent() {
+                let current_path = std::env::var("PATH").unwrap_or_default();
+                cmd.env("PATH", format!("{}:{current_path}", bin_dir.display()));
+            }
+        }
+
         let child = pair.slave.spawn_command(cmd).context("Failed to spawn")?;
         let child_pid = child.process_id();
         drop(pair.slave);
