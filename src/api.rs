@@ -8,10 +8,11 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 /// Start API socket server (blocks calling thread).
-pub fn serve(home: &Path, registry: AgentRegistry) {
+pub fn serve(home: &Path, registry: AgentRegistry, shutdown: Arc<AtomicBool>) {
     let sock = api_socket_path(home);
     let _ = std::fs::remove_file(&sock);
 
@@ -27,9 +28,10 @@ pub fn serve(home: &Path, registry: AgentRegistry) {
     for stream in listener.incoming().flatten() {
         let reg = Arc::clone(&registry);
         let home = home.to_path_buf();
+        let shutdown = Arc::clone(&shutdown);
         std::thread::Builder::new()
             .name("api_handler".into())
-            .spawn(move || handle_session(stream, &reg, &home))
+            .spawn(move || handle_session(stream, &reg, &home, &shutdown))
             .ok();
     }
 }
@@ -38,7 +40,7 @@ pub fn api_socket_path(home: &Path) -> String {
     home.join("api.sock").display().to_string()
 }
 
-fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path) {
+fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shutdown: &Arc<AtomicBool>) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
     let mut writer = stream;
 
@@ -177,6 +179,11 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path) {
                     let notification = format!("[from:{from}] {display_text}{submit_key}");
                     let _ = agent::write_to_agent(handle, notification.as_bytes());
                 }
+                json!({"ok": true})
+            }
+            "shutdown" => {
+                eprintln!("[api] shutdown requested");
+                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                 json!({"ok": true})
             }
             _ => json!({"ok": false, "error": format!("unknown method: {method}")}),

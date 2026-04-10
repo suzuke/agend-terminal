@@ -141,6 +141,15 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        "stop" => {
+            match api::call(&home, &serde_json::json!({"method": "shutdown"})) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    println!("Daemon shutdown initiated.");
+                }
+                Ok(_) => eprintln!("Shutdown request failed."),
+                Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+            }
+        }
         "list" | "ls" => {
             for entry in std::fs::read_dir(&home)?.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -289,13 +298,6 @@ fn get_submit_key_for(home: &std::path::Path, name: &str) -> String {
         }
     }
     "\r".to_string() // default
-}
-
-fn inject(socket_path: &str, data: &[u8]) -> anyhow::Result<()> {
-    let mut stream = std::os::unix::net::UnixStream::connect(socket_path)?;
-    framing::write_frame(&mut stream, data)?;
-    println!("Injected {} bytes", data.len());
-    Ok(())
 }
 
 fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
