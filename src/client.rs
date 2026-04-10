@@ -571,9 +571,23 @@ async fn attach_bridge(stream: UnixStream) -> Result<()> {
         }
     });
 
+    // Also listen for SIGINT/SIGTERM to ensure clean exit from raw mode
+    let mut sigint = signal(SignalKind::interrupt()).ok();
+    let mut sigterm = signal(SignalKind::terminate()).ok();
+
     tokio::select! {
         _ = &mut stdin_handle => { output_handle.abort(); },
         _ = &mut output_handle => { stdin_handle.abort(); },
+        _ = async { if let Some(ref mut s) = sigint { s.recv().await } else { std::future::pending().await } } => {
+            stdin_handle.abort();
+            output_handle.abort();
+            eprintln!("\r\n[Interrupted]");
+        },
+        _ = async { if let Some(ref mut s) = sigterm { s.recv().await } else { std::future::pending().await } } => {
+            stdin_handle.abort();
+            output_handle.abort();
+            eprintln!("\r\n[Terminated]");
+        },
     }
     winch_handle.abort();
 
