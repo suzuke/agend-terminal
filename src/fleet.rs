@@ -11,6 +11,27 @@ pub struct FleetConfig {
     pub instances: HashMap<String, InstanceConfig>,
     #[serde(default)]
     pub teams: HashMap<String, TeamConfig>,
+    /// Channel configuration (e.g., Telegram).
+    pub channel: Option<ChannelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ChannelConfig {
+    #[serde(rename = "telegram")]
+    Telegram {
+        /// Env var name containing the bot token.
+        bot_token_env: String,
+        /// Telegram group chat ID.
+        group_id: i64,
+        /// Mode: "topic" for forum topics.
+        #[serde(default = "default_mode")]
+        mode: String,
+    },
+}
+
+fn default_mode() -> String {
+    "topic".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -38,6 +59,8 @@ pub struct InstanceConfig {
     pub env: HashMap<String, String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
+    /// Telegram topic/thread ID for this instance.
+    pub topic_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +128,7 @@ impl FleetConfig {
             role: inst.role.clone(),
             cols,
             rows,
+            topic_id: inst.topic_id,
         })
     }
 
@@ -126,6 +150,7 @@ pub struct ResolvedInstance {
     pub role: Option<String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
+    pub topic_id: Option<i32>,
 }
 
 fn dirs_home() -> Option<PathBuf> {

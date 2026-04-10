@@ -1,0 +1,24 @@
+# Example fleet config with Telegram channel
+# Set AGEND_BOT_TOKEN env var before using
+
+defaults:
+  command: claude
+  args: ["--dangerously-skip-permissions"]
+  ready_pattern: "All tools are now trusted"
+
+channel:
+  type: telegram
+  bot_token_env: AGEND_BOT_TOKEN
+  group_id: -100123456789
+  mode: topic
+
+instances:
+  general:
+    role: "Fleet coordinator"
+    working_directory: ~/Documents/Hack/agend
+    topic_id: 1
+
+  blog-writer:
+    role: "Blog content writer"
+    working_directory: ~/Documents/Hack/blog
+    topic_id: 42

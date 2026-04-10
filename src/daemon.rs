@@ -1,6 +1,7 @@
-use crate::fleet::FleetConfig;
+use crate::fleet::{ChannelConfig, FleetConfig};
 use crate::protocol::{self, InboxMessage, Request, Response, SessionInfo};
 use crate::pty_session::PtySession;
+use crate::telegram::TelegramChannel;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ pub struct DaemonState {
     pub inboxes: HashMap<u32, VecDeque<InboxMessage>>,
     /// Loaded fleet config (if any).
     pub fleet_config: Option<FleetConfig>,
+    /// Telegram channel (if configured).
+    pub telegram: Option<Arc<Mutex<TelegramChannel>>>,
 }
 
 impl DaemonState {
@@ -34,10 +37,11 @@ impl DaemonState {
             log_dir,
             inboxes: HashMap::new(),
             fleet_config: None,
+            telegram: None,
         }
     }
 
-    fn find_session_by_name(&self, name: &str) -> Option<(u32, Arc<PtySession>)> {
+    pub fn find_session_by_name(&self, name: &str) -> Option<(u32, Arc<PtySession>)> {
         let id = self.name_to_id.get(name)?;
         let session = self.sessions.get(id)?;
         Some((*id, session.clone()))
@@ -50,7 +54,7 @@ impl DaemonState {
             .map(|(name, _)| name.clone())
     }
 
-    fn enqueue_message(&mut self, session_id: u32, msg: InboxMessage) {
+    pub fn enqueue_message(&mut self, session_id: u32, msg: InboxMessage) {
         let queue = self.inboxes.entry(session_id).or_default();
         if queue.len() >= MAX_INBOX_SIZE {
             queue.pop_front();
@@ -443,6 +447,42 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                         }
                     }
 
+                    // Set up Telegram channel if configured
+                    if let Some(ChannelConfig::Telegram {
+                        ref bot_token_env,
+                        group_id,
+                        ..
+                    }) = config.channel
+                    {
+                        match std::env::var(bot_token_env) {
+                            Ok(token) => {
+                                // Build topic map from instances
+                                let topic_map: HashMap<String, i32> = config
+                                    .instances
+                                    .iter()
+                                    .filter_map(|(name, inst)| {
+                                        inst.topic_id.map(|tid| (name.clone(), tid))
+                                    })
+                                    .collect();
+
+                                let channel = Arc::new(Mutex::new(TelegramChannel::new(
+                                    &token, group_id, topic_map,
+                                )));
+                                {
+                                    let mut st = state.lock().await;
+                                    st.telegram = Some(channel.clone());
+                                }
+                                TelegramChannel::start_polling(channel, state.clone());
+                                info!("Telegram channel configured (group_id: {group_id})");
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "Telegram bot token env '{bot_token_env}' not set, skipping"
+                                );
+                            }
+                        }
+                    }
+
                     send_response(&mut stream, &Response::FleetStarted { started }).await?;
                 }
                 Err(e) => {
@@ -491,13 +531,25 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
 
         // --- Agent communication ---
         Request::Reply { session_id, text } => {
-            // For now, log the reply. Channel adapters (Phase 3) will route to Telegram etc.
             let sender_name = {
                 let st = state.lock().await;
                 st.find_name_by_id(session_id)
                     .unwrap_or_else(|| format!("session-{session_id}"))
             };
             info!("[reply from {sender_name}] {text}");
+
+            // Route to Telegram if configured
+            let telegram = {
+                let st = state.lock().await;
+                st.telegram.clone()
+            };
+            if let Some(tg) = telegram {
+                let ch = tg.lock().await;
+                if let Err(e) = ch.send_to_topic(&sender_name, &text).await {
+                    warn!("Telegram send failed: {e:#}");
+                }
+            }
+
             send_response(&mut stream, &Response::Sent).await?;
         }
         Request::SendMessage {
