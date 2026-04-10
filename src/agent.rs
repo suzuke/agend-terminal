@@ -224,6 +224,16 @@ pub fn spawn_agent(
                                 dialog_dismissed = true;
                                 detect_buf.clear();
                             }
+                            // OpenCode update dialog: dismiss with Skip (Tab + Enter) or Escape
+                            if clean.contains("Update Available") || clean.contains("Skip  Confirm") {
+                                eprintln!("[{n}] auto-dismissing update dialog");
+                                // Try multiple dismiss methods: Escape, then Tab+Enter (Skip)
+                                let _ = pw
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .write_all(b"\x1b\r"); // Escape + Enter (select Skip if focused)
+                                detect_buf.clear();
+                            }
                         }
 
                         // Feed VTerm + state detection + broadcast (under same lock = atomic)
