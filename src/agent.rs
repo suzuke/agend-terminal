@@ -3,6 +3,8 @@
 //! Sync design: std::thread for PTY I/O, crossbeam broadcast for output distribution.
 //! Single Mutex on AgentCore ensures atomic subscribe+dump.
 
+use crate::backend::Backend;
+use crate::state::StateTracker;
 use crate::vterm::VTerm;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
@@ -15,8 +17,8 @@ pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Core state for one agent — protected by a single Mutex for atomic operations.
 pub struct AgentCore {
     pub vterm: VTerm,
-    /// Per-subscriber senders — each subscriber gets its own channel.
     pub subscribers: Vec<crossbeam::channel::Sender<Vec<u8>>>,
+    pub state: StateTracker,
 }
 
 /// Handle to interact with an agent.
@@ -147,9 +149,11 @@ pub fn spawn_agent(
         .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
     let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
+    let detected_backend = Backend::from_command(command);
     let core = Arc::new(Mutex::new(AgentCore {
         vterm: VTerm::new(cols, rows),
         subscribers: Vec::new(),
+        state: StateTracker::new(detected_backend.as_ref()),
     }));
 
     // Register in registry
@@ -219,11 +223,14 @@ pub fn spawn_agent(
                             }
                         }
 
-                        // Feed VTerm + broadcast to all subscribers (under same lock = atomic)
+                        // Feed VTerm + state detection + broadcast (under same lock = atomic)
                         {
                             let mut core =
                                 core2.lock().unwrap_or_else(|e| e.into_inner());
                             core.vterm.process(data);
+                            // State detection: strip ANSI, feed to tracker
+                            let stripped = strip_ansi(&String::from_utf8_lossy(data));
+                            core.state.feed(&stripped);
                             // Send to each subscriber, remove dead ones
                             core.subscribers
                                 .retain(|tx| tx.send(data.to_vec()).is_ok());

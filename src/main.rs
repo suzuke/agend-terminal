@@ -8,6 +8,7 @@ mod inbox;
 mod instructions;
 mod mcp;
 mod mcp_config;
+mod state;
 mod telegram;
 mod tui;
 mod verify;
