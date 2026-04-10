@@ -5,7 +5,7 @@ use crate::protocol::{self, Request, Response};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -364,19 +364,21 @@ pub async fn run(socket_path: &Path) -> Result<()> {
     info!("MCP server starting (session_id: {session_id})");
 
     let stdin = io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
     let mut stdout = io::stdout();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
+    loop {
+        // Read Content-Length framed message from stdin
+        let body = match read_content_length_message(&mut reader) {
+            Ok(Some(b)) => b,
+            Ok(None) => break, // EOF
+            Err(e) => {
+                error!("Read error: {e}");
+                break;
+            }
         };
 
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let req: JsonRpcRequest = match serde_json::from_str(&line) {
+        let req: JsonRpcRequest = match serde_json::from_str(&body) {
             Ok(r) => r,
             Err(e) => {
                 error!("Invalid JSON-RPC: {e}");
@@ -469,10 +471,43 @@ pub async fn run(socket_path: &Path) -> Result<()> {
         };
 
         let json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{json}")?;
-        stdout.flush()?;
+        write_content_length_message(&mut stdout, &json)?;
     }
 
     info!("MCP server exiting");
+    Ok(())
+}
+
+/// Read a Content-Length framed message from a BufReader.
+/// Format: `Content-Length: N\r\n\r\n{json body of N bytes}`
+fn read_content_length_message(reader: &mut BufReader<io::StdinLock>) -> Result<Option<String>> {
+    // Read headers until empty line
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(None); // EOF
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break; // End of headers
+        }
+        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+            content_length = val.trim().parse().ok();
+        }
+    }
+
+    let len = content_length.context("Missing Content-Length header")?;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    let s = String::from_utf8(body).context("Invalid UTF-8 in message body")?;
+    Ok(Some(s))
+}
+
+/// Write a Content-Length framed message to stdout.
+fn write_content_length_message(stdout: &mut io::Stdout, json: &str) -> Result<()> {
+    write!(stdout, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
+    stdout.flush()?;
     Ok(())
 }
