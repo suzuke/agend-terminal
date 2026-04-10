@@ -1,3 +1,4 @@
+use crate::vterm::VTerm;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
@@ -16,15 +17,12 @@ pub struct PtySession {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     exit_status: Arc<Mutex<Option<i32>>>,
-    /// Current terminal size.
     size: Arc<Mutex<(u16, u16)>>,
-    /// Whether the CLI is ready (matched ready_pattern).
     ready: Arc<AtomicBool>,
-    /// Broadcast channel for PTY output — attach clients subscribe here.
     output_tx: broadcast::Sender<Vec<u8>>,
-    /// Notified when the output drainer exits (PTY EOF).
     pub drainer_done: Arc<Notify>,
-    /// Process ID for signaling.
+    /// Virtual terminal for screen state tracking.
+    vterm: Arc<std::sync::Mutex<VTerm>>,
     #[allow(dead_code)]
     child_pid: Option<u32>,
 }
@@ -112,6 +110,7 @@ impl PtySession {
         let ready = Arc::new(AtomicBool::new(ready_pattern.is_none()));
 
         let drainer_done = Arc::new(Notify::new());
+        let vterm = Arc::new(std::sync::Mutex::new(VTerm::new(cols, rows)));
 
         // Spawn background output drainer — owns a clone of output_tx
         Self::spawn_output_drainer(
@@ -122,6 +121,7 @@ impl PtySession {
             ready.clone(),
             id,
             drainer_done.clone(),
+            vterm.clone(),
         );
 
         Ok(Self {
@@ -134,6 +134,7 @@ impl PtySession {
             exit_status: Arc::new(Mutex::new(None)),
             size: Arc::new(Mutex::new((cols, rows))),
             ready,
+            vterm,
             output_tx,
             drainer_done,
             child_pid,
@@ -149,6 +150,7 @@ impl PtySession {
         ready: Arc<AtomicBool>,
         session_id: u32,
         drainer_done: Arc<Notify>,
+        vterm: Arc<std::sync::Mutex<VTerm>>,
     ) {
         tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; 4096];
@@ -163,6 +165,11 @@ impl PtySession {
 
                 let _ = log_file.write_all(data);
                 let _ = log_file.flush();
+
+                // Feed into virtual terminal for screen state tracking
+                if let Ok(mut vt) = vterm.lock() {
+                    vt.process(data);
+                }
 
                 // Check ready pattern
                 if !ready.load(Ordering::Relaxed) {
@@ -184,7 +191,6 @@ impl PtySession {
 
                 let _ = tx.send(data.to_vec());
             }
-            // Signal that drainer has exited (PTY EOF)
             drainer_done.notify_waiters();
         });
     }
@@ -206,7 +212,7 @@ impl PtySession {
         .await?
     }
 
-    /// Resize the PTY.
+    /// Resize the PTY and virtual terminal.
     pub async fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         let master = self.master.lock().await;
         master
@@ -218,7 +224,15 @@ impl PtySession {
             })
             .context("PTY resize failed")?;
         *self.size.lock().await = (cols, rows);
+        if let Ok(mut vt) = self.vterm.lock() {
+            vt.resize(cols, rows);
+        }
         Ok(())
+    }
+
+    /// Dump the current virtual terminal screen as ANSI escape sequences.
+    pub fn dump_screen(&self) -> Vec<u8> {
+        self.vterm.lock().map(|vt| vt.dump_screen()).unwrap_or_default()
     }
 
     pub async fn get_size(&self) -> (u16, u16) {
