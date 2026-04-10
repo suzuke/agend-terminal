@@ -1,6 +1,7 @@
 mod client;
 mod daemon;
 mod fleet;
+mod instructions;
 mod protocol;
 mod pty_session;
 mod telegram;

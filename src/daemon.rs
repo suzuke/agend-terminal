@@ -1,4 +1,5 @@
 use crate::fleet::{ChannelConfig, FleetConfig};
+use crate::instructions;
 use crate::protocol::{self, InboxMessage, Request, Response, SessionInfo};
 use crate::pty_session::PtySession;
 use crate::telegram::TelegramChannel;
@@ -418,6 +419,11 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
 
                     for name in &instance_names {
                         if let Some(resolved) = config.resolve_instance(name) {
+                            // Generate instructions before spawn
+                            if let Some(ref dir) = resolved.working_directory {
+                                instructions::generate(dir, &resolved.command);
+                            }
+
                             match spawn_session(
                                 &state,
                                 Some(name),
@@ -618,7 +624,8 @@ async fn handle_client(mut stream: UnixStream, state: Arc<Mutex<DaemonState>>) -
                     } else {
                         text.clone()
                     };
-                    let notification = format!("\n[from:{sender_name}] {display_text}\n");
+                    let submit = if target_session.command.contains("gemini") { "\n\r" } else { "\r" };
+                    let notification = format!("\n[from:{sender_name}] {display_text}{submit}");
                     let _ = target_session.write_input(notification.as_bytes()).await;
 
                     info!("[{sender_name} → {target}] message delivered");
