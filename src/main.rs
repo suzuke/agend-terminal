@@ -123,12 +123,23 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("Usage: agend-terminal inject <name> <text>");
                 std::process::exit(1);
             }
-            // Look up submit_key from API
+            // Inject via API socket (not TUI socket — avoids kicking attach client)
             let submit_key = get_submit_key_for(&home, name);
-            let mut data = text.into_bytes();
-            data.extend_from_slice(submit_key.as_bytes());
-            let sock = daemon::agent_socket_path(&home, name);
-            inject(&sock, &data)?;
+            let data = format!("{text}{submit_key}");
+            match api::call(&home, &serde_json::json!({
+                "method": "inject",
+                "params": {"name": name, "data": data}
+            })) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    println!("Injected {} bytes", data.len());
+                }
+                Ok(resp) => {
+                    eprintln!("Inject failed: {}", resp["error"].as_str().unwrap_or("unknown"));
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to daemon: {e}");
+                }
+            }
         }
         "list" | "ls" => {
             for entry in std::fs::read_dir(&home)?.flatten() {

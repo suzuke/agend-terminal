@@ -197,5 +197,7 @@ pub fn run(
     }
     let _ = std::fs::remove_file(crate::api::api_socket_path(home));
 
-    Ok(())
+    eprintln!("[daemon] exiting.");
+    // Force exit — listener threads block on accept() and can't be interrupted gracefully
+    std::process::exit(0);
 }

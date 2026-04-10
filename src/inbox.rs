@@ -83,6 +83,9 @@ pub fn deliver(
 }
 
 /// Inject a notification into an agent's PTY via TUI socket.
+/// Inject a notification into an agent's PTY.
+/// When called from daemon (has registry), uses direct write.
+/// When called from external process (MCP), uses API socket.
 pub fn notify_agent(
     home: &Path,
     agent_name: &str,
@@ -98,8 +101,12 @@ pub fn notify_agent(
     };
     let notification = format!("[{from}] {display_text}{submit_key}");
 
-    let sock = crate::daemon::agent_socket_path(home, agent_name);
-    if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&sock) {
-        let _ = crate::framing::write_frame(&mut stream, notification.as_bytes());
-    }
+    // Use API socket to inject (doesn't kick attach clients)
+    let _ = crate::api::call(
+        home,
+        &serde_json::json!({
+            "method": "inject",
+            "params": {"name": agent_name, "data": notification}
+        }),
+    );
 }
