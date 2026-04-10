@@ -35,7 +35,7 @@ impl Backend {
             Backend::ClaudeCode => BackendPreset {
                 command: "claude",
                 args: &["--dangerously-skip-permissions"],
-                ready_pattern: "Type your",
+                ready_pattern: "bypass permissions|❯", // [実測]
                 submit_key: "\r",
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
@@ -45,9 +45,9 @@ impl Backend {
             Backend::KiroCli => BackendPreset {
                 command: "kiro-cli",
                 args: &["chat", "--trust-all-tools"],
-                ready_pattern: "ready|chat|>",
+                ready_pattern: "All tools are now trusted|!>", // [実測]
                 submit_key: "\r",
-                quit_command: "/exit",
+                quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
                 mcp_config_path: ".kiro/settings/mcp.json",
                 ready_timeout_secs: 30,
@@ -55,9 +55,9 @@ impl Backend {
             Backend::Codex => BackendPreset {
                 command: "codex",
                 args: &["--full-auto"],
-                ready_pattern: ">|codex",
+                ready_pattern: "OpenAI Codex|›", // [実測]
                 submit_key: "\r",
-                quit_command: "/exit",
+                quit_command: "exit", // Ctrl+C based
                 instructions_path: "AGENTS.md",
                 mcp_config_path: "opencode.json", // codex doesn't have file-based MCP config
                 ready_timeout_secs: 20,
@@ -65,17 +65,17 @@ impl Backend {
             Backend::OpenCode => BackendPreset {
                 command: "opencode",
                 args: &[],
-                ready_pattern: "opencode|>",
+                ready_pattern: "Ask anything|tab agents", // [実測]
                 submit_key: "\r",
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
-                ready_timeout_secs: 20,
+                ready_timeout_secs: 30, // May be blocked by update dialog
             },
             Backend::Gemini => BackendPreset {
                 command: "gemini",
                 args: &["--yolo"],
-                ready_pattern: ">|gemini",
+                ready_pattern: "Type your message|YOLO", // [実測]
                 submit_key: "\r",
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
