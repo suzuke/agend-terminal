@@ -37,12 +37,7 @@ fn upsert_mcp_servers(path: &Path) -> Result<()> {
         json!({})
     };
 
-    if let Some(servers) = config.get("mcpServers") {
-        if servers.get("agend-terminal").is_some() {
-            return Ok(());
-        }
-    }
-
+    // Always update — ensures env vars and binary path are current
     if config.get("mcpServers").is_none() {
         config["mcpServers"] = json!({});
     }
