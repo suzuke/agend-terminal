@@ -24,6 +24,8 @@ pub struct BackendPreset {
     pub inject_prefix: &'static str,
     /// Whether inject should use per-byte typed write (for bubbletea TUIs).
     pub typed_inject: bool,
+    /// Resume flag to continue previous session.
+    pub resume_args: &'static [&'static str],
     pub quit_command: &'static str,
     /// Relative path for instructions file from working dir.
     pub instructions_path: &'static str,
@@ -39,10 +41,11 @@ impl Backend {
             Backend::ClaudeCode => BackendPreset {
                 command: "claude",
                 args: &["--dangerously-skip-permissions"],
-                ready_pattern: "bypass permissions|❯", // [実測]
+                ready_pattern: "bypass permissions|❯",
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
+                resume_args: &["--continue"],
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
                 mcp_config_path: ".claude/settings.local.json",
@@ -51,10 +54,11 @@ impl Backend {
             Backend::KiroCli => BackendPreset {
                 command: "kiro-cli",
                 args: &["chat", "--trust-all-tools"],
-                ready_pattern: "All tools are now trusted|!>", // [実測]
+                ready_pattern: "All tools are now trusted|!>",
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
+                resume_args: &["--resume"],
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
                 mcp_config_path: ".kiro/settings/mcp.json",
@@ -63,34 +67,37 @@ impl Backend {
             Backend::Codex => BackendPreset {
                 command: "codex",
                 args: &["--full-auto"],
-                ready_pattern: "OpenAI Codex|›", // [実測]
+                ready_pattern: "OpenAI Codex|›",
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
+                resume_args: &[], // codex resume needs different command structure
                 quit_command: "exit",
                 instructions_path: "AGENTS.md",
-                mcp_config_path: "opencode.json", // codex doesn't have file-based MCP config
+                mcp_config_path: "opencode.json",
                 ready_timeout_secs: 20,
             },
             Backend::OpenCode => BackendPreset {
                 command: "opencode",
                 args: &[],
-                ready_pattern: "Ask anything|tab agents", // [実測]
+                ready_pattern: "Ask anything|tab agents",
                 submit_key: "\r",
                 inject_prefix: "\r",
                 typed_inject: true,
+                resume_args: &["--continue"],
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
-                ready_timeout_secs: 45, // May be blocked by update dialog
+                ready_timeout_secs: 45,
             },
             Backend::Gemini => BackendPreset {
                 command: "gemini",
                 args: &["--yolo"],
-                ready_pattern: "Type your message|YOLO", // [実測]
-                submit_key: "\n\r", // [実測 v1] Gemini needs LF+CR
+                ready_pattern: "Type your message|YOLO",
+                submit_key: "\n\r",
                 inject_prefix: "\r",
                 typed_inject: true,
+                resume_args: &["--resume", "latest"],
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",

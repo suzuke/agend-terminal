@@ -106,7 +106,10 @@ fn main() -> anyhow::Result<()> {
                     let (preset_args, submit_key) = match detected {
                         Some(ref b) => {
                             let p = b.preset();
-                            (p.args.iter().map(|s| s.to_string()).collect(), p.submit_key.to_string())
+                            let mut a: Vec<String> = p.args.iter().map(|s| s.to_string()).collect();
+                            // Add resume args to continue previous session
+                            a.extend(p.resume_args.iter().map(|s| s.to_string()));
+                            (a, p.submit_key.to_string())
                         }
                         None => (Vec::new(), "\r".to_string()),
                     };
@@ -366,8 +369,18 @@ fn start_with_fleet(home: &std::path::Path, fleet_path: &std::path::Path) -> any
                 mcp_config::configure(dir, &resolved.command);
             }
 
-            // Inject --mcp-config for Claude if working_directory has mcp-config.json
+            // Add resume args to continue previous session
             let mut args = resolved.args;
+            if let Some(ref b) = crate::backend::Backend::from_command(&resolved.command) {
+                let p = b.preset();
+                for ra in p.resume_args {
+                    if !args.iter().any(|a| a == *ra) {
+                        args.push(ra.to_string());
+                    }
+                }
+            }
+
+            // Inject --mcp-config for Claude if working_directory has mcp-config.json
             if let Some(ref dir) = resolved.working_directory {
                 let mcp_config = dir.join("mcp-config.json");
                 if resolved.command.contains("claude") {
