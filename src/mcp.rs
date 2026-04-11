@@ -64,6 +64,7 @@ fn tool_definitions() -> Value {
                         "name": { "type": "string", "description": "Instance name" },
                         "command": { "type": "string", "description": "Command (e.g. claude, codex)" },
                         "args": { "type": "string", "description": "Space-separated args" },
+                        "model": { "type": "string", "description": "Model name (e.g. opus, sonnet, gpt-4o)" },
                         "working_directory": { "type": "string", "description": "Working directory" }
                     },
                     "required": ["name", "command"]
@@ -78,6 +79,62 @@ fn tool_definitions() -> Value {
                         "name": { "type": "string", "description": "Instance name" }
                     },
                     "required": ["name"]
+                }
+            },
+            {
+                "name": "describe_instance",
+                "description": "Get detailed information about an agent instance.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Instance name" }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "set_display_name",
+                "description": "Set your display name (shown in messages and logs).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Display name" }
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "set_description",
+                "description": "Set a description for this agent instance.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "description": { "type": "string", "description": "Description text" }
+                    },
+                    "required": ["description"]
+                }
+            },
+            {
+                "name": "react",
+                "description": "React to the last message with an emoji.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "emoji": { "type": "string", "description": "Emoji to react with (e.g. thumbsup, heart)" }
+                    },
+                    "required": ["emoji"]
+                }
+            },
+            {
+                "name": "edit_message",
+                "description": "Edit a previously sent message.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "message_id": { "type": "string", "description": "ID of the message to edit" },
+                        "text": { "type": "string", "description": "New message text" }
+                    },
+                    "required": ["message_id", "text"]
                 }
             }
         ]
@@ -264,7 +321,14 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 Some(c) => c,
                 None => return json!({"error": "missing 'command'"}),
             };
-            let cmd_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("");
+            let mut cmd_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // Append --model if provided
+            if let Some(model) = args.get("model").and_then(|v| v.as_str()) {
+                if !model.is_empty() {
+                    if !cmd_args.is_empty() { cmd_args.push(' '); }
+                    cmd_args.push_str(&format!("--model {model}"));
+                }
+            }
             let work_dir = args
                 .get("working_directory")
                 .and_then(|v| v.as_str())
@@ -283,7 +347,7 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 "params": {
                     "name": name,
                     "command": command,
-                    "args": cmd_args,
+                    "args": &cmd_args,
                     "working_directory": work_dir,
                 }
             })) {
@@ -307,6 +371,74 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             let pending = home.join("pending").join(format!("{name}.json"));
             let _ = std::fs::remove_file(&pending);
             json!({"status": "deleted", "name": name, "note": "Socket removed. Process will exit when PTY closes."})
+        }
+        "describe_instance" => {
+            let name = args["name"].as_str().unwrap_or("");
+            match crate::api::call(&home, &json!({"method": "list"})) {
+                Ok(resp) => {
+                    if let Some(agents) = resp["result"]["agents"].as_array() {
+                        match agents.iter().find(|a| a["name"].as_str() == Some(name)) {
+                            Some(agent) => {
+                                // Add metadata from file
+                                let meta_path = home.join("metadata").join(format!("{name}.json"));
+                                let meta = std::fs::read_to_string(&meta_path)
+                                    .and_then(|c| Ok(serde_json::from_str::<Value>(&c).unwrap_or(json!({}))))
+                                    .unwrap_or(json!({}));
+                                let mut info = agent.clone();
+                                if let Some(obj) = info.as_object_mut() {
+                                    if let Some(m) = meta.as_object() {
+                                        for (k, v) in m {
+                                            obj.insert(k.clone(), v.clone());
+                                        }
+                                    }
+                                }
+                                json!({"instance": info})
+                            }
+                            None => json!({"error": format!("Instance '{name}' not found")}),
+                        }
+                    } else {
+                        json!({"error": "failed to list instances"})
+                    }
+                }
+                Err(e) => json!({"error": format!("API unavailable: {e}")}),
+            }
+        }
+        "set_display_name" => {
+            let display_name = args["name"].as_str().unwrap_or("");
+            let meta_dir = home.join("metadata");
+            std::fs::create_dir_all(&meta_dir).ok();
+            let meta_path = meta_dir.join(format!("{instance_name}.json"));
+            let mut meta: Value = std::fs::read_to_string(&meta_path)
+                .and_then(|c| Ok(serde_json::from_str(&c).unwrap_or(json!({}))))
+                .unwrap_or(json!({}));
+            meta["display_name"] = json!(display_name);
+            let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default());
+            json!({"display_name": display_name})
+        }
+        "set_description" => {
+            let desc = args["description"].as_str().unwrap_or("");
+            let meta_dir = home.join("metadata");
+            std::fs::create_dir_all(&meta_dir).ok();
+            let meta_path = meta_dir.join(format!("{instance_name}.json"));
+            let mut meta: Value = std::fs::read_to_string(&meta_path)
+                .and_then(|c| Ok(serde_json::from_str(&c).unwrap_or(json!({}))))
+                .unwrap_or(json!({}));
+            meta["description"] = json!(desc);
+            let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default());
+            json!({"description": desc})
+        }
+        "react" => {
+            let emoji = args["emoji"].as_str().unwrap_or("");
+            eprintln!("[mcp] react from {instance_name}: {emoji}");
+            // TODO: route to Telegram when implemented
+            json!({"status": "logged", "emoji": emoji, "note": "Telegram react not yet implemented"})
+        }
+        "edit_message" => {
+            let message_id = args["message_id"].as_str().unwrap_or("");
+            let text = args["text"].as_str().unwrap_or("");
+            eprintln!("[mcp] edit_message from {instance_name}: {message_id}");
+            // TODO: route to Telegram when implemented
+            json!({"status": "logged", "message_id": message_id, "note": "Telegram edit not yet implemented"})
         }
         _ => json!({"error": format!("unknown tool: {tool}")}),
     }
