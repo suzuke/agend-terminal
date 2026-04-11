@@ -135,7 +135,8 @@ pub fn run_dir(home: &Path) -> PathBuf {
 }
 
 pub fn agent_socket_path(home: &Path, name: &str) -> String {
-    run_dir(home).join(format!("{name}.sock")).display().to_string()
+    let dir = find_active_run_dir(home).unwrap_or_else(|| run_dir(home));
+    dir.join(format!("{name}.sock")).display().to_string()
 }
 
 /// Find any active run directory (for CLI commands connecting to daemon).
