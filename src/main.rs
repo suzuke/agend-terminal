@@ -5,6 +5,7 @@ mod backend;
 mod channel;
 mod cli;
 mod daemon;
+mod decisions;
 #[allow(dead_code)]
 mod error;
 mod fleet;
@@ -15,7 +16,10 @@ mod inbox;
 mod instructions;
 mod mcp;
 mod mcp_config;
+mod schedules;
 mod state;
+mod tasks;
+mod teams;
 mod telegram;
 mod tui;
 mod verify;
