@@ -387,6 +387,13 @@ pub fn run(
                     let home = home.to_path_buf();
                     let tx = crash_tx.clone();
 
+                    // Save health tracker from old handle before respawn replaces it
+                    let saved_health = {
+                        let r = registry.lock().unwrap_or_else(|e| e.into_inner());
+                        r.get(&crashed_name)
+                            .and_then(|h| h.core.lock().ok().map(|c| c.health.clone()))
+                    };
+
                     if let Err(e) = std::thread::Builder::new()
                         .name(format!("{crashed_name}_respawn"))
                         .spawn(move || {
@@ -402,11 +409,14 @@ pub fn run(
                                     eprintln!("[health] {}: respawned", config.name);
                                     crate::event_log::log(&home, "respawn", &config.name, "agent respawned");
 
-                                    // Mark respawn OK in core.health
+                                    // Restore health tracker from old handle + mark respawn OK
                                     {
                                         let r = reg.lock().unwrap_or_else(|e| e.into_inner());
                                         if let Some(handle) = r.get(&config.name) {
                                             let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+                                            if let Some(ref old_health) = saved_health {
+                                                core.health = old_health.clone();
+                                            }
                                             core.health.respawn_ok();
                                         }
                                     }
