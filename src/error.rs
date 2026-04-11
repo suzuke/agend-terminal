@@ -4,6 +4,7 @@
 use std::fmt;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum AgendError {
     /// PTY spawn failed.
     SpawnFailed(String),
@@ -45,3 +46,5 @@ impl From<std::io::Error> for AgendError {
         Self::Io(e)
     }
 }
+
+pub type Result<T> = std::result::Result<T, AgendError>;

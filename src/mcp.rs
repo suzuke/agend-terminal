@@ -41,6 +41,7 @@ fn tool_definitions() -> Value {
     tools.extend(team_tools());
     tools.extend(schedule_tools());
     tools.extend(repo_tools());
+    tools.extend(deploy_tools());
     json!({"tools": tools})
 }
 
@@ -190,6 +191,24 @@ fn schedule_tools() -> Vec<Value> {
             }, "required": ["id"]}}),
         json!({"name": "delete_schedule", "description": "Delete a schedule.",
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}),
+    ]
+}
+
+fn deploy_tools() -> Vec<Value> {
+    vec![
+        json!({"name": "deploy_template", "description": "Deploy a fleet template — creates instances and optionally a team.",
+            "inputSchema": {"type": "object", "properties": {
+                "template": {"type": "string", "description": "Template name from fleet.yaml"},
+                "directory": {"type": "string", "description": "Working directory for instances"},
+                "name": {"type": "string", "description": "Deployment name (defaults to template name)"},
+                "branch": {"type": "string", "description": "Git branch — each instance gets its own worktree"}
+            }, "required": ["template", "directory"]}}),
+        json!({"name": "teardown_deployment", "description": "Tear down a deployment — stops instances and team.",
+            "inputSchema": {"type": "object", "properties": {
+                "name": {"type": "string"}
+            }, "required": ["name"]}}),
+        json!({"name": "list_deployments", "description": "List active template deployments.",
+            "inputSchema": {"type": "object", "properties": {}}}),
     ]
 }
 
@@ -695,6 +714,11 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
         "list_schedules" => crate::schedules::list(&home, args),
         "update_schedule" => crate::schedules::update(&home, args),
         "delete_schedule" => crate::schedules::delete(&home, args),
+
+        // --- Deployments ---
+        "deploy_template" => crate::deployments::deploy(&home, &instance_name, args),
+        "teardown_deployment" => crate::deployments::teardown(&home, args),
+        "list_deployments" => crate::deployments::list(&home),
 
         // --- Repo access ---
         "checkout_repo" => {

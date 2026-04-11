@@ -70,6 +70,7 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unwrap_used)]
 pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
     let preset = b.preset();
     let name = format!("capture-{}", b.name());
@@ -166,6 +167,7 @@ pub fn run_tests(subcmd: &str, home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::unwrap_used)]
 fn test_attach(_home: &Path) -> anyhow::Result<()> {
     eprintln!("[test:attach] Spawning bash...");
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));

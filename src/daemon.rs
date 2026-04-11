@@ -221,7 +221,7 @@ pub fn run(
             working_dir: working_dir.clone(),
             submit_key: submit_key.clone(),
         };
-        configs.lock().unwrap().insert(name.clone(), config);
+        configs.lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), config);
 
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
         agent::spawn_agent(
@@ -262,6 +262,7 @@ pub fn run(
         Err(e) => eprintln!("[daemon] warning: Ctrl+C handler failed: {e}. Use `stop`."),
     }
 
+    crate::event_log::log(home, "daemon_start", "", &format!("{} agents", agents.len()));
     eprintln!("[daemon] running. Ctrl+C or `agend-terminal stop` to stop.");
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
@@ -317,7 +318,7 @@ pub fn run(
         check_schedules(home, &registry);
 
         {
-            let cfgs = configs.lock().unwrap();
+            let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
             for (name, config) in cfgs.iter() {
                 if let Some(ref dir) = config.working_dir {
                     let statusline = dir.join("statusline.json");
@@ -341,9 +342,10 @@ pub fn run(
         };
 
         eprintln!("[health] {crashed_name} crashed");
+        crate::event_log::log(home, "crash", &crashed_name, "agent crashed");
 
                 // Get config for respawn
-                let config = configs.lock().unwrap().get(&crashed_name).cloned();
+                let config = configs.lock().unwrap_or_else(|e| e.into_inner()).get(&crashed_name).cloned();
                 let config = match config {
                     Some(c) => c,
                     None => {
@@ -398,6 +400,7 @@ pub fn run(
                             ) {
                                 Ok(()) => {
                                     eprintln!("[health] {}: respawned", config.name);
+                                    crate::event_log::log(&home, "respawn", &config.name, "agent respawned");
 
                                     // Mark respawn OK in core.health
                                     {
@@ -449,6 +452,7 @@ pub fn run(
     }
 
     // Shutdown cleanup
+    crate::event_log::log(home, "daemon_stop", "", "shutdown");
     eprintln!("[daemon] cleaning up...");
     {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -595,16 +599,24 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
             .any(|next| next <= now);
 
         if should_trigger {
+            let sched_id = sched["id"].as_str().unwrap_or("");
             let target = sched["target"].as_str().unwrap_or("");
             let message = sched["message"].as_str().unwrap_or("");
             let label = sched["label"].as_str().unwrap_or("(unnamed)");
 
             eprintln!("[schedule] triggering '{label}' → {target}: {message}");
+            crate::event_log::log(home, "schedule_trigger", target, &format!("{label}: {message}"));
 
             // Inject message to target agent via registry
             let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(handle) = reg.get(target) {
-                let _ = agent::inject_to_agent(handle, message.as_bytes());
+            let status = if let Some(handle) = reg.get(target) {
+                match agent::inject_to_agent(handle, message.as_bytes()) {
+                    Ok(()) => "ok",
+                    Err(e) => {
+                        eprintln!("[schedule] inject failed: {e}");
+                        "inject_failed"
+                    }
+                }
             } else {
                 // Fallback: enqueue to inbox
                 let _ = crate::inbox::enqueue(home, target, crate::inbox::InboxMessage {
@@ -613,6 +625,13 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     kind: Some("schedule".to_string()),
                     timestamp: now.to_rfc3339(),
                 });
+                "ok_inbox"
+            };
+            drop(reg);
+
+            // Record run history
+            if !sched_id.is_empty() {
+                crate::schedules::record_run(home, sched_id, status);
             }
             any_triggered = true;
         }

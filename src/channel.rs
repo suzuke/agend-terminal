@@ -5,6 +5,7 @@
 use std::path::Path;
 
 /// A message received from a channel.
+#[allow(dead_code)]
 pub struct IncomingMessage {
     pub from: String,
     pub text: String,
@@ -13,12 +14,14 @@ pub struct IncomingMessage {
 }
 
 /// Result of sending a message.
+#[allow(dead_code)]
 pub enum SendResult {
     Sent,
     Failed(String),
 }
 
 /// Channel adapter trait — implement for each messaging platform.
+#[allow(dead_code)]
 pub trait ChannelAdapter: Send + Sync {
     /// Platform name (e.g., "telegram", "discord").
     fn name(&self) -> &str;

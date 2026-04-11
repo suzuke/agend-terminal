@@ -133,7 +133,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
 
     let (instance_name, home, submit_key) = {
-        let s = state.lock().unwrap();
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
         let name = thread_id
             .and_then(|tid| s.topic_to_instance.get(&tid).cloned())
             .unwrap_or_else(|| "general".to_string());
@@ -165,7 +165,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 /// Send a reply from an agent to Telegram (called from MCP reply tool).
 #[allow(dead_code)]
 pub fn send_reply(state: &Arc<Mutex<TelegramState>>, instance_name: &str, text: &str) -> anyhow::Result<()> {
-    let s = state.lock().unwrap();
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
     let bot = s.bot.clone();
     let group_id = s.group_id;
     let topic_id = s.instance_to_topic.get(instance_name).copied();
@@ -313,7 +313,7 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
     }
 
     fn send_reply(&self, instance_name: &str, text: &str) -> crate::channel::SendResult {
-        let s = self.lock().unwrap();
+        let s = self.lock().unwrap_or_else(|e| e.into_inner());
         let bot = s.bot.clone();
         let group_id = s.group_id;
         let topic_id = s.instance_to_topic.get(instance_name).copied();
@@ -344,11 +344,74 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
         }
     }
 
+    fn react(&self, _instance_name: &str, emoji: &str) -> crate::channel::SendResult {
+        let s = self.lock().unwrap_or_else(|e| e.into_inner());
+        let bot = s.bot.clone();
+        let group_id = s.group_id;
+        // React needs a message_id — for now use latest from metadata
+        drop(s);
+
+        let emoji_char = map_emoji_name(emoji);
+
+        let _rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return crate::channel::SendResult::Failed(format!("{e}")),
+        };
+        // React requires message_id which we don't have here — log only
+        let _ = (bot, group_id, emoji_char);
+        crate::channel::SendResult::Failed("react via adapter needs message_id context".into())
+    }
+
+    fn edit_message(&self, _instance_name: &str, message_id: &str, text: &str) -> crate::channel::SendResult {
+        let s = self.lock().unwrap_or_else(|e| e.into_inner());
+        let bot = s.bot.clone();
+        let group_id = s.group_id;
+        drop(s);
+
+        let mid: i32 = match message_id.parse() {
+            Ok(m) => m,
+            Err(_) => return crate::channel::SendResult::Failed(format!("invalid message_id: {message_id}")),
+        };
+
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return crate::channel::SendResult::Failed(format!("{e}")),
+        };
+        match rt.block_on(async {
+            bot.edit_message_text(group_id, MessageId(mid), text).await?;
+            Ok::<(), anyhow::Error>(())
+        }) {
+            Ok(()) => crate::channel::SendResult::Sent,
+            Err(e) => crate::channel::SendResult::Failed(format!("{e}")),
+        }
+    }
+
     fn start_polling(&self, _home: &std::path::Path) {
         // Already started via init_from_config
     }
 
     fn stop(&self) {
         // Polling thread exits when daemon exits
+    }
+}
+
+/// Map emoji name to Unicode character.
+#[allow(dead_code)]
+fn map_emoji_name(name: &str) -> &str {
+    match name {
+        "thumbsup" | "thumbs_up" => "👍",
+        "thumbsdown" | "thumbs_down" => "👎",
+        "heart" | "red_heart" => "❤",
+        "fire" => "🔥",
+        "clap" => "👏",
+        "thinking" => "🤔",
+        "pray" | "folded_hands" => "🙏",
+        "party" | "tada" => "🎉",
+        "eyes" => "👀",
+        "100" => "💯",
+        "ok" | "ok_hand" => "👌",
+        "rocket" => "🚀",
+        "check" | "white_check_mark" => "✅",
+        other => other,
     }
 }

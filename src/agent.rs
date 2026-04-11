@@ -346,20 +346,20 @@ fn try_dismiss_dialog(
 
 /// Write data to an agent's PTY (atomic write — for attach path).
 #[allow(dead_code)]
-pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> anyhow::Result<()> {
+pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
     let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
-    w.write_all(data)?;
-    w.flush()?;
+    w.write_all(data).map_err(crate::error::AgendError::PtyWrite)?;
+    w.flush().map_err(crate::error::AgendError::PtyWrite)?;
     Ok(())
 }
 
 /// Write data to an agent's PTY byte-by-byte with small delays.
 #[allow(dead_code)]
-pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> anyhow::Result<()> {
+pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
     let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
     for byte in data {
-        w.write_all(&[*byte])?;
-        w.flush()?;
+        w.write_all(&[*byte]).map_err(crate::error::AgendError::PtyWrite)?;
+        w.flush().map_err(crate::error::AgendError::PtyWrite)?;
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     Ok(())
@@ -369,7 +369,7 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> anyhow::Result<
 /// so TUI frameworks process them as separate events.
 /// - typed=false: write_all(prefix+text), delay, write_all(submit_key)
 /// - typed=true: per-byte(prefix+text), delay, write_all(submit_key)
-pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> anyhow::Result<()> {
+pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result<()> {
     let prefix = agent.inject_prefix.as_bytes();
     let submit = agent.submit_key.as_bytes();
     let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());

@@ -1,13 +1,13 @@
 mod agent;
 mod api;
 mod backend;
-#[allow(dead_code)]
 mod channel;
 mod cli;
 mod daemon;
 mod decisions;
-#[allow(dead_code)]
+mod deployments;
 mod error;
+mod event_log;
 mod fleet;
 mod framing;
 #[allow(dead_code)]
