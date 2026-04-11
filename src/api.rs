@@ -37,7 +37,18 @@ pub fn serve(home: &Path, registry: AgentRegistry, shutdown: Arc<AtomicBool>) {
 }
 
 pub fn api_socket_path(home: &Path) -> String {
-    home.join("api.sock").display().to_string()
+    crate::daemon::run_dir(home).join("api.sock").display().to_string()
+}
+
+/// Find API socket from any active daemon.
+pub fn find_api_socket(home: &Path) -> Option<String> {
+    let run = crate::daemon::find_active_run_dir(home)?;
+    let sock = run.join("api.sock");
+    if sock.exists() {
+        Some(sock.display().to_string())
+    } else {
+        None
+    }
 }
 
 fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shutdown: &Arc<AtomicBool>) {
@@ -211,7 +222,8 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
 
 /// Send a request to the API socket and get response.
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
-    let sock = api_socket_path(home);
+    let sock = find_api_socket(home)
+        .unwrap_or_else(|| api_socket_path(home));
     let mut stream = UnixStream::connect(&sock)?;
     writeln!(stream, "{}", request)?;
     stream.flush()?;

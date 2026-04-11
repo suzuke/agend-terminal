@@ -283,3 +283,50 @@ pub fn init_from_config(
         }
     }
 }
+
+/// ChannelAdapter implementation for Telegram.
+impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
+    fn name(&self) -> &str {
+        "telegram"
+    }
+
+    fn send_reply(&self, instance_name: &str, text: &str) -> crate::channel::SendResult {
+        let s = self.lock().unwrap();
+        let bot = s.bot.clone();
+        let group_id = s.group_id;
+        let topic_id = s.instance_to_topic.get(instance_name).copied();
+        drop(s);
+
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => return crate::channel::SendResult::Failed(format!("{e}")),
+        };
+
+        match rt.block_on(async {
+            if let Some(tid) = topic_id {
+                if tid == 1 {
+                    bot.send_message(group_id, text).await?;
+                } else {
+                    bot.send_message(group_id, text)
+                        .message_thread_id(ThreadId(MessageId(tid)))
+                        .await?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }) {
+            Ok(()) => crate::channel::SendResult::Sent,
+            Err(e) => crate::channel::SendResult::Failed(format!("{e}")),
+        }
+    }
+
+    fn start_polling(&self, _home: &std::path::Path) {
+        // Already started via init_from_config
+    }
+
+    fn stop(&self) {
+        // Polling thread exits when daemon exits
+    }
+}

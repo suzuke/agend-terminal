@@ -1,6 +1,8 @@
 mod agent;
 mod api;
 mod backend;
+#[allow(dead_code)]
+mod channel;
 mod daemon;
 mod fleet;
 mod framing;
@@ -163,12 +165,16 @@ fn main() -> anyhow::Result<()> {
             }
         }
         "list" | "ls" => {
-            for entry in std::fs::read_dir(&home)?.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".sock") && name != "api.sock" {
-                    let agent = &name[..name.len() - 5];
-                    println!("  {agent}");
+            if let Some(run) = daemon::find_active_run_dir(&home) {
+                for entry in std::fs::read_dir(&run)?.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".sock") && name != "api.sock" {
+                        let agent = &name[..name.len() - 5];
+                        println!("  {agent}");
+                    }
                 }
+            } else {
+                println!("No running daemon found.");
             }
         }
         "fleet" => {

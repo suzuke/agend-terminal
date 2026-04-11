@@ -123,8 +123,36 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
     }
 }
 
+/// Get the PID-isolated run directory for the current daemon.
+pub fn run_dir(home: &Path) -> PathBuf {
+    home.join("run").join(std::process::id().to_string())
+}
+
 pub fn agent_socket_path(home: &Path, name: &str) -> String {
-    home.join(format!("{name}.sock")).display().to_string()
+    run_dir(home).join(format!("{name}.sock")).display().to_string()
+}
+
+/// Find any active run directory (for CLI commands connecting to daemon).
+pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
+    let run = home.join("run");
+    if !run.exists() {
+        return None;
+    }
+    for entry in std::fs::read_dir(&run).ok()?.flatten() {
+        let pid_str = entry.file_name().to_string_lossy().to_string();
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            // Check if PID is alive
+            let alive = unsafe { nix::libc::kill(pid as i32, 0) == 0 };
+            if alive {
+                return Some(entry.path());
+            } else {
+                // Stale PID dir — clean up
+                eprintln!("[daemon] cleaning stale run dir: {}", entry.path().display());
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    None
 }
 
 /// Start daemon: spawn agents, handle crashes with auto-respawn.
@@ -132,6 +160,16 @@ pub fn run(
     home: &Path,
     agents: Vec<(String, String, Vec<String>, Option<HashMap<String, String>>, Option<PathBuf>, String)>,
 ) -> anyhow::Result<()> {
+    // Check for existing daemon
+    if let Some(existing) = find_active_run_dir(home) {
+        anyhow::bail!("Another daemon is already running ({})", existing.display());
+    }
+
+    // Create PID-isolated run directory
+    let run = run_dir(home);
+    std::fs::create_dir_all(&run)?;
+    eprintln!("[daemon] run dir: {}", run.display());
+
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // Crash channel for auto-respawn
@@ -329,11 +367,8 @@ pub fn run(
             eprintln!("[daemon] killed {name}");
         }
     }
-    for (name, _, _, _, _, _) in &agents {
-        let sock = agent_socket_path(home, name);
-        let _ = std::fs::remove_file(&sock);
-    }
-    let _ = std::fs::remove_file(crate::api::api_socket_path(home));
+    // Remove entire run dir (sockets + PID isolation)
+    let _ = std::fs::remove_dir_all(run_dir(home));
 
     {
         let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
