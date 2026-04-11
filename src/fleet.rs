@@ -108,13 +108,20 @@ impl FleetConfig {
             .or_else(|| preset.as_ref().map(|p| p.command.to_string()))
             .unwrap_or_else(|| "claude".to_string());
 
-        // Args: instance > defaults > preset
+        // Args: instance > defaults > preset (only if command matches preset command)
+        let command_matches_preset = preset.as_ref()
+            .map(|p| command.contains(p.command))
+            .unwrap_or(false);
         let args = if !inst.args.is_empty() {
             inst.args.clone()
         } else if !defaults.args.is_empty() {
             defaults.args.clone()
         } else if let Some(ref p) = preset {
-            p.args.iter().map(|s| s.to_string()).collect()
+            if command_matches_preset {
+                p.args.iter().map(|s| s.to_string()).collect()
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -131,11 +138,14 @@ impl FleetConfig {
             .or_else(|| defaults.ready_pattern.clone())
             .or_else(|| preset.as_ref().map(|p| p.ready_pattern.to_string()));
 
-        // Submit key: from preset or default \r
-        let submit_key = preset
-            .as_ref()
-            .map(|p| p.submit_key.to_string())
-            .unwrap_or_else(|| "\r".to_string());
+        // Submit key: from preset (only if command matches) or default \r
+        let submit_key = if command_matches_preset {
+            preset.as_ref()
+                .map(|p| p.submit_key.to_string())
+                .unwrap_or_else(|| "\r".to_string())
+        } else {
+            "\r".to_string()
+        };
 
         let working_directory = inst.working_directory.as_ref().map(|d| {
             // Expand ~ to home directory
