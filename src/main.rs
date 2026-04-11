@@ -1,7 +1,6 @@
 mod agent;
 mod api;
 mod backend;
-#[allow(dead_code)]
 mod channel;
 mod cli;
 mod daemon;
