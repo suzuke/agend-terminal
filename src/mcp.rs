@@ -357,7 +357,10 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             let fleet_path = home.join("fleet.yaml");
             if fleet_path.exists() {
                 match try_telegram_reply(&instance_name, text) {
-                    Ok(()) => json!({"status": "sent_to_telegram"}),
+                    Ok((msg_id, chat_id)) => json!({
+                        "messageId": msg_id.to_string(),
+                        "chatId": chat_id.to_string(),
+                    }),
                     Err(e) => json!({"status": "logged_only", "error": format!("{e}")}),
                 }
             } else {
@@ -815,9 +818,8 @@ fn save_metadata(home: &std::path::Path, instance_name: &str, key: &str, value: 
     let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default());
 }
 
-fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<()> {
-    // Read Telegram config to send reply
-    // This is a simplified approach — in production, the daemon would hold the Telegram state
+/// Returns (message_id, chat_id) on success.
+fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
     let home = crate::home_dir();
     let fleet_path = home.join("fleet.yaml");
     if !fleet_path.exists() {
@@ -830,22 +832,25 @@ fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<()> {
             let token = std::env::var(bot_token_env)?;
             let topic_id = config.instances.get(instance_name)
                 .and_then(|inst| inst.topic_id);
+            let gid = *group_id;
 
-            mcp_runtime().block_on(async {
+            let msg_id = mcp_runtime().block_on(async {
                 let bot = teloxide::Bot::new(&token);
-                let chat_id = teloxide::types::ChatId(*group_id);
-                if let Some(tid) = topic_id {
+                let chat_id = teloxide::types::ChatId(gid);
+                let sent = if let Some(tid) = topic_id {
                     if tid == 1 {
-                        bot.send_message(chat_id, text).await?;
+                        bot.send_message(chat_id, text).await?
                     } else {
                         bot.send_message(chat_id, text)
                             .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(tid)))
-                            .await?;
+                            .await?
                     }
-                }
-                Ok::<(), anyhow::Error>(())
+                } else {
+                    anyhow::bail!("No topic_id for {instance_name}");
+                };
+                Ok::<i32, anyhow::Error>(sent.id.0)
             })?;
-            Ok(())
+            Ok((msg_id, gid))
         }
         None => anyhow::bail!("No Telegram channel configured"),
     }
