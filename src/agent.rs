@@ -203,121 +203,144 @@ pub fn spawn_agent(
     std::thread::Builder::new()
         .name(format!("{n}_pty_read"))
         .spawn(move || {
-            let mut buf = [0u8; 8192];
-            let mut detect_buf = Vec::with_capacity(4096);
-            let mut dialog_dismissed = false;
-            loop {
-                match pty_reader.read(&mut buf) {
-                    Ok(0) => {
-                        eprintln!("[{n}] PTY closed — waiting for process exit");
-
-                        // Wait up to 2s for process to fully exit (timing race)
-                        let mut exit_code: Option<i32> = None;
-                        for _ in 0..20 {
-                            let reg = reg_for_reaper.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(handle) = reg.get(&n) {
-                                if let Ok(mut c) = handle.child.lock() {
-                                    if let Ok(Some(status)) = c.try_wait() {
-                                        exit_code = Some(status.exit_code() as i32);
-                                        break;
-                                    }
-                                }
-                            }
-                            drop(reg);
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-
-                        let is_crash = match exit_code {
-                            Some(0) => false,  // Graceful exit (/exit, Ctrl+D)
-                            Some(c) => { eprintln!("[{n}] exit code {c} — crash"); true }
-                            None => { eprintln!("[{n}] process didn't exit in 2s — treating as crash"); true }
-                        };
-
-                        if !is_crash {
-                            eprintln!("[{n}] graceful exit (code 0) — no respawn");
-                        }
-
-                        if is_crash {
-                            // Set Restarting state (don't remove from registry)
-                            if let Ok(reg) = reg_for_reaper.lock() {
-                                if let Some(handle) = reg.get(&n) {
-                                    if let Ok(mut core) = handle.core.lock() {
-                                        core.state.set_restarting();
-                                    }
-                                }
-                            }
-                            if let Some(ref tx) = crash_tx_for_reaper {
-                                let _ = tx.send(n.clone());
-                            }
-                        } else {
-                            // Graceful exit: remove from registry + cleanup socket
-                            if let Ok(mut reg) = reg_for_reaper.lock() {
-                                reg.remove(&n);
-                            }
-                            if let Some(ref home) = home_for_reaper {
-                                let sock = crate::daemon::agent_socket_path(home, &n);
-                                let _ = std::fs::remove_file(&sock);
-                            }
-                        }
-                        break;
-                    }
-                    Ok(n_bytes) => {
-                        let data = &buf[..n_bytes];
-
-                        // Auto-dismiss trust dialog
-                        if !dialog_dismissed {
-                            detect_buf.extend_from_slice(data);
-                            if detect_buf.len() > 8192 {
-                                let d = detect_buf.len() - 8192;
-                                detect_buf.drain(..d);
-                            }
-                            let clean = strip_ansi(&String::from_utf8_lossy(&detect_buf));
-                            if clean.contains("Yes, I trust")
-                                || clean.contains("Yes, proceed")
-                            {
-                                eprintln!("[{n}] auto-dismissing trust dialog");
-                                let _ = pw
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .write_all(b"\x1b[A\x1b[A\r");
-                                dialog_dismissed = true;
-                                detect_buf.clear();
-                            }
-                            // OpenCode update/restart dialogs: dismiss with Enter/Escape
-                            if clean.contains("Update Available")
-                                || clean.contains("Skip  Confirm")
-                                || clean.contains("Update Complete")
-                                || clean.contains("Please restart")
-                            {
-                                eprintln!("[{n}] auto-dismissing update dialog");
-                                let _ = pw
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .write_all(b"\r"); // Enter to press ok/skip
-                                detect_buf.clear();
-                            }
-                        }
-
-                        // Feed VTerm + state detection + broadcast (under same lock = atomic)
-                        {
-                            let mut core =
-                                core2.lock().unwrap_or_else(|e| e.into_inner());
-                            core.vterm.process(data);
-                            // State detection: strip ANSI, feed to tracker
-                            let stripped = strip_ansi(&String::from_utf8_lossy(data));
-                            core.state.feed(&stripped);
-                            // Send to each subscriber, remove dead ones
-                            core.subscribers
-                                .retain(|tx| tx.send(data.to_vec()).is_ok());
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+            pty_read_loop(&n, &mut pty_reader, &core2, &pw, &reg_for_reaper, &home_for_reaper, &crash_tx_for_reaper);
         })?;
 
     eprintln!("[{name}] spawned: {command} {}", args.join(" "));
     Ok(())
+}
+
+/// PTY read loop: feeds VTerm, broadcasts output, auto-dismisses dialogs, handles exit.
+fn pty_read_loop(
+    name: &str,
+    pty_reader: &mut dyn Read,
+    core: &Arc<Mutex<AgentCore>>,
+    pty_writer: &PtyWriter,
+    registry: &AgentRegistry,
+    home: &Option<std::path::PathBuf>,
+    crash_tx: &Option<CrashChannel>,
+) {
+    let mut buf = [0u8; 8192];
+    let mut detect_buf = Vec::with_capacity(4096);
+    let mut dialog_dismissed = false;
+
+    loop {
+        match pty_reader.read(&mut buf) {
+            Ok(0) => {
+                handle_pty_close(name, registry, home, crash_tx);
+                break;
+            }
+            Ok(n_bytes) => {
+                let data = &buf[..n_bytes];
+
+                // Auto-dismiss trust/update dialogs
+                if !dialog_dismissed {
+                    dialog_dismissed = try_dismiss_dialog(name, data, &mut detect_buf, pty_writer);
+                }
+
+                // Feed VTerm + state detection + broadcast (under same lock = atomic)
+                {
+                    let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
+                    c.vterm.process(data);
+                    let stripped = strip_ansi(&String::from_utf8_lossy(data));
+                    c.state.feed(&stripped);
+                    c.subscribers.retain(|tx| tx.send(data.to_vec()).is_ok());
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Handle PTY close: determine if crash or graceful exit, set state accordingly.
+fn handle_pty_close(
+    name: &str,
+    registry: &AgentRegistry,
+    home: &Option<std::path::PathBuf>,
+    crash_tx: &Option<CrashChannel>,
+) {
+    eprintln!("[{name}] PTY closed — waiting for process exit");
+
+    // Wait up to 2s for process to fully exit
+    let mut exit_code: Option<i32> = None;
+    for _ in 0..20 {
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = reg.get(name) {
+            if let Ok(mut c) = handle.child.lock() {
+                if let Ok(Some(status)) = c.try_wait() {
+                    exit_code = Some(status.exit_code() as i32);
+                    break;
+                }
+            }
+        }
+        drop(reg);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let is_crash = match exit_code {
+        Some(0) => false,
+        Some(c) => { eprintln!("[{name}] exit code {c} — crash"); true }
+        None => { eprintln!("[{name}] process didn't exit in 2s — treating as crash"); true }
+    };
+
+    if is_crash {
+        // Set Restarting state (don't remove from registry)
+        if let Ok(reg) = registry.lock() {
+            if let Some(handle) = reg.get(name) {
+                if let Ok(mut core) = handle.core.lock() {
+                    core.state.set_restarting();
+                }
+            }
+        }
+        if let Some(ref tx) = crash_tx {
+            let _ = tx.send(name.to_string());
+        }
+    } else {
+        eprintln!("[{name}] graceful exit (code 0) — no respawn");
+        if let Ok(mut reg) = registry.lock() {
+            reg.remove(name);
+        }
+        if let Some(ref home) = home {
+            let sock = crate::daemon::agent_socket_path(home, name);
+            let _ = std::fs::remove_file(&sock);
+        }
+    }
+}
+
+/// Try to auto-dismiss trust or update dialogs. Returns true if dismissed.
+fn try_dismiss_dialog(
+    name: &str,
+    data: &[u8],
+    detect_buf: &mut Vec<u8>,
+    pty_writer: &PtyWriter,
+) -> bool {
+    detect_buf.extend_from_slice(data);
+    if detect_buf.len() > 8192 {
+        let d = detect_buf.len() - 8192;
+        detect_buf.drain(..d);
+    }
+    let clean = strip_ansi(&String::from_utf8_lossy(detect_buf));
+
+    if clean.contains("Yes, I trust") || clean.contains("Yes, proceed") {
+        eprintln!("[{name}] auto-dismissing trust dialog");
+        let _ = pty_writer.lock().unwrap_or_else(|e| e.into_inner())
+            .write_all(b"\x1b[A\x1b[A\r");
+        detect_buf.clear();
+        return true;
+    }
+
+    if clean.contains("Update Available")
+        || clean.contains("Skip  Confirm")
+        || clean.contains("Update Complete")
+        || clean.contains("Please restart")
+    {
+        eprintln!("[{name}] auto-dismissing update dialog");
+        let _ = pty_writer.lock().unwrap_or_else(|e| e.into_inner())
+            .write_all(b"\r");
+        detect_buf.clear();
+    }
+
+    false
 }
 
 /// Write data to an agent's PTY (atomic write — for attach path).
