@@ -41,6 +41,7 @@ impl HealthState {
 }
 
 /// Tracks health for one agent.
+#[derive(Clone)]
 pub struct HealthTracker {
     pub state: HealthState,
     crash_times: VecDeque<Instant>,
