@@ -187,7 +187,7 @@ fn list_agents() -> Vec<String> {
     if let Ok(entries) = std::fs::read_dir(&home) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".sock") {
+            if name.ends_with(".sock") && name != "api.sock" {
                 agents.push(name[..name.len() - 5].to_string());
             }
         }
@@ -270,16 +270,15 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             let text = args["text"].as_str().unwrap_or("");
             eprintln!("[mcp] reply from {instance_name}: {text}");
 
-            // Try Telegram if state file exists
-            let tg_state_path = home.join("telegram.state");
-            if tg_state_path.exists() {
-                // Telegram is configured — try to send via short-lived runtime
+            // Try Telegram by reading fleet.yaml
+            let fleet_path = home.join("fleet.yaml");
+            if fleet_path.exists() {
                 match try_telegram_reply(&instance_name, text) {
                     Ok(()) => json!({"status": "sent_to_telegram"}),
                     Err(e) => json!({"status": "logged_only", "error": format!("{e}")}),
                 }
             } else {
-                json!({"status": "logged_only", "note": "Telegram not connected"})
+                json!({"status": "logged_only", "note": "No fleet.yaml — Telegram not configured"})
             }
         }
         "send" => {
