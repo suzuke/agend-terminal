@@ -208,6 +208,39 @@ pub fn init_from_config(
                 .filter_map(|(name, inst)| inst.topic_id.map(|tid| (name.clone(), tid)))
                 .collect();
 
+            // Auto-create topics for instances without topic_id
+            let bot = teloxide::Bot::new(&token);
+            let chat_id = teloxide::types::ChatId(*group_id);
+            let mut topic_map = topic_map;
+            for (name, inst) in &config.instances {
+                if inst.topic_id.is_none() && name != "general" {
+                    eprintln!("[telegram] creating topic for '{name}'...");
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok();
+                    if let Some(rt) = rt {
+                        let result = rt.block_on(async {
+                            bot.create_forum_topic(chat_id, name, 0x6FB9F0, "").await
+                        });
+                        match result {
+                            Ok(topic) => {
+                                let tid = topic.thread_id.0 .0;
+                                eprintln!("[telegram] created topic '{name}' → {tid}");
+                                topic_map.insert(name.clone(), tid);
+                            }
+                            Err(e) => {
+                                eprintln!("[telegram] failed to create topic for '{name}': {e}");
+                            }
+                        }
+                    }
+                }
+                // General without topic_id → use General topic (1)
+                if name == "general" && inst.topic_id.is_none() {
+                    topic_map.insert("general".to_string(), 1);
+                }
+            }
+
             let state = Arc::new(Mutex::new(TelegramState::new(
                 &token,
                 *group_id,
