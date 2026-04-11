@@ -366,10 +366,20 @@ fn start_with_fleet(home: &std::path::Path, fleet_path: &std::path::Path) -> any
                 mcp_config::configure(dir, &resolved.command);
             }
 
+            // Inject --mcp-config for Claude if working_directory has mcp-config.json
+            let mut args = resolved.args;
+            if let Some(ref dir) = resolved.working_directory {
+                let mcp_config = dir.join("mcp-config.json");
+                if mcp_config.exists() && resolved.command.contains("claude") {
+                    args.push("--mcp-config".to_string());
+                    args.push(mcp_config.display().to_string());
+                }
+            }
+
             agents.push((
                 resolved.name,
                 resolved.command,
-                resolved.args,
+                args,
                 Some(resolved.env),
                 resolved.working_directory,
                 resolved.submit_key,

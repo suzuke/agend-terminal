@@ -209,21 +209,32 @@ pub fn spawn_agent(
             loop {
                 match pty_reader.read(&mut buf) {
                     Ok(0) => {
-                        // Check exit code before removing from registry
-                        let exit_code = {
-                            let reg = reg_for_reaper.lock().unwrap_or_else(|e| e.into_inner());
-                            reg.get(&n).and_then(|handle| {
-                                handle.child.lock().ok().and_then(|mut c| {
-                                    c.try_wait().ok().flatten().map(|s| s.exit_code() as i32)
-                                })
-                            })
-                        };
-                        let is_crash = exit_code.map(|c| c != 0).unwrap_or(true);
+                        eprintln!("[{n}] PTY closed — waiting for process exit");
 
-                        if is_crash {
-                            eprintln!("[{n}] PTY closed (exit code: {}) — crash", exit_code.unwrap_or(-1));
-                        } else {
-                            eprintln!("[{n}] PTY closed (exit 0) — graceful exit");
+                        // Wait up to 2s for process to fully exit (timing race)
+                        let mut exit_code: Option<i32> = None;
+                        for _ in 0..20 {
+                            let reg = reg_for_reaper.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(handle) = reg.get(&n) {
+                                if let Ok(mut c) = handle.child.lock() {
+                                    if let Ok(Some(status)) = c.try_wait() {
+                                        exit_code = Some(status.exit_code() as i32);
+                                        break;
+                                    }
+                                }
+                            }
+                            drop(reg);
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+
+                        let is_crash = match exit_code {
+                            Some(0) => false,  // Graceful exit (/exit, Ctrl+D)
+                            Some(c) => { eprintln!("[{n}] exit code {c} — crash"); true }
+                            None => { eprintln!("[{n}] process didn't exit in 2s — treating as crash"); true }
+                        };
+
+                        if !is_crash {
+                            eprintln!("[{n}] graceful exit (code 0) — no respawn");
                         }
 
                         // Remove from registry + cleanup socket
