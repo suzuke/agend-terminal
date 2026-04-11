@@ -141,34 +141,41 @@ fn tool_definitions() -> Value {
     })
 }
 
-/// Read a Content-Length framed message.
+/// Read a message from stdin — supports both NDJSON (Claude Code) and Content-Length framing.
+/// Auto-detects format: if first non-empty char is '{', it's NDJSON. Otherwise Content-Length.
 fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<String>> {
-    let mut content_length: Option<usize> = None;
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
+        line.clear();
         if reader.read_line(&mut line)? == 0 {
             return Ok(None);
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            break;
+            continue;
         }
+        // NDJSON: line starts with '{'
+        if trimmed.starts_with('{') {
+            return Ok(Some(trimmed.to_string()));
+        }
+        // Content-Length framing
         if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-            content_length = val.trim().parse().ok();
+            let len: usize = val.trim().parse().unwrap_or(0);
+            if len == 0 { continue; }
+            // Read empty line after headers
+            let mut empty = String::new();
+            reader.read_line(&mut empty)?;
+            // Read body
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body)?;
+            return Ok(Some(String::from_utf8(body)?));
         }
     }
-    let len = match content_length {
-        Some(l) => l,
-        None => return Ok(None),
-    };
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body)?;
-    Ok(Some(String::from_utf8(body)?))
 }
 
-/// Write a Content-Length framed message.
+/// Write a message — NDJSON format (one JSON per line, like Claude expects).
 fn write_message(stdout: &mut io::Stdout, json: &str) -> anyhow::Result<()> {
-    write!(stdout, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
+    writeln!(stdout, "{json}")?;
     stdout.flush()?;
     Ok(())
 }

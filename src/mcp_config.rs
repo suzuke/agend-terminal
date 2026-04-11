@@ -50,10 +50,27 @@ fn upsert_mcp_servers(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Claude Code: .claude/settings.local.json (project-local MCP config)
+/// Claude Code: .claude/settings.local.json + standalone mcp-config.json
 fn configure_claude(working_dir: &Path) -> Result<()> {
+    // Ensure working dir is a git repo (Claude Code needs git root to find .claude/)
+    let git_dir = working_dir.join(".git");
+    if !git_dir.exists() {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(working_dir)
+            .output()
+            .ok();
+    }
+
+    // Write project-local MCP config
     let path = working_dir.join(".claude").join("settings.local.json");
-    upsert_mcp_servers(&path)
+    upsert_mcp_servers(&path)?;
+
+    // Also write standalone mcp-config.json for --mcp-config flag
+    let standalone = working_dir.join("mcp-config.json");
+    upsert_mcp_servers(&standalone)?;
+
+    Ok(())
 }
 
 /// Kiro: .kiro/settings/mcp.json — uses { "mcpServers": { ... } } format
