@@ -237,18 +237,26 @@ pub fn spawn_agent(
                             eprintln!("[{n}] graceful exit (code 0) — no respawn");
                         }
 
-                        // Remove from registry + cleanup socket
-                        if let Ok(mut reg) = reg_for_reaper.lock() {
-                            reg.remove(&n);
-                        }
-                        if let Some(ref home) = home_for_reaper {
-                            let sock = crate::daemon::agent_socket_path(home, &n);
-                            let _ = std::fs::remove_file(&sock);
-                        }
-                        // Only signal crash for non-zero exit (don't respawn graceful exit)
                         if is_crash {
+                            // Set Restarting state (don't remove from registry)
+                            if let Ok(reg) = reg_for_reaper.lock() {
+                                if let Some(handle) = reg.get(&n) {
+                                    if let Ok(mut core) = handle.core.lock() {
+                                        core.state.set_restarting();
+                                    }
+                                }
+                            }
                             if let Some(ref tx) = crash_tx_for_reaper {
                                 let _ = tx.send(n.clone());
+                            }
+                        } else {
+                            // Graceful exit: remove from registry + cleanup socket
+                            if let Ok(mut reg) = reg_for_reaper.lock() {
+                                reg.remove(&n);
+                            }
+                            if let Some(ref home) = home_for_reaper {
+                                let sock = crate::daemon::agent_socket_path(home, &n);
+                                let _ = std::fs::remove_file(&sock);
                             }
                         }
                         break;

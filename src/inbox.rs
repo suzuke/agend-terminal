@@ -35,22 +35,26 @@ pub fn enqueue(home: &Path, name: &str, msg: InboxMessage) -> anyhow::Result<()>
 }
 
 /// Drain all messages (read + truncate).
+/// Drain all messages atomically (rename + read to avoid race with concurrent append).
 pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     let path = inbox_path(home, name);
     if !path.exists() {
         return Vec::new();
     }
-    let content = match std::fs::read_to_string(&path) {
+    // Atomic: rename file, then read the renamed copy
+    let tmp = path.with_extension("draining");
+    if std::fs::rename(&path, &tmp).is_err() {
+        return Vec::new(); // File may have been drained by another caller
+    }
+    let content = match std::fs::read_to_string(&tmp) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
+    let _ = std::fs::remove_file(&tmp);
     let messages: Vec<InboxMessage> = content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
-    if !messages.is_empty() {
-        let _ = std::fs::write(&path, "");
-    }
     messages
 }
 
