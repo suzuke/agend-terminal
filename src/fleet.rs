@@ -14,6 +14,9 @@ pub struct FleetConfig {
     pub teams: HashMap<String, TeamConfig>,
     /// Channel configuration (e.g., Telegram).
     pub channel: Option<ChannelConfig>,
+    /// Template definitions for batch deployment.
+    #[serde(default)]
+    pub templates: Option<HashMap<String, serde_yaml::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

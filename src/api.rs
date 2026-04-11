@@ -150,6 +150,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                         let _ = child.kill();
                         drop(child);
                         drop(reg);
+                        crate::event_log::log(home, "kill", name, "killed via API");
                         json!({"ok": true})
                     }
                     None => json!({"ok": false, "error": format!("agent '{name}' not found")}),

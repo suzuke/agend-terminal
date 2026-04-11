@@ -5,7 +5,9 @@ mod channel;
 mod cli;
 mod daemon;
 mod decisions;
+mod deployments;
 mod error;
+mod event_log;
 mod fleet;
 mod framing;
 #[allow(dead_code)]

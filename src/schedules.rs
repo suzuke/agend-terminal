@@ -16,6 +16,14 @@ pub struct Schedule {
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub run_history: Vec<ScheduleRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleRun {
+    pub triggered_at: String,
+    pub status: String, // "ok" or error message
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -57,6 +65,7 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         created_by: instance_name.to_string(),
         created_at: now.clone(),
         updated_at: now,
+        run_history: Vec::new(),
     };
     let mut store = load(home);
     store.schedules.push(schedule);
@@ -94,6 +103,23 @@ pub fn update(home: &Path, args: &Value) -> Value {
             serde_json::json!({"id": id, "status": "updated"})
         }
         None => serde_json::json!({"error": format!("schedule '{id}' not found")}),
+    }
+}
+
+/// Record a schedule execution result. Called by daemon after cron trigger.
+pub fn record_run(home: &Path, schedule_id: &str, status: &str) {
+    let mut store = load(home);
+    if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == schedule_id) {
+        sched.run_history.push(ScheduleRun {
+            triggered_at: chrono::Utc::now().to_rfc3339(),
+            status: status.to_string(),
+        });
+        // Keep last 50 runs only
+        if sched.run_history.len() > 50 {
+            let excess = sched.run_history.len() - 50;
+            sched.run_history.drain(..excess);
+        }
+        let _ = save(home, &store);
     }
 }
 
