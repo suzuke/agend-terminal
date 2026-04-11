@@ -255,6 +255,9 @@ pub fn run(
             }
         }
 
+        // Check cron schedules
+        check_schedules(home, &registry);
+
         // Capture session IDs from statusline.json (Claude)
         {
             let cfgs = configs.lock().unwrap();
@@ -404,4 +407,100 @@ pub fn run(
     std::thread::sleep(std::time::Duration::from_millis(500));
     eprintln!("[daemon] exiting.");
     std::process::exit(0);
+}
+
+/// Check cron schedules and inject messages for due ones.
+fn check_schedules(home: &Path, registry: &AgentRegistry) {
+    use cron::Schedule;
+    use std::str::FromStr;
+
+    let store_path = home.join("schedules.json");
+    if !store_path.exists() {
+        return;
+    }
+
+    let content = match std::fs::read_to_string(&store_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let store: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let schedules = match store["schedules"].as_array() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let now = chrono::Utc::now();
+    let last_check_path = home.join(".schedule_last_check");
+    let last_check = std::fs::read_to_string(&last_check_path)
+        .ok()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|| now - chrono::Duration::seconds(10));
+
+    let mut any_triggered = false;
+
+    for sched in schedules {
+        let enabled = sched["enabled"].as_bool().unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+
+        let cron_expr = match sched["cron"].as_str() {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // cron crate needs 6-field format (sec min hour dom month dow)
+        // User provides 5-field (min hour dom month dow), prepend "0 " for seconds
+        let full_expr = if cron_expr.split_whitespace().count() == 5 {
+            format!("0 {cron_expr}")
+        } else {
+            cron_expr.to_string()
+        };
+
+        let schedule = match Schedule::from_str(&full_expr) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[schedule] invalid cron '{}': {e}", cron_expr);
+                continue;
+            }
+        };
+
+        // Check if there's a trigger between last_check and now
+        let should_trigger = schedule.after(&last_check)
+            .take(1)
+            .any(|next| next <= now);
+
+        if should_trigger {
+            let target = sched["target"].as_str().unwrap_or("");
+            let message = sched["message"].as_str().unwrap_or("");
+            let label = sched["label"].as_str().unwrap_or("(unnamed)");
+
+            eprintln!("[schedule] triggering '{label}' → {target}: {message}");
+
+            // Inject message to target agent via registry
+            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(handle) = reg.get(target) {
+                let _ = agent::inject_to_agent(handle, message.as_bytes());
+            } else {
+                // Fallback: enqueue to inbox
+                let _ = crate::inbox::enqueue(home, target, crate::inbox::InboxMessage {
+                    from: "system:schedule".to_string(),
+                    text: message.to_string(),
+                    kind: Some("schedule".to_string()),
+                    timestamp: now.to_rfc3339(),
+                });
+            }
+            any_triggered = true;
+        }
+    }
+
+    if any_triggered || now.signed_duration_since(last_check).num_seconds() >= 10 {
+        let _ = std::fs::write(&last_check_path, now.to_rfc3339());
+    }
 }

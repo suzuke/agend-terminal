@@ -333,13 +333,25 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
         }
         "react" => {
             let emoji = args["emoji"].as_str().unwrap_or("");
-            eprintln!("[mcp] react from {instance_name}: {emoji}");
-            json!({"status": "logged", "emoji": emoji, "note": "Telegram react not yet implemented"})
+            let message_id = args["message_id"].as_str();
+            match try_telegram_react(&instance_name, emoji, message_id) {
+                Ok(()) => json!({"status": "reacted", "emoji": emoji}),
+                Err(e) => json!({"status": "logged", "emoji": emoji, "error": format!("{e}")}),
+            }
         }
         "edit_message" => {
-            let message_id = args["message_id"].as_str().unwrap_or("");
-            eprintln!("[mcp] edit_message from {instance_name}: {message_id}");
-            json!({"status": "logged", "message_id": message_id, "note": "Telegram edit not yet implemented"})
+            let message_id = match args["message_id"].as_str() {
+                Some(m) => m,
+                None => return json!({"error": "missing 'message_id'"}),
+            };
+            let text = match args["text"].as_str() {
+                Some(t) => t,
+                None => return json!({"error": "missing 'text'"}),
+            };
+            match try_telegram_edit(&instance_name, message_id, text) {
+                Ok(()) => json!({"status": "edited", "message_id": message_id}),
+                Err(e) => json!({"status": "logged", "error": format!("{e}")}),
+            }
         }
         "download_attachment" => {
             let file_id = match args["file_id"].as_str() {
@@ -609,11 +621,37 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 None => return json!({"error": "missing 'name'"}),
             };
             let reason = args["reason"].as_str().unwrap_or("manual replacement");
-            // Kill old instance, respawn will handle the rest
+
+            // Collect handover context from VTerm screen buffer before killing
+            let handover = match crate::api::call(&home, &json!({"method": "list"})) {
+                Ok(resp) => {
+                    resp["result"]["agents"].as_array()
+                        .and_then(|agents| agents.iter()
+                            .find(|a| a["name"].as_str() == Some(name)))
+                        .map(|a| {
+                            let state = a["agent_state"].as_str().unwrap_or("unknown");
+                            let health = a["health_state"].as_str().unwrap_or("unknown");
+                            format!("Previous instance state: {state}, health: {health}. Replaced due to: {reason}")
+                        })
+                        .unwrap_or_else(|| format!("Replaced due to: {reason}"))
+                }
+                Err(_) => format!("Replaced due to: {reason}"),
+            };
+
+            // Kill old instance — auto-respawn creates new one
             let _ = crate::api::call(&home, &json!({"method": "kill", "params": {"name": name}}));
+
+            // Queue handover message for the new instance
+            let _ = crate::inbox::enqueue(&home, name, crate::inbox::InboxMessage {
+                from: format!("system:replace"),
+                text: format!("[handover] {handover}"),
+                kind: Some("handover".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            });
+
             eprintln!("[mcp] replace_instance {name}: {reason}");
             json!({"status": "replacing", "name": name, "reason": reason,
-                   "note": "Instance killed. Auto-respawn will create fresh instance."})
+                   "note": "Instance killed. Auto-respawn will create fresh instance with handover context."})
         }
         "set_display_name" => {
             let display_name = args["name"].as_str().unwrap_or("");
@@ -770,6 +808,88 @@ fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<()> {
                             .await?;
                     }
                 }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            Ok(())
+        }
+        None => anyhow::bail!("No Telegram channel configured"),
+    }
+}
+
+fn try_telegram_react(instance_name: &str, emoji: &str, message_id: Option<&str>) -> anyhow::Result<()> {
+    let home = crate::home_dir();
+    let fleet_path = home.join("fleet.yaml");
+    let config = crate::fleet::FleetConfig::load(&fleet_path)?;
+    match &config.channel {
+        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+            let token = std::env::var(bot_token_env)?;
+            let mid: i32 = message_id
+                .and_then(|m| m.parse().ok())
+                .unwrap_or_else(|| {
+                    // Try to read last received message ID from metadata
+                    let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
+                    std::fs::read_to_string(&meta_path).ok()
+                        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+                        .and_then(|m| m["last_message_id"].as_i64())
+                        .unwrap_or(0) as i32
+                });
+            if mid == 0 {
+                anyhow::bail!("No message_id to react to");
+            }
+            // Map emoji name to actual emoji
+            let emoji_char = match emoji {
+                "thumbsup" | "thumbs_up" => "👍",
+                "thumbsdown" | "thumbs_down" => "👎",
+                "heart" | "red_heart" => "❤",
+                "fire" => "🔥",
+                "clap" => "👏",
+                "thinking" => "🤔",
+                "pray" | "folded_hands" => "🙏",
+                "party" | "tada" => "🎉",
+                "eyes" => "👀",
+                "100" => "💯",
+                "ok" | "ok_hand" => "👌",
+                "rocket" => "🚀",
+                "check" | "white_check_mark" => "✅",
+                other => other, // Pass through actual emoji chars
+            };
+
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            rt.block_on(async {
+                let bot = teloxide::Bot::new(&token);
+                let chat_id = teloxide::types::ChatId(*group_id);
+                let msg_id = teloxide::types::MessageId(mid);
+                let reaction = teloxide::types::ReactionType::Emoji {
+                    emoji: emoji_char.to_string(),
+                };
+                bot.set_message_reaction(chat_id, msg_id)
+                    .reaction(vec![reaction])
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })?;
+            Ok(())
+        }
+        None => anyhow::bail!("No Telegram channel configured"),
+    }
+}
+
+fn try_telegram_edit(instance_name: &str, message_id: &str, text: &str) -> anyhow::Result<()> {
+    let home = crate::home_dir();
+    let fleet_path = home.join("fleet.yaml");
+    let config = crate::fleet::FleetConfig::load(&fleet_path)?;
+    match &config.channel {
+        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+            let token = std::env::var(bot_token_env)?;
+            let mid: i32 = message_id.parse()
+                .map_err(|_| anyhow::anyhow!("invalid message_id: {message_id}"))?;
+
+            let _ = instance_name; // suppress unused warning
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            rt.block_on(async {
+                let bot = teloxide::Bot::new(&token);
+                let chat_id = teloxide::types::ChatId(*group_id);
+                let msg_id = teloxide::types::MessageId(mid);
+                bot.edit_message_text(chat_id, msg_id, text).await?;
                 Ok::<(), anyhow::Error>(())
             })?;
             Ok(())
