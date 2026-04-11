@@ -135,11 +135,14 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 match reg.get(name) {
                     Some(handle) => {
+                        // Set Restarting immediately (before kill) to close timing gap
+                        if let Ok(mut core) = handle.core.lock() {
+                            core.state.set_restarting();
+                        }
                         let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
                         let _ = child.kill();
                         drop(child);
                         drop(reg);
-                        // Socket cleanup happens via session reaper
                         json!({"ok": true})
                     }
                     None => json!({"ok": false, "error": format!("agent '{name}' not found")}),

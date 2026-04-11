@@ -100,6 +100,8 @@ enum Commands {
     /// List running agents
     #[command(alias = "ls")]
     List,
+    /// Show detailed agent status (state, health)
+    Status,
     /// Stop the daemon
     Stop,
     /// Kill a specific agent
@@ -272,6 +274,26 @@ fn main() -> anyhow::Result<()> {
                 }
             } else {
                 println!("No running daemon found.");
+            }
+        }
+        Some(Commands::Status) => {
+            match api::call(&home, &serde_json::json!({"method": "list"})) {
+                Ok(resp) => {
+                    if let Some(agents) = resp["result"]["agents"].as_array() {
+                        if agents.is_empty() {
+                            println!("No agents running.");
+                        } else {
+                            for agent in agents {
+                                let name = agent["name"].as_str().unwrap_or("?");
+                                let cmd = agent["command"].as_str().unwrap_or("?");
+                                let state = agent["agent_state"].as_str().unwrap_or("?");
+                                let health = agent["health_state"].as_str().unwrap_or("?");
+                                println!("  {name}: state={state} health={health} cmd={cmd}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Failed to connect to daemon: {e}"),
             }
         }
         Some(Commands::Kill { name }) => {
