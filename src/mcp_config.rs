@@ -50,7 +50,7 @@ fn upsert_mcp_servers(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Claude Code: .claude/settings.local.json + standalone mcp-config.json
+/// Claude Code: mcp-config.json + claude-settings.json (statusline for session ID capture)
 fn configure_claude(working_dir: &Path) -> Result<()> {
     // Ensure working dir is a git repo (Claude Code needs git root to find .claude/)
     let git_dir = working_dir.join(".git");
@@ -66,9 +66,34 @@ fn configure_claude(working_dir: &Path) -> Result<()> {
     let path = working_dir.join(".claude").join("settings.local.json");
     upsert_mcp_servers(&path)?;
 
-    // Also write standalone mcp-config.json for --mcp-config flag
+    // Write standalone mcp-config.json for --mcp-config flag
     let standalone = working_dir.join("mcp-config.json");
     upsert_mcp_servers(&standalone)?;
+
+    // Write statusline capture script (captures session_id from Claude)
+    let statusline_path = working_dir.join("statusline.json");
+    let script_path = working_dir.join("statusline.sh");
+    let script = format!(
+        "#!/bin/bash\ncat > {}\necho ok\n",
+        statusline_path.display()
+    );
+    std::fs::write(&script_path, &script)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    // Write claude-settings.json with statusLine config (for --settings flag)
+    let settings_path = working_dir.join("claude-settings.json");
+    let settings = serde_json::json!({
+        "statusLine": {
+            "type": "command",
+            "command": script_path.display().to_string()
+        }
+    });
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    eprintln!("[info] Claude settings: {}", settings_path.display());
 
     Ok(())
 }

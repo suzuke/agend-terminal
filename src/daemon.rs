@@ -202,6 +202,25 @@ pub fn run(
             break;
         }
 
+        // Capture session IDs from statusline.json (Claude)
+        {
+            let cfgs = configs.lock().unwrap();
+            for (name, config) in cfgs.iter() {
+                if let Some(ref dir) = config.working_dir {
+                    let statusline = dir.join("statusline.json");
+                    if statusline.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&statusline) {
+                            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                                if let Some(sid) = data.get("session_id").and_then(|v| v.as_str()) {
+                                    crate::backend::save_session_id(home, name, sid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Check for crashes (non-blocking, 200ms timeout)
         match crash_rx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(crashed_name) => {

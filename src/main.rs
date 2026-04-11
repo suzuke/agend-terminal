@@ -376,16 +376,18 @@ fn start_with_fleet(home: &std::path::Path, fleet_path: &std::path::Path) -> any
                 args.extend(p.resume_mode.args_for(home, &name));
             }
 
-            // Inject --mcp-config for Claude if working_directory has mcp-config.json
+            // Inject Claude-specific flags
             if let Some(ref dir) = resolved.working_directory {
-                let mcp_config = dir.join("mcp-config.json");
                 if resolved.command.contains("claude") {
+                    let mcp_config = dir.join("mcp-config.json");
                     if mcp_config.exists() {
                         args.push("--mcp-config".to_string());
                         args.push(mcp_config.display().to_string());
-                        eprintln!("[fleet] {}: injecting --mcp-config {}", name, mcp_config.display());
-                    } else {
-                        eprintln!("[fleet] {}: mcp-config.json not found at {}", name, mcp_config.display());
+                    }
+                    let settings = dir.join("claude-settings.json");
+                    if settings.exists() {
+                        args.push("--settings".to_string());
+                        args.push(settings.display().to_string());
                     }
                 }
             }

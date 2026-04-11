@@ -100,7 +100,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
+                resume_mode: ResumeMode::SavedSession { flag: "--resume" },
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
                 mcp_config_path: ".claude/settings.local.json",
