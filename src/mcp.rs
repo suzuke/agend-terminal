@@ -442,7 +442,7 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
         }
         "edit_message" => {
             let message_id = args["message_id"].as_str().unwrap_or("");
-            let text = args["text"].as_str().unwrap_or("");
+            let _text = args["text"].as_str().unwrap_or("");
             eprintln!("[mcp] edit_message from {instance_name}: {message_id}");
             // TODO: route to Telegram when implemented
             json!({"status": "logged", "message_id": message_id, "note": "Telegram edit not yet implemented"})
