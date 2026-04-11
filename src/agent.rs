@@ -308,7 +308,7 @@ pub fn spawn_agent(
             }
         })?;
 
-    eprintln!("[{name}] spawned: {command}");
+    eprintln!("[{name}] spawned: {command} {}", args.join(" "));
     Ok(())
 }
 
