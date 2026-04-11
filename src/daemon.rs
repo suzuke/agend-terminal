@@ -2,7 +2,6 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::framing::{self, TAG_DATA, TAG_RESIZE};
-use crate::health::HealthTracker;
 
 use portable_pty::PtySize;
 use std::collections::HashMap;
@@ -175,9 +174,8 @@ pub fn run(
     // Crash channel for auto-respawn
     let (crash_tx, crash_rx) = crossbeam::channel::unbounded::<String>();
 
-    // Store configs for respawn + per-agent health trackers
+    // Store configs for respawn
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
-    let health_trackers: Arc<Mutex<HashMap<String, HealthTracker>>> = Arc::new(Mutex::new(HashMap::new()));
 
     eprintln!("[daemon] starting {} agent(s)", agents.len());
 
@@ -191,7 +189,6 @@ pub fn run(
             submit_key: submit_key.clone(),
         };
         configs.lock().unwrap().insert(name.clone(), config);
-        health_trackers.lock().unwrap().insert(name.clone(), HealthTracker::new());
 
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
         agent::spawn_agent(
@@ -240,6 +237,24 @@ pub fn run(
             break;
         }
 
+        // Periodic health maintenance: decay crashes, check hangs, capture session IDs
+        {
+            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            for (name, handle) in reg.iter() {
+                if let Ok(mut core) = handle.core.lock() {
+                    // Decay total_crashes after stability window
+                    core.health.maybe_decay();
+                    // Unified hang detection (state-aware timeouts)
+                    let agent_state = core.state.current;
+                    let last_output = core.state.last_output;
+                    if core.health.check_hang(agent_state, last_output) {
+                        eprintln!("[health] {name}: hang detected (state={}, silent={:?})",
+                            agent_state.display_name(), last_output.elapsed());
+                    }
+                }
+            }
+        }
+
         // Capture session IDs from statusline.json (Claude)
         {
             let cfgs = configs.lock().unwrap();
@@ -274,19 +289,29 @@ pub fn run(
                     }
                 };
 
-                // Record crash in health tracker
+                // Record crash in health tracker (unified in AgentCore)
                 let (should_respawn, delay, should_notify) = {
-                    let mut trackers = health_trackers.lock().unwrap();
-                    let tracker = trackers.entry(crashed_name.clone()).or_insert_with(HealthTracker::new);
-                    tracker.record_crash()
+                    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    match reg.get(&crashed_name) {
+                        Some(handle) => {
+                            let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+                            core.health.record_crash()
+                        }
+                        None => {
+                            eprintln!("[health] {crashed_name}: not in registry, skipping");
+                            continue;
+                        }
+                    }
                 };
 
                 if should_notify {
-                    let state = health_trackers.lock().unwrap()
-                        .get(&crashed_name)
-                        .map(|h| h.state.display_name())
-                        .unwrap_or("unknown");
-                    eprintln!("[health] {crashed_name}: {} — notifying", state);
+                    let state = {
+                        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                        reg.get(&crashed_name)
+                            .and_then(|h| h.core.lock().ok().map(|c| c.health.state.display_name()))
+                            .unwrap_or("unknown")
+                    };
+                    eprintln!("[health] {crashed_name}: {state} — notifying");
                     // TODO: Telegram notification
                 }
 
@@ -295,7 +320,6 @@ pub fn run(
                     let reg = Arc::clone(&registry);
                     let home = home.to_path_buf();
                     let tx = crash_tx.clone();
-                    let trackers = Arc::clone(&health_trackers);
 
                     std::thread::Builder::new()
                         .name(format!("{crashed_name}_respawn"))
@@ -311,10 +335,12 @@ pub fn run(
                                 Ok(()) => {
                                     eprintln!("[health] {}: respawned", config.name);
 
-                                    // Mark respawn OK
-                                    if let Ok(mut t) = trackers.lock() {
-                                        if let Some(h) = t.get_mut(&config.name) {
-                                            h.respawn_ok();
+                                    // Mark respawn OK in core.health
+                                    {
+                                        let r = reg.lock().unwrap_or_else(|e| e.into_inner());
+                                        if let Some(handle) = r.get(&config.name) {
+                                            let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+                                            core.health.respawn_ok();
                                         }
                                     }
 
@@ -323,8 +349,8 @@ pub fn run(
                                     {
                                         let r = reg.lock().unwrap_or_else(|e| e.into_inner());
                                         if let Some(handle) = r.get(&config.name) {
-                                            let reason = trackers.lock().ok()
-                                                .and_then(|t| t.get(&config.name).map(|h| h.crash_reason().to_string()))
+                                            let reason = handle.core.lock().ok()
+                                                .map(|c| c.health.crash_reason().to_string())
                                                 .unwrap_or_else(|| "crash".into());
                                             let msg = format!(
                                                 "[system] Agent restarted due to {reason}. Previous context was lost.\r"

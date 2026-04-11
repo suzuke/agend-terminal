@@ -28,6 +28,7 @@ pub enum AgentState {
     AuthError,
     ApiError,
     Crashed,
+    Restarting,
 }
 
 impl AgentState {
@@ -47,12 +48,18 @@ impl AgentState {
             Self::AuthError => 10,
             Self::ApiError => 11,
             Self::Crashed => 12,
+            Self::Restarting => 13,
         }
     }
 
     /// Is this an error state (instant transition, no hysteresis)?
     pub fn is_error(self) -> bool {
         self.priority() >= Self::ContextFull.priority()
+    }
+
+    /// Is this agent unavailable (restarting or crashed)?
+    pub fn is_unavailable(self) -> bool {
+        matches!(self, Self::Crashed | Self::Restarting)
     }
 
     pub fn display_name(self) -> &'static str {
@@ -70,6 +77,7 @@ impl AgentState {
             Self::AuthError => "auth_error",
             Self::ApiError => "api_error",
             Self::Crashed => "crashed",
+            Self::Restarting => "restarting",
         }
     }
 }
@@ -248,19 +256,16 @@ impl StateTracker {
         }
     }
 
-    /// Check for hang (call periodically or on query).
-    pub fn check_hang(&mut self) {
-        if self.current != AgentState::Starting
-            && self.last_output.elapsed() > Duration::from_secs(60)
-        {
-            self.current = AgentState::Hang;
-        }
+    /// Get current state.
+    pub fn get_state(&self) -> AgentState {
+        self.current
     }
 
-    /// Get current state (with hang check).
-    pub fn get_state(&mut self) -> AgentState {
-        self.check_hang();
-        self.current
+    /// Force state to Restarting (called by reaper on crash).
+    pub fn set_restarting(&mut self) {
+        self.current = AgentState::Restarting;
+        self.since = Instant::now();
+        self.state_buf.clear();
     }
 
     fn transition(&mut self, new_state: AgentState) {
@@ -268,29 +273,35 @@ impl StateTracker {
             return;
         }
 
+        let old_state = self.current;
+
         // Error states: instant transition (no hysteresis)
         if new_state.is_error() {
             self.current = new_state;
             self.since = Instant::now();
-            return;
+        } else {
+            // Higher priority than current: transition if current held > min duration
+            let held = self.since.elapsed();
+            let min_hold = if self.current.priority() <= AgentState::Idle.priority() {
+                Duration::from_secs(5) // Passive states: 5s
+            } else {
+                Duration::from_secs(2) // Active states: 2s
+            };
+
+            // Higher priority always transitions
+            if new_state.priority() > self.current.priority() {
+                self.current = new_state;
+                self.since = Instant::now();
+            } else if held >= min_hold {
+                // Lower priority only after min hold
+                self.current = new_state;
+                self.since = Instant::now();
+            }
         }
 
-        // Higher priority than current: transition if current held > min duration
-        let held = self.since.elapsed();
-        let min_hold = if self.current.priority() <= AgentState::Idle.priority() {
-            Duration::from_secs(5) // Passive states: 5s
-        } else {
-            Duration::from_secs(2) // Active states: 2s
-        };
-
-        // Higher priority always transitions
-        if new_state.priority() > self.current.priority() {
-            self.current = new_state;
-            self.since = Instant::now();
-        } else if held >= min_hold {
-            // Lower priority only after min hold
-            self.current = new_state;
-            self.since = Instant::now();
+        // Clear state_buf on actual transition to avoid stale pattern matches
+        if self.current != old_state {
+            self.state_buf.clear();
         }
     }
 }

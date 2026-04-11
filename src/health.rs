@@ -14,6 +14,7 @@ const NOTIFY_COOLDOWN: Duration = Duration::from_secs(300); // 5 min between sam
 const DEFAULT_MAX_RETRIES: u32 = 5;
 const BACKOFF_BASE: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
+const STABILITY_WINDOW: Duration = Duration::from_secs(1800); // 30 min stable → decay
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,6 +183,31 @@ impl HealthTracker {
             HealthState::Failed => "too many crashes",
             HealthState::ErrorLoop => "error loop",
             _ => "unknown",
+        }
+    }
+
+    /// Decay total_crashes if stable for STABILITY_WINDOW.
+    /// Call periodically from daemon main loop.
+    pub fn maybe_decay(&mut self) {
+        if self.total_crashes == 0 {
+            return;
+        }
+        let last_crash = match self.crash_times.back() {
+            Some(t) => *t,
+            None => return,
+        };
+        if last_crash.elapsed() >= STABILITY_WINDOW {
+            self.total_crashes = self.total_crashes.saturating_sub(1);
+            if self.total_crashes == 0 {
+                self.crash_times.clear();
+            }
+            // Recover from Failed/Unstable if crashes decayed enough
+            if self.total_crashes < DEFAULT_MAX_RETRIES && self.state == HealthState::Failed {
+                self.state = HealthState::Recovering;
+            }
+            if self.total_crashes < 3 && self.state == HealthState::Unstable {
+                self.state = HealthState::Healthy;
+            }
         }
     }
 

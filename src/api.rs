@@ -83,7 +83,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                     .iter()
                     .map(|(name, handle)| {
                         let (agent_state, health_state) = handle.core.lock()
-                            .map(|mut c| {
+                            .map(|c| {
                                 let as_ = c.state.get_state().display_name().to_string();
                                 let hs = c.health.state.display_name().to_string();
                                 (as_, hs)
@@ -109,15 +109,22 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 match reg.get(name) {
                     Some(handle) => {
-                        let result = if raw {
-                            agent::write_to_agent(handle, data.as_bytes())
+                        // Check if agent is restarting
+                        let is_restarting = handle.core.lock()
+                            .map(|c| c.state.current.is_unavailable())
+                            .unwrap_or(false);
+                        if is_restarting {
+                            json!({"ok": false, "error": format!("agent '{name}' is restarting, retry later")})
                         } else {
-                            // Smart inject: text only, prefix+submit added by inject_to_agent
-                            agent::inject_to_agent(handle, data.as_bytes())
-                        };
-                        match result {
-                            Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
-                            Err(e) => json!({"ok": false, "error": format!("{e}")}),
+                            let result = if raw {
+                                agent::write_to_agent(handle, data.as_bytes())
+                            } else {
+                                agent::inject_to_agent(handle, data.as_bytes())
+                            };
+                            match result {
+                                Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
+                                Err(e) => json!({"ok": false, "error": format!("{e}")}),
+                            }
                         }
                     },
                     None => json!({"ok": false, "error": format!("agent '{name}' not found")}),
