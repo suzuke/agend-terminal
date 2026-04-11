@@ -241,6 +241,35 @@ pub fn init_from_config(
                 }
             }
 
+            // Write back newly created topic_ids to fleet.yaml
+            let fleet_path = home.join("fleet.yaml");
+            if fleet_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&fleet_path) {
+                    if let Ok(mut doc) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                        let mut updated = false;
+                        if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
+                            for (name, tid) in &topic_map {
+                                let key = serde_yaml::Value::String(name.clone());
+                                if let Some(inst) = instances.get_mut(&key).and_then(|v| v.as_mapping_mut()) {
+                                    let tid_key = serde_yaml::Value::String("topic_id".to_string());
+                                    if !inst.contains_key(&tid_key) {
+                                        inst.insert(tid_key, serde_yaml::Value::Number(serde_yaml::Number::from(*tid)));
+                                        updated = true;
+                                    }
+                                }
+                            }
+                        }
+                        if updated {
+                            if let Ok(yaml) = serde_yaml::to_string(&doc) {
+                                let yaml = format!("# Auto-updated by agend-terminal (topic_ids added)\n{yaml}");
+                                let _ = std::fs::write(&fleet_path, yaml);
+                                eprintln!("[telegram] updated fleet.yaml with topic_ids");
+                            }
+                        }
+                    }
+                }
+            }
+
             let state = Arc::new(Mutex::new(TelegramState::new(
                 &token,
                 *group_id,
