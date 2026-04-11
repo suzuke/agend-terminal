@@ -2,6 +2,8 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::framing::{self, TAG_DATA, TAG_RESIZE};
+use teloxide::prelude::Requester;
+use teloxide::payloads::SendMessageSetters;
 
 use portable_pty::PtySize;
 use std::collections::HashMap;
@@ -315,7 +317,8 @@ pub fn run(
                             .unwrap_or("unknown")
                     };
                     eprintln!("[health] {crashed_name}: {state} — notifying");
-                    // TODO: Telegram notification
+                    let msg = format!("[health] {crashed_name}: {state}");
+                    notify_telegram(home, &crashed_name, &msg);
                 }
 
                 if should_respawn {
@@ -407,6 +410,62 @@ pub fn run(
     std::thread::sleep(std::time::Duration::from_millis(500));
     eprintln!("[daemon] exiting.");
     std::process::exit(0);
+}
+
+/// Send a notification to Telegram (instance topic or general).
+fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
+    let fleet_path = home.join("fleet.yaml");
+    if !fleet_path.exists() {
+        return;
+    }
+    let config = match crate::fleet::FleetConfig::load(&fleet_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let (token, group_id, topic_id) = match &config.channel {
+        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+            let token = match std::env::var(bot_token_env) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let topic_id = config.instances.get(instance_name)
+                .and_then(|inst| inst.topic_id);
+            (token, *group_id, topic_id)
+        }
+        None => return,
+    };
+
+    let text = text.to_string();
+    // Fire-and-forget in a thread to avoid blocking daemon loop
+    std::thread::Builder::new()
+        .name("tg_notify".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            let _ = rt.block_on(async {
+                let bot = teloxide::Bot::new(&token);
+                let chat_id = teloxide::types::ChatId(group_id);
+                if let Some(tid) = topic_id {
+                    if tid == 1 {
+                        bot.send_message(chat_id, &text).await?;
+                    } else {
+                        bot.send_message(chat_id, &text)
+                            .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(tid)))
+                            .await?;
+                    }
+                } else {
+                    // No topic — send to general
+                    bot.send_message(chat_id, &text).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        })
+        .ok();
 }
 
 /// Check cron schedules and inject messages for due ones.
