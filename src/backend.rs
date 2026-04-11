@@ -121,12 +121,14 @@ impl Backend {
             },
             Backend::Codex => BackendPreset {
                 command: "codex",
-                args: &["--full-auto"],
+                // Codex uses "resume --last" as subcommand, not flag
+                // resume --last scoped by cwd → safe with own working_dir
+                args: &["resume", "--last", "--dangerously-bypass-approvals-and-sandbox"],
                 ready_pattern: "OpenAI Codex|›",
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_mode: ResumeMode::NotSupported,
+                resume_mode: ResumeMode::NotSupported, // Handled via args above
                 quit_command: "exit",
                 instructions_path: "AGENTS.md",
                 mcp_config_path: "opencode.json",
