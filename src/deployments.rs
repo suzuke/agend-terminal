@@ -85,11 +85,24 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         // Create worktree if branch specified
         let work_dir = if let Some(br) = branch {
             let wt = dir.join(&inst_name);
-            let _ = std::process::Command::new("git")
-                .args(["worktree", "add", "-b", &format!("{deploy_name}/{inst_suffix}"),
+            let branch_name = format!("{deploy_name}/{inst_suffix}");
+            match std::process::Command::new("git")
+                .args(["worktree", "add", "-b", &branch_name,
                        &wt.display().to_string(), br])
                 .current_dir(&dir)
-                .output();
+                .output()
+            {
+                Ok(o) if o.status.success() => {
+                    eprintln!("[deploy] created worktree {inst_name} on branch {branch_name}");
+                }
+                Ok(o) => {
+                    eprintln!("[deploy] worktree failed for {inst_name}: {}",
+                        String::from_utf8_lossy(&o.stderr).trim());
+                }
+                Err(e) => {
+                    eprintln!("[deploy] git not available: {e}");
+                }
+            }
             wt.display().to_string()
         } else {
             directory.to_string()

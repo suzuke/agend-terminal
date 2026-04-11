@@ -18,7 +18,7 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
                     if !worktree_dir.exists() {
                         let branch = format!("agend/{name}");
                         let output = std::process::Command::new("git")
-                            .args(["worktree", "add", "-B", &branch,
+                            .args(["worktree", "add", "-b", &branch,
                                    &worktree_dir.display().to_string()])
                             .current_dir(base_dir)
                             .output();
