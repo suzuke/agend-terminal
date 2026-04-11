@@ -4,7 +4,7 @@
 //! Single Mutex on AgentCore ensures atomic subscribe+dump.
 
 use crate::backend::Backend;
-use crate::health::{HealthState, HealthTracker};
+use crate::health::HealthTracker;
 use crate::state::StateTracker;
 use crate::vterm::VTerm;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
