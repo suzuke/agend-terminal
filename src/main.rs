@@ -3,6 +3,7 @@ mod api;
 mod backend;
 #[allow(dead_code)]
 mod channel;
+mod cli;
 mod daemon;
 #[allow(dead_code)]
 mod error;
@@ -20,6 +21,7 @@ mod tui;
 mod verify;
 mod vterm;
 
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub fn home_dir() -> PathBuf {
@@ -65,23 +67,111 @@ fn load_dotenv() {
     }
 }
 
+/// AgEnD Terminal — Agent Process Manager
+#[derive(Parser)]
+#[command(name = "agend-terminal", version, about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start daemon with fleet.yaml
+    Start,
+    /// Start daemon with explicit agent specs (name:cmd ...)
+    Daemon {
+        /// Agent specs in name:command format
+        agents: Vec<String>,
+    },
+    /// Attach to an agent's terminal (Ctrl+B d to detach)
+    Attach {
+        /// Agent name
+        #[arg(default_value = "shell")]
+        name: String,
+    },
+    /// Send input to an agent's PTY
+    Inject {
+        /// Agent name
+        name: String,
+        /// Text to inject
+        text: Vec<String>,
+    },
+    /// List running agents
+    #[command(alias = "ls")]
+    List,
+    /// Stop the daemon
+    Stop,
+    /// Kill a specific agent
+    Kill {
+        /// Agent name
+        name: String,
+    },
+    /// Fleet management
+    Fleet {
+        #[command(subcommand)]
+        command: FleetCommands,
+    },
+    /// Start MCP stdio server
+    Mcp,
+    /// Capture backend output for debugging
+    Capture {
+        /// Backend name (claude-code, kiro-cli, codex, open-code, gemini)
+        #[arg(long)]
+        backend: String,
+        /// Capture duration in seconds
+        #[arg(long, default_value = "15")]
+        seconds: u64,
+    },
+    /// Run tests
+    Test {
+        /// Test suite (mcp, attach, inbox, api, all)
+        #[arg(default_value = "all")]
+        suite: String,
+    },
+    /// Full E2E verification
+    Verify {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Filter by backend
+        #[arg(long)]
+        backend: Option<String>,
+    },
+    /// Health check
+    Doctor,
+}
+
+#[derive(Subcommand)]
+enum FleetCommands {
+    /// Start fleet from config
+    Start {
+        /// Path to fleet config YAML
+        config: Option<String>,
+    },
+    /// Stop all fleet agents
+    Stop,
+}
+
 fn main() -> anyhow::Result<()> {
     load_dotenv();
 
-    let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
-
+    let cli = Cli::parse();
     let home = home_dir();
     std::fs::create_dir_all(&home)?;
 
-    match cmd {
-        "start" => {
-            // Start daemon + auto-load fleet.yaml
+    match cli.command {
+        None => {
+            // Print help
+            use clap::CommandFactory;
+            Cli::command().print_help()?;
+            println!();
+        }
+        Some(Commands::Start) => {
             let fleet_path = home.join("fleet.yaml");
             if fleet_path.exists() {
-                start_with_fleet(&home, &fleet_path)?;
+                cli::start_with_fleet(&home, &fleet_path)?;
             } else {
-                // No fleet config — start a single bash shell
                 daemon::run(
                     &home,
                     vec![(
@@ -95,9 +185,8 @@ fn main() -> anyhow::Result<()> {
                 )?;
             }
         }
-        "daemon" => {
-            // Bare daemon — parse agents from CLI
-            let agents: Vec<_> = args[2..]
+        Some(Commands::Daemon { agents }) => {
+            let agents: Vec<_> = agents
                 .iter()
                 .map(|a| {
                     let (name, cmd) = if let Some((n, c)) = a.split_once(':') {
@@ -105,12 +194,12 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         (a.to_string(), a.to_string())
                     };
-                    // Auto-detect backend preset for submit_key + args
                     let detected = backend::Backend::from_command(&cmd);
                     let (preset_args, submit_key) = match detected {
                         Some(ref b) => {
                             let p = b.preset();
-                            let mut a: Vec<String> = p.args.iter().map(|s| s.to_string()).collect();
+                            let mut a: Vec<String> =
+                                p.args.iter().map(|s| s.to_string()).collect();
                             a.extend(p.resume_mode.args_for(&home, &name));
                             (a, p.submit_key.to_string())
                         }
@@ -120,44 +209,50 @@ fn main() -> anyhow::Result<()> {
                 })
                 .collect();
             let agents = if agents.is_empty() {
-                vec![("shell".to_string(), "/bin/bash".to_string(), Vec::new(), None, None, "\r".to_string())]
+                vec![(
+                    "shell".to_string(),
+                    "/bin/bash".to_string(),
+                    Vec::new(),
+                    None,
+                    None,
+                    "\r".to_string(),
+                )]
             } else {
                 agents
             };
             daemon::run(&home, agents)?;
         }
-        "attach" => {
-            let name = args.get(2).map(|s| s.as_str()).unwrap_or("shell");
-            let sock = daemon::agent_socket_path(&home, name);
+        Some(Commands::Attach { name }) => {
+            let sock = daemon::agent_socket_path(&home, &name);
             tui::attach(&sock)?;
         }
-        "inject" => {
-            let name = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: agend-terminal inject <name> <text>");
-                std::process::exit(1);
-            });
-            let text = args.get(3..).unwrap_or_default().join(" ");
+        Some(Commands::Inject { name, text }) => {
+            let text = text.join(" ");
             if text.is_empty() {
-                eprintln!("Usage: agend-terminal inject <name> <text>");
-                std::process::exit(1);
+                anyhow::bail!("No text provided");
             }
-            // Inject via API — text only, prefix+submit handled by inject_to_agent
-            match api::call(&home, &serde_json::json!({
-                "method": "inject",
-                "params": {"name": name, "data": text}
-            })) {
+            match api::call(
+                &home,
+                &serde_json::json!({
+                    "method": "inject",
+                    "params": {"name": name, "data": text}
+                }),
+            ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     println!("Injected: {text}");
                 }
                 Ok(resp) => {
-                    eprintln!("Inject failed: {}", resp["error"].as_str().unwrap_or("unknown"));
+                    eprintln!(
+                        "Inject failed: {}",
+                        resp["error"].as_str().unwrap_or("unknown")
+                    );
                 }
                 Err(e) => {
                     eprintln!("Failed to connect to daemon: {e}");
                 }
             }
         }
-        "stop" => {
+        Some(Commands::Stop) => {
             match api::call(&home, &serde_json::json!({"method": "shutdown"})) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     println!("Daemon shutdown initiated.");
@@ -166,7 +261,7 @@ fn main() -> anyhow::Result<()> {
                 Err(e) => eprintln!("Failed to connect to daemon: {e}"),
             }
         }
-        "list" | "ls" => {
+        Some(Commands::List) => {
             if let Some(run) = daemon::find_active_run_dir(&home) {
                 for entry in std::fs::read_dir(&run)?.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
@@ -179,499 +274,79 @@ fn main() -> anyhow::Result<()> {
                 println!("No running daemon found.");
             }
         }
-        "fleet" => {
-            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("help");
-            match subcmd {
-                "stop" => {
-                    // Kill all agents via API socket
-                    match api::call(&home, &serde_json::json!({"method": "list"})) {
-                        Ok(resp) => {
-                            if let Some(agents) = resp["result"]["agents"].as_array() {
-                                for agent in agents {
-                                    let name = agent["name"].as_str().unwrap_or("");
-                                    let _ = api::call(&home, &serde_json::json!({"method": "kill", "params": {"name": name}}));
-                                    println!("  Stopped {name}");
-                                }
-                                println!("Fleet stopped ({} agents)", agents.len());
-                            }
-                        }
-                        Err(e) => eprintln!("Failed to connect to daemon: {e}"),
-                    }
+        Some(Commands::Kill { name }) => {
+            match api::call(
+                &home,
+                &serde_json::json!({"method": "kill", "params": {"name": name}}),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    println!("Killed {name}");
                 }
-                "start" => {
-                    let config_path = args.get(3).map(|s| s.as_str());
-                    let fleet_path = config_path
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| home.join("fleet.yaml"));
-                    start_with_fleet(&home, &fleet_path)?;
-                }
-                _ => {
-                    eprintln!("Fleet commands:\n  agend-terminal fleet start [config.yaml]\n  agend-terminal fleet stop");
-                }
-            }
-        }
-        "kill" => {
-            let name = args.get(2).unwrap_or_else(|| {
-                eprintln!("Usage: agend-terminal kill <name>");
-                std::process::exit(1);
-            });
-            match api::call(&home, &serde_json::json!({"method": "kill", "params": {"name": name}})) {
                 Ok(resp) => {
-                    if resp["ok"].as_bool() == Some(true) {
-                        println!("Killed {name}");
-                    } else {
-                        eprintln!("Kill failed: {}", resp["error"].as_str().unwrap_or("unknown"));
-                    }
+                    eprintln!(
+                        "Kill failed: {}",
+                        resp["error"].as_str().unwrap_or("unknown")
+                    );
                 }
                 Err(e) => eprintln!("Failed to connect to daemon: {e}"),
             }
         }
-        "mcp" => {
-            let sock = daemon::agent_socket_path(&home, &get_instance_name());
+        Some(Commands::Fleet { command }) => match command {
+            FleetCommands::Start { config } => {
+                let fleet_path = config
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home.join("fleet.yaml"));
+                cli::start_with_fleet(&home, &fleet_path)?;
+            }
+            FleetCommands::Stop => {
+                match api::call(&home, &serde_json::json!({"method": "list"})) {
+                    Ok(resp) => {
+                        if let Some(agents) = resp["result"]["agents"].as_array() {
+                            for agent in agents {
+                                let name = agent["name"].as_str().unwrap_or("");
+                                let _ = api::call(
+                                    &home,
+                                    &serde_json::json!({"method": "kill", "params": {"name": name}}),
+                                );
+                                println!("  Stopped {name}");
+                            }
+                            println!("Fleet stopped ({} agents)", agents.len());
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+                }
+            }
+        },
+        Some(Commands::Mcp) => {
+            let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_else(|_| {
+                eprintln!(
+                    "Error: AGEND_INSTANCE_NAME not set. MCP server must run inside a session."
+                );
+                std::process::exit(1);
+            });
+            let sock = daemon::agent_socket_path(&home, &instance_name);
             mcp::run(&sock)?;
         }
-        "capture" => {
-            let backend_name = args.iter()
-                .position(|a| a == "--backend")
-                .and_then(|i| args.get(i + 1))
-                .map(|s| s.as_str())
-                .unwrap_or_else(|| {
-                    eprintln!("Usage: agend-terminal capture --backend <name> [--seconds N]");
-                    eprintln!("Backends: claude-code, kiro-cli, codex, open-code, gemini");
-                    std::process::exit(1);
-                });
-            let seconds: u64 = args.iter()
-                .position(|a| a == "--seconds")
-                .and_then(|i| args.get(i + 1))
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(15);
-
-            let b: backend::Backend = serde_json::from_str(&format!("\"{backend_name}\""))
+        Some(Commands::Capture { backend, seconds }) => {
+            let b: backend::Backend = serde_json::from_str(&format!("\"{backend}\""))
                 .unwrap_or_else(|_| {
-                    eprintln!("Unknown backend: {backend_name}");
+                    eprintln!("Unknown backend: {backend}");
                     std::process::exit(1);
                 });
-
             if !b.is_installed() {
-                eprintln!("{} ({}) not found in PATH", backend_name, b.preset().command);
+                eprintln!("{} ({}) not found in PATH", backend, b.preset().command);
                 std::process::exit(1);
             }
-
-            capture_backend(&b, seconds)?;
+            cli::capture_backend(&b, seconds)?;
         }
-        "test" => {
-            let subcmd = args.get(2).map(|s| s.as_str()).unwrap_or("all");
-            run_tests(subcmd, &home)?;
+        Some(Commands::Test { suite }) => {
+            cli::run_tests(&suite, &home)?;
         }
-        "verify" => {
-            let json = args.iter().any(|a| a == "--json");
-            let backend_filter = args.iter()
-                .find(|a| a.starts_with("--backend"))
-                .and_then(|_| args.iter().skip_while(|a| !a.starts_with("--backend")).nth(1))
-                .map(|s| s.as_str());
-            verify::run(&home, json, backend_filter)?;
+        Some(Commands::Verify { json, backend }) => {
+            verify::run(&home, json, backend.as_deref())?;
         }
-        "doctor" => {
-            run_doctor(&home)?;
-        }
-        _ => {
-            eprintln!(
-                "AgEnD Terminal v2\n\n\
-                 Session management:\n  \
-                   agend-terminal start                    Start daemon + fleet\n  \
-                   agend-terminal daemon [name:cmd ...]    Start daemon (bare)\n  \
-                   agend-terminal attach <name>            Attach (Ctrl+B d to detach)\n  \
-                   agend-terminal inject <name> <text>     Send input\n  \
-                   agend-terminal list                     List agents\n\n\
-                 MCP server:\n  \
-                   agend-terminal mcp                      Start MCP stdio server\n\n\
-                 QA tools:\n  \
-                   agend-terminal verify [--json]          Full E2E verification\n  \
-                   agend-terminal test [mcp|attach|all]    Run individual tests\n  \
-                   agend-terminal doctor                   Health check\n\n\
-                 Detach: Ctrl+B d"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn get_instance_name() -> String {
-    std::env::var("AGEND_INSTANCE_NAME").unwrap_or_else(|_| {
-        eprintln!("Error: AGEND_INSTANCE_NAME not set. MCP server must run inside a session.");
-        std::process::exit(1);
-    })
-}
-
-
-fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
-    let preset = b.preset();
-    let name = format!("capture-{}", b.name());
-    let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-
-    eprintln!("[capture] Spawning {} ({} {}) for {}s...",
-        b.name(), preset.command, args.join(" "), seconds);
-
-    let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-
-    agent::spawn_agent(
-        &name, preset.command, &args, 120, 40, None, None,
-        preset.submit_key, &registry, None, None,
-    )?;
-
-    eprintln!("[capture] Waiting {}s for output...", seconds);
-    std::thread::sleep(std::time::Duration::from_secs(seconds));
-
-    // Dump VTerm screen (raw ANSI)
-    let (_raw_dump, stripped) = {
-        let reg = registry.lock().unwrap();
-        match reg.get(&name) {
-            Some(handle) => {
-                let core = handle.core.lock().unwrap();
-                let raw = core.vterm.dump_screen();
-                let raw_str = String::from_utf8_lossy(&raw).to_string();
-                let stripped = crate::agent::strip_ansi_pub(&raw_str);
-                (raw_str, stripped)
-            }
-            None => {
-                eprintln!("[capture] Agent exited before capture");
-                return Ok(());
-            }
-        }
-    };
-
-    // Kill
-    {
-        let reg = registry.lock().unwrap();
-        if let Some(handle) = reg.get(&name) {
-            let mut child = handle.child.lock().unwrap();
-            let _ = child.kill();
-        }
-    }
-
-    // Print results
-    println!("=== {} VTerm Screen (ANSI stripped, {}x40) ===", b.name(), 120);
-    for (i, line) in stripped.lines().enumerate() {
-        let trimmed = line.trim_end();
-        if !trimmed.is_empty() {
-            println!("{:>3}| {}", i + 1, trimmed);
-        }
-    }
-    println!("=== End {} ===", b.name());
-
-    Ok(())
-}
-
-/// Start daemon with fleet.yaml config.
-fn start_with_fleet(home: &std::path::Path, fleet_path: &std::path::Path) -> anyhow::Result<()> {
-    let config = fleet::FleetConfig::load(fleet_path)?;
-    let mut agents = Vec::new();
-
-    for name in config.instance_names() {
-        if let Some(resolved) = config.resolve_instance(&name) {
-            // Generate instructions + MCP config
-            if let Some(ref dir) = resolved.working_directory {
-                instructions::generate(dir, &resolved.command);
-                mcp_config::configure(dir, &resolved.command);
-            }
-
-            // Add resume args to continue previous session
-            let mut args = resolved.args;
-            // Add per-instance resume args (from saved session ID)
-            if let Some(ref b) = crate::backend::Backend::from_command(&resolved.command) {
-                let p = b.preset();
-                args.extend(p.resume_mode.args_for(home, &name));
-            }
-
-            // Inject Claude-specific flags
-            if let Some(ref dir) = resolved.working_directory {
-                if resolved.command.contains("claude") {
-                    let mcp_config = dir.join("mcp-config.json");
-                    if mcp_config.exists() {
-                        args.push("--mcp-config".to_string());
-                        args.push(mcp_config.display().to_string());
-                    }
-                    let settings = dir.join("claude-settings.json");
-                    if settings.exists() {
-                        args.push("--settings".to_string());
-                        args.push(settings.display().to_string());
-                    }
-                }
-            }
-
-            agents.push((
-                resolved.name,
-                resolved.command,
-                args,
-                Some(resolved.env),
-                resolved.working_directory,
-                resolved.submit_key,
-            ));
-        }
-    }
-
-    if agents.is_empty() {
-        eprintln!("No instances found in fleet.yaml");
-        std::process::exit(1);
-    }
-
-    // Initialize Telegram if configured
-    let submit_keys: std::collections::HashMap<String, String> = config
-        .instances
-        .keys()
-        .filter_map(|name| {
-            config.resolve_instance(name).map(|r| (name.clone(), r.submit_key))
-        })
-        .collect();
-    let _telegram = telegram::init_from_config(&config, home, submit_keys);
-
-    daemon::run(home, agents)?;
-    Ok(())
-}
-
-// --- QA Tools ---
-
-fn run_tests(subcmd: &str, home: &std::path::Path) -> anyhow::Result<()> {
-    match subcmd {
-        "mcp" => test_mcp(home)?,
-        "attach" => test_attach(home)?,
-        "inbox" => test_inbox(home)?,
-        "api" => test_api(home)?,
-        "all" => {
-            test_attach(home)?;
-            test_inbox(home)?;
-        }
-        _ => {
-            eprintln!("Unknown test: {subcmd}. Available: mcp, attach, inbox, api, all");
-            std::process::exit(1);
-        }
-    }
-    Ok(())
-}
-
-fn test_attach(_home: &std::path::Path) -> anyhow::Result<()> {
-    eprintln!("[test:attach] Spawning bash...");
-    let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-
-    agent::spawn_agent(
-        "test-attach",
-        "/bin/bash",
-        &[],
-        80,
-        24,
-        None,
-        None,
-        "\r",
-        &registry,
-        None,
-        None,
-    )?;
-
-    // Wait for PTY to be ready
-    std::thread::sleep(std::time::Duration::from_secs(1));
-
-    // Inject a command
-    eprintln!("[test:attach] Injecting test command...");
-    {
-        let reg = registry.lock().unwrap();
-        let agent = reg.get("test-attach").unwrap();
-        agent::write_to_agent(agent, b"echo AGEND_TEST_OK\r")?;
-    }
-
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    // Check VTerm output
-    let output = {
-        let reg = registry.lock().unwrap();
-        let agent = reg.get("test-attach").unwrap();
-        let core = agent.core.lock().unwrap();
-        let dump = core.vterm.dump_screen();
-        String::from_utf8_lossy(&dump).to_string()
-    };
-
-    if output.contains("AGEND_TEST_OK") {
-        eprintln!("[test:attach] PASS — PTY spawn + inject + VTerm output verified");
-    } else {
-        eprintln!("[test:attach] FAIL — 'AGEND_TEST_OK' not found in VTerm output");
-        std::process::exit(1);
-    }
-
-    // Kill
-    {
-        let reg = registry.lock().unwrap();
-        let agent = reg.get("test-attach").unwrap();
-        let mut child = agent.child.lock().unwrap();
-        let _ = child.kill();
-    }
-
-    eprintln!("[test:attach] Cleanup done");
-    Ok(())
-}
-
-fn test_mcp(home: &std::path::Path) -> anyhow::Result<()> {
-    // This test requires a running daemon with at least one agent
-    eprintln!("[test:mcp] Checking for running daemon...");
-
-    // Find any socket
-    let mut found_socket = None;
-    for entry in std::fs::read_dir(home)?.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".sock") {
-            found_socket = Some(entry.path());
-            break;
-        }
-    }
-
-    let socket_path = match found_socket {
-        Some(p) => p.display().to_string(),
-        None => {
-            eprintln!("[test:mcp] SKIP — no daemon running (no .sock files found)");
-            return Ok(());
-        }
-    };
-
-    eprintln!("[test:mcp] Testing MCP protocol on {socket_path}...");
-
-    // Test Content-Length framed initialize
-    let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
-    let init_frame = format!("Content-Length: {}\r\n\r\n{}", init_req.len(), init_req);
-
-    // We can't test MCP server directly (it reads stdin) — just verify the format functions
-    eprintln!("[test:mcp] Content-Length frame format: OK ({} bytes)", init_frame.len());
-    eprintln!("[test:mcp] PASS — MCP framing verified");
-
-    Ok(())
-}
-
-fn test_inbox(home: &std::path::Path) -> anyhow::Result<()> {
-    eprintln!("[test:inbox] Testing inbox enqueue + drain...");
-
-    let test_name = "test-inbox-agent";
-
-    // Enqueue 3 messages
-    for i in 1..=3 {
-        inbox::enqueue(
-            home,
-            test_name,
-            inbox::InboxMessage {
-                from: format!("tester-{i}"),
-                text: format!("Message {i}"),
-                kind: None,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            },
-        )?;
-    }
-
-    // Drain
-    let messages = inbox::drain(home, test_name);
-    assert_eq!(messages.len(), 3, "Expected 3 messages, got {}", messages.len());
-    assert_eq!(messages[0].from, "tester-1");
-    assert_eq!(messages[2].text, "Message 3");
-
-    // Drain again — should be empty
-    let empty = inbox::drain(home, test_name);
-    assert!(empty.is_empty(), "Inbox should be empty after drain");
-
-    // Cleanup
-    let _ = std::fs::remove_file(home.join("inbox").join(format!("{test_name}.jsonl")));
-
-    eprintln!("[test:inbox] PASS — enqueue + drain + empty verified");
-    Ok(())
-}
-
-fn test_api(home: &std::path::Path) -> anyhow::Result<()> {
-    eprintln!("[test:api] Checking for running daemon...");
-
-    // Try calling list
-    match api::call(home, &serde_json::json!({"method": "list"})) {
-        Ok(resp) => {
-            let agents = resp["result"]["agents"].as_array().map(|a| a.len()).unwrap_or(0);
-            eprintln!("[test:api] PASS — API socket responsive, {agents} agents");
-        }
-        Err(e) => {
-            eprintln!("[test:api] SKIP — daemon not running ({e})");
-        }
-    }
-
-    Ok(())
-}
-
-fn run_doctor(home: &std::path::Path) -> anyhow::Result<()> {
-    println!("AgEnD Terminal Doctor\n");
-
-    // Check home directory
-    print!("  Home directory: {}", home.display());
-    if home.exists() {
-        println!(" ✓");
-    } else {
-        println!(" ✗ (not found)");
-    }
-
-    // Check .env
-    let env_path = home.join(".env");
-    print!("  .env file: {}", env_path.display());
-    if env_path.exists() {
-        println!(" ✓");
-    } else {
-        println!(" - (optional)");
-    }
-
-    // Check fleet.yaml
-    let fleet_path = home.join("fleet.yaml");
-    print!("  fleet.yaml: {}", fleet_path.display());
-    if fleet_path.exists() {
-        match fleet::FleetConfig::load(&fleet_path) {
-            Ok(config) => {
-                println!(" ✓ ({} instances)", config.instances.len());
-                for name in config.instance_names() {
-                    if let Some(resolved) = config.resolve_instance(&name) {
-                        println!("    {name}: {} {}", resolved.command, resolved.args.join(" "));
-                    }
-                }
-            }
-            Err(e) => println!(" ✗ (parse error: {e})"),
-        }
-    } else {
-        println!(" - (not found)");
-    }
-
-    // Check active sockets
-    println!("\n  Active agents:");
-    let mut count = 0;
-    for entry in std::fs::read_dir(home)?.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".sock") {
-            let agent = &name[..name.len() - 5];
-            let path = entry.path().display().to_string();
-            // Try connecting to verify it's alive
-            match std::os::unix::net::UnixStream::connect(&path) {
-                Ok(_) => println!("    {agent} ✓ (socket responsive)"),
-                Err(_) => println!("    {agent} ✗ (socket stale)"),
-            }
-            count += 1;
-        }
-    }
-    if count == 0 {
-        println!("    (none)");
-    }
-
-    // Check backend binaries + versions
-    println!("\n  Backend binaries:");
-    for b in backend::Backend::all() {
-        let name = b.name();
-        let preset = b.preset();
-        if b.is_installed() {
-            let version = b.get_version().unwrap_or_else(|| "?".into());
-            let calibrated = b.calibrated_version();
-            let version_note = if version != calibrated {
-                format!(" (calibrated: {calibrated}, patterns may need update)")
-            } else {
-                String::new()
-            };
-            println!("    {name} ({}) v{version} ✓{version_note}", preset.command);
-        } else {
-            println!("    {name} ({}) - (not in PATH)", preset.command);
+        Some(Commands::Doctor) => {
+            cli::run_doctor(&home)?;
         }
     }
 
