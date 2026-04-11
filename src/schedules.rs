@@ -1,4 +1,4 @@
-//! Schedule storage — CRUD for cron schedules (execution engine TODO).
+//! Schedule storage — CRUD for cron schedules. Execution via daemon::check_schedules().
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

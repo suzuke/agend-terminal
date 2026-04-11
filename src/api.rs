@@ -52,7 +52,14 @@ pub fn find_api_socket(home: &Path) -> Option<String> {
 }
 
 fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shutdown: &Arc<AtomicBool>) {
-    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+    let cloned = match stream.try_clone() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[api] stream clone failed: {e}");
+            return;
+        }
+    };
+    let mut reader = BufReader::new(cloned);
     let mut writer = stream;
 
     loop {

@@ -70,16 +70,22 @@ impl TelegramState {
 pub fn start_polling(
     state: Arc<Mutex<TelegramState>>,
 ) {
-    std::thread::Builder::new()
+    if let Err(e) = std::thread::Builder::new()
         .name("telegram".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("tokio runtime");
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("[telegram] failed to build tokio runtime: {e}");
+                    return;
+                }
+            };
             rt.block_on(async {
                 let bot = {
-                    let s = state.lock().unwrap();
+                    let s = state.lock().unwrap_or_else(|e| e.into_inner());
                     s.bot.clone()
                 };
 
@@ -101,7 +107,9 @@ pub fn start_polling(
                     .await;
             });
         })
-        .expect("telegram thread");
+    {
+        eprintln!("[telegram] failed to spawn polling thread: {e}");
+    }
 }
 
 fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {

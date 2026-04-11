@@ -6,8 +6,20 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::sync::OnceLock;
 use teloxide::prelude::*;
 use teloxide::net::Download;
+
+/// Shared tokio runtime for Telegram API calls (built once, reused).
+fn mcp_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("mcp tokio runtime")
+    })
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -793,10 +805,7 @@ fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<()> {
             let topic_id = config.instances.get(instance_name)
                 .and_then(|inst| inst.topic_id);
 
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
+            mcp_runtime().block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let chat_id = teloxide::types::ChatId(*group_id);
                 if let Some(tid) = topic_id {
@@ -854,8 +863,7 @@ fn try_telegram_react(instance_name: &str, emoji: &str, message_id: Option<&str>
                 other => other, // Pass through actual emoji chars
             };
 
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            rt.block_on(async {
+            mcp_runtime().block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let chat_id = teloxide::types::ChatId(*group_id);
                 let msg_id = teloxide::types::MessageId(mid);
@@ -884,8 +892,7 @@ fn try_telegram_edit(instance_name: &str, message_id: &str, text: &str) -> anyho
                 .map_err(|_| anyhow::anyhow!("invalid message_id: {message_id}"))?;
 
             let _ = instance_name; // suppress unused warning
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            rt.block_on(async {
+            mcp_runtime().block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let chat_id = teloxide::types::ChatId(*group_id);
                 let msg_id = teloxide::types::MessageId(mid);
@@ -908,10 +915,7 @@ fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Result
     match &config.channel {
         Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, .. }) => {
             let token = std::env::var(bot_token_env)?;
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(async {
+            mcp_runtime().block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let file = bot.get_file(file_id).await?;
                 let download_dir = home.join("downloads").join(instance_name);
