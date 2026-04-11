@@ -221,7 +221,7 @@ pub fn run(
             working_dir: working_dir.clone(),
             submit_key: submit_key.clone(),
         };
-        configs.lock().unwrap().insert(name.clone(), config);
+        configs.lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), config);
 
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
         agent::spawn_agent(
@@ -317,7 +317,7 @@ pub fn run(
         check_schedules(home, &registry);
 
         {
-            let cfgs = configs.lock().unwrap();
+            let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
             for (name, config) in cfgs.iter() {
                 if let Some(ref dir) = config.working_dir {
                     let statusline = dir.join("statusline.json");
@@ -343,7 +343,7 @@ pub fn run(
         eprintln!("[health] {crashed_name} crashed");
 
                 // Get config for respawn
-                let config = configs.lock().unwrap().get(&crashed_name).cloned();
+                let config = configs.lock().unwrap_or_else(|e| e.into_inner()).get(&crashed_name).cloned();
                 let config = match config {
                     Some(c) => c,
                     None => {

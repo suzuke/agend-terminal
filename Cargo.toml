@@ -3,6 +3,9 @@ name = "agend-terminal"
 version = "0.2.0"
 edition = "2021"
 
+[lints.clippy]
+unwrap_used = "deny"
+
 [dependencies]
 # PTY
 portable-pty = "0.9"

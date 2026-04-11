@@ -133,7 +133,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
 
     let (instance_name, home, submit_key) = {
-        let s = state.lock().unwrap();
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
         let name = thread_id
             .and_then(|tid| s.topic_to_instance.get(&tid).cloned())
             .unwrap_or_else(|| "general".to_string());
@@ -165,7 +165,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 /// Send a reply from an agent to Telegram (called from MCP reply tool).
 #[allow(dead_code)]
 pub fn send_reply(state: &Arc<Mutex<TelegramState>>, instance_name: &str, text: &str) -> anyhow::Result<()> {
-    let s = state.lock().unwrap();
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
     let bot = s.bot.clone();
     let group_id = s.group_id;
     let topic_id = s.instance_to_topic.get(instance_name).copied();
@@ -313,7 +313,7 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
     }
 
     fn send_reply(&self, instance_name: &str, text: &str) -> crate::channel::SendResult {
-        let s = self.lock().unwrap();
+        let s = self.lock().unwrap_or_else(|e| e.into_inner());
         let bot = s.bot.clone();
         let group_id = s.group_id;
         let topic_id = s.instance_to_topic.get(instance_name).copied();

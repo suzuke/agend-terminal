@@ -140,6 +140,7 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
     Ok(())
 }
 
+#[allow(clippy::unwrap_used)]
 fn test_attach(_home: &Path) -> TestResult {
     let registry = Arc::new(Mutex::new(HashMap::new()));
     match agent::spawn_agent("verify-attach", "/bin/bash", &[], 80, 24, None, None, "\r", &registry, None, None) {
@@ -352,6 +353,7 @@ fn test_telegram() -> TestResult {
 }
 
 /// Per-backend verification: spawn, ready, instructions, MCP config, inject, quit.
+#[allow(clippy::unwrap_used)]
 fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let name = backend.name();
     let preset = backend.preset();
