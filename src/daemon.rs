@@ -65,7 +65,7 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
             Err(_) => continue,
         };
         let n = name.to_string();
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name(format!("{n}_tui_out"))
             .spawn(move || {
                 loop {
@@ -79,11 +79,14 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
                     }
                 }
             })
-            .ok();
+        {
+            eprintln!("[{n}] failed to spawn TUI output thread: {e}");
+        }
 
         let read_stream = stream;
         let n = name.to_string();
-        std::thread::Builder::new()
+        let n_err = n.clone();
+        if let Err(e) = std::thread::Builder::new()
             .name(format!("{n}_tui_in"))
             .spawn(move || {
                 let mut reader = read_stream;
@@ -120,7 +123,9 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
                 }
                 eprintln!("[{n}] TUI client disconnected");
             })
-            .ok();
+        {
+            eprintln!("[{n_err}] failed to spawn TUI input thread: {e}");
+        }
     }
 }
 
@@ -327,7 +332,7 @@ pub fn run(
                     let home = home.to_path_buf();
                     let tx = crash_tx.clone();
 
-                    std::thread::Builder::new()
+                    if let Err(e) = std::thread::Builder::new()
                         .name(format!("{crashed_name}_respawn"))
                         .spawn(move || {
                             std::thread::sleep(delay);
@@ -368,18 +373,23 @@ pub fn run(
                                     // Start TUI socket for respawned agent
                                     let sock = agent_socket_path(&home, &config.name);
                                     let n = config.name.clone();
+                                    let n_err = n.clone();
                                     let reg2 = Arc::clone(&reg);
-                                    std::thread::Builder::new()
+                                    if let Err(e) = std::thread::Builder::new()
                                         .name(format!("{n}_tui_server"))
                                         .spawn(move || serve_agent_tui(&n, &sock, &reg2))
-                                        .ok();
+                                    {
+                                        eprintln!("[{n_err}] failed to spawn TUI server: {e}");
+                                    }
                                 }
                                 Err(e) => {
                                     eprintln!("[health] {}: respawn failed: {e}", config.name);
                                 }
                             }
                         })
-                        .ok();
+                    {
+                        eprintln!("[health] {crashed_name}: failed to spawn respawn thread: {e}");
+                    }
                 } else {
                     eprintln!("[health] {crashed_name}: max retries exceeded, not respawning");
                 }

@@ -18,6 +18,7 @@ mod mcp;
 mod mcp_config;
 mod schedules;
 mod state;
+mod store;
 mod tasks;
 mod teams;
 mod telegram;

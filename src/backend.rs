@@ -82,6 +82,9 @@ pub struct BackendPreset {
     /// Resume strategy for this backend.
     pub resume_mode: ResumeMode,
     pub quit_command: &'static str,
+    /// Patterns to auto-dismiss (trust dialogs, update prompts).
+    /// Each entry: (pattern_text, key_sequence_to_send).
+    pub dismiss_patterns: &'static [(&'static str, &'static [u8])],
     /// Relative path for instructions file from working dir.
     pub instructions_path: &'static str,
     /// Relative path for MCP config file from working dir.
@@ -105,6 +108,10 @@ impl Backend {
                 instructions_path: ".claude/rules/agend.md",
                 mcp_config_path: ".claude/settings.local.json",
                 ready_timeout_secs: 30,
+                dismiss_patterns: &[
+                    ("Yes, I trust", b"\x1b[A\x1b[A\r"),
+                    ("Yes, proceed", b"\x1b[A\x1b[A\r"),
+                ],
             },
             Backend::KiroCli => BackendPreset {
                 command: "kiro-cli",
@@ -118,21 +125,21 @@ impl Backend {
                 instructions_path: ".kiro/steering/agend.md",
                 mcp_config_path: ".kiro/settings/mcp.json",
                 ready_timeout_secs: 30,
+                dismiss_patterns: &[],
             },
             Backend::Codex => BackendPreset {
                 command: "codex",
-                // Codex uses "resume --last" as subcommand, not flag
-                // resume --last scoped by cwd → safe with own working_dir
                 args: &["resume", "--last", "--dangerously-bypass-approvals-and-sandbox"],
                 ready_pattern: "OpenAI Codex|›",
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_mode: ResumeMode::NotSupported, // Handled via args above
+                resume_mode: ResumeMode::NotSupported,
                 quit_command: "exit",
                 instructions_path: "AGENTS.md",
                 mcp_config_path: "opencode.json",
                 ready_timeout_secs: 20,
+                dismiss_patterns: &[],
             },
             Backend::OpenCode => BackendPreset {
                 command: "opencode",
@@ -146,6 +153,12 @@ impl Backend {
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
                 ready_timeout_secs: 45,
+                dismiss_patterns: &[
+                    ("Update Available", b"\r"),
+                    ("Skip  Confirm", b"\r"),
+                    ("Update Complete", b"\r"),
+                    ("Please restart", b"\r"),
+                ],
             },
             Backend::Gemini => BackendPreset {
                 command: "gemini",
@@ -159,6 +172,7 @@ impl Backend {
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",
                 ready_timeout_secs: 20,
+                dismiss_patterns: &[],
             },
         }
     }
