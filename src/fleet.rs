@@ -51,6 +51,9 @@ pub struct InstanceDefaults {
     pub env: HashMap<String, String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
+    /// If true, create a git worktree for each instance from this repo.
+    #[serde(default)]
+    pub worktree: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +71,9 @@ pub struct InstanceConfig {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
+    /// If true, create a git worktree for this instance.
+    #[serde(default)]
+    pub worktree: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +162,7 @@ impl FleetConfig {
             cols,
             rows,
             topic_id: inst.topic_id,
+            worktree: inst.worktree.unwrap_or(defaults.worktree),
         })
     }
 
@@ -179,6 +186,7 @@ pub struct ResolvedInstance {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
+    pub worktree: bool,
 }
 
 fn dirs_home() -> Option<PathBuf> {
