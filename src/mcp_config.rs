@@ -50,9 +50,9 @@ fn upsert_mcp_servers(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Claude Code: .claude/settings.json
+/// Claude Code: .claude/settings.local.json (project-local MCP config)
 fn configure_claude(working_dir: &Path) -> Result<()> {
-    let path = working_dir.join(".claude").join("settings.json");
+    let path = working_dir.join(".claude").join("settings.local.json");
     upsert_mcp_servers(&path)
 }
 

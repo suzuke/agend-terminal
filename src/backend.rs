@@ -45,7 +45,7 @@ impl Backend {
                 typed_inject: false,
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
-                mcp_config_path: ".claude/settings.json",
+                mcp_config_path: ".claude/settings.local.json",
                 ready_timeout_secs: 30,
             },
             Backend::KiroCli => BackendPreset {
