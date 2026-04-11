@@ -139,6 +139,7 @@ pub fn agent_socket_path(home: &Path, name: &str) -> String {
 }
 
 /// Find any active run directory (for CLI commands connecting to daemon).
+/// Verifies identity via .daemon file (PID + start timestamp) to prevent PID reuse false positives.
 pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
     let run = home.join("run");
     if !run.exists() {
@@ -149,16 +150,40 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
         if let Ok(pid) = pid_str.parse::<u32>() {
             // Check if PID is alive
             let alive = unsafe { nix::libc::kill(pid as i32, 0) == 0 };
-            if alive {
-                return Some(entry.path());
-            } else {
-                // Stale PID dir — clean up
+            if !alive {
                 eprintln!("[daemon] cleaning stale run dir: {}", entry.path().display());
                 let _ = std::fs::remove_dir_all(entry.path());
+                continue;
             }
+            // Verify identity: read .daemon file with start timestamp
+            let daemon_file = entry.path().join(".daemon");
+            if let Ok(content) = std::fs::read_to_string(&daemon_file) {
+                // Format: "pid:start_time"
+                if let Some((file_pid, _start_time)) = content.trim().split_once(':') {
+                    if file_pid == pid_str {
+                        return Some(entry.path());
+                    }
+                    // PID alive but .daemon file has different PID → PID was reused
+                    eprintln!("[daemon] PID {pid} reused (was {}), cleaning", file_pid);
+                    let _ = std::fs::remove_dir_all(entry.path());
+                    continue;
+                }
+            }
+            // No .daemon file but PID alive → legacy or corrupted, accept it
+            return Some(entry.path());
         }
     }
     None
+}
+
+/// Write daemon identity file for PID reuse detection.
+fn write_daemon_id(run_dir: &Path) {
+    let pid = std::process::id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(run_dir.join(".daemon"), format!("{pid}:{now}"));
 }
 
 /// Start daemon: spawn agents, handle crashes with auto-respawn.
@@ -171,9 +196,10 @@ pub fn run(
         anyhow::bail!("Another daemon is already running ({})", existing.display());
     }
 
-    // Create PID-isolated run directory
+    // Create PID-isolated run directory with identity file
     let run = run_dir(home);
     std::fs::create_dir_all(&run)?;
+    write_daemon_id(&run);
     eprintln!("[daemon] run dir: {}", run.display());
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -238,20 +264,46 @@ pub fn run(
 
     eprintln!("[daemon] running. Ctrl+C or `agend-terminal stop` to stop.");
 
-    // Main loop: handle crashes + shutdown
+    // Periodic tick channel (every 10s for health/schedule/session maintenance)
+    let tick_rx = {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        std::thread::Builder::new()
+            .name("daemon_tick".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    if tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+        rx
+    };
+
+    // Main loop: event-driven via select on crash channel + periodic tick
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
 
-        // Periodic health maintenance: decay crashes, check hangs, capture session IDs
+        // Block until either a crash event or periodic tick
+        let crashed_name: Option<String>;
+        crossbeam::select! {
+            recv(crash_rx) -> msg => {
+                crashed_name = msg.ok();
+            }
+            recv(tick_rx) -> _ => {
+                crashed_name = None;
+            }
+        }
+
+        // Periodic maintenance (runs on every wake, whether crash or tick)
         {
             let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
             for (name, handle) in reg.iter() {
                 if let Ok(mut core) = handle.core.lock() {
-                    // Decay total_crashes after stability window
                     core.health.maybe_decay();
-                    // Unified hang detection (state-aware timeouts)
                     let agent_state = core.state.current;
                     let last_output = core.state.last_output;
                     if core.health.check_hang(agent_state, last_output) {
@@ -262,10 +314,8 @@ pub fn run(
             }
         }
 
-        // Check cron schedules
         check_schedules(home, &registry);
 
-        // Capture session IDs from statusline.json (Claude)
         {
             let cfgs = configs.lock().unwrap();
             for (name, config) in cfgs.iter() {
@@ -284,10 +334,13 @@ pub fn run(
             }
         }
 
-        // Check for crashes (non-blocking, 200ms timeout)
-        match crash_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(crashed_name) => {
-                eprintln!("[health] {crashed_name} crashed");
+        // Handle crash event (if any)
+        let crashed_name = match crashed_name {
+            Some(n) => n,
+            None => continue, // Tick only — no crash to handle
+        };
+
+        eprintln!("[health] {crashed_name} crashed");
 
                 // Get config for respawn
                 let config = configs.lock().unwrap().get(&crashed_name).cloned();
@@ -393,10 +446,6 @@ pub fn run(
                 } else {
                     eprintln!("[health] {crashed_name}: max retries exceeded, not respawning");
                 }
-            }
-            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {} // Normal
-            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
-        }
     }
 
     // Shutdown cleanup
