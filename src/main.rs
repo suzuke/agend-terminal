@@ -4,6 +4,8 @@ mod backend;
 #[allow(dead_code)]
 mod channel;
 mod daemon;
+#[allow(dead_code)]
+mod error;
 mod fleet;
 mod framing;
 #[allow(dead_code)]

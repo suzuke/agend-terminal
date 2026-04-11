@@ -7,6 +7,15 @@ use std::io::{Read, Write};
 
 pub const TAG_DATA: u8 = 0;
 pub const TAG_RESIZE: u8 = 1;
+/// Maximum frame size. Override via AGEND_FRAME_LIMIT env var (bytes).
+pub const DEFAULT_FRAME_LIMIT: usize = 1_000_000;
+
+fn frame_limit() -> usize {
+    std::env::var("AGEND_FRAME_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_FRAME_LIMIT)
+}
 
 pub fn write_frame(w: &mut impl Write, data: &[u8]) -> std::io::Result<()> {
     w.write_all(&[TAG_DATA])?;
@@ -28,7 +37,7 @@ pub fn read_tagged_frame(r: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 1_000_000 {
+    if len > frame_limit() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too large",
