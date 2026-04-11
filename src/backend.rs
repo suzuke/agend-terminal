@@ -13,6 +13,56 @@ pub enum Backend {
     Gemini,
 }
 
+/// How to resume a previous session.
+#[derive(Debug, Clone)]
+pub enum ResumeMode {
+    /// Use --resume <session-id> (Claude Code)
+    SessionId { flag: &'static str },
+    /// Use --resume-id <session-id> (Kiro)
+    ResumeId { flag: &'static str },
+    /// Use --session <session-id> (OpenCode)
+    SessionFlag { flag: &'static str },
+    /// Index-based, not safe for multi-instance (Gemini)
+    IndexBased,
+    /// Not supported (Codex — needs different command structure)
+    NotSupported,
+}
+
+impl ResumeMode {
+    /// Generate resume args for a given instance name.
+    /// Uses a deterministic UUID derived from instance name for session ID.
+    pub fn args_for(&self, instance_name: &str) -> Vec<String> {
+        let session_id = deterministic_session_id(instance_name);
+        match self {
+            ResumeMode::SessionId { flag } => vec![flag.to_string(), session_id],
+            ResumeMode::ResumeId { flag } => vec![flag.to_string(), session_id],
+            ResumeMode::SessionFlag { flag } => vec![flag.to_string(), session_id],
+            ResumeMode::IndexBased => vec![], // Can't safely resume with index
+            ResumeMode::NotSupported => vec![],
+        }
+    }
+}
+
+/// Generate a deterministic UUID v5-like ID from instance name.
+/// Same name always produces same ID → stable across restarts.
+fn deterministic_session_id(name: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    "agend-terminal".hash(&mut h);
+    name.hash(&mut h);
+    let hash = h.finish();
+    // Format as UUID-like string
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        (hash >> 32) as u32,
+        (hash >> 16) as u16 & 0xffff,
+        hash as u16 & 0x0fff | 0x4000, // version 4
+        (hash >> 48) as u16 & 0x3fff | 0x8000, // variant
+        hash & 0xffffffffffff,
+    )
+}
+
 /// Preset configuration for a backend.
 #[derive(Debug, Clone)]
 pub struct BackendPreset {
@@ -24,8 +74,8 @@ pub struct BackendPreset {
     pub inject_prefix: &'static str,
     /// Whether inject should use per-byte typed write (for bubbletea TUIs).
     pub typed_inject: bool,
-    /// Resume flag to continue previous session.
-    pub resume_args: &'static [&'static str],
+    /// Resume strategy for this backend.
+    pub resume_mode: ResumeMode,
     pub quit_command: &'static str,
     /// Relative path for instructions file from working dir.
     pub instructions_path: &'static str,
@@ -45,7 +95,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_args: &["--continue"],
+                resume_mode: ResumeMode::SessionId { flag: "--resume" },
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
                 mcp_config_path: ".claude/settings.local.json",
@@ -58,7 +108,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_args: &["--resume"],
+                resume_mode: ResumeMode::ResumeId { flag: "--resume-id" },
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
                 mcp_config_path: ".kiro/settings/mcp.json",
@@ -71,7 +121,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_args: &[], // codex resume needs different command structure
+                resume_mode: ResumeMode::NotSupported,
                 quit_command: "exit",
                 instructions_path: "AGENTS.md",
                 mcp_config_path: "opencode.json",
@@ -84,7 +134,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "\r",
                 typed_inject: true,
-                resume_args: &["--continue"],
+                resume_mode: ResumeMode::SessionFlag { flag: "--session" },
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
@@ -97,7 +147,7 @@ impl Backend {
                 submit_key: "\n\r",
                 inject_prefix: "\r",
                 typed_inject: true,
-                resume_args: &["--resume", "latest"],
+                resume_mode: ResumeMode::IndexBased, // Gemini uses index, not ID — can't safely resume
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",

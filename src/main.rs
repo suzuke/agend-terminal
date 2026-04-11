@@ -107,8 +107,7 @@ fn main() -> anyhow::Result<()> {
                         Some(ref b) => {
                             let p = b.preset();
                             let mut a: Vec<String> = p.args.iter().map(|s| s.to_string()).collect();
-                            // Add resume args to continue previous session
-                            a.extend(p.resume_args.iter().map(|s| s.to_string()));
+                            a.extend(p.resume_mode.args_for(&name));
                             (a, p.submit_key.to_string())
                         }
                         None => (Vec::new(), "\r".to_string()),
@@ -371,13 +370,10 @@ fn start_with_fleet(home: &std::path::Path, fleet_path: &std::path::Path) -> any
 
             // Add resume args to continue previous session
             let mut args = resolved.args;
+            // Add per-instance resume args (deterministic session ID)
             if let Some(ref b) = crate::backend::Backend::from_command(&resolved.command) {
                 let p = b.preset();
-                for ra in p.resume_args {
-                    if !args.iter().any(|a| a == *ra) {
-                        args.push(ra.to_string());
-                    }
-                }
+                args.extend(p.resume_mode.args_for(&name));
             }
 
             // Inject --mcp-config for Claude if working_directory has mcp-config.json
