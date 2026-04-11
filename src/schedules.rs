@@ -67,7 +67,7 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
     let mut store = load(home);
     store.schedules.push(schedule);
     match save(home, &store) {
-        Ok(()) => serde_json::json!({"id": id, "status": "created", "note": "Schedule saved. Cron execution engine not yet implemented."}),
+        Ok(()) => serde_json::json!({"id": id, "status": "created"}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
