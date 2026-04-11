@@ -510,7 +510,7 @@ fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
-            let _ = rt.block_on(async {
+            if let Err(e) = rt.block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let chat_id = teloxide::types::ChatId(group_id);
                 if let Some(tid) = topic_id {
@@ -526,7 +526,9 @@ fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
                     bot.send_message(chat_id, &text).await?;
                 }
                 Ok::<(), anyhow::Error>(())
-            });
+            }) {
+                eprintln!("[telegram] notify failed: {e}");
+            }
         })
         .ok();
 }
