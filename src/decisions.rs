@@ -156,3 +156,67 @@ pub fn update(home: &Path, args: &Value) -> Value {
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("agend-decisions-test-{}-{}-{}", std::process::id(), name, id));
+        std::fs::create_dir_all(dir.join("decisions")).ok();
+        dir
+    }
+
+    #[test]
+    fn test_post_and_list() {
+        let home = tmp_home("post_and_list");
+        let result = post(&home, "test-agent", &serde_json::json!({
+            "title": "Test Decision", "content": "We use Rust", "scope": "fleet"
+        }));
+        assert!(result["id"].as_str().is_some());
+        assert_eq!(result["status"], "posted");
+
+        let listed = list(&home, &serde_json::json!({}));
+        let decisions = listed["decisions"].as_array().expect("array");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["title"], "Test Decision");
+        assert_eq!(decisions[0]["author"], "test-agent");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_update_and_archive() {
+        let home = tmp_home("update_archive");
+        let result = post(&home, "a", &serde_json::json!({"title": "D1", "content": "v1"}));
+        let id = result["id"].as_str().expect("id");
+
+        let upd = update(&home, &serde_json::json!({"id": id, "content": "v2"}));
+        assert_eq!(upd["status"], "updated");
+
+        let listed = list(&home, &serde_json::json!({}));
+        assert_eq!(listed["decisions"][0]["content"], "v2");
+
+        // Archive
+        update(&home, &serde_json::json!({"id": id, "archive": true}));
+        let listed = list(&home, &serde_json::json!({}));
+        assert!(listed["decisions"].as_array().expect("arr").is_empty());
+
+        // Include archived
+        let listed = list(&home, &serde_json::json!({"include_archived": true}));
+        assert_eq!(listed["decisions"].as_array().expect("arr").len(), 1);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_update_nonexistent() {
+        let home = tmp_home("update_nonexistent");
+        let result = update(&home, &serde_json::json!({"id": "no-such-id"}));
+        assert!(result["error"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

@@ -321,4 +321,34 @@ mod tests {
         h.respawn_ok();
         assert_eq!(h.state, HealthState::Healthy);
     }
+
+    #[test]
+    fn test_clone_preserves_crash_history() {
+        let mut h = HealthTracker::new();
+        h.record_crash();
+        h.record_crash();
+        assert_eq!(h.total_crashes, 2);
+
+        // Simulate respawn: clone old tracker, call respawn_ok
+        let mut h2 = h.clone();
+        h2.respawn_ok();
+        assert_eq!(h2.total_crashes, 2); // History preserved
+
+        // 3rd crash on cloned tracker should see recent=3
+        let (_, _, notify) = h2.record_crash();
+        // notify is false: 2nd crash already set last_notification and cooldown (5 min) hasn't elapsed
+        assert!(!notify);
+        assert_eq!(h2.state, HealthState::Unstable);
+    }
+
+    #[test]
+    fn test_maybe_decay() {
+        let mut h = HealthTracker::new();
+        h.record_crash();
+        h.record_crash();
+        assert_eq!(h.total_crashes, 2);
+        // Decay won't trigger immediately (need 30 min)
+        h.maybe_decay();
+        assert_eq!(h.total_crashes, 2);
+    }
 }

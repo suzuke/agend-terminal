@@ -104,6 +104,70 @@ pub fn update(home: &Path, args: &Value) -> Value {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("agend-teams-test-{}-{}-{}", std::process::id(), name, id));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn test_create_list_update_delete() {
+        let home = tmp_home("crud");
+        let r = create(&home, &serde_json::json!({"name": "devs", "members": ["a", "b"]}));
+        assert_eq!(r["status"], "created");
+
+        let listed = list(&home);
+        assert_eq!(listed["teams"].as_array().expect("arr").len(), 1);
+        assert_eq!(listed["teams"][0]["members"].as_array().expect("m").len(), 2);
+
+        // Add member
+        update(&home, &serde_json::json!({"name": "devs", "add": ["c"]}));
+        let members = get_members(&home, "devs");
+        assert_eq!(members, vec!["a", "b", "c"]);
+
+        // Remove member
+        update(&home, &serde_json::json!({"name": "devs", "remove": ["a"]}));
+        let members = get_members(&home, "devs");
+        assert_eq!(members, vec!["b", "c"]);
+
+        // Duplicate add ignored
+        update(&home, &serde_json::json!({"name": "devs", "add": ["b"]}));
+        let members = get_members(&home, "devs");
+        assert_eq!(members, vec!["b", "c"]);
+
+        // Delete
+        let r = delete(&home, &serde_json::json!({"name": "devs"}));
+        assert_eq!(r["status"], "deleted");
+        assert!(list(&home)["teams"].as_array().expect("arr").is_empty());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_duplicate_create() {
+        let home = tmp_home("dup_create");
+        create(&home, &serde_json::json!({"name": "t", "members": ["a"]}));
+        let r = create(&home, &serde_json::json!({"name": "t", "members": ["b"]}));
+        assert!(r["error"].as_str().expect("err").contains("already exists"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_delete_nonexistent() {
+        let home = tmp_home("del_nonexistent");
+        let r = delete(&home, &serde_json::json!({"name": "nope"}));
+        assert!(r["error"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
 /// Get members of a team.
 pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
     let store = load(home);

@@ -138,3 +138,49 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         _ => serde_json::json!({"error": format!("unknown action: {action}")}),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("agend-tasks-test-{}-{}-{}", std::process::id(), name, id));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn test_create_list_claim_done() {
+        let home = tmp_home("crud");
+        let r = handle(&home, "agent1", &serde_json::json!({"action": "create", "title": "Fix bug", "priority": "high"}));
+        assert_eq!(r["status"], "created");
+        let id = r["id"].as_str().expect("id").to_string();
+
+        let listed = handle(&home, "agent1", &serde_json::json!({"action": "list"}));
+        assert_eq!(listed["tasks"].as_array().expect("arr").len(), 1);
+        assert_eq!(listed["tasks"][0]["status"], "open");
+
+        let claim = handle(&home, "agent2", &serde_json::json!({"action": "claim", "id": id}));
+        assert_eq!(claim["status"], "claimed");
+        assert_eq!(claim["assignee"], "agent2");
+
+        let done = handle(&home, "agent2", &serde_json::json!({"action": "done", "id": id, "result": "fixed"}));
+        assert_eq!(done["status"], "done");
+
+        let listed = handle(&home, "agent1", &serde_json::json!({"action": "list", "filter_status": "done"}));
+        assert_eq!(listed["tasks"][0]["result"], "fixed");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_claim_nonexistent() {
+        let home = tmp_home("claim_nonexistent");
+        let r = handle(&home, "a", &serde_json::json!({"action": "claim", "id": "nope"}));
+        assert!(r["error"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
