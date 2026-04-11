@@ -209,7 +209,23 @@ pub fn spawn_agent(
             loop {
                 match pty_reader.read(&mut buf) {
                     Ok(0) => {
-                        eprintln!("[{n}] PTY closed");
+                        // Check exit code before removing from registry
+                        let exit_code = {
+                            let reg = reg_for_reaper.lock().unwrap_or_else(|e| e.into_inner());
+                            reg.get(&n).and_then(|handle| {
+                                handle.child.lock().ok().and_then(|mut c| {
+                                    c.try_wait().ok().flatten().map(|s| s.exit_code() as i32)
+                                })
+                            })
+                        };
+                        let is_crash = exit_code.map(|c| c != 0).unwrap_or(true);
+
+                        if is_crash {
+                            eprintln!("[{n}] PTY closed (exit code: {}) — crash", exit_code.unwrap_or(-1));
+                        } else {
+                            eprintln!("[{n}] PTY closed (exit 0) — graceful exit");
+                        }
+
                         // Remove from registry + cleanup socket
                         if let Ok(mut reg) = reg_for_reaper.lock() {
                             reg.remove(&n);
@@ -218,9 +234,11 @@ pub fn spawn_agent(
                             let sock = crate::daemon::agent_socket_path(home, &n);
                             let _ = std::fs::remove_file(&sock);
                         }
-                        // Signal crash to daemon for auto-respawn
-                        if let Some(ref tx) = crash_tx_for_reaper {
-                            let _ = tx.send(n.clone());
+                        // Only signal crash for non-zero exit (don't respawn graceful exit)
+                        if is_crash {
+                            if let Some(ref tx) = crash_tx_for_reaper {
+                                let _ = tx.send(n.clone());
+                            }
                         }
                         break;
                     }
