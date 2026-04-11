@@ -16,51 +16,56 @@ pub enum Backend {
 /// How to resume a previous session.
 #[derive(Debug, Clone)]
 pub enum ResumeMode {
-    /// Use --resume <session-id> (Claude Code)
-    SessionId { flag: &'static str },
-    /// Use --resume-id <session-id> (Kiro)
-    ResumeId { flag: &'static str },
-    /// Use --session <session-id> (OpenCode)
-    SessionFlag { flag: &'static str },
-    /// Index-based, not safe for multi-instance (Gemini)
-    IndexBased,
-    /// Not supported (Codex — needs different command structure)
+    /// Resumes most recent session in cwd (safe if each instance has own working_dir).
+    /// flag is the CLI flag to use (e.g., "--continue" for Claude, "--resume" for Kiro).
+    ContinueInCwd { flag: &'static str },
+    /// Use --resume-id <saved-session-id> (needs captured ID from file)
+    #[allow(dead_code)]
+    SavedSession { flag: &'static str },
+    /// Fixed args (e.g., Gemini --resume latest)
+    Fixed { args: &'static [&'static str] },
+    /// Not supported
     NotSupported,
 }
 
 impl ResumeMode {
-    /// Generate resume args for a given instance name.
-    /// Uses a deterministic UUID derived from instance name for session ID.
-    pub fn args_for(&self, instance_name: &str) -> Vec<String> {
-        let session_id = deterministic_session_id(instance_name);
+    /// Get resume args. For ContinueInCwd, always returns --continue.
+    /// For others, reads saved session ID from file.
+    pub fn args_for(&self, home: &std::path::Path, instance_name: &str) -> Vec<String> {
         match self {
-            ResumeMode::SessionId { flag } => vec![flag.to_string(), session_id],
-            ResumeMode::ResumeId { flag } => vec![flag.to_string(), session_id],
-            ResumeMode::SessionFlag { flag } => vec![flag.to_string(), session_id],
-            ResumeMode::IndexBased => vec![], // Can't safely resume with index
+            ResumeMode::ContinueInCwd { flag } => vec![flag.to_string()],
+            ResumeMode::Fixed { args } => args.iter().map(|s| s.to_string()).collect(),
             ResumeMode::NotSupported => vec![],
+            _ => {
+                // Read saved session ID
+                let sid_file = home.join("sessions").join(format!("{instance_name}.sid"));
+                let session_id = std::fs::read_to_string(&sid_file)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+
+                match (self, session_id) {
+                    (ResumeMode::SavedSession { flag }, Some(sid)) => vec![flag.to_string(), sid],
+                    _ => vec![], // No saved session
+                }
+            }
         }
     }
 }
 
-/// Generate a deterministic UUID v5-like ID from instance name.
-/// Same name always produces same ID → stable across restarts.
-fn deterministic_session_id(name: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    "agend-terminal".hash(&mut h);
-    name.hash(&mut h);
-    let hash = h.finish();
-    // Format as UUID-like string
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (hash >> 32) as u32,
-        (hash >> 16) as u16 & 0xffff,
-        hash as u16 & 0x0fff | 0x4000, // version 4
-        (hash >> 48) as u16 & 0x3fff | 0x8000, // variant
-        hash & 0xffffffffffff,
-    )
+/// Save a captured session ID for an instance.
+#[allow(dead_code)]
+pub fn save_session_id(home: &std::path::Path, instance_name: &str, session_id: &str) {
+    let dir = home.join("sessions");
+    std::fs::create_dir_all(&dir).ok();
+    let _ = std::fs::write(dir.join(format!("{instance_name}.sid")), session_id);
+}
+
+/// Clear saved session ID (e.g., after crash loop).
+#[allow(dead_code)]
+pub fn clear_session_id(home: &std::path::Path, instance_name: &str) {
+    let path = home.join("sessions").join(format!("{instance_name}.sid"));
+    let _ = std::fs::remove_file(path);
 }
 
 /// Preset configuration for a backend.
@@ -95,7 +100,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_mode: ResumeMode::SessionId { flag: "--resume" },
+                resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
                 mcp_config_path: ".claude/settings.local.json",
@@ -108,7 +113,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_mode: ResumeMode::ResumeId { flag: "--resume-id" },
+                resume_mode: ResumeMode::ContinueInCwd { flag: "--resume" },
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
                 mcp_config_path: ".kiro/settings/mcp.json",
@@ -134,7 +139,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "\r",
                 typed_inject: true,
-                resume_mode: ResumeMode::SessionFlag { flag: "--session" },
+                resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
                 mcp_config_path: "opencode.json",
@@ -147,7 +152,7 @@ impl Backend {
                 submit_key: "\n\r",
                 inject_prefix: "\r",
                 typed_inject: true,
-                resume_mode: ResumeMode::IndexBased, // Gemini uses index, not ID — can't safely resume
+                resume_mode: ResumeMode::Fixed { args: &["--resume", "latest"] },
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",
