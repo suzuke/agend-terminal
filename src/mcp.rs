@@ -11,6 +11,8 @@ use teloxide::prelude::*;
 use teloxide::net::Download;
 
 /// Shared tokio runtime for Telegram API calls (built once, reused).
+/// Panics if tokio runtime cannot be built (system-level failure).
+#[allow(clippy::unwrap_used)]
 fn mcp_runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
