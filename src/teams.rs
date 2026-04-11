@@ -18,21 +18,15 @@ struct TeamStore {
 }
 
 fn store_path(home: &Path) -> std::path::PathBuf {
-    home.join("teams.json")
+    crate::store::store_path(home, "teams.json")
 }
 
 fn load(home: &Path) -> TeamStore {
-    let path = store_path(home);
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+    crate::store::load(&store_path(home))
 }
 
 fn save(home: &Path, store: &TeamStore) -> anyhow::Result<()> {
-    let path = store_path(home);
-    std::fs::write(&path, serde_json::to_string_pretty(store)?)?;
-    Ok(())
+    crate::store::save(&store_path(home), store)
 }
 
 pub fn create(home: &Path, args: &Value) -> Value {

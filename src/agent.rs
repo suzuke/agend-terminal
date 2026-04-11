@@ -199,11 +199,16 @@ pub fn spawn_agent(
     let reg_for_reaper = Arc::clone(registry);
     let home_for_reaper = home.map(|p| p.to_path_buf());
     let crash_tx_for_reaper = crash_tx;
+    let dismiss: Vec<(String, Vec<u8>)> = detected_backend.as_ref()
+        .map(|b| b.preset().dismiss_patterns.iter()
+            .map(|(p, k)| (p.to_string(), k.to_vec()))
+            .collect())
+        .unwrap_or_default();
     let n = name.to_string();
     std::thread::Builder::new()
         .name(format!("{n}_pty_read"))
         .spawn(move || {
-            pty_read_loop(&n, &mut pty_reader, &core2, &pw, &reg_for_reaper, &home_for_reaper, &crash_tx_for_reaper);
+            pty_read_loop(&n, &mut pty_reader, &core2, &pw, &reg_for_reaper, &home_for_reaper, &crash_tx_for_reaper, &dismiss);
         })?;
 
     eprintln!("[{name}] spawned: {command} {}", args.join(" "));
@@ -219,6 +224,7 @@ fn pty_read_loop(
     registry: &AgentRegistry,
     home: &Option<std::path::PathBuf>,
     crash_tx: &Option<CrashChannel>,
+    dismiss_patterns: &[(String, Vec<u8>)],
 ) {
     let mut buf = [0u8; 8192];
     let mut detect_buf = Vec::with_capacity(4096);
@@ -235,7 +241,7 @@ fn pty_read_loop(
 
                 // Auto-dismiss trust/update dialogs
                 if !dialog_dismissed {
-                    dialog_dismissed = try_dismiss_dialog(name, data, &mut detect_buf, pty_writer);
+                    dialog_dismissed = try_dismiss_dialog(name, data, &mut detect_buf, pty_writer, dismiss_patterns);
                 }
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic)
@@ -307,13 +313,17 @@ fn handle_pty_close(
     }
 }
 
-/// Try to auto-dismiss trust or update dialogs. Returns true if dismissed.
+/// Try to auto-dismiss dialogs using backend-configurable patterns. Returns true if dismissed.
 fn try_dismiss_dialog(
     name: &str,
     data: &[u8],
     detect_buf: &mut Vec<u8>,
     pty_writer: &PtyWriter,
+    dismiss_patterns: &[(String, Vec<u8>)],
 ) -> bool {
+    if dismiss_patterns.is_empty() {
+        return false;
+    }
     detect_buf.extend_from_slice(data);
     if detect_buf.len() > 8192 {
         let d = detect_buf.len() - 8192;
@@ -321,23 +331,14 @@ fn try_dismiss_dialog(
     }
     let clean = strip_ansi(&String::from_utf8_lossy(detect_buf));
 
-    if clean.contains("Yes, I trust") || clean.contains("Yes, proceed") {
-        eprintln!("[{name}] auto-dismissing trust dialog");
-        let _ = pty_writer.lock().unwrap_or_else(|e| e.into_inner())
-            .write_all(b"\x1b[A\x1b[A\r");
-        detect_buf.clear();
-        return true;
-    }
-
-    if clean.contains("Update Available")
-        || clean.contains("Skip  Confirm")
-        || clean.contains("Update Complete")
-        || clean.contains("Please restart")
-    {
-        eprintln!("[{name}] auto-dismissing update dialog");
-        let _ = pty_writer.lock().unwrap_or_else(|e| e.into_inner())
-            .write_all(b"\r");
-        detect_buf.clear();
+    for (pattern, key_seq) in dismiss_patterns {
+        if clean.contains(pattern.as_str()) {
+            eprintln!("[{name}] auto-dismissing dialog (matched: {pattern})");
+            let _ = pty_writer.lock().unwrap_or_else(|e| e.into_inner())
+                .write_all(key_seq);
+            detect_buf.clear();
+            return true;
+        }
     }
 
     false
