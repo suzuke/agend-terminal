@@ -229,11 +229,28 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
 
             let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
 
+            let role = args.get("role").and_then(|v| v.as_str()).map(String::from);
+            let backend_str = args.get("backend").and_then(|v| v.as_str()).map(String::from);
+
             match crate::api::call(&home, &json!({
                 "method": "spawn",
                 "params": { "name": name, "command": command, "args": &cmd_args, "working_directory": work_dir }
             })) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    // Persist to fleet.yaml
+                    let entry = crate::fleet::InstanceYamlEntry {
+                        command: command.to_string(),
+                        backend: backend_str,
+                        working_directory: Some(work_dir.clone()),
+                        role,
+                    };
+                    if let Err(e) = crate::fleet::add_instance_to_yaml(&home, name, &entry) {
+                        eprintln!("[mcp] failed to persist instance to fleet.yaml: {e}");
+                    }
+
+                    // Create Telegram topic if channel is configured
+                    let topic_id = telegram::create_topic_for_instance(&home, name);
+
                     // Inject initial task if provided
                     if let Some(ref task_text) = task {
                         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -242,7 +259,11 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                             "params": {"name": name, "data": task_text}
                         }));
                     }
-                    json!({"name": name, "command": command})
+                    let mut result = json!({"name": name, "command": command});
+                    if let Some(tid) = topic_id {
+                        result["topic_id"] = json!(tid);
+                    }
+                    result
                 }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("spawn failed")}),
                 Err(e) => json!({"error": format!("API unavailable: {e}")}),
@@ -255,6 +276,12 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             };
             // Use "delete" (not "kill") — removes from configs to prevent respawn
             let _ = crate::api::call(&home, &json!({"method": "delete", "params": {"name": name}}));
+
+            // Remove from fleet.yaml
+            if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, name) {
+                eprintln!("[mcp] failed to remove instance from fleet.yaml: {e}");
+            }
+
             json!({"name": name})
         }
         "start_instance" => {
