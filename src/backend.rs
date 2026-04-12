@@ -86,6 +86,9 @@ pub struct BackendPreset {
     pub mcp_config_path: &'static str,
     /// Timeout in seconds for ready detection.
     pub ready_timeout_secs: u64,
+    /// Args to use when resuming is not possible (fresh start after crash).
+    /// Falls back to `args` if None.
+    pub fresh_args: Option<&'static [&'static str]>,
 }
 
 impl Backend {
@@ -107,6 +110,7 @@ impl Backend {
                     ("Yes, I trust", b"\x1b[A\x1b[A\r"),
                     ("Yes, proceed", b"\x1b[A\x1b[A\r"),
                 ],
+                fresh_args: None, // same as args (no resume in preset)
             },
             Backend::KiroCli => BackendPreset {
                 command: "kiro-cli",
@@ -121,6 +125,7 @@ impl Backend {
                 mcp_config_path: ".kiro/settings/mcp.json",
                 ready_timeout_secs: 30,
                 dismiss_patterns: &[],
+                fresh_args: None, // same as args
             },
             Backend::Codex => BackendPreset {
                 command: "codex",
@@ -139,6 +144,8 @@ impl Backend {
                 mcp_config_path: "opencode.json",
                 ready_timeout_secs: 20,
                 dismiss_patterns: &[],
+                // Codex: "resume --last" → fresh start drops the resume subcommand
+                fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
             },
             Backend::OpenCode => BackendPreset {
                 command: "opencode",
@@ -158,6 +165,7 @@ impl Backend {
                     ("Update Complete", b"\r"),
                     ("Please restart", b"\r"),
                 ],
+                fresh_args: None, // same as args (resume is in resume_mode, not args)
             },
             Backend::Gemini => BackendPreset {
                 command: "gemini",
@@ -179,6 +187,7 @@ impl Backend {
                     ("Allow execution of MCP tool", b"3\n"),
                     ("Allow execution of:", b"2\n"),
                 ],
+                fresh_args: None, // same as args (resume is in resume_mode, not args)
             },
         }
     }

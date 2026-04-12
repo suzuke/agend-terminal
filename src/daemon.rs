@@ -538,28 +538,30 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                 return;
                             }
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-                            // Recalculate args: strip old --resume/--continue <id> and re-derive
-                            // from current .sid file (which was cleared on crash above).
-                            let respawn_args = {
-                                let mut args = Vec::new();
-                                let mut skip_next = false;
-                                for arg in &config.args {
-                                    if skip_next {
-                                        skip_next = false;
-                                        continue;
-                                    }
-                                    if arg == "--resume" || arg == "--continue" {
-                                        skip_next = true;
-                                        continue;
-                                    }
-                                    args.push(arg.clone());
-                                }
-                                // Re-add resume args from backend preset (reads .sid — now cleared → fresh start)
-                                if let Some(b) = crate::backend::Backend::from_command(&config.command) {
-                                    args.extend(b.preset().resume_mode.args_for(&home, &config.name));
-                                }
-                                args
+                            // After a crash, start fresh — use backend's fresh_args to avoid
+                            // crash loops from stale resume (--continue, --resume <id>, etc.)
+                            let mut respawn_args: Vec<String> = if let Some(b) = crate::backend::Backend::from_command(&config.command) {
+                                let p = b.preset();
+                                p.fresh_args.unwrap_or(p.args)
+                                    .iter()
+                                    .map(|s| s.to_string())
+                                    .collect()
+                            } else {
+                                // Unknown backend: strip common resume flags as best effort
+                                strip_resume_args(&config.args)
                             };
+                            // Preserve non-resume flags from original args (e.g. --mcp-config, --settings)
+                            let mut i = 0;
+                            while i < config.args.len() {
+                                let arg = &config.args[i];
+                                if (arg == "--mcp-config" || arg == "--settings") && i + 1 < config.args.len() {
+                                    respawn_args.push(arg.clone());
+                                    respawn_args.push(config.args[i + 1].clone());
+                                    i += 2;
+                                    continue;
+                                }
+                                i += 1;
+                            }
                             match agent::spawn_agent(
                                 &agent::SpawnConfig {
                                     name: &config.name, command: &config.command, args: &respawn_args,
@@ -997,6 +999,46 @@ async fn ci_check_repo(
     Ok(())
 }
 
+/// Strip resume-related arguments for fresh respawn.
+///
+/// Handles all backend resume patterns:
+/// - `--resume <session-id>` (Claude SavedSession)
+/// - `--resume latest` (Gemini Fixed)
+/// - `--continue` (OpenCode ContinueInCwd)
+/// - `resume --last` (Codex positional subcommand in preset args)
+fn strip_resume_args(args: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut skip_next = false;
+    let mut skip_codex_resume = false;
+
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        // --resume <value> or --continue (flag + next arg)
+        if arg == "--resume" || arg == "--continue" {
+            skip_next = true;
+            continue;
+        }
+
+        // Codex: "resume" subcommand followed by "--last"
+        if arg == "resume" && !arg.starts_with('-') {
+            skip_codex_resume = true;
+            continue;
+        }
+        if skip_codex_resume && arg == "--last" {
+            skip_codex_resume = false;
+            continue;
+        }
+        skip_codex_resume = false;
+
+        result.push(arg.clone());
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,5 +1158,83 @@ mod tests {
         assert!(found.is_none());
         assert!(!run.exists());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- strip_resume_args ---
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn strip_resume_claude() {
+        let args = s(&[
+            "--dangerously-skip-permissions",
+            "--resume",
+            "abc-123",
+            "--mcp-config",
+            "/path",
+        ]);
+        let stripped = strip_resume_args(&args);
+        assert_eq!(
+            stripped,
+            s(&["--dangerously-skip-permissions", "--mcp-config", "/path"])
+        );
+    }
+
+    #[test]
+    fn strip_resume_opencode_continue() {
+        let args = s(&["--continue"]);
+        let stripped = strip_resume_args(&args);
+        // --continue + its next arg (if any) stripped; here there's nothing after it
+        assert!(stripped.is_empty() || !stripped.contains(&"--continue".to_string()));
+    }
+
+    #[test]
+    fn strip_resume_gemini() {
+        let args = s(&["--yolo", "--resume", "latest"]);
+        let stripped = strip_resume_args(&args);
+        assert_eq!(stripped, s(&["--yolo"]));
+    }
+
+    #[test]
+    fn strip_resume_codex() {
+        let args = s(&[
+            "resume",
+            "--last",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]);
+        let stripped = strip_resume_args(&args);
+        assert_eq!(stripped, s(&["--dangerously-bypass-approvals-and-sandbox"]));
+    }
+
+    #[test]
+    fn strip_resume_no_resume_args() {
+        let args = s(&["--dangerously-skip-permissions", "--mcp-config", "/path"]);
+        let stripped = strip_resume_args(&args);
+        assert_eq!(stripped, args);
+    }
+
+    // --- fresh_args ---
+
+    #[test]
+    fn codex_fresh_args_drops_resume() {
+        let p = crate::backend::Backend::Codex.preset();
+        let fresh = p.fresh_args.expect("codex has fresh_args");
+        assert!(!fresh.contains(&"resume"));
+        assert!(!fresh.contains(&"--last"));
+        assert!(fresh.contains(&"--dangerously-bypass-approvals-and-sandbox"));
+    }
+
+    #[test]
+    fn claude_fresh_args_same_as_preset() {
+        let p = crate::backend::Backend::ClaudeCode.preset();
+        assert!(p.fresh_args.is_none());
+    }
+
+    #[test]
+    fn opencode_fresh_args_same_as_preset() {
+        let p = crate::backend::Backend::OpenCode.preset();
+        assert!(p.fresh_args.is_none());
     }
 }
