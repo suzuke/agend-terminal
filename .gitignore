@@ -8,3 +8,6 @@ inbox/
 metadata/
 downloads/
 .schedule_last_check
+snapshot.json
+event-log.jsonl
+run/

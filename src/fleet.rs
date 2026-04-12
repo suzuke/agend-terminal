@@ -544,6 +544,277 @@ instances:
     }
 
     #[test]
+    fn test_channel_config_telegram_parsing() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-chan-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channel:
+  type: telegram
+  bot_token_env: MY_BOT_TOKEN
+  group_id: -100123456
+  mode: topic
+instances:
+  test:
+    command: /bin/bash
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        match config.channel {
+            Some(ChannelConfig::Telegram {
+                ref bot_token_env,
+                group_id,
+                ref mode,
+            }) => {
+                assert_eq!(bot_token_env, "MY_BOT_TOKEN");
+                assert_eq!(group_id, -100123456);
+                assert_eq!(mode, "topic");
+            }
+            None => panic!("channel should be Some"),
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_channel_config_default_mode() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-defmode-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channel:
+  type: telegram
+  bot_token_env: TOKEN
+  group_id: -999
+instances: {}
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        match config.channel {
+            Some(ChannelConfig::Telegram { ref mode, .. }) => {
+                assert_eq!(mode, "topic", "default mode should be 'topic'");
+            }
+            None => panic!("channel should be Some"),
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_missing_defaults_still_works() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-nodef-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  agent1:
+    command: /bin/bash
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        assert!(config.defaults.backend.is_none());
+        assert!(config.defaults.command.is_none());
+        assert!(config.defaults.model.is_none());
+        let resolved = config.resolve_instance("agent1").expect("resolve");
+        assert_eq!(resolved.command, "/bin/bash");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_instance_names_returns_all() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-names-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  alpha:
+    command: /bin/bash
+  beta:
+    command: /bin/sh
+  gamma:
+    command: /bin/zsh
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let mut names = config.instance_names();
+        names.sort();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_add_remove_instance_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-addrem-{}", std::process::id()));
+        write_fleet(&dir, "instances: {}\n");
+
+        let entry = InstanceYamlEntry {
+            command: "test-cmd".to_string(),
+            backend: None,
+            working_directory: None,
+            role: Some("tester".to_string()),
+        };
+        add_instance_to_yaml(&dir, "temp-agent", &entry).expect("add");
+
+        let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        assert!(config.instances.contains_key("temp-agent"));
+
+        remove_instance_from_yaml(&dir, "temp-agent").expect("remove");
+        let config2 = FleetConfig::load(&dir.join("fleet.yaml")).expect("load after remove");
+        assert!(!config2.instances.contains_key("temp-agent"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_working_directory_tilde_expansion() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-tilde-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  agent1:
+    command: /bin/bash
+    working_directory: "~/project"
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("agent1").expect("resolve");
+        let wd = resolved
+            .working_directory
+            .expect("should have working_directory");
+        // Should NOT start with ~
+        assert!(
+            !wd.to_string_lossy().starts_with('~'),
+            "tilde should be expanded, got: {}",
+            wd.display()
+        );
+        // Should end with /project
+        assert!(
+            wd.to_string_lossy().ends_with("/project"),
+            "should end with /project, got: {}",
+            wd.display()
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_working_directory_absolute_unchanged() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-abs-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  agent1:
+    command: /bin/bash
+    working_directory: "/absolute/path"
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("agent1").expect("resolve");
+        let wd = resolved.working_directory.expect("should have wd");
+        assert_eq!(wd.to_string_lossy(), "/absolute/path");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_nonexistent_instance() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-noinst-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  agent1:
+    command: /bin/bash
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        assert!(config.resolve_instance("nonexistent").is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_teams_parsing() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-teams-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  a1:
+    command: /bin/bash
+  a2:
+    command: /bin/bash
+teams:
+  dev:
+    members:
+      - a1
+      - a2
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let team = config.teams.get("dev").expect("team exists");
+        assert_eq!(team.members, vec!["a1", "a2"]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_instance_env_includes_agend_name() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-envname-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  my-agent:
+    command: /bin/bash
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("my-agent").expect("resolve");
+        assert_eq!(
+            resolved.env.get("AGEND_INSTANCE_NAME").map(|s| s.as_str()),
+            Some("my-agent")
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cols_rows_override() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-colrow-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+defaults:
+  cols: 80
+  rows: 24
+instances:
+  default-size:
+    command: /bin/bash
+  custom-size:
+    command: /bin/bash
+    cols: 200
+    rows: 50
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+
+        let def = config.resolve_instance("default-size").expect("resolve");
+        assert_eq!(def.cols, Some(80));
+        assert_eq!(def.rows, Some(24));
+
+        let custom = config.resolve_instance("custom-size").expect("resolve");
+        assert_eq!(custom.cols, Some(200));
+        assert_eq!(custom.rows, Some(50));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_git_branch_override() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-test4-{}", std::process::id()));
         let path = write_fleet(

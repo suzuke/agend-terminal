@@ -11,6 +11,10 @@ categories = ["command-line-utilities", "development-tools"]
 [lints.clippy]
 unwrap_used = "deny"
 
+[profile.release]
+strip = true
+lto = true
+
 [dependencies]
 # PTY
 portable-pty = "0.9"
