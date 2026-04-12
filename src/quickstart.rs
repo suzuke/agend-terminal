@@ -160,9 +160,21 @@ fn generate_fleet_yaml(
     let fleet_path = home.join("fleet.yaml");
 
     if fleet_path.exists() {
-        println!("  ⚠ fleet.yaml already exists — not overwriting.");
-        println!("    {}\n", fleet_path.display());
-        return Ok(());
+        // Check compatibility with existing config
+        if let Ok(content) = std::fs::read_to_string(&fleet_path) {
+            check_compatibility(&content, backend, group_id);
+        }
+
+        let answer = prompt("  fleet.yaml already exists. Overwrite? (y/N): ")?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("  Keeping existing fleet.yaml.\n");
+            return Ok(());
+        }
+
+        // Backup before overwriting
+        let backup = home.join("fleet.yaml.bak");
+        std::fs::copy(&fleet_path, &backup)?;
+        println!("  ✓ Backed up to {}\n", backup.display());
     }
 
     let backend_name = backend.name();
@@ -225,6 +237,33 @@ fn detect_project_root() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+fn check_compatibility(yaml_content: &str, new_backend: &Backend, new_group_id: Option<i64>) {
+    if let Ok(config) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content) {
+        // Check backend
+        let existing_backend = config["defaults"]["backend"].as_str().unwrap_or("");
+        if !existing_backend.is_empty() && existing_backend != new_backend.name() {
+            println!("  ⚠ Existing backend: {existing_backend}, new: {}",
+                new_backend.name());
+        }
+
+        // Check group_id
+        if let Some(new_gid) = new_group_id {
+            let existing_gid = config["channel"]["group_id"].as_i64().unwrap_or(0);
+            if existing_gid != 0 && existing_gid != new_gid {
+                println!("  ⚠ Existing group_id: {existing_gid}, new: {new_gid}");
+            }
+        }
+
+        // Check instance count
+        if let Some(instances) = config["instances"].as_mapping() {
+            if instances.len() > 1 {
+                println!("  ⚠ Existing config has {} instances (new config will have 1)",
+                    instances.len());
+            }
+        }
+    }
 }
 
 fn print_next_steps(home: &Path) {
