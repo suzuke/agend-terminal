@@ -107,9 +107,17 @@ enum Commands {
     },
     /// List running agents
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show detailed agent status (state, health)
-    Status,
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop the daemon
     Stop,
     /// Kill a specific agent
@@ -156,6 +164,11 @@ enum Commands {
     Quickstart,
     /// Generate bug report with diagnostics, logs, and config
     Bugreport,
+    /// Generate shell completions (bash, zsh, fish, elvish, powershell)
+    Completions {
+        /// Shell type
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -239,7 +252,19 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Attach { name }) => {
             let sock = daemon::agent_socket_path(&home, &name);
-            tui::attach(&sock)?;
+            if let Err(e) = tui::attach(&sock) {
+                let err = format!("{e}");
+                if err.contains("No such file") || err.contains("Connection refused") {
+                    if daemon::find_active_run_dir(&home).is_none() {
+                        daemon_not_running_hint();
+                    } else {
+                        eprintln!("Agent '{name}' not found.");
+                        list_running_agents(&home);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
         }
         Some(Commands::Inject { name, text }) => {
             let text = text.join(" ");
@@ -262,8 +287,8 @@ fn main() -> anyhow::Result<()> {
                         resp["error"].as_str().unwrap_or("unknown")
                     );
                 }
-                Err(e) => {
-                    eprintln!("Failed to connect to daemon: {e}");
+                Err(_) => {
+                    daemon_not_running_hint();
                 }
             }
         }
@@ -273,40 +298,56 @@ fn main() -> anyhow::Result<()> {
                     println!("Daemon shutdown initiated.");
                 }
                 Ok(_) => eprintln!("Shutdown request failed."),
-                Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+                Err(_) => daemon_not_running_hint(),
             }
         }
-        Some(Commands::List) => {
+        Some(Commands::List { json }) => {
             if let Some(run) = daemon::find_active_run_dir(&home) {
+                let mut agents = Vec::new();
                 for entry in std::fs::read_dir(&run)?.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name.ends_with(".sock") && name != "api.sock" {
-                        let agent = &name[..name.len() - 5];
+                        agents.push(name[..name.len() - 5].to_string());
+                    }
+                }
+                if json {
+                    println!("{}", serde_json::json!(agents));
+                } else {
+                    for agent in &agents {
                         println!("  {agent}");
                     }
                 }
+            } else if json {
+                println!("[]");
             } else {
                 println!("No running daemon found.");
             }
         }
-        Some(Commands::Status) => match api::call(&home, &serde_json::json!({"method": "list"})) {
-            Ok(resp) => {
-                if let Some(agents) = resp["result"]["agents"].as_array() {
-                    if agents.is_empty() {
-                        println!("No agents running.");
-                    } else {
-                        for agent in agents {
-                            let name = agent["name"].as_str().unwrap_or("?");
-                            let cmd = agent["command"].as_str().unwrap_or("?");
-                            let state = agent["agent_state"].as_str().unwrap_or("?");
-                            let health = agent["health_state"].as_str().unwrap_or("?");
-                            println!("  {name}: state={state} health={health} cmd={cmd}");
+        Some(Commands::Status { json }) => {
+            match api::call(&home, &serde_json::json!({"method": "list"})) {
+                Ok(resp) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp["result"]).unwrap_or_default()
+                        );
+                    } else if let Some(agents) = resp["result"]["agents"].as_array() {
+                        if agents.is_empty() {
+                            println!("No agents running.");
+                        } else {
+                            for agent in agents {
+                                let name = agent["name"].as_str().unwrap_or("?");
+                                let cmd = agent["command"].as_str().unwrap_or("?");
+                                let state = agent["agent_state"].as_str().unwrap_or("?");
+                                let health = agent["health_state"].as_str().unwrap_or("?");
+                                println!("  {name}: state={state} health={health} cmd={cmd}");
+                            }
                         }
                     }
                 }
+                Err(_) => daemon_not_running_hint(),
             }
-            Err(e) => eprintln!("Failed to connect to daemon: {e}"),
-        },
+        }
         Some(Commands::Kill { name }) => {
             match api::call(
                 &home,
@@ -321,7 +362,7 @@ fn main() -> anyhow::Result<()> {
                         resp["error"].as_str().unwrap_or("unknown")
                     );
                 }
-                Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+                Err(_) => daemon_not_running_hint(),
             }
         }
         Some(Commands::Fleet { command }) => match command {
@@ -345,7 +386,7 @@ fn main() -> anyhow::Result<()> {
                         println!("Fleet stopped ({} agents)", agents.len());
                     }
                 }
-                Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+                Err(_) => daemon_not_running_hint(),
             },
         },
         Some(Commands::Mcp) => {
@@ -388,7 +429,35 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Bugreport) => {
             crate::bugreport::run(&home)?;
         }
+        Some(Commands::Completions { shell }) => {
+            use clap::CommandFactory;
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "agend-terminal",
+                &mut std::io::stdout(),
+            );
+        }
     }
 
     Ok(())
+}
+
+fn daemon_not_running_hint() {
+    eprintln!("Daemon is not running.");
+    eprintln!("  Start it with:  agend-terminal start");
+    eprintln!("  Or first setup: agend-terminal quickstart");
+}
+
+fn list_running_agents(home: &std::path::Path) {
+    if let Ok(resp) = api::call(home, &serde_json::json!({"method": "list"})) {
+        if let Some(agents) = resp["result"]["agents"].as_array() {
+            if !agents.is_empty() {
+                eprintln!("Running agents:");
+                for a in agents {
+                    eprintln!("  - {}", a["name"].as_str().unwrap_or("?"));
+                }
+            }
+        }
+    }
 }
