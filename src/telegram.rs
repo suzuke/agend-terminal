@@ -143,9 +143,29 @@ fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) -> String {
 }
 
 fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
-    // Detect topic closure
+    // Detect topic closure/deletion — auto-delete the corresponding instance
     if msg.forum_topic_closed().is_some() {
-        eprintln!("[telegram] topic closed");
+        let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
+        if let Some(tid) = thread_id {
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(instance_name) = s.topic_to_instance.remove(&tid) {
+                s.instance_to_topic.remove(&instance_name);
+                let home = s.home.clone();
+                drop(s);
+                eprintln!("[telegram] topic {tid} closed, deleting instance '{instance_name}'");
+                // Kill + remove via API
+                let _ = crate::api::call(
+                    &home,
+                    &serde_json::json!({"method": "delete", "params": {"name": instance_name}}),
+                );
+                // Remove from fleet.yaml
+                if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, &instance_name) {
+                    eprintln!("[telegram] failed to remove '{instance_name}' from fleet.yaml: {e}");
+                }
+                return;
+            }
+        }
+        eprintln!("[telegram] topic closed (no matching instance)");
         return;
     }
 

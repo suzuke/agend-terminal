@@ -359,7 +359,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             }
             // Close and delete the Telegram topic if one exists
             if let Some(tid) = topic_id {
-                telegram::close_topic(&home, tid);
+                telegram::delete_topic(&home, tid);
             }
             json!({"name": name})
         }
