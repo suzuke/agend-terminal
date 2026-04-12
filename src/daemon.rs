@@ -20,6 +20,8 @@ struct AgentConfig {
     args: Vec<String>,
     env: Option<HashMap<String, String>>,
     working_dir: Option<PathBuf>,
+    /// Original repo root (before worktree redirect).
+    worktree_source: Option<PathBuf>,
     submit_key: String,
 }
 
@@ -214,12 +216,22 @@ pub fn run(
     eprintln!("[daemon] starting {} agent(s)", agents.len());
 
     for (name, command, args, env, working_dir, submit_key) in &agents {
+        // Derive worktree_source: if working_dir contains .worktrees/, the repo root is 2 levels up
+        let worktree_source = working_dir.as_ref().and_then(|wd| {
+            let wd_str = wd.display().to_string();
+            if wd_str.contains(".worktrees/") {
+                wd.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+            } else {
+                None
+            }
+        });
         let config = AgentConfig {
             name: name.clone(),
             command: command.clone(),
             args: args.clone(),
             env: env.clone(),
             working_dir: working_dir.clone(),
+            worktree_source,
             submit_key: submit_key.clone(),
         };
         configs.lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), config);
@@ -467,7 +479,9 @@ pub fn run(
         let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
         let mut seen = std::collections::HashSet::new();
         for config in cfgs.values() {
-            if let Some(ref dir) = config.working_dir {
+            // Use worktree_source (original repo) if available, otherwise working_dir
+            let repo = config.worktree_source.as_ref().or(config.working_dir.as_ref());
+            if let Some(dir) = repo {
                 if seen.insert(dir.clone()) {
                     let residual = crate::worktree::list_residual(dir);
                     if !residual.is_empty() {
