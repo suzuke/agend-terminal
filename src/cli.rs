@@ -382,52 +382,77 @@ pub fn run_demo() -> anyhow::Result<()> {
     use std::sync::{Arc, Mutex};
     use std::collections::HashMap;
     use std::time::Duration;
+    use std::io::Write;
+
+    // Demo always uses bash for speed and reliability.
+    // Real AI agent orchestration: use `agend-terminal start` with fleet.yaml.
+    let (cmd, args, label) = ("/bin/bash", vec![], "Live Preview");
 
     let registry: agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let home = std::env::temp_dir().join(format!("agend-demo-{}", std::process::id()));
     std::fs::create_dir_all(&home)?;
 
-    println!("\n  AgEnD Terminal — Live Multi-Agent Demo\n");
+    // Clear screen
+    print!("\x1b[2J\x1b[H");
+    std::io::stdout().flush().ok();
+
+    println!("  AgEnD Terminal — Live Multi-Agent Demo ({label})\n");
     println!("  Spawning alice and bob...");
 
-    agent::spawn_agent("alice", "/bin/bash", &[], 80, 10, None, None, "\r", &registry, Some(&home), None, None)?;
-    agent::spawn_agent("bob", "/bin/bash", &[], 80, 10, None, None, "\r", &registry, Some(&home), None, None)?;
-    std::thread::sleep(Duration::from_secs(1));
-    println!("  ✓ Both agents running with isolated PTYs\n");
+    let crash_tx = {
+        let (tx, _rx) = crossbeam::channel::unbounded::<String>();
+        tx
+    };
 
-    // Step 1: Alice sends message to Bob via PTY inject (real communication path)
-    println!("  ── Step 1: Alice sends a task to Bob ──\n");
-    std::thread::sleep(Duration::from_millis(500));
-    {
-        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        // Inject into Bob's PTY — this is what the daemon does in production
-        if let Some(bob) = reg.get("bob") {
-            let _ = agent::write_to_agent(bob, b"echo '[from:alice] Hey Bob, can you review src/main.rs?'\r");
+    agent::spawn_agent("alice", cmd, &args, 60, 8, None, None, "\r",
+        &registry, Some(&home), Some(crash_tx.clone()), None)?;
+    agent::spawn_agent("bob", cmd, &args, 60, 8, None, None, "\r",
+        &registry, Some(&home), Some(crash_tx), None)?;
+
+    println!("  ✓ Both agents running\n");
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Conversation script
+    let conversation = [
+        ("alice", "bob",   "[from:alice] Hey Bob, what's the best way to handle errors in Rust?"),
+        ("bob",   "alice", "[from:bob] Use Result<T, E> and the ? operator. Avoid unwrap() in production."),
+        ("alice", "bob",   "[from:alice] What about custom error types?"),
+        ("bob",   "alice", "[from:bob] Create an enum with thiserror derive. Each variant for a different failure mode."),
+        ("alice", "bob",   "[from:alice] Thanks! Delegating the implementation to you."),
+        ("bob",   "alice", "[from:bob] Done! Check my branch agend/bob for the changes."),
+    ];
+
+    for (i, (from, to, msg)) in conversation.iter().enumerate() {
+        // Inject message into recipient's PTY (echo so it appears in VTerm)
+        {
+            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(handle) = reg.get(*to) {
+                let _ = agent::write_to_agent(handle, format!("echo '{msg}'\r").as_bytes());
+            }
         }
+
+        std::thread::sleep(Duration::from_millis(800));
+
+        // Redraw split screen
+        print!("\x1b[2J\x1b[H"); // clear + home
+        std::io::stdout().flush().ok();
+
+        println!("  AgEnD Terminal — Live Multi-Agent Demo  [{}/{}]",  i + 1, conversation.len());
+        println!("  {from} → {to}\n");
+
+        draw_split_screen(&registry);
+
+        println!("\n  Message: {msg}");
+
+        std::thread::sleep(Duration::from_millis(700));
     }
+
+    // Final: show crash recovery
     std::thread::sleep(Duration::from_secs(1));
+    print!("\x1b[2J\x1b[H");
+    std::io::stdout().flush().ok();
 
-    // Show Bob's screen
-    println!("  Bob's terminal:");
-    dump_agent_screen(&registry, "bob");
-
-    // Step 2: Bob replies to Alice
-    println!("\n  ── Step 2: Bob replies to Alice ──\n");
-    std::thread::sleep(Duration::from_millis(500));
-    {
-        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(alice) = reg.get("alice") {
-            let _ = agent::write_to_agent(alice, b"echo '[from:bob] LGTM! Just one suggestion: add error handling on line 42.'\r");
-        }
-    }
-    std::thread::sleep(Duration::from_secs(1));
-
-    // Show Alice's screen
-    println!("  Alice's terminal:");
-    dump_agent_screen(&registry, "alice");
-
-    // Step 3: Crash recovery
-    println!("\n  ── Step 3: Crash Recovery ──\n");
+    println!("  AgEnD Terminal — Crash Recovery Demo\n");
     println!("  Killing bob...");
     {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -437,9 +462,7 @@ pub fn run_demo() -> anyhow::Result<()> {
         }
     }
     std::thread::sleep(Duration::from_millis(500));
-    println!("  ✓ Bob crashed");
 
-    // Check restarting state
     {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(bob) = reg.get("bob") {
@@ -449,30 +472,23 @@ pub fn run_demo() -> anyhow::Result<()> {
             println!("  Bob's state: {state}");
         }
     }
-    println!("  Waiting for auto-respawn...");
-    std::thread::sleep(Duration::from_secs(6));
 
-    // Check if bob is back
+    println!("  Waiting for auto-respawn...");
+    for sec in 1..=5 {
+        std::thread::sleep(Duration::from_secs(1));
+        print!("  {sec}s...");
+        std::io::stdout().flush().ok();
+    }
+    println!();
+
     {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         if reg.get("bob").is_some() {
-            println!("  ✓ Bob respawned automatically!");
-        } else {
-            println!("  (Bob removed — no crash_tx in demo mode)");
+            println!("  ✓ Bob respawned automatically!\n");
         }
     }
 
-    // Step 4: VTerm screen capture
-    println!("\n  ── Step 4: VTerm Screen Capture ──\n");
-    {
-        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(alice) = reg.get("alice") {
-            let _ = agent::write_to_agent(alice, b"echo '--- AgEnD Terminal captures this output without screen scraping ---'\r");
-        }
-    }
-    std::thread::sleep(Duration::from_secs(1));
-    println!("  Alice's terminal (captured via VTerm, not screen scraping):");
-    dump_agent_screen(&registry, "alice");
+    draw_split_screen(&registry);
 
     // Cleanup
     println!("\n  Cleaning up...");
@@ -486,37 +502,56 @@ pub fn run_demo() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&home);
 
     println!("  ✓ Demo complete!\n");
-    println!("  What you saw:");
-    println!("    1. Two agents with isolated PTYs");
-    println!("    2. Messages injected into each other's terminals (real comm path)");
-    println!("    3. Crash detection + auto-respawn");
-    println!("    4. VTerm output capture without screen scraping");
-    println!();
-    println!("  With real AI backends (Claude, Codex, Gemini), agents use MCP tools");
-    println!("  to delegate_task, report_result, and coordinate automatically.");
-    println!();
+    println!("  With real AI backends, agents use MCP tools to autonomously");
+    println!("  delegate_task, report_result, and coordinate.\n");
     println!("  Next:");
-    println!("    agend-terminal doctor          # Check which backends you have");
-    println!("    agend-terminal start           # Start with fleet.yaml");
+    println!("    agend-terminal doctor     # Check backends");
+    println!("    agend-terminal start      # Start fleet");
     println!();
 
     Ok(())
 }
 
-fn dump_agent_screen(registry: &agent::AgentRegistry, name: &str) {
+fn draw_split_screen(registry: &agent::AgentRegistry) {
     let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(handle) = reg.get(name) {
-        let core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
-        let dump = core.vterm.dump_screen();
-        let output = String::from_utf8_lossy(&dump);
-        let stripped = agent::strip_ansi_pub(&output);
-        println!("  ┌─ {name} ─────────────────────────────────────────────┐");
-        for line in stripped.lines().take(8) {
-            let trimmed = line.trim_end();
-            if !trimmed.is_empty() {
-                println!("  │ {:<55}│", if trimmed.len() > 55 { &trimmed[..55] } else { trimmed });
-            }
-        }
-        println!("  └─────────────────────────────────────────────────────┘");
+
+    let alice_lines = get_screen_lines(&reg, "alice");
+    let bob_lines = get_screen_lines(&reg, "bob");
+
+    let width = 38;
+    let top_sep = "─".repeat(width - 9);
+    let bot_sep = "─".repeat(width);
+    println!("  ┌─ alice ─{}┬─ bob ───{}┐", top_sep, top_sep);
+    for i in 0..8 {
+        let a = alice_lines.get(i).map(|s| s.as_str()).unwrap_or("");
+        let b = bob_lines.get(i).map(|s| s.as_str()).unwrap_or("");
+        let a_display = truncate_str(a, width);
+        let b_display = truncate_str(b, width);
+        println!("  │{:<w$}│{:<w$}│", a_display, b_display, w = width);
     }
+    println!("  └{}┴{}┘", bot_sep, bot_sep);
+}
+
+/// Truncate a string to at most `max_chars` characters (char-safe).
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    let truncated: String = s.chars().take(max_chars).collect();
+    truncated
+}
+
+fn get_screen_lines(
+    reg: &std::sync::MutexGuard<'_, std::collections::HashMap<String, agent::AgentHandle>>,
+    name: &str,
+) -> Vec<String> {
+    if let Some(handle) = reg.get(name) {
+        if let Ok(core) = handle.core.lock() {
+            let dump = core.vterm.dump_screen();
+            let output = String::from_utf8_lossy(&dump);
+            let stripped = agent::strip_ansi_pub(&output);
+            return stripped.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| l.trim_end().to_string())
+                .collect();
+        }
+    }
+    vec!["(not available)".to_string()]
 }
