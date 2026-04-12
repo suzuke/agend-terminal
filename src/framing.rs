@@ -7,6 +7,8 @@ use std::io::{Read, Write};
 
 pub const TAG_DATA: u8 = 0;
 pub const TAG_RESIZE: u8 = 1;
+/// Protocol version for TUI socket handshake.
+pub const PROTOCOL_VERSION: u8 = 1;
 /// Maximum frame size. Override via AGEND_FRAME_LIMIT env var (bytes).
 pub const DEFAULT_FRAME_LIMIT: usize = 1_000_000;
 

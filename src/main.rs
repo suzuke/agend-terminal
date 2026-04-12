@@ -17,6 +17,7 @@ mod mcp;
 mod mcp_config;
 mod quickstart;
 mod schedules;
+mod snapshot;
 mod state;
 mod store;
 mod tasks;
