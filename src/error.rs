@@ -14,8 +14,6 @@ pub enum AgendError {
     SocketConnect(std::io::Error),
     /// Agent not found in registry.
     AgentNotFound(String),
-    /// Registry lock poisoned (another thread panicked).
-    LockPoisoned(String),
     /// API call failed.
     ApiError(String),
     /// Config parse error.
@@ -31,7 +29,6 @@ impl fmt::Display for AgendError {
             Self::PtyWrite(e) => write!(f, "PTY write: {e}"),
             Self::SocketConnect(e) => write!(f, "socket connect: {e}"),
             Self::AgentNotFound(name) => write!(f, "agent '{name}' not found"),
-            Self::LockPoisoned(what) => write!(f, "lock poisoned: {what}"),
             Self::ApiError(msg) => write!(f, "API: {msg}"),
             Self::ConfigError(msg) => write!(f, "config: {msg}"),
             Self::Io(e) => write!(f, "IO: {e}"),

@@ -32,15 +32,6 @@ fn mcp_server_entry() -> serde_json::Value {
 /// The MCP process still runs (stdio is required by Claude Code), but tool calls
 /// are forwarded to the daemon via `mcp_tool` API — the heavy work (Telegram,
 /// tokio runtime, registry access) happens in the shared daemon process.
-/// Falls back to local handling when no daemon is running.
-#[allow(dead_code)]
-pub fn mcp_server_entry_pooled() -> serde_json::Value {
-    // The entry is identical to the non-pooled version because pooling is
-    // transparent: the `agend-terminal mcp` process auto-detects a running
-    // daemon and proxies tool calls to it. No config change needed.
-    mcp_server_entry()
-}
-
 /// Upsert mcpServers.agend-terminal in a JSON file.
 fn upsert_mcp_servers(path: &Path) -> Result<()> {
     let mut config: serde_json::Value = if path.exists() {
