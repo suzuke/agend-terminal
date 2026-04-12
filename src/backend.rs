@@ -169,8 +169,12 @@ impl Backend {
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",
                 ready_timeout_secs: 20,
-                // Auto-approve MCP tools: "3" = "Allow all server tools for this session"
-                dismiss_patterns: &[("Allow execution of MCP tool", b"3\n")],
+                // Auto-approve: MCP tools ("3" = all server tools for session),
+                // shell commands ("2" = allow for session)
+                dismiss_patterns: &[
+                    ("Allow execution of MCP tool", b"3\n"),
+                    ("Allow execution of:", b"2\n"),
+                ],
             },
         }
     }
