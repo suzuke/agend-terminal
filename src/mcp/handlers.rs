@@ -3,9 +3,13 @@
 use super::telegram;
 use serde_json::{json, Value};
 
-pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
+pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name: &str) -> Value {
     let home = crate::home_dir();
-    let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
+    let instance_name = if instance_name.is_empty() {
+        std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default()
+    } else {
+        instance_name.to_string()
+    };
 
     match tool {
         // --- Channel ---
