@@ -199,6 +199,153 @@ fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+/// Entry for adding a dynamic instance to fleet.yaml.
+pub struct InstanceYamlEntry {
+    pub command: String,
+    pub backend: Option<String>,
+    pub working_directory: Option<String>,
+    pub role: Option<String>,
+}
+
+/// Atomically write a serde_yaml::Value back to fleet.yaml using temp file + rename.
+/// Caller must hold the file lock.
+fn atomic_write_yaml(home: &Path, doc: &serde_yaml::Value) -> Result<()> {
+    let yaml = serde_yaml::to_string(doc)
+        .context("Failed to serialize fleet.yaml")?;
+    let fleet_path = home.join("fleet.yaml");
+    let tmp_path = home.join(".fleet.yaml.tmp");
+    std::fs::write(&tmp_path, &yaml)
+        .context("Failed to write temp fleet.yaml")?;
+    std::fs::rename(&tmp_path, &fleet_path)
+        .context("Failed to rename temp fleet.yaml")?;
+    Ok(())
+}
+
+/// Acquire the fleet.yaml file lock. Returns the lock file handle on success.
+fn acquire_lock(home: &Path) -> Result<std::fs::File> {
+    let lock_path = home.join(".fleet.yaml.lock");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .context("fleet.yaml is locked by another process")
+}
+
+/// Release the fleet.yaml file lock.
+fn release_lock(home: &Path) {
+    let lock_path = home.join(".fleet.yaml.lock");
+    let _ = std::fs::remove_file(&lock_path);
+}
+
+/// Add a new instance entry to fleet.yaml. Uses file lock + atomic write.
+pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry) -> Result<()> {
+    let fleet_path = home.join("fleet.yaml");
+    let _lock = acquire_lock(home)?;
+    let result = (|| -> Result<()> {
+        let content = std::fs::read_to_string(&fleet_path)
+            .unwrap_or_else(|_| "instances: {}\n".to_string());
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
+            .context("Failed to parse fleet.yaml")?;
+
+        // Ensure instances mapping exists
+        if doc.get("instances").is_none() {
+            doc["instances"] = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+        }
+        let instances = doc.get_mut("instances")
+            .and_then(|v| v.as_mapping_mut())
+            .context("instances is not a mapping")?;
+
+        // Build the instance value
+        let mut inst = serde_yaml::Mapping::new();
+        inst.insert(
+            serde_yaml::Value::String("command".into()),
+            serde_yaml::Value::String(config.command.clone()),
+        );
+        if let Some(ref backend) = config.backend {
+            inst.insert(
+                serde_yaml::Value::String("backend".into()),
+                serde_yaml::Value::String(backend.clone()),
+            );
+        }
+        if let Some(ref wd) = config.working_directory {
+            inst.insert(
+                serde_yaml::Value::String("working_directory".into()),
+                serde_yaml::Value::String(wd.clone()),
+            );
+        }
+        if let Some(ref role) = config.role {
+            inst.insert(
+                serde_yaml::Value::String("role".into()),
+                serde_yaml::Value::String(role.clone()),
+            );
+        }
+
+        instances.insert(
+            serde_yaml::Value::String(name.to_string()),
+            serde_yaml::Value::Mapping(inst),
+        );
+
+        atomic_write_yaml(home, &doc)?;
+        eprintln!("[fleet] added instance '{name}' to fleet.yaml");
+        Ok(())
+    })();
+    release_lock(home);
+    result
+}
+
+/// Remove an instance entry from fleet.yaml. Uses file lock + atomic write.
+pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
+    let fleet_path = home.join("fleet.yaml");
+    if !fleet_path.exists() {
+        return Ok(());
+    }
+    let _lock = acquire_lock(home)?;
+    let result = (|| -> Result<()> {
+        let content = std::fs::read_to_string(&fleet_path)
+            .context("Failed to read fleet.yaml")?;
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
+            .context("Failed to parse fleet.yaml")?;
+
+        if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
+            let key = serde_yaml::Value::String(name.to_string());
+            instances.remove(&key);
+        }
+
+        atomic_write_yaml(home, &doc)?;
+        eprintln!("[fleet] removed instance '{name}' from fleet.yaml");
+        Ok(())
+    })();
+    release_lock(home);
+    result
+}
+
+/// Update a specific field of an instance in fleet.yaml. Uses file lock + atomic write.
+pub fn update_instance_field(home: &Path, name: &str, field: &str, value: serde_yaml::Value) -> Result<()> {
+    let fleet_path = home.join("fleet.yaml");
+    if !fleet_path.exists() {
+        return Ok(());
+    }
+    let _lock = acquire_lock(home)?;
+    let result = (|| -> Result<()> {
+        let content = std::fs::read_to_string(&fleet_path)
+            .context("Failed to read fleet.yaml")?;
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
+            .context("Failed to parse fleet.yaml")?;
+
+        if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
+            let key = serde_yaml::Value::String(name.to_string());
+            if let Some(inst) = instances.get_mut(&key).and_then(|v| v.as_mapping_mut()) {
+                inst.insert(serde_yaml::Value::String(field.to_string()), value);
+            }
+        }
+
+        atomic_write_yaml(home, &doc)?;
+        Ok(())
+    })();
+    release_lock(home);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +421,85 @@ instances:
         assert_eq!(resolved.env.get("KEY1").map(|s| s.as_str()), Some("default_val"));
         assert_eq!(resolved.env.get("KEY2").map(|s| s.as_str()), Some("instance_val")); // instance overrides
         assert_eq!(resolved.env.get("KEY3").map(|s| s.as_str()), Some("instance_only"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_add_instance_to_yaml() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-add-{}", std::process::id()));
+        let path = write_fleet(&dir, r#"
+instances:
+  existing:
+    command: /bin/bash
+"#);
+        let entry = InstanceYamlEntry {
+            command: "claude".to_string(),
+            backend: Some("claude-code".to_string()),
+            working_directory: Some("/tmp/work".to_string()),
+            role: Some("developer".to_string()),
+        };
+        add_instance_to_yaml(&dir, "new-agent", &entry).expect("add");
+        let config = FleetConfig::load(&path).expect("load after add");
+        assert!(config.instances.contains_key("new-agent"));
+        let inst = &config.instances["new-agent"];
+        assert_eq!(inst.command.as_deref(), Some("claude"));
+        assert_eq!(inst.working_directory.as_deref(), Some("/tmp/work"));
+        assert_eq!(inst.role.as_deref(), Some("developer"));
+        // existing instance should still be there
+        assert!(config.instances.contains_key("existing"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_remove_instance_from_yaml() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-rm-{}", std::process::id()));
+        write_fleet(&dir, r#"
+instances:
+  keep:
+    command: /bin/bash
+  remove-me:
+    command: /bin/bash
+"#);
+        remove_instance_from_yaml(&dir, "remove-me").expect("remove");
+        let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load after remove");
+        assert!(config.instances.contains_key("keep"));
+        assert!(!config.instances.contains_key("remove-me"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_add_instance_creates_fleet_yaml() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-create-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        // No fleet.yaml exists yet
+        let entry = InstanceYamlEntry {
+            command: "claude".to_string(),
+            backend: None,
+            working_directory: None,
+            role: None,
+        };
+        add_instance_to_yaml(&dir, "first", &entry).expect("add to new");
+        let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        assert!(config.instances.contains_key("first"));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_update_instance_field() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-upd-{}", std::process::id()));
+        write_fleet(&dir, r#"
+instances:
+  agent1:
+    command: /bin/bash
+"#);
+        update_instance_field(&dir, "agent1", "topic_id", serde_yaml::Value::Number(serde_yaml::Number::from(42)))
+            .expect("update field");
+        let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        assert_eq!(config.instances["agent1"].topic_id, Some(42));
 
         fs::remove_dir_all(&dir).ok();
     }

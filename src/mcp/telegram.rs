@@ -136,6 +136,46 @@ pub fn try_telegram_edit(instance_name: &str, message_id: &str, text: &str) -> a
     }
 }
 
+/// Create a Telegram forum topic for a new instance.
+/// Reads channel config from fleet.yaml. Returns the topic_id on success.
+pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
+    let fleet_path = home.join("fleet.yaml");
+    if !fleet_path.exists() {
+        return None;
+    }
+    let config = crate::fleet::FleetConfig::load(&fleet_path).ok()?;
+    match &config.channel {
+        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+            let token = std::env::var(bot_token_env).ok()?;
+            let gid = *group_id;
+            let topic_id = mcp_runtime().block_on(async {
+                let bot = teloxide::Bot::new(&token);
+                let chat_id = teloxide::types::ChatId(gid);
+                let topic = bot.create_forum_topic(chat_id, instance_name, 0x6FB9F0, "").await?;
+                Ok::<i32, anyhow::Error>(topic.thread_id.0 .0)
+            });
+            match topic_id {
+                Ok(tid) => {
+                    eprintln!("[telegram] created topic for '{instance_name}' -> {tid}");
+                    // Save topic_id back to fleet.yaml
+                    let _ = crate::fleet::update_instance_field(
+                        home,
+                        instance_name,
+                        "topic_id",
+                        serde_yaml::Value::Number(serde_yaml::Number::from(tid)),
+                    );
+                    Some(tid)
+                }
+                Err(e) => {
+                    eprintln!("[telegram] failed to create topic for '{instance_name}': {e}");
+                    None
+                }
+            }
+        }
+        None => None,
+    }
+}
+
 pub fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Result<String> {
     let home = crate::home_dir();
     let fleet_path = home.join("fleet.yaml");
