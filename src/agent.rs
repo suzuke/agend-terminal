@@ -406,27 +406,27 @@ fn handle_pty_close(
         }
     };
 
+    // In daemon mode, ALL unexpected exits trigger respawn — even exit 0.
+    // An agent exiting on its own (not via `kill` or shutdown) is unexpected.
+    // Only daemon shutdown and explicit `kill` skip respawn (handled above).
     if is_crash {
-        // Set Restarting state (don't remove from registry)
-        if let Ok(reg) = registry.lock() {
-            if let Some(handle) = reg.get(name) {
-                if let Ok(mut core) = handle.core.lock() {
-                    core.state.set_restarting();
-                }
+        tracing::info!(agent = name, "setting restarting state");
+    } else {
+        tracing::warn!(
+            agent = name,
+            "unexpected exit (code 0), treating as crash for respawn"
+        );
+    }
+    // Set Restarting state (don't remove from registry)
+    if let Ok(reg) = registry.lock() {
+        if let Some(handle) = reg.get(name) {
+            if let Ok(mut core) = handle.core.lock() {
+                core.state.set_restarting();
             }
         }
-        if let Some(ref tx) = crash_tx {
-            let _ = tx.send(name.to_string());
-        }
-    } else {
-        tracing::info!(agent = name, "graceful exit (code 0), no respawn");
-        if let Ok(mut reg) = registry.lock() {
-            reg.remove(name);
-        }
-        if let Some(ref home) = home {
-            let sock = crate::daemon::agent_socket_path(home, name);
-            let _ = std::fs::remove_file(&sock);
-        }
+    }
+    if let Some(ref tx) = crash_tx {
+        let _ = tx.send(name.to_string());
     }
 }
 
