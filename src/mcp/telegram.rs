@@ -202,6 +202,37 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     }
 }
 
+/// Close a Telegram forum topic when an instance is deleted.
+pub fn close_topic(home: &std::path::Path, topic_id: i32) {
+    let fleet_path = home.join("fleet.yaml");
+    let config = match crate::fleet::FleetConfig::load(&fleet_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let (token, gid) = match &config.channel {
+        Some(crate::fleet::ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        }) => match std::env::var(bot_token_env) {
+            Ok(t) => (t, *group_id),
+            Err(_) => return,
+        },
+        None => return,
+    };
+    let _ = mcp_runtime().block_on(async {
+        let bot = teloxide::Bot::new(&token);
+        let chat_id = teloxide::types::ChatId(gid);
+        // Close the topic (makes it read-only)
+        bot.close_forum_topic(
+            chat_id,
+            teloxide::types::ThreadId(teloxide::types::MessageId(topic_id)),
+        )
+        .await
+    });
+    eprintln!("[telegram] closed topic {topic_id}");
+}
+
 pub fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Result<String> {
     let home = crate::home_dir();
     let fleet_path = home.join("fleet.yaml");

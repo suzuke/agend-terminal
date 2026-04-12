@@ -141,9 +141,27 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
 
     let (instance_name, home, submit_key) = {
-        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         let name = thread_id
             .and_then(|tid| s.topic_to_instance.get(&tid).cloned())
+            .or_else(|| {
+                // Unknown topic_id — reload topic map from fleet.yaml
+                // (handles topics created at runtime via create_instance)
+                if let Some(tid) = thread_id {
+                    if let Ok(config) = crate::fleet::FleetConfig::load(&s.home.join("fleet.yaml"))
+                    {
+                        for (inst_name, inst) in &config.instances {
+                            if inst.topic_id == Some(tid) {
+                                // Update maps for future lookups
+                                s.topic_to_instance.insert(tid, inst_name.clone());
+                                s.instance_to_topic.insert(inst_name.clone(), tid);
+                                return Some(inst_name.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            })
             .unwrap_or_else(|| "general".to_string());
         let sk = s
             .submit_keys

@@ -226,10 +226,12 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             if let Err(e) = crate::agent::validate_name(name) {
                 return json!({"error": e});
             }
-            let command = match args["command"].as_str() {
-                Some(c) => c,
-                None => return json!({"error": "missing 'command'"}),
-            };
+            // Accept "backend" (preferred) or "command" (deprecated) for the CLI tool name.
+            // Default to "claude" if neither is specified.
+            let command = args["backend"]
+                .as_str()
+                .or_else(|| args["command"].as_str())
+                .unwrap_or("claude");
             let mut cmd_args = args
                 .get("args")
                 .and_then(|v| v.as_str())
@@ -289,7 +291,10 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     let entry = crate::fleet::InstanceYamlEntry {
                         command: command.to_string(),
-                        backend: backend_str,
+                        backend: backend_str.or_else(|| {
+                            crate::backend::Backend::from_command(command)
+                                .map(|b| b.name().to_string())
+                        }),
                         working_directory: Some(work_dir.clone()),
                         role,
                     };
@@ -304,7 +309,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                             &json!({"method": "inject", "params": {"name": name, "data": task_text}}),
                         );
                     }
-                    let mut result = json!({"name": name, "command": command});
+                    let mut result = json!({"name": name, "backend": command});
                     if let Some(tid) = topic_id {
                         result["topic_id"] = json!(tid);
                     }
@@ -322,12 +327,21 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             if let Err(e) = crate::agent::validate_name(name) {
                 return json!({"error": e});
             }
+            // Read topic_id before removing from fleet.yaml
+            let topic_id = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                .ok()
+                .and_then(|c| c.instances.get(name).and_then(|i| i.topic_id));
+
             let _ = crate::api::call(
                 &home,
                 &json!({"method": "delete", "params": {"name": name}}),
             );
             if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, name) {
                 eprintln!("[mcp] failed to remove from fleet.yaml: {e}");
+            }
+            // Close and delete the Telegram topic if one exists
+            if let Some(tid) = topic_id {
+                telegram::close_topic(&home, tid);
             }
             json!({"name": name})
         }

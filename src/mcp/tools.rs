@@ -69,13 +69,17 @@ fn instance_tools() -> Vec<Value> {
     vec![
         json!({"name": "list_instances", "description": "List all active agent instances.",
             "inputSchema": {"type": "object", "properties": {}}}),
-        json!({"name": "create_instance", "description": "Create a new agent instance.",
+        json!({"name": "create_instance", "description": "Create a new agent instance. Backend is the CLI tool name (e.g. claude, gemini, kiro-cli, codex, opencode).",
             "inputSchema": {"type": "object", "properties": {
-                "name": {"type": "string"}, "command": {"type": "string"}, "args": {"type": "string"},
-                "model": {"type": "string"}, "working_directory": {"type": "string"},
+                "name": {"type": "string", "description": "Instance name (alphanumeric, dash, underscore)"},
+                "backend": {"type": "string", "description": "Backend CLI name: claude, gemini, kiro-cli, codex, opencode"},
+                "args": {"type": "string", "description": "Extra CLI arguments"},
+                "model": {"type": "string", "description": "Model override (e.g. --model flag)"},
+                "working_directory": {"type": "string"},
                 "branch": {"type": "string", "description": "Git branch — creates worktree if specified"},
-                "task": {"type": "string", "description": "Initial task to inject after spawn"}
-            }, "required": ["name", "command"]}}),
+                "task": {"type": "string", "description": "Initial task to inject after spawn"},
+                "command": {"type": "string", "description": "Deprecated: use 'backend' instead"}
+            }, "required": ["name"]}}),
         json!({"name": "delete_instance", "description": "Stop and remove an instance.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
         json!({"name": "start_instance", "description": "Start a stopped instance.",
