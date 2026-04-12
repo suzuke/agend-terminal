@@ -382,3 +382,46 @@ fn print_next_steps(home: &Path) {
     println!("  4. Attach to an agent:");
     println!("     agend-terminal attach general\n");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_token_long() {
+        let masked = mask_token("1234567890abcdef");
+        assert_eq!(masked, "1234...cdef");
+    }
+
+    #[test]
+    fn mask_token_short() {
+        let masked = mask_token("abcd");
+        assert_eq!(masked, "****");
+    }
+
+    #[test]
+    fn mask_token_exactly_8() {
+        let masked = mask_token("12345678");
+        assert_eq!(masked, "****");
+    }
+
+    #[test]
+    fn mask_token_9_chars() {
+        let masked = mask_token("123456789");
+        assert_eq!(masked, "1234...6789");
+    }
+
+    #[test]
+    fn detect_project_root_empty_home() {
+        // With no standard dirs, should return None (or some existing project)
+        // This test validates the function doesn't panic
+        let _ = detect_project_root();
+    }
+
+    #[test]
+    fn detect_backends_does_not_panic() {
+        let backends = detect_backends();
+        // Should return 0 or more backends without panicking
+        assert!(backends.len() <= 5);
+    }
+}

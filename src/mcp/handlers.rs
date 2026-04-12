@@ -665,3 +665,136 @@ fn list_agents() -> Vec<String> {
     }
     agents
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-handlers-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    // validate_branch tests
+    #[test]
+    fn branch_valid_simple() {
+        assert!(validate_branch("main"));
+        assert!(validate_branch("feature/foo"));
+        assert!(validate_branch("v1.0.0"));
+        assert!(validate_branch("fix-123"));
+        assert!(validate_branch("release_2.0"));
+    }
+
+    #[test]
+    fn branch_rejects_empty() {
+        assert!(!validate_branch(""));
+    }
+
+    #[test]
+    fn branch_rejects_dotdot() {
+        assert!(!validate_branch(".."));
+        assert!(!validate_branch("foo/.."));
+        assert!(!validate_branch("../bar"));
+    }
+
+    #[test]
+    fn branch_rejects_leading_dash() {
+        assert!(!validate_branch("-main"));
+        assert!(!validate_branch("-"));
+    }
+
+    #[test]
+    fn branch_rejects_special_chars() {
+        assert!(!validate_branch("main branch"));
+        assert!(!validate_branch("foo;bar"));
+        assert!(!validate_branch("$(echo)"));
+        assert!(!validate_branch("main\ninjected"));
+    }
+
+    // merge_metadata tests
+    #[test]
+    fn merge_metadata_no_file() {
+        let home = tmp_home("merge_meta_no_file");
+        let mut info = json!({"name": "agent1", "state": "idle"});
+        merge_metadata(&home, "agent1", &mut info);
+        // Should not crash, info unchanged
+        assert_eq!(info["name"], "agent1");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_metadata_merges_fields() {
+        let home = tmp_home("merge_meta_fields");
+        let meta_dir = home.join("metadata");
+        std::fs::create_dir_all(&meta_dir).ok();
+        std::fs::write(
+            meta_dir.join("agent1.json"),
+            r#"{"display_name": "Dev Agent", "custom": 42}"#,
+        )
+        .ok();
+        let mut info = json!({"name": "agent1", "state": "idle"});
+        merge_metadata(&home, "agent1", &mut info);
+        assert_eq!(info["display_name"], "Dev Agent");
+        assert_eq!(info["custom"], 42);
+        assert_eq!(info["name"], "agent1"); // original preserved
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // save_metadata tests
+    #[test]
+    fn save_and_load_metadata() {
+        let home = tmp_home("save_meta");
+        save_metadata(&home, "agent1", "display_name", json!("My Agent"));
+        save_metadata(&home, "agent1", "version", json!(2));
+        let content = std::fs::read_to_string(home.join("metadata/agent1.json")).expect("read");
+        let meta: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(meta["display_name"], "My Agent");
+        assert_eq!(meta["version"], 2);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn save_metadata_creates_dir() {
+        let home = tmp_home("save_meta_dir");
+        assert!(!home.join("metadata").exists());
+        save_metadata(&home, "agent1", "key", json!("value"));
+        assert!(home.join("metadata").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // get_submit_key tests
+    #[test]
+    fn get_submit_key_default() {
+        let home = tmp_home("submit_key");
+        // No fleet.yaml → default \r
+        let key = get_submit_key(&home, "agent1");
+        assert_eq!(key, "\r");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn get_submit_key_from_fleet() {
+        let home = tmp_home("submit_key_fleet");
+        let yaml = r#"defaults:
+  backend: claude-code
+instances:
+  dev:
+    role: "Developer"
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        let key = get_submit_key(&home, "dev");
+        // Claude Code preset submit_key is "\r" or similar
+        assert!(!key.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

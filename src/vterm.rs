@@ -198,3 +198,142 @@ fn write_color(out: &mut Vec<u8>, color: Color, is_fg: bool) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_creates_term_with_dimensions() {
+        let vt = VTerm::new(80, 24);
+        assert_eq!(vt.cols, 80);
+        assert_eq!(vt.rows, 24);
+    }
+
+    #[test]
+    fn new_small_terminal() {
+        let vt = VTerm::new(1, 1);
+        assert_eq!(vt.cols, 1);
+        assert_eq!(vt.rows, 1);
+    }
+
+    #[test]
+    fn process_plain_text() {
+        let mut vt = VTerm::new(80, 24);
+        vt.process(b"Hello, world!");
+        let screen = vt.dump_screen();
+        let screen_str = String::from_utf8_lossy(&screen);
+        assert!(screen_str.contains("Hello, world!"));
+    }
+
+    #[test]
+    fn process_ansi_color() {
+        let mut vt = VTerm::new(80, 24);
+        vt.process(b"\x1b[31mRed\x1b[0m Normal");
+        let screen = vt.dump_screen();
+        let screen_str = String::from_utf8_lossy(&screen);
+        assert!(screen_str.contains("Red"));
+        assert!(screen_str.contains("Normal"));
+    }
+
+    #[test]
+    fn process_newlines() {
+        let mut vt = VTerm::new(80, 24);
+        vt.process(b"line1\r\nline2");
+        let screen = vt.dump_screen();
+        let screen_str = String::from_utf8_lossy(&screen);
+        assert!(screen_str.contains("line1"));
+        assert!(screen_str.contains("line2"));
+    }
+
+    #[test]
+    fn resize_updates_dimensions() {
+        let mut vt = VTerm::new(80, 24);
+        vt.resize(120, 40);
+        assert_eq!(vt.cols, 120);
+        assert_eq!(vt.rows, 40);
+    }
+
+    #[test]
+    fn dump_empty_screen_has_cursor_reset() {
+        let vt = VTerm::new(80, 24);
+        let screen = vt.dump_screen();
+        let screen_str = String::from_utf8_lossy(&screen);
+        // Should have cursor home and clear screen
+        assert!(screen_str.contains("\x1b[H\x1b[2J"));
+        // Should end with reset + cursor position
+        assert!(screen_str.contains("\x1b[0m"));
+    }
+
+    #[test]
+    fn write_color_fg_red() {
+        let mut out = Vec::new();
+        write_color(&mut out, Color::Named(NamedColor::Red), true);
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(s, ";31");
+    }
+
+    #[test]
+    fn write_color_bg_blue() {
+        let mut out = Vec::new();
+        write_color(&mut out, Color::Named(NamedColor::Blue), false);
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(s, ";44");
+    }
+
+    #[test]
+    fn write_color_rgb() {
+        let mut out = Vec::new();
+        write_color(
+            &mut out,
+            Color::Spec(alacritty_terminal::vte::ansi::Rgb { r: 255, g: 128, b: 0 }),
+            true,
+        );
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(s, ";38;2;255;128;0");
+    }
+
+    #[test]
+    fn write_color_indexed() {
+        let mut out = Vec::new();
+        write_color(&mut out, Color::Indexed(200), false);
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(s, ";48;5;200");
+    }
+
+    #[test]
+    fn write_color_default_foreground_skipped() {
+        let mut out = Vec::new();
+        write_color(&mut out, Color::Named(NamedColor::Foreground), true);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn write_color_bright_colors() {
+        let mut out = Vec::new();
+        write_color(&mut out, Color::Named(NamedColor::BrightRed), true);
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(s, ";91");
+    }
+
+    #[test]
+    fn process_then_resize_then_dump() {
+        let mut vt = VTerm::new(40, 10);
+        vt.process(b"Before resize");
+        vt.resize(80, 24);
+        vt.process(b"\r\nAfter resize");
+        let screen = vt.dump_screen();
+        let screen_str = String::from_utf8_lossy(&screen);
+        assert!(screen_str.contains("Before resize"));
+        assert!(screen_str.contains("After resize"));
+    }
+
+    #[test]
+    fn process_wide_char() {
+        let mut vt = VTerm::new(80, 24);
+        vt.process("日本語".as_bytes());
+        let screen = vt.dump_screen();
+        let screen_str = String::from_utf8_lossy(&screen);
+        assert!(screen_str.contains("日本語"));
+    }
+}

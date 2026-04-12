@@ -348,3 +348,82 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
     let resp: Value = serde_json::from_str(line.trim())?;
     Ok(resp)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-api-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn api_socket_path_ends_with_api_sock() {
+        let home = tmp_home("sock_path");
+        let path = api_socket_path(&home);
+        assert!(path.ends_with("api.sock"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn api_socket_path_under_run_dir() {
+        let home = tmp_home("sock_path_run");
+        let path = api_socket_path(&home);
+        assert!(path.contains("run"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_api_socket_no_daemon() {
+        let home = tmp_home("no_daemon");
+        assert!(find_api_socket(&home).is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_api_socket_with_sock_file() {
+        let home = tmp_home("with_sock");
+        let pid = std::process::id();
+        let run = home.join("run").join(pid.to_string());
+        std::fs::create_dir_all(&run).ok();
+        // Write daemon ID so find_active_run_dir finds it
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::fs::write(run.join(".daemon"), format!("{pid}:{now}")).ok();
+        // Create fake api.sock
+        std::fs::write(run.join("api.sock"), "").ok();
+        let found = find_api_socket(&home);
+        assert!(found.is_some());
+        assert!(found.as_ref().map(|s| s.ends_with("api.sock")).unwrap_or(false));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_api_socket_run_dir_without_sock() {
+        let home = tmp_home("no_sock");
+        let pid = std::process::id();
+        let run = home.join("run").join(pid.to_string());
+        std::fs::create_dir_all(&run).ok();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::fs::write(run.join(".daemon"), format!("{pid}:{now}")).ok();
+        // No api.sock file
+        let found = find_api_socket(&home);
+        assert!(found.is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

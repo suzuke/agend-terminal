@@ -339,3 +339,79 @@ fn map_emoji_name(name: &str) -> &str {
         other => other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telegram_state_new_builds_reverse_map() {
+        let mut topic_map = HashMap::new();
+        topic_map.insert("agent1".to_string(), 100);
+        topic_map.insert("agent2".to_string(), 200);
+        let state = TelegramState::new(
+            "fake-token",
+            -12345,
+            topic_map,
+            PathBuf::from("/tmp/test"),
+            HashMap::new(),
+        );
+        assert_eq!(state.topic_to_instance.get(&100), Some(&"agent1".to_string()));
+        assert_eq!(state.topic_to_instance.get(&200), Some(&"agent2".to_string()));
+        assert_eq!(state.instance_to_topic.get("agent1"), Some(&100));
+        assert_eq!(state.instance_to_topic.get("agent2"), Some(&200));
+    }
+
+    #[test]
+    fn telegram_state_empty_topic_map() {
+        let state = TelegramState::new(
+            "fake-token",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+        );
+        assert!(state.topic_to_instance.is_empty());
+        assert!(state.instance_to_topic.is_empty());
+    }
+
+    #[test]
+    fn telegram_state_submit_keys_preserved() {
+        let mut keys = HashMap::new();
+        keys.insert("agent1".to_string(), "\n".to_string());
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            keys,
+        );
+        assert_eq!(state.submit_keys.get("agent1"), Some(&"\n".to_string()));
+    }
+
+    #[test]
+    fn map_emoji_name_known() {
+        assert_eq!(map_emoji_name("thumbsup"), "👍");
+        assert_eq!(map_emoji_name("thumbs_up"), "👍");
+        assert_eq!(map_emoji_name("fire"), "🔥");
+        assert_eq!(map_emoji_name("heart"), "❤");
+        assert_eq!(map_emoji_name("rocket"), "🚀");
+        assert_eq!(map_emoji_name("check"), "✅");
+    }
+
+    #[test]
+    fn map_emoji_name_unknown_passthrough() {
+        assert_eq!(map_emoji_name("🎵"), "🎵");
+        assert_eq!(map_emoji_name("custom_emoji"), "custom_emoji");
+    }
+
+    #[test]
+    fn map_emoji_name_aliases() {
+        assert_eq!(map_emoji_name("pray"), "🙏");
+        assert_eq!(map_emoji_name("folded_hands"), "🙏");
+        assert_eq!(map_emoji_name("thumbsdown"), "👎");
+        assert_eq!(map_emoji_name("thumbs_down"), "👎");
+        assert_eq!(map_emoji_name("tada"), "🎉");
+        assert_eq!(map_emoji_name("party"), "🎉");
+    }
+}

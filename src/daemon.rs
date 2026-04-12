@@ -955,3 +955,125 @@ async fn ci_check_repo(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-daemon-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn run_dir_contains_pid() {
+        let home = tmp_home("run_dir");
+        let dir = run_dir(&home);
+        let pid = std::process::id().to_string();
+        assert!(dir.display().to_string().contains(&pid));
+        assert!(dir.ends_with(&pid));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn run_dir_under_home() {
+        let home = tmp_home("run_dir_home");
+        let dir = run_dir(&home);
+        assert!(dir.starts_with(&home));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_active_run_dir_no_run_dir() {
+        let home = tmp_home("no_run");
+        assert!(find_active_run_dir(&home).is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_active_run_dir_empty_run_dir() {
+        let home = tmp_home("empty_run");
+        std::fs::create_dir_all(home.join("run")).ok();
+        assert!(find_active_run_dir(&home).is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_active_run_dir_stale_pid_cleaned() {
+        let home = tmp_home("stale_pid");
+        // Use PID 999999 which is very unlikely to be alive
+        let stale = home.join("run").join("999999");
+        std::fs::create_dir_all(&stale).ok();
+        std::fs::write(stale.join(".daemon"), "999999:0").ok();
+        assert!(find_active_run_dir(&home).is_none());
+        // Stale dir should be cleaned up
+        assert!(!stale.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_active_run_dir_current_pid() {
+        let home = tmp_home("current_pid");
+        let pid = std::process::id();
+        let run = home.join("run").join(pid.to_string());
+        std::fs::create_dir_all(&run).ok();
+        write_daemon_id(&run);
+        let found = find_active_run_dir(&home);
+        assert!(found.is_some());
+        assert_eq!(found.as_ref().map(|p| p.as_path()), Some(run.as_path()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn write_daemon_id_format() {
+        let home = tmp_home("daemon_id");
+        let run = home.join("run").join("test");
+        std::fs::create_dir_all(&run).ok();
+        write_daemon_id(&run);
+        let content = std::fs::read_to_string(run.join(".daemon")).expect("read .daemon");
+        let parts: Vec<&str> = content.split(':').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], std::process::id().to_string());
+        // Timestamp should be a positive number
+        let ts: u64 = parts[1].parse().expect("parse timestamp");
+        assert!(ts > 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn agent_socket_path_format() {
+        let home = tmp_home("sock_path");
+        // Create run dir for current PID so find_active_run_dir works
+        let run = run_dir(&home);
+        std::fs::create_dir_all(&run).ok();
+        write_daemon_id(&run);
+        let path = agent_socket_path(&home, "myagent");
+        assert!(path.ends_with("myagent.sock"));
+        assert!(path.contains("run"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn find_active_run_dir_pid_reuse_detected() {
+        let home = tmp_home("pid_reuse");
+        let pid = std::process::id();
+        let run = home.join("run").join(pid.to_string());
+        std::fs::create_dir_all(&run).ok();
+        // Write a .daemon file with a DIFFERENT PID (simulates PID reuse)
+        std::fs::write(run.join(".daemon"), "12345:0").ok();
+        // Should detect PID reuse and clean up
+        let found = find_active_run_dir(&home);
+        assert!(found.is_none());
+        assert!(!run.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

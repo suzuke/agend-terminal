@@ -80,7 +80,7 @@ fn load_dotenv() {
 }
 
 /// Parse a double-quoted value, handling escaped quotes (e.g. `"hello \"world\""`)
-fn parse_double_quoted(s: &str) -> String {
+pub(crate) fn parse_double_quoted(s: &str) -> String {
     let inner = &s[1..]; // skip opening "
     let mut result = String::new();
     let mut chars = inner.chars();
@@ -470,5 +470,61 @@ fn list_running_agents(home: &std::path::Path) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_dir_default() {
+        // Should return a path ending with .agend-terminal
+        let home = home_dir();
+        assert!(home.display().to_string().contains("agend-terminal"));
+    }
+
+    #[test]
+    fn parse_double_quoted_simple() {
+        assert_eq!(parse_double_quoted(r#""hello""#), "hello");
+    }
+
+    #[test]
+    fn parse_double_quoted_escaped_quote() {
+        assert_eq!(parse_double_quoted(r#""hello \"world\"""#), r#"hello "world""#);
+    }
+
+    #[test]
+    fn parse_double_quoted_escaped_backslash() {
+        assert_eq!(parse_double_quoted(r#""path\\to\\file""#), r#"path\to\file"#);
+    }
+
+    #[test]
+    fn parse_double_quoted_newline_escape() {
+        assert_eq!(parse_double_quoted(r#""line1\nline2""#), "line1\nline2");
+    }
+
+    #[test]
+    fn parse_double_quoted_tab_escape() {
+        assert_eq!(parse_double_quoted(r#""col1\tcol2""#), "col1\tcol2");
+    }
+
+    #[test]
+    fn parse_double_quoted_unknown_escape() {
+        // Unknown escape sequences preserved as-is
+        assert_eq!(parse_double_quoted(r#""foo\xbar""#), r#"foo\xbar"#);
+    }
+
+    #[test]
+    fn parse_double_quoted_hash_preserved() {
+        assert_eq!(
+            parse_double_quoted(r#""https://example.com#fragment""#),
+            "https://example.com#fragment"
+        );
+    }
+
+    #[test]
+    fn parse_double_quoted_empty() {
+        assert_eq!(parse_double_quoted(r#""""#), "");
     }
 }
