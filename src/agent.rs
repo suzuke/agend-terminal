@@ -317,13 +317,7 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
                 if !in_cooldown
-                    && try_dismiss_dialog(
-                        name,
-                        data,
-                        &mut detect_buf,
-                        pty_writer,
-                        dismiss_patterns,
-                    )
+                    && try_dismiss_dialog(name, data, &mut detect_buf, pty_writer, dismiss_patterns)
                 {
                     dismiss_cooldown_until =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
