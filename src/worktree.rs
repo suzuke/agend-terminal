@@ -21,6 +21,16 @@ pub fn is_git_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// Validate a git branch name. Only allows [a-zA-Z0-9/_.-], rejects ".." and leading "-".
+fn validate_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.contains("..")
+        && !branch.starts_with('-')
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
+}
+
 /// Create a worktree for an instance. Returns WorktreeInfo if created,
 /// None if not a git repo.
 ///
@@ -40,6 +50,11 @@ pub fn create(
     let branch = custom_branch
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("agend/{instance_name}"));
+
+    if !validate_branch(&branch) {
+        tracing::warn!(branch = %branch, "invalid branch name, rejecting worktree creation");
+        return None;
+    }
 
     let wt_dir = repo_dir.join(".worktrees").join(instance_name);
 

@@ -217,7 +217,10 @@ pub fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Re
                 let file = bot.get_file(file_id).await?;
                 let download_dir = home.join("downloads").join(instance_name);
                 std::fs::create_dir_all(&download_dir)?;
-                let filename = file.path.rsplit('/').next().unwrap_or("attachment");
+                let filename = std::path::Path::new(&file.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("attachment");
                 let dest = download_dir.join(filename);
                 let mut dst = tokio::fs::File::create(&dest).await?;
                 bot.download_file(&file.path, &mut dst).await?;

@@ -38,6 +38,26 @@ pub struct AgentHandle {
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
 
+/// Validate and sanitize an instance name. Only allows [a-zA-Z0-9_-].
+pub fn validate_name(name: &str) -> Result<&str, String> {
+    if name.is_empty() {
+        return Err("instance name cannot be empty".into());
+    }
+    if name.len() > 64 {
+        return Err("instance name too long (max 64 chars)".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!(
+            "instance name '{}' contains invalid characters (only a-z, 0-9, -, _ allowed)",
+            name
+        ));
+    }
+    Ok(name)
+}
+
 /// Lock the agent registry, recovering from poison.
 pub fn lock_registry(
     reg: &AgentRegistry,
@@ -281,7 +301,7 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
     } = ctx;
     let mut buf = [0u8; 8192];
     let mut detect_buf = Vec::with_capacity(4096);
-    let mut dialog_dismissed = false;
+    let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
 
     loop {
         match pty_reader.read(&mut buf) {
@@ -292,15 +312,21 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
             Ok(n_bytes) => {
                 let data = &buf[..n_bytes];
 
-                // Auto-dismiss trust/update dialogs
-                if !dialog_dismissed {
-                    dialog_dismissed = try_dismiss_dialog(
+                // Auto-dismiss trust/update dialogs (cooldown: 10s after last dismiss)
+                let in_cooldown = dismiss_cooldown_until
+                    .map(|t| std::time::Instant::now() < t)
+                    .unwrap_or(false);
+                if !in_cooldown
+                    && try_dismiss_dialog(
                         name,
                         data,
                         &mut detect_buf,
                         pty_writer,
                         dismiss_patterns,
-                    );
+                    )
+                {
+                    dismiss_cooldown_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
                 }
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic)

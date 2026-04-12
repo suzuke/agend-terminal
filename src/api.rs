@@ -119,6 +119,10 @@ fn handle_session(
             }
             "inject" => {
                 let name = params["name"].as_str().unwrap_or("");
+                if let Err(e) = agent::validate_name(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
+                    continue;
+                }
                 let data = params["data"].as_str().unwrap_or("");
                 // "raw" flag: send bytes as-is (for attach-like paths)
                 let raw = params["raw"].as_bool().unwrap_or(false);
@@ -150,6 +154,10 @@ fn handle_session(
             }
             "kill" => {
                 let name = params["name"].as_str().unwrap_or("");
+                if let Err(e) = agent::validate_name(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
+                    continue;
+                }
                 let reg = agent::lock_registry(registry);
                 match reg.get(name) {
                     Some(handle) => {
@@ -169,6 +177,10 @@ fn handle_session(
             "delete" => {
                 // Kill + remove from configs (prevents respawn)
                 let name = params["name"].as_str().unwrap_or("");
+                if let Err(e) = agent::validate_name(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
+                    continue;
+                }
                 // Remove from configs first (so crash handler won't respawn)
                 configs
                     .lock()
@@ -198,6 +210,10 @@ fn handle_session(
                         continue;
                     }
                 };
+                if let Err(e) = agent::validate_name(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
+                    continue;
+                }
                 let command = params["command"].as_str().unwrap_or("bash");
                 let args: Vec<String> = params["args"]
                     .as_str()
@@ -245,6 +261,10 @@ fn handle_session(
                     params["target"].as_str().unwrap_or(""),
                     params["text"].as_str().unwrap_or(""),
                 );
+                if let Err(e) = agent::validate_name(target) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
+                    continue;
+                }
                 let _ = crate::inbox::enqueue(
                     home,
                     target,

@@ -71,6 +71,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(t) => t,
                 None => return json!({"error": "missing 'instance_name' or 'target'"}),
             };
+            if let Err(e) = crate::agent::validate_name(target) {
+                return json!({"error": e});
+            }
             let text = args["message"]
                 .as_str()
                 .or_else(|| args["text"].as_str())
@@ -109,6 +112,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(t) => t,
                 None => return json!({"error": "missing 'target_instance'"}),
             };
+            if let Err(e) = crate::agent::validate_name(target) {
+                return json!({"error": e});
+            }
             let task = match args["task"].as_str() {
                 Some(t) => t,
                 None => return json!({"error": "missing 'task'"}),
@@ -127,6 +133,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(t) => t,
                 None => return json!({"error": "missing 'target_instance'"}),
             };
+            if let Err(e) = crate::agent::validate_name(target) {
+                return json!({"error": e});
+            }
             let summary = match args["summary"].as_str() {
                 Some(s) => s,
                 None => return json!({"error": "missing 'summary'"}),
@@ -145,6 +154,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(t) => t,
                 None => return json!({"error": "missing 'target_instance'"}),
             };
+            if let Err(e) = crate::agent::validate_name(target) {
+                return json!({"error": e});
+            }
             let question = match args["question"].as_str() {
                 Some(q) => q,
                 None => return json!({"error": "missing 'question'"}),
@@ -211,6 +223,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
+            if let Err(e) = crate::agent::validate_name(name) {
+                return json!({"error": e});
+            }
             let command = match args["command"].as_str() {
                 Some(c) => c,
                 None => return json!({"error": "missing 'command'"}),
@@ -230,6 +245,15 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 }
                 cmd_args.push_str(&format!("--model {model}"));
             }
+            // Validate working_directory: reject paths with ".." or relative paths
+            if let Some(dir) = args.get("working_directory").and_then(|v| v.as_str()) {
+                if dir.contains("..") {
+                    return json!({"error": "working_directory must not contain '..'"});
+                }
+                if !dir.starts_with('/') {
+                    return json!({"error": "working_directory must be an absolute path"});
+                }
+            }
             let mut work_dir = args
                 .get("working_directory")
                 .and_then(|v| v.as_str())
@@ -237,6 +261,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 .unwrap_or_else(|| home.join("workspaces").join(name).display().to_string());
 
             if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
+                if !validate_branch(branch) {
+                    return json!({"error": format!("invalid branch name '{branch}'")});
+                }
                 let wd = std::path::PathBuf::from(&work_dir);
                 if let Some(info) = crate::worktree::create(&wd, name, Some(branch)) {
                     work_dir = info.path.display().to_string();
@@ -292,6 +319,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
+            if let Err(e) = crate::agent::validate_name(name) {
+                return json!({"error": e});
+            }
             let _ = crate::api::call(
                 &home,
                 &json!({"method": "delete", "params": {"name": name}}),
@@ -306,6 +336,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
+            if let Err(e) = crate::agent::validate_name(name) {
+                return json!({"error": e});
+            }
             let fleet_path = home.join("fleet.yaml");
             if !fleet_path.exists() {
                 return json!({"error": "No fleet.yaml"});
@@ -345,6 +378,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
         }
         "describe_instance" => {
             let name = args["name"].as_str().unwrap_or("");
+            if let Err(e) = crate::agent::validate_name(name) {
+                return json!({"error": e});
+            }
             match crate::api::call(&home, &json!({"method": "list"})) {
                 Ok(resp) => {
                     match resp["result"]["agents"]
@@ -367,6 +403,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
+            if let Err(e) = crate::agent::validate_name(name) {
+                return json!({"error": e});
+            }
             let reason = args["reason"].as_str().unwrap_or("manual replacement");
             let handover = crate::api::call(&home, &json!({"method": "list"})).ok()
                 .and_then(|resp| resp["result"]["agents"].as_array()?.iter()
@@ -432,6 +471,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 None => return json!({"error": "missing 'source'"}),
             };
             let branch = args["branch"].as_str().unwrap_or("HEAD");
+            if !validate_branch(branch) {
+                return json!({"error": format!("invalid branch name '{branch}'")});
+            }
             let worktree_dir = home.join("worktrees").join(format!(
                 "{}-{}",
                 instance_name,
@@ -597,6 +639,16 @@ fn get_submit_key(home: &std::path::Path, target: &str) -> String {
         }
     }
     "\r".to_string()
+}
+
+/// Validate a git branch name. Only allows [a-zA-Z0-9/_.-], rejects ".." and leading "-".
+fn validate_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.contains("..")
+        && !branch.starts_with('-')
+        && branch
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
 }
 
 /// List agent sockets in home directory.
