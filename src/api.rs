@@ -175,18 +175,14 @@ fn handle_session(
                 }
             }
             "delete" => {
-                // Kill + remove from configs (prevents respawn)
+                // Kill + remove from registry + configs
                 let name = params["name"].as_str().unwrap_or("");
                 if let Err(e) = agent::validate_name(name) {
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
                 }
-                // Remove from configs first (so crash handler won't respawn)
-                configs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(name);
-                // Then kill
+                // Kill and remove from registry first — this prevents the PTY close
+                // handler from sending a crash event (agent not in registry = no crash).
                 let mut reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(name) {
                     let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
@@ -195,6 +191,11 @@ fn handle_session(
                 }
                 reg.remove(name);
                 drop(reg);
+                // Then remove config (no race: agent already gone from registry)
+                configs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name);
                 // Cleanup socket
                 let sock = crate::daemon::agent_socket_path(home, name);
                 let _ = std::fs::remove_file(&sock);

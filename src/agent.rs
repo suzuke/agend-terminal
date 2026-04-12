@@ -373,6 +373,14 @@ fn handle_pty_close(
     let mut exit_code: Option<i32> = None;
     for _ in 0..20 {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if reg.get(name).is_none() {
+            // Agent already removed from registry (deleted via API) — not a crash
+            tracing::debug!(
+                agent = name,
+                "removed from registry, skipping crash handling"
+            );
+            return;
+        }
         if let Some(handle) = reg.get(name) {
             if let Ok(mut c) = handle.child.lock() {
                 if let Ok(Some(status)) = c.try_wait() {

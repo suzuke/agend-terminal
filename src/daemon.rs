@@ -482,7 +482,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         let config = match config {
             Some(c) => c,
             None => {
-                tracing::warn!(agent = %crashed_name, "no config for respawn");
+                tracing::debug!(agent = %crashed_name, "no config for respawn (likely deleted)");
                 continue;
             }
         };
