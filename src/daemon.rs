@@ -457,6 +457,15 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         tracing::warn!(agent = %crashed_name, "crashed");
         crate::event_log::log(home, "crash", &crashed_name, "agent crashed");
 
+        // Clear stale session ID — if agent crashed with --resume, the session
+        // may no longer exist. Removing the .sid file ensures the next respawn
+        // starts fresh instead of crash-looping on "No conversation found".
+        let sid_file = home.join("sessions").join(format!("{crashed_name}.sid"));
+        if sid_file.exists() {
+            tracing::info!(agent = %crashed_name, "clearing stale session ID");
+            let _ = std::fs::remove_file(&sid_file);
+        }
+
         // Get config for respawn
         let config = configs
             .lock()
@@ -522,9 +531,31 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                 return;
                             }
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+                            // Recalculate args: strip old --resume/--continue <id> and re-derive
+                            // from current .sid file (which was cleared on crash above).
+                            let respawn_args = {
+                                let mut args = Vec::new();
+                                let mut skip_next = false;
+                                for arg in &config.args {
+                                    if skip_next {
+                                        skip_next = false;
+                                        continue;
+                                    }
+                                    if arg == "--resume" || arg == "--continue" {
+                                        skip_next = true;
+                                        continue;
+                                    }
+                                    args.push(arg.clone());
+                                }
+                                // Re-add resume args from backend preset (reads .sid — now cleared → fresh start)
+                                if let Some(b) = crate::backend::Backend::from_command(&config.command) {
+                                    args.extend(b.preset().resume_mode.args_for(&home, &config.name));
+                                }
+                                args
+                            };
                             match agent::spawn_agent(
                                 &agent::SpawnConfig {
-                                    name: &config.name, command: &config.command, args: &config.args,
+                                    name: &config.name, command: &config.command, args: &respawn_args,
                                     cols, rows,
                                     env: config.env.as_ref(), working_dir: config.working_dir.as_deref(),
                                     submit_key: &config.submit_key, home: Some(&home), crash_tx: Some(tx),
