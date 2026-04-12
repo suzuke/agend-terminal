@@ -526,3 +526,44 @@ pub fn subscribe_with_dump(
     core.subscribers.push(tx);
     (rx, dump)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_name_valid() {
+        assert!(validate_name("hello").is_ok());
+        assert!(validate_name("agent-1").is_ok());
+        assert!(validate_name("my_agent").is_ok());
+        assert!(validate_name("A123").is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_traversal() {
+        assert!(validate_name("../etc").is_err());
+        assert!(validate_name("foo/bar").is_err());
+        assert!(validate_name("a b").is_err());
+        assert!(validate_name("").is_err());
+    }
+
+    #[test]
+    fn validate_name_rejects_long() {
+        let long = "a".repeat(65);
+        assert!(validate_name(&long).is_err());
+        let ok = "a".repeat(64);
+        assert!(validate_name(&ok).is_ok());
+    }
+
+    #[test]
+    fn strip_ansi_basic() {
+        assert_eq!(strip_ansi("hello"), "hello");
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[0m"), "bold green");
+    }
+
+    #[test]
+    fn strip_ansi_osc() {
+        assert_eq!(strip_ansi("\x1b]0;title\x07rest"), "rest");
+    }
+}

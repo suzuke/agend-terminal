@@ -285,7 +285,11 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             .name(format!("{n}_tui_server"))
             .spawn(move || serve_agent_tui(&n, &sock, &reg))?;
         if agents.len() > 1 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            let stagger_ms: u64 = std::env::var("AGEND_SPAWN_STAGGER_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500);
+            std::thread::sleep(std::time::Duration::from_millis(stagger_ms));
         }
     }
 

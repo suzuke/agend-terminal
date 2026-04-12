@@ -310,4 +310,22 @@ mod tests {
         assert!(residual.contains(&"agent2".to_string()));
         std::fs::remove_dir_all(&repo).ok();
     }
+
+    #[test]
+    fn test_validate_branch_valid() {
+        assert!(validate_branch("main"));
+        assert!(validate_branch("feature/my-branch"));
+        assert!(validate_branch("agend/agent-1"));
+        assert!(validate_branch("v1.0.0"));
+    }
+
+    #[test]
+    fn test_validate_branch_rejects() {
+        assert!(!validate_branch(""));
+        assert!(!validate_branch(".."));
+        assert!(!validate_branch("foo/../bar"));
+        assert!(!validate_branch("-starts-with-dash"));
+        assert!(!validate_branch("has spaces"));
+        assert!(!validate_branch("has;semicolon"));
+    }
 }

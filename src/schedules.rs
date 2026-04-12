@@ -3,6 +3,23 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
+
+/// Detect system timezone from /etc/localtime or TZ env var. Falls back to UTC.
+fn detect_timezone() -> &'static str {
+    // Check TZ env var first
+    if let Ok(tz) = std::env::var("TZ") {
+        // Leak the string to get a 'static lifetime (called rarely)
+        return Box::leak(tz.into_boxed_str());
+    }
+    // macOS/Linux: read /etc/localtime symlink
+    if let Ok(link) = std::fs::read_link("/etc/localtime") {
+        let path = link.display().to_string();
+        if let Some(tz) = path.split("/zoneinfo/").nth(1) {
+            return Box::leak(tz.to_string().into_boxed_str());
+        }
+    }
+    "UTC"
+}
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +88,7 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         label: args["label"].as_str().map(String::from),
         timezone: args["timezone"]
             .as_str()
-            .unwrap_or("Asia/Taipei")
+            .unwrap_or_else(|| detect_timezone())
             .to_string(),
         enabled: true,
         created_by: instance_name.to_string(),
