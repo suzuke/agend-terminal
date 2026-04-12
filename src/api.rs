@@ -15,7 +15,12 @@ use std::sync::{Arc, Mutex};
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
 /// Start API socket server (blocks calling thread).
-pub fn serve(home: &Path, registry: AgentRegistry, shutdown: Arc<AtomicBool>, configs: ConfigRegistry) {
+pub fn serve(
+    home: &Path,
+    registry: AgentRegistry,
+    shutdown: Arc<AtomicBool>,
+    configs: ConfigRegistry,
+) {
     let sock = api_socket_path(home);
     let _ = std::fs::remove_file(&sock);
 
@@ -41,7 +46,10 @@ pub fn serve(home: &Path, registry: AgentRegistry, shutdown: Arc<AtomicBool>, co
 }
 
 pub fn api_socket_path(home: &Path) -> String {
-    crate::daemon::run_dir(home).join("api.sock").display().to_string()
+    crate::daemon::run_dir(home)
+        .join("api.sock")
+        .display()
+        .to_string()
 }
 
 /// Find API socket from any active daemon.
@@ -55,7 +63,13 @@ pub fn find_api_socket(home: &Path) -> Option<String> {
     }
 }
 
-fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shutdown: &Arc<AtomicBool>, configs: &ConfigRegistry) {
+fn handle_session(
+    stream: UnixStream,
+    registry: &AgentRegistry,
+    home: &Path,
+    shutdown: &Arc<AtomicBool>,
+    configs: &ConfigRegistry,
+) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
         Err(e) => {
@@ -79,7 +93,11 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
         let req: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                let _ = writeln!(writer, "{}", json!({"ok": false, "error": format!("parse: {e}")}));
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    json!({"ok": false, "error": format!("parse: {e}")})
+                );
                 continue;
             }
         };
@@ -93,7 +111,9 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let agents: Vec<Value> = reg
                     .iter()
                     .map(|(name, handle)| {
-                        let (agent_state, health_state) = handle.core.lock()
+                        let (agent_state, health_state) = handle
+                            .core
+                            .lock()
                             .map(|c| {
                                 let as_ = c.state.get_state().display_name().to_string();
                                 let hs = c.health.state.display_name().to_string();
@@ -121,7 +141,9 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 match reg.get(name) {
                     Some(handle) => {
                         // Check if agent is restarting
-                        let is_restarting = handle.core.lock()
+                        let is_restarting = handle
+                            .core
+                            .lock()
                             .map(|c| c.state.current.is_unavailable())
                             .unwrap_or(false);
                         if is_restarting {
@@ -137,7 +159,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                                 Err(e) => json!({"ok": false, "error": format!("{e}")}),
                             }
                         }
-                    },
+                    }
                     None => json!({"ok": false, "error": format!("agent '{name}' not found")}),
                 }
             }
@@ -163,16 +185,16 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 // Kill + remove from configs (prevents respawn)
                 let name = params["name"].as_str().unwrap_or("");
                 // Remove from configs first (so crash handler won't respawn)
-                configs.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+                configs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name);
                 // Then kill
                 let mut reg = agent::lock_registry(registry);
-                match reg.get(name) {
-                    Some(handle) => {
-                        let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = child.kill();
-                        drop(child);
-                    }
-                    None => {}
+                if let Some(handle) = reg.get(name) {
+                    let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = child.kill();
+                    drop(child);
                 }
                 reg.remove(name);
                 drop(reg);
@@ -186,7 +208,8 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let name = match params["name"].as_str() {
                     Some(n) => n,
                     None => {
-                        let _ = writeln!(writer, "{}", json!({"ok": false, "error": "missing name"}));
+                        let _ =
+                            writeln!(writer, "{}", json!({"ok": false, "error": "missing name"}));
                         continue;
                     }
                 };
@@ -205,8 +228,20 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
 
                 match agent::spawn_agent(
-                    name, command, &args, cols, rows, None,
-                    Some(work_dir.as_path()), "\r", registry, Some(home), None, None,
+                    &agent::SpawnConfig {
+                        name,
+                        command,
+                        args: &args,
+                        cols,
+                        rows,
+                        env: None,
+                        working_dir: Some(work_dir.as_path()),
+                        submit_key: "\r",
+                        home: Some(home),
+                        crash_tx: None,
+                        shutdown: None,
+                    },
+                    registry,
                 ) {
                     Ok(()) => {
                         // Start TUI socket
@@ -232,7 +267,10 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let msg = crate::inbox::InboxMessage {
                     from: format!("from:{from}"),
                     text: text.to_string(),
-                    kind: params.get("kind").and_then(|v| v.as_str()).map(String::from),
+                    kind: params
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                 };
                 let _ = crate::inbox::enqueue(home, target, msg);
@@ -266,8 +304,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
 
 /// Send a request to the API socket and get response.
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
-    let sock = find_api_socket(home)
-        .unwrap_or_else(|| api_socket_path(home));
+    let sock = find_api_socket(home).unwrap_or_else(|| api_socket_path(home));
     let mut stream = UnixStream::connect(&sock)?;
     writeln!(stream, "{}", request)?;
     stream.flush()?;

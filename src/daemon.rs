@@ -3,8 +3,8 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::framing::{self, TAG_DATA, TAG_RESIZE};
-use teloxide::prelude::Requester;
 use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::Requester;
 
 use portable_pty::PtySize;
 use std::collections::HashMap;
@@ -46,7 +46,7 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
         eprintln!("[{name}] TUI client connected");
 
         let (rx, pty_writer, pty_master, core) = {
-            let reg = agent::lock_registry(&registry);
+            let reg = agent::lock_registry(registry);
             let agent = match reg.get(name) {
                 Some(a) => a,
                 None => continue,
@@ -71,14 +71,9 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
         if let Err(e) = std::thread::Builder::new()
             .name(format!("{n}_tui_out"))
             .spawn(move || {
-                loop {
-                    match rx.recv() {
-                        Ok(data) => {
-                            if framing::write_frame(&mut write_stream, &data).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok(data) = rx.recv() {
+                    if framing::write_frame(&mut write_stream, &data).is_err() {
+                        break;
                     }
                 }
             })
@@ -108,15 +103,14 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
                         Ok((TAG_RESIZE, data)) if data.len() == 4 => {
                             let cols = u16::from_be_bytes([data[0], data[1]]);
                             let rows = u16::from_be_bytes([data[2], data[3]]);
-                            let _ = pty_master
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .resize(PtySize {
+                            let _ = pty_master.lock().unwrap_or_else(|e| e.into_inner()).resize(
+                                PtySize {
                                     rows,
                                     cols,
                                     pixel_width: 0,
                                     pixel_height: 0,
-                                });
+                                },
+                            );
                             if let Ok(mut c) = core.lock() {
                                 c.vterm.resize(cols, rows);
                             }
@@ -155,7 +149,10 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
             // Check if PID is alive
             let alive = unsafe { nix::libc::kill(pid as i32, 0) == 0 };
             if !alive {
-                eprintln!("[daemon] cleaning stale run dir: {}", entry.path().display());
+                eprintln!(
+                    "[daemon] cleaning stale run dir: {}",
+                    entry.path().display()
+                );
                 let _ = std::fs::remove_dir_all(entry.path());
                 continue;
             }
@@ -190,11 +187,18 @@ fn write_daemon_id(run_dir: &Path) {
     let _ = std::fs::write(run_dir.join(".daemon"), format!("{pid}:{now}"));
 }
 
+/// Agent definition tuple for daemon startup.
+pub type AgentDef = (
+    String,
+    String,
+    Vec<String>,
+    Option<HashMap<String, String>>,
+    Option<PathBuf>,
+    String,
+);
+
 /// Start daemon: spawn agents, handle crashes with auto-respawn.
-pub fn run(
-    home: &Path,
-    agents: Vec<(String, String, Vec<String>, Option<HashMap<String, String>>, Option<PathBuf>, String)>,
-) -> anyhow::Result<()> {
+pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // Check for existing daemon
     if let Some(existing) = find_active_run_dir(home) {
         anyhow::bail!("Another daemon is already running ({})", existing.display());
@@ -224,7 +228,9 @@ pub fn run(
         let worktree_source = working_dir.as_ref().and_then(|wd| {
             let wd_str = wd.display().to_string();
             if wd_str.contains(".worktrees/") {
-                wd.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf())
+                wd.parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_path_buf())
             } else {
                 None
             }
@@ -238,14 +244,27 @@ pub fn run(
             worktree_source,
             submit_key: submit_key.clone(),
         };
-        configs.lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), config);
+        configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.clone(), config);
 
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
         agent::spawn_agent(
-            name, command, args, cols, rows,
-            env.as_ref(), working_dir.as_deref(), submit_key,
-            &registry, Some(home), Some(crash_tx.clone()),
-            Some(Arc::clone(&shutdown)),
+            &agent::SpawnConfig {
+                name,
+                command,
+                args,
+                cols,
+                rows,
+                env: env.as_ref(),
+                working_dir: working_dir.as_deref(),
+                submit_key,
+                home: Some(home),
+                crash_tx: Some(crash_tx.clone()),
+                shutdown: Some(Arc::clone(&shutdown)),
+            },
+            &registry,
         )?;
 
         let sock = agent_socket_path(home, name);
@@ -278,7 +297,12 @@ pub fn run(
         Err(e) => eprintln!("[daemon] warning: Ctrl+C handler failed: {e}. Use `stop`."),
     }
 
-    crate::event_log::log(home, "daemon_start", "", &format!("{} agents", agents.len()));
+    crate::event_log::log(
+        home,
+        "daemon_start",
+        "",
+        &format!("{} agents", agents.len()),
+    );
     eprintln!("[daemon] running. Ctrl+C or `agend-terminal stop` to stop.");
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
@@ -286,12 +310,10 @@ pub fn run(
         let (tx, rx) = crossbeam::channel::bounded(1);
         std::thread::Builder::new()
             .name("daemon_tick".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                    if tx.send(()).is_err() {
-                        break;
-                    }
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                if tx.send(()).is_err() {
+                    break;
                 }
             })
             .ok();
@@ -324,8 +346,11 @@ pub fn run(
                     let agent_state = core.state.current;
                     let last_output = core.state.last_output;
                     if core.health.check_hang(agent_state, last_output) {
-                        eprintln!("[health] {name}: hang detected (state={}, silent={:?})",
-                            agent_state.display_name(), last_output.elapsed());
+                        eprintln!(
+                            "[health] {name}: hang detected (state={}, silent={:?})",
+                            agent_state.display_name(),
+                            last_output.elapsed()
+                        );
                     }
                 }
             }
@@ -360,58 +385,62 @@ pub fn run(
         eprintln!("[health] {crashed_name} crashed");
         crate::event_log::log(home, "crash", &crashed_name, "agent crashed");
 
-                // Get config for respawn
-                let config = configs.lock().unwrap_or_else(|e| e.into_inner()).get(&crashed_name).cloned();
-                let config = match config {
-                    Some(c) => c,
-                    None => {
-                        eprintln!("[health] {crashed_name}: no config for respawn");
-                        continue;
-                    }
-                };
+        // Get config for respawn
+        let config = configs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&crashed_name)
+            .cloned();
+        let config = match config {
+            Some(c) => c,
+            None => {
+                eprintln!("[health] {crashed_name}: no config for respawn");
+                continue;
+            }
+        };
 
-                // Record crash in health tracker (unified in AgentCore)
-                let (should_respawn, delay, should_notify) = {
-                    let reg = agent::lock_registry(&registry);
-                    match reg.get(&crashed_name) {
-                        Some(handle) => {
-                            let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
-                            core.health.record_crash()
-                        }
-                        None => {
-                            eprintln!("[health] {crashed_name}: not in registry, skipping");
-                            continue;
-                        }
-                    }
-                };
-
-                if should_notify {
-                    let state = {
-                        let reg = agent::lock_registry(&registry);
-                        reg.get(&crashed_name)
-                            .and_then(|h| h.core.lock().ok().map(|c| c.health.state.display_name()))
-                            .unwrap_or("unknown")
-                    };
-                    eprintln!("[health] {crashed_name}: {state} — notifying");
-                    let msg = format!("[health] {crashed_name}: {state}");
-                    notify_telegram(home, &crashed_name, &msg);
+        // Record crash in health tracker (unified in AgentCore)
+        let (should_respawn, delay, should_notify) = {
+            let reg = agent::lock_registry(&registry);
+            match reg.get(&crashed_name) {
+                Some(handle) => {
+                    let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+                    core.health.record_crash()
                 }
+                None => {
+                    eprintln!("[health] {crashed_name}: not in registry, skipping");
+                    continue;
+                }
+            }
+        };
 
-                if should_respawn {
-                    eprintln!("[health] {crashed_name}: respawning in {:?}", delay);
-                    let reg = Arc::clone(&registry);
-                    let home = home.to_path_buf();
-                    let tx = crash_tx.clone();
-                    let shutdown_for_respawn = Arc::clone(&shutdown);
+        if should_notify {
+            let state = {
+                let reg = agent::lock_registry(&registry);
+                reg.get(&crashed_name)
+                    .and_then(|h| h.core.lock().ok().map(|c| c.health.state.display_name()))
+                    .unwrap_or("unknown")
+            };
+            eprintln!("[health] {crashed_name}: {state} — notifying");
+            let msg = format!("[health] {crashed_name}: {state}");
+            notify_telegram(home, &crashed_name, &msg);
+        }
 
-                    // Save health tracker from old handle before respawn replaces it
-                    let saved_health = {
-                        let r = registry.lock().unwrap_or_else(|e| e.into_inner());
-                        r.get(&crashed_name)
-                            .and_then(|h| h.core.lock().ok().map(|c| c.health.clone()))
-                    };
+        if should_respawn {
+            eprintln!("[health] {crashed_name}: respawning in {:?}", delay);
+            let reg = Arc::clone(&registry);
+            let home = home.to_path_buf();
+            let tx = crash_tx.clone();
+            let shutdown_for_respawn = Arc::clone(&shutdown);
 
-                    if let Err(e) = std::thread::Builder::new()
+            // Save health tracker from old handle before respawn replaces it
+            let saved_health = {
+                let r = registry.lock().unwrap_or_else(|e| e.into_inner());
+                r.get(&crashed_name)
+                    .and_then(|h| h.core.lock().ok().map(|c| c.health.clone()))
+            };
+
+            if let Err(e) = std::thread::Builder::new()
                         .name(format!("{crashed_name}_respawn"))
                         .spawn(move || {
                             std::thread::sleep(delay);
@@ -422,11 +451,14 @@ pub fn run(
                             }
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
                             match agent::spawn_agent(
-                                &config.name, &config.command, &config.args,
-                                cols, rows,
-                                config.env.as_ref(), config.working_dir.as_deref(),
-                                &config.submit_key, &reg, Some(&home), Some(tx),
-                                Some(Arc::clone(&shutdown_for_respawn)),
+                                &agent::SpawnConfig {
+                                    name: &config.name, command: &config.command, args: &config.args,
+                                    cols, rows,
+                                    env: config.env.as_ref(), working_dir: config.working_dir.as_deref(),
+                                    submit_key: &config.submit_key, home: Some(&home), crash_tx: Some(tx),
+                                    shutdown: Some(Arc::clone(&shutdown_for_respawn)),
+                                },
+                                &reg,
                             ) {
                                 Ok(()) => {
                                     eprintln!("[health] {}: respawned", config.name);
@@ -479,9 +511,9 @@ pub fn run(
                     {
                         eprintln!("[health] {crashed_name}: failed to spawn respawn thread: {e}");
                     }
-                } else {
-                    eprintln!("[health] {crashed_name}: max retries exceeded, not respawning");
-                }
+        } else {
+            eprintln!("[health] {crashed_name}: max retries exceeded, not respawning");
+        }
     }
 
     // Shutdown: print residual worktrees
@@ -490,12 +522,19 @@ pub fn run(
         let mut seen = std::collections::HashSet::new();
         for config in cfgs.values() {
             // Use worktree_source (original repo) if available, otherwise working_dir
-            let repo = config.worktree_source.as_ref().or(config.working_dir.as_ref());
+            let repo = config
+                .worktree_source
+                .as_ref()
+                .or(config.working_dir.as_ref());
             if let Some(dir) = repo {
                 if seen.insert(dir.clone()) {
                     let residual = crate::worktree::list_residual(dir);
                     if !residual.is_empty() {
-                        eprintln!("[worktree] residual in {}: {:?} (use `git worktree remove` to clean)", dir.display(), residual);
+                        eprintln!(
+                            "[worktree] residual in {}: {:?} (use `git worktree remove` to clean)",
+                            dir.display(),
+                            residual
+                        );
                     }
                 }
             }
@@ -536,12 +575,18 @@ fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
         Err(_) => return,
     };
     let (token, group_id, topic_id) = match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+        Some(crate::fleet::ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        }) => {
             let token = match std::env::var(bot_token_env) {
                 Ok(t) => t,
                 Err(_) => return,
             };
-            let topic_id = config.instances.get(instance_name)
+            let topic_id = config
+                .instances
+                .get(instance_name)
                 .and_then(|inst| inst.topic_id);
             (token, *group_id, topic_id)
         }
@@ -568,7 +613,9 @@ fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
                         bot.send_message(chat_id, &text).await?;
                     } else {
                         bot.send_message(chat_id, &text)
-                            .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(tid)))
+                            .message_thread_id(teloxide::types::ThreadId(
+                                teloxide::types::MessageId(tid),
+                            ))
                             .await?;
                     }
                 } else {
@@ -646,9 +693,7 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
         };
 
         // Check if there's a trigger between last_check and now
-        let should_trigger = schedule.after(&last_check)
-            .take(1)
-            .any(|next| next <= now);
+        let should_trigger = schedule.after(&last_check).take(1).any(|next| next <= now);
 
         if should_trigger {
             let sched_id = sched["id"].as_str().unwrap_or("");
@@ -657,10 +702,15 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
             let label = sched["label"].as_str().unwrap_or("(unnamed)");
 
             eprintln!("[schedule] triggering '{label}' → {target}: {message}");
-            crate::event_log::log(home, "schedule_trigger", target, &format!("{label}: {message}"));
+            crate::event_log::log(
+                home,
+                "schedule_trigger",
+                target,
+                &format!("{label}: {message}"),
+            );
 
             // Inject message to target agent via registry
-            let reg = agent::lock_registry(&registry);
+            let reg = agent::lock_registry(registry);
             let status = if let Some(handle) = reg.get(target) {
                 match agent::inject_to_agent(handle, message.as_bytes()) {
                     Ok(()) => "ok",
@@ -671,12 +721,16 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
                 }
             } else {
                 // Fallback: enqueue to inbox
-                let _ = crate::inbox::enqueue(home, target, crate::inbox::InboxMessage {
-                    from: "system:schedule".to_string(),
-                    text: message.to_string(),
-                    kind: Some("schedule".to_string()),
-                    timestamp: now.to_rfc3339(),
-                });
+                let _ = crate::inbox::enqueue(
+                    home,
+                    target,
+                    crate::inbox::InboxMessage {
+                        from: "system:schedule".to_string(),
+                        text: message.to_string(),
+                        kind: Some("schedule".to_string()),
+                        timestamp: now.to_rfc3339(),
+                    },
+                );
                 "ok_inbox"
             };
             drop(reg);

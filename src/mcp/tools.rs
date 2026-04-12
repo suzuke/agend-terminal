@@ -100,9 +100,9 @@ fn decision_tools() -> Vec<Value> {
                 "ttl_days": {"type": "number"}, "supersedes": {"type": "string"}
             }, "required": ["title", "content"]}}),
         json!({"name": "list_decisions", "description": "List active decisions.",
-            "inputSchema": {"type": "object", "properties": {
-                "include_archived": {"type": "boolean"}, "tags": {"type": "array", "items": {"type": "string"}}
-            }}}),
+        "inputSchema": {"type": "object", "properties": {
+            "include_archived": {"type": "boolean"}, "tags": {"type": "array", "items": {"type": "string"}}
+        }}}),
         json!({"name": "update_decision", "description": "Update or archive a decision.",
             "inputSchema": {"type": "object", "properties": {
                 "id": {"type": "string"}, "content": {"type": "string"},

@@ -77,7 +77,8 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             None => continue,
         };
         let inst_name = format!("{deploy_name}-{inst_suffix}");
-        let command = inst_val.get("command")
+        let command = inst_val
+            .get("command")
             .or_else(|| inst_val.get("backend"))
             .and_then(|v| v.as_str())
             .unwrap_or("claude");
@@ -87,8 +88,14 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             let wt = dir.join(&inst_name);
             let branch_name = format!("{deploy_name}/{inst_suffix}");
             match std::process::Command::new("git")
-                .args(["worktree", "add", "-b", &branch_name,
-                       &wt.display().to_string(), br])
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch_name,
+                    &wt.display().to_string(),
+                    br,
+                ])
                 .current_dir(&dir)
                 .output()
             {
@@ -96,8 +103,10 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                     eprintln!("[deploy] created worktree {inst_name} on branch {branch_name}");
                 }
                 Ok(o) => {
-                    eprintln!("[deploy] worktree failed for {inst_name}: {}",
-                        String::from_utf8_lossy(&o.stderr).trim());
+                    eprintln!(
+                        "[deploy] worktree failed for {inst_name}: {}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    );
                 }
                 Err(e) => {
                     eprintln!("[deploy] git not available: {e}");
@@ -109,24 +118,30 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         };
 
         // Spawn via API
-        let _ = crate::api::call(home, &serde_json::json!({
-            "method": "spawn",
-            "params": {
-                "name": inst_name,
-                "command": command,
-                "working_directory": work_dir,
-            }
-        }));
+        let _ = crate::api::call(
+            home,
+            &serde_json::json!({
+                "method": "spawn",
+                "params": {
+                    "name": inst_name,
+                    "command": command,
+                    "working_directory": work_dir,
+                }
+            }),
+        );
         created.push(inst_name);
     }
 
     // Create team if multiple instances
     if created.len() > 1 {
-        let _ = crate::teams::create(home, &serde_json::json!({
-            "name": deploy_name,
-            "members": created,
-            "description": format!("Template deployment: {template}")
-        }));
+        let _ = crate::teams::create(
+            home,
+            &serde_json::json!({
+                "name": deploy_name,
+                "members": created,
+                "description": format!("Template deployment: {template}")
+            }),
+        );
     }
 
     // Track deployment
@@ -134,7 +149,11 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         name: deploy_name.to_string(),
         template: template.to_string(),
         instances: created.clone(),
-        team: if created.len() > 1 { Some(deploy_name.to_string()) } else { None },
+        team: if created.len() > 1 {
+            Some(deploy_name.to_string())
+        } else {
+            None
+        },
         directory: directory.to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -160,7 +179,10 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
 
     // Kill all instances
     for inst in &deployment.instances {
-        let _ = crate::api::call(home, &serde_json::json!({"method": "kill", "params": {"name": inst}}));
+        let _ = crate::api::call(
+            home,
+            &serde_json::json!({"method": "kill", "params": {"name": inst}}),
+        );
     }
 
     // Delete team if exists

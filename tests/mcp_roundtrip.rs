@@ -46,7 +46,9 @@ fn mcp_session(requests: &[&str]) -> Vec<serde_json::Value> {
             Ok(l) => l,
             Err(_) => break,
         };
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
             responses.push(v);
         }
@@ -63,7 +65,10 @@ fn test_initialize() {
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
     ]);
     assert!(!responses.is_empty(), "should get initialize response");
-    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "agend-terminal");
+    assert_eq!(
+        responses[0]["result"]["serverInfo"]["name"],
+        "agend-terminal"
+    );
     assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
 }
 
@@ -74,13 +79,17 @@ fn test_tools_list_count() {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     ]);
     assert!(responses.len() >= 2, "should get 2 responses");
-    let tools = responses[1]["result"]["tools"].as_array().expect("tools array");
-    assert!(tools.len() >= 35, "should have at least 35 tools, got {}", tools.len());
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert!(
+        tools.len() >= 35,
+        "should have at least 35 tools, got {}",
+        tools.len()
+    );
 
     // Verify key tools exist
-    let tool_names: Vec<&str> = tools.iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(tool_names.contains(&"reply"));
     assert!(tool_names.contains(&"delegate_task"));
     assert!(tool_names.contains(&"post_decision"));
@@ -102,7 +111,10 @@ fn test_tool_call_inbox() {
     assert!(content.is_array(), "content should be array");
     let text = content[0]["text"].as_str().expect("text");
     let result: serde_json::Value = serde_json::from_str(text).expect("parse result");
-    assert!(result["messages"].is_array(), "inbox should return messages array");
+    assert!(
+        result["messages"].is_array(),
+        "inbox should return messages array"
+    );
 }
 
 #[test]
@@ -115,12 +127,16 @@ fn test_tool_call_post_decision() {
     assert!(responses.len() >= 3);
 
     // Verify post result
-    let post_text = responses[1]["result"]["content"][0]["text"].as_str().expect("post text");
+    let post_text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("post text");
     let post_result: serde_json::Value = serde_json::from_str(post_text).expect("parse");
     assert_eq!(post_result["status"], "posted");
 
     // Verify list contains the decision
-    let list_text = responses[2]["result"]["content"][0]["text"].as_str().expect("list text");
+    let list_text = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .expect("list text");
     let list_result: serde_json::Value = serde_json::from_str(list_text).expect("parse");
     let decisions = list_result["decisions"].as_array().expect("arr");
     assert!(!decisions.is_empty(), "should have at least 1 decision");
@@ -163,8 +179,14 @@ fn test_content_length_framing() {
     child.wait().ok();
     let _ = std::fs::remove_dir_all(&home);
 
-    assert!(!responses.is_empty(), "should get response from Content-Length framed request");
-    assert_eq!(responses[0]["result"]["serverInfo"]["name"], "agend-terminal");
+    assert!(
+        !responses.is_empty(),
+        "should get response from Content-Length framed request"
+    );
+    assert_eq!(
+        responses[0]["result"]["serverInfo"]["name"],
+        "agend-terminal"
+    );
 }
 
 #[test]
@@ -174,7 +196,10 @@ fn test_unknown_method() {
         r#"{"jsonrpc":"2.0","id":2,"method":"nonexistent/method","params":{}}"#,
     ]);
     assert!(responses.len() >= 2);
-    assert!(responses[1]["error"].is_object(), "unknown method should return error");
+    assert!(
+        responses[1]["error"].is_object(),
+        "unknown method should return error"
+    );
     assert_eq!(responses[1]["error"]["code"], -32601);
 }
 
@@ -185,5 +210,8 @@ fn test_ping() {
         r#"{"jsonrpc":"2.0","id":2,"method":"ping","params":{}}"#,
     ]);
     assert!(responses.len() >= 2);
-    assert!(responses[1]["result"].is_object(), "ping should return result");
+    assert!(
+        responses[1]["result"].is_object(),
+        "ping should return result"
+    );
 }

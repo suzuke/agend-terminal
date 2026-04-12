@@ -136,7 +136,7 @@ impl HealthTracker {
     pub fn check_hang(&mut self, agent_state: AgentState, last_output: Instant) -> bool {
         let silent = last_output.elapsed();
         let is_hang = match agent_state {
-            AgentState::Idle => false,                              // Waiting for input
+            AgentState::Idle => false, // Waiting for input
             AgentState::Starting => silent > Duration::from_secs(120),
             AgentState::Thinking | AgentState::ToolUse => silent > Duration::from_secs(600),
             _ => silent > Duration::from_secs(120),
@@ -167,7 +167,9 @@ impl HealthTracker {
             }
         }
 
-        let count = self.error_events.iter()
+        let count = self
+            .error_events
+            .iter()
             .filter(|(_, s)| *s == state)
             .count();
 

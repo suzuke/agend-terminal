@@ -23,9 +23,9 @@ mod tasks;
 mod teams;
 mod telegram;
 mod tui;
-mod worktree;
 mod verify;
 mod vterm;
+mod worktree;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -210,8 +210,7 @@ fn main() -> anyhow::Result<()> {
                     let (preset_args, submit_key) = match detected {
                         Some(ref b) => {
                             let p = b.preset();
-                            let mut a: Vec<String> =
-                                p.args.iter().map(|s| s.to_string()).collect();
+                            let mut a: Vec<String> = p.args.iter().map(|s| s.to_string()).collect();
                             a.extend(p.resume_mode.args_for(&home, &name));
                             (a, p.submit_key.to_string())
                         }
@@ -286,26 +285,24 @@ fn main() -> anyhow::Result<()> {
                 println!("No running daemon found.");
             }
         }
-        Some(Commands::Status) => {
-            match api::call(&home, &serde_json::json!({"method": "list"})) {
-                Ok(resp) => {
-                    if let Some(agents) = resp["result"]["agents"].as_array() {
-                        if agents.is_empty() {
-                            println!("No agents running.");
-                        } else {
-                            for agent in agents {
-                                let name = agent["name"].as_str().unwrap_or("?");
-                                let cmd = agent["command"].as_str().unwrap_or("?");
-                                let state = agent["agent_state"].as_str().unwrap_or("?");
-                                let health = agent["health_state"].as_str().unwrap_or("?");
-                                println!("  {name}: state={state} health={health} cmd={cmd}");
-                            }
+        Some(Commands::Status) => match api::call(&home, &serde_json::json!({"method": "list"})) {
+            Ok(resp) => {
+                if let Some(agents) = resp["result"]["agents"].as_array() {
+                    if agents.is_empty() {
+                        println!("No agents running.");
+                    } else {
+                        for agent in agents {
+                            let name = agent["name"].as_str().unwrap_or("?");
+                            let cmd = agent["command"].as_str().unwrap_or("?");
+                            let state = agent["agent_state"].as_str().unwrap_or("?");
+                            let health = agent["health_state"].as_str().unwrap_or("?");
+                            println!("  {name}: state={state} health={health} cmd={cmd}");
                         }
                     }
                 }
-                Err(e) => eprintln!("Failed to connect to daemon: {e}"),
             }
-        }
+            Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+        },
         Some(Commands::Kill { name }) => {
             match api::call(
                 &home,
@@ -330,24 +327,22 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| home.join("fleet.yaml"));
                 cli::start_with_fleet(&home, &fleet_path)?;
             }
-            FleetCommands::Stop => {
-                match api::call(&home, &serde_json::json!({"method": "list"})) {
-                    Ok(resp) => {
-                        if let Some(agents) = resp["result"]["agents"].as_array() {
-                            for agent in agents {
-                                let name = agent["name"].as_str().unwrap_or("");
-                                let _ = api::call(
-                                    &home,
-                                    &serde_json::json!({"method": "kill", "params": {"name": name}}),
-                                );
-                                println!("  Stopped {name}");
-                            }
-                            println!("Fleet stopped ({} agents)", agents.len());
+            FleetCommands::Stop => match api::call(&home, &serde_json::json!({"method": "list"})) {
+                Ok(resp) => {
+                    if let Some(agents) = resp["result"]["agents"].as_array() {
+                        for agent in agents {
+                            let name = agent["name"].as_str().unwrap_or("");
+                            let _ = api::call(
+                                &home,
+                                &serde_json::json!({"method": "kill", "params": {"name": name}}),
+                            );
+                            println!("  Stopped {name}");
                         }
+                        println!("Fleet stopped ({} agents)", agents.len());
                     }
-                    Err(e) => eprintln!("Failed to connect to daemon: {e}"),
                 }
-            }
+                Err(e) => eprintln!("Failed to connect to daemon: {e}"),
+            },
         },
         Some(Commands::Mcp) => {
             let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_else(|_| {

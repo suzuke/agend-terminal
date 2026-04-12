@@ -2,8 +2,8 @@
 
 use serde_json::Value;
 use std::sync::OnceLock;
-use teloxide::prelude::*;
 use teloxide::net::Download;
+use teloxide::prelude::*;
 
 /// Shared tokio runtime for Telegram API calls (built once, reused).
 /// Panics if tokio runtime cannot be built (system-level failure).
@@ -28,9 +28,15 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
     let config = crate::fleet::FleetConfig::load(&fleet_path)?;
 
     match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+        Some(crate::fleet::ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        }) => {
             let token = std::env::var(bot_token_env)?;
-            let topic_id = config.instances.get(instance_name)
+            let topic_id = config
+                .instances
+                .get(instance_name)
                 .and_then(|inst| inst.topic_id);
             let gid = *group_id;
 
@@ -42,7 +48,9 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
                         bot.send_message(chat_id, text).await?
                     } else {
                         bot.send_message(chat_id, text)
-                            .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(tid)))
+                            .message_thread_id(teloxide::types::ThreadId(
+                                teloxide::types::MessageId(tid),
+                            ))
                             .await?
                     }
                 } else {
@@ -56,23 +64,30 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
     }
 }
 
-pub fn try_telegram_react(instance_name: &str, emoji: &str, message_id: Option<&str>) -> anyhow::Result<()> {
+pub fn try_telegram_react(
+    instance_name: &str,
+    emoji: &str,
+    message_id: Option<&str>,
+) -> anyhow::Result<()> {
     let home = crate::home_dir();
     let fleet_path = home.join("fleet.yaml");
     let config = crate::fleet::FleetConfig::load(&fleet_path)?;
     match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+        Some(crate::fleet::ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        }) => {
             let token = std::env::var(bot_token_env)?;
-            let mid: i32 = message_id
-                .and_then(|m| m.parse().ok())
-                .unwrap_or_else(|| {
-                    // Try to read last received message ID from metadata
-                    let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
-                    std::fs::read_to_string(&meta_path).ok()
-                        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-                        .and_then(|m| m["last_message_id"].as_i64())
-                        .unwrap_or(0) as i32
-                });
+            let mid: i32 = message_id.and_then(|m| m.parse().ok()).unwrap_or_else(|| {
+                // Try to read last received message ID from metadata
+                let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
+                std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+                    .and_then(|m| m["last_message_id"].as_i64())
+                    .unwrap_or(0) as i32
+            });
             if mid == 0 {
                 anyhow::bail!("No message_id to react to");
             }
@@ -117,9 +132,14 @@ pub fn try_telegram_edit(instance_name: &str, message_id: &str, text: &str) -> a
     let fleet_path = home.join("fleet.yaml");
     let config = crate::fleet::FleetConfig::load(&fleet_path)?;
     match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+        Some(crate::fleet::ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        }) => {
             let token = std::env::var(bot_token_env)?;
-            let mid: i32 = message_id.parse()
+            let mid: i32 = message_id
+                .parse()
                 .map_err(|_| anyhow::anyhow!("invalid message_id: {message_id}"))?;
 
             let _ = instance_name; // suppress unused warning
@@ -145,13 +165,19 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     }
     let config = crate::fleet::FleetConfig::load(&fleet_path).ok()?;
     match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, group_id, .. }) => {
+        Some(crate::fleet::ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        }) => {
             let token = std::env::var(bot_token_env).ok()?;
             let gid = *group_id;
             let topic_id = mcp_runtime().block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let chat_id = teloxide::types::ChatId(gid);
-                let topic = bot.create_forum_topic(chat_id, instance_name, 0x6FB9F0, "").await?;
+                let topic = bot
+                    .create_forum_topic(chat_id, instance_name, 0x6FB9F0, "")
+                    .await?;
                 Ok::<i32, anyhow::Error>(topic.thread_id.0 .0)
             });
             match topic_id {
@@ -191,7 +217,7 @@ pub fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Re
                 let file = bot.get_file(file_id).await?;
                 let download_dir = home.join("downloads").join(instance_name);
                 std::fs::create_dir_all(&download_dir)?;
-                let filename = file.path.split('/').last().unwrap_or("attachment");
+                let filename = file.path.rsplit('/').next().unwrap_or("attachment");
                 let dest = download_dir.join(filename);
                 let mut dst = tokio::fs::File::create(&dest).await?;
                 bot.download_file(&file.path, &mut dst).await?;

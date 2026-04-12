@@ -39,13 +39,17 @@ pub struct AgentHandle {
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
 
 /// Lock the agent registry, recovering from poison.
-pub fn lock_registry(reg: &AgentRegistry) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
+pub fn lock_registry(
+    reg: &AgentRegistry,
+) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
     reg.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// ANSI escape sequence stripper for dialog detection.
 /// Public ANSI strip for capture command.
-pub fn strip_ansi_pub(s: &str) -> String { strip_ansi(s) }
+pub fn strip_ansi_pub(s: &str) -> String {
+    strip_ansi(s)
+}
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -93,32 +97,47 @@ fn strip_ansi(s: &str) -> String {
 /// Channel for crash events from reaper to daemon.
 pub type CrashChannel = crossbeam::channel::Sender<String>;
 
-pub fn spawn_agent(
-    name: &str,
-    command: &str,
-    args: &[String],
-    cols: u16,
-    rows: u16,
-    env: Option<&HashMap<String, String>>,
-    working_dir: Option<&std::path::Path>,
-    submit_key: &str,
-    registry: &AgentRegistry,
-    home: Option<&std::path::Path>,
-    crash_tx: Option<CrashChannel>,
-    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
-) -> anyhow::Result<()> {
+/// Configuration for spawning an agent.
+pub struct SpawnConfig<'a> {
+    pub name: &'a str,
+    pub command: &'a str,
+    pub args: &'a [String],
+    pub cols: u16,
+    pub rows: u16,
+    pub env: Option<&'a HashMap<String, String>>,
+    pub working_dir: Option<&'a std::path::Path>,
+    pub submit_key: &'a str,
+    pub home: Option<&'a std::path::Path>,
+    pub crash_tx: Option<CrashChannel>,
+    pub shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Result<()> {
+    let SpawnConfig {
+        name,
+        command,
+        args,
+        cols,
+        rows,
+        env,
+        working_dir,
+        submit_key,
+        home,
+        crash_tx,
+        shutdown,
+    } = config;
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows,
-            cols,
+            rows: *rows,
+            cols: *cols,
             pixel_width: 0,
             pixel_height: 0,
         })
         .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
 
     let mut cmd = CommandBuilder::new(command);
-    cmd.args(args);
+    cmd.args(*args);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("FORCE_COLOR", "1");
@@ -129,7 +148,7 @@ pub fn spawn_agent(
     }
 
     // User env
-    if let Some(env_map) = env {
+    if let Some(env_map) = *env {
         for (k, v) in env_map {
             cmd.env(k, v);
         }
@@ -167,7 +186,7 @@ pub fn spawn_agent(
 
     let detected_backend = Backend::from_command(command);
     let core = Arc::new(Mutex::new(AgentCore {
-        vterm: VTerm::new(cols, rows),
+        vterm: VTerm::new(*cols, *rows),
         subscribers: Vec::new(),
         state: StateTracker::new(detected_backend.as_ref()),
         health: HealthTracker::new(),
@@ -203,36 +222,63 @@ pub fn spawn_agent(
     let pw = Arc::clone(&pty_writer);
     let reg_for_reaper = Arc::clone(registry);
     let home_for_reaper = home.map(|p| p.to_path_buf());
-    let crash_tx_for_reaper = crash_tx;
-    let dismiss: Vec<(String, Vec<u8>)> = detected_backend.as_ref()
-        .map(|b| b.preset().dismiss_patterns.iter()
-            .map(|(p, k)| (p.to_string(), k.to_vec()))
-            .collect())
+    let crash_tx_for_reaper = crash_tx.clone();
+    let dismiss: Vec<(String, Vec<u8>)> = detected_backend
+        .as_ref()
+        .map(|b| {
+            b.preset()
+                .dismiss_patterns
+                .iter()
+                .map(|(p, k)| (p.to_string(), k.to_vec()))
+                .collect()
+        })
         .unwrap_or_default();
-    let shutdown_for_reaper = shutdown;
+    let shutdown_for_reaper = shutdown.clone();
     let n = name.to_string();
+    let ctx = PtyReadContext {
+        name: n.clone(),
+        core: core2,
+        pty_writer: pw,
+        registry: reg_for_reaper,
+        home: home_for_reaper,
+        crash_tx: crash_tx_for_reaper,
+        dismiss_patterns: dismiss,
+        shutdown: shutdown_for_reaper,
+    };
     std::thread::Builder::new()
         .name(format!("{n}_pty_read"))
         .spawn(move || {
-            pty_read_loop(&n, &mut pty_reader, &core2, &pw, &reg_for_reaper, &home_for_reaper, &crash_tx_for_reaper, &dismiss, &shutdown_for_reaper);
+            pty_read_loop(&mut pty_reader, &ctx);
         })?;
 
     eprintln!("[{name}] spawned: {command} {}", args.join(" "));
     Ok(())
 }
 
+/// Context for PTY read loop reaper (reduces argument count).
+struct PtyReadContext {
+    name: String,
+    core: Arc<Mutex<AgentCore>>,
+    pty_writer: PtyWriter,
+    registry: AgentRegistry,
+    home: Option<std::path::PathBuf>,
+    crash_tx: Option<CrashChannel>,
+    dismiss_patterns: Vec<(String, Vec<u8>)>,
+    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
 /// PTY read loop: feeds VTerm, broadcasts output, auto-dismisses dialogs, handles exit.
-fn pty_read_loop(
-    name: &str,
-    pty_reader: &mut dyn Read,
-    core: &Arc<Mutex<AgentCore>>,
-    pty_writer: &PtyWriter,
-    registry: &AgentRegistry,
-    home: &Option<std::path::PathBuf>,
-    crash_tx: &Option<CrashChannel>,
-    dismiss_patterns: &[(String, Vec<u8>)],
-    shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
-) {
+fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
+    let PtyReadContext {
+        name,
+        core,
+        pty_writer,
+        registry,
+        home,
+        crash_tx,
+        dismiss_patterns,
+        shutdown,
+    } = ctx;
     let mut buf = [0u8; 8192];
     let mut detect_buf = Vec::with_capacity(4096);
     let mut dialog_dismissed = false;
@@ -248,7 +294,13 @@ fn pty_read_loop(
 
                 // Auto-dismiss trust/update dialogs
                 if !dialog_dismissed {
-                    dialog_dismissed = try_dismiss_dialog(name, data, &mut detect_buf, pty_writer, dismiss_patterns);
+                    dialog_dismissed = try_dismiss_dialog(
+                        name,
+                        data,
+                        &mut detect_buf,
+                        pty_writer,
+                        dismiss_patterns,
+                    );
                 }
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic)
@@ -274,7 +326,8 @@ fn handle_pty_close(
     shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     // Check if daemon is shutting down — if so, this is not a crash
-    let is_shutdown = shutdown.as_ref()
+    let is_shutdown = shutdown
+        .as_ref()
         .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(false);
 
@@ -310,8 +363,14 @@ fn handle_pty_close(
 
     let is_crash = match exit_code {
         Some(0) => false,
-        Some(c) => { eprintln!("[{name}] exit code {c} — crash"); true }
-        None => { eprintln!("[{name}] process didn't exit in 2s — treating as crash"); true }
+        Some(c) => {
+            eprintln!("[{name}] exit code {c} — crash");
+            true
+        }
+        None => {
+            eprintln!("[{name}] process didn't exit in 2s — treating as crash");
+            true
+        }
     };
 
     if is_crash {
@@ -359,7 +418,9 @@ fn try_dismiss_dialog(
     for (pattern, key_seq) in dismiss_patterns {
         if clean.contains(pattern.as_str()) {
             eprintln!("[{name}] auto-dismissing dialog (matched: {pattern})");
-            let _ = pty_writer.lock().unwrap_or_else(|e| e.into_inner())
+            let _ = pty_writer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .write_all(key_seq);
             detect_buf.clear();
             return true;
@@ -372,7 +433,8 @@ fn try_dismiss_dialog(
 /// Write data to an agent's PTY (atomic write — for attach path).
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
     let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
-    w.write_all(data).map_err(crate::error::AgendError::PtyWrite)?;
+    w.write_all(data)
+        .map_err(crate::error::AgendError::PtyWrite)?;
     w.flush().map_err(crate::error::AgendError::PtyWrite)?;
     Ok(())
 }
@@ -382,7 +444,8 @@ pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<
 pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
     let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
     for byte in data {
-        w.write_all(&[*byte]).map_err(crate::error::AgendError::PtyWrite)?;
+        w.write_all(&[*byte])
+            .map_err(crate::error::AgendError::PtyWrite)?;
         w.flush().map_err(crate::error::AgendError::PtyWrite)?;
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -425,7 +488,9 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
 
 /// Get atomic subscribe + screen dump (under core lock — no output gap).
 /// Creates a new per-subscriber channel. Each subscriber gets ALL output (broadcast).
-pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam::channel::Receiver<Vec<u8>>, Vec<u8>) {
+pub fn subscribe_with_dump(
+    agent: &AgentHandle,
+) -> (crossbeam::channel::Receiver<Vec<u8>>, Vec<u8>) {
     let mut core = agent.core.lock().unwrap_or_else(|e| e.into_inner());
     let dump = core.vterm.dump_screen();
     let (tx, rx) = crossbeam::channel::unbounded();

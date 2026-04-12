@@ -120,7 +120,11 @@ impl Backend {
             },
             Backend::Codex => BackendPreset {
                 command: "codex",
-                args: &["resume", "--last", "--dangerously-bypass-approvals-and-sandbox"],
+                args: &[
+                    "resume",
+                    "--last",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                ],
                 ready_pattern: "OpenAI Codex|›",
                 submit_key: "\r",
                 inject_prefix: "",
@@ -158,7 +162,9 @@ impl Backend {
                 submit_key: "\n\r",
                 inject_prefix: "\r",
                 typed_inject: true,
-                resume_mode: ResumeMode::Fixed { args: &["--resume", "latest"] },
+                resume_mode: ResumeMode::Fixed {
+                    args: &["--resume", "latest"],
+                },
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
                 mcp_config_path: ".gemini/settings.json",
@@ -237,7 +243,12 @@ impl Backend {
         // "0.37.1" → "0.37.1"
         let version = text
             .split_whitespace()
-            .find(|w| w.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+            .find(|w| {
+                w.chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+            })
             .unwrap_or(&text)
             .trim_end_matches(|c: char| !c.is_ascii_digit() && c != '.')
             .to_string();
