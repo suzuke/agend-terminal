@@ -22,13 +22,20 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start(name: &str) -> Self {
+        Self::start_with_agents(name, vec!["shell:/bin/bash"])
+    }
+
+    fn start_with_agents(name: &str, agents: Vec<&str>) -> Self {
         let home =
             std::env::temp_dir().join(format!("agend-integ-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("create home");
 
+        let mut args: Vec<&str> = vec!["daemon"];
+        args.extend(agents);
+
         let child = Command::new(binary())
-            .args(["daemon", "shell:/bin/bash"])
+            .args(&args)
             .env("AGEND_TERMINAL_HOME", &home)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -220,4 +227,72 @@ fn test_event_log_written() {
 
     // daemon_stop may not be written if process::exit runs before flush
     // Just verify file exists and has daemon_start — daemon_stop is best-effort
+}
+
+#[test]
+fn test_fleet_multi_agent_lifecycle() {
+    // Start daemon with two agents
+    let mut daemon =
+        TestDaemon::start_with_agents("fleet", vec!["shell1:/bin/bash", "shell2:/bin/bash"]);
+
+    // Verify both appear in API list
+    let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
+    assert_eq!(resp["ok"], true);
+    let agents = resp["result"]["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 2, "should have 2 agents");
+    let names: Vec<&str> = agents.iter().filter_map(|a| a["name"].as_str()).collect();
+    assert!(names.contains(&"shell1"), "should contain shell1");
+    assert!(names.contains(&"shell2"), "should contain shell2");
+
+    // Kill shell1 → verify it respawns after backoff
+    let resp =
+        daemon.api_call(&serde_json::json!({"method": "kill", "params": {"name": "shell1"}}));
+    assert_eq!(resp["ok"], true);
+
+    // Wait for respawn (5s backoff + spawn time)
+    std::thread::sleep(Duration::from_secs(8));
+
+    let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
+    let agents = resp["result"]["agents"].as_array().expect("agents");
+    assert_eq!(
+        agents.len(),
+        2,
+        "both agents should be present after respawn"
+    );
+    let shell1 = agents
+        .iter()
+        .find(|a| a["name"] == "shell1")
+        .expect("shell1 should exist");
+    assert_eq!(
+        shell1["health_state"].as_str().unwrap_or(""),
+        "healthy",
+        "shell1 should be healthy after respawn"
+    );
+
+    // Send a cross-instance message via API: from shell1 to shell2
+    let resp = daemon.api_call(&serde_json::json!({
+        "method": "send",
+        "params": {
+            "from": "shell1",
+            "target": "shell2",
+            "text": "hello from shell1",
+            "kind": "message"
+        }
+    }));
+    assert_eq!(resp["ok"], true, "send should succeed");
+
+    // Verify shell2's inbox has the message by draining inbox file directly
+    // The inbox is stored at {home}/inbox/shell2.jsonl
+    let inbox_path = daemon.home.join("inbox").join("shell2.jsonl");
+    assert!(
+        inbox_path.exists(),
+        "shell2 inbox file should exist after send"
+    );
+    let content = std::fs::read_to_string(&inbox_path).expect("read inbox");
+    assert!(
+        content.contains("hello from shell1"),
+        "inbox should contain the sent message"
+    );
+
+    daemon.stop();
 }

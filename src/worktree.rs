@@ -45,9 +45,10 @@ pub fn create(
 
     // Already exists — reuse
     if wt_dir.exists() {
-        eprintln!(
-            "[worktree] reusing existing worktree for {instance_name}: {}",
-            wt_dir.display()
+        tracing::info!(
+            instance = instance_name,
+            path = %wt_dir.display(),
+            "reusing existing worktree"
         );
         return Some(WorktreeInfo {
             path: wt_dir,
@@ -73,9 +74,11 @@ pub fn create(
 
     match output {
         Ok(o) if o.status.success() => {
-            eprintln!(
-                "[worktree] created for {instance_name}: {} (branch {branch})",
-                wt_dir.display()
+            tracing::info!(
+                instance = instance_name,
+                path = %wt_dir.display(),
+                branch = %branch,
+                "created worktree"
             );
             Some(WorktreeInfo {
                 path: wt_dir,
@@ -93,8 +96,10 @@ pub fn create(
                     .output();
                 match output2 {
                     Ok(o2) if o2.status.success() => {
-                        eprintln!(
-                            "[worktree] created for {instance_name} on existing branch {branch}"
+                        tracing::info!(
+                            instance = instance_name,
+                            %branch,
+                            "created worktree on existing branch"
                         );
                         Some(WorktreeInfo {
                             path: wt_dir,
@@ -103,24 +108,25 @@ pub fn create(
                         })
                     }
                     Ok(o2) => {
-                        eprintln!(
-                            "[worktree] failed for {instance_name}: {}",
-                            String::from_utf8_lossy(&o2.stderr).trim()
+                        tracing::warn!(
+                            instance = instance_name,
+                            error = %String::from_utf8_lossy(&o2.stderr).trim(),
+                            "worktree creation failed"
                         );
                         None
                     }
                     Err(e) => {
-                        eprintln!("[worktree] git not available: {e}");
+                        tracing::warn!(error = %e, "git not available");
                         None
                     }
                 }
             } else {
-                eprintln!("[worktree] failed for {instance_name}: {}", stderr.trim());
+                tracing::warn!(instance = instance_name, error = %stderr.trim(), "worktree creation failed");
                 None
             }
         }
         Err(e) => {
-            eprintln!("[worktree] git not available: {e}");
+            tracing::warn!(error = %e, "git not available");
             None
         }
     }
@@ -137,12 +143,12 @@ pub fn prune(repo_dir: &Path) {
         .output();
     match output {
         Ok(o) if o.status.success() => {
-            eprintln!("[worktree] pruned stale entries in {}", repo_dir.display());
+            tracing::info!(repo = %repo_dir.display(), "pruned stale worktree entries");
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             if !stderr.trim().is_empty() {
-                eprintln!("[worktree] prune warning: {}", stderr.trim());
+                tracing::warn!(warning = %stderr.trim(), "worktree prune warning");
             }
         }
         Err(_) => {} // git not available, skip silently
@@ -187,7 +193,7 @@ fn ensure_gitignore(repo_dir: &Path) {
                 "\n"
             };
             let _ = writeln!(f, "{prefix}.worktrees");
-            eprintln!("[worktree] added .worktrees to .gitignore");
+            tracing::info!("added .worktrees to .gitignore");
         }
     }
 }

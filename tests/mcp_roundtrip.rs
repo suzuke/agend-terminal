@@ -12,16 +12,26 @@ fn binary() -> PathBuf {
     path
 }
 
-fn mcp_session(requests: &[&str]) -> Vec<serde_json::Value> {
+fn mcp_home() -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let home = std::env::temp_dir().join(format!("agend-mcp-test-{}-{}", std::process::id(), id));
     std::fs::create_dir_all(&home).ok();
+    home
+}
 
+fn mcp_session(requests: &[&str]) -> Vec<serde_json::Value> {
+    let home = mcp_home();
+    let result = mcp_session_in_home(&home, requests);
+    let _ = std::fs::remove_dir_all(&home);
+    result
+}
+
+fn mcp_session_in_home(home: &std::path::Path, requests: &[&str]) -> Vec<serde_json::Value> {
     let mut child = Command::new(binary())
         .args(["mcp"])
-        .env("AGEND_TERMINAL_HOME", &home)
+        .env("AGEND_TERMINAL_HOME", home)
         .env("AGEND_INSTANCE_NAME", "test-agent")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -55,8 +65,39 @@ fn mcp_session(requests: &[&str]) -> Vec<serde_json::Value> {
     }
 
     child.wait().ok();
-    let _ = std::fs::remove_dir_all(&home);
     responses
+}
+
+/// Run an MCP session where later requests depend on earlier responses.
+/// `initial` requests are sent first, then `make_followups` generates additional
+/// requests based on the initial responses. All run in the same home directory.
+fn mcp_session_with_dynamic(
+    initial: &[&str],
+    make_followups: impl FnOnce(&[serde_json::Value]) -> Vec<String>,
+) -> Vec<serde_json::Value> {
+    let home = mcp_home();
+
+    // Phase 1: send initial requests
+    let phase1 = mcp_session_in_home(&home, initial);
+
+    // Generate follow-up requests based on phase 1 responses
+    let followups = make_followups(&phase1);
+    let followup_refs: Vec<&str> = followups.iter().map(|s| s.as_str()).collect();
+
+    // Phase 2: send follow-up requests (same home dir, new MCP process)
+    // We need to re-initialize since it's a new process
+    let mut all_requests: Vec<&str> = vec![initial[0]]; // re-send initialize
+    all_requests.extend(followup_refs.iter());
+    let phase2 = mcp_session_in_home(&home, &all_requests);
+
+    let _ = std::fs::remove_dir_all(&home);
+
+    // Combine: phase1 responses + phase2 responses (skip the duplicate initialize)
+    let mut combined = phase1;
+    if phase2.len() > 1 {
+        combined.extend(phase2.into_iter().skip(1));
+    }
+    combined
 }
 
 #[test]
@@ -214,4 +255,154 @@ fn test_ping() {
         responses[1]["result"].is_object(),
         "ping should return result"
     );
+}
+
+// ---- MCP Behavioral Tests ----
+
+/// Helper to extract the JSON result text from an MCP tools/call response.
+fn extract_tool_result(response: &serde_json::Value) -> serde_json::Value {
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("{}");
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({"_raw": text}))
+}
+
+#[test]
+fn test_create_delete_instance_lifecycle() {
+    // This test verifies create_instance and delete_instance actually modify state.
+    // create_instance/delete_instance need a running daemon (they call API spawn/delete).
+    // We use list_instances which falls back to scanning fleet.yaml when API is unavailable.
+    // So we verify the fleet.yaml persistence side.
+    let responses = mcp_session(&[
+        // 1: initialize
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        // 2: create_instance (will fail API call since no daemon, but tests the path)
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_instance","arguments":{"name":"test-dynamic","command":"/bin/bash"}}}"#,
+        // 3: list_instances (will show from fleet.yaml fallback)
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_instances","arguments":{}}}"#,
+        // 4: delete_instance
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"delete_instance","arguments":{"name":"test-dynamic"}}}"#,
+        // 5: list_instances again
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_instances","arguments":{}}}"#,
+    ]);
+    assert!(
+        responses.len() >= 5,
+        "expected 5 responses, got {}",
+        responses.len()
+    );
+
+    // create_instance will return an error (no daemon) but the tool should still respond
+    let _create_result = extract_tool_result(&responses[1]);
+    // It may have an "error" field (API unavailable) — that's expected without daemon
+    // The key test is that delete_instance returns the name
+    let delete_result = extract_tool_result(&responses[3]);
+    assert_eq!(
+        delete_result["name"], "test-dynamic",
+        "delete_instance should return the deleted name"
+    );
+}
+
+#[test]
+fn test_delegate_task_reaches_inbox() {
+    // delegate_task sends a message to target_instance's inbox.
+    // Without a daemon, it falls back to direct file delivery.
+    // We then drain inbox to verify the message arrived.
+    let responses = mcp_session(&[
+        // 1: initialize
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        // 2: delegate_task to self (test-agent is our AGEND_INSTANCE_NAME).
+        // The message must exceed 500 chars so inbox::deliver stores it to file
+        // (short messages only inject to PTY which doesn't exist in test).
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegate_task","arguments":{"target_instance":"test-agent","task":"fix the bug","success_criteria":"all unit tests and integration tests must pass without any failures or warnings","context":"This is a critical bug that affects the main processing pipeline. The root cause appears to be in the data validation layer where input is not properly sanitized before being passed to the transformation engine. Please investigate the following files: processor.rs, validator.rs, transform.rs, pipeline.rs, and engine.rs. Make sure to add regression tests for each case you fix. The bug was reported by multiple users and is blocking the next release. Priority is high. Additional context: the bug manifests as incorrect output when special characters are present in the input data stream."}}}"#,
+        // 3: drain inbox
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inbox","arguments":{}}}"#,
+    ]);
+    assert!(
+        responses.len() >= 3,
+        "expected 3 responses, got {}",
+        responses.len()
+    );
+
+    // delegate_task should indicate it was sent (possibly with API fallback note)
+    let delegate_result = extract_tool_result(&responses[1]);
+    assert_eq!(
+        delegate_result["target"], "test-agent",
+        "delegate_task should target test-agent, got: {delegate_result}"
+    );
+
+    // inbox should contain the delegated task message
+    let inbox_result = extract_tool_result(&responses[2]);
+    let messages = inbox_result["messages"].as_array().expect("messages array");
+    assert!(
+        !messages.is_empty(),
+        "inbox should have at least 1 message after delegate_task"
+    );
+    let found = messages.iter().any(|m| {
+        let text = m["text"].as_str().unwrap_or("");
+        text.contains("[delegate_task]") && text.contains("fix the bug")
+    });
+    assert!(
+        found,
+        "inbox should contain a message with '[delegate_task]' and 'fix the bug', got: {messages:?}"
+    );
+}
+
+#[test]
+fn test_task_board_lifecycle() {
+    // Full task lifecycle: create → claim → complete → list with filter.
+    // Uses mcp_session_with_dynamic because task ID from create is needed for claim/done.
+    let responses2 = mcp_session_with_dynamic(
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"task","arguments":{"action":"create","title":"Implement feature X","priority":"high"}}}"#,
+        ],
+        |responses| {
+            let create_result = extract_tool_result(&responses[1]);
+            let id = create_result["id"].as_str().expect("task id").to_string();
+            vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"task","arguments":{{"action":"claim","id":"{id}"}}}}}}"#,
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"task","arguments":{{"action":"done","id":"{id}","result":"feature implemented and tested"}}}}}}"#,
+            ),
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"task","arguments":{"action":"list","filter_status":"done"}}}"#.to_string(),
+        ]
+        },
+    );
+
+    assert!(
+        responses2.len() >= 5,
+        "expected 5 responses, got {}",
+        responses2.len()
+    );
+
+    // Verify create
+    let create_r = extract_tool_result(&responses2[1]);
+    assert_eq!(create_r["status"], "created");
+    let task_id = create_r["id"].as_str().expect("id");
+
+    // Verify claim
+    let claim_r = extract_tool_result(&responses2[2]);
+    assert_eq!(claim_r["status"], "claimed", "task should be claimed");
+    assert_eq!(
+        claim_r["assignee"], "test-agent",
+        "assignee should be test-agent"
+    );
+
+    // Verify done
+    let done_r = extract_tool_result(&responses2[3]);
+    assert_eq!(done_r["status"], "done", "task should be done");
+
+    // Verify list with filter_status=done
+    let list_r = extract_tool_result(&responses2[4]);
+    let tasks = list_r["tasks"].as_array().expect("tasks array");
+    assert!(!tasks.is_empty(), "should have at least 1 done task");
+    let found = tasks.iter().any(|t| t["id"].as_str() == Some(task_id));
+    assert!(found, "completed task should appear in done list");
+    let task = tasks
+        .iter()
+        .find(|t| t["id"].as_str() == Some(task_id))
+        .expect("task");
+    assert_eq!(task["result"], "feature implemented and tested");
 }

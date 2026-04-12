@@ -32,18 +32,18 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
     let listener = match UnixListener::bind(socket_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[{name}] failed to bind TUI socket {socket_path}: {e}");
+            tracing::warn!(agent = name, path = socket_path, error = %e, "failed to bind TUI socket");
             return;
         }
     };
-    eprintln!("[{name}] TUI socket on {socket_path}");
+    tracing::info!(agent = name, path = socket_path, "TUI socket ready");
 
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
             Err(_) => continue,
         };
-        eprintln!("[{name}] TUI client connected");
+        tracing::info!(agent = name, "TUI client connected");
 
         // Protocol version handshake: send version byte before any framed data
         if stream.write_all(&[framing::PROTOCOL_VERSION]).is_err() {
@@ -86,7 +86,7 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
                 }
             })
         {
-            eprintln!("[{n}] failed to spawn TUI output thread: {e}");
+            tracing::warn!(agent = %n, error = %e, "failed to spawn TUI output thread");
         }
 
         let read_stream = stream;
@@ -126,10 +126,10 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
                         _ => break,
                     }
                 }
-                eprintln!("[{n}] TUI client disconnected");
+                tracing::info!(agent = %n, "TUI client disconnected");
             })
         {
-            eprintln!("[{n_err}] failed to spawn TUI input thread: {e}");
+            tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI input thread");
         }
     }
 }
@@ -157,10 +157,7 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
             // Check if PID is alive
             let alive = unsafe { nix::libc::kill(pid as i32, 0) == 0 };
             if !alive {
-                eprintln!(
-                    "[daemon] cleaning stale run dir: {}",
-                    entry.path().display()
-                );
+                tracing::info!(path = %entry.path().display(), "cleaning stale run dir");
                 let _ = std::fs::remove_dir_all(entry.path());
                 continue;
             }
@@ -173,7 +170,7 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
                         return Some(entry.path());
                     }
                     // PID alive but .daemon file has different PID → PID was reused
-                    eprintln!("[daemon] PID {pid} reused (was {}), cleaning", file_pid);
+                    tracing::info!(pid, old_pid = file_pid, "PID reused, cleaning");
                     let _ = std::fs::remove_dir_all(entry.path());
                     continue;
                 }
@@ -216,15 +213,15 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     let run = run_dir(home);
     std::fs::create_dir_all(&run)?;
     write_daemon_id(&run);
-    eprintln!("[daemon] run dir: {}", run.display());
+    tracing::info!(path = %run.display(), "run dir");
 
     // Check for previous snapshot if fleet.yaml doesn't exist
     if !home.join("fleet.yaml").exists() {
         if let Some(snapshot) = crate::snapshot::load(home) {
-            eprintln!(
-                "[daemon] previous snapshot found ({} agents, {})",
-                snapshot.agents.len(),
-                snapshot.timestamp
+            tracing::info!(
+                count = snapshot.agents.len(),
+                timestamp = %snapshot.timestamp,
+                "previous snapshot found"
             );
         }
     }
@@ -240,7 +237,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // Shutdown flag — shared with agent reapers to distinguish crash from shutdown
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    eprintln!("[daemon] starting {} agent(s)", agents.len());
+    tracing::info!(count = agents.len(), "starting agents");
 
     for (name, command, args, env, working_dir, submit_key) in &agents {
         // Derive worktree_source: if working_dir contains .worktrees/, the repo root is 2 levels up
@@ -309,11 +306,11 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
     let shutdown2 = Arc::clone(&shutdown);
     match ctrlc::set_handler(move || {
-        eprintln!("\n[daemon] shutting down...");
+        tracing::info!("shutting down...");
         shutdown2.store(true, std::sync::atomic::Ordering::Relaxed);
     }) {
         Ok(()) => {}
-        Err(e) => eprintln!("[daemon] warning: Ctrl+C handler failed: {e}. Use `stop`."),
+        Err(e) => tracing::warn!(error = %e, "Ctrl+C handler failed, use `stop`"),
     }
 
     crate::event_log::log(
@@ -322,7 +319,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         "",
         &format!("{} agents", agents.len()),
     );
-    eprintln!("[daemon] running. Ctrl+C or `agend-terminal stop` to stop.");
+    tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -365,10 +362,11 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     let agent_state = core.state.current;
                     let last_output = core.state.last_output;
                     if core.health.check_hang(agent_state, last_output) {
-                        eprintln!(
-                            "[health] {name}: hang detected (state={}, silent={:?})",
-                            agent_state.display_name(),
-                            last_output.elapsed()
+                        tracing::warn!(
+                            agent = %name,
+                            state = agent_state.display_name(),
+                            silent = ?last_output.elapsed(),
+                            "hang detected"
                         );
                     }
                 }
@@ -437,7 +435,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             None => continue, // Tick only — no crash to handle
         };
 
-        eprintln!("[health] {crashed_name} crashed");
+        tracing::warn!(agent = %crashed_name, "crashed");
         crate::event_log::log(home, "crash", &crashed_name, "agent crashed");
 
         // Get config for respawn
@@ -449,7 +447,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         let config = match config {
             Some(c) => c,
             None => {
-                eprintln!("[health] {crashed_name}: no config for respawn");
+                tracing::warn!(agent = %crashed_name, "no config for respawn");
                 continue;
             }
         };
@@ -463,7 +461,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     core.health.record_crash()
                 }
                 None => {
-                    eprintln!("[health] {crashed_name}: not in registry, skipping");
+                    tracing::warn!(agent = %crashed_name, "not in registry, skipping");
                     continue;
                 }
             }
@@ -476,13 +474,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     .and_then(|h| h.core.lock().ok().map(|c| c.health.state.display_name()))
                     .unwrap_or("unknown")
             };
-            eprintln!("[health] {crashed_name}: {state} — notifying");
+            tracing::warn!(agent = %crashed_name, %state, "notifying");
             let msg = format!("[health] {crashed_name}: {state}");
             notify_telegram(home, &crashed_name, &msg);
         }
 
         if should_respawn {
-            eprintln!("[health] {crashed_name}: respawning in {:?}", delay);
+            tracing::info!(agent = %crashed_name, ?delay, "respawning");
             let reg = Arc::clone(&registry);
             let home = home.to_path_buf();
             let tx = crash_tx.clone();
@@ -501,7 +499,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                             std::thread::sleep(delay);
                             // Check shutdown flag after backoff — don't respawn during shutdown
                             if shutdown_for_respawn.load(std::sync::atomic::Ordering::Relaxed) {
-                                eprintln!("[health] {}: shutdown during respawn backoff, aborting", config.name);
+                                tracing::info!(agent = %config.name, "shutdown during respawn backoff, aborting");
                                 return;
                             }
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
@@ -516,7 +514,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                 &reg,
                             ) {
                                 Ok(()) => {
-                                    eprintln!("[health] {}: respawned", config.name);
+                                    tracing::info!(agent = %config.name, "respawned");
                                     crate::event_log::log(&home, "respawn", &config.name, "agent respawned");
 
                                     // Restore health tracker from old handle + mark respawn OK
@@ -555,19 +553,19 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                         .name(format!("{n}_tui_server"))
                                         .spawn(move || serve_agent_tui(&n, &sock, &reg2))
                                     {
-                                        eprintln!("[{n_err}] failed to spawn TUI server: {e}");
+                                        tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI server");
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("[health] {}: respawn failed: {e}", config.name);
+                                    tracing::warn!(agent = %config.name, error = %e, "respawn failed");
                                 }
                             }
                         })
                     {
-                        eprintln!("[health] {crashed_name}: failed to spawn respawn thread: {e}");
+                        tracing::warn!(agent = %crashed_name, error = %e, "failed to spawn respawn thread");
                     }
         } else {
-            eprintln!("[health] {crashed_name}: max retries exceeded, not respawning");
+            tracing::warn!(agent = %crashed_name, "max retries exceeded, not respawning");
         }
     }
 
@@ -585,10 +583,10 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                 if seen.insert(dir.clone()) {
                     let residual = crate::worktree::list_residual(dir);
                     if !residual.is_empty() {
-                        eprintln!(
-                            "[worktree] residual in {}: {:?} (use `git worktree remove` to clean)",
-                            dir.display(),
-                            residual
+                        tracing::info!(
+                            repo = %dir.display(),
+                            residual = ?residual,
+                            "residual worktrees found (use `git worktree remove` to clean)"
                         );
                     }
                 }
@@ -597,13 +595,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     }
 
     crate::event_log::log(home, "daemon_stop", "", "shutdown");
-    eprintln!("[daemon] cleaning up...");
+    tracing::info!("cleaning up...");
     {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         for (name, agent) in reg.iter() {
             let mut child = agent.child.lock().unwrap_or_else(|e| e.into_inner());
             let _ = child.kill();
-            eprintln!("[daemon] killed {name}");
+            tracing::info!(agent = %name, "killed");
         }
     }
     // Remove entire run dir (sockets + PID isolation)
@@ -615,7 +613,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     }
 
     std::thread::sleep(std::time::Duration::from_millis(500));
-    eprintln!("[daemon] exiting.");
+    tracing::info!("exiting");
     std::process::exit(0);
 }
 
@@ -660,7 +658,7 @@ fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
                 Ok(rt) => rt,
                 Err(_) => return,
             };
-            if let Err(e) = rt.block_on(async {
+            if let Err(_e) = rt.block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let chat_id = teloxide::types::ChatId(group_id);
                 if let Some(tid) = topic_id {
@@ -679,7 +677,7 @@ fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
                 }
                 Ok::<(), anyhow::Error>(())
             }) {
-                eprintln!("[telegram] notify failed: {e}");
+                tracing::warn!(error = %_e, "telegram notify failed");
             }
         })
         .ok();
@@ -742,7 +740,7 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
         let schedule = match Schedule::from_str(&full_expr) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[schedule] invalid cron '{}': {e}", cron_expr);
+                tracing::warn!(cron = cron_expr, error = %e, "invalid cron expression");
                 continue;
             }
         };
@@ -756,7 +754,7 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
             let message = sched["message"].as_str().unwrap_or("");
             let label = sched["label"].as_str().unwrap_or("(unnamed)");
 
-            eprintln!("[schedule] triggering '{label}' → {target}: {message}");
+            tracing::info!(label, target, message, "schedule triggered");
             crate::event_log::log(
                 home,
                 "schedule_trigger",
@@ -770,7 +768,7 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
                 match agent::inject_to_agent(handle, message.as_bytes()) {
                     Ok(()) => "ok",
                     Err(e) => {
-                        eprintln!("[schedule] inject failed: {e}");
+                        tracing::warn!(error = %e, "schedule inject failed");
                         "inject_failed"
                     }
                 }
