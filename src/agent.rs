@@ -101,6 +101,7 @@ pub fn spawn_agent(
     registry: &AgentRegistry,
     home: Option<&std::path::Path>,
     crash_tx: Option<CrashChannel>,
+    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<()> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -204,11 +205,12 @@ pub fn spawn_agent(
             .map(|(p, k)| (p.to_string(), k.to_vec()))
             .collect())
         .unwrap_or_default();
+    let shutdown_for_reaper = shutdown;
     let n = name.to_string();
     std::thread::Builder::new()
         .name(format!("{n}_pty_read"))
         .spawn(move || {
-            pty_read_loop(&n, &mut pty_reader, &core2, &pw, &reg_for_reaper, &home_for_reaper, &crash_tx_for_reaper, &dismiss);
+            pty_read_loop(&n, &mut pty_reader, &core2, &pw, &reg_for_reaper, &home_for_reaper, &crash_tx_for_reaper, &dismiss, &shutdown_for_reaper);
         })?;
 
     eprintln!("[{name}] spawned: {command} {}", args.join(" "));
@@ -225,6 +227,7 @@ fn pty_read_loop(
     home: &Option<std::path::PathBuf>,
     crash_tx: &Option<CrashChannel>,
     dismiss_patterns: &[(String, Vec<u8>)],
+    shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mut buf = [0u8; 8192];
     let mut detect_buf = Vec::with_capacity(4096);
@@ -233,7 +236,7 @@ fn pty_read_loop(
     loop {
         match pty_reader.read(&mut buf) {
             Ok(0) => {
-                handle_pty_close(name, registry, home, crash_tx);
+                handle_pty_close(name, registry, home, crash_tx, shutdown);
                 break;
             }
             Ok(n_bytes) => {
@@ -258,13 +261,31 @@ fn pty_read_loop(
     }
 }
 
-/// Handle PTY close: determine if crash or graceful exit, set state accordingly.
+/// Handle PTY close: determine if crash, graceful exit, or daemon shutdown.
 fn handle_pty_close(
     name: &str,
     registry: &AgentRegistry,
     home: &Option<std::path::PathBuf>,
     crash_tx: &Option<CrashChannel>,
+    shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
+    // Check if daemon is shutting down — if so, this is not a crash
+    let is_shutdown = shutdown.as_ref()
+        .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
+
+    if is_shutdown {
+        eprintln!("[{name}] stopped (daemon shutdown)");
+        if let Ok(mut reg) = registry.lock() {
+            reg.remove(name);
+        }
+        if let Some(ref home) = home {
+            let sock = crate::daemon::agent_socket_path(home, name);
+            let _ = std::fs::remove_file(&sock);
+        }
+        return;
+    }
+
     eprintln!("[{name}] PTY closed — waiting for process exit");
 
     // Wait up to 2s for process to fully exit

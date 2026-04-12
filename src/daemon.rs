@@ -213,6 +213,9 @@ pub fn run(
     // Store configs for respawn
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    // Shutdown flag — shared with agent reapers to distinguish crash from shutdown
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     eprintln!("[daemon] starting {} agent(s)", agents.len());
 
     for (name, command, args, env, working_dir, submit_key) in &agents {
@@ -241,6 +244,7 @@ pub fn run(
             name, command, args, cols, rows,
             env.as_ref(), working_dir.as_deref(), submit_key,
             &registry, Some(home), Some(crash_tx.clone()),
+            Some(Arc::clone(&shutdown)),
         )?;
 
         let sock = agent_socket_path(home, name);
@@ -254,9 +258,6 @@ pub fn run(
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
-
-    // Shutdown flag
-    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // API socket server
     let api_reg = Arc::clone(&registry);
@@ -399,6 +400,7 @@ pub fn run(
                     let reg = Arc::clone(&registry);
                     let home = home.to_path_buf();
                     let tx = crash_tx.clone();
+                    let shutdown_for_respawn = Arc::clone(&shutdown);
 
                     // Save health tracker from old handle before respawn replaces it
                     let saved_health = {
@@ -411,12 +413,18 @@ pub fn run(
                         .name(format!("{crashed_name}_respawn"))
                         .spawn(move || {
                             std::thread::sleep(delay);
+                            // Check shutdown flag after backoff — don't respawn during shutdown
+                            if shutdown_for_respawn.load(std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("[health] {}: shutdown during respawn backoff, aborting", config.name);
+                                return;
+                            }
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
                             match agent::spawn_agent(
                                 &config.name, &config.command, &config.args,
                                 cols, rows,
                                 config.env.as_ref(), config.working_dir.as_deref(),
                                 &config.submit_key, &reg, Some(&home), Some(tx),
+                                Some(Arc::clone(&shutdown_for_respawn)),
                             ) {
                                 Ok(()) => {
                                     eprintln!("[health] {}: respawned", config.name);

@@ -122,6 +122,7 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
         &registry,
         None,
         None,
+        None,
     )?;
 
     eprintln!("[capture] Waiting {}s for output...", seconds);
@@ -197,7 +198,7 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     agent::spawn_agent(
-        "test-attach", "/bin/bash", &[], 80, 24, None, None, "\r", &registry, None, None,
+        "test-attach", "/bin/bash", &[], 80, 24, None, None, "\r", &registry, None, None, None,
     )?;
 
     std::thread::sleep(std::time::Duration::from_secs(1));

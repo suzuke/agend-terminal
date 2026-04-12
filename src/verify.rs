@@ -37,10 +37,10 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
     // Spawn two test agents
     let spawn_ok = agent::spawn_agent(
         "test-a", "/bin/bash", &[], 80, 24, None, None, "\r",
-        &registry, Some(&daemon_home), None,
+        &registry, Some(&daemon_home), None, None,
     ).is_ok() && agent::spawn_agent(
         "test-b", "/bin/bash", &[], 80, 24, None, None, "\r",
-        &registry, Some(&daemon_home), None,
+        &registry, Some(&daemon_home), None, None,
     ).is_ok();
 
     if spawn_ok {
@@ -143,7 +143,7 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
 #[allow(clippy::unwrap_used)]
 fn test_attach(_home: &Path) -> TestResult {
     let registry = Arc::new(Mutex::new(HashMap::new()));
-    match agent::spawn_agent("verify-attach", "/bin/bash", &[], 80, 24, None, None, "\r", &registry, None, None) {
+    match agent::spawn_agent("verify-attach", "/bin/bash", &[], 80, 24, None, None, "\r", &registry, None, None, None) {
         Ok(()) => {
             std::thread::sleep(std::time::Duration::from_secs(1));
             let reg = registry.lock().unwrap();
@@ -416,6 +416,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
         Some(test_dir.as_path()),
         preset.submit_key,
         &registry,
+        None,
         None,
         None,
     );
