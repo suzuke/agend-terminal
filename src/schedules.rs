@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
@@ -48,6 +49,14 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         Some(c) => c,
         None => return serde_json::json!({"error": "missing 'cron'"}),
     };
+    let full_expr = if cron.split_whitespace().count() == 5 {
+        format!("0 {cron}")
+    } else {
+        cron.to_string()
+    };
+    if cron::Schedule::from_str(&full_expr).is_err() {
+        return serde_json::json!({"error": format!("invalid cron expression: {cron}")});
+    }
     let message = match args["message"].as_str() {
         Some(m) => m,
         None => return serde_json::json!({"error": "missing 'message'"}),

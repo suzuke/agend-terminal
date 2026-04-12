@@ -166,7 +166,9 @@ pub fn prune(repo_dir: &Path) {
                 tracing::warn!(warning = %stderr.trim(), "worktree prune warning");
             }
         }
-        Err(_) => {} // git not available, skip silently
+        Err(e) => {
+            tracing::warn!(repo = %repo_dir.display(), error = %e, "git worktree prune failed");
+        }
     }
 }
 
@@ -207,7 +209,9 @@ fn ensure_gitignore(repo_dir: &Path) {
             } else {
                 "\n"
             };
-            let _ = writeln!(f, "{prefix}.worktrees");
+            if let Err(e) = writeln!(f, "{prefix}.worktrees") {
+                tracing::warn!(error = %e, "failed to update .gitignore");
+            }
             tracing::info!("added .worktrees to .gitignore");
         }
     }

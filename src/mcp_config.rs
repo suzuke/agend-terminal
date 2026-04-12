@@ -69,11 +69,23 @@ fn configure_claude(working_dir: &Path) -> Result<()> {
     // Ensure working dir is a git repo (Claude Code needs git root to find .claude/)
     let git_dir = working_dir.join(".git");
     if !git_dir.exists() {
-        std::process::Command::new("git")
+        match std::process::Command::new("git")
             .args(["init"])
             .current_dir(working_dir)
             .output()
-            .ok();
+        {
+            Ok(o) if !o.status.success() => {
+                tracing::warn!(
+                    dir = %working_dir.display(),
+                    stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "git init failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(dir = %working_dir.display(), error = %e, "git init failed");
+            }
+            _ => {}
+        }
     }
 
     // Write project-local MCP config

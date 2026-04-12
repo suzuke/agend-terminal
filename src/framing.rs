@@ -20,6 +20,12 @@ fn frame_limit() -> usize {
 }
 
 pub fn write_frame(w: &mut impl Write, data: &[u8]) -> std::io::Result<()> {
+    if data.len() > frame_limit() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
     w.write_all(&[TAG_DATA])?;
     w.write_all(&(data.len() as u32).to_be_bytes())?;
     w.write_all(data)?;

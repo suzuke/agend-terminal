@@ -382,9 +382,14 @@ fn handle_pty_close(
     }
 
     let is_crash = match exit_code {
-        Some(0) => false,                          // Graceful exit
-        Some(137) | Some(143) => {                  // SIGKILL (137) / SIGTERM (143) — killed by daemon or user
-            tracing::info!(agent = name, exit_code = exit_code.unwrap_or(0), "killed by signal, not crash");
+        Some(0) => false, // Graceful exit
+        Some(137) | Some(143) => {
+            // SIGKILL (137) / SIGTERM (143) — killed by daemon or user
+            tracing::info!(
+                agent = name,
+                exit_code = exit_code.unwrap_or(0),
+                "killed by signal, not crash"
+            );
             false
         }
         Some(c) => {

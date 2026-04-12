@@ -22,12 +22,19 @@ pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
     };
     if let Ok(json) = serde_json::to_string(&event) {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)
         {
-            let _ = writeln!(f, "{json}");
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{json}") {
+                    tracing::warn!(path = %log_path.display(), error = %e, "failed to write event log entry");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %log_path.display(), error = %e, "failed to open event log");
+            }
         }
     }
 }

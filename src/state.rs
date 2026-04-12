@@ -235,7 +235,13 @@ impl StatePatterns {
 
         let compiled: Vec<_> = patterns
             .into_iter()
-            .filter_map(|(state, pat)| Regex::new(pat).ok().map(|re| (state, re)))
+            .filter_map(|(state, pat)| match Regex::new(pat) {
+                Ok(re) => Some((state, re)),
+                Err(err) => {
+                    tracing::warn!("invalid state pattern: {pat}: {err}");
+                    None
+                }
+            })
             .collect();
 
         Self { patterns: compiled }
