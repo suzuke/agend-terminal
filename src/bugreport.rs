@@ -12,26 +12,21 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     let mut out = String::new();
 
     section(&mut out, "AgEnD Terminal Bug Report");
-    out.push_str(&format!("Generated: {}\n", chrono::Utc::now().to_rfc3339()));
-    out.push('\n');
+    out.push_str(&format!(
+        "Generated: {}\n\n",
+        chrono::Utc::now().to_rfc3339()
+    ));
 
     // Version info
     section(&mut out, "Version");
     out.push_str(&format!("agend-terminal: {}\n", env!("CARGO_PKG_VERSION")));
-    if let Ok(o) = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-    {
-        out.push_str(&format!(
-            "rustc: {}\n",
-            String::from_utf8_lossy(&o.stdout).trim()
-        ));
-    }
-    if let Ok(o) = std::process::Command::new("uname").arg("-a").output() {
-        out.push_str(&format!(
-            "system: {}\n",
-            String::from_utf8_lossy(&o.stdout).trim()
-        ));
+    for (label, cmd, arg) in [("rustc", "rustc", "--version"), ("system", "uname", "-a")] {
+        if let Ok(o) = std::process::Command::new(cmd).arg(arg).output() {
+            out.push_str(&format!(
+                "{label}: {}\n",
+                String::from_utf8_lossy(&o.stdout).trim()
+            ));
+        }
     }
     if let Ok((cols, rows)) = crossterm::terminal::size() {
         out.push_str(&format!("terminal: {cols}x{rows}\n"));
@@ -40,46 +35,54 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
 
     // Home directory
     section(&mut out, "Home Directory");
-    out.push_str(&format!("AGEND_TERMINAL_HOME: {}\n", home.display()));
     out.push_str(&format!(
-        "exists: {}\n",
+        "AGEND_TERMINAL_HOME: {}\nexists: {}\n\n",
+        home.display(),
         if home.exists() { "yes" } else { "no" }
     ));
-    out.push('\n');
 
-    // Fleet config (redacted)
-    section(&mut out, "Fleet Config (tokens redacted)");
-    let fleet_path = home.join("fleet.yaml");
-    if fleet_path.exists() {
-        match std::fs::read_to_string(&fleet_path) {
+    // File sections
+    for (title, path, redact, fallback) in [
+        (
+            "Fleet Config (tokens redacted)",
+            home.join("fleet.yaml"),
+            true,
+            "(not found)",
+        ),
+        ("Schedules", home.join("schedules.json"), false, "(none)"),
+    ] {
+        section(&mut out, title);
+        match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let redacted = redact_secrets(&content);
-                out.push_str(&redacted);
+                let s = if redact {
+                    redact_secrets(&content)
+                } else {
+                    content
+                };
+                out.push_str(&s);
             }
-            Err(e) => out.push_str(&format!("(read error: {e})\n")),
+            Err(_) => out.push_str(fallback),
         }
-    } else {
-        out.push_str("(not found)\n");
+        out.push('\n');
     }
-    out.push('\n');
 
     // Daemon status
     section(&mut out, "Daemon Status");
     match crate::api::call(home, &serde_json::json!({"method": "list"})) {
-        Ok(resp) => {
-            out.push_str(&serde_json::to_string_pretty(&resp).unwrap_or_default());
-            out.push('\n');
-        }
-        Err(e) => out.push_str(&format!("(daemon not running: {e})\n")),
+        Ok(resp) => out.push_str(&serde_json::to_string_pretty(&resp).unwrap_or_default()),
+        Err(e) => out.push_str(&format!("(daemon not running: {e})")),
     }
-    out.push('\n');
+    out.push_str("\n\n");
 
     // Snapshot
     section(&mut out, "Latest Snapshot");
     match crate::snapshot::load(home) {
         Some(snapshot) => {
-            out.push_str(&format!("timestamp: {}\n", snapshot.timestamp));
-            out.push_str(&format!("agents: {}\n", snapshot.agents.len()));
+            out.push_str(&format!(
+                "timestamp: {}\nagents: {}\n",
+                snapshot.timestamp,
+                snapshot.agents.len()
+            ));
             for a in &snapshot.agents {
                 out.push_str(&format!(
                     "  {} state={} health={} cmd={}\n",
@@ -93,42 +96,29 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
 
     // Event log (last 50 lines)
     section(&mut out, "Event Log (last 50)");
-    let event_log = home.join("event-log.jsonl");
-    if event_log.exists() {
-        match std::fs::read_to_string(&event_log) {
-            Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                let start = lines.len().saturating_sub(50);
-                for line in &lines[start..] {
-                    out.push_str(line);
-                    out.push('\n');
-                }
+    match std::fs::read_to_string(home.join("event-log.jsonl")) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            for line in &lines[lines.len().saturating_sub(50)..] {
+                out.push_str(line);
+                out.push('\n');
             }
-            Err(e) => out.push_str(&format!("(read error: {e})\n")),
         }
-    } else {
-        out.push_str("(no event log)\n");
+        Err(_) => out.push_str("(no event log)\n"),
     }
     out.push('\n');
 
     // Installed backends
     section(&mut out, "Installed Backends");
     for b in crate::backend::Backend::all() {
-        let preset = b.preset();
+        let (name, cmd) = (b.name(), b.preset().command);
         if b.is_installed() {
-            let version = b.get_version().unwrap_or_else(|| "?".into());
             out.push_str(&format!(
-                "  {} ({}) v{}\n",
-                b.name(),
-                preset.command,
-                version
+                "  {name} ({cmd}) v{}\n",
+                b.get_version().unwrap_or_else(|| "?".into())
             ));
         } else {
-            out.push_str(&format!(
-                "  {} ({}) — not installed\n",
-                b.name(),
-                preset.command
-            ));
+            out.push_str(&format!("  {name} ({cmd}) — not installed\n"));
         }
     }
     out.push('\n');
@@ -139,8 +129,7 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         out.push_str(&format!("run dir: {}\n", run.display()));
         if let Ok(entries) = std::fs::read_dir(&run) {
             for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                out.push_str(&format!("  {name}\n"));
+                out.push_str(&format!("  {}\n", entry.file_name().to_string_lossy()));
             }
         }
     } else {
@@ -150,40 +139,20 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
 
     // .env (redacted)
     section(&mut out, "Environment (.env redacted)");
-    let env_path = home.join(".env");
-    if env_path.exists() {
-        match std::fs::read_to_string(&env_path) {
-            Ok(content) => {
-                for line in content.lines() {
-                    if let Some((key, _)) = line.split_once('=') {
-                        out.push_str(&format!("{key}=***REDACTED***\n"));
-                    } else {
-                        out.push_str(line);
-                        out.push('\n');
-                    }
+    match std::fs::read_to_string(home.join(".env")) {
+        Ok(content) => {
+            for line in content.lines() {
+                if let Some((key, _)) = line.split_once('=') {
+                    out.push_str(&format!("{key}=***REDACTED***\n"));
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
                 }
             }
-            Err(e) => out.push_str(&format!("(read error: {e})\n")),
         }
-    } else {
-        out.push_str("(no .env)\n");
+        Err(_) => out.push_str("(no .env)\n"),
     }
     out.push('\n');
-
-    // Schedules
-    section(&mut out, "Schedules");
-    let schedules_path = home.join("schedules.json");
-    if schedules_path.exists() {
-        match std::fs::read_to_string(&schedules_path) {
-            Ok(content) => {
-                out.push_str(&content);
-                out.push('\n');
-            }
-            Err(e) => out.push_str(&format!("(read error: {e})\n")),
-        }
-    } else {
-        out.push_str("(none)\n");
-    }
 
     // Write report
     std::fs::write(&output_path, &out)?;

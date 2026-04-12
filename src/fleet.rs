@@ -234,17 +234,28 @@ fn acquire_lock(home: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
     // Lock auto-released when Flock is dropped
 }
 
+/// Lock fleet.yaml, parse it, apply a mutation, and atomically write back.
+fn mutate_fleet_yaml(
+    home: &Path,
+    default_content: &str,
+    mutate: impl FnOnce(&mut serde_yaml::Value) -> Result<()>,
+) -> Result<()> {
+    let fleet_path = home.join("fleet.yaml");
+    if default_content.is_empty() && !fleet_path.exists() {
+        return Ok(());
+    }
+    let _lock = acquire_lock(home)?;
+    let content =
+        std::fs::read_to_string(&fleet_path).unwrap_or_else(|_| default_content.to_string());
+    let mut doc: serde_yaml::Value =
+        serde_yaml::from_str(&content).context("Failed to parse fleet.yaml")?;
+    mutate(&mut doc)?;
+    atomic_write_yaml(home, &doc)
+}
+
 /// Add a new instance entry to fleet.yaml. Uses file lock + atomic write.
 pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry) -> Result<()> {
-    let fleet_path = home.join("fleet.yaml");
-    let _lock = acquire_lock(home)?;
-    let result = (|| -> Result<()> {
-        let content =
-            std::fs::read_to_string(&fleet_path).unwrap_or_else(|_| "instances: {}\n".to_string());
-        let mut doc: serde_yaml::Value =
-            serde_yaml::from_str(&content).context("Failed to parse fleet.yaml")?;
-
-        // Ensure instances mapping exists
+    mutate_fleet_yaml(home, "instances: {}\n", |doc| {
         if doc.get("instances").is_none() {
             doc["instances"] = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
         }
@@ -253,67 +264,38 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
             .and_then(|v| v.as_mapping_mut())
             .context("instances is not a mapping")?;
 
-        // Build the instance value
         let mut inst = serde_yaml::Mapping::new();
         inst.insert(
-            serde_yaml::Value::String("command".into()),
+            "command".into(),
             serde_yaml::Value::String(config.command.clone()),
         );
-        if let Some(ref backend) = config.backend {
-            inst.insert(
-                serde_yaml::Value::String("backend".into()),
-                serde_yaml::Value::String(backend.clone()),
-            );
+        for (key, val) in [
+            ("backend", &config.backend),
+            ("working_directory", &config.working_directory),
+            ("role", &config.role),
+        ] {
+            if let Some(ref v) = val {
+                inst.insert(key.into(), serde_yaml::Value::String(v.clone()));
+            }
         }
-        if let Some(ref wd) = config.working_directory {
-            inst.insert(
-                serde_yaml::Value::String("working_directory".into()),
-                serde_yaml::Value::String(wd.clone()),
-            );
-        }
-        if let Some(ref role) = config.role {
-            inst.insert(
-                serde_yaml::Value::String("role".into()),
-                serde_yaml::Value::String(role.clone()),
-            );
-        }
-
         instances.insert(
             serde_yaml::Value::String(name.to_string()),
             serde_yaml::Value::Mapping(inst),
         );
-
-        atomic_write_yaml(home, &doc)?;
         eprintln!("[fleet] added instance '{name}' to fleet.yaml");
         Ok(())
-    })();
-    drop(_lock); // flock released on drop
-    result
+    })
 }
 
 /// Remove an instance entry from fleet.yaml. Uses file lock + atomic write.
 pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
-    let fleet_path = home.join("fleet.yaml");
-    if !fleet_path.exists() {
-        return Ok(());
-    }
-    let _lock = acquire_lock(home)?;
-    let result = (|| -> Result<()> {
-        let content = std::fs::read_to_string(&fleet_path).context("Failed to read fleet.yaml")?;
-        let mut doc: serde_yaml::Value =
-            serde_yaml::from_str(&content).context("Failed to parse fleet.yaml")?;
-
+    mutate_fleet_yaml(home, "", |doc| {
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
-            let key = serde_yaml::Value::String(name.to_string());
-            instances.remove(&key);
+            instances.remove(serde_yaml::Value::String(name.to_string()));
         }
-
-        atomic_write_yaml(home, &doc)?;
         eprintln!("[fleet] removed instance '{name}' from fleet.yaml");
         Ok(())
-    })();
-    drop(_lock); // flock released on drop
-    result
+    })
 }
 
 /// Update a specific field of an instance in fleet.yaml. Uses file lock + atomic write.
@@ -323,28 +305,15 @@ pub fn update_instance_field(
     field: &str,
     value: serde_yaml::Value,
 ) -> Result<()> {
-    let fleet_path = home.join("fleet.yaml");
-    if !fleet_path.exists() {
-        return Ok(());
-    }
-    let _lock = acquire_lock(home)?;
-    let result = (|| -> Result<()> {
-        let content = std::fs::read_to_string(&fleet_path).context("Failed to read fleet.yaml")?;
-        let mut doc: serde_yaml::Value =
-            serde_yaml::from_str(&content).context("Failed to parse fleet.yaml")?;
-
+    mutate_fleet_yaml(home, "", |doc| {
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
             let key = serde_yaml::Value::String(name.to_string());
             if let Some(inst) = instances.get_mut(&key).and_then(|v| v.as_mapping_mut()) {
                 inst.insert(serde_yaml::Value::String(field.to_string()), value);
             }
         }
-
-        atomic_write_yaml(home, &doc)?;
         Ok(())
-    })();
-    drop(_lock); // flock released on drop
-    result
+    })
 }
 
 #[cfg(test)]

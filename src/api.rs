@@ -108,28 +108,13 @@ fn handle_session(
         let response = match method {
             "list" => {
                 let reg = agent::lock_registry(registry);
-                let agents: Vec<Value> = reg
-                    .iter()
-                    .map(|(name, handle)| {
-                        let (agent_state, health_state) = handle
-                            .core
-                            .lock()
-                            .map(|c| {
-                                let as_ = c.state.get_state().display_name().to_string();
-                                let hs = c.health.state.display_name().to_string();
-                                (as_, hs)
-                            })
-                            .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
-                        json!({
-                            "name": name,
-                            "command": handle.command,
-                            "submit_key": handle.submit_key,
-                            "inject_prefix": handle.inject_prefix,
-                            "agent_state": agent_state,
-                            "health_state": health_state,
-                        })
-                    })
-                    .collect();
+                let agents: Vec<Value> = reg.iter().map(|(name, handle)| {
+                    let (agent_state, health_state) = handle.core.lock()
+                        .map(|c| (c.state.get_state().display_name().to_string(), c.health.state.display_name().to_string()))
+                        .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
+                    json!({"name": name, "command": handle.command, "submit_key": handle.submit_key,
+                           "inject_prefix": handle.inject_prefix, "agent_state": agent_state, "health_state": health_state})
+                }).collect();
                 json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
             }
             "inject" => {
@@ -218,13 +203,11 @@ fn handle_session(
                     .as_str()
                     .map(|s| s.split_whitespace().map(String::from).collect())
                     .unwrap_or_default();
-
                 let work_dir = params["working_directory"]
                     .as_str()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| home.join("workspaces").join(name));
                 std::fs::create_dir_all(&work_dir).ok();
-
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
 
                 match agent::spawn_agent(
@@ -244,7 +227,6 @@ fn handle_session(
                     registry,
                 ) {
                     Ok(()) => {
-                        // Start TUI socket
                         let sock = crate::daemon::agent_socket_path(home, name);
                         let reg = Arc::clone(registry);
                         let n = name.to_string();
@@ -252,40 +234,44 @@ fn handle_session(
                             .name(format!("{n}_tui"))
                             .spawn(move || crate::daemon::serve_agent_tui(&n, &sock, &reg))
                             .ok();
-
                         json!({"ok": true, "result": {"name": name}})
                     }
                     Err(e) => json!({"ok": false, "error": format!("{e}")}),
                 }
             }
             "send" => {
-                let from = params["from"].as_str().unwrap_or("unknown");
-                let target = params["target"].as_str().unwrap_or("");
-                let text = params["text"].as_str().unwrap_or("");
-
-                // Enqueue in inbox
-                let msg = crate::inbox::InboxMessage {
-                    from: format!("from:{from}"),
-                    text: text.to_string(),
-                    kind: params
-                        .get("kind")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
-                let _ = crate::inbox::enqueue(home, target, msg);
-
-                // Direct write to PTY (daemon has registry — no API loop)
+                let (from, target, text) = (
+                    params["from"].as_str().unwrap_or("unknown"),
+                    params["target"].as_str().unwrap_or(""),
+                    params["text"].as_str().unwrap_or(""),
+                );
+                let _ = crate::inbox::enqueue(
+                    home,
+                    target,
+                    crate::inbox::InboxMessage {
+                        from: format!("from:{from}"),
+                        text: text.to_string(),
+                        kind: params
+                            .get("kind")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    },
+                );
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(target) {
                     let display_text = if text.chars().count() > 200 {
-                        let truncated: String = text.chars().take(200).collect();
-                        format!("{truncated}... (use inbox tool)")
+                        format!(
+                            "{}... (use inbox tool)",
+                            text.chars().take(200).collect::<String>()
+                        )
                     } else {
                         text.to_string()
                     };
-                    let notification = format!("[from:{from}] {display_text}");
-                    let _ = agent::inject_to_agent(handle, notification.as_bytes());
+                    let _ = agent::inject_to_agent(
+                        handle,
+                        format!("[from:{from}] {display_text}").as_bytes(),
+                    );
                 }
                 json!({"ok": true})
             }

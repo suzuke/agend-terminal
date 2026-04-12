@@ -56,14 +56,8 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     let (token, group_id) = if existing_token.is_some() && existing_group_id.is_some() {
         let tok = existing_token.clone().unwrap_or_default();
         let gid = existing_group_id.unwrap_or(0);
-        let masked = if tok.len() > 8 {
-            format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
-        } else {
-            "****".to_string()
-        };
         println!("  ── Telegram ──\n");
-        println!("  ✓ Token: {masked}");
-        println!("  ✓ Group: {gid}");
+        println!("  ✓ Token: {}\n  ✓ Group: {gid}", mask_token(&tok));
         let answer = prompt("\n  Use existing Telegram config? (Y/n): ")?;
         if answer.trim().eq_ignore_ascii_case("n") {
             telegram_setup(home)?
@@ -73,17 +67,11 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         }
     } else if let Some(tok) = existing_token {
         println!("  ── Telegram ──\n");
-        let masked = if tok.len() > 8 {
-            format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
-        } else {
-            "****".to_string()
-        };
-        println!("  ✓ Token found: {masked}");
+        println!("  ✓ Token found: {}", mask_token(&tok));
         let answer = prompt("  Use existing token? (Y/n): ")?;
         if answer.trim().eq_ignore_ascii_case("n") {
             telegram_setup(home)?
         } else {
-            // Have token but no group — detect group
             println!("\n  Add the bot to your Telegram group and send a message.\n");
             print!("  Waiting for group message (3 min timeout)... ");
             io::stdout().flush().ok();
@@ -158,6 +146,14 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
             println!("  Set group_id manually in fleet.yaml later.\n");
             Ok((token, None))
         }
+    }
+}
+
+fn mask_token(tok: &str) -> String {
+    if tok.len() > 8 {
+        format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
+    } else {
+        "****".to_string()
     }
 }
 
@@ -315,8 +311,6 @@ fn detect_project_root() -> Option<std::path::PathBuf> {
 fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
     let env_path = home.join(".env");
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
-
-    // Check if token already exists
     let existing_token = existing
         .lines()
         .find(|l| l.starts_with("AGEND_BOT_TOKEN="))
@@ -327,13 +321,7 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
             println!("  ✓ Token unchanged in .env\n");
             return Ok(());
         }
-        // Show masked existing token
-        let masked = if old.len() > 8 {
-            format!("{}...{}", &old[..4], &old[old.len() - 4..])
-        } else {
-            "****".to_string()
-        };
-        println!("  .env already has AGEND_BOT_TOKEN={masked}");
+        println!("  .env already has AGEND_BOT_TOKEN={}", mask_token(old));
         let answer = prompt("  Update token? (Y/n): ")?;
         if answer.trim().eq_ignore_ascii_case("n") {
             println!("  Keeping existing token.\n");
@@ -341,16 +329,13 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Replace or append AGEND_BOT_TOKEN, preserve other lines
     let mut lines: Vec<String> = existing
         .lines()
         .filter(|l| !l.starts_with("AGEND_BOT_TOKEN="))
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("AGEND_BOT_TOKEN={token}"));
-
-    let content = lines.join("\n") + "\n";
-    std::fs::write(&env_path, content)?;
+    std::fs::write(&env_path, lines.join("\n") + "\n")?;
     println!("  ✓ Token saved to {}\n", env_path.display());
     Ok(())
 }

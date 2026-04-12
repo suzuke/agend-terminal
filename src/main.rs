@@ -224,38 +224,35 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Daemon { agents }) => {
-            let agents: Vec<_> = agents
-                .iter()
-                .map(|a| {
-                    let (name, cmd) = if let Some((n, c)) = a.split_once(':') {
-                        (n.to_string(), c.to_string())
-                    } else {
-                        (a.to_string(), a.to_string())
-                    };
-                    let detected = backend::Backend::from_command(&cmd);
-                    let (preset_args, submit_key) = match detected {
-                        Some(ref b) => {
-                            let p = b.preset();
-                            let mut a: Vec<String> = p.args.iter().map(|s| s.to_string()).collect();
-                            a.extend(p.resume_mode.args_for(&home, &name));
-                            (a, p.submit_key.to_string())
-                        }
-                        None => (Vec::new(), "\r".to_string()),
-                    };
-                    (name, cmd, preset_args, None, None, submit_key)
-                })
-                .collect();
-            let agents = if agents.is_empty() {
+            let agents: Vec<_> = if agents.is_empty() {
                 vec![(
-                    "shell".to_string(),
-                    "/bin/bash".to_string(),
+                    "shell".into(),
+                    "/bin/bash".into(),
                     Vec::new(),
                     None,
                     None,
-                    "\r".to_string(),
+                    "\r".into(),
                 )]
             } else {
                 agents
+                    .iter()
+                    .map(|a| {
+                        let (name, cmd) = a
+                            .split_once(':')
+                            .map(|(n, c)| (n.to_string(), c.to_string()))
+                            .unwrap_or_else(|| (a.to_string(), a.to_string()));
+                        let (preset_args, submit_key) = backend::Backend::from_command(&cmd)
+                            .map(|b| {
+                                let p = b.preset();
+                                let mut a: Vec<String> =
+                                    p.args.iter().map(|s| s.to_string()).collect();
+                                a.extend(p.resume_mode.args_for(&home, &name));
+                                (a, p.submit_key.to_string())
+                            })
+                            .unwrap_or_else(|| (Vec::new(), "\r".to_string()));
+                        (name, cmd, preset_args, None, None, submit_key)
+                    })
+                    .collect()
             };
             daemon::run(&home, agents)?;
         }
@@ -282,29 +279,20 @@ fn main() -> anyhow::Result<()> {
             }
             match api::call(
                 &home,
-                &serde_json::json!({
-                    "method": "inject",
-                    "params": {"name": name, "data": text}
-                }),
+                &serde_json::json!({"method": "inject", "params": {"name": name, "data": text}}),
             ) {
-                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    println!("Injected: {text}");
-                }
-                Ok(resp) => {
-                    eprintln!(
-                        "Inject failed: {}",
-                        resp["error"].as_str().unwrap_or("unknown")
-                    );
-                }
-                Err(_) => {
-                    daemon_not_running_hint();
-                }
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => println!("Injected: {text}"),
+                Ok(resp) => eprintln!(
+                    "Inject failed: {}",
+                    resp["error"].as_str().unwrap_or("unknown")
+                ),
+                Err(_) => daemon_not_running_hint(),
             }
         }
         Some(Commands::Stop) => {
             match api::call(&home, &serde_json::json!({"method": "shutdown"})) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    println!("Daemon shutdown initiated.");
+                    println!("Daemon shutdown initiated.")
                 }
                 Ok(_) => eprintln!("Shutdown request failed."),
                 Err(_) => daemon_not_running_hint(),
@@ -312,18 +300,19 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::List { json }) => {
             if let Some(run) = daemon::find_active_run_dir(&home) {
-                let mut agents = Vec::new();
-                for entry in std::fs::read_dir(&run)?.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.ends_with(".sock") && name != "api.sock" {
-                        agents.push(name[..name.len() - 5].to_string());
-                    }
-                }
+                let agents: Vec<String> = std::fs::read_dir(&run)?
+                    .flatten()
+                    .filter_map(|e| {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        n.ends_with(".sock").then(|| n[..n.len() - 5].to_string())
+                    })
+                    .filter(|n| n != "api")
+                    .collect();
                 if json {
                     println!("{}", serde_json::json!(agents));
                 } else {
-                    for agent in &agents {
-                        println!("  {agent}");
+                    for a in &agents {
+                        println!("  {a}");
                     }
                 }
             } else if json {
@@ -344,12 +333,14 @@ fn main() -> anyhow::Result<()> {
                         if agents.is_empty() {
                             println!("No agents running.");
                         } else {
-                            for agent in agents {
-                                let name = agent["name"].as_str().unwrap_or("?");
-                                let cmd = agent["command"].as_str().unwrap_or("?");
-                                let state = agent["agent_state"].as_str().unwrap_or("?");
-                                let health = agent["health_state"].as_str().unwrap_or("?");
-                                println!("  {name}: state={state} health={health} cmd={cmd}");
+                            for a in agents {
+                                println!(
+                                    "  {}: state={} health={} cmd={}",
+                                    a["name"].as_str().unwrap_or("?"),
+                                    a["agent_state"].as_str().unwrap_or("?"),
+                                    a["health_state"].as_str().unwrap_or("?"),
+                                    a["command"].as_str().unwrap_or("?")
+                                );
                             }
                         }
                     }
@@ -362,15 +353,11 @@ fn main() -> anyhow::Result<()> {
                 &home,
                 &serde_json::json!({"method": "kill", "params": {"name": name}}),
             ) {
-                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    println!("Killed {name}");
-                }
-                Ok(resp) => {
-                    eprintln!(
-                        "Kill failed: {}",
-                        resp["error"].as_str().unwrap_or("unknown")
-                    );
-                }
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => println!("Killed {name}"),
+                Ok(resp) => eprintln!(
+                    "Kill failed: {}",
+                    resp["error"].as_str().unwrap_or("unknown")
+                ),
                 Err(_) => daemon_not_running_hint(),
             }
         }
@@ -384,8 +371,8 @@ fn main() -> anyhow::Result<()> {
             FleetCommands::Stop => match api::call(&home, &serde_json::json!({"method": "list"})) {
                 Ok(resp) => {
                     if let Some(agents) = resp["result"]["agents"].as_array() {
-                        for agent in agents {
-                            let name = agent["name"].as_str().unwrap_or("");
+                        for a in agents {
+                            let name = a["name"].as_str().unwrap_or("");
                             let _ = api::call(
                                 &home,
                                 &serde_json::json!({"method": "kill", "params": {"name": name}}),
@@ -405,8 +392,7 @@ fn main() -> anyhow::Result<()> {
                 );
                 std::process::exit(1);
             });
-            let sock = daemon::agent_socket_path(&home, &instance_name);
-            mcp::run(&sock)?;
+            mcp::run(&daemon::agent_socket_path(&home, &instance_name))?;
         }
         Some(Commands::Capture { backend, seconds }) => {
             let b: backend::Backend = serde_json::from_str(&format!("\"{backend}\""))
@@ -420,24 +406,12 @@ fn main() -> anyhow::Result<()> {
             }
             cli::capture_backend(&b, seconds)?;
         }
-        Some(Commands::Test { suite }) => {
-            cli::run_tests(&suite, &home)?;
-        }
-        Some(Commands::Verify { json, backend }) => {
-            verify::run(&home, json, backend.as_deref())?;
-        }
-        Some(Commands::Doctor) => {
-            cli::run_doctor(&home)?;
-        }
-        Some(Commands::Demo) => {
-            cli::run_demo()?;
-        }
-        Some(Commands::Quickstart) => {
-            crate::quickstart::run(&home)?;
-        }
-        Some(Commands::Bugreport) => {
-            crate::bugreport::run(&home)?;
-        }
+        Some(Commands::Test { suite }) => cli::run_tests(&suite, &home)?,
+        Some(Commands::Verify { json, backend }) => verify::run(&home, json, backend.as_deref())?,
+        Some(Commands::Doctor) => cli::run_doctor(&home)?,
+        Some(Commands::Demo) => cli::run_demo()?,
+        Some(Commands::Quickstart) => quickstart::run(&home)?,
+        Some(Commands::Bugreport) => bugreport::run(&home)?,
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;
             clap_complete::generate(

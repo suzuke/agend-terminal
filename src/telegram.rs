@@ -52,18 +52,30 @@ impl TelegramState {
             .instance_to_topic
             .get(instance_name)
             .ok_or_else(|| anyhow::anyhow!("No topic for '{instance_name}'"))?;
+        send_with_topic(&self.bot, self.group_id, Some(*topic_id), text).await
+    }
+}
 
-        if *topic_id == 1 {
-            // General topic — no message_thread_id
-            self.bot.send_message(self.group_id, text).await?;
-        } else {
-            self.bot
-                .send_message(self.group_id, text)
-                .message_thread_id(ThreadId(MessageId(*topic_id)))
+/// Send a message, optionally to a topic.
+async fn send_with_topic(
+    bot: &Bot,
+    chat_id: ChatId,
+    topic_id: Option<i32>,
+    text: &str,
+) -> anyhow::Result<()> {
+    use teloxide::payloads::SendMessageSetters;
+    use teloxide::prelude::Requester;
+    match topic_id {
+        Some(tid) if tid != 1 => {
+            bot.send_message(chat_id, text)
+                .message_thread_id(ThreadId(MessageId(tid)))
                 .await?;
         }
-        Ok(())
+        _ => {
+            bot.send_message(chat_id, text).await?;
+        }
     }
+    Ok(())
 }
 
 /// Start Telegram polling in a dedicated thread with its own tokio runtime.
@@ -71,22 +83,15 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
     if let Err(e) = std::thread::Builder::new()
         .name("telegram".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("[telegram] failed to build tokio runtime: {e}");
-                    return;
-                }
+            else {
+                eprintln!("[telegram] failed to build tokio runtime");
+                return;
             };
             rt.block_on(async {
-                let bot = {
-                    let s = state.lock().unwrap_or_else(|e| e.into_inner());
-                    s.bot.clone()
-                };
-
+                let bot = state.lock().unwrap_or_else(|e| e.into_inner()).bot.clone();
                 let state2 = Arc::clone(&state);
                 let handler = Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
                     let state = Arc::clone(&state2);
@@ -95,7 +100,6 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
                         respond(())
                     }
                 });
-
                 eprintln!("[telegram] polling started");
                 Dispatcher::builder(bot, handler).build().dispatch().await;
             });
@@ -167,28 +171,16 @@ pub fn send_reply(
     text: &str,
 ) -> anyhow::Result<()> {
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let bot = s.bot.clone();
-    let group_id = s.group_id;
-    let topic_id = s.instance_to_topic.get(instance_name).copied();
+    let (bot, group_id, topic_id) = (
+        s.bot.clone(),
+        s.group_id,
+        s.instance_to_topic.get(instance_name).copied(),
+    );
     drop(s);
-
-    // Use a short-lived tokio runtime for the send
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async {
-        if let Some(tid) = topic_id {
-            if tid == 1 {
-                bot.send_message(group_id, text).await?;
-            } else {
-                bot.send_message(group_id, text)
-                    .message_thread_id(ThreadId(MessageId(tid)))
-                    .await?;
-            }
-        }
-        Ok::<(), anyhow::Error>(())
-    })?;
-    Ok(())
+    rt.block_on(send_with_topic(&bot, group_id, topic_id, text))
 }
 
 /// Initialize Telegram from fleet config.
@@ -197,88 +189,73 @@ pub fn init_from_config(
     home: &Path,
     submit_keys: HashMap<String, String>,
 ) -> Option<Arc<Mutex<TelegramState>>> {
-    let channel = config.channel.as_ref()?;
-    match channel {
-        ChannelConfig::Telegram {
-            bot_token_env,
-            group_id,
-            ..
-        } => {
-            let token = match std::env::var(bot_token_env) {
-                Ok(t) => t,
-                Err(_) => {
-                    eprintln!("[telegram] bot token env '{bot_token_env}' not set, skipping");
-                    return None;
-                }
-            };
-            let topic_map: HashMap<String, i32> = config
-                .instances
-                .iter()
-                .filter_map(|(name, inst)| inst.topic_id.map(|tid| (name.clone(), tid)))
-                .collect();
+    let ChannelConfig::Telegram {
+        bot_token_env,
+        group_id,
+        ..
+    } = config.channel.as_ref()?;
+    let token = match std::env::var(bot_token_env) {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("[telegram] bot token env '{bot_token_env}' not set, skipping");
+            return None;
+        }
+    };
 
-            // Auto-create topics for instances without topic_id
-            let bot = teloxide::Bot::new(&token);
-            let chat_id = teloxide::types::ChatId(*group_id);
-            let mut topic_map = topic_map;
-            for (name, inst) in &config.instances {
-                if inst.topic_id.is_none() && name != "general" {
-                    eprintln!("[telegram] creating topic for '{name}'...");
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .ok();
-                    if let Some(rt) = rt {
-                        let result = rt.block_on(async {
-                            bot.create_forum_topic(chat_id, name, 0x6FB9F0, "").await
-                        });
-                        match result {
-                            Ok(topic) => {
-                                let tid = topic.thread_id.0 .0;
-                                eprintln!("[telegram] created topic '{name}' → {tid}");
-                                topic_map.insert(name.clone(), tid);
-                            }
-                            Err(e) => {
-                                eprintln!("[telegram] failed to create topic for '{name}': {e}");
-                            }
-                        }
+    let mut topic_map: HashMap<String, i32> = config
+        .instances
+        .iter()
+        .filter_map(|(name, inst)| inst.topic_id.map(|tid| (name.clone(), tid)))
+        .collect();
+
+    // Auto-create topics for instances without topic_id
+    let bot = teloxide::Bot::new(&token);
+    let chat_id = teloxide::types::ChatId(*group_id);
+    for (name, inst) in &config.instances {
+        if name == "general" && inst.topic_id.is_none() {
+            topic_map.insert("general".to_string(), 1);
+        } else if inst.topic_id.is_none() {
+            eprintln!("[telegram] creating topic for '{name}'...");
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                match rt
+                    .block_on(async { bot.create_forum_topic(chat_id, name, 0x6FB9F0, "").await })
+                {
+                    Ok(topic) => {
+                        let tid = topic.thread_id.0 .0;
+                        eprintln!("[telegram] created topic '{name}' → {tid}");
+                        topic_map.insert(name.clone(), tid);
                     }
-                }
-                // General without topic_id → use General topic (1)
-                if name == "general" && inst.topic_id.is_none() {
-                    topic_map.insert("general".to_string(), 1);
+                    Err(e) => eprintln!("[telegram] failed to create topic for '{name}': {e}"),
                 }
             }
-
-            // Write back newly created topic_ids to fleet.yaml (atomic via temp file)
-            let fleet_path = home.join("fleet.yaml");
-            if fleet_path.exists() {
-                // Write back topic_ids using fleet.rs's atomic write + flock
-                for (name, tid) in &topic_map {
-                    let _ = crate::fleet::update_instance_field(
-                        home,
-                        name,
-                        "topic_id",
-                        serde_yaml::Value::Number(serde_yaml::Number::from(*tid)),
-                    );
-                }
-                if !topic_map.is_empty() {
-                    eprintln!("[telegram] updated fleet.yaml with topic_ids");
-                }
-            }
-
-            let state = Arc::new(Mutex::new(TelegramState::new(
-                &token,
-                *group_id,
-                topic_map,
-                home.to_path_buf(),
-                submit_keys,
-            )));
-
-            start_polling(Arc::clone(&state));
-            Some(state)
         }
     }
+
+    // Write back topic_ids
+    if home.join("fleet.yaml").exists() && !topic_map.is_empty() {
+        for (name, tid) in &topic_map {
+            let _ = crate::fleet::update_instance_field(
+                home,
+                name,
+                "topic_id",
+                serde_yaml::Value::Number(serde_yaml::Number::from(*tid)),
+            );
+        }
+        eprintln!("[telegram] updated fleet.yaml with topic_ids");
+    }
+
+    let state = Arc::new(Mutex::new(TelegramState::new(
+        &token,
+        *group_id,
+        topic_map,
+        home.to_path_buf(),
+        submit_keys,
+    )));
+    start_polling(Arc::clone(&state));
+    Some(state)
 }
 
 /// ChannelAdapter implementation for Telegram.
@@ -289,54 +266,26 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
 
     fn send_reply(&self, instance_name: &str, text: &str) -> crate::channel::SendResult {
         let s = self.lock().unwrap_or_else(|e| e.into_inner());
-        let bot = s.bot.clone();
-        let group_id = s.group_id;
-        let topic_id = s.instance_to_topic.get(instance_name).copied();
+        let (bot, group_id, topic_id) = (
+            s.bot.clone(),
+            s.group_id,
+            s.instance_to_topic.get(instance_name).copied(),
+        );
         drop(s);
-
-        let rt = match tokio::runtime::Builder::new_current_thread()
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => return crate::channel::SendResult::Failed(format!("{e}")),
+        else {
+            return crate::channel::SendResult::Failed("tokio build failed".into());
         };
-
-        match rt.block_on(async {
-            if let Some(tid) = topic_id {
-                if tid == 1 {
-                    bot.send_message(group_id, text).await?;
-                } else {
-                    bot.send_message(group_id, text)
-                        .message_thread_id(ThreadId(MessageId(tid)))
-                        .await?;
-                }
-            }
-            Ok::<(), anyhow::Error>(())
-        }) {
+        match rt.block_on(send_with_topic(&bot, group_id, topic_id, text)) {
             Ok(()) => crate::channel::SendResult::Sent,
             Err(e) => crate::channel::SendResult::Failed(format!("{e}")),
         }
     }
 
-    fn react(&self, _instance_name: &str, emoji: &str) -> crate::channel::SendResult {
-        let s = self.lock().unwrap_or_else(|e| e.into_inner());
-        let bot = s.bot.clone();
-        let group_id = s.group_id;
-        // React needs a message_id — for now use latest from metadata
-        drop(s);
-
-        let emoji_char = map_emoji_name(emoji);
-
-        let _rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => return crate::channel::SendResult::Failed(format!("{e}")),
-        };
-        // React requires message_id which we don't have here — log only
-        let _ = (bot, group_id, emoji_char);
+    fn react(&self, _instance_name: &str, _emoji: &str) -> crate::channel::SendResult {
+        // React requires message_id which we don't have in this context
         crate::channel::SendResult::Failed("react via adapter needs message_id context".into())
     }
 
@@ -347,30 +296,21 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
         text: &str,
     ) -> crate::channel::SendResult {
         let s = self.lock().unwrap_or_else(|e| e.into_inner());
-        let bot = s.bot.clone();
-        let group_id = s.group_id;
+        let (bot, group_id) = (s.bot.clone(), s.group_id);
         drop(s);
-
-        let mid: i32 = match message_id.parse() {
-            Ok(m) => m,
-            Err(_) => {
-                return crate::channel::SendResult::Failed(format!(
-                    "invalid message_id: {message_id}"
-                ))
-            }
+        let Ok(mid) = message_id.parse::<i32>() else {
+            return crate::channel::SendResult::Failed(format!("invalid message_id: {message_id}"));
         };
-
-        let rt = match tokio::runtime::Builder::new_current_thread()
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => return crate::channel::SendResult::Failed(format!("{e}")),
+        else {
+            return crate::channel::SendResult::Failed("tokio build failed".into());
         };
         match rt.block_on(async {
             bot.edit_message_text(group_id, MessageId(mid), text)
-                .await?;
-            Ok::<(), anyhow::Error>(())
+                .await
+                .map(|_| ())
         }) {
             Ok(()) => crate::channel::SendResult::Sent,
             Err(e) => crate::channel::SendResult::Failed(format!("{e}")),

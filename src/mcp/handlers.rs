@@ -194,19 +194,8 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                     let instances: Vec<Value> = agents
                         .iter()
                         .map(|a| {
-                            let name = a["name"].as_str().unwrap_or("");
-                            let meta_path = home.join("metadata").join(format!("{name}.json"));
-                            let meta = std::fs::read_to_string(&meta_path)
-                                .map(|c| serde_json::from_str::<Value>(&c).unwrap_or(json!({})))
-                                .unwrap_or(json!({}));
                             let mut info = a.clone();
-                            if let Some(obj) = info.as_object_mut() {
-                                if let Some(m) = meta.as_object() {
-                                    for (k, v) in m {
-                                        obj.insert(k.clone(), v.clone());
-                                    }
-                                }
-                            }
+                            merge_metadata(&home, a["name"].as_str().unwrap_or(""), &mut info);
                             info
                         })
                         .collect();
@@ -231,13 +220,15 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if let Some(model) = args.get("model").and_then(|v| v.as_str()) {
-                if !model.is_empty() {
-                    if !cmd_args.is_empty() {
-                        cmd_args.push(' ');
-                    }
-                    cmd_args.push_str(&format!("--model {model}"));
+            if let Some(model) = args
+                .get("model")
+                .and_then(|v| v.as_str())
+                .filter(|m| !m.is_empty())
+            {
+                if !cmd_args.is_empty() {
+                    cmd_args.push(' ');
                 }
+                cmd_args.push_str(&format!("--model {model}"));
             }
             let mut work_dir = args
                 .get("working_directory")
@@ -245,9 +236,8 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 .map(String::from)
                 .unwrap_or_else(|| home.join("workspaces").join(name).display().to_string());
 
-            // Create worktree if branch specified and directory is a git repo
-            let wd = std::path::PathBuf::from(&work_dir);
             if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
+                let wd = std::path::PathBuf::from(&work_dir);
                 if let Some(info) = crate::worktree::create(&wd, name, Some(branch)) {
                     work_dir = info.path.display().to_string();
                 }
@@ -259,7 +249,6 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             crate::mcp_config::configure(&wd, command);
 
             let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
-
             let role = args.get("role").and_then(|v| v.as_str()).map(String::from);
             let backend_str = args
                 .get("backend")
@@ -268,13 +257,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
 
             match crate::api::call(
                 &home,
-                &json!({
-                    "method": "spawn",
-                    "params": { "name": name, "command": command, "args": &cmd_args, "working_directory": work_dir }
-                }),
+                &json!({"method": "spawn", "params": {"name": name, "command": command, "args": &cmd_args, "working_directory": work_dir}}),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    // Persist to fleet.yaml
                     let entry = crate::fleet::InstanceYamlEntry {
                         command: command.to_string(),
                         backend: backend_str,
@@ -282,21 +267,14 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                         role,
                     };
                     if let Err(e) = crate::fleet::add_instance_to_yaml(&home, name, &entry) {
-                        eprintln!("[mcp] failed to persist instance to fleet.yaml: {e}");
+                        eprintln!("[mcp] failed to persist to fleet.yaml: {e}");
                     }
-
-                    // Create Telegram topic if channel is configured
                     let topic_id = telegram::create_topic_for_instance(&home, name);
-
-                    // Inject initial task if provided
                     if let Some(ref task_text) = task {
                         std::thread::sleep(std::time::Duration::from_secs(3));
                         let _ = crate::api::call(
                             &home,
-                            &json!({
-                                "method": "inject",
-                                "params": {"name": name, "data": task_text}
-                            }),
+                            &json!({"method": "inject", "params": {"name": name, "data": task_text}}),
                         );
                     }
                     let mut result = json!({"name": name, "command": command});
@@ -314,17 +292,13 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
-            // Use "delete" (not "kill") — removes from configs to prevent respawn
             let _ = crate::api::call(
                 &home,
                 &json!({"method": "delete", "params": {"name": name}}),
             );
-
-            // Remove from fleet.yaml
             if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, name) {
-                eprintln!("[mcp] failed to remove instance from fleet.yaml: {e}");
+                eprintln!("[mcp] failed to remove from fleet.yaml: {e}");
             }
-
             json!({"name": name})
         }
         "start_instance" => {
@@ -332,38 +306,32 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
-            // Re-spawn from saved config
             let fleet_path = home.join("fleet.yaml");
             if !fleet_path.exists() {
-                return json!({"error": "No fleet.yaml — cannot determine instance config"});
+                return json!({"error": "No fleet.yaml"});
             }
             let config = match crate::fleet::FleetConfig::load(&fleet_path) {
                 Ok(c) => c,
-                Err(e) => return json!({"error": format!("fleet.yaml parse error: {e}")}),
+                Err(e) => return json!({"error": format!("fleet.yaml: {e}")}),
             };
             match config.resolve_instance(name) {
                 Some(resolved) => {
                     let mut cmd_args = resolved.args.join(" ");
                     if let Some(ref b) = crate::backend::Backend::from_command(&resolved.command) {
-                        let p = b.preset();
-                        let resume_args = p.resume_mode.args_for(&home, name);
-                        if !resume_args.is_empty() {
+                        let resume = b.preset().resume_mode.args_for(&home, name);
+                        if !resume.is_empty() {
                             if !cmd_args.is_empty() {
                                 cmd_args.push(' ');
                             }
-                            cmd_args.push_str(&resume_args.join(" "));
+                            cmd_args.push_str(&resume.join(" "));
                         }
                     }
                     match crate::api::call(
                         &home,
-                        &json!({
-                            "method": "spawn",
-                            "params": {
-                                "name": name, "command": resolved.command,
-                                "args": cmd_args,
-                                "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
-                            }
-                        }),
+                        &json!({"method": "spawn", "params": {
+                            "name": name, "command": resolved.command, "args": cmd_args,
+                            "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
+                        }}),
                     ) {
                         Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"name": name}),
                         Ok(resp) => {
@@ -379,27 +347,16 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             let name = args["name"].as_str().unwrap_or("");
             match crate::api::call(&home, &json!({"method": "list"})) {
                 Ok(resp) => {
-                    if let Some(agents) = resp["result"]["agents"].as_array() {
-                        match agents.iter().find(|a| a["name"].as_str() == Some(name)) {
-                            Some(agent) => {
-                                let meta_path = home.join("metadata").join(format!("{name}.json"));
-                                let meta = std::fs::read_to_string(&meta_path)
-                                    .map(|c| serde_json::from_str::<Value>(&c).unwrap_or(json!({})))
-                                    .unwrap_or(json!({}));
-                                let mut info = agent.clone();
-                                if let Some(obj) = info.as_object_mut() {
-                                    if let Some(m) = meta.as_object() {
-                                        for (k, v) in m {
-                                            obj.insert(k.clone(), v.clone());
-                                        }
-                                    }
-                                }
-                                json!({"instance": info})
-                            }
-                            None => json!({"error": format!("Instance '{name}' not found")}),
+                    match resp["result"]["agents"]
+                        .as_array()
+                        .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(name)))
+                    {
+                        Some(agent) => {
+                            let mut info = agent.clone();
+                            merge_metadata(&home, name, &mut info);
+                            json!({"instance": info})
                         }
-                    } else {
-                        json!({"error": "failed to list instances"})
+                        None => json!({"error": format!("Instance '{name}' not found")}),
                     }
                 }
                 Err(e) => json!({"error": format!("API unavailable: {e}")}),
@@ -411,27 +368,14 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 None => return json!({"error": "missing 'name'"}),
             };
             let reason = args["reason"].as_str().unwrap_or("manual replacement");
+            let handover = crate::api::call(&home, &json!({"method": "list"})).ok()
+                .and_then(|resp| resp["result"]["agents"].as_array()?.iter()
+                    .find(|a| a["name"].as_str() == Some(name))
+                    .map(|a| format!("Previous instance state: {}, health: {}. Replaced due to: {reason}",
+                        a["agent_state"].as_str().unwrap_or("unknown"), a["health_state"].as_str().unwrap_or("unknown"))))
+                .unwrap_or_else(|| format!("Replaced due to: {reason}"));
 
-            // Collect handover context from VTerm screen buffer before killing
-            let handover = match crate::api::call(&home, &json!({"method": "list"})) {
-                Ok(resp) => {
-                    resp["result"]["agents"].as_array()
-                        .and_then(|agents| agents.iter()
-                            .find(|a| a["name"].as_str() == Some(name)))
-                        .map(|a| {
-                            let state = a["agent_state"].as_str().unwrap_or("unknown");
-                            let health = a["health_state"].as_str().unwrap_or("unknown");
-                            format!("Previous instance state: {state}, health: {health}. Replaced due to: {reason}")
-                        })
-                        .unwrap_or_else(|| format!("Replaced due to: {reason}"))
-                }
-                Err(_) => format!("Replaced due to: {reason}"),
-            };
-
-            // Kill old instance — auto-respawn creates new one
             let _ = crate::api::call(&home, &json!({"method": "kill", "params": {"name": name}}));
-
-            // Queue handover message for the new instance
             let _ = crate::inbox::enqueue(
                 &home,
                 name,
@@ -442,10 +386,8 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                     timestamp: chrono::Utc::now().to_rfc3339(),
                 },
             );
-
             eprintln!("[mcp] replace_instance {name}: {reason}");
-            json!({"name": name, "reason": reason,
-                   "note": "Instance killed. Auto-respawn will create fresh instance with handover context."})
+            json!({"name": name, "reason": reason, "note": "Instance killed. Auto-respawn will create fresh instance with handover context."})
         }
         "set_display_name" => {
             let display_name = args["name"].as_str().unwrap_or("");
@@ -497,28 +439,28 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             ));
             std::fs::create_dir_all(worktree_dir.parent().unwrap_or(&home)).ok();
             let source_path = if source.starts_with('/') || source.starts_with('~') {
-                if let Some(rest) = source.strip_prefix("~/") {
-                    let h = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                    format!("{h}/{rest}")
-                } else {
-                    source.to_string()
-                }
+                source
+                    .strip_prefix("~/")
+                    .map(|rest| {
+                        format!(
+                            "{}/{rest}",
+                            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
+                        )
+                    })
+                    .unwrap_or_else(|| source.to_string())
             } else {
-                // Instance name — look up working directory
-                match crate::api::call(&home, &json!({"method": "list"})) {
-                    Ok(resp) => resp["result"]["agents"]
-                        .as_array()
-                        .and_then(|agents| {
-                            agents
-                                .iter()
-                                .find(|a| a["name"].as_str() == Some(source))
-                                .and_then(|a| a["working_directory"].as_str().map(String::from))
-                        })
-                        .unwrap_or_else(|| source.to_string()),
-                    Err(_) => source.to_string(),
-                }
+                crate::api::call(&home, &json!({"method": "list"}))
+                    .ok()
+                    .and_then(|r| {
+                        r["result"]["agents"]
+                            .as_array()?
+                            .iter()
+                            .find(|a| a["name"].as_str() == Some(source))
+                            .and_then(|a| a["working_directory"].as_str().map(String::from))
+                    })
+                    .unwrap_or_else(|| source.to_string())
             };
-            let output = std::process::Command::new("git")
+            match std::process::Command::new("git")
                 .args([
                     "worktree",
                     "add",
@@ -527,8 +469,8 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                     branch,
                 ])
                 .current_dir(&source_path)
-                .output();
-            match output {
+                .output()
+            {
                 Ok(o) if o.status.success() => {
                     json!({"path": worktree_dir.display().to_string(), "source": source_path, "branch": branch})
                 }
@@ -541,10 +483,10 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 Some(p) => p,
                 None => return json!({"error": "missing 'path'"}),
             };
-            let output = std::process::Command::new("git")
+            match std::process::Command::new("git")
                 .args(["worktree", "remove", "--force", path])
-                .output();
-            match output {
+                .output()
+            {
                 Ok(o) if o.status.success() => json!({"path": path}),
                 Ok(o) => {
                     let _ = std::fs::remove_dir_all(path);
@@ -614,6 +556,20 @@ fn send_to(home: &std::path::Path, from: &str, target: &str, text: &str, kind: &
                 None,
             );
             json!({"target": target, "note": format!("API unavailable: {e}")})
+        }
+    }
+}
+
+/// Load metadata for an instance and merge it into the given JSON value.
+fn merge_metadata(home: &std::path::Path, name: &str, info: &mut Value) {
+    let meta_path = home.join("metadata").join(format!("{name}.json"));
+    if let Ok(meta) = std::fs::read_to_string(&meta_path)
+        .and_then(|c| serde_json::from_str::<Value>(&c).map_err(std::io::Error::other))
+    {
+        if let (Some(obj), Some(m)) = (info.as_object_mut(), meta.as_object()) {
+            for (k, v) in m {
+                obj.insert(k.clone(), v.clone());
+            }
         }
     }
 }

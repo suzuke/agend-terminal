@@ -101,17 +101,14 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     let preset = b.preset();
     let name = format!("capture-{}", b.name());
     let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-
     eprintln!(
-        "[capture] Spawning {} ({} {}) for {}s...",
+        "[capture] Spawning {} ({} {}) for {seconds}s...",
         b.name(),
         preset.command,
-        args.join(" "),
-        seconds
+        args.join(" ")
     );
 
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: &name,
@@ -129,19 +126,15 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
         &registry,
     )?;
 
-    eprintln!("[capture] Waiting {}s for output...", seconds);
+    eprintln!("[capture] Waiting {seconds}s for output...");
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 
-    // Dump VTerm screen (raw ANSI)
-    let (_raw_dump, stripped) = {
+    let stripped = {
         let reg = registry.lock().unwrap();
         match reg.get(&name) {
             Some(handle) => {
-                let core = handle.core.lock().unwrap();
-                let raw = core.vterm.dump_screen();
-                let raw_str = String::from_utf8_lossy(&raw).to_string();
-                let stripped = agent::strip_ansi_pub(&raw_str);
-                (raw_str, stripped)
+                let raw = handle.core.lock().unwrap().vterm.dump_screen();
+                agent::strip_ansi_pub(&String::from_utf8_lossy(&raw))
             }
             None => {
                 eprintln!("[capture] Agent exited before capture");
@@ -150,29 +143,21 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
         }
     };
 
-    // Kill
     {
         let reg = registry.lock().unwrap();
-        if let Some(handle) = reg.get(&name) {
-            let mut child = handle.child.lock().unwrap();
-            let _ = child.kill();
+        if let Some(h) = reg.get(&name) {
+            let _ = h.child.lock().unwrap().kill();
         }
     }
 
-    // Print results
-    println!(
-        "=== {} VTerm Screen (ANSI stripped, {}x40) ===",
-        b.name(),
-        120
-    );
+    println!("=== {} VTerm Screen (ANSI stripped, 120x40) ===", b.name());
     for (i, line) in stripped.lines().enumerate() {
-        let trimmed = line.trim_end();
-        if !trimmed.is_empty() {
-            println!("{:>3}| {}", i + 1, trimmed);
+        let t = line.trim_end();
+        if !t.is_empty() {
+            println!("{:>3}| {}", i + 1, t);
         }
     }
     println!("=== End {} ===", b.name());
-
     Ok(())
 }
 
@@ -200,12 +185,13 @@ pub fn run_tests(subcmd: &str, home: &Path) -> anyhow::Result<()> {
 fn test_attach(_home: &Path) -> anyhow::Result<()> {
     eprintln!("[test:attach] Spawning bash...");
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let args: Vec<String> = vec![];
 
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: "test-attach",
             command: "/bin/bash",
-            args: &[],
+            args: &args,
             cols: 80,
             rows: 24,
             env: None,
@@ -326,20 +312,12 @@ fn test_api(home: &Path) -> anyhow::Result<()> {
 pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     println!("AgEnD Terminal Doctor\n");
 
-    print!("  Home directory: {}", home.display());
-    if home.exists() {
-        println!(" ✓");
-    } else {
-        println!(" ✗ (not found)");
-    }
-
-    let env_path = home.join(".env");
-    print!("  .env file: {}", env_path.display());
-    if env_path.exists() {
-        println!(" ✓");
-    } else {
-        println!(" - (optional)");
-    }
+    let check = |label: &str, path: &Path, missing: &str| {
+        print!("  {label}: {}", path.display());
+        println!("{}", if path.exists() { " ✓" } else { missing });
+    };
+    check("Home directory", home, " ✗ (not found)");
+    check(".env file", &home.join(".env"), " - (optional)");
 
     let fleet_path = home.join("fleet.yaml");
     print!("  fleet.yaml: {}", fleet_path.display());
@@ -348,12 +326,8 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
             Ok(config) => {
                 println!(" ✓ ({} instances)", config.instances.len());
                 for name in config.instance_names() {
-                    if let Some(resolved) = config.resolve_instance(&name) {
-                        println!(
-                            "    {name}: {} {}",
-                            resolved.command,
-                            resolved.args.join(" ")
-                        );
+                    if let Some(r) = config.resolve_instance(&name) {
+                        println!("    {name}: {} {}", r.command, r.args.join(" "));
                     }
                 }
             }
@@ -370,11 +344,15 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(".sock") && name != "api.sock" {
                 let agent = &name[..name.len() - 5];
-                let path = entry.path().display().to_string();
-                match std::os::unix::net::UnixStream::connect(&path) {
-                    Ok(_) => println!("    {agent} ✓ (socket responsive)"),
-                    Err(_) => println!("    {agent} ✗ (socket stale)"),
-                }
+                let ok = std::os::unix::net::UnixStream::connect(entry.path()).is_ok();
+                println!(
+                    "    {agent} {}",
+                    if ok {
+                        "✓ (socket responsive)"
+                    } else {
+                        "✗ (socket stale)"
+                    }
+                );
                 count += 1;
             }
         }
@@ -385,22 +363,20 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
 
     println!("\n  Backend binaries:");
     for b in backend::Backend::all() {
-        let name = b.name();
-        let preset = b.preset();
+        let (name, cmd) = (b.name(), b.preset().command);
         if b.is_installed() {
             let version = b.get_version().unwrap_or_else(|| "?".into());
-            let calibrated = b.calibrated_version();
-            let version_note = if version != calibrated {
-                format!(" (calibrated: {calibrated}, patterns may need update)")
+            let cal = b.calibrated_version();
+            let note = if version != cal {
+                format!(" (calibrated: {cal}, patterns may need update)")
             } else {
                 String::new()
             };
-            println!("    {name} ({}) v{version} ✓{version_note}", preset.command);
+            println!("    {name} ({cmd}) v{version} ✓{note}");
         } else {
-            println!("    {name} ({}) - (not in PATH)", preset.command);
+            println!("    {name} ({cmd}) - (not in PATH)");
         }
     }
-
     Ok(())
 }
 
@@ -410,58 +386,35 @@ pub fn run_demo() -> anyhow::Result<()> {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    // Demo always uses bash for speed and reliability.
-    // Real AI agent orchestration: use `agend-terminal start` with fleet.yaml.
-    let (cmd, args, label) = ("/bin/bash", vec![], "Live Preview");
-
     let registry: agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let home = std::env::temp_dir().join(format!("agend-demo-{}", std::process::id()));
     std::fs::create_dir_all(&home)?;
 
-    // Clear screen
     print!("\x1b[2J\x1b[H");
     std::io::stdout().flush().ok();
-
-    println!("  AgEnD Terminal — Live Multi-Agent Demo ({label})\n");
+    println!("  AgEnD Terminal — Live Multi-Agent Demo (Live Preview)\n");
     println!("  Spawning alice and bob...");
 
-    let crash_tx = {
-        let (tx, _rx) = crossbeam::channel::unbounded::<String>();
-        tx
-    };
-
-    agent::spawn_agent(
-        &agent::SpawnConfig {
-            name: "alice",
-            command: cmd,
-            args: &args,
-            cols: 60,
-            rows: 8,
-            env: None,
-            working_dir: None,
-            submit_key: "\r",
-            home: Some(&home),
-            crash_tx: Some(crash_tx.clone()),
-            shutdown: None,
-        },
-        &registry,
-    )?;
-    agent::spawn_agent(
-        &agent::SpawnConfig {
-            name: "bob",
-            command: cmd,
-            args: &args,
-            cols: 60,
-            rows: 8,
-            env: None,
-            working_dir: None,
-            submit_key: "\r",
-            home: Some(&home),
-            crash_tx: Some(crash_tx),
-            shutdown: None,
-        },
-        &registry,
-    )?;
+    let (crash_tx, _rx) = crossbeam::channel::unbounded::<String>();
+    let args: Vec<String> = vec![];
+    for name in &["alice", "bob"] {
+        agent::spawn_agent(
+            &agent::SpawnConfig {
+                name,
+                command: "/bin/bash",
+                args: &args,
+                cols: 60,
+                rows: 8,
+                env: None,
+                working_dir: None,
+                submit_key: "\r",
+                home: Some(&home),
+                crash_tx: Some(crash_tx.clone()),
+                shutdown: None,
+            },
+            &registry,
+        )?;
+    }
 
     println!("  ✓ Both agents running\n");
     std::thread::sleep(Duration::from_secs(2));
@@ -594,8 +547,7 @@ fn draw_split_screen(registry: &agent::AgentRegistry) {
 
 /// Truncate a string to at most `max_chars` characters (char-safe).
 fn truncate_str(s: &str, max_chars: usize) -> String {
-    let truncated: String = s.chars().take(max_chars).collect();
-    truncated
+    s.chars().take(max_chars).collect()
 }
 
 fn get_screen_lines(

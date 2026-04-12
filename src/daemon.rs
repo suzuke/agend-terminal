@@ -240,30 +240,25 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     tracing::info!(count = agents.len(), "starting agents");
 
     for (name, command, args, env, working_dir, submit_key) in &agents {
-        // Derive worktree_source: if working_dir contains .worktrees/, the repo root is 2 levels up
         let worktree_source = working_dir.as_ref().and_then(|wd| {
-            let wd_str = wd.display().to_string();
-            if wd_str.contains(".worktrees/") {
+            wd.display().to_string().contains(".worktrees/").then(|| {
                 wd.parent()
                     .and_then(|p| p.parent())
                     .map(|p| p.to_path_buf())
-            } else {
-                None
-            }
+            })?
         });
-        let config = AgentConfig {
-            name: name.clone(),
-            command: command.clone(),
-            args: args.clone(),
-            env: env.clone(),
-            working_dir: working_dir.clone(),
-            worktree_source,
-            submit_key: submit_key.clone(),
-        };
-        configs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(name.clone(), config);
+        configs.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            name.clone(),
+            AgentConfig {
+                name: name.clone(),
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+                working_dir: working_dir.clone(),
+                worktree_source,
+                submit_key: submit_key.clone(),
+            },
+        );
 
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
         agent::spawn_agent(
@@ -289,7 +284,6 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name(format!("{n}_tui_server"))
             .spawn(move || serve_agent_tui(&n, &sock, &reg))?;
-
         if agents.len() > 1 {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
@@ -377,7 +371,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         {
             let reg = agent::lock_registry(&registry);
             let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
-            let snapshots: Vec<crate::snapshot::AgentSnapshot> = reg
+            let snapshots: Vec<_> = reg
                 .iter()
                 .map(|(name, handle)| {
                     let (agent_state, health_state) = handle
@@ -416,15 +410,16 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
             for (name, config) in cfgs.iter() {
                 if let Some(ref dir) = config.working_dir {
-                    let statusline = dir.join("statusline.json");
-                    if statusline.exists() {
-                        if let Ok(content) = std::fs::read_to_string(&statusline) {
-                            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
-                                if let Some(sid) = data.get("session_id").and_then(|v| v.as_str()) {
-                                    crate::backend::save_session_id(home, name, sid);
-                                }
-                            }
-                        }
+                    if let Some(sid) = std::fs::read_to_string(dir.join("statusline.json"))
+                        .ok()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                        .and_then(|d| {
+                            d.get("session_id")
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                        })
+                    {
+                        crate::backend::save_session_id(home, name, &sid);
                     }
                 }
             }
@@ -620,11 +615,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
 /// Send a notification to Telegram (instance topic or general).
 fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
-    let fleet_path = home.join("fleet.yaml");
-    if !fleet_path.exists() {
-        return;
-    }
-    let config = match crate::fleet::FleetConfig::load(&fleet_path) {
+    let config = match crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -633,48 +624,41 @@ fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
             bot_token_env,
             group_id,
             ..
-        }) => {
-            let token = match std::env::var(bot_token_env) {
-                Ok(t) => t,
-                Err(_) => return,
-            };
-            let topic_id = config
-                .instances
-                .get(instance_name)
-                .and_then(|inst| inst.topic_id);
-            (token, *group_id, topic_id)
-        }
+        }) => match std::env::var(bot_token_env) {
+            Ok(t) => (
+                t,
+                *group_id,
+                config.instances.get(instance_name).and_then(|i| i.topic_id),
+            ),
+            Err(_) => return,
+        },
         None => return,
     };
 
     let text = text.to_string();
-    // Fire-and-forget in a thread to avoid blocking daemon loop
     std::thread::Builder::new()
         .name("tg_notify".into())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-            {
-                Ok(rt) => rt,
-                Err(_) => return,
+            else {
+                return;
             };
             if let Err(_e) = rt.block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let chat_id = teloxide::types::ChatId(group_id);
-                if let Some(tid) = topic_id {
-                    if tid == 1 {
-                        bot.send_message(chat_id, &text).await?;
-                    } else {
+                match topic_id {
+                    Some(tid) if tid != 1 => {
                         bot.send_message(chat_id, &text)
                             .message_thread_id(teloxide::types::ThreadId(
                                 teloxide::types::MessageId(tid),
                             ))
                             .await?;
                     }
-                } else {
-                    // No topic — send to general
-                    bot.send_message(chat_id, &text).await?;
+                    _ => {
+                        bot.send_message(chat_id, &text).await?;
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             }) {
@@ -689,21 +673,13 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
     use cron::Schedule;
     use std::str::FromStr;
 
-    let store_path = home.join("schedules.json");
-    if !store_path.exists() {
-        return;
-    }
-
-    let content = match std::fs::read_to_string(&store_path) {
-        Ok(c) => c,
-        Err(_) => return,
+    let store: serde_json::Value = match std::fs::read_to_string(home.join("schedules.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+    {
+        Some(v) => v,
+        None => return,
     };
-
-    let store: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
     let schedules = match store["schedules"].as_array() {
         Some(s) => s,
         None => return,
@@ -718,20 +694,14 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
         .unwrap_or_else(|| now - chrono::Duration::seconds(10));
 
     let mut any_triggered = false;
-
     for sched in schedules {
-        let enabled = sched["enabled"].as_bool().unwrap_or(true);
-        if !enabled {
+        if !sched["enabled"].as_bool().unwrap_or(true) {
             continue;
         }
-
         let cron_expr = match sched["cron"].as_str() {
             Some(c) => c,
             None => continue,
         };
-
-        // cron crate needs 6-field format (sec min hour dom month dow)
-        // User provides 5-field (min hour dom month dow), prepend "0 " for seconds
         let full_expr = if cron_expr.split_whitespace().count() == 5 {
             format!("0 {cron_expr}")
         } else {
@@ -741,60 +711,58 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
         let schedule = match Schedule::from_str(&full_expr) {
             Ok(s) => s,
             Err(e) => {
-                tracing::warn!(cron = cron_expr, error = %e, "invalid cron expression");
+                tracing::warn!(cron = cron_expr, error = %e, "invalid cron");
                 continue;
             }
         };
-
-        // Check if there's a trigger between last_check and now
-        let should_trigger = schedule.after(&last_check).take(1).any(|next| next <= now);
-
-        if should_trigger {
-            let sched_id = sched["id"].as_str().unwrap_or("");
-            let target = sched["target"].as_str().unwrap_or("");
-            let message = sched["message"].as_str().unwrap_or("");
-            let label = sched["label"].as_str().unwrap_or("(unnamed)");
-
-            tracing::info!(label, target, message, "schedule triggered");
-            crate::event_log::log(
-                home,
-                "schedule_trigger",
-                target,
-                &format!("{label}: {message}"),
-            );
-
-            // Inject message to target agent via registry
-            let reg = agent::lock_registry(registry);
-            let status = if let Some(handle) = reg.get(target) {
-                match agent::inject_to_agent(handle, message.as_bytes()) {
-                    Ok(()) => "ok",
-                    Err(e) => {
-                        tracing::warn!(error = %e, "schedule inject failed");
-                        "inject_failed"
-                    }
-                }
-            } else {
-                // Fallback: enqueue to inbox
-                let _ = crate::inbox::enqueue(
-                    home,
-                    target,
-                    crate::inbox::InboxMessage {
-                        from: "system:schedule".to_string(),
-                        text: message.to_string(),
-                        kind: Some("schedule".to_string()),
-                        timestamp: now.to_rfc3339(),
-                    },
-                );
-                "ok_inbox"
-            };
-            drop(reg);
-
-            // Record run history
-            if !sched_id.is_empty() {
-                crate::schedules::record_run(home, sched_id, status);
-            }
-            any_triggered = true;
+        if !schedule.after(&last_check).take(1).any(|next| next <= now) {
+            continue;
         }
+
+        let (sched_id, target) = (
+            sched["id"].as_str().unwrap_or(""),
+            sched["target"].as_str().unwrap_or(""),
+        );
+        let (message, label) = (
+            sched["message"].as_str().unwrap_or(""),
+            sched["label"].as_str().unwrap_or("(unnamed)"),
+        );
+
+        tracing::info!(label, target, message, "schedule triggered");
+        crate::event_log::log(
+            home,
+            "schedule_trigger",
+            target,
+            &format!("{label}: {message}"),
+        );
+
+        let reg = agent::lock_registry(registry);
+        let status = if let Some(handle) = reg.get(target) {
+            match agent::inject_to_agent(handle, message.as_bytes()) {
+                Ok(()) => "ok",
+                Err(e) => {
+                    tracing::warn!(error = %e, "schedule inject failed");
+                    "inject_failed"
+                }
+            }
+        } else {
+            let _ = crate::inbox::enqueue(
+                home,
+                target,
+                crate::inbox::InboxMessage {
+                    from: "system:schedule".to_string(),
+                    text: message.to_string(),
+                    kind: Some("schedule".to_string()),
+                    timestamp: now.to_rfc3339(),
+                },
+            );
+            "ok_inbox"
+        };
+        drop(reg);
+        if !sched_id.is_empty() {
+            crate::schedules::record_run(home, sched_id, status);
+        }
+        any_triggered = true;
     }
 
     if any_triggered || now.signed_duration_since(last_check).num_seconds() >= 10 {
@@ -804,63 +772,55 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
 
 /// Check CI watch configs and inject failure logs to agents when CI fails.
 fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
-    let ci_dir = home.join("ci-watches");
-    let entries = match std::fs::read_dir(&ci_dir) {
+    let entries = match std::fs::read_dir(home.join("ci-watches")) {
         Ok(e) => e,
         Err(_) => return,
     };
-
     for entry in entries.flatten() {
         let path = entry.path();
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let watch: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let repo = match watch["repo"].as_str() {
-            Some(r) => r.to_string(),
+        let watch: serde_json::Value = match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+        {
+            Some(v) => v,
             None => continue,
+        };
+        let (repo, instance) = match (watch["repo"].as_str(), watch["instance"].as_str()) {
+            (Some(r), Some(i)) => (r.to_string(), i.to_string()),
+            _ => continue,
         };
         let branch = watch["branch"].as_str().unwrap_or("main").to_string();
         let interval = watch["interval_secs"].as_u64().unwrap_or(60);
-        let instance = match watch["instance"].as_str() {
-            Some(i) => i.to_string(),
-            None => continue,
-        };
         let last_run_id = watch["last_run_id"].as_u64();
 
-        // Throttle: check file mtime to avoid polling too frequently
+        // Throttle via mtime
         if let Ok(meta) = std::fs::metadata(&path) {
-            if let Ok(modified) = meta.modified() {
-                let age = modified.elapsed().unwrap_or_default();
-                if age.as_secs() < interval {
-                    continue;
-                }
+            if meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .map(|age| age.as_secs() < interval)
+                .unwrap_or(false)
+            {
+                continue;
             }
         }
-
-        // Touch the file to update mtime (throttle next check)
         let _ = std::fs::write(
             &path,
             serde_json::to_string_pretty(&watch).unwrap_or_default(),
         );
 
-        // Spawn a thread for the HTTP call to avoid blocking the daemon tick
         let home = home.to_path_buf();
         let watch_path = path.clone();
         let registry = Arc::clone(registry);
         std::thread::Builder::new()
             .name("ci_check".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                {
-                    Ok(rt) => rt,
-                    Err(_) => return,
+                else {
+                    return;
                 };
                 if let Err(e) = rt.block_on(ci_check_repo(
                     &home,
@@ -891,52 +851,53 @@ async fn ci_check_repo(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    let url =
-        format!("https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=1");
-    let mut req = client
-        .get(&url)
-        .header("User-Agent", "agend-terminal")
-        .header("Accept", "application/vnd.github+json");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        req = req.header("Authorization", format!("Bearer {token}"));
-    }
-    let resp: serde_json::Value = req.send().await?.json().await?;
+    let gh_get = |url: &str| {
+        let mut req = client
+            .get(url)
+            .header("User-Agent", "agend-terminal")
+            .header("Accept", "application/vnd.github+json");
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        req
+    };
+
+    let resp: serde_json::Value = gh_get(&format!(
+        "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=1"
+    ))
+    .send()
+    .await?
+    .json()
+    .await?;
     let run = match resp["workflow_runs"].as_array().and_then(|a| a.first()) {
         Some(r) => r,
         None => return Ok(()),
     };
     let run_id = run["id"].as_u64().unwrap_or(0);
-    let conclusion = run["conclusion"].as_str().unwrap_or("");
-
-    if conclusion != "failure" || Some(run_id) == last_run_id {
+    if run["conclusion"].as_str() != Some("failure") || Some(run_id) == last_run_id {
         return Ok(());
     }
 
-    // Fetch failed jobs
-    let jobs_url = format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs");
-    let mut req = client
-        .get(&jobs_url)
-        .header("User-Agent", "agend-terminal")
-        .header("Accept", "application/vnd.github+json");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        req = req.header("Authorization", format!("Bearer {token}"));
-    }
-    let jobs_resp: serde_json::Value = req.send().await?.json().await?;
+    let jobs_resp: serde_json::Value = gh_get(&format!(
+        "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
+    ))
+    .send()
+    .await?
+    .json()
+    .await?;
     let failure_summary = jobs_resp["jobs"]
         .as_array()
         .and_then(|jobs| {
             jobs.iter().find_map(|job| {
                 job["steps"].as_array().and_then(|steps| {
                     steps.iter().find_map(|step| {
-                        if step["conclusion"].as_str() == Some("failure") {
-                            Some(format!(
+                        (step["conclusion"].as_str() == Some("failure")).then(|| {
+                            format!(
                                 "{} / {}",
                                 job["name"].as_str().unwrap_or("?"),
                                 step["name"].as_str().unwrap_or("?")
-                            ))
-                        } else {
-                            None
-                        }
+                            )
+                        })
                     })
                 })
             })
@@ -961,7 +922,7 @@ async fn ci_check_repo(
         );
     }
 
-    // Update last_run_id in watch config
+    // Update last_run_id
     if let Ok(content) = std::fs::read_to_string(watch_path) {
         if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
             watch["last_run_id"] = serde_json::json!(run_id);
@@ -971,6 +932,5 @@ async fn ci_check_repo(
             );
         }
     }
-
     Ok(())
 }
