@@ -165,7 +165,7 @@ enum Commands {
     Mcp,
     /// Capture backend output for debugging
     Capture {
-        /// Backend name (claude-code, kiro-cli, codex, open-code, gemini)
+        /// Backend name (claude, kiro-cli, codex, opencode, gemini)
         #[arg(long)]
         backend: String,
         /// Capture duration in seconds

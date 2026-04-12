@@ -40,7 +40,7 @@ fn default_mode() -> String {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceDefaults {
-    /// Backend preset name (e.g., "claude-code", "kiro-cli").
+    /// Backend preset name (e.g., "claude", "kiro-cli").
     pub backend: Option<Backend>,
     pub command: Option<String>,
     #[serde(default)]
@@ -338,7 +338,7 @@ mod tests {
             &dir,
             r#"
 defaults:
-  backend: claude-code
+  backend: claude
 instances:
   test:
     command: /bin/bash
@@ -367,7 +367,7 @@ instances:
             &dir,
             r#"
 defaults:
-  backend: claude-code
+  backend: claude
 instances:
   test:
     command: claude
@@ -434,7 +434,7 @@ instances:
 "#,
         );
         let entry = InstanceYamlEntry {
-            backend: Some("claude-code".to_string()),
+            backend: Some("claude".to_string()),
             working_directory: Some("/tmp/work".to_string()),
             role: Some("developer".to_string()),
         };
@@ -478,7 +478,7 @@ instances:
         fs::create_dir_all(&dir).ok();
         // No fleet.yaml exists yet
         let entry = InstanceYamlEntry {
-            backend: Some("claude-code".to_string()),
+            backend: Some("claude".to_string()),
             working_directory: None,
             role: None,
         };
@@ -620,7 +620,7 @@ instances:
         write_fleet(&dir, "instances: {}\n");
 
         let entry = InstanceYamlEntry {
-            backend: Some("claude-code".to_string()),
+            backend: Some("claude".to_string()),
             working_directory: None,
             role: Some("tester".to_string()),
         };
@@ -817,10 +817,10 @@ instances:
             &path,
             r#"instances:
   alice:
-    backend: claude-code
+    backend: claude
     topic_id: 229
   general:
-    backend: claude-code
+    backend: claude
     topic_id: 1
 "#,
         )
@@ -846,7 +846,7 @@ instances:
             &path,
             r#"instances:
   dev:
-    backend: claude-code
+    backend: claude
 "#,
         )
         .ok();
@@ -864,10 +864,10 @@ instances:
             &path,
             r#"instances:
   alice:
-    backend: claude-code
+    backend: claude
     topic_id: 229
   bob:
-    backend: claude-code
+    backend: claude
     topic_id: 300
 "#,
         )

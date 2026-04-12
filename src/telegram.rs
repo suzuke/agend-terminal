@@ -487,7 +487,7 @@ mod tests {
     fn resolve_topic_reloads_from_fleet_yaml() {
         let home = tmp_home("resolve_reload");
         let yaml = r#"defaults:
-  backend: claude-code
+  backend: claude
 instances:
   alice:
     role: "Test"

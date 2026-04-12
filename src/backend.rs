@@ -2,14 +2,18 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Known backend presets.
+/// Known backend presets. Serde names match the actual CLI command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "kebab-case")]
 pub enum Backend {
+    #[serde(rename = "claude")]
     ClaudeCode,
+    #[serde(rename = "kiro-cli")]
     KiroCli,
+    #[serde(rename = "codex")]
     Codex,
+    #[serde(rename = "opencode")]
     OpenCode,
+    #[serde(rename = "gemini")]
     Gemini,
 }
 
@@ -212,13 +216,13 @@ impl Backend {
         ]
     }
 
-    /// Kebab-case name for this backend.
+    /// Display name matching the CLI command.
     pub fn name(&self) -> &'static str {
         match self {
-            Backend::ClaudeCode => "claude-code",
+            Backend::ClaudeCode => "claude",
             Backend::KiroCli => "kiro-cli",
             Backend::Codex => "codex",
-            Backend::OpenCode => "open-code",
+            Backend::OpenCode => "opencode",
             Backend::Gemini => "gemini",
         }
     }
@@ -342,10 +346,10 @@ mod tests {
 
     #[test]
     fn backend_name_roundtrip() {
-        assert_eq!(Backend::ClaudeCode.name(), "claude-code");
+        assert_eq!(Backend::ClaudeCode.name(), "claude");
         assert_eq!(Backend::KiroCli.name(), "kiro-cli");
         assert_eq!(Backend::Codex.name(), "codex");
-        assert_eq!(Backend::OpenCode.name(), "open-code");
+        assert_eq!(Backend::OpenCode.name(), "opencode");
         assert_eq!(Backend::Gemini.name(), "gemini");
     }
 

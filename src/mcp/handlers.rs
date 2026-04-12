@@ -818,7 +818,7 @@ mod tests {
     fn get_submit_key_from_fleet() {
         let home = tmp_home("submit_key_fleet");
         let yaml = r#"defaults:
-  backend: claude-code
+  backend: claude
 instances:
   dev:
     role: "Developer"
