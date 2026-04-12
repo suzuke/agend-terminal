@@ -280,7 +280,10 @@ mod tests {
         assert_eq!(Backend::from_command("gemini"), Some(Backend::Gemini));
         // Case insensitive
         assert_eq!(Backend::from_command("Claude"), Some(Backend::ClaudeCode));
-        assert_eq!(Backend::from_command("/usr/bin/claude"), Some(Backend::ClaudeCode));
+        assert_eq!(
+            Backend::from_command("/usr/bin/claude"),
+            Some(Backend::ClaudeCode)
+        );
     }
 
     #[test]
@@ -307,7 +310,10 @@ mod tests {
     #[test]
     fn resume_mode_types() {
         let claude = Backend::ClaudeCode.preset();
-        assert!(matches!(claude.resume_mode, ResumeMode::SavedSession { .. }));
+        assert!(matches!(
+            claude.resume_mode,
+            ResumeMode::SavedSession { .. }
+        ));
 
         let kiro = Backend::KiroCli.preset();
         assert!(matches!(kiro.resume_mode, ResumeMode::ContinueInCwd { .. }));
@@ -319,7 +325,10 @@ mod tests {
         assert!(matches!(gemini.resume_mode, ResumeMode::Fixed { .. }));
 
         let opencode = Backend::OpenCode.preset();
-        assert!(matches!(opencode.resume_mode, ResumeMode::ContinueInCwd { .. }));
+        assert!(matches!(
+            opencode.resume_mode,
+            ResumeMode::ContinueInCwd { .. }
+        ));
     }
 
     #[test]
@@ -345,7 +354,9 @@ mod tests {
 
     #[test]
     fn resume_mode_fixed_args() {
-        let mode = ResumeMode::Fixed { args: &["--resume", "latest"] };
+        let mode = ResumeMode::Fixed {
+            args: &["--resume", "latest"],
+        };
         let args = mode.args_for(std::path::Path::new("/tmp"), "test");
         assert_eq!(args, vec!["--resume".to_string(), "latest".to_string()]);
     }
@@ -361,7 +372,11 @@ mod tests {
     fn preset_ready_pattern_nonempty() {
         for backend in Backend::all() {
             let preset = backend.preset();
-            assert!(!preset.ready_pattern.is_empty(), "Backend {:?} has empty ready_pattern", backend);
+            assert!(
+                !preset.ready_pattern.is_empty(),
+                "Backend {:?} has empty ready_pattern",
+                backend
+            );
         }
     }
 
@@ -371,7 +386,11 @@ mod tests {
             let version = backend.calibrated_version();
             assert!(!version.is_empty());
             // Should look like a semver: at least one dot
-            assert!(version.contains('.'), "Version {version} for {:?} doesn't look like semver", backend);
+            assert!(
+                version.contains('.'),
+                "Version {version} for {:?} doesn't look like semver",
+                backend
+            );
         }
     }
 }

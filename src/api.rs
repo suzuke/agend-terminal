@@ -130,7 +130,7 @@ fn handle_session(
                         })
                     })
                     .collect();
-                json!({"ok": true, "result": {"agents": agents}})
+                json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
             }
             "inject" => {
                 let name = params["name"].as_str().unwrap_or("");
@@ -289,6 +289,26 @@ fn handle_session(
                 }
                 json!({"ok": true})
             }
+            "status" => match crate::snapshot::load(home) {
+                Some(snapshot) => {
+                    json!({"ok": true, "result": {
+                        "protocol_version": crate::framing::PROTOCOL_VERSION,
+                        "timestamp": snapshot.timestamp,
+                        "agents": snapshot.agents.iter().map(|a| {
+                            json!({
+                                "name": a.name,
+                                "command": a.command,
+                                "args": a.args,
+                                "working_dir": a.working_dir,
+                                "submit_key": a.submit_key,
+                                "health_state": a.health_state,
+                                "agent_state": a.agent_state,
+                            })
+                        }).collect::<Vec<_>>()
+                    }})
+                }
+                None => json!({"ok": true, "result": {"agents": [], "timestamp": null}}),
+            },
             "shutdown" => {
                 eprintln!("[api] shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

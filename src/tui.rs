@@ -2,10 +2,10 @@
 //!
 //! Ctrl+B d to detach. Agent keeps running.
 
-use crate::framing::{self, TAG_DATA};
+use crate::framing::{self, PROTOCOL_VERSION, TAG_DATA};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
 /// RAII guard for crossterm raw mode.
@@ -18,8 +18,21 @@ impl Drop for RawModeGuard {
 
 /// Connect to agent socket, enter raw mode, bridge terminal.
 pub fn attach(socket_path: &str) -> anyhow::Result<()> {
-    let stream = UnixStream::connect(socket_path)
+    let mut stream = UnixStream::connect(socket_path)
         .map_err(|e| anyhow::anyhow!("Failed to connect to {socket_path}: {e}"))?;
+
+    // Read protocol version byte from server
+    let mut version_buf = [0u8; 1];
+    stream
+        .read_exact(&mut version_buf)
+        .map_err(|e| anyhow::anyhow!("Failed to read protocol version: {e}"))?;
+    if version_buf[0] != PROTOCOL_VERSION {
+        anyhow::bail!(
+            "Protocol version mismatch: server={} client={}",
+            version_buf[0],
+            PROTOCOL_VERSION
+        );
+    }
 
     terminal::enable_raw_mode()?;
     let _guard = RawModeGuard;

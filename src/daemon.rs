@@ -45,6 +45,14 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
         };
         eprintln!("[{name}] TUI client connected");
 
+        // Protocol version handshake: send version byte before any framed data
+        if stream.write_all(&[framing::PROTOCOL_VERSION]).is_err() {
+            continue;
+        }
+        if stream.flush().is_err() {
+            continue;
+        }
+
         let (rx, pty_writer, pty_master, core) = {
             let reg = agent::lock_registry(registry);
             let agent = match reg.get(name) {
@@ -210,6 +218,17 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     write_daemon_id(&run);
     eprintln!("[daemon] run dir: {}", run.display());
 
+    // Check for previous snapshot if fleet.yaml doesn't exist
+    if !home.join("fleet.yaml").exists() {
+        if let Some(snapshot) = crate::snapshot::load(home) {
+            eprintln!(
+                "[daemon] previous snapshot found ({} agents, {})",
+                snapshot.agents.len(),
+                snapshot.timestamp
+            );
+        }
+    }
+
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // Crash channel for auto-respawn
@@ -354,6 +373,42 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        // Periodic snapshot: save fleet state
+        {
+            let reg = agent::lock_registry(&registry);
+            let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
+            let snapshots: Vec<crate::snapshot::AgentSnapshot> = reg
+                .iter()
+                .map(|(name, handle)| {
+                    let (agent_state, health_state) = handle
+                        .core
+                        .lock()
+                        .map(|c| {
+                            (
+                                c.state.get_state().display_name().to_string(),
+                                c.health.state.display_name().to_string(),
+                            )
+                        })
+                        .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
+                    let cfg = cfgs.get(name);
+                    crate::snapshot::AgentSnapshot {
+                        name: name.clone(),
+                        command: handle.command.clone(),
+                        args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
+                        working_dir: cfg
+                            .and_then(|c| c.working_dir.as_ref())
+                            .map(|p| p.display().to_string()),
+                        submit_key: handle.submit_key.clone(),
+                        health_state,
+                        agent_state,
+                    }
+                })
+                .collect();
+            drop(cfgs);
+            drop(reg);
+            crate::snapshot::save(home, &snapshots);
         }
 
         check_schedules(home, &registry);
