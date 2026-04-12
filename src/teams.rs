@@ -35,7 +35,10 @@ pub fn create(home: &Path, args: &Value) -> Value {
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
     let members: Vec<String> = match args["members"].as_array() {
-        Some(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
         None => return serde_json::json!({"error": "missing 'members'"}),
     };
     let mut store = load(home);
@@ -92,7 +95,8 @@ pub fn update(home: &Path, args: &Value) -> Value {
                 }
             }
             if let Some(remove) = args["remove"].as_array() {
-                let to_remove: Vec<String> = remove.iter()
+                let to_remove: Vec<String> = remove
+                    .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
                 team.members.retain(|m| !to_remove.contains(m));
@@ -112,7 +116,12 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("agend-teams-test-{}-{}-{}", std::process::id(), name, id));
+        let dir = std::env::temp_dir().join(format!(
+            "agend-teams-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
         std::fs::create_dir_all(&dir).ok();
         dir
     }
@@ -120,12 +129,18 @@ mod tests {
     #[test]
     fn test_create_list_update_delete() {
         let home = tmp_home("crud");
-        let r = create(&home, &serde_json::json!({"name": "devs", "members": ["a", "b"]}));
+        let r = create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["a", "b"]}),
+        );
         assert_eq!(r["status"], "created");
 
         let listed = list(&home);
         assert_eq!(listed["teams"].as_array().expect("arr").len(), 1);
-        assert_eq!(listed["teams"][0]["members"].as_array().expect("m").len(), 2);
+        assert_eq!(
+            listed["teams"][0]["members"].as_array().expect("m").len(),
+            2
+        );
 
         // Add member
         update(&home, &serde_json::json!({"name": "devs", "add": ["c"]}));
@@ -171,7 +186,9 @@ mod tests {
 /// Get members of a team.
 pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
     let store = load(home);
-    store.teams.iter()
+    store
+        .teams
+        .iter()
         .find(|t| t.name == team_name)
         .map(|t| t.members.clone())
         .unwrap_or_default()

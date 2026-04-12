@@ -96,17 +96,29 @@ impl StatePatterns {
             // Claude Code v2.1.89
             Backend::ClaudeCode => vec![
                 // [文件] Claude Code SDK error handling
-                (AgentState::AuthError, r"API key|authentication failed|unauthorized"),
+                (
+                    AgentState::AuthError,
+                    r"API key|authentication failed|unauthorized",
+                ),
                 // [文件] SDK retry logic for 429/overloaded
                 (AgentState::RateLimit, r"overloaded|rate.?limit|429"),
                 // [文件] Auto-compaction on context limit
-                (AgentState::ContextFull, r"compacting context|context.*(full|limit)"),
+                (
+                    AgentState::ContextFull,
+                    r"compacting context|context.*(full|limit)",
+                ),
                 // [推測] Ink select component for permissions
-                (AgentState::PermissionPrompt, r"Allow once|Allow always|approve"),
+                (
+                    AgentState::PermissionPrompt,
+                    r"Allow once|Allow always|approve",
+                ),
                 // [推測] Ink render during processing
                 (AgentState::Thinking, r"Thinking"),
                 // [推測] Tool name with spinner/status icon prefix
-                (AgentState::ToolUse, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●].*(Read|Bash|Edit|Write|Grep|Glob)"),
+                (
+                    AgentState::ToolUse,
+                    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●].*(Read|Bash|Edit|Write|Grep|Glob)",
+                ),
                 // [実測] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
                 // [実測] Shown after startup with --dangerously-skip-permissions
@@ -115,11 +127,20 @@ impl StatePatterns {
             // Kiro CLI (version TBD)
             Backend::KiroCli => vec![
                 // [文件] Kiro auth error messages
-                (AgentState::AuthError, r"Not authenticated|AccessDenied|denied access"),
+                (
+                    AgentState::AuthError,
+                    r"Not authenticated|AccessDenied|denied access",
+                ),
                 // [文件] AWS quota errors
-                (AgentState::UsageLimit, r"ServiceQuotaExceeded|InsufficientModelCapacity"),
+                (
+                    AgentState::UsageLimit,
+                    r"ServiceQuotaExceeded|InsufficientModelCapacity",
+                ),
                 // [文件] HTTP 429 handling
-                (AgentState::RateLimit, r"Too Many Requests|ThrottlingError|429"),
+                (
+                    AgentState::RateLimit,
+                    r"Too Many Requests|ThrottlingError|429",
+                ),
                 // [文件] Context overflow triggers compaction
                 (AgentState::ContextFull, r"context window overflow|/compact"),
                 // [文件] Trust-based permission system
@@ -144,7 +165,10 @@ impl StatePatterns {
                 // [文件] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [文件] Permission approval flow
-                (AgentState::PermissionPrompt, r"Request approval|approve|deny"),
+                (
+                    AgentState::PermissionPrompt,
+                    r"Request approval|approve|deny",
+                ),
                 // [推測] Processing state
                 (AgentState::Thinking, r"Thinking"),
                 // [推測] Patch tool
@@ -161,11 +185,17 @@ impl StatePatterns {
                 // [文件] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [文件] Permission UI
-                (AgentState::PermissionPrompt, r"Permission required|Allow once|Allow always"),
+                (
+                    AgentState::PermissionPrompt,
+                    r"Permission required|Allow once|Allow always",
+                ),
                 // [文件] Busy text
                 (AgentState::Thinking, r"Working"),
                 // [実測] Update dialog that may block
-                (AgentState::PermissionPrompt, r"Update Available|Skip\s+Confirm"),
+                (
+                    AgentState::PermissionPrompt,
+                    r"Update Available|Skip\s+Confirm",
+                ),
                 // [実測] Input prompt text
                 (AgentState::Idle, r"Ask anything"),
                 // [実測] Ready state with keybinding hints
@@ -174,15 +204,24 @@ impl StatePatterns {
             // Gemini CLI v0.37.1
             Backend::Gemini => vec![
                 // [文件] OAuth errors from API
-                (AgentState::AuthError, r"OAuth not authenticated|OAuth expired|UNAUTHENTICATED|check API key"),
+                (
+                    AgentState::AuthError,
+                    r"OAuth not authenticated|OAuth expired|UNAUTHENTICATED|check API key",
+                ),
                 // [文件] Usage limit messages
-                (AgentState::UsageLimit, r"Usage limit reached|Access resets at"),
+                (
+                    AgentState::UsageLimit,
+                    r"Usage limit reached|Access resets at",
+                ),
                 // [文件] API resource exhaustion
                 (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|429"),
                 // [文件] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
                 // [文件] Permission select options
-                (AgentState::PermissionPrompt, r"Allow once|Allow for this session|suggest changes"),
+                (
+                    AgentState::PermissionPrompt,
+                    r"Allow once|Allow for this session|suggest changes",
+                ),
                 // [推測] Processing indicator
                 (AgentState::Thinking, r"Thinking"),
                 // [推測] MCP tool execution

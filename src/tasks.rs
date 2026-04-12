@@ -9,7 +9,7 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub description: String,
-    pub status: String, // open, claimed, done, blocked, cancelled
+    pub status: String,   // open, claimed, done, blocked, cancelled
     pub priority: String, // low, normal, high, urgent
     pub assignee: Option<String>,
     pub created_by: String,
@@ -60,7 +60,11 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 created_by: instance_name.to_string(),
                 depends_on: args["depends_on"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 result: None,
                 created_at: now.clone(),
@@ -77,9 +81,11 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let store = load(home);
             let filter_assignee = args["filter_assignee"].as_str();
             let filter_status = args["filter_status"].as_str();
-            let filtered: Vec<_> = store.tasks.iter()
-                .filter(|t| filter_assignee.map_or(true, |a| t.assignee.as_deref() == Some(a)))
-                .filter(|t| filter_status.map_or(true, |s| t.status == s))
+            let filtered: Vec<_> = store
+                .tasks
+                .iter()
+                .filter(|t| filter_assignee.is_none_or(|a| t.assignee.as_deref() == Some(a)))
+                .filter(|t| filter_status.is_none_or(|s| t.status == s))
                 .collect();
             serde_json::json!({"tasks": filtered})
         }
@@ -125,9 +131,15 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let mut store = load(home);
             match store.tasks.iter_mut().find(|t| t.id == id) {
                 Some(task) => {
-                    if let Some(s) = args["status"].as_str() { task.status = s.to_string(); }
-                    if let Some(p) = args["priority"].as_str() { task.priority = p.to_string(); }
-                    if let Some(a) = args["assignee"].as_str() { task.assignee = Some(a.to_string()); }
+                    if let Some(s) = args["status"].as_str() {
+                        task.status = s.to_string();
+                    }
+                    if let Some(p) = args["priority"].as_str() {
+                        task.priority = p.to_string();
+                    }
+                    if let Some(a) = args["assignee"].as_str() {
+                        task.assignee = Some(a.to_string());
+                    }
                     task.updated_at = chrono::Utc::now().to_rfc3339();
                     let _ = save(home, &store);
                     serde_json::json!({"id": id, "status": "updated"})
@@ -147,7 +159,12 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("agend-tasks-test-{}-{}-{}", std::process::id(), name, id));
+        let dir = std::env::temp_dir().join(format!(
+            "agend-tasks-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
         std::fs::create_dir_all(&dir).ok();
         dir
     }
@@ -155,7 +172,11 @@ mod tests {
     #[test]
     fn test_create_list_claim_done() {
         let home = tmp_home("crud");
-        let r = handle(&home, "agent1", &serde_json::json!({"action": "create", "title": "Fix bug", "priority": "high"}));
+        let r = handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "create", "title": "Fix bug", "priority": "high"}),
+        );
         assert_eq!(r["status"], "created");
         let id = r["id"].as_str().expect("id").to_string();
 
@@ -163,14 +184,26 @@ mod tests {
         assert_eq!(listed["tasks"].as_array().expect("arr").len(), 1);
         assert_eq!(listed["tasks"][0]["status"], "open");
 
-        let claim = handle(&home, "agent2", &serde_json::json!({"action": "claim", "id": id}));
+        let claim = handle(
+            &home,
+            "agent2",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
         assert_eq!(claim["status"], "claimed");
         assert_eq!(claim["assignee"], "agent2");
 
-        let done = handle(&home, "agent2", &serde_json::json!({"action": "done", "id": id, "result": "fixed"}));
+        let done = handle(
+            &home,
+            "agent2",
+            &serde_json::json!({"action": "done", "id": id, "result": "fixed"}),
+        );
         assert_eq!(done["status"], "done");
 
-        let listed = handle(&home, "agent1", &serde_json::json!({"action": "list", "filter_status": "done"}));
+        let listed = handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "list", "filter_status": "done"}),
+        );
         assert_eq!(listed["tasks"][0]["result"], "fixed");
 
         std::fs::remove_dir_all(&home).ok();
@@ -179,7 +212,11 @@ mod tests {
     #[test]
     fn test_claim_nonexistent() {
         let home = tmp_home("claim_nonexistent");
-        let r = handle(&home, "a", &serde_json::json!({"action": "claim", "id": "nope"}));
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "claim", "id": "nope"}),
+        );
         assert!(r["error"].as_str().is_some());
         std::fs::remove_dir_all(&home).ok();
     }

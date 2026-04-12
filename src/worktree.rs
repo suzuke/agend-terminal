@@ -45,7 +45,10 @@ pub fn create(
 
     // Already exists — reuse
     if wt_dir.exists() {
-        eprintln!("[worktree] reusing existing worktree for {instance_name}: {}", wt_dir.display());
+        eprintln!(
+            "[worktree] reusing existing worktree for {instance_name}: {}",
+            wt_dir.display()
+        );
         return Some(WorktreeInfo {
             path: wt_dir,
             source_repo: repo_dir.to_path_buf(),
@@ -58,13 +61,22 @@ pub fn create(
 
     // Try creating worktree: first with -b (new branch), fallback without -b (existing branch)
     let output = std::process::Command::new("git")
-        .args(["worktree", "add", "-b", &branch, &wt_dir.display().to_string()])
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &wt_dir.display().to_string(),
+        ])
         .current_dir(repo_dir)
         .output();
 
     match output {
         Ok(o) if o.status.success() => {
-            eprintln!("[worktree] created for {instance_name}: {} (branch {branch})", wt_dir.display());
+            eprintln!(
+                "[worktree] created for {instance_name}: {} (branch {branch})",
+                wt_dir.display()
+            );
             Some(WorktreeInfo {
                 path: wt_dir,
                 source_repo: repo_dir.to_path_buf(),
@@ -81,7 +93,9 @@ pub fn create(
                     .output();
                 match output2 {
                     Ok(o2) if o2.status.success() => {
-                        eprintln!("[worktree] created for {instance_name} on existing branch {branch}");
+                        eprintln!(
+                            "[worktree] created for {instance_name} on existing branch {branch}"
+                        );
                         Some(WorktreeInfo {
                             path: wt_dir,
                             source_repo: repo_dir.to_path_buf(),
@@ -89,7 +103,10 @@ pub fn create(
                         })
                     }
                     Ok(o2) => {
-                        eprintln!("[worktree] failed for {instance_name}: {}", String::from_utf8_lossy(&o2.stderr).trim());
+                        eprintln!(
+                            "[worktree] failed for {instance_name}: {}",
+                            String::from_utf8_lossy(&o2.stderr).trim()
+                        );
                         None
                     }
                     Err(e) => {
@@ -154,14 +171,21 @@ pub fn list_residual(repo_dir: &Path) -> Vec<String> {
 fn ensure_gitignore(repo_dir: &Path) {
     let gitignore = repo_dir.join(".gitignore");
     let content = std::fs::read_to_string(&gitignore).unwrap_or_default();
-    if !content.lines().any(|line| line.trim() == ".worktrees" || line.trim() == ".worktrees/") {
+    if !content
+        .lines()
+        .any(|line| line.trim() == ".worktrees" || line.trim() == ".worktrees/")
+    {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&gitignore)
         {
-            let prefix = if content.is_empty() || content.ends_with('\n') { "" } else { "\n" };
+            let prefix = if content.is_empty() || content.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
             let _ = writeln!(f, "{prefix}.worktrees");
             eprintln!("[worktree] added .worktrees to .gitignore");
         }
@@ -176,7 +200,12 @@ mod tests {
     fn tmp_repo(name: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("agend-wt-test-{}-{}-{}", std::process::id(), name, id));
+        let dir = std::env::temp_dir().join(format!(
+            "agend-wt-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
         std::fs::create_dir_all(&dir).ok();
         // git init
         std::process::Command::new("git")

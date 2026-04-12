@@ -36,9 +36,11 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
 
     // Step 2: Check existing .env for token
     let env_path = home.join(".env");
-    let existing_token = std::fs::read_to_string(&env_path).ok()
+    let existing_token = std::fs::read_to_string(&env_path)
+        .ok()
         .and_then(|content| {
-            content.lines()
+            content
+                .lines()
                 .find(|l| l.starts_with("AGEND_BOT_TOKEN="))
                 .map(|l| l.trim_start_matches("AGEND_BOT_TOKEN=").trim().to_string())
         })
@@ -46,17 +48,16 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
 
     // Step 3: Check existing fleet.yaml for group_id
     let fleet_path = home.join("fleet.yaml");
-    let existing_group_id = std::fs::read_to_string(&fleet_path).ok()
-        .and_then(|content| {
-            serde_yaml::from_str::<serde_yaml::Value>(&content).ok()
-        })
+    let existing_group_id = std::fs::read_to_string(&fleet_path)
+        .ok()
+        .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
         .and_then(|config| config["channel"]["group_id"].as_i64());
 
     let (token, group_id) = if existing_token.is_some() && existing_group_id.is_some() {
         let tok = existing_token.clone().unwrap_or_default();
         let gid = existing_group_id.unwrap_or(0);
         let masked = if tok.len() > 8 {
-            format!("{}...{}", &tok[..4], &tok[tok.len()-4..])
+            format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
         } else {
             "****".to_string()
         };
@@ -73,7 +74,7 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     } else if let Some(tok) = existing_token {
         println!("  ── Telegram ──\n");
         let masked = if tok.len() > 8 {
-            format!("{}...{}", &tok[..4], &tok[tok.len()-4..])
+            format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
         } else {
             "****".to_string()
         };
@@ -105,7 +106,12 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     if !token.is_empty() {
         save_env_token(home, &token)?;
     }
-    generate_fleet_yaml(home, &selected, group_id, if token.is_empty() { None } else { Some(&token) })?;
+    generate_fleet_yaml(
+        home,
+        &selected,
+        group_id,
+        if token.is_empty() { None } else { Some(&token) },
+    )?;
 
     print_next_steps(home);
     Ok(())
@@ -182,7 +188,10 @@ fn verify_bot(token: &str) -> anyhow::Result<String> {
             let username = resp["result"]["username"].as_str().unwrap_or("unknown");
             Ok(username.to_string())
         } else {
-            anyhow::bail!("Invalid token: {}", resp["description"].as_str().unwrap_or("unknown error"))
+            anyhow::bail!(
+                "Invalid token: {}",
+                resp["description"].as_str().unwrap_or("unknown error")
+            )
         }
     })
 }
@@ -242,13 +251,15 @@ fn generate_fleet_yaml(
     let project_dir = detect_project_root();
 
     let channel_section = if let Some(gid) = group_id {
-        format!(r#"
+        format!(
+            r#"
 channel:
   type: telegram
   bot_token_env: AGEND_BOT_TOKEN
   group_id: {gid}
   mode: topic
-"#)
+"#
+        )
     } else {
         "\n# channel:\n#   type: telegram\n#   bot_token_env: AGEND_BOT_TOKEN\n#   group_id: YOUR_GROUP_ID\n".to_string()
     };
@@ -257,14 +268,16 @@ channel:
         .map(|p| format!("    working_directory: {}", p.display()))
         .unwrap_or_else(|| "    # working_directory: ~/your-project".to_string());
 
-    let yaml = format!(r#"defaults:
+    let yaml = format!(
+        r#"defaults:
   backend: {backend_name}
 {channel_section}
 instances:
   general:
     role: "General assistant"
 {working_dir}
-"#);
+"#
+    );
 
     std::fs::write(&fleet_path, &yaml)?;
     println!("  ✓ Generated {}\n", fleet_path.display());
@@ -304,7 +317,8 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
     let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
 
     // Check if token already exists
-    let existing_token = existing.lines()
+    let existing_token = existing
+        .lines()
         .find(|l| l.starts_with("AGEND_BOT_TOKEN="))
         .map(|l| l.trim_start_matches("AGEND_BOT_TOKEN=").trim());
 
@@ -315,7 +329,7 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
         }
         // Show masked existing token
         let masked = if old.len() > 8 {
-            format!("{}...{}", &old[..4], &old[old.len()-4..])
+            format!("{}...{}", &old[..4], &old[old.len() - 4..])
         } else {
             "****".to_string()
         };
@@ -328,7 +342,8 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
     }
 
     // Replace or append AGEND_BOT_TOKEN, preserve other lines
-    let mut lines: Vec<String> = existing.lines()
+    let mut lines: Vec<String> = existing
+        .lines()
         .filter(|l| !l.starts_with("AGEND_BOT_TOKEN="))
         .map(|l| l.to_string())
         .collect();
@@ -345,8 +360,10 @@ fn check_compatibility(yaml_content: &str, new_backend: &Backend, new_group_id: 
         // Check backend
         let existing_backend = config["defaults"]["backend"].as_str().unwrap_or("");
         if !existing_backend.is_empty() && existing_backend != new_backend.name() {
-            println!("  ⚠ Existing backend: {existing_backend}, new: {}",
-                new_backend.name());
+            println!(
+                "  ⚠ Existing backend: {existing_backend}, new: {}",
+                new_backend.name()
+            );
         }
 
         // Check group_id
@@ -360,8 +377,10 @@ fn check_compatibility(yaml_content: &str, new_backend: &Backend, new_group_id: 
         // Check instance count
         if let Some(instances) = config["instances"].as_mapping() {
             if instances.len() > 1 {
-                println!("  ⚠ Existing config has {} instances (new config will have 1)",
-                    instances.len());
+                println!(
+                    "  ⚠ Existing config has {} instances (new config will have 1)",
+                    instances.len()
+                );
             }
         }
     }

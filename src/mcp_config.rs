@@ -100,10 +100,7 @@ fn configure_claude(working_dir: &Path) -> Result<()> {
 
 /// Kiro: .kiro/settings/mcp.json — uses { "mcpServers": { ... } } format
 fn configure_kiro(working_dir: &Path) -> Result<()> {
-    let path = working_dir
-        .join(".kiro")
-        .join("settings")
-        .join("mcp.json");
+    let path = working_dir.join(".kiro").join("settings").join("mcp.json");
 
     // Clean up old format: always remove top-level "agend-terminal" key
     if path.exists() {

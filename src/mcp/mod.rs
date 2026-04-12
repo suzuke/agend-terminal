@@ -41,7 +41,9 @@ fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<
         // Content-Length framing
         if let Some(val) = trimmed.strip_prefix("Content-Length:") {
             let len: usize = val.trim().parse().unwrap_or(0);
-            if len == 0 { continue; }
+            if len == 0 {
+                continue;
+            }
             // Read empty line after headers
             let mut empty = String::new();
             reader.read_line(&mut empty)?;
@@ -95,7 +97,9 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
             }),
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             "notifications/initialized" | "notifications/cancelled" => continue,
-            "tools/list" => json!({ "jsonrpc": "2.0", "id": id, "result": tools::tool_definitions() }),
+            "tools/list" => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": tools::tool_definitions() })
+            }
             "tools/call" => {
                 let tool = req.params["name"].as_str().unwrap_or("");
                 let args = &req.params["arguments"];

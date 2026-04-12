@@ -62,7 +62,11 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     let scope = args["scope"].as_str().unwrap_or("project");
     let tags: Vec<String> = args["tags"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let ttl_days = args["ttl_days"].as_u64();
     let supersedes = args["supersedes"].as_str().map(String::from);
@@ -109,16 +113,18 @@ pub fn list(home: &Path, args: &Value) -> Value {
     let include_archived = args["include_archived"].as_bool().unwrap_or(false);
     let filter_tags: Vec<String> = args["tags"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     let all = load_all(home);
     let filtered: Vec<_> = all
         .into_iter()
         .filter(|d| include_archived || !d.archived)
-        .filter(|d| {
-            filter_tags.is_empty() || filter_tags.iter().any(|t| d.tags.contains(t))
-        })
+        .filter(|d| filter_tags.is_empty() || filter_tags.iter().any(|t| d.tags.contains(t)))
         .collect();
 
     serde_json::json!({"decisions": filtered})
@@ -140,7 +146,10 @@ pub fn update(home: &Path, args: &Value) -> Value {
         decision.content = content.to_string();
     }
     if let Some(tags) = args["tags"].as_array() {
-        decision.tags = tags.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        decision.tags = tags
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
     }
     if let Some(ttl) = args["ttl_days"].as_u64() {
         decision.ttl_days = Some(ttl);
@@ -165,7 +174,12 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("agend-decisions-test-{}-{}-{}", std::process::id(), name, id));
+        let dir = std::env::temp_dir().join(format!(
+            "agend-decisions-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
         std::fs::create_dir_all(dir.join("decisions")).ok();
         dir
     }
@@ -173,9 +187,13 @@ mod tests {
     #[test]
     fn test_post_and_list() {
         let home = tmp_home("post_and_list");
-        let result = post(&home, "test-agent", &serde_json::json!({
-            "title": "Test Decision", "content": "We use Rust", "scope": "fleet"
-        }));
+        let result = post(
+            &home,
+            "test-agent",
+            &serde_json::json!({
+                "title": "Test Decision", "content": "We use Rust", "scope": "fleet"
+            }),
+        );
         assert!(result["id"].as_str().is_some());
         assert_eq!(result["status"], "posted");
 
@@ -191,7 +209,11 @@ mod tests {
     #[test]
     fn test_update_and_archive() {
         let home = tmp_home("update_archive");
-        let result = post(&home, "a", &serde_json::json!({"title": "D1", "content": "v1"}));
+        let result = post(
+            &home,
+            "a",
+            &serde_json::json!({"title": "D1", "content": "v1"}),
+        );
         let id = result["id"].as_str().expect("id");
 
         let upd = update(&home, &serde_json::json!({"id": id, "content": "v2"}));

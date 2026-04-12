@@ -60,7 +60,10 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         message: message.to_string(),
         target: args["target"].as_str().unwrap_or(instance_name).to_string(),
         label: args["label"].as_str().map(String::from),
-        timezone: args["timezone"].as_str().unwrap_or("Asia/Taipei").to_string(),
+        timezone: args["timezone"]
+            .as_str()
+            .unwrap_or("Asia/Taipei")
+            .to_string(),
         enabled: true,
         created_by: instance_name.to_string(),
         created_at: now.clone(),
@@ -78,8 +81,10 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
 pub fn list(home: &Path, args: &Value) -> Value {
     let store = load(home);
     let target_filter = args["target"].as_str();
-    let filtered: Vec<_> = store.schedules.iter()
-        .filter(|s| target_filter.map_or(true, |t| s.target == t))
+    let filtered: Vec<_> = store
+        .schedules
+        .iter()
+        .filter(|s| target_filter.is_none_or(|t| s.target == t))
         .collect();
     serde_json::json!({"schedules": filtered})
 }
@@ -92,12 +97,24 @@ pub fn update(home: &Path, args: &Value) -> Value {
     let mut store = load(home);
     match store.schedules.iter_mut().find(|s| s.id == id) {
         Some(schedule) => {
-            if let Some(c) = args["cron"].as_str() { schedule.cron = c.to_string(); }
-            if let Some(m) = args["message"].as_str() { schedule.message = m.to_string(); }
-            if let Some(t) = args["target"].as_str() { schedule.target = t.to_string(); }
-            if let Some(l) = args["label"].as_str() { schedule.label = Some(l.to_string()); }
-            if let Some(tz) = args["timezone"].as_str() { schedule.timezone = tz.to_string(); }
-            if let Some(e) = args["enabled"].as_bool() { schedule.enabled = e; }
+            if let Some(c) = args["cron"].as_str() {
+                schedule.cron = c.to_string();
+            }
+            if let Some(m) = args["message"].as_str() {
+                schedule.message = m.to_string();
+            }
+            if let Some(t) = args["target"].as_str() {
+                schedule.target = t.to_string();
+            }
+            if let Some(l) = args["label"].as_str() {
+                schedule.label = Some(l.to_string());
+            }
+            if let Some(tz) = args["timezone"].as_str() {
+                schedule.timezone = tz.to_string();
+            }
+            if let Some(e) = args["enabled"].as_bool() {
+                schedule.enabled = e;
+            }
             schedule.updated_at = chrono::Utc::now().to_rfc3339();
             let _ = save(home, &store);
             serde_json::json!({"id": id, "status": "updated"})
@@ -131,7 +148,12 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("agend-schedules-test-{}-{}-{}", std::process::id(), name, id));
+        let dir = std::env::temp_dir().join(format!(
+            "agend-schedules-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
         std::fs::create_dir_all(&dir).ok();
         dir
     }
@@ -139,7 +161,11 @@ mod tests {
     #[test]
     fn test_create_list_update_delete() {
         let home = tmp_home("crud");
-        let r = create(&home, "agent1", &serde_json::json!({"cron": "0 9 * * *", "message": "hello", "label": "morning"}));
+        let r = create(
+            &home,
+            "agent1",
+            &serde_json::json!({"cron": "0 9 * * *", "message": "hello", "label": "morning"}),
+        );
         assert_eq!(r["status"], "created");
         let id = r["id"].as_str().expect("id").to_string();
 
@@ -155,7 +181,10 @@ mod tests {
         // Delete
         let r = delete(&home, &serde_json::json!({"id": id}));
         assert_eq!(r["status"], "deleted");
-        assert!(list(&home, &serde_json::json!({}))["schedules"].as_array().expect("arr").is_empty());
+        assert!(list(&home, &serde_json::json!({}))["schedules"]
+            .as_array()
+            .expect("arr")
+            .is_empty());
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -163,7 +192,11 @@ mod tests {
     #[test]
     fn test_run_history() {
         let home = tmp_home("run_history");
-        let r = create(&home, "a", &serde_json::json!({"cron": "* * * * *", "message": "test"}));
+        let r = create(
+            &home,
+            "a",
+            &serde_json::json!({"cron": "* * * * *", "message": "test"}),
+        );
         let id = r["id"].as_str().expect("id").to_string();
 
         record_run(&home, &id, "ok");
@@ -171,7 +204,9 @@ mod tests {
         record_run(&home, &id, "inject_failed");
 
         let listed = list(&home, &serde_json::json!({}));
-        let history = listed["schedules"][0]["run_history"].as_array().expect("arr");
+        let history = listed["schedules"][0]["run_history"]
+            .as_array()
+            .expect("arr");
         assert_eq!(history.len(), 3);
         assert_eq!(history[2]["status"], "inject_failed");
 
@@ -181,8 +216,16 @@ mod tests {
     #[test]
     fn test_filter_by_target() {
         let home = tmp_home("filter_target");
-        create(&home, "a", &serde_json::json!({"cron": "0 9 * * *", "message": "m1", "target": "agent1"}));
-        create(&home, "a", &serde_json::json!({"cron": "0 10 * * *", "message": "m2", "target": "agent2"}));
+        create(
+            &home,
+            "a",
+            &serde_json::json!({"cron": "0 9 * * *", "message": "m1", "target": "agent1"}),
+        );
+        create(
+            &home,
+            "a",
+            &serde_json::json!({"cron": "0 10 * * *", "message": "m2", "target": "agent2"}),
+        );
 
         let listed = list(&home, &serde_json::json!({"target": "agent1"}));
         assert_eq!(listed["schedules"].as_array().expect("arr").len(), 1);

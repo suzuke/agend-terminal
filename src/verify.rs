@@ -18,14 +18,13 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
     let test_home = home.join("_verify_tmp");
     std::fs::create_dir_all(&test_home)?;
 
-    let mut results = Vec::new();
-
-    // --- Tests that don't need daemon ---
-    results.push(test_attach(&test_home));
-    results.push(test_inbox(&test_home));
-    results.push(test_mcp_framing());
-    results.push(test_backend_config(&test_home));
-    results.push(test_instructions(&test_home));
+    let mut results = vec![
+        test_attach(&test_home),
+        test_inbox(&test_home),
+        test_mcp_framing(),
+        test_backend_config(&test_home),
+        test_instructions(&test_home),
+    ];
 
     // --- Tests that need daemon ---
     // Start a test daemon
@@ -36,12 +35,39 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
 
     // Spawn two test agents
     let spawn_ok = agent::spawn_agent(
-        "test-a", "/bin/bash", &[], 80, 24, None, None, "\r",
-        &registry, Some(&daemon_home), None, None,
-    ).is_ok() && agent::spawn_agent(
-        "test-b", "/bin/bash", &[], 80, 24, None, None, "\r",
-        &registry, Some(&daemon_home), None, None,
-    ).is_ok();
+        &agent::SpawnConfig {
+            name: "test-a",
+            command: "/bin/bash",
+            args: &[],
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: Some(&daemon_home),
+            crash_tx: None,
+            shutdown: None,
+        },
+        &registry,
+    )
+    .is_ok()
+        && agent::spawn_agent(
+            &agent::SpawnConfig {
+                name: "test-b",
+                command: "/bin/bash",
+                args: &[],
+                cols: 80,
+                rows: 24,
+                env: None,
+                working_dir: None,
+                submit_key: "\r",
+                home: Some(&daemon_home),
+                crash_tx: None,
+                shutdown: None,
+            },
+            &registry,
+        )
+        .is_ok();
 
     if spawn_ok {
         // Start TUI sockets
@@ -106,32 +132,57 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
     let _ = std::fs::remove_dir_all(&test_home);
 
     // --- Report ---
-    let passed = results.iter().filter(|r| r.passed && !r.detail.starts_with("SKIP")).count();
-    let skipped = results.iter().filter(|r| r.detail.starts_with("SKIP")).count();
+    let passed = results
+        .iter()
+        .filter(|r| r.passed && !r.detail.starts_with("SKIP"))
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|r| r.detail.starts_with("SKIP"))
+        .count();
     let failed = results.len() - passed - skipped;
 
     if json_output {
-        let items: Vec<_> = results.iter().map(|r| json!({
-            "name": r.name,
-            "passed": r.passed,
-            "detail": r.detail,
-        })).collect();
-        println!("{}", serde_json::to_string_pretty(&json!({
-            "total": results.len(),
-            "passed": passed,
-            "failed": failed,
-            "skipped": skipped,
-            "tests": items,
-        }))?);
+        let items: Vec<_> = results
+            .iter()
+            .map(|r| {
+                json!({
+                    "name": r.name,
+                    "passed": r.passed,
+                    "detail": r.detail,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "total": results.len(),
+                "passed": passed,
+                "failed": failed,
+                "skipped": skipped,
+                "tests": items,
+            }))?
+        );
     } else {
         println!("\n{:=<50}", "= AgEnD Terminal Verify ");
         for r in &results {
-            let icon = if r.passed { "✓" } else if r.detail.starts_with("SKIP") { "-" } else { "✗" };
+            let icon = if r.passed {
+                "✓"
+            } else if r.detail.starts_with("SKIP") {
+                "-"
+            } else {
+                "✗"
+            };
             println!("  {icon} {:<25} {}", r.name, r.detail);
         }
         println!("{:=<50}", "");
-        println!("  Total: {}  Passed: {}  Failed: {}  Skipped: {}",
-            results.len(), passed, failed, skipped);
+        println!(
+            "  Total: {}  Passed: {}  Failed: {}  Skipped: {}",
+            results.len(),
+            passed,
+            failed,
+            skipped
+        );
 
         if failed > 0 {
             std::process::exit(1);
@@ -144,7 +195,22 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
 #[allow(clippy::unwrap_used)]
 fn test_attach(_home: &Path) -> TestResult {
     let registry = Arc::new(Mutex::new(HashMap::new()));
-    match agent::spawn_agent("verify-attach", "/bin/bash", &[], 80, 24, None, None, "\r", &registry, None, None, None) {
+    match agent::spawn_agent(
+        &agent::SpawnConfig {
+            name: "verify-attach",
+            command: "/bin/bash",
+            args: &[],
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        },
+        &registry,
+    ) {
         Ok(()) => {
             std::thread::sleep(std::time::Duration::from_secs(1));
             let reg = registry.lock().unwrap();
@@ -170,20 +236,34 @@ fn test_attach(_home: &Path) -> TestResult {
             TestResult {
                 name: "attach".into(),
                 passed: ok,
-                detail: if ok { "PTY spawn + inject + VTerm".into() } else { "VERIFY_OK not found in output".into() },
+                detail: if ok {
+                    "PTY spawn + inject + VTerm".into()
+                } else {
+                    "VERIFY_OK not found in output".into()
+                },
             }
         }
-        Err(e) => TestResult { name: "attach".into(), passed: false, detail: format!("{e}") },
+        Err(e) => TestResult {
+            name: "attach".into(),
+            passed: false,
+            detail: format!("{e}"),
+        },
     }
 }
 
 fn test_inbox(home: &Path) -> TestResult {
     let test_name = "verify-inbox";
     for i in 1..=3 {
-        let _ = inbox::enqueue(home, test_name, inbox::InboxMessage {
-            from: format!("test-{i}"), text: format!("msg {i}"), kind: None,
-            timestamp: "2024-01-01T00:00:00Z".into(),
-        });
+        let _ = inbox::enqueue(
+            home,
+            test_name,
+            inbox::InboxMessage {
+                from: format!("test-{i}"),
+                text: format!("msg {i}"),
+                kind: None,
+                timestamp: "2024-01-01T00:00:00Z".into(),
+            },
+        );
     }
     let msgs = inbox::drain(home, test_name);
     let empty = inbox::drain(home, test_name);
@@ -193,18 +273,27 @@ fn test_inbox(home: &Path) -> TestResult {
     TestResult {
         name: "inbox".into(),
         passed: ok,
-        detail: if ok { "enqueue 3 + drain + empty".into() } else { format!("got {} msgs, empty={}", msgs.len(), empty.is_empty()) },
+        detail: if ok {
+            "enqueue 3 + drain + empty".into()
+        } else {
+            format!("got {} msgs, empty={}", msgs.len(), empty.is_empty())
+        },
     }
 }
 
 fn test_mcp_framing() -> TestResult {
     let req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let frame = format!("Content-Length: {}\r\n\r\n{}", req.len(), req);
-    let ok = frame.contains("Content-Length:") && frame.contains("\r\n\r\n") && frame.ends_with('}');
+    let ok =
+        frame.contains("Content-Length:") && frame.contains("\r\n\r\n") && frame.ends_with('}');
     TestResult {
         name: "mcp_framing".into(),
         passed: ok,
-        detail: if ok { "Content-Length format correct".into() } else { "bad format".into() },
+        detail: if ok {
+            "Content-Length format correct".into()
+        } else {
+            "bad format".into()
+        },
     }
 }
 
@@ -217,7 +306,9 @@ fn test_backend_config(home: &Path) -> TestResult {
     let claude_path = test_dir.join(".claude").join("settings.json");
     let claude_ok = if claude_path.exists() {
         let content = std::fs::read_to_string(&claude_path).unwrap_or_default();
-        content.contains("mcpServers") && content.contains("agend-terminal") && content.contains("AGEND_TERMINAL_HOME")
+        content.contains("mcpServers")
+            && content.contains("agend-terminal")
+            && content.contains("AGEND_TERMINAL_HOME")
     } else {
         false
     };
@@ -237,7 +328,11 @@ fn test_backend_config(home: &Path) -> TestResult {
     TestResult {
         name: "backend_config".into(),
         passed: ok,
-        detail: if ok { "Claude + Kiro MCP config correct".into() } else { format!("claude={claude_ok} kiro={kiro_ok}") },
+        detail: if ok {
+            "Claude + Kiro MCP config correct".into()
+        } else {
+            format!("claude={claude_ok} kiro={kiro_ok}")
+        },
     }
 }
 
@@ -261,33 +356,51 @@ fn test_instructions(home: &Path) -> TestResult {
     TestResult {
         name: "instructions".into(),
         passed: ok,
-        detail: if ok { "Claude + Kiro instructions generated".into() } else { format!("claude={claude_ok} kiro={kiro_ok}") },
+        detail: if ok {
+            "Claude + Kiro instructions generated".into()
+        } else {
+            format!("claude={claude_ok} kiro={kiro_ok}")
+        },
     }
 }
 
 fn test_api(home: &Path) -> TestResult {
     match api::call(home, &json!({"method": "list"})) {
         Ok(resp) => {
-            let agents = resp["result"]["agents"].as_array().map(|a| a.len()).unwrap_or(0);
+            let agents = resp["result"]["agents"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
             TestResult {
                 name: "api".into(),
                 passed: agents >= 2,
                 detail: format!("{agents} agents in registry"),
             }
         }
-        Err(e) => TestResult { name: "api".into(), passed: false, detail: format!("{e}") },
+        Err(e) => TestResult {
+            name: "api".into(),
+            passed: false,
+            detail: format!("{e}"),
+        },
     }
 }
 
 fn test_send(home: &Path) -> TestResult {
     // Send from test-a to test-b via API
-    let send_result = api::call(home, &json!({
-        "method": "send",
-        "params": {"from": "test-a", "target": "test-b", "text": "verify-send-ok"}
-    }));
+    let send_result = api::call(
+        home,
+        &json!({
+            "method": "send",
+            "params": {"from": "test-a", "target": "test-b", "text": "verify-send-ok"}
+        }),
+    );
 
     if send_result.is_err() {
-        return TestResult { name: "send".into(), passed: false, detail: "API send failed".into() };
+        return TestResult {
+            name: "send".into(),
+            passed: false,
+            detail: "API send failed".into(),
+        };
     }
 
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -299,41 +412,69 @@ fn test_send(home: &Path) -> TestResult {
     TestResult {
         name: "send".into(),
         passed: found,
-        detail: if found { "a→b message delivered via inbox".into() } else { format!("not found in {} msgs", msgs.len()) },
+        detail: if found {
+            "a→b message delivered via inbox".into()
+        } else {
+            format!("not found in {} msgs", msgs.len())
+        },
     }
 }
 
 fn test_create_delete(home: &Path) -> TestResult {
     // Create via API
-    let create = api::call(home, &json!({
-        "method": "spawn",
-        "params": {"name": "verify-dynamic", "command": "/bin/bash"}
-    }));
+    let create = api::call(
+        home,
+        &json!({
+            "method": "spawn",
+            "params": {"name": "verify-dynamic", "command": "/bin/bash"}
+        }),
+    );
     if create.is_err() {
-        return TestResult { name: "create_delete".into(), passed: false, detail: "spawn failed".into() };
+        return TestResult {
+            name: "create_delete".into(),
+            passed: false,
+            detail: "spawn failed".into(),
+        };
     }
 
     std::thread::sleep(std::time::Duration::from_secs(1));
 
     // Verify in list
     let list = api::call(home, &json!({"method": "list"})).unwrap_or(json!({}));
-    let agents = list["result"]["agents"].as_array().unwrap_or(&Vec::new()).clone();
-    let found = agents.iter().any(|a| a["name"].as_str() == Some("verify-dynamic"));
+    let agents = list["result"]["agents"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .clone();
+    let found = agents
+        .iter()
+        .any(|a| a["name"].as_str() == Some("verify-dynamic"));
 
     // Kill
-    let _ = api::call(home, &json!({"method": "kill", "params": {"name": "verify-dynamic"}}));
+    let _ = api::call(
+        home,
+        &json!({"method": "kill", "params": {"name": "verify-dynamic"}}),
+    );
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // Verify removed (reaper should clean up)
     let list2 = api::call(home, &json!({"method": "list"})).unwrap_or(json!({}));
-    let agents2 = list2["result"]["agents"].as_array().unwrap_or(&Vec::new()).clone();
-    let removed = !agents2.iter().any(|a| a["name"].as_str() == Some("verify-dynamic"));
+    let agents2 = list2["result"]["agents"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .clone();
+    let removed = !agents2
+        .iter()
+        .any(|a| a["name"].as_str() == Some("verify-dynamic"));
 
     let ok = found && removed;
     TestResult {
         name: "create_delete".into(),
         passed: ok,
-        detail: if ok { "spawn → found in list → kill → reaped".into() } else { format!("found={found} removed={removed}") },
+        detail: if ok {
+            "spawn → found in list → kill → reaped".into()
+        } else {
+            format!("found={found} removed={removed}")
+        },
     }
 }
 
@@ -383,7 +524,11 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     results.push(TestResult {
         name: format!("backend:{name}:instructions"),
         passed: instr_ok,
-        detail: if instr_ok { format!("{}", preset.instructions_path) } else { "missing or invalid".into() },
+        detail: if instr_ok {
+            preset.instructions_path.to_string()
+        } else {
+            "missing or invalid".into()
+        },
     });
 
     // 2. MCP config generation
@@ -391,7 +536,9 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let mcp_path = test_dir.join(preset.mcp_config_path);
     let mcp_ok = if mcp_path.exists() {
         let c = std::fs::read_to_string(&mcp_path).unwrap_or_default();
-        c.contains("mcpServers") && c.contains("agend-terminal") && c.contains("AGEND_TERMINAL_HOME")
+        c.contains("mcpServers")
+            && c.contains("agend-terminal")
+            && c.contains("AGEND_TERMINAL_HOME")
     } else {
         // Some backends (codex) don't have file-based MCP config
         name == "codex"
@@ -399,7 +546,11 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     results.push(TestResult {
         name: format!("backend:{name}:mcp_config"),
         passed: mcp_ok,
-        detail: if mcp_ok { format!("{}", preset.mcp_config_path) } else { "missing mcpServers/env".into() },
+        detail: if mcp_ok {
+            preset.mcp_config_path.to_string()
+        } else {
+            "missing mcpServers/env".into()
+        },
     });
 
     // 3. Spawn + ready detection
@@ -408,18 +559,20 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
 
     let spawn_result = agent::spawn_agent(
-        &agent_name,
-        preset.command,
-        &args,
-        120,
-        40,
-        None,
-        Some(test_dir.as_path()),
-        preset.submit_key,
+        &agent::SpawnConfig {
+            name: &agent_name,
+            command: preset.command,
+            args: &args,
+            cols: 120,
+            rows: 40,
+            env: None,
+            working_dir: Some(test_dir.as_path()),
+            submit_key: preset.submit_key,
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        },
         &registry,
-        None,
-        None,
-        None,
     );
 
     match spawn_result {
@@ -428,13 +581,14 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(preset.ready_timeout_secs);
             let mut ready = false;
+            let re = regex::Regex::new(preset.ready_pattern)
+                .unwrap_or_else(|_| regex::Regex::new(".").unwrap());
             while std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 let reg = registry.lock().unwrap();
                 if let Some(handle) = reg.get(&agent_name) {
                     let core = handle.core.lock().unwrap();
                     let screen = String::from_utf8_lossy(&core.vterm.dump_screen()).to_string();
-                    let re = regex::Regex::new(preset.ready_pattern).unwrap_or_else(|_| regex::Regex::new(".").unwrap());
                     if re.is_match(&screen) {
                         ready = true;
                         break;
@@ -467,7 +621,10 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
                 detail: if ready {
                     format!("ready in <{}s", preset.ready_timeout_secs)
                 } else {
-                    format!("timeout after {}s (pattern: {})", preset.ready_timeout_secs, preset.ready_pattern)
+                    format!(
+                        "timeout after {}s (pattern: {})",
+                        preset.ready_timeout_secs, preset.ready_pattern
+                    )
                 },
             });
 
@@ -480,7 +637,11 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
                     results.push(TestResult {
                         name: format!("backend:{name}:inject"),
                         passed: inject_ok,
-                        detail: if inject_ok { "inject accepted".into() } else { "write failed".into() },
+                        detail: if inject_ok {
+                            "inject accepted".into()
+                        } else {
+                            "write failed".into()
+                        },
                     });
                 }
                 drop(reg);
@@ -548,7 +709,11 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             results.push(TestResult {
                 name: format!("backend:{name}:quit"),
                 passed: true, // Force kill is valid cleanup
-                detail: if quit_ok { "graceful exit".into() } else { "force killed (quit cmd ineffective, process cleaned up)".into() },
+                detail: if quit_ok {
+                    "graceful exit".into()
+                } else {
+                    "force killed (quit cmd ineffective, process cleaned up)".into()
+                },
             });
         }
         Err(e) => {

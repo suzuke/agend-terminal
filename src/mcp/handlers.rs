@@ -1,7 +1,7 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
-use serde_json::{json, Value};
 use super::telegram;
+use serde_json::{json, Value};
 
 pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
     let home = crate::home_dir();
@@ -60,29 +60,42 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
 
         // --- Cross-instance communication ---
         "send_to_instance" | "send" => {
-            let target = args["instance_name"].as_str()
+            let target = args["instance_name"]
+                .as_str()
                 .or_else(|| args["target"].as_str());
             let target = match target {
                 Some(t) => t,
                 None => return json!({"error": "missing 'instance_name' or 'target'"}),
             };
-            let text = args["message"].as_str()
+            let text = args["message"]
+                .as_str()
                 .or_else(|| args["text"].as_str())
                 .unwrap_or("");
-            let kind = args["request_kind"].as_str()
+            let kind = args["request_kind"]
+                .as_str()
                 .or_else(|| args["kind"].as_str());
 
-            match crate::api::call(&home, &json!({
-                "method": "send",
-                "params": { "from": instance_name, "target": target, "text": text, "kind": kind }
-            })) {
+            match crate::api::call(
+                &home,
+                &json!({
+                    "method": "send",
+                    "params": { "from": instance_name, "target": target, "text": text, "kind": kind }
+                }),
+            ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     json!({"target": target})
                 }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
                 Err(e) => {
                     let submit_key = get_submit_key(&home, target);
-                    crate::inbox::deliver(&home, target, &format!("from:{instance_name}"), text, &submit_key, None);
+                    crate::inbox::deliver(
+                        &home,
+                        target,
+                        &format!("from:{instance_name}"),
+                        text,
+                        &submit_key,
+                        None,
+                    );
                     json!({"target": target, "note": format!("API unavailable, sent direct: {e}")})
                 }
             }
@@ -147,11 +160,14 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             let targets: Vec<String> = if let Some(team) = args["team"].as_str() {
                 crate::teams::get_members(&home, team)
             } else if let Some(t) = args["targets"].as_array() {
-                t.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+                t.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
             } else {
                 list_agents()
             };
-            let targets: Vec<String> = targets.into_iter()
+            let targets: Vec<String> = targets
+                .into_iter()
                 .filter(|t| *t != instance_name)
                 .collect();
             let kind = args["request_kind"].as_str().unwrap_or("update");
@@ -168,32 +184,35 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
         }
 
         // --- Instance management ---
-        "list_instances" => {
-            match crate::api::call(&home, &json!({"method": "list"})) {
-                Ok(resp) => {
-                    if let Some(agents) = resp["result"]["agents"].as_array() {
-                        let instances: Vec<Value> = agents.iter().map(|a| {
+        "list_instances" => match crate::api::call(&home, &json!({"method": "list"})) {
+            Ok(resp) => {
+                if let Some(agents) = resp["result"]["agents"].as_array() {
+                    let instances: Vec<Value> = agents
+                        .iter()
+                        .map(|a| {
                             let name = a["name"].as_str().unwrap_or("");
                             let meta_path = home.join("metadata").join(format!("{name}.json"));
                             let meta = std::fs::read_to_string(&meta_path)
-                                .and_then(|c| Ok(serde_json::from_str::<Value>(&c).unwrap_or(json!({}))))
+                                .map(|c| serde_json::from_str::<Value>(&c).unwrap_or(json!({})))
                                 .unwrap_or(json!({}));
                             let mut info = a.clone();
                             if let Some(obj) = info.as_object_mut() {
                                 if let Some(m) = meta.as_object() {
-                                    for (k, v) in m { obj.insert(k.clone(), v.clone()); }
+                                    for (k, v) in m {
+                                        obj.insert(k.clone(), v.clone());
+                                    }
                                 }
                             }
                             info
-                        }).collect();
-                        json!({"instances": instances})
-                    } else {
-                        json!({"instances": list_agents()})
-                    }
+                        })
+                        .collect();
+                    json!({"instances": instances})
+                } else {
+                    json!({"instances": list_agents()})
                 }
-                Err(_) => json!({"instances": list_agents()}),
             }
-        }
+            Err(_) => json!({"instances": list_agents()}),
+        },
         "create_instance" => {
             let name = match args["name"].as_str() {
                 Some(n) => n,
@@ -203,14 +222,22 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 Some(c) => c,
                 None => return json!({"error": "missing 'command'"}),
             };
-            let mut cmd_args = args.get("args").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mut cmd_args = args
+                .get("args")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if let Some(model) = args.get("model").and_then(|v| v.as_str()) {
                 if !model.is_empty() {
-                    if !cmd_args.is_empty() { cmd_args.push(' '); }
+                    if !cmd_args.is_empty() {
+                        cmd_args.push(' ');
+                    }
                     cmd_args.push_str(&format!("--model {model}"));
                 }
             }
-            let mut work_dir = args.get("working_directory").and_then(|v| v.as_str())
+            let mut work_dir = args
+                .get("working_directory")
+                .and_then(|v| v.as_str())
                 .map(String::from)
                 .unwrap_or_else(|| home.join("workspaces").join(name).display().to_string());
 
@@ -230,12 +257,18 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
 
             let role = args.get("role").and_then(|v| v.as_str()).map(String::from);
-            let backend_str = args.get("backend").and_then(|v| v.as_str()).map(String::from);
+            let backend_str = args
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
-            match crate::api::call(&home, &json!({
-                "method": "spawn",
-                "params": { "name": name, "command": command, "args": &cmd_args, "working_directory": work_dir }
-            })) {
+            match crate::api::call(
+                &home,
+                &json!({
+                    "method": "spawn",
+                    "params": { "name": name, "command": command, "args": &cmd_args, "working_directory": work_dir }
+                }),
+            ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     // Persist to fleet.yaml
                     let entry = crate::fleet::InstanceYamlEntry {
@@ -254,10 +287,13 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                     // Inject initial task if provided
                     if let Some(ref task_text) = task {
                         std::thread::sleep(std::time::Duration::from_secs(3));
-                        let _ = crate::api::call(&home, &json!({
-                            "method": "inject",
-                            "params": {"name": name, "data": task_text}
-                        }));
+                        let _ = crate::api::call(
+                            &home,
+                            &json!({
+                                "method": "inject",
+                                "params": {"name": name, "data": task_text}
+                            }),
+                        );
                     }
                     let mut result = json!({"name": name, "command": command});
                     if let Some(tid) = topic_id {
@@ -275,7 +311,10 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 None => return json!({"error": "missing 'name'"}),
             };
             // Use "delete" (not "kill") — removes from configs to prevent respawn
-            let _ = crate::api::call(&home, &json!({"method": "delete", "params": {"name": name}}));
+            let _ = crate::api::call(
+                &home,
+                &json!({"method": "delete", "params": {"name": name}}),
+            );
 
             // Remove from fleet.yaml
             if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, name) {
@@ -305,20 +344,27 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                         let p = b.preset();
                         let resume_args = p.resume_mode.args_for(&home, name);
                         if !resume_args.is_empty() {
-                            if !cmd_args.is_empty() { cmd_args.push(' '); }
+                            if !cmd_args.is_empty() {
+                                cmd_args.push(' ');
+                            }
                             cmd_args.push_str(&resume_args.join(" "));
                         }
                     }
-                    match crate::api::call(&home, &json!({
-                        "method": "spawn",
-                        "params": {
-                            "name": name, "command": resolved.command,
-                            "args": cmd_args,
-                            "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
-                        }
-                    })) {
+                    match crate::api::call(
+                        &home,
+                        &json!({
+                            "method": "spawn",
+                            "params": {
+                                "name": name, "command": resolved.command,
+                                "args": cmd_args,
+                                "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
+                            }
+                        }),
+                    ) {
                         Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"name": name}),
-                        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("spawn failed")}),
+                        Ok(resp) => {
+                            json!({"error": resp["error"].as_str().unwrap_or("spawn failed")})
+                        }
                         Err(e) => json!({"error": format!("API unavailable: {e}")}),
                     }
                 }
@@ -334,12 +380,14 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                             Some(agent) => {
                                 let meta_path = home.join("metadata").join(format!("{name}.json"));
                                 let meta = std::fs::read_to_string(&meta_path)
-                                    .and_then(|c| Ok(serde_json::from_str::<Value>(&c).unwrap_or(json!({}))))
+                                    .map(|c| serde_json::from_str::<Value>(&c).unwrap_or(json!({})))
                                     .unwrap_or(json!({}));
                                 let mut info = agent.clone();
                                 if let Some(obj) = info.as_object_mut() {
                                     if let Some(m) = meta.as_object() {
-                                        for (k, v) in m { obj.insert(k.clone(), v.clone()); }
+                                        for (k, v) in m {
+                                            obj.insert(k.clone(), v.clone());
+                                        }
                                     }
                                 }
                                 json!({"instance": info})
@@ -380,12 +428,16 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             let _ = crate::api::call(&home, &json!({"method": "kill", "params": {"name": name}}));
 
             // Queue handover message for the new instance
-            let _ = crate::inbox::enqueue(&home, name, crate::inbox::InboxMessage {
-                from: "system:replace".to_string(),
-                text: format!("[handover] {handover}"),
-                kind: Some("handover".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            });
+            let _ = crate::inbox::enqueue(
+                &home,
+                name,
+                crate::inbox::InboxMessage {
+                    from: "system:replace".to_string(),
+                    text: format!("[handover] {handover}"),
+                    kind: Some("handover".to_string()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+            );
 
             eprintln!("[mcp] replace_instance {name}: {reason}");
             json!({"name": name, "reason": reason,
@@ -434,8 +486,11 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 None => return json!({"error": "missing 'source'"}),
             };
             let branch = args["branch"].as_str().unwrap_or("HEAD");
-            let worktree_dir = home.join("worktrees").join(format!("{}-{}", instance_name,
-                source.replace('/', "_").replace('~', "")));
+            let worktree_dir = home.join("worktrees").join(format!(
+                "{}-{}",
+                instance_name,
+                source.replace('/', "_").replace('~', "")
+            ));
             std::fs::create_dir_all(worktree_dir.parent().unwrap_or(&home)).ok();
             let source_path = if source.starts_with('/') || source.starts_with('~') {
                 if let Some(rest) = source.strip_prefix("~/") {
@@ -447,18 +502,26 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
             } else {
                 // Instance name — look up working directory
                 match crate::api::call(&home, &json!({"method": "list"})) {
-                    Ok(resp) => {
-                        resp["result"]["agents"].as_array()
-                            .and_then(|agents| agents.iter()
+                    Ok(resp) => resp["result"]["agents"]
+                        .as_array()
+                        .and_then(|agents| {
+                            agents
+                                .iter()
                                 .find(|a| a["name"].as_str() == Some(source))
-                                .and_then(|a| a["working_directory"].as_str().map(String::from)))
-                            .unwrap_or_else(|| source.to_string())
-                    }
+                                .and_then(|a| a["working_directory"].as_str().map(String::from))
+                        })
+                        .unwrap_or_else(|| source.to_string()),
                     Err(_) => source.to_string(),
                 }
             };
             let output = std::process::Command::new("git")
-                .args(["worktree", "add", "--detach", &worktree_dir.display().to_string(), branch])
+                .args([
+                    "worktree",
+                    "add",
+                    "--detach",
+                    &worktree_dir.display().to_string(),
+                    branch,
+                ])
                 .current_dir(&source_path)
                 .output();
             match output {
@@ -495,15 +558,25 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
 }
 
 fn send_to(home: &std::path::Path, from: &str, target: &str, text: &str, kind: &str) -> Value {
-    match crate::api::call(home, &json!({
-        "method": "send",
-        "params": { "from": from, "target": target, "text": text, "kind": kind }
-    })) {
+    match crate::api::call(
+        home,
+        &json!({
+            "method": "send",
+            "params": { "from": from, "target": target, "text": text, "kind": kind }
+        }),
+    ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
             let submit_key = get_submit_key(home, target);
-            crate::inbox::deliver(home, target, &format!("from:{from}"), text, &submit_key, None);
+            crate::inbox::deliver(
+                home,
+                target,
+                &format!("from:{from}"),
+                text,
+                &submit_key,
+                None,
+            );
             json!({"target": target, "note": format!("API unavailable: {e}")})
         }
     }
@@ -514,10 +587,13 @@ fn save_metadata(home: &std::path::Path, instance_name: &str, key: &str, value: 
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = meta_dir.join(format!("{instance_name}.json"));
     let mut meta: Value = std::fs::read_to_string(&meta_path)
-        .and_then(|c| Ok(serde_json::from_str(&c).unwrap_or(json!({}))))
+        .map(|c| serde_json::from_str(&c).unwrap_or(json!({})))
         .unwrap_or(json!({}));
     meta[key] = value;
-    let _ = std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default());
+    let _ = std::fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+    );
 }
 
 /// Look up submit_key for a target instance from fleet config.

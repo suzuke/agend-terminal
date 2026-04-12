@@ -41,7 +41,12 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("agend-store-test-{}-{}-{}", std::process::id(), name, id));
+        let dir = std::env::temp_dir().join(format!(
+            "agend-store-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
         fs::create_dir_all(&dir).ok();
         dir
     }
@@ -50,7 +55,10 @@ mod tests {
     fn test_roundtrip() {
         let dir = tmp_dir("roundtrip");
         let path = dir.join("roundtrip.json");
-        let data = TestData { items: vec!["a".into(), "b".into()], count: 42 };
+        let data = TestData {
+            items: vec!["a".into(), "b".into()],
+            count: 42,
+        };
         save(&path, &data).expect("save");
         let loaded: TestData = load(&path);
         assert_eq!(loaded, data);
@@ -88,7 +96,10 @@ mod tests {
     fn test_save_creates_parent_dirs() {
         let dir = tmp_dir("parent_dirs");
         let path = dir.join("nested/deep/data.json");
-        let data = TestData { items: vec!["x".into()], count: 1 };
+        let data = TestData {
+            items: vec!["x".into()],
+            count: 1,
+        };
         save(&path, &data).expect("save with nested dirs");
         let loaded: TestData = load(&path);
         assert_eq!(loaded, data);
@@ -99,8 +110,14 @@ mod tests {
     fn test_overwrite() {
         let dir = tmp_dir("overwrite");
         let path = dir.join("overwrite.json");
-        let v1 = TestData { items: vec!["old".into()], count: 1 };
-        let v2 = TestData { items: vec!["new".into()], count: 2 };
+        let v1 = TestData {
+            items: vec!["old".into()],
+            count: 1,
+        };
+        let v2 = TestData {
+            items: vec!["new".into()],
+            count: 2,
+        };
         save(&path, &v1).expect("save v1");
         save(&path, &v2).expect("save v2");
         let loaded: TestData = load(&path);

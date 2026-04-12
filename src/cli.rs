@@ -85,7 +85,9 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
         .instances
         .keys()
         .filter_map(|name| {
-            config.resolve_instance(name).map(|r| (name.clone(), r.submit_key))
+            config
+                .resolve_instance(name)
+                .map(|r| (name.clone(), r.submit_key))
         })
         .collect();
     let _telegram = crate::telegram::init_from_config(&config, home, submit_keys);
@@ -111,18 +113,20 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     agent::spawn_agent(
-        &name,
-        preset.command,
-        &args,
-        120,
-        40,
-        None,
-        None,
-        preset.submit_key,
+        &agent::SpawnConfig {
+            name: &name,
+            command: preset.command,
+            args: &args,
+            cols: 120,
+            rows: 40,
+            env: None,
+            working_dir: None,
+            submit_key: preset.submit_key,
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        },
         &registry,
-        None,
-        None,
-        None,
     )?;
 
     eprintln!("[capture] Waiting {}s for output...", seconds);
@@ -198,7 +202,20 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
     agent::spawn_agent(
-        "test-attach", "/bin/bash", &[], 80, 24, None, None, "\r", &registry, None, None, None,
+        &agent::SpawnConfig {
+            name: "test-attach",
+            command: "/bin/bash",
+            args: &[],
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        },
+        &registry,
     )?;
 
     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -269,7 +286,12 @@ fn test_inbox(home: &Path) -> anyhow::Result<()> {
     }
 
     let messages = inbox::drain(home, test_name);
-    assert_eq!(messages.len(), 3, "Expected 3 messages, got {}", messages.len());
+    assert_eq!(
+        messages.len(),
+        3,
+        "Expected 3 messages, got {}",
+        messages.len()
+    );
     assert_eq!(messages[0].from, "tester-1");
     assert_eq!(messages[2].text, "Message 3");
 
@@ -327,7 +349,11 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
                 println!(" ✓ ({} instances)", config.instances.len());
                 for name in config.instance_names() {
                     if let Some(resolved) = config.resolve_instance(&name) {
-                        println!("    {name}: {} {}", resolved.command, resolved.args.join(" "));
+                        println!(
+                            "    {name}: {} {}",
+                            resolved.command,
+                            resolved.args.join(" ")
+                        );
                     }
                 }
             }
@@ -379,10 +405,10 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
 }
 
 pub fn run_demo() -> anyhow::Result<()> {
-    use std::sync::{Arc, Mutex};
     use std::collections::HashMap;
-    use std::time::Duration;
     use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     // Demo always uses bash for speed and reliability.
     // Real AI agent orchestration: use `agend-terminal start` with fleet.yaml.
@@ -404,10 +430,38 @@ pub fn run_demo() -> anyhow::Result<()> {
         tx
     };
 
-    agent::spawn_agent("alice", cmd, &args, 60, 8, None, None, "\r",
-        &registry, Some(&home), Some(crash_tx.clone()), None)?;
-    agent::spawn_agent("bob", cmd, &args, 60, 8, None, None, "\r",
-        &registry, Some(&home), Some(crash_tx), None)?;
+    agent::spawn_agent(
+        &agent::SpawnConfig {
+            name: "alice",
+            command: cmd,
+            args: &args,
+            cols: 60,
+            rows: 8,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: Some(&home),
+            crash_tx: Some(crash_tx.clone()),
+            shutdown: None,
+        },
+        &registry,
+    )?;
+    agent::spawn_agent(
+        &agent::SpawnConfig {
+            name: "bob",
+            command: cmd,
+            args: &args,
+            cols: 60,
+            rows: 8,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: Some(&home),
+            crash_tx: Some(crash_tx),
+            shutdown: None,
+        },
+        &registry,
+    )?;
 
     println!("  ✓ Both agents running\n");
     std::thread::sleep(Duration::from_secs(2));
@@ -437,7 +491,11 @@ pub fn run_demo() -> anyhow::Result<()> {
         print!("\x1b[2J\x1b[H"); // clear + home
         std::io::stdout().flush().ok();
 
-        println!("  AgEnD Terminal — Live Multi-Agent Demo  [{}/{}]",  i + 1, conversation.len());
+        println!(
+            "  AgEnD Terminal — Live Multi-Agent Demo  [{}/{}]",
+            i + 1,
+            conversation.len()
+        );
         println!("  {from} → {to}\n");
 
         draw_split_screen(&registry);
@@ -466,7 +524,9 @@ pub fn run_demo() -> anyhow::Result<()> {
     {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(bob) = reg.get("bob") {
-            let state = bob.core.lock()
+            let state = bob
+                .core
+                .lock()
                 .map(|c| c.state.current.display_name().to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
             println!("  Bob's state: {state}");
@@ -547,7 +607,8 @@ fn get_screen_lines(
             let dump = core.vterm.dump_screen();
             let output = String::from_utf8_lossy(&dump);
             let stripped = agent::strip_ansi_pub(&output);
-            return stripped.lines()
+            return stripped
+                .lines()
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| l.trim_end().to_string())
                 .collect();

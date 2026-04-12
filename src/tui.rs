@@ -75,17 +75,13 @@ pub fn attach(socket_path: &str) -> anyhow::Result<()> {
                     }
                     continue;
                 }
-                if code == KeyCode::Char('b')
-                    && modifiers.contains(KeyModifiers::CONTROL)
-                {
+                if code == KeyCode::Char('b') && modifiers.contains(KeyModifiers::CONTROL) {
                     ctrl_b_pressed = true;
                     continue;
                 }
                 let bytes = key_to_bytes(code, modifiers);
-                if !bytes.is_empty() {
-                    if framing::write_frame(&mut write_stream, &bytes).is_err() {
-                        break;
-                    }
+                if !bytes.is_empty() && framing::write_frame(&mut write_stream, &bytes).is_err() {
+                    break;
                 }
             }
             Ok(Event::Paste(text)) => {

@@ -22,7 +22,8 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start(name: &str) -> Self {
-        let home = std::env::temp_dir().join(format!("agend-integ-{}-{}", name, std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("agend-integ-{}-{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("create home");
 
@@ -50,7 +51,9 @@ impl TestDaemon {
 
     fn find_api_sock(home: &Path) -> Option<PathBuf> {
         let run = home.join("run");
-        if !run.exists() { return None; }
+        if !run.exists() {
+            return None;
+        }
         for entry in std::fs::read_dir(&run).ok()?.flatten() {
             let api = entry.path().join("api.sock");
             if api.exists() {
@@ -140,7 +143,10 @@ fn test_crash_respawn_health() {
 
     // Health state should be healthy (respawn_ok called)
     let health = agents[0]["health_state"].as_str().unwrap_or("");
-    assert_eq!(health, "healthy", "health should be healthy after respawn_ok");
+    assert_eq!(
+        health, "healthy",
+        "health should be healthy after respawn_ok"
+    );
 
     daemon.stop();
 }
@@ -181,7 +187,8 @@ fn test_shutdown_no_crash_log() {
     std::thread::sleep(Duration::from_secs(3));
 
     // Read stderr — should NOT contain "crash"
-    let log: String = stderr_reader.lines()
+    let log: String = stderr_reader
+        .lines()
         .take(50)
         .filter_map(|l| l.ok())
         .collect::<Vec<_>>()
@@ -203,7 +210,10 @@ fn test_event_log_written() {
     assert!(log_path.exists(), "event-log.jsonl should exist");
 
     let content = std::fs::read_to_string(&log_path).expect("read log");
-    assert!(content.contains("daemon_start"), "should have daemon_start event");
+    assert!(
+        content.contains("daemon_start"),
+        "should have daemon_start event"
+    );
 
     daemon.stop();
     std::thread::sleep(Duration::from_secs(2));

@@ -67,9 +67,7 @@ impl TelegramState {
 }
 
 /// Start Telegram polling in a dedicated thread with its own tokio runtime.
-pub fn start_polling(
-    state: Arc<Mutex<TelegramState>>,
-) {
+pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
     if let Err(e) = std::thread::Builder::new()
         .name("telegram".into())
         .spawn(move || {
@@ -90,21 +88,16 @@ pub fn start_polling(
                 };
 
                 let state2 = Arc::clone(&state);
-                let handler = Update::filter_message().endpoint(
-                    move |_bot: Bot, msg: Message| {
-                        let state = Arc::clone(&state2);
-                        async move {
-                            handle_message(&state, &msg);
-                            respond(())
-                        }
-                    },
-                );
+                let handler = Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
+                    let state = Arc::clone(&state2);
+                    async move {
+                        handle_message(&state, &msg);
+                        respond(())
+                    }
+                });
 
                 eprintln!("[telegram] polling started");
-                Dispatcher::builder(bot, handler)
-                    .build()
-                    .dispatch()
-                    .await;
+                Dispatcher::builder(bot, handler).build().dispatch().await;
             });
         })
     {
@@ -137,7 +130,11 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         let name = thread_id
             .and_then(|tid| s.topic_to_instance.get(&tid).cloned())
             .unwrap_or_else(|| "general".to_string());
-        let sk = s.submit_keys.get(&name).cloned().unwrap_or_else(|| "\r".to_string());
+        let sk = s
+            .submit_keys
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| "\r".to_string());
         (name, s.home.clone(), sk)
     };
 
@@ -164,7 +161,11 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
 /// Send a reply from an agent to Telegram (called from MCP reply tool).
 #[allow(dead_code)]
-pub fn send_reply(state: &Arc<Mutex<TelegramState>>, instance_name: &str, text: &str) -> anyhow::Result<()> {
+pub fn send_reply(
+    state: &Arc<Mutex<TelegramState>>,
+    instance_name: &str,
+    text: &str,
+) -> anyhow::Result<()> {
     let s = state.lock().unwrap_or_else(|e| e.into_inner());
     let bot = s.bot.clone();
     let group_id = s.group_id;
@@ -255,7 +256,9 @@ pub fn init_from_config(
                 // Write back topic_ids using fleet.rs's atomic write + flock
                 for (name, tid) in &topic_map {
                     let _ = crate::fleet::update_instance_field(
-                        home, name, "topic_id",
+                        home,
+                        name,
+                        "topic_id",
                         serde_yaml::Value::Number(serde_yaml::Number::from(*tid)),
                     );
                 }
@@ -325,7 +328,10 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
 
         let emoji_char = map_emoji_name(emoji);
 
-        let _rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let _rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => return crate::channel::SendResult::Failed(format!("{e}")),
         };
@@ -334,7 +340,12 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
         crate::channel::SendResult::Failed("react via adapter needs message_id context".into())
     }
 
-    fn edit_message(&self, _instance_name: &str, message_id: &str, text: &str) -> crate::channel::SendResult {
+    fn edit_message(
+        &self,
+        _instance_name: &str,
+        message_id: &str,
+        text: &str,
+    ) -> crate::channel::SendResult {
         let s = self.lock().unwrap_or_else(|e| e.into_inner());
         let bot = s.bot.clone();
         let group_id = s.group_id;
@@ -342,15 +353,23 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
 
         let mid: i32 = match message_id.parse() {
             Ok(m) => m,
-            Err(_) => return crate::channel::SendResult::Failed(format!("invalid message_id: {message_id}")),
+            Err(_) => {
+                return crate::channel::SendResult::Failed(format!(
+                    "invalid message_id: {message_id}"
+                ))
+            }
         };
 
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => return crate::channel::SendResult::Failed(format!("{e}")),
         };
         match rt.block_on(async {
-            bot.edit_message_text(group_id, MessageId(mid), text).await?;
+            bot.edit_message_text(group_id, MessageId(mid), text)
+                .await?;
             Ok::<(), anyhow::Error>(())
         }) {
             Ok(()) => crate::channel::SendResult::Sent,

@@ -26,10 +26,7 @@ pub fn enqueue(home: &Path, name: &str, msg: InboxMessage) -> anyhow::Result<()>
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
     writeln!(f, "{}", serde_json::to_string(&msg)?)?;
     Ok(())
 }
@@ -88,13 +85,7 @@ pub fn deliver(
 /// Inject a notification into an agent's PTY.
 /// When called from daemon (has registry), uses direct write.
 /// When called from external process (MCP), uses API socket.
-pub fn notify_agent(
-    home: &Path,
-    agent_name: &str,
-    from: &str,
-    text: &str,
-    submit_key: &str,
-) {
+pub fn notify_agent(home: &Path, agent_name: &str, from: &str, text: &str, submit_key: &str) {
     let display_text = if text.chars().count() > 200 {
         let truncated: String = text.chars().take(200).collect();
         format!("{truncated}... (use inbox tool for full message)")

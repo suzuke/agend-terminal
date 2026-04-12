@@ -105,7 +105,8 @@ impl FleetConfig {
             .unwrap_or_else(|| "claude".to_string());
 
         // Args: instance > defaults > preset (only if command matches preset command)
-        let command_matches_preset = preset.as_ref()
+        let command_matches_preset = preset
+            .as_ref()
             .map(|p| command.contains(p.command))
             .unwrap_or(false);
         let args = if !inst.args.is_empty() {
@@ -136,7 +137,8 @@ impl FleetConfig {
 
         // Submit key: from preset (only if command matches) or default \r
         let submit_key = if command_matches_preset {
-            preset.as_ref()
+            preset
+                .as_ref()
                 .map(|p| p.submit_key.to_string())
                 .unwrap_or_else(|| "\r".to_string())
         } else {
@@ -145,9 +147,9 @@ impl FleetConfig {
 
         let working_directory = inst.working_directory.as_ref().map(|d| {
             // Expand ~ to home directory
-            if d.starts_with("~/") {
+            if let Some(rest) = d.strip_prefix("~/") {
                 if let Some(home) = dirs_home() {
-                    return home.join(&d[2..]);
+                    return home.join(rest);
                 }
             }
             PathBuf::from(d)
@@ -210,14 +212,11 @@ pub struct InstanceYamlEntry {
 /// Atomically write a serde_yaml::Value back to fleet.yaml using temp file + rename.
 /// Caller must hold the file lock.
 fn atomic_write_yaml(home: &Path, doc: &serde_yaml::Value) -> Result<()> {
-    let yaml = serde_yaml::to_string(doc)
-        .context("Failed to serialize fleet.yaml")?;
+    let yaml = serde_yaml::to_string(doc).context("Failed to serialize fleet.yaml")?;
     let fleet_path = home.join("fleet.yaml");
     let tmp_path = home.join(".fleet.yaml.tmp");
-    std::fs::write(&tmp_path, &yaml)
-        .context("Failed to write temp fleet.yaml")?;
-    std::fs::rename(&tmp_path, &fleet_path)
-        .context("Failed to rename temp fleet.yaml")?;
+    std::fs::write(&tmp_path, &yaml).context("Failed to write temp fleet.yaml")?;
+    std::fs::rename(&tmp_path, &fleet_path).context("Failed to rename temp fleet.yaml")?;
     Ok(())
 }
 
@@ -227,6 +226,7 @@ fn acquire_lock(home: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
     let f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&lock_path)
         .context("failed to open lock file")?;
     nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
@@ -239,16 +239,17 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
     let fleet_path = home.join("fleet.yaml");
     let _lock = acquire_lock(home)?;
     let result = (|| -> Result<()> {
-        let content = std::fs::read_to_string(&fleet_path)
-            .unwrap_or_else(|_| "instances: {}\n".to_string());
-        let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
-            .context("Failed to parse fleet.yaml")?;
+        let content =
+            std::fs::read_to_string(&fleet_path).unwrap_or_else(|_| "instances: {}\n".to_string());
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str(&content).context("Failed to parse fleet.yaml")?;
 
         // Ensure instances mapping exists
         if doc.get("instances").is_none() {
             doc["instances"] = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
         }
-        let instances = doc.get_mut("instances")
+        let instances = doc
+            .get_mut("instances")
             .and_then(|v| v.as_mapping_mut())
             .context("instances is not a mapping")?;
 
@@ -298,10 +299,9 @@ pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
     }
     let _lock = acquire_lock(home)?;
     let result = (|| -> Result<()> {
-        let content = std::fs::read_to_string(&fleet_path)
-            .context("Failed to read fleet.yaml")?;
-        let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
-            .context("Failed to parse fleet.yaml")?;
+        let content = std::fs::read_to_string(&fleet_path).context("Failed to read fleet.yaml")?;
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str(&content).context("Failed to parse fleet.yaml")?;
 
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
             let key = serde_yaml::Value::String(name.to_string());
@@ -317,17 +317,21 @@ pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
 }
 
 /// Update a specific field of an instance in fleet.yaml. Uses file lock + atomic write.
-pub fn update_instance_field(home: &Path, name: &str, field: &str, value: serde_yaml::Value) -> Result<()> {
+pub fn update_instance_field(
+    home: &Path,
+    name: &str,
+    field: &str,
+    value: serde_yaml::Value,
+) -> Result<()> {
     let fleet_path = home.join("fleet.yaml");
     if !fleet_path.exists() {
         return Ok(());
     }
     let _lock = acquire_lock(home)?;
     let result = (|| -> Result<()> {
-        let content = std::fs::read_to_string(&fleet_path)
-            .context("Failed to read fleet.yaml")?;
-        let mut doc: serde_yaml::Value = serde_yaml::from_str(&content)
-            .context("Failed to parse fleet.yaml")?;
+        let content = std::fs::read_to_string(&fleet_path).context("Failed to read fleet.yaml")?;
+        let mut doc: serde_yaml::Value =
+            serde_yaml::from_str(&content).context("Failed to parse fleet.yaml")?;
 
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
             let key = serde_yaml::Value::String(name.to_string());
@@ -358,19 +362,26 @@ mod tests {
     #[test]
     fn test_preset_args_not_applied_to_different_command() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-test-{}", std::process::id()));
-        let path = write_fleet(&dir, r#"
+        let path = write_fleet(
+            &dir,
+            r#"
 defaults:
   backend: claude-code
 instances:
   test:
     command: /bin/bash
-"#);
+"#,
+        );
         let config = FleetConfig::load(&path).expect("load");
         let resolved = config.resolve_instance("test").expect("resolve");
 
         assert_eq!(resolved.command, "/bin/bash");
         // Preset args (--dangerously-skip-permissions) should NOT be applied
-        assert!(resolved.args.is_empty(), "args should be empty for non-preset command, got: {:?}", resolved.args);
+        assert!(
+            resolved.args.is_empty(),
+            "args should be empty for non-preset command, got: {:?}",
+            resolved.args
+        );
         // Submit key should be default \r, not preset's
         assert_eq!(resolved.submit_key, "\r");
 
@@ -380,19 +391,24 @@ instances:
     #[test]
     fn test_preset_args_applied_to_matching_command() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-test2-{}", std::process::id()));
-        let path = write_fleet(&dir, r#"
+        let path = write_fleet(
+            &dir,
+            r#"
 defaults:
   backend: claude-code
 instances:
   test:
     command: claude
-"#);
+"#,
+        );
         let config = FleetConfig::load(&path).expect("load");
         let resolved = config.resolve_instance("test").expect("resolve");
 
         assert_eq!(resolved.command, "claude");
         assert!(!resolved.args.is_empty(), "preset args should be applied");
-        assert!(resolved.args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(resolved
+            .args
+            .contains(&"--dangerously-skip-permissions".to_string()));
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -400,7 +416,9 @@ instances:
     #[test]
     fn test_env_merge_order() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-test3-{}", std::process::id()));
-        let path = write_fleet(&dir, r#"
+        let path = write_fleet(
+            &dir,
+            r#"
 defaults:
   env:
     KEY1: default_val
@@ -411,13 +429,23 @@ instances:
     env:
       KEY2: instance_val
       KEY3: instance_only
-"#);
+"#,
+        );
         let config = FleetConfig::load(&path).expect("load");
         let resolved = config.resolve_instance("test").expect("resolve");
 
-        assert_eq!(resolved.env.get("KEY1").map(|s| s.as_str()), Some("default_val"));
-        assert_eq!(resolved.env.get("KEY2").map(|s| s.as_str()), Some("instance_val")); // instance overrides
-        assert_eq!(resolved.env.get("KEY3").map(|s| s.as_str()), Some("instance_only"));
+        assert_eq!(
+            resolved.env.get("KEY1").map(|s| s.as_str()),
+            Some("default_val")
+        );
+        assert_eq!(
+            resolved.env.get("KEY2").map(|s| s.as_str()),
+            Some("instance_val")
+        ); // instance overrides
+        assert_eq!(
+            resolved.env.get("KEY3").map(|s| s.as_str()),
+            Some("instance_only")
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -425,11 +453,14 @@ instances:
     #[test]
     fn test_add_instance_to_yaml() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-add-{}", std::process::id()));
-        let path = write_fleet(&dir, r#"
+        let path = write_fleet(
+            &dir,
+            r#"
 instances:
   existing:
     command: /bin/bash
-"#);
+"#,
+        );
         let entry = InstanceYamlEntry {
             command: "claude".to_string(),
             backend: Some("claude-code".to_string()),
@@ -452,13 +483,16 @@ instances:
     #[test]
     fn test_remove_instance_from_yaml() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-rm-{}", std::process::id()));
-        write_fleet(&dir, r#"
+        write_fleet(
+            &dir,
+            r#"
 instances:
   keep:
     command: /bin/bash
   remove-me:
     command: /bin/bash
-"#);
+"#,
+        );
         remove_instance_from_yaml(&dir, "remove-me").expect("remove");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load after remove");
         assert!(config.instances.contains_key("keep"));
@@ -488,13 +522,21 @@ instances:
     #[test]
     fn test_update_instance_field() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-upd-{}", std::process::id()));
-        write_fleet(&dir, r#"
+        write_fleet(
+            &dir,
+            r#"
 instances:
   agent1:
     command: /bin/bash
-"#);
-        update_instance_field(&dir, "agent1", "topic_id", serde_yaml::Value::Number(serde_yaml::Number::from(42)))
-            .expect("update field");
+"#,
+        );
+        update_instance_field(
+            &dir,
+            "agent1",
+            "topic_id",
+            serde_yaml::Value::Number(serde_yaml::Number::from(42)),
+        )
+        .expect("update field");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
         assert_eq!(config.instances["agent1"].topic_id, Some(42));
 
@@ -504,14 +546,17 @@ instances:
     #[test]
     fn test_git_branch_override() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-test4-{}", std::process::id()));
-        let path = write_fleet(&dir, r#"
+        let path = write_fleet(
+            &dir,
+            r#"
 instances:
   with_branch:
     command: /bin/bash
     git_branch: "custom/branch"
   without_branch:
     command: /bin/bash
-"#);
+"#,
+        );
         let config = FleetConfig::load(&path).expect("load");
 
         let with = config.resolve_instance("with_branch").expect("resolve");
