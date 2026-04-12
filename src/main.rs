@@ -1,6 +1,7 @@
 mod agent;
 mod api;
 mod backend;
+mod bugreport;
 mod channel;
 mod cli;
 mod daemon;
@@ -153,6 +154,8 @@ enum Commands {
     Demo,
     /// Interactive setup — detect backends, configure Telegram, generate fleet.yaml
     Quickstart,
+    /// Generate bug report with diagnostics, logs, and config
+    Bugreport,
 }
 
 #[derive(Subcommand)]
@@ -381,6 +384,9 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Quickstart) => {
             crate::quickstart::run(&home)?;
+        }
+        Some(Commands::Bugreport) => {
+            crate::bugreport::run(&home)?;
         }
     }
 
