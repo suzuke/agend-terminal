@@ -252,43 +252,15 @@ pub fn init_from_config(
             // Write back newly created topic_ids to fleet.yaml (atomic via temp file)
             let fleet_path = home.join("fleet.yaml");
             if fleet_path.exists() {
-                let lock_path = home.join(".fleet.yaml.lock");
-                // Simple file lock: create lock file, write, remove lock
-                if std::fs::OpenOptions::new().write(true).create_new(true).open(&lock_path).is_ok() {
-                    if let Ok(content) = std::fs::read_to_string(&fleet_path) {
-                        if let Ok(mut doc) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                            let mut updated = false;
-                            if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
-                                for (name, tid) in &topic_map {
-                                    let key = serde_yaml::Value::String(name.clone());
-                                    if let Some(inst) = instances.get_mut(&key).and_then(|v| v.as_mapping_mut()) {
-                                        let tid_key = serde_yaml::Value::String("topic_id".to_string());
-                                        if !inst.contains_key(&tid_key) {
-                                            inst.insert(tid_key, serde_yaml::Value::Number(serde_yaml::Number::from(*tid)));
-                                            updated = true;
-                                        }
-                                    }
-                                }
-                            }
-                            if updated {
-                                if let Ok(yaml) = serde_yaml::to_string(&doc) {
-                                    let yaml = format!("# Auto-updated by agend-terminal (topic_ids added)\n{yaml}");
-                                    // Write to temp file first, then rename (atomic on same filesystem)
-                                    let tmp_path = home.join(".fleet.yaml.tmp");
-                                    if std::fs::write(&tmp_path, &yaml).is_ok() {
-                                        if std::fs::rename(&tmp_path, &fleet_path).is_ok() {
-                                            eprintln!("[telegram] updated fleet.yaml with topic_ids");
-                                        } else {
-                                            let _ = std::fs::remove_file(&tmp_path);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let _ = std::fs::remove_file(&lock_path);
-                } else {
-                    eprintln!("[telegram] fleet.yaml locked by another process, skipping topic_id write-back");
+                // Write back topic_ids using fleet.rs's atomic write + flock
+                for (name, tid) in &topic_map {
+                    let _ = crate::fleet::update_instance_field(
+                        home, name, "topic_id",
+                        serde_yaml::Value::Number(serde_yaml::Number::from(*tid)),
+                    );
+                }
+                if !topic_map.is_empty() {
+                    eprintln!("[telegram] updated fleet.yaml with topic_ids");
                 }
             }
 
