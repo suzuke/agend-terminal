@@ -266,3 +266,112 @@ impl Backend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_command_detection() {
+        assert_eq!(Backend::from_command("claude"), Some(Backend::ClaudeCode));
+        assert_eq!(Backend::from_command("kiro-cli"), Some(Backend::KiroCli));
+        assert_eq!(Backend::from_command("codex"), Some(Backend::Codex));
+        assert_eq!(Backend::from_command("opencode"), Some(Backend::OpenCode));
+        assert_eq!(Backend::from_command("gemini"), Some(Backend::Gemini));
+        // Case insensitive
+        assert_eq!(Backend::from_command("Claude"), Some(Backend::ClaudeCode));
+        assert_eq!(Backend::from_command("/usr/bin/claude"), Some(Backend::ClaudeCode));
+    }
+
+    #[test]
+    fn from_command_unknown() {
+        assert_eq!(Backend::from_command("unknown-tool"), None);
+        assert_eq!(Backend::from_command("vim"), None);
+        assert_eq!(Backend::from_command(""), None);
+    }
+
+    #[test]
+    fn preset_args_correct() {
+        let claude = Backend::ClaudeCode.preset();
+        assert!(claude.args.contains(&"--dangerously-skip-permissions"));
+        assert_eq!(claude.command, "claude");
+
+        let kiro = Backend::KiroCli.preset();
+        assert!(kiro.args.contains(&"chat"));
+        assert!(kiro.args.contains(&"--trust-all-tools"));
+
+        let gemini = Backend::Gemini.preset();
+        assert!(gemini.args.contains(&"--yolo"));
+    }
+
+    #[test]
+    fn resume_mode_types() {
+        let claude = Backend::ClaudeCode.preset();
+        assert!(matches!(claude.resume_mode, ResumeMode::SavedSession { .. }));
+
+        let kiro = Backend::KiroCli.preset();
+        assert!(matches!(kiro.resume_mode, ResumeMode::ContinueInCwd { .. }));
+
+        let codex = Backend::Codex.preset();
+        assert!(matches!(codex.resume_mode, ResumeMode::NotSupported));
+
+        let gemini = Backend::Gemini.preset();
+        assert!(matches!(gemini.resume_mode, ResumeMode::Fixed { .. }));
+
+        let opencode = Backend::OpenCode.preset();
+        assert!(matches!(opencode.resume_mode, ResumeMode::ContinueInCwd { .. }));
+    }
+
+    #[test]
+    fn backend_name_roundtrip() {
+        assert_eq!(Backend::ClaudeCode.name(), "claude-code");
+        assert_eq!(Backend::KiroCli.name(), "kiro-cli");
+        assert_eq!(Backend::Codex.name(), "codex");
+        assert_eq!(Backend::OpenCode.name(), "open-code");
+        assert_eq!(Backend::Gemini.name(), "gemini");
+    }
+
+    #[test]
+    fn all_backends_returns_five() {
+        assert_eq!(Backend::all().len(), 5);
+    }
+
+    #[test]
+    fn resume_mode_continue_in_cwd_args() {
+        let mode = ResumeMode::ContinueInCwd { flag: "--continue" };
+        let args = mode.args_for(std::path::Path::new("/tmp"), "test");
+        assert_eq!(args, vec!["--continue".to_string()]);
+    }
+
+    #[test]
+    fn resume_mode_fixed_args() {
+        let mode = ResumeMode::Fixed { args: &["--resume", "latest"] };
+        let args = mode.args_for(std::path::Path::new("/tmp"), "test");
+        assert_eq!(args, vec!["--resume".to_string(), "latest".to_string()]);
+    }
+
+    #[test]
+    fn resume_mode_not_supported_args() {
+        let mode = ResumeMode::NotSupported;
+        let args = mode.args_for(std::path::Path::new("/tmp"), "test");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn preset_ready_pattern_nonempty() {
+        for backend in Backend::all() {
+            let preset = backend.preset();
+            assert!(!preset.ready_pattern.is_empty(), "Backend {:?} has empty ready_pattern", backend);
+        }
+    }
+
+    #[test]
+    fn calibrated_version_nonempty() {
+        for backend in Backend::all() {
+            let version = backend.calibrated_version();
+            assert!(!version.is_empty());
+            // Should look like a semver: at least one dot
+            assert!(version.contains('.'), "Version {version} for {:?} doesn't look like semver", backend);
+        }
+    }
+}
