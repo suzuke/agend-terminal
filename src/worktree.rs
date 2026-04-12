@@ -21,6 +21,16 @@ pub fn is_git_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// Check if a git repo has at least one commit (valid HEAD).
+fn has_commits(repo_dir: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Validate a git branch name. Only allows [a-zA-Z0-9/_.-], rejects ".." and leading "-".
 fn validate_branch(branch: &str) -> bool {
     !branch.is_empty()
@@ -45,6 +55,22 @@ pub fn create(
 ) -> Option<WorktreeInfo> {
     if !is_git_repo(repo_dir) {
         return None;
+    }
+
+    // Empty repo (git init without any commits) → HEAD is invalid.
+    // Worktree creation requires at least one commit.
+    if !has_commits(repo_dir) {
+        tracing::info!(repo = %repo_dir.display(), "empty repo, creating initial commit for worktree support");
+        let ok = std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init (agend-terminal)"])
+            .current_dir(repo_dir)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            tracing::warn!(repo = %repo_dir.display(), "failed to create initial commit in empty repo");
+            return None;
+        }
     }
 
     let branch = custom_branch
@@ -224,8 +250,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
     fn tmp_repo(name: &str) -> PathBuf {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "agend-wt-test-{}-{}-{}",
@@ -311,6 +338,29 @@ mod tests {
         assert!(residual.contains(&"agent1".to_string()));
         assert!(residual.contains(&"agent2".to_string()));
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn test_empty_repo_gets_initial_commit() {
+        // git init without any commit — should auto-create initial commit
+        let dir = std::env::temp_dir().join(format!(
+            "agend-wt-test-empty-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        // No commit — HEAD is invalid
+        assert!(!has_commits(&dir));
+        // create() should handle this gracefully
+        let info = create(&dir, "agent1", None);
+        assert!(info.is_some(), "worktree should be created in empty repo");
+        assert!(has_commits(&dir), "initial commit should exist now");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
