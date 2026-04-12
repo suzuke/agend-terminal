@@ -15,6 +15,7 @@ mod inbox;
 mod instructions;
 mod mcp;
 mod mcp_config;
+mod quickstart;
 mod schedules;
 mod state;
 mod store;
@@ -149,6 +150,8 @@ enum Commands {
     Doctor,
     /// Interactive demo — experience multi-agent orchestration in 30 seconds
     Demo,
+    /// Interactive setup — detect backends, configure Telegram, generate fleet.yaml
+    Quickstart,
 }
 
 #[derive(Subcommand)]
@@ -379,6 +382,9 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Demo) => {
             cli::run_demo()?;
+        }
+        Some(Commands::Quickstart) => {
+            crate::quickstart::run(&home)?;
         }
     }
 
