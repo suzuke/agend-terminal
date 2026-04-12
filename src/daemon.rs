@@ -315,6 +315,8 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     );
     tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
 
+    let mut last_snapshot_json = String::new();
+
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
         let (tx, rx) = crossbeam::channel::bounded(1);
@@ -367,7 +369,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             }
         }
 
-        // Periodic snapshot: save fleet state
+        // Periodic snapshot: save fleet state (only if changed)
         {
             let reg = agent::lock_registry(&registry);
             let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
@@ -400,7 +402,12 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                 .collect();
             drop(cfgs);
             drop(reg);
-            crate::snapshot::save(home, &snapshots);
+            // Only write if snapshot content changed
+            let new_json = serde_json::to_string(&snapshots).unwrap_or_default();
+            if last_snapshot_json != new_json {
+                crate::snapshot::save(home, &snapshots);
+                last_snapshot_json = new_json;
+            }
         }
 
         check_schedules(home, &registry);
@@ -608,9 +615,10 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         reg.clear();
     }
 
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Give threads time to flush logs and close connections
+    std::thread::sleep(std::time::Duration::from_secs(1));
     tracing::info!("exiting");
-    std::process::exit(0);
+    Ok(())
 }
 
 /// Send a notification to Telegram (instance topic or general).
