@@ -34,37 +34,110 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         backends[idx].clone()
     };
 
-    // Step 2: Telegram setup
+    // Step 2: Check existing .env for token
+    let env_path = home.join(".env");
+    let existing_token = std::fs::read_to_string(&env_path).ok()
+        .and_then(|content| {
+            content.lines()
+                .find(|l| l.starts_with("AGEND_BOT_TOKEN="))
+                .map(|l| l.trim_start_matches("AGEND_BOT_TOKEN=").trim().to_string())
+        })
+        .filter(|t| !t.is_empty());
+
+    // Step 3: Check existing fleet.yaml for group_id
+    let fleet_path = home.join("fleet.yaml");
+    let existing_group_id = std::fs::read_to_string(&fleet_path).ok()
+        .and_then(|content| {
+            serde_yaml::from_str::<serde_yaml::Value>(&content).ok()
+        })
+        .and_then(|config| config["channel"]["group_id"].as_i64());
+
+    let (token, group_id) = if existing_token.is_some() && existing_group_id.is_some() {
+        let tok = existing_token.clone().unwrap_or_default();
+        let gid = existing_group_id.unwrap_or(0);
+        let masked = if tok.len() > 8 {
+            format!("{}...{}", &tok[..4], &tok[tok.len()-4..])
+        } else {
+            "****".to_string()
+        };
+        println!("  ── Telegram ──\n");
+        println!("  ✓ Token: {masked}");
+        println!("  ✓ Group: {gid}");
+        let answer = prompt("\n  Use existing Telegram config? (Y/n): ")?;
+        if answer.trim().eq_ignore_ascii_case("n") {
+            telegram_setup(home)?
+        } else {
+            println!();
+            (tok, Some(gid))
+        }
+    } else if let Some(tok) = existing_token {
+        println!("  ── Telegram ──\n");
+        let masked = if tok.len() > 8 {
+            format!("{}...{}", &tok[..4], &tok[tok.len()-4..])
+        } else {
+            "****".to_string()
+        };
+        println!("  ✓ Token found: {masked}");
+        let answer = prompt("  Use existing token? (Y/n): ")?;
+        if answer.trim().eq_ignore_ascii_case("n") {
+            telegram_setup(home)?
+        } else {
+            // Have token but no group — detect group
+            println!("\n  Add the bot to your Telegram group and send a message.\n");
+            print!("  Waiting for group message (3 min timeout)... ");
+            io::stdout().flush().ok();
+            match detect_group(&tok) {
+                Ok((gid, title)) => {
+                    println!("✓ {title} ({gid})\n");
+                    (tok, Some(gid))
+                }
+                Err(e) => {
+                    println!("timeout: {e}\n");
+                    (tok, None)
+                }
+            }
+        }
+    } else {
+        telegram_setup(home)?
+    };
+
+    // Save .env + fleet.yaml
+    if !token.is_empty() {
+        save_env_token(home, &token)?;
+    }
+    generate_fleet_yaml(home, &selected, group_id, if token.is_empty() { None } else { Some(&token) })?;
+
+    print_next_steps(home);
+    Ok(())
+}
+
+/// Full Telegram setup flow — BotFather → token → group detection.
+fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
     println!("  ── Telegram Setup ──\n");
     println!("  1. Open Telegram, talk to @BotFather");
     println!("  2. Send /newbot and follow instructions");
     println!("  3. Copy the bot token\n");
 
-    let token = prompt("  Bot token: ")?;
+    let token = prompt("  Bot token (Enter to skip): ")?;
     let token = token.trim().to_string();
 
     if token.is_empty() {
-        println!("\n  Skipping Telegram setup. You can configure later in fleet.yaml.\n");
-        generate_fleet_yaml(home, &selected, None, None)?;
-        print_next_steps(home);
-        return Ok(());
+        println!("\n  Skipping Telegram. Configure later in fleet.yaml.\n");
+        return Ok((String::new(), None));
     }
 
-    // Validate token format
     if !token.contains(':') {
-        println!("  ⚠ Token format looks wrong (expected number:string). Continuing anyway.\n");
+        println!("  ⚠ Token format looks wrong. Continuing anyway.\n");
     }
 
-    // Verify bot via API
     print!("  Verifying bot... ");
     io::stdout().flush().ok();
     match verify_bot(&token) {
         Ok(bot_name) => println!("✓ @{bot_name}\n"),
-        Err(e) => println!("⚠ {e} (continuing anyway)\n"),
+        Err(e) => println!("⚠ {e}\n"),
     }
 
-    // Step 3: Group detection
-    println!("  Now add the bot to your Telegram group (as admin).");
+    println!("  Add the bot to your Telegram group (as admin).");
     println!("  Then send any message in the group.\n");
     print!("  Waiting for group message (3 min timeout)... ");
     io::stdout().flush().ok();
@@ -72,25 +145,14 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     match detect_group(&token) {
         Ok((group_id, group_title)) => {
             println!("✓ {group_title} ({group_id})\n");
-
-            // Save token to .env
-            save_env_token(home, &token)?;
-
-            generate_fleet_yaml(home, &selected, Some(group_id), Some(&token))?;
+            Ok((token, Some(group_id)))
         }
         Err(e) => {
-            println!("timeout/error: {e}\n");
-            println!("  You can set group_id manually in fleet.yaml later.\n");
-
-            // Save token anyway
-            save_env_token(home, &token)?;
-
-            generate_fleet_yaml(home, &selected, None, Some(&token))?;
+            println!("timeout: {e}\n");
+            println!("  Set group_id manually in fleet.yaml later.\n");
+            Ok((token, None))
         }
     }
-
-    print_next_steps(home);
-    Ok(())
 }
 
 fn detect_backends() -> Vec<Backend> {
