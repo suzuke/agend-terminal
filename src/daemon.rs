@@ -462,7 +462,22 @@ pub fn run(
                 }
     }
 
-    // Shutdown cleanup
+    // Shutdown: print residual worktrees
+    {
+        let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = std::collections::HashSet::new();
+        for config in cfgs.values() {
+            if let Some(ref dir) = config.working_dir {
+                if seen.insert(dir.clone()) {
+                    let residual = crate::worktree::list_residual(dir);
+                    if !residual.is_empty() {
+                        eprintln!("[worktree] residual in {}: {:?} (use `git worktree remove` to clean)", dir.display(), residual);
+                    }
+                }
+            }
+        }
+    }
+
     crate::event_log::log(home, "daemon_stop", "", "shutdown");
     eprintln!("[daemon] cleaning up...");
     {

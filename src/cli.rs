@@ -9,36 +9,28 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
     let config = fleet::FleetConfig::load(fleet_path)?;
     let mut agents = Vec::new();
 
+    // Prune stale worktrees on startup
+    {
+        let mut seen_repos = std::collections::HashSet::new();
+        for name in config.instance_names() {
+            if let Some(resolved) = config.resolve_instance(&name) {
+                if let Some(ref dir) = resolved.working_directory {
+                    if seen_repos.insert(dir.clone()) {
+                        crate::worktree::prune(dir);
+                    }
+                }
+            }
+        }
+    }
+
     for name in config.instance_names() {
         if let Some(mut resolved) = config.resolve_instance(&name) {
-            // Auto-create git worktree if configured
-            if resolved.worktree {
-                if let Some(ref base_dir) = resolved.working_directory {
-                    let worktree_dir = base_dir.join(format!(".worktrees/{name}"));
-                    if !worktree_dir.exists() {
-                        let branch = format!("agend/{name}");
-                        let output = std::process::Command::new("git")
-                            .args(["worktree", "add", "-b", &branch,
-                                   &worktree_dir.display().to_string()])
-                            .current_dir(base_dir)
-                            .output();
-                        match output {
-                            Ok(o) if o.status.success() => {
-                                eprintln!("[fleet] created worktree for {name}: {}", worktree_dir.display());
-                                resolved.working_directory = Some(worktree_dir);
-                            }
-                            Ok(o) => {
-                                eprintln!("[fleet] worktree creation failed for {name}: {}",
-                                    String::from_utf8_lossy(&o.stderr));
-                                // Fall back to shared directory
-                            }
-                            Err(e) => {
-                                eprintln!("[fleet] git not available for worktree: {e}");
-                            }
-                        }
-                    } else {
-                        // Worktree already exists — use it
-                        resolved.working_directory = Some(worktree_dir);
+            // Auto-create git worktree if working_directory is a git repo
+            if let Some(ref base_dir) = resolved.working_directory {
+                if crate::worktree::is_git_repo(base_dir) {
+                    let custom_branch = resolved.git_branch.as_deref();
+                    if let Some(info) = crate::worktree::create(base_dir, &name, custom_branch) {
+                        resolved.working_directory = Some(info.path);
                     }
                 }
             }

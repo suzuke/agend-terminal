@@ -23,6 +23,7 @@ mod tasks;
 mod teams;
 mod telegram;
 mod tui;
+mod worktree;
 mod verify;
 mod vterm;
 

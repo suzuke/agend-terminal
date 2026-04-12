@@ -102,7 +102,9 @@ fn instance_tools() -> Vec<Value> {
         json!({"name": "create_instance", "description": "Create a new agent instance.",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string"}, "command": {"type": "string"}, "args": {"type": "string"},
-                "model": {"type": "string"}, "working_directory": {"type": "string"}
+                "model": {"type": "string"}, "working_directory": {"type": "string"},
+                "branch": {"type": "string", "description": "Git branch — creates worktree if specified"},
+                "task": {"type": "string", "description": "Initial task to inject after spawn"}
             }, "required": ["name", "command"]}}),
         json!({"name": "delete_instance", "description": "Stop and remove an instance.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
@@ -558,18 +560,40 @@ fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                     cmd_args.push_str(&format!("--model {model}"));
                 }
             }
-            let work_dir = args.get("working_directory").and_then(|v| v.as_str())
+            let mut work_dir = args.get("working_directory").and_then(|v| v.as_str())
                 .map(String::from)
                 .unwrap_or_else(|| home.join("workspaces").join(name).display().to_string());
+
+            // Create worktree if branch specified and directory is a git repo
+            let wd = std::path::PathBuf::from(&work_dir);
+            if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
+                if let Some(info) = crate::worktree::create(&wd, name, Some(branch)) {
+                    work_dir = info.path.display().to_string();
+                }
+            }
+
             let wd = std::path::PathBuf::from(&work_dir);
             std::fs::create_dir_all(&wd).ok();
             crate::instructions::generate(&wd, command);
             crate::mcp_config::configure(&wd, command);
+
+            let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
+
             match crate::api::call(&home, &json!({
                 "method": "spawn",
                 "params": { "name": name, "command": command, "args": &cmd_args, "working_directory": work_dir }
             })) {
-                Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"status": "created", "name": name}),
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    // Inject initial task if provided
+                    if let Some(ref task_text) = task {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let _ = crate::api::call(&home, &json!({
+                            "method": "inject",
+                            "params": {"name": name, "data": task_text}
+                        }));
+                    }
+                    json!({"status": "created", "name": name})
+                }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("spawn failed")}),
                 Err(e) => json!({"error": format!("API unavailable: {e}")}),
             }

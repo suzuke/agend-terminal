@@ -51,9 +51,6 @@ pub struct InstanceDefaults {
     pub env: HashMap<String, String>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
-    /// If true, create a git worktree for each instance from this repo.
-    #[serde(default)]
-    pub worktree: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,9 +68,8 @@ pub struct InstanceConfig {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
-    /// If true, create a git worktree for this instance.
-    #[serde(default)]
-    pub worktree: Option<bool>,
+    /// Custom git branch name for worktree (overrides agend/{name}).
+    pub git_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,7 +168,7 @@ impl FleetConfig {
             cols,
             rows,
             topic_id: inst.topic_id,
-            worktree: inst.worktree.unwrap_or(defaults.worktree),
+            git_branch: inst.git_branch.clone(),
         })
     }
 
@@ -196,7 +192,7 @@ pub struct ResolvedInstance {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
-    pub worktree: bool,
+    pub git_branch: Option<String>,
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -283,25 +279,23 @@ instances:
     }
 
     #[test]
-    fn test_worktree_flag() {
+    fn test_git_branch_override() {
         let dir = std::env::temp_dir().join(format!("agend-fleet-test4-{}", std::process::id()));
         let path = write_fleet(&dir, r#"
-defaults:
-  worktree: true
 instances:
-  with_wt:
+  with_branch:
     command: /bin/bash
-  without_wt:
+    git_branch: "custom/branch"
+  without_branch:
     command: /bin/bash
-    worktree: false
 "#);
         let config = FleetConfig::load(&path).expect("load");
 
-        let with = config.resolve_instance("with_wt").expect("resolve");
-        assert!(with.worktree);
+        let with = config.resolve_instance("with_branch").expect("resolve");
+        assert_eq!(with.git_branch.as_deref(), Some("custom/branch"));
 
-        let without = config.resolve_instance("without_wt").expect("resolve");
-        assert!(!without.worktree);
+        let without = config.resolve_instance("without_branch").expect("resolve");
+        assert!(without.git_branch.is_none());
 
         fs::remove_dir_all(&dir).ok();
     }
