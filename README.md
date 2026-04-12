@@ -1,117 +1,134 @@
 # AgEnD Terminal
 
-Rust-based Agent Process Manager — replaces tmux for managing AI coding agents.
+Orchestrate AI coding agents — not just run them.
 
-Direct PTY ownership eliminates `send-keys` race conditions and enables atomic writes, output capture, and virtual terminal state tracking.
+```bash
+cargo install agend-terminal
+agend-terminal demo    # Try it in 30 seconds
+```
 
-## Features
+## What It Does
 
-- **PTY Engine** — portable-pty + alacritty_terminal VTerm emulation
-- **Attach/Detach** — Ctrl+B d to detach, agent runs in background
-- **5 Backend Presets** — Claude Code, Kiro CLI, Codex, OpenCode, Gemini
-- **35 MCP Tools** — reply, delegate_task, decisions, task board, teams, schedules, deployments
-- **Fleet Management** — fleet.yaml config, Telegram integration
-- **Health Monitoring** — auto-respawn with exponential backoff, state detection
-- **Git Worktree Isolation** — auto-creates worktree per agent on git repos
-- **Event Log** — append-only JSONL audit trail
-- **Cron Scheduling** — inject messages on cron schedule
+**Run 3 Claude agents working on the same repo in parallel:**
+```bash
+agend-terminal start    # reads fleet.yaml, spawns agents with git worktree isolation
+agend-terminal status   # see all agents and their health
+agend-terminal attach dev  # watch one agent work (Ctrl+B d to detach)
+```
+
+**Agents talk to each other — no glue code:**
+```
+Agent A finds a bug outside its scope → delegates to Agent B via MCP tool.
+Agent B fixes it → reports back with commit hash.
+Agent A continues with the fix applied.
+```
+
+**Survive crashes without losing context:**
+```
+Agent crashes → auto-respawned with exponential backoff.
+System message tells the new agent what happened.
+Worktree preserves all code changes.
+```
+
+## Why Not tmux?
+
+| | tmux + shell scripts | agend-terminal |
+|---|---|---|
+| Input injection | `send-keys` race conditions | Atomic PTY write |
+| Output capture | Screen scraping | VTerm state tracking |
+| Agent health | Manual monitoring | Auto-respawn + state detection |
+| Multi-agent comms | Custom IPC | Built-in MCP tools |
+| Git isolation | Manual worktrees | Auto per-agent worktree |
 
 ## Quick Start
 
 ```bash
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
+# Try the demo (no config needed)
+agend-terminal demo
 
-# Single agent
-agend-terminal daemon shell:/bin/bash
+# Or start with your own agents
+cat > ~/.agend-terminal/fleet.yaml << 'YAML'
+defaults:
+  backend: claude-code
 
-# Fleet (with fleet.yaml)
-mkdir -p ~/.agend-terminal
-cp fleet.yaml ~/.agend-terminal/fleet.yaml
+instances:
+  dev:
+    role: "Developer"
+    working_directory: ~/my-project
+  reviewer:
+    role: "Code reviewer"
+    working_directory: ~/my-project
+YAML
+
 agend-terminal start
 ```
 
 ## Commands
 
 ```
+agend-terminal demo                      30-second interactive demo
 agend-terminal start                     Start daemon + fleet
-agend-terminal daemon [name:cmd ...]     Start daemon with agents
-agend-terminal attach <name>             Attach (Ctrl+B d to detach)
-agend-terminal inject <name> <text>      Send input to agent
-agend-terminal list                      List running agents
-agend-terminal status                    Show agent state + health
-agend-terminal kill <name>               Kill an agent
+agend-terminal daemon [name:cmd ...]     Start with explicit agents
+agend-terminal attach <name>             Attach to agent (Ctrl+B d)
+agend-terminal inject <name> <text>      Send input
+agend-terminal list / status             Show agents
+agend-terminal kill <name>               Kill agent
 agend-terminal stop                      Stop daemon
-agend-terminal fleet start [config]      Start fleet from config
-agend-terminal fleet stop                Stop all fleet agents
-agend-terminal mcp                       Start MCP stdio server
-agend-terminal doctor                    Health check
-agend-terminal verify [--json]           E2E verification
+agend-terminal doctor                    Check backends
+agend-terminal mcp                       MCP stdio server
 ```
 
-## Fleet Configuration
+## 35 MCP Tools
 
-```yaml
-defaults:
-  backend: claude-code
-
-channel:
-  type: telegram
-  bot_token_env: AGEND_BOT_TOKEN
-  group_id: -100123456789
-
-instances:
-  dev:
-    role: "Developer"
-    working_directory: ~/project    # auto worktree if git repo
-    git_branch: "custom/branch"     # optional branch override
-  reviewer:
-    role: "Code reviewer"
-    working_directory: ~/project
-```
-
-## MCP Tools (35)
+Agents get these tools automatically via MCP:
 
 | Category | Tools |
 |----------|-------|
-| Channel | reply, react, edit_message, download_attachment |
-| Communication | send_to_instance, delegate_task, report_result, request_information, broadcast, inbox |
-| Instance | list_instances, create_instance, delete_instance, start_instance, describe_instance, replace_instance, set_display_name, set_description |
-| Decisions | post_decision, list_decisions, update_decision |
-| Task Board | task (create/list/claim/done/update) |
-| Teams | create_team, delete_team, list_teams, update_team |
-| Scheduling | create_schedule, list_schedules, update_schedule, delete_schedule |
-| Deployments | deploy_template, teardown_deployment, list_deployments |
-| Repo | checkout_repo, release_repo |
+| Talk to users | reply, react, edit_message, download_attachment |
+| Talk to agents | send_to_instance, delegate_task, report_result, request_information, broadcast, inbox |
+| Manage agents | list/create/delete/start/describe/replace_instance, set_display_name, set_description |
+| Track decisions | post_decision, list_decisions, update_decision |
+| Track tasks | task (create/list/claim/done/update) |
+| Organize teams | create/delete/list/update_team |
+| Schedule work | create/list/update/delete_schedule |
+| Deploy fleets | deploy_template, teardown_deployment, list_deployments |
+| Share code | checkout_repo, release_repo |
 
 ## Git Worktree Isolation
 
-Agents with `working_directory` pointing to a git repo automatically get their own worktree at `.worktrees/{name}/` with branch `agend/{name}`. No configuration needed.
+Agents pointing to git repos automatically get isolated worktrees:
 
-- Worktrees are reused on respawn
-- `.worktrees` auto-added to `.gitignore`
-- Stale entries pruned on daemon startup
-- Residual worktrees listed on shutdown
+```
+~/my-project/               ← original repo (untouched)
+~/my-project/.worktrees/
+  dev/                       ← agent "dev" works here (branch agend/dev)
+  reviewer/                  ← agent "reviewer" works here (branch agend/reviewer)
+```
+
+No configuration needed. `.worktrees` auto-added to `.gitignore`.
 
 ## Health Monitoring
 
-- **States**: Starting, Ready, Idle, Thinking, ToolUse, PermissionPrompt, RateLimit, Crashed, Restarting
-- **Health**: Healthy → Recovering → Unstable → Failed (with decay after 30 min stability)
-- **Auto-respawn**: Exponential backoff (5s → 300s), max 5 retries
-- **Hang detection**: State-aware timeouts (120s starting, 600s thinking)
-- **Crash notifications**: Telegram notification on repeated crashes
+- Auto-respawn with exponential backoff (5s → 300s)
+- State detection: Idle, Thinking, ToolUse, RateLimit, Crashed, Restarting
+- Crash notifications via Telegram
+- 30-minute stability window prevents permanent failure from occasional crashes
 
-## Environment
+## Backends
 
-- `AGEND_TERMINAL_HOME` — Data directory (default: `~/.agend-terminal`)
-- `.env` file in home directory is auto-loaded on startup
+| Backend | Command | Status |
+|---------|---------|--------|
+| Claude Code | `claude` | Tested |
+| Kiro CLI | `kiro-cli` | Tested |
+| Codex | `codex` | Tested |
+| OpenCode | `opencode` | Tested |
+| Gemini CLI | `gemini` | Tested |
 
 ## Testing
 
 ```bash
-cargo test              # 51 tests (39 unit + 5 integration + 7 MCP)
-cargo clippy            # 0 errors (deny unwrap_used)
-agend-terminal verify   # E2E verification suite
+cargo test         # 51 tests (unit + integration + MCP round-trip)
+cargo clippy       # 0 errors (deny unwrap_used)
 ```
 
 ## License

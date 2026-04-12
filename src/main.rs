@@ -148,6 +148,8 @@ enum Commands {
     },
     /// Health check
     Doctor,
+    /// Interactive demo — experience multi-agent orchestration in 30 seconds
+    Demo,
 }
 
 #[derive(Subcommand)]
@@ -375,6 +377,9 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Doctor) => {
             cli::run_doctor(&home)?;
+        }
+        Some(Commands::Demo) => {
+            cli::run_demo()?;
         }
     }
 
