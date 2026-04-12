@@ -62,7 +62,16 @@ pub fn create(
     if !has_commits(repo_dir) {
         tracing::info!(repo = %repo_dir.display(), "empty repo, creating initial commit for worktree support");
         let ok = std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "init (agend-terminal)"])
+            .args([
+                "-c",
+                "user.name=agend-terminal",
+                "-c",
+                "user.email=agend@localhost",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init (agend-terminal)",
+            ])
             .current_dir(repo_dir)
             .output()
             .map(|o| o.status.success())
@@ -268,7 +277,16 @@ mod tests {
             .output()
             .ok();
         std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "init"])
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@test",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
             .current_dir(&dir)
             .output()
             .ok();
