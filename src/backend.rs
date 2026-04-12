@@ -143,8 +143,12 @@ impl Backend {
                 instructions_path: "AGENTS.md",
                 mcp_config_path: "opencode.json",
                 ready_timeout_secs: 20,
-                // Auto-dismiss update prompt: "Please restart Codex" → press Enter
-                dismiss_patterns: &[("Please restart", b"\r")],
+                dismiss_patterns: &[
+                    // Trust directory prompt: "Yes, continue" is already selected → Enter
+                    ("Do you trust the contents", b"\r"),
+                    // Auto-update prompt: "Please restart Codex" → Enter
+                    ("Please restart", b"\r"),
+                ],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
             },
