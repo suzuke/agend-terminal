@@ -41,4 +41,3 @@ chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"
 ctrlc = "3"
 clap = { version = "4", features = ["derive"] }
-log = "0.4"

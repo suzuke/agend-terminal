@@ -34,7 +34,6 @@ pub fn enqueue(home: &Path, name: &str, msg: InboxMessage) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Drain all messages (read + truncate).
 /// Drain all messages atomically (rename + read to avoid race with concurrent append).
 pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     let path = inbox_path(home, name);
@@ -86,7 +85,6 @@ pub fn deliver(
     }
 }
 
-/// Inject a notification into an agent's PTY via TUI socket.
 /// Inject a notification into an agent's PTY.
 /// When called from daemon (has registry), uses direct write.
 /// When called from external process (MCP), uses API socket.

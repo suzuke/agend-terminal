@@ -14,7 +14,6 @@ dependencies = [
  "crossbeam",
  "crossterm",
  "ctrlc",
- "log",
  "nix 0.29.0",
  "portable-pty",
  "regex",

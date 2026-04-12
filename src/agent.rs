@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
-#[allow(dead_code)]
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// Core state for one agent — protected by a single Mutex for atomic operations.
@@ -38,6 +37,11 @@ pub struct AgentHandle {
 }
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
+
+/// Lock the agent registry, recovering from poison.
+pub fn lock_registry(reg: &AgentRegistry) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
+    reg.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// ANSI escape sequence stripper for dialog detection.
 /// Public ANSI strip for capture command.
@@ -366,7 +370,6 @@ fn try_dismiss_dialog(
 }
 
 /// Write data to an agent's PTY (atomic write — for attach path).
-#[allow(dead_code)]
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
     let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
     w.write_all(data).map_err(crate::error::AgendError::PtyWrite)?;
@@ -417,23 +420,6 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
     // Write submit key
     w.write_all(submit)?;
     w.flush()?;
-    Ok(())
-}
-
-/// Resize an agent's PTY + VTerm.
-#[allow(dead_code)]
-pub fn resize_agent(agent: &AgentHandle, cols: u16, rows: u16) -> anyhow::Result<()> {
-    let master = agent.pty_master.lock().unwrap_or_else(|e| e.into_inner());
-    master
-        .resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| anyhow::anyhow!("resize: {e}"))?;
-    let mut core = agent.core.lock().unwrap_or_else(|e| e.into_inner());
-    core.vterm.resize(cols, rows);
     Ok(())
 }
 

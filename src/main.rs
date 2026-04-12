@@ -10,7 +10,6 @@ mod error;
 mod event_log;
 mod fleet;
 mod framing;
-#[allow(dead_code)]
 mod health;
 mod inbox;
 mod instructions;
