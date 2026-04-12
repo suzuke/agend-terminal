@@ -143,7 +143,8 @@ impl Backend {
                 instructions_path: "AGENTS.md",
                 mcp_config_path: "opencode.json",
                 ready_timeout_secs: 20,
-                dismiss_patterns: &[],
+                // Auto-dismiss update prompt: "Please restart Codex" → press Enter
+                dismiss_patterns: &[("Please restart", b"\r")],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
             },

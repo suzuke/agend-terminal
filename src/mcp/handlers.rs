@@ -232,11 +232,13 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 .as_str()
                 .or_else(|| args["command"].as_str())
                 .unwrap_or("claude");
-            // Start with backend preset args (e.g. --yolo for gemini, --dangerously-skip-permissions for claude)
+            // Start with backend fresh_args (no resume flags — this is a new instance).
+            // Falls back to preset args if fresh_args is not defined.
             let mut cmd_args = crate::backend::Backend::from_command(command)
                 .map(|b| {
-                    b.preset()
-                        .args
+                    let p = b.preset();
+                    p.fresh_args
+                        .unwrap_or(p.args)
                         .iter()
                         .map(|s| s.to_string())
                         .collect::<Vec<_>>()
