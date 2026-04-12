@@ -41,6 +41,9 @@ pub fn home_dir() -> PathBuf {
 }
 
 /// Load .env file from AGEND_TERMINAL_HOME.
+///
+/// Supports: `KEY=value`, `export KEY=value`, single/double quoted values.
+/// Quoted values preserve `#` inside; unquoted values strip inline comments.
 fn load_dotenv() {
     let env_path = home_dir().join(".env");
     if !env_path.exists() {
@@ -56,23 +59,48 @@ fn load_dotenv() {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
-        if let Some((key, value)) = line.split_once('=') {
+        if let Some((key, rest)) = line.split_once('=') {
             let key = key.trim();
-            let value = value.trim();
-            let value = if let Some(quoted) = value
-                .strip_prefix('"')
-                .and_then(|v| v.strip_suffix('"'))
-                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            {
-                quoted
+            let rest = rest.trim();
+            let value = if rest.starts_with('"') {
+                // Double-quoted: find matching close quote (handles escaped \")
+                parse_double_quoted(rest)
+            } else if let Some(inner) = rest.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
+                // Single-quoted: literal content, no escapes
+                inner.to_string()
             } else {
-                value.split('#').next().unwrap_or(value).trim()
+                // Unquoted: strip inline comment
+                rest.split(" #").next().unwrap_or(rest).trim().to_string()
             };
             if !key.is_empty() {
-                std::env::set_var(key, value);
+                std::env::set_var(key, &value);
             }
         }
     }
+}
+
+/// Parse a double-quoted value, handling escaped quotes (e.g. `"hello \"world\""`)
+fn parse_double_quoted(s: &str) -> String {
+    let inner = &s[1..]; // skip opening "
+    let mut result = String::new();
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    match next {
+                        '"' | '\\' => result.push(next),
+                        'n' => result.push('\n'),
+                        't' => result.push('\t'),
+                        _ => { result.push('\\'); result.push(next); }
+                    }
+                }
+            }
+            '"' => break, // closing quote
+            _ => result.push(c),
+        }
+    }
+    result
 }
 
 /// AgEnD Terminal — Agent Process Manager

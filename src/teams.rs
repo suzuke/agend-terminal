@@ -25,13 +25,9 @@ fn load(home: &Path) -> TeamStore {
     crate::store::load(&store_path(home))
 }
 
-fn save(home: &Path, store: &TeamStore) -> anyhow::Result<()> {
-    crate::store::save(&store_path(home), store)
-}
-
 pub fn create(home: &Path, args: &Value) -> Value {
     let name = match args["name"].as_str() {
-        Some(n) => n,
+        Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
     let members: Vec<String> = match args["members"].as_array() {
@@ -41,35 +37,37 @@ pub fn create(home: &Path, args: &Value) -> Value {
             .collect(),
         None => return serde_json::json!({"error": "missing 'members'"}),
     };
-    let mut store = load(home);
-    if store.teams.iter().any(|t| t.name == name) {
-        return serde_json::json!({"error": format!("team '{name}' already exists")});
-    }
-    store.teams.push(Team {
-        name: name.to_string(),
-        members,
-        description: args["description"].as_str().map(String::from),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    });
-    match save(home, &store) {
-        Ok(()) => serde_json::json!({"status": "created", "name": name}),
+    let description = args["description"].as_str().map(String::from);
+    match crate::store::mutate(&store_path(home), |store: &mut TeamStore| {
+        if store.teams.iter().any(|t| t.name == name) {
+            return Ok(false);
+        }
+        store.teams.push(Team {
+            name: name.clone(),
+            members,
+            description,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+        Ok(true)
+    }) {
+        Ok(true) => serde_json::json!({"status": "created", "name": name}),
+        Ok(false) => serde_json::json!({"error": format!("team '{name}' already exists")}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
 
 pub fn delete(home: &Path, args: &Value) -> Value {
     let name = match args["name"].as_str() {
-        Some(n) => n,
+        Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
-    let mut store = load(home);
-    let before = store.teams.len();
-    store.teams.retain(|t| t.name != name);
-    if store.teams.len() == before {
-        return serde_json::json!({"error": format!("team '{name}' not found")});
-    }
-    match save(home, &store) {
-        Ok(()) => serde_json::json!({"status": "deleted", "name": name}),
+    match crate::store::mutate(&store_path(home), |store: &mut TeamStore| {
+        let before = store.teams.len();
+        store.teams.retain(|t| t.name != name);
+        Ok(store.teams.len() < before)
+    }) {
+        Ok(true) => serde_json::json!({"status": "deleted", "name": name}),
+        Ok(false) => serde_json::json!({"error": format!("team '{name}' not found")}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
@@ -81,30 +79,34 @@ pub fn list(home: &Path) -> Value {
 
 pub fn update(home: &Path, args: &Value) -> Value {
     let name = match args["name"].as_str() {
-        Some(n) => n,
+        Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
-    let mut store = load(home);
-    match store.teams.iter_mut().find(|t| t.name == name) {
-        Some(team) => {
-            if let Some(add) = args["add"].as_array() {
-                for m in add.iter().filter_map(|v| v.as_str()) {
-                    if !team.members.contains(&m.to_string()) {
-                        team.members.push(m.to_string());
+    let to_add: Vec<String> = args["add"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let to_remove: Vec<String> = args["remove"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    match crate::store::mutate(&store_path(home), |store: &mut TeamStore| {
+        match store.teams.iter_mut().find(|t| t.name == name) {
+            Some(team) => {
+                for m in &to_add {
+                    if !team.members.contains(m) {
+                        team.members.push(m.clone());
                     }
                 }
-            }
-            if let Some(remove) = args["remove"].as_array() {
-                let to_remove: Vec<String> = remove
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
                 team.members.retain(|m| !to_remove.contains(m));
+                Ok(true)
             }
-            let _ = save(home, &store);
-            serde_json::json!({"status": "updated", "name": name})
+            None => Ok(false),
         }
-        None => serde_json::json!({"error": format!("team '{name}' not found")}),
+    }) {
+        Ok(true) => serde_json::json!({"status": "updated", "name": name}),
+        Ok(false) => serde_json::json!({"error": format!("team '{name}' not found")}),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
 

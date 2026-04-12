@@ -1,4 +1,6 @@
 //! Generic JSON file store — shared by decisions, tasks, teams, schedules.
+//!
+//! Uses file locking to prevent concurrent load-modify-save races.
 
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::{Path, PathBuf};
@@ -18,6 +20,29 @@ pub fn save<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     }
     std::fs::write(path, serde_json::to_string_pretty(data)?)?;
     Ok(())
+}
+
+/// Atomically load-modify-save with file locking.
+/// Holds an exclusive flock for the entire read→mutate→write cycle.
+pub fn mutate<T, R, F>(path: &Path, f: F) -> anyhow::Result<R>
+where
+    T: DeserializeOwned + Default + Serialize,
+    F: FnOnce(&mut T) -> anyhow::Result<R>,
+{
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("lock");
+    let lock_file = std::fs::File::create(&lock_path)?;
+    use nix::fcntl::{Flock, FlockArg};
+    use std::os::fd::AsFd;
+    let _lock = Flock::lock(lock_file.as_fd().try_clone_to_owned()?, FlockArg::LockExclusive)
+        .map_err(|(_,e)| anyhow::anyhow!("store lock failed: {e}"))?;
+
+    let mut data: T = load(path);
+    let result = f(&mut data)?;
+    save(path, &data)?;
+    Ok(result)
 }
 
 /// Helper: build a store path from home + filename.

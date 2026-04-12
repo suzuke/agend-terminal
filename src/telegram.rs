@@ -7,9 +7,20 @@ use crate::fleet::ChannelConfig;
 use crate::inbox::{self, InboxMessage};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ThreadId};
+
+/// Shared tokio runtime for all Telegram sync→async calls.
+fn telegram_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("telegram tokio runtime")
+    })
+}
 
 pub struct TelegramState {
     pub bot: Bot,
@@ -177,10 +188,7 @@ pub fn send_reply(
         s.instance_to_topic.get(instance_name).copied(),
     );
     drop(s);
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(send_with_topic(&bot, group_id, topic_id, text))
+    telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text))
 }
 
 /// Initialize Telegram from fleet config.
@@ -216,11 +224,8 @@ pub fn init_from_config(
             topic_map.insert("general".to_string(), 1);
         } else if inst.topic_id.is_none() {
             eprintln!("[telegram] creating topic for '{name}'...");
-            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
             {
-                match rt
+                match telegram_runtime()
                     .block_on(async { bot.create_forum_topic(chat_id, name, 0x6FB9F0, "").await })
                 {
                     Ok(topic) => {
@@ -272,13 +277,7 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
             s.instance_to_topic.get(instance_name).copied(),
         );
         drop(s);
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return crate::channel::SendResult::Failed("tokio build failed".into());
-        };
-        match rt.block_on(send_with_topic(&bot, group_id, topic_id, text)) {
+        match telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text)) {
             Ok(()) => crate::channel::SendResult::Sent,
             Err(e) => crate::channel::SendResult::Failed(format!("{e}")),
         }
@@ -301,13 +300,7 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
         let Ok(mid) = message_id.parse::<i32>() else {
             return crate::channel::SendResult::Failed(format!("invalid message_id: {message_id}"));
         };
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return crate::channel::SendResult::Failed("tokio build failed".into());
-        };
-        match rt.block_on(async {
+        match telegram_runtime().block_on(async {
             bot.edit_message_text(group_id, MessageId(mid), text)
                 .await
                 .map(|_| ())

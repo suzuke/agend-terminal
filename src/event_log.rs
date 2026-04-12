@@ -1,7 +1,12 @@
 //! Event log — append-only audit trail for daemon events.
+//!
+//! Rotates at 10 MB to prevent unbounded growth.
 
 use serde::Serialize;
 use std::path::Path;
+
+/// Maximum log file size before rotation (10 MB).
+const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct Event {
@@ -11,7 +16,7 @@ pub struct Event {
     pub detail: String,
 }
 
-/// Append an event to the log file.
+/// Append an event to the log file. Rotates when size exceeds MAX_LOG_SIZE.
 pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
     let log_path = home.join("event-log.jsonl");
     let event = Event {
@@ -20,6 +25,15 @@ pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
         instance: instance.to_string(),
         detail: detail.to_string(),
     };
+
+    // Rotate if too large
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > MAX_LOG_SIZE {
+            let rotated = home.join("event-log.jsonl.1");
+            let _ = std::fs::rename(&log_path, &rotated);
+        }
+    }
+
     if let Ok(json) = serde_json::to_string(&event) {
         use std::io::Write;
         match std::fs::OpenOptions::new()

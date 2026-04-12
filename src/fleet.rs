@@ -104,10 +104,15 @@ impl FleetConfig {
             .or_else(|| preset.as_ref().map(|p| p.command.to_string()))
             .unwrap_or_else(|| "claude".to_string());
 
-        // Args: instance > defaults > preset (only if command matches preset command)
+        // Args: instance > defaults > preset (only if command basename matches preset)
+        let command_basename = std::path::Path::new(&command)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(&command)
+            .to_lowercase();
         let command_matches_preset = preset
             .as_ref()
-            .map(|p| command.contains(p.command))
+            .map(|p| command_basename == p.command || command_basename.starts_with(&format!("{}-", p.command)))
             .unwrap_or(false);
         let args = if !inst.args.is_empty() {
             inst.args.clone()

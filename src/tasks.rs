@@ -32,10 +32,6 @@ fn load(home: &Path) -> TaskStore {
     crate::store::load(&store_path(home))
 }
 
-fn save(home: &Path, store: &TaskStore) -> anyhow::Result<()> {
-    crate::store::save(&store_path(home), store)
-}
-
 pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
     let action = match args["action"].as_str() {
         Some(a) => a,
@@ -70,9 +66,10 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 created_at: now.clone(),
                 updated_at: now,
             };
-            let mut store = load(home);
-            store.tasks.push(task);
-            match save(home, &store) {
+            match crate::store::mutate(&store_path(home), |store: &mut TaskStore| {
+                store.tasks.push(task);
+                Ok(())
+            }) {
                 Ok(()) => serde_json::json!({"id": id, "status": "created"}),
                 Err(e) => serde_json::json!({"error": format!("{e}")}),
             }
@@ -91,60 +88,77 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         }
         "claim" => {
             let id = match args["id"].as_str() {
-                Some(i) => i,
+                Some(i) => i.to_string(),
                 None => return serde_json::json!({"error": "missing 'id'"}),
             };
-            let mut store = load(home);
-            match store.tasks.iter_mut().find(|t| t.id == id) {
-                Some(task) => {
-                    task.status = "claimed".to_string();
-                    task.assignee = Some(instance_name.to_string());
-                    task.updated_at = chrono::Utc::now().to_rfc3339();
-                    let _ = save(home, &store);
-                    serde_json::json!({"id": id, "status": "claimed", "assignee": instance_name})
+            let iname = instance_name.to_string();
+            match crate::store::mutate(&store_path(home), |store: &mut TaskStore| {
+                match store.tasks.iter_mut().find(|t| t.id == id) {
+                    Some(task) => {
+                        task.status = "claimed".to_string();
+                        task.assignee = Some(iname.clone());
+                        task.updated_at = chrono::Utc::now().to_rfc3339();
+                        Ok(true)
+                    }
+                    None => Ok(false),
                 }
-                None => serde_json::json!({"error": format!("task '{id}' not found")}),
+            }) {
+                Ok(true) => serde_json::json!({"id": id, "status": "claimed", "assignee": instance_name}),
+                Ok(false) => serde_json::json!({"error": format!("task '{id}' not found")}),
+                Err(e) => serde_json::json!({"error": format!("{e}")}),
             }
         }
         "done" => {
             let id = match args["id"].as_str() {
-                Some(i) => i,
+                Some(i) => i.to_string(),
                 None => return serde_json::json!({"error": "missing 'id'"}),
             };
-            let mut store = load(home);
-            match store.tasks.iter_mut().find(|t| t.id == id) {
-                Some(task) => {
-                    task.status = "done".to_string();
-                    task.result = args["result"].as_str().map(String::from);
-                    task.updated_at = chrono::Utc::now().to_rfc3339();
-                    let _ = save(home, &store);
-                    serde_json::json!({"id": id, "status": "done"})
+            let result_text = args["result"].as_str().map(String::from);
+            match crate::store::mutate(&store_path(home), |store: &mut TaskStore| {
+                match store.tasks.iter_mut().find(|t| t.id == id) {
+                    Some(task) => {
+                        task.status = "done".to_string();
+                        task.result.clone_from(&result_text);
+                        task.updated_at = chrono::Utc::now().to_rfc3339();
+                        Ok(true)
+                    }
+                    None => Ok(false),
                 }
-                None => serde_json::json!({"error": format!("task '{id}' not found")}),
+            }) {
+                Ok(true) => serde_json::json!({"id": id, "status": "done"}),
+                Ok(false) => serde_json::json!({"error": format!("task '{id}' not found")}),
+                Err(e) => serde_json::json!({"error": format!("{e}")}),
             }
         }
         "update" => {
             let id = match args["id"].as_str() {
-                Some(i) => i,
+                Some(i) => i.to_string(),
                 None => return serde_json::json!({"error": "missing 'id'"}),
             };
-            let mut store = load(home);
-            match store.tasks.iter_mut().find(|t| t.id == id) {
-                Some(task) => {
-                    if let Some(s) = args["status"].as_str() {
-                        task.status = s.to_string();
+            let new_status = args["status"].as_str().map(String::from);
+            let new_priority = args["priority"].as_str().map(String::from);
+            let new_assignee = args["assignee"].as_str().map(String::from);
+            match crate::store::mutate(&store_path(home), |store: &mut TaskStore| {
+                match store.tasks.iter_mut().find(|t| t.id == id) {
+                    Some(task) => {
+                        if let Some(ref s) = new_status {
+                            task.status = s.clone();
+                        }
+                        if let Some(ref p) = new_priority {
+                            task.priority = p.clone();
+                        }
+                        if let Some(ref a) = new_assignee {
+                            task.assignee = Some(a.clone());
+                        }
+                        task.updated_at = chrono::Utc::now().to_rfc3339();
+                        Ok(true)
                     }
-                    if let Some(p) = args["priority"].as_str() {
-                        task.priority = p.to_string();
-                    }
-                    if let Some(a) = args["assignee"].as_str() {
-                        task.assignee = Some(a.to_string());
-                    }
-                    task.updated_at = chrono::Utc::now().to_rfc3339();
-                    let _ = save(home, &store);
-                    serde_json::json!({"id": id, "status": "updated"})
+                    None => Ok(false),
                 }
-                None => serde_json::json!({"error": format!("task '{id}' not found")}),
+            }) {
+                Ok(true) => serde_json::json!({"id": id, "status": "updated"}),
+                Ok(false) => serde_json::json!({"error": format!("task '{id}' not found")}),
+                Err(e) => serde_json::json!({"error": format!("{e}")}),
             }
         }
         _ => serde_json::json!({"error": format!("unknown action: {action}")}),

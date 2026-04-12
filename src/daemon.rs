@@ -204,7 +204,16 @@ pub type AgentDef = (
 
 /// Start daemon: spawn agents, handle crashes with auto-respawn.
 pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
-    // Check for existing daemon
+    // Acquire exclusive daemon lock (prevents TOCTOU race)
+    std::fs::create_dir_all(home)?;
+    let lock_path = home.join(".daemon.lock");
+    let lock_file = std::fs::File::create(&lock_path)?;
+    use nix::fcntl::{Flock, FlockArg};
+    use std::os::fd::AsFd;
+    let _daemon_lock = Flock::lock(lock_file.as_fd().try_clone_to_owned()?, FlockArg::LockExclusiveNonblock)
+        .map_err(|(_,e)| anyhow::anyhow!("Another daemon is already running (lock held): {e}"))?;
+
+    // Check for existing daemon (secondary check after lock acquired)
     if let Some(existing) = find_active_run_dir(home) {
         anyhow::bail!("Another daemon is already running ({})", existing.display());
     }

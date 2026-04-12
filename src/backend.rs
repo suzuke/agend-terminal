@@ -174,18 +174,22 @@ impl Backend {
         }
     }
 
-    /// Try to detect backend from a command string.
+    /// Try to detect backend from a command string (matches basename, not full path).
     pub fn from_command(command: &str) -> Option<Backend> {
-        let cmd = command.to_lowercase();
-        if cmd.contains("claude") {
+        let basename = std::path::Path::new(command)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(command)
+            .to_lowercase();
+        if basename == "claude" || basename.starts_with("claude-") {
             Some(Backend::ClaudeCode)
-        } else if cmd.contains("kiro") {
+        } else if basename == "kiro-cli" || basename == "kiro" || basename.starts_with("kiro-") {
             Some(Backend::KiroCli)
-        } else if cmd.contains("codex") {
+        } else if basename == "codex" || basename.starts_with("codex-") {
             Some(Backend::Codex)
-        } else if cmd.contains("opencode") {
+        } else if basename == "opencode" || basename.starts_with("opencode-") {
             Some(Backend::OpenCode)
-        } else if cmd.contains("gemini") {
+        } else if basename == "gemini" || basename.starts_with("gemini-") {
             Some(Backend::Gemini)
         } else {
             None

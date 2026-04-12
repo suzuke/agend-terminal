@@ -57,10 +57,6 @@ fn load(home: &Path) -> ScheduleStore {
     crate::store::load(&store_path(home))
 }
 
-fn save(home: &Path, store: &ScheduleStore) -> anyhow::Result<()> {
-    crate::store::save(&store_path(home), store)
-}
-
 pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
     let cron = match args["cron"].as_str() {
         Some(c) => c,
@@ -96,9 +92,10 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         updated_at: now,
         run_history: Vec::new(),
     };
-    let mut store = load(home);
-    store.schedules.push(schedule);
-    match save(home, &store) {
+    match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+        store.schedules.push(schedule);
+        Ok(())
+    }) {
         Ok(()) => serde_json::json!({"id": id, "status": "created"}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
@@ -117,53 +114,54 @@ pub fn list(home: &Path, args: &Value) -> Value {
 
 pub fn update(home: &Path, args: &Value) -> Value {
     let id = match args["id"].as_str() {
-        Some(i) => i,
+        Some(i) => i.to_string(),
         None => return serde_json::json!({"error": "missing 'id'"}),
     };
-    let mut store = load(home);
-    match store.schedules.iter_mut().find(|s| s.id == id) {
-        Some(schedule) => {
-            if let Some(c) = args["cron"].as_str() {
-                schedule.cron = c.to_string();
+    let new_cron = args["cron"].as_str().map(String::from);
+    let new_message = args["message"].as_str().map(String::from);
+    let new_target = args["target"].as_str().map(String::from);
+    let new_label = args["label"].as_str().map(String::from);
+    let new_tz = args["timezone"].as_str().map(String::from);
+    let new_enabled = args["enabled"].as_bool();
+    match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+        match store.schedules.iter_mut().find(|s| s.id == id) {
+            Some(schedule) => {
+                if let Some(ref c) = new_cron { schedule.cron.clone_from(c); }
+                if let Some(ref m) = new_message { schedule.message.clone_from(m); }
+                if let Some(ref t) = new_target { schedule.target.clone_from(t); }
+                if let Some(ref l) = new_label { schedule.label = Some(l.clone()); }
+                if let Some(ref tz) = new_tz { schedule.timezone.clone_from(tz); }
+                if let Some(e) = new_enabled { schedule.enabled = e; }
+                schedule.updated_at = chrono::Utc::now().to_rfc3339();
+                Ok(true)
             }
-            if let Some(m) = args["message"].as_str() {
-                schedule.message = m.to_string();
-            }
-            if let Some(t) = args["target"].as_str() {
-                schedule.target = t.to_string();
-            }
-            if let Some(l) = args["label"].as_str() {
-                schedule.label = Some(l.to_string());
-            }
-            if let Some(tz) = args["timezone"].as_str() {
-                schedule.timezone = tz.to_string();
-            }
-            if let Some(e) = args["enabled"].as_bool() {
-                schedule.enabled = e;
-            }
-            schedule.updated_at = chrono::Utc::now().to_rfc3339();
-            let _ = save(home, &store);
-            serde_json::json!({"id": id, "status": "updated"})
+            None => Ok(false),
         }
-        None => serde_json::json!({"error": format!("schedule '{id}' not found")}),
+    }) {
+        Ok(true) => serde_json::json!({"id": id, "status": "updated"}),
+        Ok(false) => serde_json::json!({"error": format!("schedule '{id}' not found")}),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
 
 /// Record a schedule execution result. Called by daemon after cron trigger.
 pub fn record_run(home: &Path, schedule_id: &str, status: &str) {
-    let mut store = load(home);
-    if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == schedule_id) {
-        sched.run_history.push(ScheduleRun {
-            triggered_at: chrono::Utc::now().to_rfc3339(),
-            status: status.to_string(),
-        });
-        // Keep last 50 runs only
-        if sched.run_history.len() > 50 {
-            let excess = sched.run_history.len() - 50;
-            sched.run_history.drain(..excess);
+    let sid = schedule_id.to_string();
+    let st = status.to_string();
+    let _ = crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+        if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == sid) {
+            sched.run_history.push(ScheduleRun {
+                triggered_at: chrono::Utc::now().to_rfc3339(),
+                status: st.clone(),
+            });
+            // Keep last 50 runs only
+            if sched.run_history.len() > 50 {
+                let excess = sched.run_history.len() - 50;
+                sched.run_history.drain(..excess);
+            }
         }
-        let _ = save(home, &store);
-    }
+        Ok(())
+    });
 }
 
 #[cfg(test)]
@@ -262,17 +260,16 @@ mod tests {
 
 pub fn delete(home: &Path, args: &Value) -> Value {
     let id = match args["id"].as_str() {
-        Some(i) => i,
+        Some(i) => i.to_string(),
         None => return serde_json::json!({"error": "missing 'id'"}),
     };
-    let mut store = load(home);
-    let before = store.schedules.len();
-    store.schedules.retain(|s| s.id != id);
-    if store.schedules.len() == before {
-        return serde_json::json!({"error": format!("schedule '{id}' not found")});
-    }
-    match save(home, &store) {
-        Ok(()) => serde_json::json!({"id": id, "status": "deleted"}),
+    match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+        let before = store.schedules.len();
+        store.schedules.retain(|s| s.id != id);
+        Ok(store.schedules.len() < before)
+    }) {
+        Ok(true) => serde_json::json!({"id": id, "status": "deleted"}),
+        Ok(false) => serde_json::json!({"error": format!("schedule '{id}' not found")}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }

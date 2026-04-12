@@ -103,8 +103,8 @@ pub fn create(
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            // Branch already exists — try without -b
-            if stderr.contains("already exists") {
+            // Branch or worktree already exists — try without -b (exit code 128 = git error)
+            if o.status.code() == Some(128) && (stderr.contains("already exists") || stderr.contains("is already checked out")) {
                 let output2 = std::process::Command::new("git")
                     .args(["worktree", "add", &wt_dir.display().to_string(), &branch])
                     .current_dir(repo_dir)
