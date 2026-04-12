@@ -3,19 +3,15 @@
 //! Ctrl+B d to detach. Agent keeps running.
 
 use crate::framing::{self, PROTOCOL_VERSION, TAG_DATA};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-    MouseEvent, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-/// RAII guard for crossterm raw mode + mouse capture.
+/// RAII guard for crossterm raw mode.
 struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        crossterm::execute!(std::io::stdout(), DisableMouseCapture).ok();
         terminal::disable_raw_mode().ok();
     }
 }
@@ -39,7 +35,6 @@ pub fn attach(socket_path: &str) -> anyhow::Result<()> {
     }
 
     terminal::enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
     let _guard = RawModeGuard;
 
     let mut write_stream = stream.try_clone()?;
@@ -107,14 +102,6 @@ pub fn attach(socket_path: &str) -> anyhow::Result<()> {
                     break;
                 }
             }
-            Ok(Event::Mouse(MouseEvent {
-                kind, column, row, ..
-            })) => {
-                let bytes = mouse_to_bytes(kind, column, row);
-                if !bytes.is_empty() && framing::write_frame(&mut write_stream, &bytes).is_err() {
-                    break;
-                }
-            }
             Ok(Event::Resize(cols, rows)) => {
                 if framing::write_resize(&mut write_stream, cols, rows).is_err() {
                     break;
@@ -128,45 +115,6 @@ pub fn attach(socket_path: &str) -> anyhow::Result<()> {
     // _guard dropped here — terminal restored
     println!();
     Ok(())
-}
-
-/// Convert mouse events to SGR mouse encoding (\x1b[<...M/m).
-fn mouse_to_bytes(kind: MouseEventKind, col: u16, row: u16) -> Vec<u8> {
-    // SGR encoding: \x1b[<button;col;rowM (press) or m (release)
-    // col/row are 1-based in SGR
-    let c = col + 1;
-    let r = row + 1;
-    match kind {
-        MouseEventKind::ScrollUp => format!("\x1b[<64;{c};{r}M").into_bytes(),
-        MouseEventKind::ScrollDown => format!("\x1b[<65;{c};{r}M").into_bytes(),
-        MouseEventKind::Down(btn) => {
-            let b = match btn {
-                event::MouseButton::Left => 0,
-                event::MouseButton::Middle => 1,
-                event::MouseButton::Right => 2,
-            };
-            format!("\x1b[<{b};{c};{r}M").into_bytes()
-        }
-        MouseEventKind::Up(btn) => {
-            let b = match btn {
-                event::MouseButton::Left => 0,
-                event::MouseButton::Middle => 1,
-                event::MouseButton::Right => 2,
-            };
-            format!("\x1b[<{b};{c};{r}m").into_bytes()
-        }
-        MouseEventKind::Drag(btn) => {
-            let b = match btn {
-                event::MouseButton::Left => 32,
-                event::MouseButton::Middle => 33,
-                event::MouseButton::Right => 34,
-            };
-            format!("\x1b[<{b};{c};{r}M").into_bytes()
-        }
-        MouseEventKind::Moved => vec![],
-        MouseEventKind::ScrollLeft => format!("\x1b[<66;{c};{r}M").into_bytes(),
-        MouseEventKind::ScrollRight => format!("\x1b[<67;{c};{r}M").into_bytes(),
-    }
 }
 
 /// Convert crossterm KeyEvent to terminal bytes.
