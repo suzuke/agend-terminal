@@ -410,6 +410,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
 
         check_schedules(home, &registry);
+        check_ci_watches(home, &registry);
 
         {
             let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
@@ -799,4 +800,177 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
     if any_triggered || now.signed_duration_since(last_check).num_seconds() >= 10 {
         let _ = std::fs::write(&last_check_path, now.to_rfc3339());
     }
+}
+
+/// Check CI watch configs and inject failure logs to agents when CI fails.
+fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
+    let ci_dir = home.join("ci-watches");
+    let entries = match std::fs::read_dir(&ci_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let watch: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let repo = match watch["repo"].as_str() {
+            Some(r) => r.to_string(),
+            None => continue,
+        };
+        let branch = watch["branch"].as_str().unwrap_or("main").to_string();
+        let interval = watch["interval_secs"].as_u64().unwrap_or(60);
+        let instance = match watch["instance"].as_str() {
+            Some(i) => i.to_string(),
+            None => continue,
+        };
+        let last_run_id = watch["last_run_id"].as_u64();
+
+        // Throttle: check file mtime to avoid polling too frequently
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(modified) = meta.modified() {
+                let age = modified.elapsed().unwrap_or_default();
+                if age.as_secs() < interval {
+                    continue;
+                }
+            }
+        }
+
+        // Touch the file to update mtime (throttle next check)
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&watch).unwrap_or_default());
+
+        // Spawn a thread for the HTTP call to avoid blocking the daemon tick
+        let home = home.to_path_buf();
+        let watch_path = path.clone();
+        let registry = Arc::clone(registry);
+        std::thread::Builder::new()
+            .name("ci_check".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return,
+                };
+                if let Err(e) = rt.block_on(ci_check_repo(
+                    &home,
+                    &watch_path,
+                    &repo,
+                    &branch,
+                    &instance,
+                    last_run_id,
+                    &registry,
+                )) {
+                    tracing::debug!(repo = %repo, error = %e, "CI check failed");
+                }
+            })
+            .ok();
+    }
+}
+
+/// Fetch latest GitHub Actions run and inject failure info if new failure detected.
+async fn ci_check_repo(
+    home: &Path,
+    watch_path: &Path,
+    repo: &str,
+    branch: &str,
+    instance: &str,
+    last_run_id: Option<u64>,
+    registry: &AgentRegistry,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let url = format!(
+        "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=1"
+    );
+    let mut req = client
+        .get(&url)
+        .header("User-Agent", "agend-terminal")
+        .header("Accept", "application/vnd.github+json");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let resp: serde_json::Value = req.send().await?.json().await?;
+    let run = match resp["workflow_runs"].as_array().and_then(|a| a.first()) {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    let run_id = run["id"].as_u64().unwrap_or(0);
+    let conclusion = run["conclusion"].as_str().unwrap_or("");
+
+    if conclusion != "failure" || Some(run_id) == last_run_id {
+        return Ok(());
+    }
+
+    // Fetch failed jobs
+    let jobs_url = format!(
+        "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
+    );
+    let mut req = client
+        .get(&jobs_url)
+        .header("User-Agent", "agend-terminal")
+        .header("Accept", "application/vnd.github+json");
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let jobs_resp: serde_json::Value = req.send().await?.json().await?;
+    let failure_summary = jobs_resp["jobs"]
+        .as_array()
+        .and_then(|jobs| {
+            jobs.iter().find_map(|job| {
+                job["steps"].as_array().and_then(|steps| {
+                    steps.iter().find_map(|step| {
+                        if step["conclusion"].as_str() == Some("failure") {
+                            Some(format!(
+                                "{} / {}",
+                                job["name"].as_str().unwrap_or("?"),
+                                step["name"].as_str().unwrap_or("?")
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+        })
+        .unwrap_or_else(|| "unknown step".to_string());
+
+    let msg = format!("[ci-fail] {repo} branch {branch}: {failure_summary}\r");
+    let reg = agent::lock_registry(registry);
+    if let Some(handle) = reg.get(instance) {
+        let _ = agent::inject_to_agent(handle, msg.as_bytes());
+    } else {
+        drop(reg);
+        let _ = crate::inbox::enqueue(
+            home,
+            instance,
+            crate::inbox::InboxMessage {
+                from: "system:ci".to_string(),
+                text: msg,
+                kind: Some("ci-fail".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+    }
+
+    // Update last_run_id in watch config
+    if let Ok(content) = std::fs::read_to_string(watch_path) {
+        if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
+            watch["last_run_id"] = serde_json::json!(run_id);
+            let _ = std::fs::write(
+                watch_path,
+                serde_json::to_string_pretty(&watch).unwrap_or_default(),
+            );
+        }
+    }
+
+    Ok(())
 }

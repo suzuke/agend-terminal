@@ -13,6 +13,7 @@ pub fn tool_definitions() -> Value {
     tools.extend(schedule_tools());
     tools.extend(repo_tools());
     tools.extend(deploy_tools());
+    tools.extend(ci_tools());
     json!({"tools": tools})
 }
 
@@ -182,6 +183,21 @@ fn deploy_tools() -> Vec<Value> {
             }, "required": ["name"]}}),
         json!({"name": "list_deployments", "description": "List active template deployments.",
             "inputSchema": {"type": "object", "properties": {}}}),
+    ]
+}
+
+fn ci_tools() -> Vec<Value> {
+    vec![
+        json!({"name": "watch_ci", "description": "Watch GitHub Actions CI for a repo. When CI fails, the error log is automatically injected to this agent.",
+            "inputSchema": {"type": "object", "properties": {
+                "repo": {"type": "string", "description": "GitHub repo (owner/repo)"},
+                "branch": {"type": "string", "description": "Branch to watch (default: main)"},
+                "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"}
+            }, "required": ["repo"]}}),
+        json!({"name": "unwatch_ci", "description": "Stop watching CI for a repo.",
+            "inputSchema": {"type": "object", "properties": {
+                "repo": {"type": "string"}
+            }, "required": ["repo"]}}),
     ]
 }
 
