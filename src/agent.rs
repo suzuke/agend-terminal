@@ -251,7 +251,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             pty_read_loop(&mut pty_reader, &ctx);
         })?;
 
-    eprintln!("[{name}] spawned: {command} {}", args.join(" "));
+    tracing::info!(agent = name, command, args = %args.join(" "), "spawned");
     Ok(())
 }
 
@@ -332,7 +332,7 @@ fn handle_pty_close(
         .unwrap_or(false);
 
     if is_shutdown {
-        eprintln!("[{name}] stopped (daemon shutdown)");
+        tracing::info!(agent = name, "stopped (daemon shutdown)");
         if let Ok(mut reg) = registry.lock() {
             reg.remove(name);
         }
@@ -343,7 +343,7 @@ fn handle_pty_close(
         return;
     }
 
-    eprintln!("[{name}] PTY closed — waiting for process exit");
+    tracing::info!(agent = name, "PTY closed, waiting for process exit");
 
     // Wait up to 2s for process to fully exit
     let mut exit_code: Option<i32> = None;
@@ -364,11 +364,11 @@ fn handle_pty_close(
     let is_crash = match exit_code {
         Some(0) => false,
         Some(c) => {
-            eprintln!("[{name}] exit code {c} — crash");
+            tracing::warn!(agent = name, exit_code = c, "crash");
             true
         }
         None => {
-            eprintln!("[{name}] process didn't exit in 2s — treating as crash");
+            tracing::warn!(agent = name, "process didn't exit in 2s, treating as crash");
             true
         }
     };
@@ -386,7 +386,7 @@ fn handle_pty_close(
             let _ = tx.send(name.to_string());
         }
     } else {
-        eprintln!("[{name}] graceful exit (code 0) — no respawn");
+        tracing::info!(agent = name, "graceful exit (code 0), no respawn");
         if let Ok(mut reg) = registry.lock() {
             reg.remove(name);
         }
@@ -417,7 +417,7 @@ fn try_dismiss_dialog(
 
     for (pattern, key_seq) in dismiss_patterns {
         if clean.contains(pattern.as_str()) {
-            eprintln!("[{name}] auto-dismissing dialog (matched: {pattern})");
+            tracing::info!(agent = name, pattern, "auto-dismissing dialog");
             let _ = pty_writer
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

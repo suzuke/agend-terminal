@@ -27,11 +27,11 @@ pub fn serve(
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[api] failed to bind {sock}: {e}");
+            tracing::warn!(path = %sock, error = %e, "failed to bind API socket");
             return;
         }
     };
-    eprintln!("[api] listening on {sock}");
+    tracing::info!(path = %sock, "API listening");
 
     for stream in listener.incoming().flatten() {
         let reg = Arc::clone(&registry);
@@ -73,7 +73,7 @@ fn handle_session(
     let cloned = match stream.try_clone() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[api] stream clone failed: {e}");
+            tracing::warn!(error = %e, "API stream clone failed");
             return;
         }
     };
@@ -310,7 +310,7 @@ fn handle_session(
                 None => json!({"ok": true, "result": {"agents": [], "timestamp": null}}),
             },
             "shutdown" => {
-                eprintln!("[api] shutdown requested");
+                tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                 json!({"ok": true})
             }

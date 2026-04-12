@@ -183,6 +183,15 @@ enum FleetCommands {
 }
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agend_terminal=info")),
+        )
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+
     load_dotenv();
 
     let cli = Cli::parse();
