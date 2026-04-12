@@ -221,20 +221,17 @@ fn atomic_write_yaml(home: &Path, doc: &serde_yaml::Value) -> Result<()> {
     Ok(())
 }
 
-/// Acquire the fleet.yaml file lock. Returns the lock file handle on success.
-fn acquire_lock(home: &Path) -> Result<std::fs::File> {
+/// Acquire the fleet.yaml file lock via flock (auto-released on crash/drop).
+fn acquire_lock(home: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
     let lock_path = home.join(".fleet.yaml.lock");
-    std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
         .open(&lock_path)
-        .context("fleet.yaml is locked by another process")
-}
-
-/// Release the fleet.yaml file lock.
-fn release_lock(home: &Path) {
-    let lock_path = home.join(".fleet.yaml.lock");
-    let _ = std::fs::remove_file(&lock_path);
+        .context("failed to open lock file")?;
+    nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| anyhow::anyhow!("flock failed: {e}"))
+    // Lock auto-released when Flock is dropped
 }
 
 /// Add a new instance entry to fleet.yaml. Uses file lock + atomic write.
@@ -289,7 +286,7 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
         eprintln!("[fleet] added instance '{name}' to fleet.yaml");
         Ok(())
     })();
-    release_lock(home);
+    drop(_lock); // flock released on drop
     result
 }
 
@@ -315,7 +312,7 @@ pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
         eprintln!("[fleet] removed instance '{name}' from fleet.yaml");
         Ok(())
     })();
-    release_lock(home);
+    drop(_lock); // flock released on drop
     result
 }
 
@@ -342,7 +339,7 @@ pub fn update_instance_field(home: &Path, name: &str, field: &str, value: serde_
         atomic_write_yaml(home, &doc)?;
         Ok(())
     })();
-    release_lock(home);
+    drop(_lock); // flock released on drop
     result
 }
 
