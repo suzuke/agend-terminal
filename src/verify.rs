@@ -62,7 +62,8 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
             .name("verify_api".into())
             .spawn(move || {
                 let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                api::serve(&api_home, api_reg, shutdown)
+                let configs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                api::serve(&api_home, api_reg, shutdown, configs)
             })
             .ok();
 
