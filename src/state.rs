@@ -256,9 +256,9 @@ impl StatePatterns {
 /// Tracks state with hysteresis.
 pub struct StateTracker {
     pub current: AgentState,
-    since: Instant,
+    pub(crate) since: Instant,
     pub last_output: Instant,
-    state_buf: String,
+    pub(crate) state_buf: String,
     patterns: Option<StatePatterns>,
 }
 
@@ -342,5 +342,244 @@ impl StateTracker {
         if self.current != old_state {
             self.state_buf.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::health::HealthTracker;
+
+    /// Create a tracker with a given current state and elapsed time since that state began.
+    fn tracker_at(backend: &Backend, state: AgentState, elapsed_secs: u64) -> StateTracker {
+        let mut t = StateTracker::new(Some(backend));
+        t.current = state;
+        t.since = Instant::now() - Duration::from_secs(elapsed_secs);
+        t
+    }
+
+    // ── P0: Core behavior ───────────────────────────────────────────────
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn error_state_instant_transition() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        // Feed a rate limit pattern — error state should transition instantly
+        t.feed("429 rate limit exceeded");
+        assert_eq!(t.get_state(), AgentState::RateLimit);
+    }
+
+    #[test]
+    fn active_to_passive_needs_hold() {
+        let backend = Backend::ClaudeCode;
+
+        // Thinking held for only 1s — transition to Idle should NOT happen
+        let mut t = tracker_at(&backend, AgentState::Thinking, 1);
+        t.transition(AgentState::Idle);
+        assert_eq!(t.get_state(), AgentState::Thinking);
+
+        // Thinking held for 3s (>= 2s active hold) — transition to Idle SHOULD happen
+        let mut t = tracker_at(&backend, AgentState::Thinking, 3);
+        t.transition(AgentState::Idle);
+        assert_eq!(t.get_state(), AgentState::Idle);
+    }
+
+    #[test]
+    fn passive_to_passive_needs_5s() {
+        let backend = Backend::ClaudeCode;
+
+        // Idle(3) → Ready(2): lower priority, passive hold = 5s
+        // Idle held for 3s — should NOT transition
+        let mut t = tracker_at(&backend, AgentState::Idle, 3);
+        t.transition(AgentState::Ready);
+        assert_eq!(t.get_state(), AgentState::Idle);
+
+        // Idle held for 6s (>= 5s passive hold) — SHOULD transition
+        let mut t = tracker_at(&backend, AgentState::Idle, 6);
+        t.transition(AgentState::Ready);
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn higher_priority_instant() {
+        let backend = Backend::ClaudeCode;
+
+        // Idle → Thinking: higher priority, should transition immediately even at 0s
+        let mut t = tracker_at(&backend, AgentState::Idle, 0);
+        t.transition(AgentState::Thinking);
+        assert_eq!(t.get_state(), AgentState::Thinking);
+    }
+
+    #[test]
+    fn error_recovery_needs_hold() {
+        let backend = Backend::ClaudeCode;
+
+        // RateLimit held for 1s — transition to Idle (lower priority) needs hold time
+        // RateLimit priority > Idle priority, and RateLimit is active (priority > Idle),
+        // so 2s active hold applies
+        let mut t = tracker_at(&backend, AgentState::RateLimit, 1);
+        t.transition(AgentState::Idle);
+        assert_eq!(t.get_state(), AgentState::RateLimit);
+
+        // RateLimit held for 3s (>= 2s) — should transition
+        let mut t = tracker_at(&backend, AgentState::RateLimit, 3);
+        t.transition(AgentState::Idle);
+        assert_eq!(t.get_state(), AgentState::Idle);
+    }
+
+    // ── P1: Edge cases ──────────────────────────────────────────────────
+
+    #[test]
+    fn state_buf_clears_on_transition() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        // Feed thinking pattern — Thinking > Idle so instant transition
+        t.feed("Thinking");
+        assert_eq!(t.get_state(), AgentState::Thinking);
+        // state_buf should be cleared after transition
+        assert!(t.state_buf.is_empty());
+    }
+
+    #[test]
+    fn same_state_no_timer_reset() {
+        let backend = Backend::ClaudeCode;
+        let mut t = tracker_at(&backend, AgentState::Thinking, 10);
+        let since_before = t.since;
+        // Re-transition to same state — should be no-op
+        t.transition(AgentState::Thinking);
+        assert_eq!(t.since, since_before);
+    }
+
+    #[test]
+    fn starting_hang_120s() {
+        let mut h = HealthTracker::new();
+
+        // 119s — no hang
+        let recent = Instant::now() - Duration::from_secs(119);
+        assert!(!h.check_hang(AgentState::Starting, recent));
+
+        // 121s — hang
+        let old = Instant::now() - Duration::from_secs(121);
+        assert!(h.check_hang(AgentState::Starting, old));
+    }
+
+    #[test]
+    fn idle_never_hangs() {
+        let mut h = HealthTracker::new();
+        // Even with 10000s of silence, Idle should never be considered hung
+        let ancient = Instant::now() - Duration::from_secs(10_000);
+        assert!(!h.check_hang(AgentState::Idle, ancient));
+    }
+
+    #[test]
+    fn thinking_hang_600s() {
+        let mut h = HealthTracker::new();
+
+        // 599s — no hang
+        let recent = Instant::now() - Duration::from_secs(599);
+        assert!(!h.check_hang(AgentState::Thinking, recent));
+
+        // 601s — hang
+        let old = Instant::now() - Duration::from_secs(601);
+        assert!(h.check_hang(AgentState::Thinking, old));
+    }
+
+    // ── P2: Pattern matching ────────────────────────────────────────────
+
+    #[test]
+    fn claude_tooluse_spinner_match() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let detected = patterns.detect("⠋Read file.txt");
+        assert_eq!(detected, Some(AgentState::ToolUse));
+    }
+
+    #[test]
+    fn pattern_does_not_cross_backends() {
+        // Claude's "❯" idle pattern should not match on Gemini tracker
+        let gemini_patterns = StatePatterns::for_backend(&Backend::Gemini);
+        let detected = gemini_patterns.detect("❯");
+        assert_ne!(detected, Some(AgentState::Idle));
+    }
+
+    #[test]
+    fn empty_input_no_change() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+        t.feed("");
+        assert_eq!(t.get_state(), AgentState::Starting);
+    }
+
+    #[test]
+    fn ready_detection() {
+        let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+        t.feed("bypass permissions");
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn idle_detection() {
+        let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+        // First get to Ready so that Idle (lower prio than Starting) can be tested
+        // Starting → Ready (higher prio) is instant
+        t.feed("bypass permissions");
+        assert_eq!(t.get_state(), AgentState::Ready);
+        // Now wait enough time for passive hold (5s) then feed idle pattern
+        t.since = Instant::now() - Duration::from_secs(6);
+        t.feed("❯");
+        assert_eq!(t.get_state(), AgentState::Idle);
+    }
+
+    // ── Additional edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn context_full_instant_transition() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
+        t.feed("compacting context");
+        assert_eq!(t.get_state(), AgentState::ContextFull);
+    }
+
+    #[test]
+    fn auth_error_instant_transition() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("API key invalid");
+        assert_eq!(t.get_state(), AgentState::AuthError);
+    }
+
+    #[test]
+    fn permission_prompt_higher_than_thinking() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
+        // PermissionPrompt (priority 6) > Thinking (priority 5) — instant
+        t.feed("Allow once");
+        assert_eq!(t.get_state(), AgentState::PermissionPrompt);
+    }
+
+    #[test]
+    fn set_restarting_clears_buf() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 5);
+        t.state_buf.push_str("some old data");
+        t.set_restarting();
+        assert_eq!(t.get_state(), AgentState::Restarting);
+        assert!(t.state_buf.is_empty());
+    }
+
+    #[test]
+    fn state_buf_truncates_to_max() {
+        let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+        // Feed more than STATE_BUF_MAX bytes
+        let big_input = "x".repeat(STATE_BUF_MAX + 500);
+        t.feed(&big_input);
+        assert!(t.state_buf.len() <= STATE_BUF_MAX);
+    }
+
+    #[test]
+    fn error_state_is_error() {
+        assert!(AgentState::ContextFull.is_error());
+        assert!(AgentState::RateLimit.is_error());
+        assert!(AgentState::UsageLimit.is_error());
+        assert!(AgentState::AuthError.is_error());
+        assert!(AgentState::ApiError.is_error());
+        assert!(AgentState::Crashed.is_error());
+        assert!(AgentState::Restarting.is_error());
+        assert!(!AgentState::Thinking.is_error());
+        assert!(!AgentState::Idle.is_error());
+        assert!(!AgentState::Starting.is_error());
     }
 }
