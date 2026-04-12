@@ -406,7 +406,10 @@ mod tests {
         std::fs::write(run.join("api.sock"), "").ok();
         let found = find_api_socket(&home);
         assert!(found.is_some());
-        assert!(found.as_ref().map(|s| s.ends_with("api.sock")).unwrap_or(false));
+        assert!(found
+            .as_ref()
+            .map(|s| s.ends_with("api.sock"))
+            .unwrap_or(false));
         std::fs::remove_dir_all(&home).ok();
     }
 

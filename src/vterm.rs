@@ -286,7 +286,11 @@ mod tests {
         let mut out = Vec::new();
         write_color(
             &mut out,
-            Color::Spec(alacritty_terminal::vte::ansi::Rgb { r: 255, g: 128, b: 0 }),
+            Color::Spec(alacritty_terminal::vte::ansi::Rgb {
+                r: 255,
+                g: 128,
+                b: 0,
+            }),
             true,
         );
         let s = String::from_utf8_lossy(&out);

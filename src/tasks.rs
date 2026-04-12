@@ -103,7 +103,9 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     None => Ok(false),
                 }
             }) {
-                Ok(true) => serde_json::json!({"id": id, "status": "claimed", "assignee": instance_name}),
+                Ok(true) => {
+                    serde_json::json!({"id": id, "status": "claimed", "assignee": instance_name})
+                }
                 Ok(false) => serde_json::json!({"error": format!("task '{id}' not found")}),
                 Err(e) => serde_json::json!({"error": format!("{e}")}),
             }

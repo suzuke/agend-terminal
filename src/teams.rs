@@ -84,11 +84,19 @@ pub fn update(home: &Path, args: &Value) -> Value {
     };
     let to_add: Vec<String> = args["add"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let to_remove: Vec<String> = args["remove"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     match crate::store::mutate(&store_path(home), |store: &mut TeamStore| {
         match store.teams.iter_mut().find(|t| t.name == name) {

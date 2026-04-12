@@ -356,8 +356,14 @@ mod tests {
             PathBuf::from("/tmp/test"),
             HashMap::new(),
         );
-        assert_eq!(state.topic_to_instance.get(&100), Some(&"agent1".to_string()));
-        assert_eq!(state.topic_to_instance.get(&200), Some(&"agent2".to_string()));
+        assert_eq!(
+            state.topic_to_instance.get(&100),
+            Some(&"agent1".to_string())
+        );
+        assert_eq!(
+            state.topic_to_instance.get(&200),
+            Some(&"agent2".to_string())
+        );
         assert_eq!(state.instance_to_topic.get("agent1"), Some(&100));
         assert_eq!(state.instance_to_topic.get("agent2"), Some(&200));
     }
@@ -379,13 +385,7 @@ mod tests {
     fn telegram_state_submit_keys_preserved() {
         let mut keys = HashMap::new();
         keys.insert("agent1".to_string(), "\n".to_string());
-        let state = TelegramState::new(
-            "tok",
-            -1,
-            HashMap::new(),
-            PathBuf::from("/tmp"),
-            keys,
-        );
+        let state = TelegramState::new("tok", -1, HashMap::new(), PathBuf::from("/tmp"), keys);
         assert_eq!(state.submit_keys.get("agent1"), Some(&"\n".to_string()));
     }
 

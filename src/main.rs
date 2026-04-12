@@ -92,7 +92,10 @@ pub(crate) fn parse_double_quoted(s: &str) -> String {
                         '"' | '\\' => result.push(next),
                         'n' => result.push('\n'),
                         't' => result.push('\t'),
-                        _ => { result.push('\\'); result.push(next); }
+                        _ => {
+                            result.push('\\');
+                            result.push(next);
+                        }
                     }
                 }
             }
@@ -491,12 +494,18 @@ mod tests {
 
     #[test]
     fn parse_double_quoted_escaped_quote() {
-        assert_eq!(parse_double_quoted(r#""hello \"world\"""#), r#"hello "world""#);
+        assert_eq!(
+            parse_double_quoted(r#""hello \"world\"""#),
+            r#"hello "world""#
+        );
     }
 
     #[test]
     fn parse_double_quoted_escaped_backslash() {
-        assert_eq!(parse_double_quoted(r#""path\\to\\file""#), r#"path\to\file"#);
+        assert_eq!(
+            parse_double_quoted(r#""path\\to\\file""#),
+            r#"path\to\file"#
+        );
     }
 
     #[test]

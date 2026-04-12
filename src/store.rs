@@ -36,8 +36,11 @@ where
     let lock_file = std::fs::File::create(&lock_path)?;
     use nix::fcntl::{Flock, FlockArg};
     use std::os::fd::AsFd;
-    let _lock = Flock::lock(lock_file.as_fd().try_clone_to_owned()?, FlockArg::LockExclusive)
-        .map_err(|(_,e)| anyhow::anyhow!("store lock failed: {e}"))?;
+    let _lock = Flock::lock(
+        lock_file.as_fd().try_clone_to_owned()?,
+        FlockArg::LockExclusive,
+    )
+    .map_err(|(_, e)| anyhow::anyhow!("store lock failed: {e}"))?;
 
     let mut data: T = load(path);
     let result = f(&mut data)?;

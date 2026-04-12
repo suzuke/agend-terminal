@@ -126,12 +126,24 @@ pub fn update(home: &Path, args: &Value) -> Value {
     match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
         match store.schedules.iter_mut().find(|s| s.id == id) {
             Some(schedule) => {
-                if let Some(ref c) = new_cron { schedule.cron.clone_from(c); }
-                if let Some(ref m) = new_message { schedule.message.clone_from(m); }
-                if let Some(ref t) = new_target { schedule.target.clone_from(t); }
-                if let Some(ref l) = new_label { schedule.label = Some(l.clone()); }
-                if let Some(ref tz) = new_tz { schedule.timezone.clone_from(tz); }
-                if let Some(e) = new_enabled { schedule.enabled = e; }
+                if let Some(ref c) = new_cron {
+                    schedule.cron.clone_from(c);
+                }
+                if let Some(ref m) = new_message {
+                    schedule.message.clone_from(m);
+                }
+                if let Some(ref t) = new_target {
+                    schedule.target.clone_from(t);
+                }
+                if let Some(ref l) = new_label {
+                    schedule.label = Some(l.clone());
+                }
+                if let Some(ref tz) = new_tz {
+                    schedule.timezone.clone_from(tz);
+                }
+                if let Some(e) = new_enabled {
+                    schedule.enabled = e;
+                }
                 schedule.updated_at = chrono::Utc::now().to_rfc3339();
                 Ok(true)
             }

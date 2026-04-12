@@ -112,7 +112,10 @@ impl FleetConfig {
             .to_lowercase();
         let command_matches_preset = preset
             .as_ref()
-            .map(|p| command_basename == p.command || command_basename.starts_with(&format!("{}-", p.command)))
+            .map(|p| {
+                command_basename == p.command
+                    || command_basename.starts_with(&format!("{}-", p.command))
+            })
             .unwrap_or(false);
         let args = if !inst.args.is_empty() {
             inst.args.clone()
