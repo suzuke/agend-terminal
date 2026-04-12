@@ -377,3 +377,131 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+pub fn run_demo() -> anyhow::Result<()> {
+    use std::sync::{Arc, Mutex};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    println!("\n  AgEnD Terminal Demo — Multi-Agent Orchestration\n");
+    println!("  Spawning 2 agents (alice, bob)...\n");
+
+    let registry: agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let home = std::env::temp_dir().join(format!("agend-demo-{}", std::process::id()));
+    std::fs::create_dir_all(&home)?;
+
+    // Spawn two bash agents
+    agent::spawn_agent(
+        "alice", "/bin/bash", &[], 80, 24, None, None, "\r",
+        &registry, Some(&home), None, None,
+    )?;
+    agent::spawn_agent(
+        "bob", "/bin/bash", &[], 80, 24, None, None, "\r",
+        &registry, Some(&home), None, None,
+    )?;
+
+    println!("  ✓ alice spawned");
+    println!("  ✓ bob spawned");
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Show agents
+    println!("\n  Agents running:");
+    {
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        for name in reg.keys() {
+            println!("    - {name}");
+        }
+    }
+
+    // Agent-to-agent communication via inbox
+    println!("\n  Alice sends a message to Bob...");
+    inbox::enqueue(
+        &home, "bob",
+        inbox::InboxMessage {
+            from: "alice".to_string(),
+            text: "Hey Bob, can you review my code?".to_string(),
+            kind: Some("task".to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+    )?;
+    println!("  ✓ Message queued in Bob's inbox");
+
+    // Bob reads inbox
+    std::thread::sleep(Duration::from_millis(500));
+    let messages = inbox::drain(&home, "bob");
+    println!("\n  Bob checks inbox:");
+    for msg in &messages {
+        println!("    From: {} | Kind: {} | Text: {}",
+            msg.from,
+            msg.kind.as_deref().unwrap_or("message"),
+            msg.text);
+    }
+
+    // Bob replies
+    println!("\n  Bob replies to Alice...");
+    inbox::enqueue(
+        &home, "alice",
+        inbox::InboxMessage {
+            from: "bob".to_string(),
+            text: "Sure, I'll take a look!".to_string(),
+            kind: Some("report".to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        },
+    )?;
+    let replies = inbox::drain(&home, "alice");
+    println!("  Alice receives:");
+    for msg in &replies {
+        println!("    From: {} | Text: {}", msg.from, msg.text);
+    }
+
+    // Inject a command to show PTY works
+    println!("\n  Injecting command to alice's PTY...");
+    {
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = reg.get("alice") {
+            let _ = agent::write_to_agent(handle, b"echo 'Hello from AgEnD Terminal!'\r");
+        }
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
+    // Read VTerm output
+    {
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = reg.get("alice") {
+            let core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+            let dump = core.vterm.dump_screen();
+            let output = String::from_utf8_lossy(&dump);
+            let lines: Vec<&str> = output.lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            if let Some(line) = lines.iter().find(|l| l.contains("Hello from AgEnD")) {
+                println!("  ✓ PTY output: {}", line.trim());
+            }
+        }
+    }
+
+    // Cleanup
+    println!("\n  Cleaning up...");
+    {
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, handle) in reg.iter() {
+            let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = child.kill();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&home);
+
+    println!("  ✓ Demo complete!\n");
+    println!("  What you just saw:");
+    println!("    - 2 agents running in parallel with isolated PTYs");
+    println!("    - Agent-to-agent messaging via inbox");
+    println!("    - Direct PTY command injection + VTerm output capture");
+    println!();
+    println!("  Next steps:");
+    println!("    agend-terminal start          # Start with fleet.yaml");
+    println!("    agend-terminal attach <name>   # Watch an agent work");
+    println!("    agend-terminal doctor          # Check backend availability");
+    println!();
+
+    Ok(())
+}
