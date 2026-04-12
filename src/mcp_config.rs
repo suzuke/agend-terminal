@@ -263,3 +263,233 @@ pub fn configure(working_dir: &Path, command: &str) {
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn tmp_dir(name: &str) -> std::path::PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-mcp-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn shell_escape_simple() {
+        assert_eq!(shell_escape("/usr/bin/foo"), "'/usr/bin/foo'");
+    }
+
+    #[test]
+    fn shell_escape_with_quotes() {
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_escape_with_spaces() {
+        assert_eq!(
+            shell_escape("/path with spaces/bin"),
+            "'/path with spaces/bin'"
+        );
+    }
+
+    // --- OpenCode: must use "mcp" key, not "mcpServers" ---
+
+    #[test]
+    fn opencode_uses_mcp_key() {
+        let dir = tmp_dir("oc_key");
+        configure_opencode(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert!(config.get("mcp").is_some(), "must have 'mcp' key");
+        assert!(
+            config.get("mcpServers").is_none(),
+            "must NOT have 'mcpServers'"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_command_is_array() {
+        let dir = tmp_dir("oc_cmd");
+        configure_opencode(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        let cmd = &config["mcp"]["agend-terminal"]["command"];
+        assert!(cmd.is_array(), "command must be array, got: {cmd}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_has_type_local() {
+        let dir = tmp_dir("oc_type");
+        configure_opencode(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(config["mcp"]["agend-terminal"]["type"], "local");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_uses_environment_not_env() {
+        let dir = tmp_dir("oc_env");
+        configure_opencode(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        let entry = &config["mcp"]["agend-terminal"];
+        assert!(
+            entry.get("environment").is_some(),
+            "must have 'environment'"
+        );
+        assert!(entry.get("env").is_none(), "must NOT have 'env'");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_removes_old_mcpservers() {
+        let dir = tmp_dir("oc_migrate");
+        // Write old wrong format
+        let old = json!({"mcpServers": {"agend-terminal": {"command": "old"}}});
+        std::fs::write(
+            dir.join("opencode.json"),
+            serde_json::to_string(&old).expect("s"),
+        )
+        .ok();
+        configure_opencode(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert!(
+            config.get("mcpServers").is_none(),
+            "old mcpServers must be removed"
+        );
+        assert!(config.get("mcp").is_some(), "new mcp key must exist");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Kiro: must use wrapper script ---
+
+    #[test]
+    fn kiro_creates_wrapper_script() {
+        let dir = tmp_dir("kiro_wrapper");
+        configure_kiro(&dir).expect("configure");
+        let wrapper = dir.join(".kiro/settings/agend-mcp-wrapper.sh");
+        assert!(wrapper.exists(), "wrapper script must exist");
+        let content = std::fs::read_to_string(&wrapper).expect("read");
+        assert!(content.starts_with("#!/bin/bash"));
+        assert!(content.contains("AGEND_TERMINAL_HOME"));
+        assert!(content.contains("exec"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kiro_mcp_json_points_to_wrapper() {
+        let dir = tmp_dir("kiro_json");
+        configure_kiro(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        let cmd = config["mcpServers"]["agend-terminal"]["command"]
+            .as_str()
+            .expect("command str");
+        assert!(cmd.contains("agend-mcp-wrapper.sh"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kiro_no_env_in_mcp_json() {
+        let dir = tmp_dir("kiro_noenv");
+        configure_kiro(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert!(
+            config["mcpServers"]["agend-terminal"].get("env").is_none(),
+            "kiro mcp.json should NOT have env (use wrapper instead)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Gemini: mcpServers format ---
+
+    #[test]
+    fn gemini_uses_mcpservers() {
+        let dir = tmp_dir("gemini");
+        configure_gemini(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join(".gemini/settings.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert!(config.get("mcpServers").is_some());
+        assert!(config["mcpServers"]["agend-terminal"]["command"].is_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Claude: mcp-config.json + claude-settings.json ---
+
+    #[test]
+    fn claude_creates_mcp_config_and_settings() {
+        let dir = tmp_dir("claude");
+        // git init so configure_claude doesn't fail
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        configure_claude(&dir).expect("configure");
+        assert!(dir.join("mcp-config.json").exists());
+        assert!(dir.join(".claude/settings.local.json").exists());
+        assert!(dir.join("claude-settings.json").exists());
+        assert!(dir.join("statusline.sh").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_statusline_script_has_quoted_path() {
+        let dir = tmp_dir("claude_quote");
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        configure_claude(&dir).expect("configure");
+        let script = std::fs::read_to_string(dir.join("statusline.sh")).expect("read");
+        // Path should be single-quoted
+        assert!(
+            script.contains("cat > '"),
+            "statusline path must be quoted: {script}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- configure() dispatches correctly ---
+
+    #[test]
+    fn configure_dispatches_opencode() {
+        let dir = tmp_dir("dispatch_oc");
+        configure(&dir, "opencode");
+        assert!(dir.join("opencode.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn configure_dispatches_gemini() {
+        let dir = tmp_dir("dispatch_gem");
+        configure(&dir, "gemini");
+        assert!(dir.join(".gemini/settings.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn configure_unknown_backend_no_crash() {
+        let dir = tmp_dir("dispatch_unknown");
+        configure(&dir, "unknown-tool");
+        // Should not create any config files
+        assert!(!dir.join("opencode.json").exists());
+        assert!(!dir.join(".gemini").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
