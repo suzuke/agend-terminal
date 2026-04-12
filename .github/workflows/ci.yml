@@ -33,7 +33,7 @@ jobs:
         run: cargo build --release
 
       - name: Unit tests
-        run: cargo test --lib
+        run: cargo test --bin agend-terminal
 
       - name: Integration tests
         run: cargo test --test integration
