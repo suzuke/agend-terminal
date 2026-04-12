@@ -180,6 +180,7 @@ fn redact_secrets(content: &str) -> String {
             || line.contains("TOKEN")
             || line.contains("key")
             || line.contains("KEY")
+            || line.contains("group_id")
         {
             if let Some((key, _)) = line.split_once(':') {
                 result.push_str(&format!("{key}: ***REDACTED***\n"));
