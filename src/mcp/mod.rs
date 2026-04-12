@@ -103,7 +103,10 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
             "tools/call" => {
                 let tool = req.params["name"].as_str().unwrap_or("");
                 let args = &req.params["arguments"];
-                let result = handlers::handle_tool(tool, args, agent_socket);
+
+                // Try daemon proxy first — avoids per-process overhead
+                let result = proxy_or_local(tool, args, &instance_name, agent_socket);
+
                 json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": {
@@ -128,4 +131,29 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
 
     eprintln!("[mcp] server exiting");
     Ok(())
+}
+
+/// Try to proxy a tool call through the daemon API socket.
+/// Falls back to local handling if the daemon is unavailable.
+fn proxy_or_local(tool: &str, args: &Value, instance_name: &str, agent_socket: &str) -> Value {
+    let home = crate::home_dir();
+
+    if let Ok(resp) = crate::api::call(
+        &home,
+        &json!({
+            "method": "mcp_tool",
+            "params": {
+                "tool": tool,
+                "arguments": args,
+                "instance": instance_name
+            }
+        }),
+    ) {
+        if resp["ok"].as_bool() == Some(true) {
+            return resp["result"].clone();
+        }
+    }
+
+    // Daemon unavailable or returned error — handle locally
+    handlers::handle_tool(tool, args, agent_socket, instance_name)
 }

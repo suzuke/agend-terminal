@@ -314,6 +314,13 @@ fn handle_session(
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                 json!({"ok": true})
             }
+            "mcp_tool" => {
+                let tool = params["tool"].as_str().unwrap_or("");
+                let args = &params["arguments"];
+                let instance = params["instance"].as_str().unwrap_or("");
+                let result = crate::mcp::handlers::handle_tool(tool, args, "", instance);
+                json!({"ok": true, "result": result})
+            }
             _ => json!({"ok": false, "error": format!("unknown method: {method}")}),
         };
 
