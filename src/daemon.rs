@@ -1,4 +1,5 @@
-//! Daemon: manages agent registry, TUI sockets, auto-respawn, and fleet lifecycle.
+//! Daemon: manages agent registry, TUI sockets, auto-respawn, fleet lifecycle,
+//! schedule checking, health monitoring, Telegram notifications.
 
 use crate::agent::{self, AgentRegistry};
 use crate::framing::{self, TAG_DATA, TAG_RESIZE};
@@ -45,7 +46,7 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
         eprintln!("[{name}] TUI client connected");
 
         let (rx, pty_writer, pty_master, core) = {
-            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            let reg = agent::lock_registry(&registry);
             let agent = match reg.get(name) {
                 Some(a) => a,
                 None => continue,
@@ -315,7 +316,7 @@ pub fn run(
 
         // Periodic maintenance (runs on every wake, whether crash or tick)
         {
-            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            let reg = agent::lock_registry(&registry);
             for (name, handle) in reg.iter() {
                 if let Ok(mut core) = handle.core.lock() {
                     core.health.maybe_decay();
@@ -370,7 +371,7 @@ pub fn run(
 
                 // Record crash in health tracker (unified in AgentCore)
                 let (should_respawn, delay, should_notify) = {
-                    let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    let reg = agent::lock_registry(&registry);
                     match reg.get(&crashed_name) {
                         Some(handle) => {
                             let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,7 +386,7 @@ pub fn run(
 
                 if should_notify {
                     let state = {
-                        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                        let reg = agent::lock_registry(&registry);
                         reg.get(&crashed_name)
                             .and_then(|h| h.core.lock().ok().map(|c| c.health.state.display_name()))
                             .unwrap_or("unknown")
@@ -658,7 +659,7 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
             crate::event_log::log(home, "schedule_trigger", target, &format!("{label}: {message}"));
 
             // Inject message to target agent via registry
-            let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            let reg = agent::lock_registry(&registry);
             let status = if let Some(handle) = reg.get(target) {
                 match agent::inject_to_agent(handle, message.as_bytes()) {
                     Ok(()) => "ok",

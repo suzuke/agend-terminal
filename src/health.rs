@@ -18,6 +18,7 @@ const STABILITY_WINDOW: Duration = Duration::from_secs(1800); // 30 min stable â
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // ErrorLoop constructed by record_error() in health monitoring
 pub enum HealthState {
     Healthy,
     Recovering,
@@ -42,6 +43,7 @@ impl HealthState {
 
 /// Tracks health for one agent.
 #[derive(Clone)]
+#[allow(dead_code)] // error_events, last_output, record_error, reset: reserved for daemon health monitoring
 pub struct HealthTracker {
     pub state: HealthState,
     crash_times: VecDeque<Instant>,
@@ -151,6 +153,7 @@ impl HealthTracker {
     }
 
     /// Record an error state. Returns true if error loop detected (3x in 10min).
+    #[allow(dead_code)]
     pub fn record_error(&mut self, state: AgentState) -> bool {
         let now = Instant::now();
         self.error_events.push_back((now, state));
@@ -213,6 +216,7 @@ impl HealthTracker {
     }
 
     /// Reset health state (e.g., after manual restart).
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.state = HealthState::Healthy;
         self.crash_times.clear();

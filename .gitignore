@@ -3,3 +3,8 @@
 *.sock
 sessions/
 workspaces/
+decisions/
+inbox/
+metadata/
+downloads/
+.schedule_last_check

@@ -20,7 +20,6 @@ pub enum ResumeMode {
     /// flag is the CLI flag to use (e.g., "--continue" for Claude, "--resume" for Kiro).
     ContinueInCwd { flag: &'static str },
     /// Use --resume-id <saved-session-id> (needs captured ID from file)
-    #[allow(dead_code)]
     SavedSession { flag: &'static str },
     /// Fixed args (e.g., Gemini --resume latest)
     Fixed { args: &'static [&'static str] },
@@ -54,18 +53,10 @@ impl ResumeMode {
 }
 
 /// Save a captured session ID for an instance.
-#[allow(dead_code)]
 pub fn save_session_id(home: &std::path::Path, instance_name: &str, session_id: &str) {
     let dir = home.join("sessions");
     std::fs::create_dir_all(&dir).ok();
     let _ = std::fs::write(dir.join(format!("{instance_name}.sid")), session_id);
-}
-
-/// Clear saved session ID (e.g., after crash loop).
-#[allow(dead_code)]
-pub fn clear_session_id(home: &std::path::Path, instance_name: &str) {
-    let path = home.join("sessions").join(format!("{instance_name}.sid"));
-    let _ = std::fs::remove_file(path);
 }
 
 /// Preset configuration for a backend.
@@ -178,7 +169,6 @@ impl Backend {
     }
 
     /// Try to detect backend from a command string.
-    #[allow(dead_code)]
     pub fn from_command(command: &str) -> Option<Backend> {
         let cmd = command.to_lowercase();
         if cmd.contains("claude") {
@@ -205,12 +195,6 @@ impl Backend {
             Backend::OpenCode,
             Backend::Gemini,
         ]
-    }
-
-    /// Get all known backend names (kebab-case).
-    #[allow(dead_code)]
-    pub fn all_names() -> &'static [&'static str] {
-        &["claude-code", "kiro-cli", "codex", "open-code", "gemini"]
     }
 
     /// Kebab-case name for this backend.

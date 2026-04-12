@@ -85,7 +85,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
 
         let response = match method {
             "list" => {
-                let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                let reg = agent::lock_registry(registry);
                 let agents: Vec<Value> = reg
                     .iter()
                     .map(|(name, handle)| {
@@ -113,7 +113,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let data = params["data"].as_str().unwrap_or("");
                 // "raw" flag: send bytes as-is (for attach-like paths)
                 let raw = params["raw"].as_bool().unwrap_or(false);
-                let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                let reg = agent::lock_registry(registry);
                 match reg.get(name) {
                     Some(handle) => {
                         // Check if agent is restarting
@@ -139,7 +139,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
             }
             "kill" => {
                 let name = params["name"].as_str().unwrap_or("");
-                let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                let reg = agent::lock_registry(registry);
                 match reg.get(name) {
                     Some(handle) => {
                         // Set Restarting immediately (before kill) to close timing gap
@@ -212,7 +212,7 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let _ = crate::inbox::enqueue(home, target, msg);
 
                 // Direct write to PTY (daemon has registry — no API loop)
-                let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(target) {
                     let display_text = if text.chars().count() > 200 {
                         let truncated: String = text.chars().take(200).collect();
