@@ -23,7 +23,7 @@ alacritty_terminal = "0.26"
 crossbeam = "0.8"
 
 # Async (for Telegram + daemon UDS)
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "fs", "macros", "time"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
