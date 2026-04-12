@@ -56,3 +56,153 @@ pub fn write_resize(w: &mut impl Write, cols: u16, rows: u16) -> std::io::Result
     data[2..4].copy_from_slice(&rows.to_be_bytes());
     write_tagged(w, TAG_RESIZE, &data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn write_frame_read_roundtrip() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, b"hello world").expect("write");
+
+        let mut cursor = Cursor::new(buf);
+        let (tag, data) = read_tagged_frame(&mut cursor).expect("read");
+        assert_eq!(tag, TAG_DATA);
+        assert_eq!(data, b"hello world");
+    }
+
+    #[test]
+    fn frame_with_tag_data() {
+        let mut buf = Vec::new();
+        write_tagged(&mut buf, TAG_DATA, b"payload").expect("write");
+
+        let mut cursor = Cursor::new(buf);
+        let (tag, data) = read_tagged_frame(&mut cursor).expect("read");
+        assert_eq!(tag, TAG_DATA);
+        assert_eq!(data, b"payload");
+    }
+
+    #[test]
+    fn frame_with_tag_resize() {
+        let mut buf = Vec::new();
+        write_resize(&mut buf, 120, 40).expect("write");
+
+        let mut cursor = Cursor::new(buf);
+        let (tag, data) = read_tagged_frame(&mut cursor).expect("read");
+        assert_eq!(tag, TAG_RESIZE);
+        assert_eq!(data.len(), 4);
+        let cols = u16::from_be_bytes([data[0], data[1]]);
+        let rows = u16::from_be_bytes([data[2], data[3]]);
+        assert_eq!(cols, 120);
+        assert_eq!(rows, 40);
+    }
+
+    #[test]
+    fn write_tagged_arbitrary_tag() {
+        let mut buf = Vec::new();
+        write_tagged(&mut buf, 42, b"custom").expect("write");
+
+        let mut cursor = Cursor::new(buf);
+        let (tag, data) = read_tagged_frame(&mut cursor).expect("read");
+        assert_eq!(tag, 42);
+        assert_eq!(data, b"custom");
+    }
+
+    #[test]
+    fn empty_payload() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, b"").expect("write");
+
+        let mut cursor = Cursor::new(buf);
+        let (tag, data) = read_tagged_frame(&mut cursor).expect("read");
+        assert_eq!(tag, TAG_DATA);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn multiple_frames_sequential() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, b"first").expect("write");
+        write_frame(&mut buf, b"second").expect("write");
+        write_tagged(&mut buf, TAG_RESIZE, &[0, 80, 0, 24]).expect("write");
+
+        let mut cursor = Cursor::new(buf);
+        let (t1, d1) = read_tagged_frame(&mut cursor).expect("read 1");
+        let (t2, d2) = read_tagged_frame(&mut cursor).expect("read 2");
+        let (t3, d3) = read_tagged_frame(&mut cursor).expect("read 3");
+
+        assert_eq!(t1, TAG_DATA);
+        assert_eq!(d1, b"first");
+        assert_eq!(t2, TAG_DATA);
+        assert_eq!(d2, b"second");
+        assert_eq!(t3, TAG_RESIZE);
+        assert_eq!(d3, vec![0, 80, 0, 24]);
+    }
+
+    #[test]
+    fn read_truncated_frame_errors() {
+        // Only write the tag byte — no length
+        let buf = vec![TAG_DATA];
+        let mut cursor = Cursor::new(buf);
+        assert!(read_tagged_frame(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn read_empty_stream_errors() {
+        let buf: Vec<u8> = vec![];
+        let mut cursor = Cursor::new(buf);
+        assert!(read_tagged_frame(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn frame_too_large_errors() {
+        // Craft a frame header claiming a huge payload
+        let mut buf = Vec::new();
+        buf.push(TAG_DATA);
+        let huge_len: u32 = (DEFAULT_FRAME_LIMIT as u32) + 1;
+        buf.extend_from_slice(&huge_len.to_be_bytes());
+        // Don't even write the payload — should fail on length check
+
+        let mut cursor = Cursor::new(buf);
+        let result = read_tagged_frame(&mut cursor);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_frame_format_is_tag_len_data() {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, b"AB").expect("write");
+
+        // [TAG_DATA=0] [len=2 as u32 BE] [0x41, 0x42]
+        assert_eq!(buf.len(), 1 + 4 + 2);
+        assert_eq!(buf[0], TAG_DATA);
+        assert_eq!(&buf[1..5], &[0, 0, 0, 2]);
+        assert_eq!(&buf[5..], b"AB");
+    }
+
+    #[test]
+    fn resize_dimensions_max_values() {
+        let mut buf = Vec::new();
+        write_resize(&mut buf, u16::MAX, u16::MAX).expect("write");
+
+        let mut cursor = Cursor::new(buf);
+        let (tag, data) = read_tagged_frame(&mut cursor).expect("read");
+        assert_eq!(tag, TAG_RESIZE);
+        let cols = u16::from_be_bytes([data[0], data[1]]);
+        let rows = u16::from_be_bytes([data[2], data[3]]);
+        assert_eq!(cols, u16::MAX);
+        assert_eq!(rows, u16::MAX);
+    }
+
+    #[test]
+    fn constants_correct() {
+        assert_eq!(TAG_DATA, 0);
+        assert_eq!(TAG_RESIZE, 1);
+        assert_eq!(PROTOCOL_VERSION, 1);
+        assert!(DEFAULT_FRAME_LIMIT > 0);
+    }
+}
