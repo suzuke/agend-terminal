@@ -454,6 +454,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             None => continue, // Tick only — no crash to handle
         };
 
+        // Ignore crash events during shutdown — agents are being killed intentionally.
+        // This prevents spurious respawns and "Agent restarted" system messages.
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(agent = %crashed_name, "ignoring crash during shutdown");
+            break;
+        }
+
         tracing::warn!(agent = %crashed_name, "crashed");
         crate::event_log::log(home, "crash", &crashed_name, "agent crashed");
 

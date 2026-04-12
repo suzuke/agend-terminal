@@ -345,6 +345,10 @@ fn handle_pty_close(
     crash_tx: &Option<CrashChannel>,
     shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
+    // Brief pause to let Ctrl+C shutdown flag propagate before checking.
+    // Without this, PTY EOF from signal propagation races with the flag.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
     // Check if daemon is shutting down — if so, this is not a crash
     let is_shutdown = shutdown
         .as_ref()
