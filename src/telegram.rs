@@ -120,6 +120,28 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
     }
 }
 
+/// Resolve a topic_id to an instance name.
+/// First checks the in-memory map, then reloads from fleet.yaml for
+/// runtime-created topics (via create_instance).
+fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) -> String {
+    if let Some(tid) = topic_id {
+        if let Some(name) = state.topic_to_instance.get(&tid).cloned() {
+            return name;
+        }
+        // Unknown topic_id — reload from fleet.yaml
+        if let Ok(config) = crate::fleet::FleetConfig::load(&state.home.join("fleet.yaml")) {
+            for (inst_name, inst) in &config.instances {
+                if inst.topic_id == Some(tid) {
+                    state.topic_to_instance.insert(tid, inst_name.clone());
+                    state.instance_to_topic.insert(inst_name.clone(), tid);
+                    return inst_name.clone();
+                }
+            }
+        }
+    }
+    "general".to_string()
+}
+
 fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // Detect topic closure
     if msg.forum_topic_closed().is_some() {
@@ -142,27 +164,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
     let (instance_name, home, submit_key) = {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-        let name = thread_id
-            .and_then(|tid| s.topic_to_instance.get(&tid).cloned())
-            .or_else(|| {
-                // Unknown topic_id — reload topic map from fleet.yaml
-                // (handles topics created at runtime via create_instance)
-                if let Some(tid) = thread_id {
-                    if let Ok(config) = crate::fleet::FleetConfig::load(&s.home.join("fleet.yaml"))
-                    {
-                        for (inst_name, inst) in &config.instances {
-                            if inst.topic_id == Some(tid) {
-                                // Update maps for future lookups
-                                s.topic_to_instance.insert(tid, inst_name.clone());
-                                s.instance_to_topic.insert(inst_name.clone(), tid);
-                                return Some(inst_name.clone());
-                            }
-                        }
-                    }
-                }
-                None
-            })
-            .unwrap_or_else(|| "general".to_string());
+        let name = resolve_topic(&mut s, thread_id);
         let sk = s
             .submit_keys
             .get(&name)
@@ -431,5 +433,102 @@ mod tests {
         assert_eq!(map_emoji_name("thumbs_down"), "👎");
         assert_eq!(map_emoji_name("tada"), "🎉");
         assert_eq!(map_emoji_name("party"), "🎉");
+    }
+
+    fn tmp_home(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-telegram-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn resolve_topic_known_topic() {
+        let mut topic_map = HashMap::new();
+        topic_map.insert("alice".to_string(), 100);
+        let mut state =
+            TelegramState::new("tok", -1, topic_map, PathBuf::from("/tmp"), HashMap::new());
+        assert_eq!(resolve_topic(&mut state, Some(100)), "alice");
+    }
+
+    #[test]
+    fn resolve_topic_none_returns_general() {
+        let mut state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+        );
+        assert_eq!(resolve_topic(&mut state, None), "general");
+    }
+
+    #[test]
+    fn resolve_topic_unknown_falls_back_to_general() {
+        let mut state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp/nonexistent"),
+            HashMap::new(),
+        );
+        // No fleet.yaml → falls back to general
+        assert_eq!(resolve_topic(&mut state, Some(999)), "general");
+    }
+
+    #[test]
+    fn resolve_topic_reloads_from_fleet_yaml() {
+        let home = tmp_home("resolve_reload");
+        let yaml = r#"defaults:
+  backend: claude-code
+instances:
+  alice:
+    role: "Test"
+    topic_id: 229
+  general:
+    role: "General"
+    topic_id: 1
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+
+        // State has NO topic mappings — simulates runtime-created topic
+        let mut state = TelegramState::new("tok", -1, HashMap::new(), home.clone(), HashMap::new());
+
+        // Should reload from fleet.yaml and find alice
+        assert_eq!(resolve_topic(&mut state, Some(229)), "alice");
+        // Should be cached now
+        assert_eq!(
+            state.topic_to_instance.get(&229),
+            Some(&"alice".to_string())
+        );
+        assert_eq!(state.instance_to_topic.get("alice"), Some(&229));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resolve_topic_reload_caches_for_next_call() {
+        let home = tmp_home("resolve_cache");
+        let yaml = r#"instances:
+  bob:
+    topic_id: 500
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        let mut state = TelegramState::new("tok", -1, HashMap::new(), home.clone(), HashMap::new());
+
+        // First call: reloads from fleet.yaml
+        assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
+        // Delete fleet.yaml — second call should use cached map
+        std::fs::remove_file(home.join("fleet.yaml")).ok();
+        assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }

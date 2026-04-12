@@ -815,4 +815,78 @@ instances:
 
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn test_topic_id_parsed() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-topic-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        let path = dir.join("fleet.yaml");
+        fs::write(
+            &path,
+            r#"instances:
+  alice:
+    backend: claude-code
+    topic_id: 229
+  general:
+    backend: claude-code
+    topic_id: 1
+"#,
+        )
+        .ok();
+        let config = FleetConfig::load(&path).expect("load");
+        assert_eq!(
+            config.instances.get("alice").and_then(|i| i.topic_id),
+            Some(229)
+        );
+        assert_eq!(
+            config.instances.get("general").and_then(|i| i.topic_id),
+            Some(1)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_topic_id_none_when_missing() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-notopic-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        let path = dir.join("fleet.yaml");
+        fs::write(
+            &path,
+            r#"instances:
+  dev:
+    backend: claude-code
+"#,
+        )
+        .ok();
+        let config = FleetConfig::load(&path).expect("load");
+        assert_eq!(config.instances.get("dev").and_then(|i| i.topic_id), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_remove_instance_preserves_other_topics() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-rmtopic-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        let path = dir.join("fleet.yaml");
+        fs::write(
+            &path,
+            r#"instances:
+  alice:
+    backend: claude-code
+    topic_id: 229
+  bob:
+    backend: claude-code
+    topic_id: 300
+"#,
+        )
+        .ok();
+        remove_instance_from_yaml(&dir, "alice").expect("remove");
+        let config = FleetConfig::load(&path).expect("load");
+        assert!(config.instances.get("alice").is_none());
+        assert_eq!(
+            config.instances.get("bob").and_then(|i| i.topic_id),
+            Some(300)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
 }

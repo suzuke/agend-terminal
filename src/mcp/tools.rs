@@ -215,3 +215,104 @@ fn repo_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_instance_has_backend_param() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let create = tools
+            .iter()
+            .find(|t| t["name"] == "create_instance")
+            .expect("create_instance tool not found");
+        let props = &create["inputSchema"]["properties"];
+        assert!(
+            props["backend"].is_object(),
+            "create_instance should have 'backend' property"
+        );
+        assert!(
+            props["backend"]["description"]
+                .as_str()
+                .expect("desc")
+                .contains("claude"),
+            "backend description should list available CLI names"
+        );
+    }
+
+    #[test]
+    fn create_instance_name_not_required_command() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let create = tools
+            .iter()
+            .find(|t| t["name"] == "create_instance")
+            .expect("create_instance tool not found");
+        let required = create["inputSchema"]["required"]
+            .as_array()
+            .expect("required");
+        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_strs.contains(&"name"), "name should be required");
+        assert!(
+            !required_strs.contains(&"command"),
+            "command should NOT be required (backend is preferred, default is claude)"
+        );
+    }
+
+    #[test]
+    fn create_instance_command_deprecated() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let create = tools
+            .iter()
+            .find(|t| t["name"] == "create_instance")
+            .expect("create_instance tool not found");
+        let desc = create["inputSchema"]["properties"]["command"]["description"]
+            .as_str()
+            .expect("command desc");
+        assert!(
+            desc.to_lowercase().contains("deprecated"),
+            "command should be marked as deprecated"
+        );
+    }
+
+    #[test]
+    fn delete_instance_exists() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let delete = tools
+            .iter()
+            .find(|t| t["name"] == "delete_instance")
+            .expect("delete_instance tool not found");
+        let required = delete["inputSchema"]["required"]
+            .as_array()
+            .expect("required");
+        assert!(required.iter().any(|v| v == "name"));
+    }
+
+    #[test]
+    fn tool_count_at_least_35() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        assert!(
+            tools.len() >= 35,
+            "expected at least 35 tools, got {}",
+            tools.len()
+        );
+    }
+
+    #[test]
+    fn all_tools_have_input_schema() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or("?");
+            assert!(
+                tool["inputSchema"].is_object(),
+                "tool '{name}' missing inputSchema"
+            );
+        }
+    }
+}
