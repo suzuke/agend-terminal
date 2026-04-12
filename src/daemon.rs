@@ -15,15 +15,15 @@ use std::sync::{Arc, Mutex};
 
 /// Agent spawn config — stored for auto-respawn.
 #[derive(Clone)]
-struct AgentConfig {
-    name: String,
-    command: String,
-    args: Vec<String>,
-    env: Option<HashMap<String, String>>,
-    working_dir: Option<PathBuf>,
+pub struct AgentConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Option<HashMap<String, String>>,
+    pub working_dir: Option<PathBuf>,
     /// Original repo root (before worktree redirect).
-    worktree_source: Option<PathBuf>,
-    submit_key: String,
+    pub worktree_source: Option<PathBuf>,
+    pub submit_key: String,
 }
 
 /// Start the TUI socket server for an agent (blocks the calling thread).
@@ -264,9 +264,10 @@ pub fn run(
     let api_reg = Arc::clone(&registry);
     let api_home = home.to_path_buf();
     let api_shutdown = Arc::clone(&shutdown);
+    let api_configs = Arc::clone(&configs);
     std::thread::Builder::new()
         .name("api_server".into())
-        .spawn(move || crate::api::serve(&api_home, api_reg, api_shutdown))?;
+        .spawn(move || crate::api::serve(&api_home, api_reg, api_shutdown, api_configs))?;
 
     let shutdown2 = Arc::clone(&shutdown);
     match ctrlc::set_handler(move || {

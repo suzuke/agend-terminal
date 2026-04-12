@@ -253,7 +253,8 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str) -> Value {
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
-            let _ = crate::api::call(&home, &json!({"method": "kill", "params": {"name": name}}));
+            // Use "delete" (not "kill") — removes from configs to prevent respawn
+            let _ = crate::api::call(&home, &json!({"method": "delete", "params": {"name": name}}));
             json!({"name": name})
         }
         "start_instance" => {

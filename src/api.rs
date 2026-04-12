@@ -5,14 +5,17 @@
 
 use crate::agent::{self, AgentRegistry};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
 /// Start API socket server (blocks calling thread).
-pub fn serve(home: &Path, registry: AgentRegistry, shutdown: Arc<AtomicBool>) {
+pub fn serve(home: &Path, registry: AgentRegistry, shutdown: Arc<AtomicBool>, configs: ConfigRegistry) {
     let sock = api_socket_path(home);
     let _ = std::fs::remove_file(&sock);
 
@@ -29,9 +32,10 @@ pub fn serve(home: &Path, registry: AgentRegistry, shutdown: Arc<AtomicBool>) {
         let reg = Arc::clone(&registry);
         let home = home.to_path_buf();
         let shutdown = Arc::clone(&shutdown);
+        let cfgs = Arc::clone(&configs);
         std::thread::Builder::new()
             .name("api_handler".into())
-            .spawn(move || handle_session(stream, &reg, &home, &shutdown))
+            .spawn(move || handle_session(stream, &reg, &home, &shutdown, &cfgs))
             .ok();
     }
 }
@@ -51,7 +55,7 @@ pub fn find_api_socket(home: &Path) -> Option<String> {
     }
 }
 
-fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shutdown: &Arc<AtomicBool>) {
+fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shutdown: &Arc<AtomicBool>, configs: &ConfigRegistry) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
         Err(e) => {
@@ -142,7 +146,6 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                 let reg = agent::lock_registry(registry);
                 match reg.get(name) {
                     Some(handle) => {
-                        // Set Restarting immediately (before kill) to close timing gap
                         if let Ok(mut core) = handle.core.lock() {
                             core.state.set_restarting();
                         }
@@ -155,6 +158,29 @@ fn handle_session(stream: UnixStream, registry: &AgentRegistry, home: &Path, shu
                     }
                     None => json!({"ok": false, "error": format!("agent '{name}' not found")}),
                 }
+            }
+            "delete" => {
+                // Kill + remove from configs (prevents respawn)
+                let name = params["name"].as_str().unwrap_or("");
+                // Remove from configs first (so crash handler won't respawn)
+                configs.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+                // Then kill
+                let mut reg = agent::lock_registry(registry);
+                match reg.get(name) {
+                    Some(handle) => {
+                        let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+                        let _ = child.kill();
+                        drop(child);
+                    }
+                    None => {}
+                }
+                reg.remove(name);
+                drop(reg);
+                // Cleanup socket
+                let sock = crate::daemon::agent_socket_path(home, name);
+                let _ = std::fs::remove_file(&sock);
+                crate::event_log::log(home, "delete", name, "deleted via API");
+                json!({"ok": true})
             }
             "spawn" => {
                 let name = match params["name"].as_str() {
