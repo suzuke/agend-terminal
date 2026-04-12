@@ -843,7 +843,10 @@ fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
         }
 
         // Touch the file to update mtime (throttle next check)
-        let _ = std::fs::write(&path, serde_json::to_string_pretty(&watch).unwrap_or_default());
+        let _ = std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&watch).unwrap_or_default(),
+        );
 
         // Spawn a thread for the HTTP call to avoid blocking the daemon tick
         let home = home.to_path_buf();
@@ -888,9 +891,8 @@ async fn ci_check_repo(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    let url = format!(
-        "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=1"
-    );
+    let url =
+        format!("https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=1");
     let mut req = client
         .get(&url)
         .header("User-Agent", "agend-terminal")
@@ -911,9 +913,7 @@ async fn ci_check_repo(
     }
 
     // Fetch failed jobs
-    let jobs_url = format!(
-        "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
-    );
+    let jobs_url = format!("https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs");
     let mut req = client
         .get(&jobs_url)
         .header("User-Agent", "agend-terminal")
