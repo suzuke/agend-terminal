@@ -307,11 +307,12 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     let entry = crate::fleet::InstanceYamlEntry {
-                        command: command.to_string(),
-                        backend: backend_str.or_else(|| {
-                            crate::backend::Backend::from_command(command)
-                                .map(|b| b.name().to_string())
-                        }),
+                        backend: backend_str
+                            .or_else(|| {
+                                crate::backend::Backend::from_command(command)
+                                    .map(|b| b.name().to_string())
+                            })
+                            .or_else(|| Some(command.to_string())),
                         working_directory: Some(work_dir.clone()),
                         role,
                     };

@@ -211,7 +211,6 @@ fn dirs_home() -> Option<PathBuf> {
 
 /// Entry for adding a dynamic instance to fleet.yaml.
 pub struct InstanceYamlEntry {
-    pub command: String,
     pub backend: Option<String>,
     pub working_directory: Option<String>,
     pub role: Option<String>,
@@ -273,10 +272,6 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
             .context("instances is not a mapping")?;
 
         let mut inst = serde_yaml::Mapping::new();
-        inst.insert(
-            "command".into(),
-            serde_yaml::Value::String(config.command.clone()),
-        );
         for (key, val) in [
             ("backend", &config.backend),
             ("working_directory", &config.working_directory),
@@ -439,7 +434,6 @@ instances:
 "#,
         );
         let entry = InstanceYamlEntry {
-            command: "claude".to_string(),
             backend: Some("claude-code".to_string()),
             working_directory: Some("/tmp/work".to_string()),
             role: Some("developer".to_string()),
@@ -448,7 +442,7 @@ instances:
         let config = FleetConfig::load(&path).expect("load after add");
         assert!(config.instances.contains_key("new-agent"));
         let inst = &config.instances["new-agent"];
-        assert_eq!(inst.command.as_deref(), Some("claude"));
+        assert_eq!(inst.backend, Some(crate::backend::Backend::ClaudeCode));
         assert_eq!(inst.working_directory.as_deref(), Some("/tmp/work"));
         assert_eq!(inst.role.as_deref(), Some("developer"));
         // existing instance should still be there
@@ -484,8 +478,7 @@ instances:
         fs::create_dir_all(&dir).ok();
         // No fleet.yaml exists yet
         let entry = InstanceYamlEntry {
-            command: "claude".to_string(),
-            backend: None,
+            backend: Some("claude-code".to_string()),
             working_directory: None,
             role: None,
         };
@@ -627,8 +620,7 @@ instances:
         write_fleet(&dir, "instances: {}\n");
 
         let entry = InstanceYamlEntry {
-            command: "test-cmd".to_string(),
-            backend: None,
+            backend: Some("claude-code".to_string()),
             working_directory: None,
             role: Some("tester".to_string()),
         };
