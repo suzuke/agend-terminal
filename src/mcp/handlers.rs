@@ -232,11 +232,28 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 .as_str()
                 .or_else(|| args["command"].as_str())
                 .unwrap_or("claude");
-            let mut cmd_args = args
+            // Start with backend preset args (e.g. --yolo for gemini, --dangerously-skip-permissions for claude)
+            let mut cmd_args = crate::backend::Backend::from_command(command)
+                .map(|b| {
+                    b.preset()
+                        .args
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            // Append user-specified args
+            if let Some(extra) = args
                 .get("args")
                 .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .filter(|s| !s.is_empty())
+            {
+                if !cmd_args.is_empty() {
+                    cmd_args.push(' ');
+                }
+                cmd_args.push_str(extra);
+            }
             if let Some(model) = args
                 .get("model")
                 .and_then(|v| v.as_str())
