@@ -73,10 +73,8 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         Ok((group_id, group_title)) => {
             println!("✓ {group_title} ({group_id})\n");
 
-            // Save .env
-            let env_path = home.join(".env");
-            std::fs::write(&env_path, format!("AGEND_BOT_TOKEN={token}\n"))?;
-            println!("  ✓ Token saved to {}\n", env_path.display());
+            // Save token to .env
+            save_env_token(home, &token)?;
 
             generate_fleet_yaml(home, &selected, Some(group_id), Some(&token))?;
         }
@@ -85,8 +83,7 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
             println!("  You can set group_id manually in fleet.yaml later.\n");
 
             // Save token anyway
-            let env_path = home.join(".env");
-            std::fs::write(&env_path, format!("AGEND_BOT_TOKEN={token}\n"))?;
+            save_env_token(home, &token)?;
 
             generate_fleet_yaml(home, &selected, None, Some(&token))?;
         }
@@ -237,6 +234,48 @@ fn detect_project_root() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// Save AGEND_BOT_TOKEN to .env, preserving other variables.
+fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
+    let env_path = home.join(".env");
+    let existing = std::fs::read_to_string(&env_path).unwrap_or_default();
+
+    // Check if token already exists
+    let existing_token = existing.lines()
+        .find(|l| l.starts_with("AGEND_BOT_TOKEN="))
+        .map(|l| l.trim_start_matches("AGEND_BOT_TOKEN=").trim());
+
+    if let Some(old) = existing_token {
+        if old == token {
+            println!("  ✓ Token unchanged in .env\n");
+            return Ok(());
+        }
+        // Show masked existing token
+        let masked = if old.len() > 8 {
+            format!("{}...{}", &old[..4], &old[old.len()-4..])
+        } else {
+            "****".to_string()
+        };
+        println!("  .env already has AGEND_BOT_TOKEN={masked}");
+        let answer = prompt("  Update token? (Y/n): ")?;
+        if answer.trim().eq_ignore_ascii_case("n") {
+            println!("  Keeping existing token.\n");
+            return Ok(());
+        }
+    }
+
+    // Replace or append AGEND_BOT_TOKEN, preserve other lines
+    let mut lines: Vec<String> = existing.lines()
+        .filter(|l| !l.starts_with("AGEND_BOT_TOKEN="))
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(format!("AGEND_BOT_TOKEN={token}"));
+
+    let content = lines.join("\n") + "\n";
+    std::fs::write(&env_path, content)?;
+    println!("  ✓ Token saved to {}\n", env_path.display());
+    Ok(())
 }
 
 fn check_compatibility(yaml_content: &str, new_backend: &Backend, new_group_id: Option<i64>) {
