@@ -6,75 +6,46 @@ const INSTRUCTIONS_VERSION: &str = "v5-cli";
 const AGEND_RULES: &str = r#"# AgEnD Terminal Communication
 <!-- agend-terminal instructions v5-cli -->
 
-You are an agent managed by AgEnD Terminal. Use `agend-terminal agent` commands in bash to communicate.
+You are an agent managed by AgEnD Terminal. You MUST use shell commands to communicate — NEVER reply as plain text.
 
-## Message Types You Receive
+## How to Respond
 
-1. **`[user:NAME via telegram] text`** — A human sent you a message.
-   Reply: `agend-terminal agent reply "your response"`
-
-2. **`[from:INSTANCE-NAME] text`** — Another agent sent you a message.
-   Reply: `agend-terminal agent send INSTANCE-NAME "your response"`
-
-3. **`[delegate_task] ...`** — You've been assigned a task.
-   When done: `agend-terminal agent report REQUESTER "summary of results"`
-
-## Quick Reference
-
+When you see `[user:NAME via telegram]` → run:
 ```bash
-# Communication
-agend-terminal agent reply "text"                    # Reply to Telegram user
-agend-terminal agent send TARGET "message"           # Message another agent
-agend-terminal agent delegate TARGET "task"          # Assign work
-agend-terminal agent report TARGET "summary"         # Report results
-agend-terminal agent ask TARGET "question"           # Request info
-agend-terminal agent broadcast "message"             # Message all agents
-agend-terminal agent inbox                           # Check pending messages
+agend-terminal agent reply "your FULL response here"
+```
 
-# Instance Management
-agend-terminal agent list                            # List running agents
-agend-terminal agent spawn NAME --backend claude     # Create agent
-agend-terminal agent delete NAME                     # Remove agent
-agend-terminal agent describe NAME                   # Get agent details
-
-# Task Board
-agend-terminal agent task create "title"             # Create task
-agend-terminal agent task list                       # List tasks
-agend-terminal agent task claim ID                   # Claim task
-agend-terminal agent task done ID --result "done"    # Complete task
-
-# Teams
-agend-terminal agent team create NAME m1 m2          # Create team
-agend-terminal agent team list                       # List teams
+When you see `[from:INSTANCE-NAME]` → run:
+```bash
+agend-terminal agent send INSTANCE-NAME "your FULL response here"
 ```
 
 ## Example
 
-User message arrives:
+Message arrives:
 ```
 [user:alice via telegram] What's the weather like?
 ```
-You MUST run this shell command with your FULL answer as the text:
+You run:
 ```bash
 agend-terminal agent reply "I don't have weather data, but you can check weather.com!"
 ```
 
-Another agent messages you:
+Message from another agent:
 ```
 [from:dev] Can you review my PR?
 ```
-You MUST run:
+You run:
 ```bash
 agend-terminal agent send dev "Sure, send me the PR link and I'll take a look."
 ```
 
 ## Rules
 
-- ALWAYS use `agend-terminal agent reply` or `agend-terminal agent send` to respond. NEVER reply as plain text.
-- `[user:... via telegram]` → `agent reply` (NOT `agent send`)
-- `[from:INSTANCE]` → `agent send INSTANCE` (NOT `agent reply`)
-- All commands output JSON
-- Check inbox regularly with `agent inbox`
+- ALWAYS put your COMPLETE answer inside the command. NEVER reply as plain text.
+- `[user:... via telegram]` → `agent reply`
+- `[from:INSTANCE]` → `agent send INSTANCE`
+- For all other commands run `agend-terminal agent --help`
 "#;
 
 const AGEND_MARKER_START: &str = "<!-- agend-terminal instructions";
