@@ -1,10 +1,10 @@
 use anyhow::Result;
 use std::path::Path;
 
-const INSTRUCTIONS_VERSION: &str = "v4-cli";
+const INSTRUCTIONS_VERSION: &str = "v5-cli";
 
 const AGEND_RULES: &str = r#"# AgEnD Terminal Communication
-<!-- agend-terminal instructions v4-cli -->
+<!-- agend-terminal instructions v5-cli -->
 
 You are an agent managed by AgEnD Terminal. Use `agend-terminal agent` commands in bash to communicate.
 
@@ -48,13 +48,33 @@ agend-terminal agent team create NAME m1 m2          # Create team
 agend-terminal agent team list                       # List teams
 ```
 
+## Example
+
+User message arrives:
+```
+[user:alice via telegram] What's the weather like?
+```
+You MUST run this shell command with your FULL answer as the text:
+```bash
+agend-terminal agent reply "I don't have weather data, but you can check weather.com!"
+```
+
+Another agent messages you:
+```
+[from:dev] Can you review my PR?
+```
+You MUST run:
+```bash
+agend-terminal agent send dev "Sure, send me the PR link and I'll take a look."
+```
+
 ## Rules
 
-- All commands output JSON — parse the result for structured data
-- `[user:... via telegram]` → use `agent reply` (NOT `agent send`)
-- `[from:INSTANCE]` → use `agent send` (NOT `agent reply`)
+- ALWAYS use `agend-terminal agent reply` or `agend-terminal agent send` to respond. NEVER reply as plain text.
+- `[user:... via telegram]` → `agent reply` (NOT `agent send`)
+- `[from:INSTANCE]` → `agent send INSTANCE` (NOT `agent reply`)
+- All commands output JSON
 - Check inbox regularly with `agent inbox`
-- Run `agend-terminal agent --help` for full command list
 "#;
 
 const AGEND_MARKER_START: &str = "<!-- agend-terminal instructions";
@@ -172,37 +192,9 @@ fn generate_gemini(working_dir: &Path) -> Result<()> {
     write_with_marker(&working_dir.join("GEMINI.md"), AGEND_RULES)
 }
 
-const OPENCODE_ONESHOT: &str = r#"
-
-## Example Conversation
-
-User message arrives:
-```
-[user:alice via telegram] What's the weather like?
-```
-
-Your response — you MUST run this shell command with your FULL answer as the text:
-```bash
-agend-terminal agent reply "I don't have access to weather data, but you can check weather.com for the latest forecast!"
-```
-
-Another agent messages you:
-```
-[from:dev] Can you review my PR?
-```
-
-Your response:
-```bash
-agend-terminal agent send dev "Sure, send me the PR link and I'll take a look."
-```
-
-IMPORTANT: Always put your COMPLETE response inside the agend-terminal command. Do NOT reply as plain text.
-"#;
-
 /// OpenCode: AGENTS.md (auto-discovered by opencode)
 fn generate_opencode(working_dir: &Path) -> Result<()> {
-    let content = format!("{AGEND_RULES}{OPENCODE_ONESHOT}");
-    write_with_marker(&working_dir.join("AGENTS.md"), &content)
+    write_with_marker(&working_dir.join("AGENTS.md"), AGEND_RULES)
 }
 
 /// Detect backend from command name and generate appropriate instructions.
@@ -244,7 +236,7 @@ mod tests {
     fn write_with_marker_creates_new_file() {
         let dir = tmp_dir("new_file");
         let path = dir.join("AGENTS.md");
-        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v4-cli -->")
+        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v5-cli -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# Test"));
@@ -257,12 +249,12 @@ mod tests {
         let dir = tmp_dir("before");
         let path = dir.join("AGENTS.md");
         std::fs::write(&path, "# My Custom Rules\n\nDo not delete files.\n").ok();
-        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v4-cli -->")
+        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v5-cli -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# My Custom Rules"));
         assert!(content.contains("Do not delete files."));
-        assert!(content.contains("v4-cli"));
+        assert!(content.contains("v5-cli"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -276,11 +268,11 @@ mod tests {
             AGEND_MARKER_END
         );
         std::fs::write(&path, &initial).ok();
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v4-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v5-cli -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# Preamble"));
-        assert!(content.contains("v4-cli"));
+        assert!(content.contains("v5-cli"));
         assert!(!content.contains("v3-mcp"));
         assert!(!content.contains("old stuff"));
         assert!(content.contains("# My Notes"));
@@ -295,10 +287,10 @@ mod tests {
         write_with_marker(&path, "# Old\n<!-- agend-terminal instructions v3-mcp -->")
             .expect("first write");
         // Force re-write by bumping version
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v4-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v5-cli -->")
             .expect("second write");
         let content = std::fs::read_to_string(&path).expect("read");
-        assert!(content.contains("v4-cli"));
+        assert!(content.contains("v5-cli"));
         assert!(!content.contains("v3-mcp"));
         // Should have exactly one end marker
         assert_eq!(
@@ -313,7 +305,7 @@ mod tests {
     fn write_with_marker_idempotent() {
         let dir = tmp_dir("idempotent");
         let path = dir.join("AGENTS.md");
-        let content = format!("# Test\n<!-- agend-terminal instructions v4-cli -->\nstuff\n");
+        let content = format!("# Test\n<!-- agend-terminal instructions v5-cli -->\nstuff\n");
         write_with_marker(&path, &content).expect("first");
         let first = std::fs::read_to_string(&path).expect("read");
         write_with_marker(&path, &content).expect("second");
@@ -335,11 +327,11 @@ mod tests {
             "# User stuff\n\n<!-- agend-terminal instructions v3-mcp -->\nold agend content\n",
         )
         .ok();
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v4-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v5-cli -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# User stuff"));
-        assert!(content.contains("v4-cli"));
+        assert!(content.contains("v5-cli"));
         assert!(!content.contains("old agend content"));
         assert!(content.contains(AGEND_MARKER_END));
         std::fs::remove_dir_all(&dir).ok();
@@ -351,7 +343,7 @@ mod tests {
         let path = dir.join("test.md");
         write_file(
             &path,
-            "# Rules\n<!-- agend-terminal instructions v4-cli -->",
+            "# Rules\n<!-- agend-terminal instructions v5-cli -->",
         )
         .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
