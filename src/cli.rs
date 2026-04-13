@@ -6,6 +6,13 @@ use std::path::Path;
 
 /// Start daemon with fleet.yaml config.
 pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
+    // One-time migration: remove MCP config remnants from pre-CLI versions
+    let migration_marker = home.join(".mcp-cleaned");
+    if !migration_marker.exists() {
+        crate::instructions::cleanup_global_mcp();
+        let _ = std::fs::write(&migration_marker, "");
+    }
+
     let mut config = fleet::FleetConfig::load(fleet_path)?;
 
     // Auto-create "general" instance if channel is configured but no general exists.
@@ -82,8 +89,9 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
                 }
             }
 
-            // Generate instructions + MCP config
+            // Generate instructions (+ clean old MCP configs if present)
             if let Some(ref dir) = resolved.working_directory {
+                crate::instructions::cleanup_mcp(dir);
                 crate::instructions::generate(dir, &resolved.command);
             }
 

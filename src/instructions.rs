@@ -177,3 +177,93 @@ pub fn generate(working_dir: &Path, command: &str) {
         eprintln!("[warn] Failed to generate instructions: {e:#}");
     }
 }
+
+/// Remove MCP config files left by previous versions.
+/// MCP has been replaced by CLI — these files cause backend warnings.
+pub fn cleanup_mcp(working_dir: &Path) {
+    let mcp_files = [
+        // Claude
+        ".claude/settings.local.json",
+        "mcp-config.json",
+        "claude-settings.json",
+        "statusline.sh",
+        // Gemini
+        ".gemini/settings.json",
+        // OpenCode
+        "opencode.json",
+        // Kiro
+        ".kiro/settings/mcp.json",
+        ".kiro/settings/agend-mcp-wrapper.sh",
+    ];
+    for file in &mcp_files {
+        let path = working_dir.join(file);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                // Only remove if it's an agend-terminal MCP config
+                if content.contains("agend-terminal") || content.contains("AGEND_HOME") {
+                    let _ = std::fs::remove_file(&path);
+                    eprintln!("[cleanup] removed old MCP config: {}", path.display());
+                }
+            }
+        }
+    }
+    // Codex: remove from .codex/config.toml in working dir
+    let codex_config = working_dir.join(".codex").join("config.toml");
+    if codex_config.exists() {
+        if let Ok(content) = std::fs::read_to_string(&codex_config) {
+            if content.contains("[mcp_servers.agend-terminal]") {
+                // Remove the MCP server section
+                let cleaned: String = content
+                    .lines()
+                    .filter(|l| {
+                        !l.contains("mcp_servers.agend-terminal")
+                            && !l.starts_with("command = ")
+                            && !l.starts_with("args = ")
+                            && !l.starts_with("AGEND_HOME")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let _ = std::fs::write(&codex_config, cleaned.trim_end().to_string() + "\n");
+                eprintln!("[cleanup] removed MCP from {}", codex_config.display());
+            }
+        }
+    }
+}
+
+/// Remove agend-terminal MCP server from global ~/.codex/config.toml.
+pub fn cleanup_global_mcp() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let config_path = std::path::PathBuf::from(home)
+        .join(".codex")
+        .join("config.toml");
+    if !config_path.exists() {
+        return;
+    }
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if !content.contains("[mcp_servers.agend-terminal]") {
+            return;
+        }
+        // Remove the [mcp_servers.agend-terminal] section and its sub-keys
+        let mut lines: Vec<&str> = Vec::new();
+        let mut in_mcp_section = false;
+        for line in content.lines() {
+            if line.starts_with("[mcp_servers.agend-terminal") {
+                in_mcp_section = true;
+                continue;
+            }
+            if in_mcp_section {
+                // End of section: next [section] header or blank line after content
+                if line.starts_with('[') {
+                    in_mcp_section = false;
+                    lines.push(line);
+                }
+                // Skip lines in the MCP section
+                continue;
+            }
+            lines.push(line);
+        }
+        let cleaned = lines.join("\n");
+        let _ = std::fs::write(&config_path, cleaned.trim_end().to_string() + "\n");
+        eprintln!("[cleanup] removed agend-terminal MCP from global codex config");
+    }
+}
