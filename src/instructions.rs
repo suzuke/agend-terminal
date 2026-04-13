@@ -40,12 +40,47 @@ You run:
 agend-terminal agent send dev "Sure, send me the PR link and I'll take a look."
 ```
 
+## All Available Commands
+
+```
+agend-terminal agent <COMMAND>
+
+Communication:
+  reply            Reply to a Telegram user
+  send             Send a message to another agent
+  delegate         Delegate a task to another agent
+  report           Report a result to another agent
+  ask              Ask another agent a question
+  broadcast        Broadcast to a team or all agents
+  inbox            Check pending messages
+
+Instance Management:
+  list             List all running agents
+  spawn            Create a new agent instance
+  delete           Delete an agent instance
+  start            Start a stopped instance
+  describe         Get details about an instance
+  replace          Kill + respawn with handover context
+
+Coordination:
+  task             Task board (create, list, claim, done, update)
+  decision         Decision log (post, list, update)
+  team             Team management (create, list, delete, update)
+  schedule         Cron scheduling (create, list, update, delete)
+  deploy           Deploy fleet templates
+  ci               Watch GitHub Actions CI
+
+Other:
+  channel          Telegram operations (react, edit, download)
+  repo             Git worktree operations
+```
+
 ## Rules
 
 - ALWAYS put your COMPLETE answer inside the command. NEVER reply as plain text.
 - `[user:... via telegram]` → `agent reply`
 - `[from:INSTANCE]` → `agent send INSTANCE`
-- For all other commands run `agend-terminal agent --help`
+- All commands output JSON
 "#;
 
 const AGEND_MARKER_START: &str = "<!-- agend-terminal instructions";
