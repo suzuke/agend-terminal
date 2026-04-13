@@ -347,10 +347,15 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             if let Err(e) = crate::agent::validate_name(name) {
                 return json!({"error": e});
             }
+            // Prevent deleting the last instance when a channel is configured
+            let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+            if let Some(ref config) = fleet {
+                if config.channel.is_some() && config.instances.len() <= 1 {
+                    return json!({"error": "cannot delete the last instance — channel needs at least one instance to receive messages"});
+                }
+            }
             // Read topic_id before removing from fleet.yaml
-            let topic_id = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
-                .ok()
-                .and_then(|c| c.instances.get(name).and_then(|i| i.topic_id));
+            let topic_id = fleet.and_then(|c| c.instances.get(name).and_then(|i| i.topic_id));
 
             let _ = crate::api::call(
                 &home,
