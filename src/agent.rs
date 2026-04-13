@@ -345,10 +345,6 @@ fn handle_pty_close(
     crash_tx: &Option<CrashChannel>,
     shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
-    // Brief pause to let Ctrl+C shutdown flag propagate before checking.
-    // Without this, PTY EOF from signal propagation races with the flag.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
     // Check if daemon is shutting down — if so, this is not a crash
     let is_shutdown = shutdown
         .as_ref()
@@ -372,24 +368,10 @@ fn handle_pty_close(
     // Wait up to 2s for process to fully exit
     let mut exit_code: Option<i32> = None;
     for _ in 0..20 {
-        // Check shutdown flag each iteration — don't wait 2s during Ctrl+C
-        let shutting_down = shutdown
-            .as_ref()
-            .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(false);
-        if shutting_down {
-            tracing::info!(agent = name, "stopped (daemon shutdown)");
-            if let Ok(mut reg) = registry.lock() {
-                reg.remove(name);
-            }
-            return;
-        }
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        // Agent removed from registry → shutdown or explicit delete. Not a crash.
         if reg.get(name).is_none() {
-            tracing::debug!(
-                agent = name,
-                "removed from registry, skipping crash handling"
-            );
+            tracing::debug!(agent = name, "not in registry, skipping crash handling");
             return;
         }
         if let Some(handle) = reg.get(name) {

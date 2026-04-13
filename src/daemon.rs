@@ -643,21 +643,24 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
     crate::event_log::log(home, "daemon_stop", "", "shutdown");
     tracing::info!("cleaning up...");
-    {
-        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        for (name, agent) in reg.iter() {
-            let mut child = agent.child.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = child.kill();
-            tracing::info!(agent = %name, "killed");
-        }
+    // Drain registry FIRST, then kill. PTY close handlers check the
+    // registry — if the agent is gone, they return silently instead of
+    // sending crash events. This eliminates all shutdown race conditions.
+    let agents_to_kill: Vec<_> = {
+        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let agents: Vec<_> = reg
+            .drain()
+            .map(|(name, handle)| (name, handle.child))
+            .collect();
+        agents
+    };
+    for (name, child) in &agents_to_kill {
+        let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = c.kill();
+        tracing::info!(agent = %name, "killed");
     }
     // Remove entire run dir (sockets + PID isolation)
     let _ = std::fs::remove_dir_all(run_dir(home));
-
-    {
-        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        reg.clear();
-    }
 
     // Give threads time to flush logs and close connections
     std::thread::sleep(std::time::Duration::from_secs(1));

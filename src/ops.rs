@@ -861,4 +861,47 @@ mod tests {
         assert!(!home.join("sessions/a.sid").exists());
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn no_mcp_prefix_in_ops() {
+        // Verify old prefix was fully replaced with [agend]
+        let source = include_str!("ops.rs");
+        let old_prefix = format!("[{}]", "mcp");
+        let lines_with_old: Vec<_> = source
+            .lines()
+            .filter(|l| l.contains(&old_prefix) && !l.contains("test"))
+            .collect();
+        assert!(
+            lines_with_old.is_empty(),
+            "ops.rs has old prefix: {:?}",
+            lines_with_old
+        );
+    }
+
+    #[test]
+    fn reply_returns_error_without_fleet() {
+        let home = tmp_home("reply_nofleet");
+        let result = reply(&home, "test", "hello");
+        assert!(result.get("error").is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn drain_inbox_empty() {
+        let home = tmp_home("drain_empty");
+        let result = drain_inbox(&home, "test");
+        assert_eq!(result["messages"].as_array().unwrap().len(), 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn backend_resolves_to_preset_command() {
+        // "kiro" should resolve to "kiro-cli" via preset
+        let resolved = crate::backend::Backend::from_command("kiro").map(|b| b.preset().command);
+        assert_eq!(resolved, Some("kiro-cli"));
+
+        // "claude" stays "claude"
+        let resolved = crate::backend::Backend::from_command("claude").map(|b| b.preset().command);
+        assert_eq!(resolved, Some("claude"));
+    }
 }

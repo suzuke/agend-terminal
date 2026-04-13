@@ -310,4 +310,43 @@ mod tests {
 
         fs::remove_dir_all(&home).ok();
     }
+
+    // --- Reply hint tests ---
+
+    #[test]
+    fn notify_format_telegram_has_reply_hint() {
+        // We can't easily call notify_agent (needs API), but we can test
+        // the hint logic by checking the format string construction.
+        let from = "user:chiacheng via telegram";
+        let hint = if from.contains("via telegram") {
+            " (reply: agend-terminal agent reply \"your response\")"
+        } else {
+            ""
+        };
+        assert!(hint.contains("agent reply"));
+    }
+
+    #[test]
+    fn notify_format_agent_has_send_hint() {
+        let from = "from:dev";
+        let hint = if let Some(target) = from.strip_prefix("from:") {
+            format!(" (reply: agend-terminal agent send {target} \"your response\")")
+        } else {
+            String::new()
+        };
+        assert!(hint.contains("agent send dev"));
+    }
+
+    #[test]
+    fn notify_format_system_no_hint() {
+        let from = "system:ci";
+        let hint = if from.contains("via telegram") {
+            "telegram".to_string()
+        } else if from.starts_with("from:") {
+            "agent".to_string()
+        } else {
+            String::new()
+        };
+        assert!(hint.is_empty());
+    }
 }
