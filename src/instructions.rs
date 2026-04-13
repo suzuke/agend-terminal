@@ -137,28 +137,9 @@ fn generate_gemini(working_dir: &Path) -> Result<()> {
     write_with_marker(&working_dir.join("GEMINI.md"), AGEND_RULES)
 }
 
-/// OpenCode: instructions/agend.md
+/// OpenCode: AGENTS.md (auto-discovered by opencode)
 fn generate_opencode(working_dir: &Path) -> Result<()> {
-    let instructions_path = working_dir.join("instructions").join("agend.md");
-    write_file(&instructions_path, AGEND_RULES)?;
-
-    // Add to opencode.json instructions array if it exists
-    let json_path = working_dir.join("opencode.json");
-    if json_path.exists() {
-        let content = std::fs::read_to_string(&json_path)?;
-        if !content.contains("instructions/agend.md") {
-            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(arr) = val.get_mut("instructions").and_then(|v| v.as_array_mut()) {
-                    arr.push(serde_json::Value::String(
-                        "instructions/agend.md".to_string(),
-                    ));
-                    std::fs::write(&json_path, serde_json::to_string_pretty(&val)?)?;
-                    eprintln!("[info] Updated opencode.json instructions array");
-                }
-            }
-        }
-    }
-    Ok(())
+    write_with_marker(&working_dir.join("AGENTS.md"), AGEND_RULES)
 }
 
 /// Detect backend from command name and generate appropriate instructions.

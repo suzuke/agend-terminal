@@ -157,7 +157,7 @@ impl Backend {
                 typed_inject: true,
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
-                instructions_path: "instructions/agend.md",
+                instructions_path: "AGENTS.md",
                 ready_timeout_secs: 45,
                 dismiss_patterns: &[
                     ("Update Available", b"\r"),
