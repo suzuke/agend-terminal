@@ -172,12 +172,37 @@ fn write_with_marker(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Claude Code: .claude/rules/agend.md
+/// Claude Code: .claude/rules/agend.md + statusline for session ID capture
 fn generate_claude(working_dir: &Path) -> Result<()> {
     write_file(
         &working_dir.join(".claude").join("rules").join("agend.md"),
         AGEND_RULES,
-    )
+    )?;
+    // Statusline capture script — daemon reads statusline.json to get session_id for --resume
+    let statusline_path = working_dir.join("statusline.json");
+    let script_path = working_dir.join("statusline.sh");
+    if !script_path.exists() {
+        let escaped = statusline_path.display().to_string().replace('\'', "'\\''");
+        let script = format!("#!/bin/bash\ncat > '{}'\necho ok\n", escaped);
+        std::fs::write(&script_path, &script)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+    // claude-settings.json for --settings flag
+    let settings_path = working_dir.join("claude-settings.json");
+    if !settings_path.exists() {
+        let settings = serde_json::json!({
+            "statusLine": {
+                "type": "command",
+                "command": script_path.display().to_string()
+            }
+        });
+        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    }
+    Ok(())
 }
 
 /// Kiro: .kiro/steering/agend.md
@@ -188,9 +213,38 @@ fn generate_kiro(working_dir: &Path) -> Result<()> {
     )
 }
 
-/// Codex: AGENTS.md (marker append/replace)
+/// Codex: AGENTS.md (marker append/replace) + auto-trust working directory
 fn generate_codex(working_dir: &Path) -> Result<()> {
-    write_with_marker(&working_dir.join("AGENTS.md"), AGEND_RULES)
+    write_with_marker(&working_dir.join("AGENTS.md"), AGEND_RULES)?;
+    codex_trust_directory(working_dir);
+    Ok(())
+}
+
+/// Add a directory to Codex's trusted projects in ~/.codex/config.toml.
+fn codex_trust_directory(dir: &Path) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let config_path = std::path::PathBuf::from(home)
+        .join(".codex")
+        .join("config.toml");
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let dir_str = dir.display().to_string();
+    let toml_key = format!("[projects.\"{dir_str}\"]");
+    if content.contains(&toml_key) {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config_path)
+    {
+        let prefix = if content.is_empty() || content.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        let _ = writeln!(f, "{prefix}{toml_key}\ntrust_level = \"trusted\"");
+    }
 }
 
 /// Gemini: GEMINI.md (marker append/replace)

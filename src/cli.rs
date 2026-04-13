@@ -100,6 +100,15 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
                 args.push(model.clone());
             }
 
+            // Claude: --settings for statusline (session ID capture for --resume)
+            if let Some(ref dir) = resolved.working_directory {
+                let settings = dir.join("claude-settings.json");
+                if settings.exists() {
+                    args.push("--settings".to_string());
+                    args.push(settings.display().to_string());
+                }
+            }
+
             agents.push((
                 resolved.name,
                 resolved.command,
