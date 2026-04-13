@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "code-review-expert": {
+      "source": "sanyuan0704/sanyuan-skills",
+      "sourceType": "github",
+      "computedHash": "6c2fe31851a34e63e033257527eab04eea835ca1cf4c4276d1392a323e36e377"
+    },
+    "sigma": {
+      "source": "sanyuan0704/sanyuan-skills",
+      "sourceType": "github",
+      "computedHash": "88bcbdec596ed7e19a50ca80282c3b12cfdcf48ae28e3ba275da3193f8a8f057"
+    },
+    "skill-forge": {
+      "source": "sanyuan0704/sanyuan-skills",
+      "sourceType": "github",
+      "computedHash": "63785e2efb35dcee3588e9cd8428aab25b2a8f1e5eb67b380bdbdbeb420e5ecf"
+    }
+  }
+}

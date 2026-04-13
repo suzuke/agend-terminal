@@ -1,11 +1,9 @@
-//! MCP stdio server — Content-Length framed JSON-RPC 2.0.
+//! MCP stdio server — minimal implementation for backwards compatibility.
 //!
-//! Translates MCP tool calls to agent PTY writes via TUI socket.
-//! Runs synchronously (no tokio needed).
+//! Tool calls are deprecated in favor of `agend-terminal agent` CLI commands.
+//! This server only handles protocol handshake (initialize, ping, tools/list).
 
-pub mod handlers;
 pub mod telegram;
-pub mod tools;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,8 +19,7 @@ struct JsonRpcRequest {
     params: Value,
 }
 
-/// Read a message from stdin — supports both NDJSON (Claude Code) and Content-Length framing.
-/// Auto-detects format: if first non-empty char is '{', it's NDJSON. Otherwise Content-Length.
+/// Read a message from stdin — supports both NDJSON and Content-Length framing.
 fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<String>> {
     let mut line = String::new();
     loop {
@@ -34,20 +31,16 @@ fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<
         if trimmed.is_empty() {
             continue;
         }
-        // NDJSON: line starts with '{'
         if trimmed.starts_with('{') {
             return Ok(Some(trimmed.to_string()));
         }
-        // Content-Length framing
         if let Some(val) = trimmed.strip_prefix("Content-Length:") {
             let len: usize = val.trim().parse().unwrap_or(0);
             if len == 0 {
                 continue;
             }
-            // Read empty line after headers
             let mut empty = String::new();
             reader.read_line(&mut empty)?;
-            // Read body
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body)?;
             return Ok(Some(String::from_utf8(body)?));
@@ -55,16 +48,15 @@ fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<
     }
 }
 
-/// Write a message — NDJSON format (one JSON per line, like Claude expects).
 fn write_message(stdout: &mut io::Stdout, json: &str) -> anyhow::Result<()> {
     writeln!(stdout, "{json}")?;
     stdout.flush()?;
     Ok(())
 }
 
-pub fn run(agent_socket: &str) -> anyhow::Result<()> {
+pub fn run(_agent_socket: &str) -> anyhow::Result<()> {
     let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
-    eprintln!("[mcp] server starting for '{instance_name}'");
+    eprintln!("[mcp] server starting for '{instance_name}' (tools deprecated — use `agend-terminal agent` CLI)");
 
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -98,20 +90,19 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             "notifications/initialized" | "notifications/cancelled" => continue,
             "tools/list" => {
-                json!({ "jsonrpc": "2.0", "id": id, "result": tools::tool_definitions() })
+                // Return empty tools list — agents use CLI now
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [] } })
             }
             "tools/call" => {
-                let tool = req.params["name"].as_str().unwrap_or("");
-                let args = &req.params["arguments"];
-
-                // Try daemon proxy first — avoids per-process overhead
-                let result = proxy_or_local(tool, args, &instance_name, agent_socket);
-
+                // Deprecated: tell agent to use CLI instead
+                let tool = req.params["name"].as_str().unwrap_or("?");
                 json!({
                     "jsonrpc": "2.0", "id": id,
                     "result": {
-                        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap_or_default() }],
-                        "isError": result.get("error").is_some()
+                        "content": [{ "type": "text", "text": format!(
+                            "MCP tools are deprecated. Use CLI instead: agend-terminal agent {tool} (run `agend-terminal agent --help` for commands)"
+                        )}],
+                        "isError": true
                     }
                 })
             }
@@ -131,29 +122,4 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
 
     eprintln!("[mcp] server exiting");
     Ok(())
-}
-
-/// Try to proxy a tool call through the daemon API socket.
-/// Falls back to local handling if the daemon is unavailable.
-fn proxy_or_local(tool: &str, args: &Value, instance_name: &str, agent_socket: &str) -> Value {
-    let home = crate::home_dir();
-
-    if let Ok(resp) = crate::api::call(
-        &home,
-        &json!({
-            "method": "mcp_tool",
-            "params": {
-                "tool": tool,
-                "arguments": args,
-                "instance": instance_name
-            }
-        }),
-    ) {
-        if resp["ok"].as_bool() == Some(true) {
-            return resp["result"].clone();
-        }
-    }
-
-    // Daemon unavailable or returned error — handle locally
-    handlers::handle_tool(tool, args, agent_socket, instance_name)
 }

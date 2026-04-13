@@ -739,3 +739,124 @@ pub fn list_agents() -> Vec<String> {
     }
     agents
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-ops-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn branch_valid() {
+        assert!(validate_branch("main"));
+        assert!(validate_branch("feature/foo"));
+        assert!(validate_branch("v1.0.0"));
+    }
+
+    #[test]
+    fn branch_rejects_dotdot() {
+        assert!(!validate_branch(".."));
+        assert!(!validate_branch("foo/.."));
+    }
+
+    #[test]
+    fn branch_rejects_special() {
+        assert!(!validate_branch(""));
+        assert!(!validate_branch("-main"));
+        assert!(!validate_branch("foo;bar"));
+    }
+
+    #[test]
+    fn metadata_merge_no_file() {
+        let home = tmp_home("meta_no_file");
+        let mut info = json!({"name": "a"});
+        merge_metadata(&home, "a", &mut info);
+        assert_eq!(info["name"], "a");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn metadata_merge_fields() {
+        let home = tmp_home("meta_fields");
+        std::fs::create_dir_all(home.join("metadata")).ok();
+        std::fs::write(
+            home.join("metadata/a.json"),
+            r#"{"display_name":"Dev","x":1}"#,
+        )
+        .ok();
+        let mut info = json!({"name": "a"});
+        merge_metadata(&home, "a", &mut info);
+        assert_eq!(info["display_name"], "Dev");
+        assert_eq!(info["x"], 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn metadata_save_roundtrip() {
+        let home = tmp_home("meta_save");
+        save_metadata(&home, "a", "key", json!("val"));
+        let c = std::fs::read_to_string(home.join("metadata/a.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&c).unwrap();
+        assert_eq!(v["key"], "val");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn submit_key_default() {
+        let home = tmp_home("sk");
+        assert_eq!(get_submit_key(&home, "x"), "\r");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_workspace_removes_dir() {
+        let home = tmp_home("cw");
+        let ws = home.join("workspaces/agent1");
+        std::fs::create_dir_all(&ws).ok();
+        std::fs::write(ws.join("f.txt"), "x").ok();
+        cleanup_working_dir(&home, "agent1", &ws);
+        assert!(!ws.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_user_dir_selective() {
+        let home = tmp_home("cu");
+        let ud = tmp_home("cu_proj");
+        std::fs::write(ud.join("main.rs"), "fn main(){}").ok();
+        std::fs::write(ud.join("opencode.json"), "{}").ok();
+        cleanup_working_dir(&home, "a", &ud);
+        assert!(ud.join("main.rs").exists());
+        assert!(!ud.join("opencode.json").exists());
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&ud).ok();
+    }
+
+    #[test]
+    fn cleanup_metadata_and_session() {
+        let home = tmp_home("cms");
+        let ws = home.join("workspaces/a");
+        std::fs::create_dir_all(&ws).ok();
+        std::fs::create_dir_all(home.join("metadata")).ok();
+        std::fs::write(home.join("metadata/a.json"), "{}").ok();
+        std::fs::create_dir_all(home.join("sessions")).ok();
+        std::fs::write(home.join("sessions/a.sid"), "x").ok();
+        cleanup_working_dir(&home, "a", &ws);
+        assert!(!home.join("metadata/a.json").exists());
+        assert!(!home.join("sessions/a.sid").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
