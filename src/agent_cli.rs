@@ -19,14 +19,16 @@ fn output(value: Value) {
 /// Read text from argument or stdin. Avoids shell escaping issues —
 /// agents can pipe complex text (markdown, code, JSON) via stdin.
 fn text_or_stdin(arg: Option<String>) -> String {
+    text_or_reader(arg, &mut std::io::stdin().lock())
+}
+
+/// Testable core: read from arg or a generic reader.
+fn text_or_reader(arg: Option<String>, reader: &mut impl std::io::Read) -> String {
     if let Some(text) = arg {
         return text;
     }
-    use std::io::Read;
     let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .unwrap_or_default();
+    reader.read_to_string(&mut buf).unwrap_or_default();
     buf.trim_end().to_string()
 }
 
@@ -745,5 +747,81 @@ pub fn run(home: &Path, command: AgentCommand) {
                 output(crate::ops::download_attachment(&me, &file_id));
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn text_or_reader_prefers_arg() {
+        let mut reader = Cursor::new("stdin content");
+        assert_eq!(
+            text_or_reader(Some("from arg".into()), &mut reader),
+            "from arg"
+        );
+    }
+
+    #[test]
+    fn text_or_reader_falls_back_to_reader() {
+        let mut reader = Cursor::new("from stdin");
+        assert_eq!(text_or_reader(None, &mut reader), "from stdin");
+    }
+
+    #[test]
+    fn text_or_reader_trims_trailing_newline() {
+        let mut reader = Cursor::new("hello\n\n");
+        assert_eq!(text_or_reader(None, &mut reader), "hello");
+    }
+
+    #[test]
+    fn text_or_reader_preserves_internal_newlines() {
+        let mut reader = Cursor::new("line1\nline2\nline3\n");
+        assert_eq!(text_or_reader(None, &mut reader), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn text_or_reader_empty_stdin() {
+        let mut reader = Cursor::new("");
+        assert_eq!(text_or_reader(None, &mut reader), "");
+    }
+
+    #[test]
+    fn text_or_reader_complex_content() {
+        let complex = r#"Here's "quotes" and $variables and `backticks`
+```python
+print("hello world")
+```
+"#;
+        let mut reader = Cursor::new(complex);
+        let result = text_or_reader(None, &mut reader);
+        assert!(result.contains("\"quotes\""));
+        assert!(result.contains("$variables"));
+        assert!(result.contains("`backticks`"));
+        assert!(result.contains("```python"));
+    }
+
+    #[test]
+    fn text_or_reader_arg_not_trimmed() {
+        let mut reader = Cursor::new("");
+        // Args are not trimmed — only stdin is
+        assert_eq!(text_or_reader(Some("text\n".into()), &mut reader), "text\n");
+    }
+
+    #[test]
+    fn csv_to_json_array_splits() {
+        let arr = csv_to_json_array("a, b, c");
+        assert_eq!(arr.as_array().unwrap().len(), 3);
+        assert_eq!(arr[0], "a");
+        assert_eq!(arr[1], "b");
+        assert_eq!(arr[2], "c");
+    }
+
+    #[test]
+    fn csv_to_json_array_single() {
+        let arr = csv_to_json_array("only");
+        assert_eq!(arr.as_array().unwrap().len(), 1);
     }
 }
