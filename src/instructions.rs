@@ -137,9 +137,37 @@ fn generate_gemini(working_dir: &Path) -> Result<()> {
     write_with_marker(&working_dir.join("GEMINI.md"), AGEND_RULES)
 }
 
+const OPENCODE_ONESHOT: &str = r#"
+
+## Example Conversation
+
+User message arrives:
+```
+[user:alice via telegram] What's the weather like?
+```
+
+Your response — you MUST run this shell command with your FULL answer as the text:
+```bash
+agend-terminal agent reply "I don't have access to weather data, but you can check weather.com for the latest forecast!"
+```
+
+Another agent messages you:
+```
+[from:dev] Can you review my PR?
+```
+
+Your response:
+```bash
+agend-terminal agent send dev "Sure, send me the PR link and I'll take a look."
+```
+
+IMPORTANT: Always put your COMPLETE response inside the agend-terminal command. Do NOT reply as plain text.
+"#;
+
 /// OpenCode: AGENTS.md (auto-discovered by opencode)
 fn generate_opencode(working_dir: &Path) -> Result<()> {
-    write_with_marker(&working_dir.join("AGENTS.md"), AGEND_RULES)
+    let content = format!("{AGEND_RULES}{OPENCODE_ONESHOT}");
+    write_with_marker(&working_dir.join("AGENTS.md"), &content)
 }
 
 /// Detect backend from command name and generate appropriate instructions.
