@@ -55,6 +55,8 @@ pub struct InstanceDefaults {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceConfig {
+    /// Role description. TS version uses "description", accepted as alias.
+    #[serde(alias = "description")]
     pub role: Option<String>,
     /// Backend preset name — overrides defaults.backend.
     pub backend: Option<Backend>,
@@ -68,8 +70,13 @@ pub struct InstanceConfig {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
-    /// Custom git branch name for worktree (overrides agend/{name}).
+    /// Custom git branch name for worktree. TS version uses "worktree_source".
+    #[serde(alias = "worktree_source")]
     pub git_branch: Option<String>,
+    /// Model override (e.g., "opus", "sonnet"). Passed as --model flag.
+    pub model: Option<String>,
+    /// Display name for UI/Telegram.
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +178,7 @@ impl FleetConfig {
 
         let cols = inst.cols.or(defaults.cols);
         let rows = inst.rows.or(defaults.rows);
+        let model = inst.model.clone().or_else(|| defaults.model.clone());
 
         Some(ResolvedInstance {
             name: name.to_string(),
@@ -185,6 +193,7 @@ impl FleetConfig {
             rows,
             topic_id: inst.topic_id,
             git_branch: inst.git_branch.clone(),
+            model,
         })
     }
 
@@ -209,6 +218,7 @@ pub struct ResolvedInstance {
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
     pub git_branch: Option<String>,
+    pub model: Option<String>,
 }
 
 fn dirs_home() -> Option<PathBuf> {

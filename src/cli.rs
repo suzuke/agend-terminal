@@ -95,6 +95,12 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
                 args.extend(p.resume_mode.args_for(home, &name));
             }
 
+            // Inject --model if specified
+            if let Some(ref model) = resolved.model {
+                args.push("--model".to_string());
+                args.push(model.clone());
+            }
+
             // Inject Claude-specific flags
             if let Some(ref dir) = resolved.working_directory {
                 if resolved.command.contains("claude") {
