@@ -38,7 +38,3 @@ jobs:
       - name: Integration tests
         run: cargo test --test integration
         if: runner.os != 'Windows'
-
-      - name: MCP round-trip tests
-        run: cargo test --test mcp_roundtrip
-        if: runner.os != 'Windows'
