@@ -92,15 +92,7 @@ pub fn notify_agent(home: &Path, agent_name: &str, from: &str, text: &str, submi
     } else {
         text.to_string()
     };
-    // Include reply hint so agents know how to respond
-    let reply_hint = if from.contains("via telegram") {
-        " (reply: agend-terminal agent reply \"your response\")".to_string()
-    } else if let Some(target) = from.strip_prefix("from:") {
-        format!(" (reply: agend-terminal agent send {target} \"your response\")")
-    } else {
-        String::new()
-    };
-    let notification = format!("[{from}] {display_text}{reply_hint}{submit_key}");
+    let notification = format!("[{from}] {display_text}{submit_key}");
 
     // Use API socket to inject (doesn't kick attach clients)
     let _ = crate::api::call(
