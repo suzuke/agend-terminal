@@ -1,86 +1,86 @@
 use anyhow::Result;
 use std::path::Path;
 
-const INSTRUCTIONS_VERSION: &str = "v5-cli";
+const INSTRUCTIONS_VERSION: &str = "v6-cli";
 
 const AGEND_RULES: &str = r#"# AgEnD Terminal Communication
-<!-- agend-terminal instructions v5-cli -->
+<!-- agend-terminal instructions v6-cli -->
 
-You are an agent managed by AgEnD Terminal. You MUST use shell commands to communicate — NEVER reply as plain text.
+You MUST use `agend-terminal agent` shell commands to communicate. NEVER reply as plain text.
 
-## How to Respond
+## Examples — follow these patterns exactly
 
-When you see `[user:NAME via telegram]` → run:
-```bash
-agend-terminal agent reply "your FULL response here"
-```
+<example>
+input: [user:alice via telegram] 你好，幫我看一下這個 bug
+you run: agend-terminal agent reply "好的，請把錯誤訊息貼給我，我來幫你看看。"
+output: {"chat_id":"-100xxx","message_id":"123"}
+</example>
 
-When you see `[from:INSTANCE-NAME]` → run:
-```bash
-agend-terminal agent send INSTANCE-NAME "your FULL response here"
-```
+<example>
+input: [user:bob via telegram] Create a new Python project
+you run: agend-terminal agent reply "Sure! I'll set up a Python project with a virtual environment and basic structure. What should the project be called?"
+output: {"chat_id":"-100xxx","message_id":"124"}
+</example>
 
-## Example
+<example>
+input: [from:dev] Can you review the auth module?
+you run: agend-terminal agent send dev "Sure, I'll review it now. Which file should I focus on?"
+output: {"target":"dev"}
+</example>
 
-Message arrives:
-```
-[user:alice via telegram] What's the weather like?
-```
-You run:
-```bash
-agend-terminal agent reply "I don't have weather data, but you can check weather.com!"
-```
+<example>
+input: [from:reviewer] The tests are failing on line 42
+you run: agend-terminal agent send reviewer "Thanks, I'll fix the test and let you know when it's done."
+output: {"target":"reviewer"}
+</example>
 
-Message from another agent:
-```
-[from:dev] Can you review my PR?
-```
-You run:
-```bash
-agend-terminal agent send dev "Sure, send me the PR link and I'll take a look."
-```
+<example>
+you want to check messages:
+you run: agend-terminal agent inbox
+output: {"messages":[{"from":"user:alice","text":"hello","kind":"telegram"}]}
+</example>
 
-## All Available Commands
+For long replies with code or special characters, use heredoc:
+<example>
+you run:
+agend-terminal agent reply <<'EOF'
+Here's the fix:
+```python
+def hello():
+    print("world")
+```
+Let me know if this works!
+EOF
+output: {"chat_id":"-100xxx","message_id":"125"}
+</example>
+
+## Command Reference
 
 ```
 agend-terminal agent <COMMAND>
 
-Communication:
-  reply            Reply to a Telegram user
-  send             Send a message to another agent
-  delegate         Delegate a task to another agent
-  report           Report a result to another agent
-  ask              Ask another agent a question
-  broadcast        Broadcast to a team or all agents
-  inbox            Check pending messages
-
-Instance Management:
-  list             List all running agents
-  spawn            Create a new agent instance
-  delete           Delete an agent instance
-  start            Start a stopped instance
-  describe         Get details about an instance
-  replace          Kill + respawn with handover context
-
-Coordination:
-  task             Task board (create, list, claim, done, update)
-  decision         Decision log (post, list, update)
-  team             Team management (create, list, delete, update)
-  schedule         Cron scheduling (create, list, update, delete)
-  deploy           Deploy fleet templates
-  ci               Watch GitHub Actions CI
-
-Other:
-  channel          Telegram operations (react, edit, download)
-  repo             Git worktree operations
+reply "text"                   Reply to Telegram user
+send TARGET "text"             Message another agent
+delegate TARGET "task"         Assign work to another agent
+report TARGET "summary"        Report results back
+ask TARGET "question"          Request information
+broadcast "message"            Message all agents
+inbox                          Check pending messages
+list                           List running agents
+spawn NAME --backend claude    Create new agent
+delete NAME                    Remove agent
+describe NAME                  Agent details
+task create/list/claim/done    Task board
+team create/list/delete        Team management
+schedule create/list/delete    Cron scheduling
 ```
 
 ## Rules
 
-- ALWAYS put your COMPLETE answer inside the command. NEVER reply as plain text.
-- `[user:... via telegram]` → `agent reply`
-- `[from:INSTANCE]` → `agent send INSTANCE`
-- All commands output JSON
+1. ALWAYS run a shell command to respond. NEVER output plain text as your answer.
+2. `[user:... via telegram]` → `agent reply`
+3. `[from:INSTANCE]` → `agent send INSTANCE`
+4. Put your COMPLETE answer inside the command argument.
 "#;
 
 const AGEND_MARKER_START: &str = "<!-- agend-terminal instructions";
@@ -242,7 +242,7 @@ mod tests {
     fn write_with_marker_creates_new_file() {
         let dir = tmp_dir("new_file");
         let path = dir.join("AGENTS.md");
-        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v5-cli -->")
+        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v6-cli -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# Test"));
@@ -255,12 +255,12 @@ mod tests {
         let dir = tmp_dir("before");
         let path = dir.join("AGENTS.md");
         std::fs::write(&path, "# My Custom Rules\n\nDo not delete files.\n").ok();
-        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v5-cli -->")
+        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v6-cli -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# My Custom Rules"));
         assert!(content.contains("Do not delete files."));
-        assert!(content.contains("v5-cli"));
+        assert!(content.contains("v6-cli"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -274,11 +274,11 @@ mod tests {
             AGEND_MARKER_END
         );
         std::fs::write(&path, &initial).ok();
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v5-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v6-cli -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# Preamble"));
-        assert!(content.contains("v5-cli"));
+        assert!(content.contains("v6-cli"));
         assert!(!content.contains("v3-mcp"));
         assert!(!content.contains("old stuff"));
         assert!(content.contains("# My Notes"));
@@ -293,10 +293,10 @@ mod tests {
         write_with_marker(&path, "# Old\n<!-- agend-terminal instructions v3-mcp -->")
             .expect("first write");
         // Force re-write by bumping version
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v5-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v6-cli -->")
             .expect("second write");
         let content = std::fs::read_to_string(&path).expect("read");
-        assert!(content.contains("v5-cli"));
+        assert!(content.contains("v6-cli"));
         assert!(!content.contains("v3-mcp"));
         // Should have exactly one end marker
         assert_eq!(
@@ -311,7 +311,7 @@ mod tests {
     fn write_with_marker_idempotent() {
         let dir = tmp_dir("idempotent");
         let path = dir.join("AGENTS.md");
-        let content = format!("# Test\n<!-- agend-terminal instructions v5-cli -->\nstuff\n");
+        let content = format!("# Test\n<!-- agend-terminal instructions v6-cli -->\nstuff\n");
         write_with_marker(&path, &content).expect("first");
         let first = std::fs::read_to_string(&path).expect("read");
         write_with_marker(&path, &content).expect("second");
@@ -333,11 +333,11 @@ mod tests {
             "# User stuff\n\n<!-- agend-terminal instructions v3-mcp -->\nold agend content\n",
         )
         .ok();
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v5-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v6-cli -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# User stuff"));
-        assert!(content.contains("v5-cli"));
+        assert!(content.contains("v6-cli"));
         assert!(!content.contains("old agend content"));
         assert!(content.contains(AGEND_MARKER_END));
         std::fs::remove_dir_all(&dir).ok();
@@ -349,7 +349,7 @@ mod tests {
         let path = dir.join("test.md");
         write_file(
             &path,
-            "# Rules\n<!-- agend-terminal instructions v5-cli -->",
+            "# Rules\n<!-- agend-terminal instructions v6-cli -->",
         )
         .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
