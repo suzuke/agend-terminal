@@ -372,9 +372,20 @@ fn handle_pty_close(
     // Wait up to 2s for process to fully exit
     let mut exit_code: Option<i32> = None;
     for _ in 0..20 {
+        // Check shutdown flag each iteration — don't wait 2s during Ctrl+C
+        let shutting_down = shutdown
+            .as_ref()
+            .map(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false);
+        if shutting_down {
+            tracing::info!(agent = name, "stopped (daemon shutdown)");
+            if let Ok(mut reg) = registry.lock() {
+                reg.remove(name);
+            }
+            return;
+        }
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         if reg.get(name).is_none() {
-            // Agent already removed from registry (deleted via API) — not a crash
             tracing::debug!(
                 agent = name,
                 "removed from registry, skipping crash handling"
