@@ -223,7 +223,7 @@ fn handle_session(
                 let work_dir = params["working_directory"]
                     .as_str()
                     .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| home.join("workspaces").join(name));
+                    .unwrap_or_else(|| home.join("workspace").join(name));
                 std::fs::create_dir_all(&work_dir).ok();
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
 

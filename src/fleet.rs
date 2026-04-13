@@ -172,8 +172,8 @@ impl FleetConfig {
                 PathBuf::from(d)
             }
         } else {
-            // Default: $AGEND_HOME/workspaces/{name}/
-            crate::home_dir().join("workspaces").join(name)
+            // Default: $AGEND_HOME/workspace/{name}/
+            crate::home_dir().join("workspace").join(name)
         });
 
         let cols = inst.cols.or(defaults.cols);
@@ -916,11 +916,11 @@ instances:
         .ok();
         let config = FleetConfig::load(&path).expect("load");
 
-        // alice: no working_directory → defaults to $AGEND_HOME/workspaces/alice
+        // alice: no working_directory → defaults to $AGEND_HOME/workspace/alice
         let alice = config.resolve_instance("alice").expect("alice");
         let wd = alice.working_directory.expect("wd");
         assert!(
-            wd.display().to_string().ends_with("workspaces/alice"),
+            wd.display().to_string().ends_with("workspace/alice"),
             "expected default workspace path, got: {}",
             wd.display()
         );
