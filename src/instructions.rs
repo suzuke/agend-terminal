@@ -410,4 +410,93 @@ mod tests {
         assert!(content.contains(AGEND_MARKER_END));
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // --- Per-backend generate() tests ---
+
+    #[test]
+    fn generate_claude_creates_rules_and_statusline() {
+        let dir = tmp_dir("gen_claude");
+        generate(&dir, "claude");
+        // Instructions
+        assert!(
+            dir.join(".claude/rules/agend.md").exists(),
+            "missing .claude/rules/agend.md"
+        );
+        // Statusline script (for session ID capture)
+        assert!(dir.join("statusline.sh").exists(), "missing statusline.sh");
+        // Claude settings (for --settings flag)
+        assert!(
+            dir.join("claude-settings.json").exists(),
+            "missing claude-settings.json"
+        );
+        let settings = std::fs::read_to_string(dir.join("claude-settings.json")).unwrap();
+        assert!(settings.contains("statusLine"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_kiro_creates_steering() {
+        let dir = tmp_dir("gen_kiro");
+        generate(&dir, "kiro-cli");
+        assert!(
+            dir.join(".kiro/steering/agend.md").exists(),
+            "missing .kiro/steering/agend.md"
+        );
+        let content = std::fs::read_to_string(dir.join(".kiro/steering/agend.md")).unwrap();
+        assert!(content.contains("v6-cli"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_codex_creates_agents_md_and_trust() {
+        let dir = tmp_dir("gen_codex");
+        generate(&dir, "codex");
+        assert!(dir.join("AGENTS.md").exists(), "missing AGENTS.md");
+        let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(content.contains("v6-cli"));
+        assert!(content.contains(AGEND_MARKER_END));
+        // Trust: check ~/.codex/config.toml has the directory
+        let home = std::env::var("HOME").unwrap_or_default();
+        let codex_config = std::path::PathBuf::from(&home).join(".codex/config.toml");
+        if codex_config.exists() {
+            let toml = std::fs::read_to_string(&codex_config).unwrap();
+            assert!(
+                toml.contains(&dir.display().to_string()),
+                "codex trust missing for {}",
+                dir.display()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_gemini_creates_gemini_md() {
+        let dir = tmp_dir("gen_gemini");
+        generate(&dir, "gemini");
+        assert!(dir.join("GEMINI.md").exists(), "missing GEMINI.md");
+        let content = std::fs::read_to_string(dir.join("GEMINI.md")).unwrap();
+        assert!(content.contains("v6-cli"));
+        assert!(content.contains(AGEND_MARKER_END));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_opencode_creates_agents_md() {
+        let dir = tmp_dir("gen_opencode");
+        generate(&dir, "opencode");
+        assert!(dir.join("AGENTS.md").exists(), "missing AGENTS.md");
+        let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(content.contains("v6-cli"));
+        assert!(content.contains(AGEND_MARKER_END));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generate_unknown_backend_no_crash() {
+        let dir = tmp_dir("gen_unknown");
+        generate(&dir, "unknown-tool");
+        // Should not create any files
+        assert!(std::fs::read_dir(&dir).unwrap().count() == 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
