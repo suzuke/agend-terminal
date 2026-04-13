@@ -15,8 +15,6 @@ mod framing;
 mod health;
 mod inbox;
 mod instructions;
-mod mcp;
-mod mcp_config;
 mod ops;
 mod quickstart;
 mod schedules;
@@ -171,8 +169,6 @@ enum Commands {
         #[command(subcommand)]
         command: FleetCommands,
     },
-    /// Start MCP stdio server
-    Mcp,
     /// Agent CLI — commands for agent-to-agent coordination (JSON output)
     #[command(alias = "a")]
     Agent {
@@ -432,13 +428,6 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => daemon_not_running_hint(),
             },
         },
-        Some(Commands::Mcp) => {
-            let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
-            if instance_name.is_empty() {
-                eprintln!("[mcp] AGEND_INSTANCE_NAME not set, running in standalone mode");
-            }
-            mcp::run(&daemon::agent_socket_path(&home, &instance_name))?;
-        }
         Some(Commands::Agent { command }) => {
             agent_cli::run(&home, command);
         }

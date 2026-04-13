@@ -540,7 +540,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
                             // After a crash, start fresh — use backend's fresh_args to avoid
                             // crash loops from stale resume (--continue, --resume <id>, etc.)
-                            let mut respawn_args: Vec<String> = if let Some(b) = crate::backend::Backend::from_command(&config.command) {
+                            let respawn_args: Vec<String> = if let Some(b) = crate::backend::Backend::from_command(&config.command) {
                                 let p = b.preset();
                                 p.fresh_args.unwrap_or(p.args)
                                     .iter()
@@ -550,18 +550,6 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                 // Unknown backend: strip common resume flags as best effort
                                 strip_resume_args(&config.args)
                             };
-                            // Preserve non-resume flags from original args (e.g. --mcp-config, --settings)
-                            let mut i = 0;
-                            while i < config.args.len() {
-                                let arg = &config.args[i];
-                                if (arg == "--mcp-config" || arg == "--settings") && i + 1 < config.args.len() {
-                                    respawn_args.push(arg.clone());
-                                    respawn_args.push(config.args[i + 1].clone());
-                                    i += 2;
-                                    continue;
-                                }
-                                i += 1;
-                            }
                             match agent::spawn_agent(
                                 &agent::SpawnConfig {
                                     name: &config.name, command: &config.command, args: &respawn_args,
@@ -1168,18 +1156,9 @@ mod tests {
 
     #[test]
     fn strip_resume_claude() {
-        let args = s(&[
-            "--dangerously-skip-permissions",
-            "--resume",
-            "abc-123",
-            "--mcp-config",
-            "/path",
-        ]);
+        let args = s(&["--dangerously-skip-permissions", "--resume", "abc-123"]);
         let stripped = strip_resume_args(&args);
-        assert_eq!(
-            stripped,
-            s(&["--dangerously-skip-permissions", "--mcp-config", "/path"])
-        );
+        assert_eq!(stripped, s(&["--dangerously-skip-permissions"]));
     }
 
     #[test]
@@ -1210,7 +1189,7 @@ mod tests {
 
     #[test]
     fn strip_resume_no_resume_args() {
-        let args = s(&["--dangerously-skip-permissions", "--mcp-config", "/path"]);
+        let args = s(&["--dangerously-skip-permissions"]);
         let stripped = strip_resume_args(&args);
         assert_eq!(stripped, args);
     }

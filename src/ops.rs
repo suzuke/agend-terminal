@@ -140,7 +140,7 @@ pub fn reply(home: &Path, instance_name: &str, text: &str) -> Value {
     eprintln!("[mcp] reply from {instance_name}: {text}");
     let fleet_path = home.join("fleet.yaml");
     if fleet_path.exists() {
-        match crate::mcp::telegram::try_telegram_reply(instance_name, text) {
+        match crate::telegram::try_telegram_reply(instance_name, text) {
             Ok((msg_id, chat_id)) => json!({
                 "message_id": msg_id.to_string(),
                 "chat_id": chat_id.to_string(),
@@ -153,21 +153,21 @@ pub fn reply(home: &Path, instance_name: &str, text: &str) -> Value {
 }
 
 pub fn react(instance_name: &str, emoji: &str, message_id: Option<&str>) -> Value {
-    match crate::mcp::telegram::try_telegram_react(instance_name, emoji, message_id) {
+    match crate::telegram::try_telegram_react(instance_name, emoji, message_id) {
         Ok(()) => json!({"emoji": emoji}),
         Err(e) => json!({"error": format!("{e}")}),
     }
 }
 
 pub fn edit_message(instance_name: &str, message_id: &str, text: &str) -> Value {
-    match crate::mcp::telegram::try_telegram_edit(instance_name, message_id, text) {
+    match crate::telegram::try_telegram_edit(instance_name, message_id, text) {
         Ok(()) => json!({"message_id": message_id}),
         Err(e) => json!({"error": format!("{e}")}),
     }
 }
 
 pub fn download_attachment(instance_name: &str, file_id: &str) -> Value {
-    match crate::mcp::telegram::try_download_attachment(instance_name, file_id) {
+    match crate::telegram::try_download_attachment(instance_name, file_id) {
         Ok(path) => json!({"path": path}),
         Err(e) => json!({"error": format!("{e}")}),
     }
@@ -274,7 +274,6 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
     let wd = std::path::PathBuf::from(&work_dir);
     std::fs::create_dir_all(&wd).ok();
     crate::instructions::generate(&wd, command);
-    crate::mcp_config::configure(&wd, command);
 
     let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
     let role = args.get("role").and_then(|v| v.as_str()).map(String::from);
@@ -301,7 +300,7 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 eprintln!("[mcp] failed to persist to fleet.yaml: {e}");
             }
-            let topic_id = crate::mcp::telegram::create_topic_for_instance(home, name);
+            let topic_id = crate::telegram::create_topic_for_instance(home, name);
             if let Some(ref task_text) = task {
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 let _ = crate::api::call(
@@ -350,7 +349,7 @@ pub fn delete_instance(home: &Path, args: &Value) -> Value {
     }
     // Delete the Telegram topic if one exists
     if let Some(tid) = topic_id {
-        crate::mcp::telegram::delete_topic(home, tid);
+        crate::telegram::delete_topic(home, tid);
     }
     // Clean up working directory
     if let Some(ref wd) = working_dir {

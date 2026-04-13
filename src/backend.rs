@@ -83,7 +83,6 @@ pub struct BackendPreset {
     /// Relative path for instructions file from working dir.
     pub instructions_path: &'static str,
     /// Relative path for MCP config file from working dir.
-    pub mcp_config_path: &'static str,
     /// Timeout in seconds for ready detection.
     pub ready_timeout_secs: u64,
     /// Args to use when resuming is not possible (fresh start after crash).
@@ -104,7 +103,6 @@ impl Backend {
                 resume_mode: ResumeMode::SavedSession { flag: "--resume" },
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
-                mcp_config_path: ".claude/settings.local.json",
                 ready_timeout_secs: 30,
                 dismiss_patterns: &[
                     ("Yes, I trust", b"\x1b[A\x1b[A\r"),
@@ -122,7 +120,6 @@ impl Backend {
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--resume" },
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
-                mcp_config_path: ".kiro/settings/mcp.json",
                 ready_timeout_secs: 30,
                 dismiss_patterns: &[],
                 fresh_args: None, // same as args
@@ -141,7 +138,6 @@ impl Backend {
                 resume_mode: ResumeMode::NotSupported,
                 quit_command: "exit",
                 instructions_path: "AGENTS.md",
-                mcp_config_path: "opencode.json",
                 ready_timeout_secs: 20,
                 dismiss_patterns: &[
                     // Trust directory prompt: "Yes, continue" is pre-selected → Enter
@@ -162,7 +158,6 @@ impl Backend {
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
                 instructions_path: "instructions/agend.md",
-                mcp_config_path: "opencode.json",
                 ready_timeout_secs: 45,
                 dismiss_patterns: &[
                     ("Update Available", b"\r"),
@@ -184,7 +179,6 @@ impl Backend {
                 },
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
-                mcp_config_path: ".gemini/settings.json",
                 ready_timeout_secs: 20,
                 // Auto-approve: MCP tools ("3" = all server tools for session),
                 // shell commands ("2" = allow for session)

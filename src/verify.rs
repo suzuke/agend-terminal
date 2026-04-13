@@ -2,7 +2,7 @@
 //!
 //! `agend-terminal verify` runs all tests with auto daemon lifecycle.
 
-use crate::{agent, api, backend, daemon, inbox, instructions, mcp_config};
+use crate::{agent, api, backend, daemon, inbox, instructions};
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
@@ -294,36 +294,9 @@ fn test_mcp_framing() -> TestResult {
     )
 }
 
-fn test_backend_config(home: &Path) -> TestResult {
-    let test_dir = home.join("verify-backend");
-    std::fs::create_dir_all(&test_dir).ok();
-
-    let check_mcp = |cmd: &str, path: &Path, patterns: &[&str]| -> bool {
-        mcp_config::configure(&test_dir, cmd);
-        path.exists() && {
-            let c = std::fs::read_to_string(path).unwrap_or_default();
-            patterns.iter().all(|p| c.contains(p))
-        }
-    };
-    let claude_ok = check_mcp(
-        "claude",
-        &test_dir.join(".claude").join("settings.json"),
-        &["mcpServers", "agend-terminal", "AGEND_HOME"],
-    );
-    let kiro_ok = check_mcp(
-        "kiro-cli",
-        &test_dir.join(".kiro").join("settings").join("mcp.json"),
-        &["mcpServers", "agend-terminal"],
-    );
-
-    let _ = std::fs::remove_dir_all(&test_dir);
-    let ok = claude_ok && kiro_ok;
-    TestResult::from_bool(
-        "backend_config",
-        ok,
-        "Claude + Kiro MCP config correct",
-        format!("claude={claude_ok} kiro={kiro_ok}"),
-    )
+fn test_backend_config(_home: &Path) -> TestResult {
+    // MCP config removed — agents use CLI now. Just pass.
+    TestResult::from_bool("backend_config", true, "MCP removed, using CLI", "")
 }
 
 fn test_instructions(home: &Path) -> TestResult {
@@ -463,25 +436,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
         "missing or invalid",
     ));
 
-    // 2. MCP config
-    crate::mcp_config::configure(&test_dir, preset.command);
-    let mcp_path = test_dir.join(preset.mcp_config_path);
-    let mcp_ok = if mcp_path.exists() {
-        let c = std::fs::read_to_string(&mcp_path).unwrap_or_default();
-        ["mcpServers", "agend-terminal", "AGEND_HOME"]
-            .iter()
-            .all(|p| c.contains(p))
-    } else {
-        name == "codex"
-    };
-    results.push(TestResult::from_bool(
-        format!("backend:{name}:mcp_config"),
-        mcp_ok,
-        preset.mcp_config_path.to_string(),
-        "missing mcpServers/env",
-    ));
-
-    // 3. Spawn + ready detection
+    // 2. Spawn + ready detection
     let registry = Arc::new(Mutex::new(HashMap::new()));
     let agent_name = format!("verify-{name}");
     let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();

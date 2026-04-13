@@ -85,7 +85,6 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
             // Generate instructions + MCP config
             if let Some(ref dir) = resolved.working_directory {
                 crate::instructions::generate(dir, &resolved.command);
-                crate::mcp_config::configure(dir, &resolved.command);
             }
 
             // Add resume args to continue previous session
@@ -99,22 +98,6 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
             if let Some(ref model) = resolved.model {
                 args.push("--model".to_string());
                 args.push(model.clone());
-            }
-
-            // Inject Claude-specific flags
-            if let Some(ref dir) = resolved.working_directory {
-                if resolved.command.contains("claude") {
-                    let mcp_config = dir.join("mcp-config.json");
-                    if mcp_config.exists() {
-                        args.push("--mcp-config".to_string());
-                        args.push(mcp_config.display().to_string());
-                    }
-                    let settings = dir.join("claude-settings.json");
-                    if settings.exists() {
-                        args.push("--settings".to_string());
-                        args.push(settings.display().to_string());
-                    }
-                }
             }
 
             agents.push((
