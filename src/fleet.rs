@@ -53,7 +53,7 @@ pub struct InstanceDefaults {
     pub rows: Option<u16>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceConfig {
     pub role: Option<String>,
     /// Backend preset name — overrides defaults.backend.
@@ -153,14 +153,20 @@ impl FleetConfig {
             "\r".to_string()
         };
 
-        let working_directory = inst.working_directory.as_ref().map(|d| {
+        let working_directory = Some(if let Some(d) = inst.working_directory.as_ref() {
             // Expand ~ to home directory
             if let Some(rest) = d.strip_prefix("~/") {
                 if let Some(home) = dirs_home() {
-                    return home.join(rest);
+                    home.join(rest)
+                } else {
+                    PathBuf::from(d)
                 }
+            } else {
+                PathBuf::from(d)
             }
-            PathBuf::from(d)
+        } else {
+            // Default: $AGEND_HOME/workspaces/{name}/
+            crate::home_dir().join("workspaces").join(name)
         });
 
         let cols = inst.cols.or(defaults.cols);
@@ -878,6 +884,65 @@ instances:
         assert_eq!(
             config.instances.get("bob").and_then(|i| i.topic_id),
             Some(300)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_default_working_directory() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-defwd-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        let path = dir.join("fleet.yaml");
+        fs::write(
+            &path,
+            r#"instances:
+  alice:
+    backend: claude
+  bob:
+    backend: claude
+    working_directory: /tmp/custom
+"#,
+        )
+        .ok();
+        let config = FleetConfig::load(&path).expect("load");
+
+        // alice: no working_directory → defaults to $AGEND_HOME/workspaces/alice
+        let alice = config.resolve_instance("alice").expect("alice");
+        let wd = alice.working_directory.expect("wd");
+        assert!(
+            wd.display().to_string().ends_with("workspaces/alice"),
+            "expected default workspace path, got: {}",
+            wd.display()
+        );
+
+        // bob: explicit working_directory → used as-is
+        let bob = config.resolve_instance("bob").expect("bob");
+        assert_eq!(
+            bob.working_directory.expect("wd"),
+            std::path::PathBuf::from("/tmp/custom")
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_working_directory_always_some() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-wdsome-{}", std::process::id()));
+        fs::create_dir_all(&dir).ok();
+        let path = dir.join("fleet.yaml");
+        fs::write(
+            &path,
+            r#"instances:
+  minimal:
+    backend: claude
+"#,
+        )
+        .ok();
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("minimal").expect("resolve");
+        assert!(
+            resolved.working_directory.is_some(),
+            "working_directory must always be Some after resolve"
         );
         fs::remove_dir_all(&dir).ok();
     }

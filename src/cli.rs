@@ -6,7 +6,49 @@ use std::path::Path;
 
 /// Start daemon with fleet.yaml config.
 pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
-    let config = fleet::FleetConfig::load(fleet_path)?;
+    let mut config = fleet::FleetConfig::load(fleet_path)?;
+
+    // Auto-create "general" instance if channel is configured but no general exists.
+    // General is the default coordinator bound to Telegram's General topic (topic_id: 1).
+    if config.channel.is_some() && !config.instances.contains_key("general") {
+        let default_backend = config
+            .defaults
+            .backend
+            .clone()
+            .unwrap_or(backend::Backend::ClaudeCode);
+        config.instances.insert(
+            "general".to_string(),
+            fleet::InstanceConfig {
+                role: Some("Fleet coordinator — routes tasks between agents".to_string()),
+                backend: Some(default_backend),
+                working_directory: None, // resolve_instance will default to $AGEND_HOME/workspaces/general
+                topic_id: Some(1),       // Telegram General topic
+                ..Default::default()
+            },
+        );
+        // Persist to fleet.yaml so it's visible to the user
+        let entry = fleet::InstanceYamlEntry {
+            backend: config
+                .defaults
+                .backend
+                .as_ref()
+                .map(|b| b.name().to_string()),
+            working_directory: None,
+            role: Some("Fleet coordinator — routes tasks between agents".to_string()),
+        };
+        if let Err(e) = fleet::add_instance_to_yaml(home, "general", &entry) {
+            tracing::warn!(error = %e, "failed to persist general instance");
+        }
+        // Write topic_id
+        let _ = fleet::update_instance_field(
+            home,
+            "general",
+            "topic_id",
+            serde_yaml::Value::Number(serde_yaml::Number::from(1)),
+        );
+        tracing::info!("auto-created 'general' instance for channel");
+    }
+
     let mut agents = Vec::new();
 
     // Prune stale worktrees on startup
@@ -25,6 +67,11 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
 
     for name in config.instance_names() {
         if let Some(mut resolved) = config.resolve_instance(&name) {
+            // Ensure working directory exists
+            if let Some(ref base_dir) = resolved.working_directory {
+                std::fs::create_dir_all(base_dir).ok();
+            }
+
             // Auto-create git worktree if working_directory is a git repo
             if let Some(ref base_dir) = resolved.working_directory {
                 if crate::worktree::is_git_repo(base_dir) {
