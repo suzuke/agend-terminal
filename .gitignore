@@ -12,3 +12,12 @@ snapshot.json
 event-log.jsonl
 run/
 .worktrees
+bugreport-*.txt
+CODE_REVIEW_*.md
+fleet.yaml
+skills-lock.json
+.agents/
+.claude/
+.continue/
+.factory/
+.kiro/
