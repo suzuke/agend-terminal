@@ -1,38 +1,60 @@
 use anyhow::Result;
 use std::path::Path;
 
-const INSTRUCTIONS_VERSION: &str = "v3-mcp";
+const INSTRUCTIONS_VERSION: &str = "v4-cli";
 
 const AGEND_RULES: &str = r#"# AgEnD Terminal Communication
-<!-- agend-terminal instructions v3-mcp -->
+<!-- agend-terminal instructions v4-cli -->
 
-## Message Types
+You are an agent managed by AgEnD Terminal. Use `agend-terminal agent` commands in bash to communicate.
 
-You will receive two types of messages:
+## Message Types You Receive
 
-1. **`[user:NAME via telegram] text`** — A human user sent you a message via Telegram.
-   → Respond using the **`reply`** MCP tool.
+1. **`[user:NAME via telegram] text`** — A human sent you a message.
+   Reply: `agend-terminal agent reply "your response"`
 
-2. **`[from:INSTANCE-NAME] text`** — Another agent instance sent you a message.
-   → Respond using the **`send`** MCP tool with `target` set to the instance name.
+2. **`[from:INSTANCE-NAME] text`** — Another agent sent you a message.
+   Reply: `agend-terminal agent send INSTANCE-NAME "your response"`
 
-## MCP Tools
+3. **`[delegate_task] ...`** — You've been assigned a task.
+   When done: `agend-terminal agent report REQUESTER "summary of results"`
 
-| Tool | When to use |
-|------|-------------|
-| **reply** | Reply to `[user:... via telegram]` messages. Sends your response back to Telegram. |
-| **send** | Reply to `[from:INSTANCE]` messages, or proactively message another instance. Set `target` to the instance name. |
-| **inbox** | Retrieve full message content when notification says "Run: agend-terminal inbox". |
-| **list_instances** | See all active agent instances. |
-| **create_instance** | Spawn a new agent instance dynamically. |
-| **delete_instance** | Stop and remove an agent instance. |
+## Quick Reference
+
+```bash
+# Communication
+agend-terminal agent reply "text"                    # Reply to Telegram user
+agend-terminal agent send TARGET "message"           # Message another agent
+agend-terminal agent delegate TARGET "task"          # Assign work
+agend-terminal agent report TARGET "summary"         # Report results
+agend-terminal agent ask TARGET "question"           # Request info
+agend-terminal agent broadcast "message"             # Message all agents
+agend-terminal agent inbox                           # Check pending messages
+
+# Instance Management
+agend-terminal agent list                            # List running agents
+agend-terminal agent spawn NAME --backend claude     # Create agent
+agend-terminal agent delete NAME                     # Remove agent
+agend-terminal agent describe NAME                   # Get agent details
+
+# Task Board
+agend-terminal agent task create "title"             # Create task
+agend-terminal agent task list                       # List tasks
+agend-terminal agent task claim ID                   # Claim task
+agend-terminal agent task done ID --result "done"    # Complete task
+
+# Teams
+agend-terminal agent team create NAME m1 m2          # Create team
+agend-terminal agent team list                       # List teams
+```
 
 ## Rules
 
-- `[user:... via telegram]` → use **reply** (NOT send)
-- `[from:INSTANCE]` → use **send** with target=INSTANCE (NOT reply)
-- For long messages, use **inbox** to see the full content
-- Keep replies concise and direct
+- All commands output JSON — parse the result for structured data
+- `[user:... via telegram]` → use `agent reply` (NOT `agent send`)
+- `[from:INSTANCE]` → use `agent send` (NOT `agent reply`)
+- Check inbox regularly with `agent inbox`
+- Run `agend-terminal agent --help` for full command list
 "#;
 
 const AGEND_MARKER: &str = "<!-- agend-terminal instructions";
@@ -141,19 +163,14 @@ fn generate_opencode(working_dir: &Path) -> Result<()> {
 
 /// Detect backend from command name and generate appropriate instructions.
 pub fn generate(working_dir: &Path, command: &str) {
-    let cmd = command.to_lowercase();
-    let result = if cmd.contains("claude") {
-        generate_claude(working_dir)
-    } else if cmd.contains("kiro") {
-        generate_kiro(working_dir)
-    } else if cmd.contains("codex") {
-        generate_codex(working_dir)
-    } else if cmd.contains("gemini") {
-        generate_gemini(working_dir)
-    } else if cmd.contains("opencode") {
-        generate_opencode(working_dir)
-    } else {
-        return;
+    let backend = crate::backend::Backend::from_command(command);
+    let result = match backend {
+        Some(crate::backend::Backend::ClaudeCode) => generate_claude(working_dir),
+        Some(crate::backend::Backend::KiroCli) => generate_kiro(working_dir),
+        Some(crate::backend::Backend::Codex) => generate_codex(working_dir),
+        Some(crate::backend::Backend::Gemini) => generate_gemini(working_dir),
+        Some(crate::backend::Backend::OpenCode) => generate_opencode(working_dir),
+        None => return,
     };
 
     if let Err(e) = result {

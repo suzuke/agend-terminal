@@ -1,4 +1,5 @@
 mod agent;
+mod agent_cli;
 mod api;
 mod backend;
 mod bugreport;
@@ -16,6 +17,7 @@ mod inbox;
 mod instructions;
 mod mcp;
 mod mcp_config;
+mod ops;
 mod quickstart;
 mod schedules;
 mod snapshot;
@@ -171,6 +173,12 @@ enum Commands {
     },
     /// Start MCP stdio server
     Mcp,
+    /// Agent CLI — commands for agent-to-agent coordination (JSON output)
+    #[command(alias = "a")]
+    Agent {
+        #[command(subcommand)]
+        command: agent_cli::AgentCommand,
+    },
     /// Capture backend output for debugging
     Capture {
         /// Backend name (claude, kiro-cli, codex, opencode, gemini)
@@ -430,6 +438,9 @@ fn main() -> anyhow::Result<()> {
                 eprintln!("[mcp] AGEND_INSTANCE_NAME not set, running in standalone mode");
             }
             mcp::run(&daemon::agent_socket_path(&home, &instance_name))?;
+        }
+        Some(Commands::Agent { command }) => {
+            agent_cli::run(&home, command);
         }
         Some(Commands::Capture { backend, seconds }) => {
             let b: backend::Backend = serde_json::from_str(&format!("\"{backend}\""))
