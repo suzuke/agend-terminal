@@ -36,7 +36,7 @@ impl TestDaemon {
 
         let child = Command::new(binary())
             .args(&args)
-            .env("AGEND_TERMINAL_HOME", &home)
+            .env("AGEND_HOME", &home)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()

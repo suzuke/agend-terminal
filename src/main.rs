@@ -33,14 +33,22 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub fn home_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("AGEND_TERMINAL_HOME") {
+    if let Ok(home) = std::env::var("AGEND_HOME") {
         return PathBuf::from(home);
     }
     let base = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(base).join(".agend-terminal")
+    let base = PathBuf::from(base);
+    // Prefer ~/.agend, fallback to ~/.agend-terminal for backwards compat
+    let new_path = base.join(".agend");
+    let legacy_path = base.join(".agend-terminal");
+    if new_path.exists() || !legacy_path.exists() {
+        new_path
+    } else {
+        legacy_path
+    }
 }
 
-/// Load .env file from AGEND_TERMINAL_HOME.
+/// Load .env file from AGEND_HOME.
 ///
 /// Supports: `KEY=value`, `export KEY=value`, single/double quoted values.
 /// Quoted values preserve `#` inside; unquoted values strip inline comments.
@@ -480,9 +488,12 @@ mod tests {
 
     #[test]
     fn home_dir_default() {
-        // Should return a path ending with .agend-terminal
         let home = home_dir();
-        assert!(home.display().to_string().contains("agend-terminal"));
+        let s = home.display().to_string();
+        assert!(
+            s.contains(".agend") || s.contains("agend"),
+            "home_dir should contain 'agend': {s}"
+        );
     }
 
     #[test]

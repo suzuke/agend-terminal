@@ -31,7 +31,7 @@ fn mcp_session(requests: &[&str]) -> Vec<serde_json::Value> {
 fn mcp_session_in_home(home: &std::path::Path, requests: &[&str]) -> Vec<serde_json::Value> {
     let mut child = Command::new(binary())
         .args(["mcp"])
-        .env("AGEND_TERMINAL_HOME", home)
+        .env("AGEND_HOME", home)
         .env("AGEND_INSTANCE_NAME", "test-agent")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -190,7 +190,7 @@ fn test_content_length_framing() {
 
     let mut child = Command::new(binary())
         .args(["mcp"])
-        .env("AGEND_TERMINAL_HOME", &home)
+        .env("AGEND_HOME", &home)
         .env("AGEND_INSTANCE_NAME", "test-cl")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

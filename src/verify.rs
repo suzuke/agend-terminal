@@ -308,7 +308,7 @@ fn test_backend_config(home: &Path) -> TestResult {
     let claude_ok = check_mcp(
         "claude",
         &test_dir.join(".claude").join("settings.json"),
-        &["mcpServers", "agend-terminal", "AGEND_TERMINAL_HOME"],
+        &["mcpServers", "agend-terminal", "AGEND_HOME"],
     );
     let kiro_ok = check_mcp(
         "kiro-cli",
@@ -468,7 +468,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let mcp_path = test_dir.join(preset.mcp_config_path);
     let mcp_ok = if mcp_path.exists() {
         let c = std::fs::read_to_string(&mcp_path).unwrap_or_default();
-        ["mcpServers", "agend-terminal", "AGEND_TERMINAL_HOME"]
+        ["mcpServers", "agend-terminal", "AGEND_HOME"]
             .iter()
             .all(|p| c.contains(p))
     } else {

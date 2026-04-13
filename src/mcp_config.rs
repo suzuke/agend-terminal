@@ -13,7 +13,7 @@ fn binary_path() -> String {
         .unwrap_or_else(|_| "agend-terminal".to_string())
 }
 
-/// Get the AGEND_TERMINAL_HOME value.
+/// Get the AGEND_HOME value.
 fn home_path() -> String {
     crate::home_dir().display().to_string()
 }
@@ -24,7 +24,7 @@ fn mcp_server_entry() -> serde_json::Value {
         "command": binary_path(),
         "args": ["mcp"],
         "env": {
-            "AGEND_TERMINAL_HOME": home_path()
+            "AGEND_HOME": home_path()
         }
     })
 }
@@ -131,7 +131,7 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(&wrapper_dir)?;
     let wrapper_path = wrapper_dir.join("agend-mcp-wrapper.sh");
     let wrapper = format!(
-        "#!/bin/bash\nexport AGEND_TERMINAL_HOME={home}\nexec {bin} mcp\n",
+        "#!/bin/bash\nexport AGEND_HOME={home}\nexec {bin} mcp\n",
         home = shell_escape(&home_path()),
         bin = shell_escape(&binary_path()),
     );
@@ -191,7 +191,7 @@ fn configure_opencode(working_dir: &Path) -> Result<()> {
         "command": [binary_path(), "mcp"],
         "enabled": true,
         "environment": {
-            "AGEND_TERMINAL_HOME": home_path()
+            "AGEND_HOME": home_path()
         }
     });
 
@@ -239,7 +239,7 @@ command = "{bin}"
 args = ["mcp"]
 
 [mcp_servers.agend-terminal.env]
-AGEND_TERMINAL_HOME = "{home}""#
+AGEND_HOME = "{home}""#
         )?;
     }
     eprintln!("[info] Configured MCP: {}", config_path.display());
@@ -425,7 +425,7 @@ mod tests {
         assert!(wrapper.exists(), "wrapper script must exist");
         let content = std::fs::read_to_string(&wrapper).expect("read");
         assert!(content.starts_with("#!/bin/bash"));
-        assert!(content.contains("AGEND_TERMINAL_HOME"));
+        assert!(content.contains("AGEND_HOME"));
         assert!(content.contains("exec"));
         std::fs::remove_dir_all(&dir).ok();
     }

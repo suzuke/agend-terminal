@@ -36,7 +36,7 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     // Home directory
     section(&mut out, "Home Directory");
     out.push_str(&format!(
-        "AGEND_TERMINAL_HOME: {}\nexists: {}\n\n",
+        "AGEND_HOME: {}\nexists: {}\n\n",
         home.display(),
         if home.exists() { "yes" } else { "no" }
     ));
