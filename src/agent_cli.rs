@@ -16,6 +16,20 @@ fn output(value: Value) {
     }
 }
 
+/// Read text from argument or stdin. Avoids shell escaping issues —
+/// agents can pipe complex text (markdown, code, JSON) via stdin.
+fn text_or_stdin(arg: Option<String>) -> String {
+    if let Some(text) = arg {
+        return text;
+    }
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .unwrap_or_default();
+    buf.trim_end().to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Top-level agent command
 // ---------------------------------------------------------------------------
@@ -23,36 +37,39 @@ fn output(value: Value) {
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
     // -- High-frequency (flat) ------------------------------------------------
-    /// Send a message to another agent.
-    Send { target: String, message: String },
-    /// Delegate a task to another agent.
+    /// Send a message to another agent. Text from arg or stdin.
+    Send {
+        target: String,
+        message: Option<String>,
+    },
+    /// Delegate a task to another agent. Task text from arg or stdin.
     Delegate {
         target: String,
-        task: String,
+        task: Option<String>,
         #[arg(long)]
         criteria: Option<String>,
         #[arg(long)]
         context: Option<String>,
     },
-    /// Report a result to another agent.
+    /// Report a result to another agent. Summary from arg or stdin.
     Report {
         target: String,
-        summary: String,
+        summary: Option<String>,
         #[arg(long)]
         correlation_id: Option<String>,
         #[arg(long)]
         artifacts: Option<String>,
     },
-    /// Ask another agent a question.
+    /// Ask another agent a question. Question from arg or stdin.
     Ask {
         target: String,
-        question: String,
+        question: Option<String>,
         #[arg(long)]
         context: Option<String>,
     },
-    /// Broadcast a message to a team or all agents.
+    /// Broadcast a message to a team or all agents. Text from arg or stdin.
     Broadcast {
-        message: String,
+        message: Option<String>,
         #[arg(long)]
         team: Option<String>,
         #[arg(long)]
@@ -60,8 +77,8 @@ pub enum AgentCommand {
     },
     /// Drain the inbox.
     Inbox,
-    /// Reply in the channel.
-    Reply { text: String },
+    /// Reply in the channel. Text from arg or stdin.
+    Reply { text: Option<String> },
     /// List instances.
     #[command(alias = "ls")]
     List,
@@ -349,7 +366,8 @@ pub fn run(home: &Path, command: AgentCommand) {
     match command {
         // -- Communication ----------------------------------------------------
         AgentCommand::Send { target, message } => {
-            output(crate::ops::send_message(home, &me, &target, &message, None));
+            let text = text_or_stdin(message);
+            output(crate::ops::send_message(home, &me, &target, &text, None));
         }
         AgentCommand::Delegate {
             target,
@@ -357,11 +375,12 @@ pub fn run(home: &Path, command: AgentCommand) {
             criteria,
             context,
         } => {
+            let text = text_or_stdin(task);
             output(crate::ops::delegate_task(
                 home,
                 &me,
                 &target,
-                &task,
+                &text,
                 criteria.as_deref(),
                 context.as_deref(),
             ));
@@ -372,11 +391,12 @@ pub fn run(home: &Path, command: AgentCommand) {
             correlation_id,
             artifacts,
         } => {
+            let text = text_or_stdin(summary);
             output(crate::ops::report_result(
                 home,
                 &me,
                 &target,
-                &summary,
+                &text,
                 correlation_id.as_deref(),
                 artifacts.as_deref(),
             ));
@@ -386,11 +406,12 @@ pub fn run(home: &Path, command: AgentCommand) {
             question,
             context,
         } => {
+            let text = text_or_stdin(question);
             output(crate::ops::request_information(
                 home,
                 &me,
                 &target,
-                &question,
+                &text,
                 context.as_deref(),
             ));
         }
@@ -399,13 +420,14 @@ pub fn run(home: &Path, command: AgentCommand) {
             team,
             targets,
         } => {
+            let text = text_or_stdin(message);
             let target_list: Option<Vec<String>> = targets
                 .as_deref()
                 .map(|s| s.split(',').map(|t| t.trim().to_string()).collect());
             output(crate::ops::broadcast(
                 home,
                 &me,
-                &message,
+                &text,
                 team.as_deref(),
                 target_list.as_deref(),
             ));
@@ -414,6 +436,7 @@ pub fn run(home: &Path, command: AgentCommand) {
             output(crate::ops::drain_inbox(home, &me));
         }
         AgentCommand::Reply { text } => {
+            let text = text_or_stdin(text);
             output(crate::ops::reply(home, &me, &text));
         }
         AgentCommand::List => {
