@@ -203,43 +203,48 @@ fn configure_opencode(working_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Codex: uses `codex mcp add` CLI command + trust config in ~/.codex/config.toml.
+/// Codex: write .codex/config.toml per-project + trust in ~/.codex/config.toml.
+///
+/// `codex mcp add` only writes to global config and doesn't support per-project.
+/// But Codex loads .codex/config.toml from the project root (trusted projects only).
+/// This gives us per-instance AGEND_INSTANCE_NAME via project-level config.
 fn configure_codex(working_dir: &Path) -> Result<()> {
     let bin = binary_path();
     let home = home_path();
 
-    // Register MCP server via CLI
-    let status = std::process::Command::new("codex")
-        .args([
-            "mcp",
-            "add",
-            "agend-terminal",
-            "--env",
-            &format!("AGEND_TERMINAL_HOME={home}"),
-            "--",
-            &bin,
-            "mcp",
-        ])
-        .current_dir(working_dir)
-        .output();
+    // Write per-project .codex/config.toml with MCP server config
+    let codex_dir = working_dir.join(".codex");
+    std::fs::create_dir_all(&codex_dir)?;
+    let config_path = codex_dir.join("config.toml");
 
-    match status {
-        Ok(o) if o.status.success() => {
-            eprintln!("[info] Configured MCP: codex mcp add agend-terminal");
-        }
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            if !stderr.contains("already") {
-                tracing::warn!(error = %stderr.trim(), "codex mcp add failed");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "codex not available for MCP config");
-        }
+    // Read existing config to preserve other settings
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    // Only write MCP section if not already configured
+    if !existing.contains("[mcp_servers.agend-terminal]") {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&config_path)?;
+        let prefix = if existing.is_empty() || existing.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        writeln!(
+            f,
+            r#"{prefix}[mcp_servers.agend-terminal]
+command = "{bin}"
+args = ["mcp"]
+
+[mcp_servers.agend-terminal.env]
+AGEND_TERMINAL_HOME = "{home}""#
+        )?;
     }
+    eprintln!("[info] Configured MCP: {}", config_path.display());
 
     // Auto-trust working directory in ~/.codex/config.toml
-    // Prevents "Do you trust the contents of this directory?" prompt
     codex_trust_directory(working_dir);
 
     Ok(())
