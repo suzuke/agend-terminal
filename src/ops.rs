@@ -206,12 +206,15 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
     if let Err(e) = crate::agent::validate_name(name) {
         return json!({"error": e});
     }
-    // Accept "backend" (preferred) or "command" (deprecated) for the CLI tool name.
-    // Default to "claude" if neither is specified.
-    let command = args["backend"]
+    // Accept "backend" (preferred) or "command" (deprecated).
+    // Resolve to actual CLI command via preset (e.g. "kiro" → "kiro-cli").
+    let raw_backend = args["backend"]
         .as_str()
         .or_else(|| args["command"].as_str())
         .unwrap_or("claude");
+    let command = crate::backend::Backend::from_command(raw_backend)
+        .map(|b| b.preset().command)
+        .unwrap_or(raw_backend);
     // Start with backend fresh_args (no resume flags — this is a new instance).
     // Falls back to preset args if fresh_args is not defined.
     let mut cmd_args = crate::backend::Backend::from_command(command)
