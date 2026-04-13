@@ -417,12 +417,10 @@ fn main() -> anyhow::Result<()> {
             },
         },
         Some(Commands::Mcp) => {
-            let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_else(|_| {
-                eprintln!(
-                    "Error: AGEND_INSTANCE_NAME not set. MCP server must run inside a session."
-                );
-                std::process::exit(1);
-            });
+            let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
+            if instance_name.is_empty() {
+                eprintln!("[mcp] AGEND_INSTANCE_NAME not set, running in standalone mode");
+            }
             mcp::run(&daemon::agent_socket_path(&home, &instance_name))?;
         }
         Some(Commands::Capture { backend, seconds }) => {
