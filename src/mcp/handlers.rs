@@ -98,7 +98,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                     crate::inbox::deliver(
                         &home,
                         target,
-                        &format!("from:{instance_name}"),
+                        &crate::inbox::NotifySource::Agent(&instance_name),
                         text,
                         &submit_key,
                         None,
@@ -661,7 +661,7 @@ fn send_to(home: &std::path::Path, from: &str, target: &str, text: &str, kind: &
             crate::inbox::deliver(
                 home,
                 target,
-                &format!("from:{from}"),
+                &crate::inbox::NotifySource::Agent(from),
                 text,
                 &submit_key,
                 None,

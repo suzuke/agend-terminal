@@ -34,7 +34,7 @@ pub fn send_message(
             crate::inbox::deliver(
                 home,
                 target,
-                &format!("from:{from}"),
+                &crate::inbox::NotifySource::Agent(from),
                 text,
                 &submit_key,
                 None,
@@ -719,7 +719,7 @@ pub fn send_to(home: &Path, from: &str, target: &str, text: &str, kind: &str) ->
             crate::inbox::deliver(
                 home,
                 target,
-                &format!("from:{from}"),
+                &crate::inbox::NotifySource::Agent(from),
                 text,
                 &submit_key,
                 None,

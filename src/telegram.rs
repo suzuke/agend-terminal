@@ -250,7 +250,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     inbox::notify_agent(
         &home,
         &instance_name,
-        &format!("user:{username} via telegram"),
+        &inbox::NotifySource::Telegram(username),
         text,
         &submit_key,
     );
@@ -441,11 +441,15 @@ fn map_emoji_name(name: &str) -> &str {
 
 // ---------------------------------------------------------------------------
 // Bot API functions (reply, react, edit, download, topic management)
-// Moved from mcp/telegram.rs after MCP removal.
 // ---------------------------------------------------------------------------
 
-/// Send a reply from an instance to its Telegram topic. Returns (message_id, chat_id).
-pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
+/// Resolved Telegram channel credentials — avoids repeated fleet.yaml loads.
+struct TelegramChannel {
+    token: String,
+    group_id: i64,
+}
+
+fn resolve_channel() -> anyhow::Result<(TelegramChannel, crate::fleet::FleetConfig)> {
     let home = crate::home_dir();
     let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))?;
     match &config.channel {
@@ -454,36 +458,52 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
             group_id,
             ..
         }) => {
-            let token = std::env::var(bot_token_env)?;
-            let topic_id = config
-                .instances
-                .get(instance_name)
-                .and_then(|inst| inst.topic_id);
-            let gid = *group_id;
-            let msg_id = telegram_runtime().block_on(async {
-                let bot = teloxide::Bot::new(&token);
-                let chat_id = teloxide::types::ChatId(gid);
-                let sent = match topic_id {
-                    Some(1) | None => {
-                        if topic_id.is_none() {
-                            anyhow::bail!("No topic_id for {instance_name}");
-                        }
-                        bot.send_message(chat_id, text).await?
-                    }
-                    Some(tid) => {
-                        bot.send_message(chat_id, text)
-                            .message_thread_id(teloxide::types::ThreadId(
-                                teloxide::types::MessageId(tid),
-                            ))
-                            .await?
-                    }
-                };
-                Ok::<i32, anyhow::Error>(sent.id.0)
-            })?;
-            Ok((msg_id, gid))
+            let token = std::env::var(bot_token_env)
+                .map_err(|_| anyhow::anyhow!("bot token env '{bot_token_env}' not set"))?;
+            Ok((
+                TelegramChannel {
+                    token,
+                    group_id: *group_id,
+                },
+                config,
+            ))
         }
         None => anyhow::bail!("No Telegram channel configured"),
     }
+}
+
+fn resolve_channel_only() -> anyhow::Result<TelegramChannel> {
+    resolve_channel().map(|(ch, _)| ch)
+}
+
+/// Send a reply from an instance to its Telegram topic. Returns (message_id, chat_id).
+pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
+    let (ch, config) = resolve_channel()?;
+    let topic_id = config
+        .instances
+        .get(instance_name)
+        .and_then(|inst| inst.topic_id);
+    let msg_id = telegram_runtime().block_on(async {
+        let bot = teloxide::Bot::new(&ch.token);
+        let chat_id = teloxide::types::ChatId(ch.group_id);
+        let sent = match topic_id {
+            Some(1) | None => {
+                if topic_id.is_none() {
+                    anyhow::bail!("No topic_id for {instance_name}");
+                }
+                bot.send_message(chat_id, text).await?
+            }
+            Some(tid) => {
+                bot.send_message(chat_id, text)
+                    .message_thread_id(teloxide::types::ThreadId(
+                        teloxide::types::MessageId(tid),
+                    ))
+                    .await?
+            }
+        };
+        Ok::<i32, anyhow::Error>(sent.id.0)
+    })?;
+    Ok((msg_id, ch.group_id))
 }
 
 /// React to a message with an emoji.
@@ -492,133 +512,95 @@ pub fn try_telegram_react(
     emoji: &str,
     message_id: Option<&str>,
 ) -> anyhow::Result<()> {
+    let ch = resolve_channel_only()?;
     let home = crate::home_dir();
-    let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))?;
-    match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram {
-            bot_token_env,
-            group_id,
-            ..
-        }) => {
-            let token = std::env::var(bot_token_env)?;
-            let mid: i32 = message_id.and_then(|m| m.parse().ok()).unwrap_or_else(|| {
-                let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
-                std::fs::read_to_string(&meta_path)
-                    .ok()
-                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                    .and_then(|m| m["last_message_id"].as_i64())
-                    .unwrap_or(0) as i32
-            });
-            if mid == 0 {
-                anyhow::bail!("No message_id to react to");
-            }
-            let emoji_char = map_emoji_name(emoji);
-            telegram_runtime().block_on(async {
-                let bot = teloxide::Bot::new(&token);
-                let chat_id = teloxide::types::ChatId(*group_id);
-                let msg_id = teloxide::types::MessageId(mid);
-                let reaction = teloxide::types::ReactionType::Emoji {
-                    emoji: emoji_char.to_string(),
-                };
-                bot.set_message_reaction(chat_id, msg_id)
-                    .reaction(vec![reaction])
-                    .await?;
-                Ok::<(), anyhow::Error>(())
-            })
-        }
-        None => anyhow::bail!("No Telegram channel configured"),
+    let mid: i32 = message_id.and_then(|m| m.parse().ok()).unwrap_or_else(|| {
+        let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
+        std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|m| m["last_message_id"].as_i64())
+            .unwrap_or(0) as i32
+    });
+    if mid == 0 {
+        anyhow::bail!("No message_id to react to");
     }
+    let emoji_char = map_emoji_name(emoji);
+    telegram_runtime().block_on(async {
+        let bot = teloxide::Bot::new(&ch.token);
+        let chat_id = teloxide::types::ChatId(ch.group_id);
+        let msg_id = teloxide::types::MessageId(mid);
+        let reaction = teloxide::types::ReactionType::Emoji {
+            emoji: emoji_char.to_string(),
+        };
+        bot.set_message_reaction(chat_id, msg_id)
+            .reaction(vec![reaction])
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 /// Edit a previously sent message.
 pub fn try_telegram_edit(_instance_name: &str, message_id: &str, text: &str) -> anyhow::Result<()> {
-    let home = crate::home_dir();
-    let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))?;
-    match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram {
-            bot_token_env,
-            group_id,
-            ..
-        }) => {
-            let token = std::env::var(bot_token_env)?;
-            let mid: i32 = message_id
-                .parse()
-                .map_err(|_| anyhow::anyhow!("invalid message_id: {message_id}"))?;
-            telegram_runtime().block_on(async {
-                let bot = teloxide::Bot::new(&token);
-                bot.edit_message_text(
-                    teloxide::types::ChatId(*group_id),
-                    teloxide::types::MessageId(mid),
-                    text,
-                )
-                .await?;
-                Ok::<(), anyhow::Error>(())
-            })
-        }
-        None => anyhow::bail!("No Telegram channel configured"),
-    }
+    let ch = resolve_channel_only()?;
+    let mid: i32 = message_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid message_id: {message_id}"))?;
+    telegram_runtime().block_on(async {
+        let bot = teloxide::Bot::new(&ch.token);
+        bot.edit_message_text(
+            teloxide::types::ChatId(ch.group_id),
+            teloxide::types::MessageId(mid),
+            text,
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    })
 }
 
 /// Create a forum topic for a new instance.
 pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
-    let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok()?;
-    match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram {
-            bot_token_env,
-            group_id,
-            ..
-        }) => {
-            let token = std::env::var(bot_token_env).ok()?;
-            let gid = *group_id;
-            match telegram_runtime().block_on(async {
-                let bot = teloxide::Bot::new(&token);
-                let topic = bot
-                    .create_forum_topic(teloxide::types::ChatId(gid), instance_name, 0x6FB9F0, "")
-                    .await?;
-                Ok::<i32, anyhow::Error>(topic.thread_id.0 .0)
-            }) {
-                Ok(tid) => {
-                    eprintln!("[telegram] created topic for '{instance_name}' -> {tid}");
-                    let _ = crate::fleet::update_instance_field(
-                        home,
-                        instance_name,
-                        "topic_id",
-                        serde_yaml::Value::Number(serde_yaml::Number::from(tid)),
-                    );
-                    register_topic(home, tid, instance_name);
-                    Some(tid)
-                }
-                Err(e) => {
-                    eprintln!("[telegram] failed to create topic for '{instance_name}': {e}");
-                    None
-                }
-            }
+    let ch = resolve_channel_only().ok()?;
+    match telegram_runtime().block_on(async {
+        let bot = teloxide::Bot::new(&ch.token);
+        let topic = bot
+            .create_forum_topic(
+                teloxide::types::ChatId(ch.group_id),
+                instance_name,
+                0x6FB9F0,
+                "",
+            )
+            .await?;
+        Ok::<i32, anyhow::Error>(topic.thread_id.0 .0)
+    }) {
+        Ok(tid) => {
+            eprintln!("[telegram] created topic for '{instance_name}' -> {tid}");
+            let _ = crate::fleet::update_instance_field(
+                home,
+                instance_name,
+                "topic_id",
+                serde_yaml::Value::Number(serde_yaml::Number::from(tid)),
+            );
+            register_topic(home, tid, instance_name);
+            Some(tid)
         }
-        None => None,
+        Err(e) => {
+            eprintln!("[telegram] failed to create topic for '{instance_name}': {e}");
+            None
+        }
     }
 }
 
 /// Delete a forum topic.
 pub fn delete_topic(home: &std::path::Path, topic_id: i32) {
-    let config = match crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
+    let ch = match resolve_channel_only() {
         Ok(c) => c,
         Err(_) => return,
     };
-    let (token, gid) = match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram {
-            bot_token_env,
-            group_id,
-            ..
-        }) => match std::env::var(bot_token_env) {
-            Ok(t) => (t, *group_id),
-            Err(_) => return,
-        },
-        None => return,
-    };
     let tid = teloxide::types::ThreadId(teloxide::types::MessageId(topic_id));
     let _ = telegram_runtime().block_on(async {
-        let bot = teloxide::Bot::new(&token);
-        let chat_id = teloxide::types::ChatId(gid);
+        let bot = teloxide::Bot::new(&ch.token);
+        let chat_id = teloxide::types::ChatId(ch.group_id);
         let _ = bot.close_forum_topic(chat_id, tid).await;
         bot.delete_forum_topic(chat_id, tid).await
     });
@@ -628,28 +610,22 @@ pub fn delete_topic(home: &std::path::Path, topic_id: i32) {
 
 /// Download an attachment by file_id.
 pub fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Result<String> {
+    let ch = resolve_channel_only()?;
     let home = crate::home_dir();
-    let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))?;
-    match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram { bot_token_env, .. }) => {
-            let token = std::env::var(bot_token_env)?;
-            telegram_runtime().block_on(async {
-                let bot = teloxide::Bot::new(&token);
-                let file = bot.get_file(file_id).await?;
-                let download_dir = home.join("downloads").join(instance_name);
-                std::fs::create_dir_all(&download_dir)?;
-                let filename = std::path::Path::new(&file.path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("attachment");
-                let dest = download_dir.join(filename);
-                let mut dst = tokio::fs::File::create(&dest).await?;
-                bot.download_file(&file.path, &mut dst).await?;
-                Ok(dest.display().to_string())
-            })
-        }
-        None => anyhow::bail!("No Telegram channel configured"),
-    }
+    telegram_runtime().block_on(async {
+        let bot = teloxide::Bot::new(&ch.token);
+        let file = bot.get_file(file_id).await?;
+        let download_dir = home.join("downloads").join(instance_name);
+        std::fs::create_dir_all(&download_dir)?;
+        let filename = std::path::Path::new(&file.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment");
+        let dest = download_dir.join(filename);
+        let mut dst = tokio::fs::File::create(&dest).await?;
+        bot.download_file(&file.path, &mut dst).await?;
+        Ok(dest.display().to_string())
+    })
 }
 
 #[cfg(test)]

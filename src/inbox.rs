@@ -4,9 +4,46 @@
 //! Append is atomic on most filesystems for small writes — no file locking needed.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Type-safe notification source — replaces raw string conventions.
+pub enum NotifySource<'a> {
+    /// Message from a Telegram user (e.g., "chiacheng").
+    Telegram(&'a str),
+    /// Message from another agent instance (e.g., "dev").
+    Agent(&'a str),
+    /// System message (e.g., "replace", "ci").
+    #[allow(dead_code)]
+    System(&'a str),
+}
+
+impl fmt::Display for NotifySource<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Telegram(user) => write!(f, "user:{user} via telegram"),
+            Self::Agent(name) => write!(f, "from:{name}"),
+            Self::System(label) => write!(f, "system:{label}"),
+        }
+    }
+}
+
+impl NotifySource<'_> {
+    fn reply_hint(&self) -> Cow<'static, str> {
+        match self {
+            Self::Telegram(_) => {
+                "\n(Reply using the reply tool — do NOT respond with direct text)".into()
+            }
+            Self::Agent(sender) => {
+                format!("\n(Reply using the send_to_instance tool with target \"{sender}\")").into()
+            }
+            Self::System(_) => "".into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxMessage {
@@ -61,48 +98,39 @@ pub const INLINE_THRESHOLD: usize = 500;
 pub fn deliver(
     home: &Path,
     agent_name: &str,
-    from: &str,
+    source: &NotifySource<'_>,
     text: &str,
     submit_key: &str,
     kind: Option<String>,
 ) {
     if text.chars().count() <= INLINE_THRESHOLD {
-        // Short message — inject directly, no file I/O
-        notify_agent(home, agent_name, from, text, submit_key);
+        notify_agent(home, agent_name, source, text, submit_key);
     } else {
-        // Long message — store to inbox + truncated notification
         let msg = InboxMessage {
-            from: from.to_string(),
+            from: source.to_string(),
             text: text.to_string(),
             kind,
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
         let _ = enqueue(home, agent_name, msg);
-        notify_agent(home, agent_name, from, text, submit_key);
+        notify_agent(home, agent_name, source, text, submit_key);
     }
 }
 
-/// Inject a notification into an agent's PTY.
-/// When called from daemon (has registry), uses direct write.
-/// When called from external process (MCP), uses API socket.
-fn reply_hint(from: &str) -> String {
-    if from.contains("via telegram") {
-        "\n(Reply using the reply tool — do NOT respond with direct text)".into()
-    } else if let Some(sender) = from.strip_prefix("from:") {
-        format!("\n(Reply using the send_to_instance tool with target \"{sender}\")")
-    } else {
-        String::new()
-    }
-}
-
-pub fn notify_agent(home: &Path, agent_name: &str, from: &str, text: &str, submit_key: &str) {
+pub fn notify_agent(
+    home: &Path,
+    agent_name: &str,
+    source: &NotifySource<'_>,
+    text: &str,
+    submit_key: &str,
+) {
     let display_text = if text.chars().count() > 200 {
         let truncated: String = text.chars().take(200).collect();
         format!("{truncated}... (run: agend-terminal agent inbox)")
     } else {
         text.to_string()
     };
-    let notification = format!("[{from}] {display_text}{}{submit_key}", reply_hint(from));
+    let notification = format!("[{source}] {display_text}{}{submit_key}", source.reply_hint());
 
     // Use API socket to inject (doesn't kick attach clients)
     let _ = crate::api::call(
@@ -227,7 +255,7 @@ mod tests {
         let home = tmp_home("deliver-short");
         // deliver with short text — should NOT write to inbox file
         // (notify_agent will fail because no daemon, but enqueue should not be called)
-        deliver(&home, "agent1", "user", "short msg", "\r", None);
+        deliver(&home, "agent1", &NotifySource::Telegram("user"), "short msg", "\r", None);
         let msgs = drain(&home, "agent1");
         assert!(msgs.is_empty(), "short messages bypass inbox");
 
@@ -241,7 +269,7 @@ mod tests {
         deliver(
             &home,
             "agent1",
-            "user",
+            &NotifySource::Telegram("user"),
             &long_text,
             "\r",
             Some("chat".to_string()),
@@ -313,22 +341,28 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
-    // --- Reply hint tests ---
+    // --- NotifySource tests ---
 
     #[test]
-    fn reply_hint_telegram() {
-        assert!(reply_hint("user:chiacheng via telegram").contains("reply tool"));
+    fn notify_source_telegram_display() {
+        let s = NotifySource::Telegram("chiacheng");
+        assert_eq!(s.to_string(), "user:chiacheng via telegram");
+        assert!(s.reply_hint().contains("reply tool"));
     }
 
     #[test]
-    fn reply_hint_agent() {
-        let h = reply_hint("from:dev");
+    fn notify_source_agent_display() {
+        let s = NotifySource::Agent("dev");
+        assert_eq!(s.to_string(), "from:dev");
+        let h = s.reply_hint();
         assert!(h.contains("send_to_instance"));
         assert!(h.contains("dev"));
     }
 
     #[test]
-    fn reply_hint_system_empty() {
-        assert!(reply_hint("system:ci").is_empty());
+    fn notify_source_system_display() {
+        let s = NotifySource::System("ci");
+        assert_eq!(s.to_string(), "system:ci");
+        assert!(s.reply_hint().is_empty());
     }
 }
