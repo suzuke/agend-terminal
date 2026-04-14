@@ -3,36 +3,70 @@
 # Measures actual token usage in Claude Code for different tool delivery methods.
 #
 # Prerequisites: claude CLI installed and authenticated
-# Usage: bash tests/context-cost-benchmark.sh
+# Usage: bash tests/context-cost-benchmark.sh [RUNS]
+#   RUNS: number of runs per scenario (default: 5, takes median)
 
 set -euo pipefail
 
+RUNS=${1:-5}
 BENCHDIR=$(mktemp -d)
 trap '[[ -d "$BENCHDIR" ]] && rm -rf "$BENCHDIR"' EXIT
 
 echo "============================================="
 echo "Context Cost Benchmark: MCP vs CLI"
+echo "Runs per scenario: $RUNS (median)"
 echo "============================================="
 echo ""
 
-# --- Helper ---
+# --- Helper: single measurement ---
+measure_once() {
+    local dir=$1; shift
+    local result
+    result=$(cd "$dir" && claude --output-format json \
+        --dangerously-skip-permissions "$@" \
+        -p "reply with just 'ok'" 2>/dev/null)
+    echo "$result" | python3 -c "
+import sys,json; u=json.load(sys.stdin)['usage']
+print(u['cache_creation_input_tokens'])"
+}
+
+# --- Helper: N runs, return median ---
 measure() {
     local label=$1; shift
     local dir="$BENCHDIR/$label"
     mkdir -p "$dir"
 
-    local result
-    result=$(cd "$dir" && claude --output-format json \
-        --dangerously-skip-permissions "$@" \
-        -p "reply with just 'ok'" 2>/dev/null)
+    local values=()
+    for i in $(seq 1 "$RUNS"); do
+        echo -n "  run $i/$RUNS... "
+        local v
+        v=$(measure_once "$dir" "$@")
+        values+=("$v")
+        echo "$v tokens"
+    done
 
-    local tokens
-    tokens=$(echo "$result" | python3 -c "
-import sys,json; u=json.load(sys.stdin)['usage']
-print(u['cache_creation_input_tokens'], u['cache_read_input_tokens'], u['input_tokens'], u['output_tokens'])")
-
-    echo "$label|$tokens"
+    # Median via python
+    local median
+    median=$(python3 -c "
+v = sorted([$(IFS=,; echo "${values[*]}")])
+n = len(v)
+print(v[n//2] if n % 2 else (v[n//2-1] + v[n//2]) // 2)")
+    echo "  → median: $median"
+    echo "$label|$median"
 }
+
+# Routing rules shared by both MCP+rules and CLI-only tests
+ROUTING_RULES='# AgEnD Terminal Tools
+
+This project uses `agend_*` CLI tools for message routing.
+
+## How to respond
+- `[user:NAME via telegram]` → `agend_reply "text"`
+- `[from:INSTANCE]` → `agend_send INSTANCE "text"`
+
+## Examples
+User: `[user:alice via telegram] hi` → Run: `agend_reply "Hello!"`
+Agent: `[from:dev] review this` → Run: `agend_send dev "Sure!"`'
 
 # --- 1. Fake MCP server with 37 tools ---
 cat > "$BENCHDIR/mcp-server.py" << 'PYEOF'
@@ -101,7 +135,12 @@ cat > "$BENCHDIR/mcp-37.json" << JSON
 {"mcpServers":{"agend":{"command":"python3","args":["$BENCHDIR/mcp-server.py"]}}}
 JSON
 
-# --- 3. CLI instruction (needs git init for Claude Code to load rules) ---
+# --- 3. Setup: MCP + routing rules (apples-to-apples with CLI) ---
+mkdir -p "$BENCHDIR/mcp37/.claude/rules"
+(cd "$BENCHDIR/mcp37" && git init -q)
+echo "$ROUTING_RULES" > "$BENCHDIR/mcp37/.claude/rules/agend.md"
+
+# --- 4. Setup: CLI-only (routing rules + command reference) ---
 mkdir -p "$BENCHDIR/cli/.claude/rules"
 (cd "$BENCHDIR/cli" && git init -q)
 cat > "$BENCHDIR/cli/.claude/rules/agend.md" << 'MD'
@@ -137,68 +176,67 @@ Agent: `[from:dev] review this` → Run: `agend_send dev "Sure!"`
 MD
 
 # --- Run tests ---
-echo "Running 3 tests (each calls Claude API once)..."
+echo "Running 4 scenarios × $RUNS runs = $((4 * RUNS)) API calls..."
 echo ""
 
-echo -n "[1/3] Baseline (no tools)... "
+echo "[1/4] Baseline (no tools, no rules)"
 R1=$(measure "baseline")
-echo "done"
+echo ""
 
-echo -n "[2/3] MCP 37 tools... "
+echo "[2/4] MCP 37 tools + routing rules"
 R2=$(measure "mcp37" --mcp-config "$BENCHDIR/mcp-37.json")
-echo "done"
+echo ""
 
-echo -n "[3/3] CLI instruction (.claude/rules/)... "
+echo "[3/4] CLI instruction only (rules with command reference)"
 R3=$(measure "cli")
-echo "done"
+echo ""
+
+echo "[4/4] MCP 37 tools only (no routing rules)"
+mkdir -p "$BENCHDIR/mcp37-bare"
+R4=$(measure "mcp37-bare" --mcp-config "$BENCHDIR/mcp-37.json")
+echo ""
 
 # --- Report ---
-echo ""
 echo "============================================="
-echo "Results"
+echo "Results (median of $RUNS runs)"
 echo "============================================="
 echo ""
 
 python3 << PYEOF
 rows = """$R1
 $R2
-$R3""".strip().split("\n")
+$R3
+$R4""".strip().split("\n")
 
 data = []
 for row in rows:
-    parts = row.split("|")
-    label = parts[0]
-    nums = parts[1].split()
-    data.append({
-        "label": label,
-        "cache_create": int(nums[0]),
-        "cache_read": int(nums[1]),
-        "input": int(nums[2]),
-        "output": int(nums[3]),
-    })
+    label, median = row.split("|")
+    data.append({"label": label, "tokens": int(median)})
 
-baseline = data[0]["cache_create"]
+baseline = data[0]["tokens"]
 
-print(f"{'Scenario':<30} {'cache_create':>12} {'cache_read':>11} {'delta':>8} {'% of 200K':>10}")
-print("-" * 73)
+print(f"{'Scenario':<40} {'median':>8} {'delta':>8} {'% of 200K':>10}")
+print("-" * 68)
 for d in data:
-    delta = d["cache_create"] - baseline
+    delta = d["tokens"] - baseline
     pct = delta / 200000 * 100
     delta_str = f"+{delta}" if delta > 0 else "—"
     pct_str = f"{pct:.3f}%" if delta > 0 else "—"
-    print(f"{d['label']:<30} {d['cache_create']:>12,} {d['cache_read']:>11,} {delta_str:>8} {pct_str:>10}")
+    print(f"{d['label']:<40} {d['tokens']:>8,} {delta_str:>8} {pct_str:>10}")
 
 print()
-mcp_delta = data[1]["cache_create"] - baseline
-cli_delta = data[2]["cache_create"] - baseline
-print(f"MCP 37 tools overhead:    {mcp_delta:>6} tokens")
-print(f"CLI instruction overhead:  {cli_delta:>5} tokens")
-if cli_delta > 0:
-    print(f"MCP / CLI ratio:          {mcp_delta/cli_delta:.1f}x")
-print()
-print(f"On 200K context: MCP={mcp_delta/200000*100:.3f}%, CLI={cli_delta/200000*100:.3f}%")
-print(f"On 128K context: MCP={mcp_delta/128000*100:.3f}%, CLI={cli_delta/128000*100:.3f}%")
-print(f"On   1M context: MCP={mcp_delta/1000000*100:.4f}%, CLI={cli_delta/1000000*100:.4f}%")
+mcp_rules = data[1]["tokens"] - baseline
+cli_only = data[2]["tokens"] - baseline
+mcp_bare = data[3]["tokens"] - baseline
+
+print(f"MCP tools + routing rules:  {mcp_rules:>5} tokens  (fair comparison with CLI)")
+print(f"CLI instruction only:       {cli_only:>5} tokens")
+print(f"MCP tools only (no rules):  {mcp_bare:>5} tokens  (tool schema cost alone)")
+print(f"Routing rules alone:        {mcp_rules - mcp_bare:>5} tokens  (MCP+rules minus MCP-bare)")
+if cli_only > 0:
+    print(f"\nMCP+rules / CLI ratio:      {mcp_rules/cli_only:.2f}x")
+print(f"\nOn 200K: MCP+rules={mcp_rules/200000*100:.3f}%, CLI={cli_only/200000*100:.3f}%")
+print(f"On 128K: MCP+rules={mcp_rules/128000*100:.3f}%, CLI={cli_only/128000*100:.3f}%")
 PYEOF
 
 echo ""
