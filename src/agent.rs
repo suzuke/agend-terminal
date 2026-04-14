@@ -38,6 +38,21 @@ pub struct AgentHandle {
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
 
+/// Handle for an externally connected agent (not PTY-managed by daemon).
+pub struct ExternalAgentHandle {
+    pub backend_command: String,
+    pub pid: u32,
+}
+
+pub type ExternalRegistry = Arc<Mutex<HashMap<String, ExternalAgentHandle>>>;
+
+/// Lock the external registry, recovering from poison.
+pub fn lock_external(
+    reg: &ExternalRegistry,
+) -> std::sync::MutexGuard<'_, HashMap<String, ExternalAgentHandle>> {
+    reg.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Validate and sanitize an instance name. Only allows [a-zA-Z0-9_-].
 pub fn validate_name(name: &str) -> Result<&str, String> {
     if name.is_empty() {

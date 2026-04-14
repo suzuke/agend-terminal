@@ -115,7 +115,8 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
             .spawn(move || {
                 let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let configs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-                api::serve(&api_home, api_reg, shutdown, configs)
+                let externals = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                api::serve(&api_home, api_reg, shutdown, configs, externals)
             })
             .ok();
 

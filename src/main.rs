@@ -4,6 +4,7 @@ mod backend;
 mod bugreport;
 mod channel;
 mod cli;
+mod connect;
 mod daemon;
 mod decisions;
 mod deployments;
@@ -158,6 +159,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Connect a local agent to the running daemon
+    Connect {
+        /// Agent name (unique identifier)
+        name: String,
+        /// Backend command (claude, kiro-cli, codex, opencode, gemini)
+        #[arg(long)]
+        backend: String,
+        /// Working directory (default: current dir)
+        #[arg(long)]
+        working_dir: Option<String>,
+        /// Extra args passed to backend
+        #[arg(last = true)]
+        extra_args: Vec<String>,
+    },
     /// Stop the daemon
     Stop,
     /// Kill a specific agent
@@ -297,6 +312,14 @@ fn main() -> anyhow::Result<()> {
                     .collect()
             };
             daemon::run(&home, agents)?;
+        }
+        Some(Commands::Connect {
+            name,
+            backend,
+            working_dir,
+            extra_args,
+        }) => {
+            connect::run(&home, &name, &backend, working_dir.as_deref(), &extra_args)?;
         }
         Some(Commands::Attach { name }) => {
             let sock = daemon::agent_socket_path(&home, &name);
