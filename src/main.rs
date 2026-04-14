@@ -1,5 +1,4 @@
 mod agent;
-mod agent_cli;
 mod api;
 mod backend;
 mod bugreport;
@@ -172,11 +171,6 @@ enum Commands {
         command: FleetCommands,
     },
     /// Agent CLI — commands for agent-to-agent coordination (JSON output)
-    #[command(alias = "a")]
-    Agent {
-        #[command(subcommand)]
-        command: agent_cli::AgentCommand,
-    },
     /// Start MCP stdio server
     Mcp,
     /// Capture backend output for debugging
@@ -433,9 +427,6 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => daemon_not_running_hint(),
             },
         },
-        Some(Commands::Agent { command }) => {
-            agent_cli::run(&home, command);
-        }
         Some(Commands::Mcp) => {
             let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
             if instance_name.is_empty() {
