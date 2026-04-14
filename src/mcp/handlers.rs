@@ -219,13 +219,37 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             Err(_) => json!({"instances": list_agents()}),
         },
         "create_instance" => {
-            let name = match args["name"].as_str() {
+            let raw_name = match args["name"].as_str() {
                 Some(n) => n,
                 None => return json!({"error": "missing 'name'"}),
             };
-            if let Err(e) = crate::agent::validate_name(name) {
+            if let Err(e) = crate::agent::validate_name(raw_name) {
                 return json!({"error": e});
             }
+            // Auto-dedup: append short random suffix if name already exists
+            let name_owned = {
+                let existing: std::collections::HashSet<String> =
+                    crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                        .map(|c| c.instance_names().into_iter().collect())
+                        .unwrap_or_default();
+                if existing.contains(raw_name) {
+                    let suffix = format!(
+                        "{:04x}",
+                        (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .subsec_nanos()
+                            ^ std::process::id())
+                            & 0xFFFF
+                    );
+                    let deduped = format!("{raw_name}-{suffix}");
+                    tracing::info!(original = raw_name, deduped = %deduped, "name conflict, auto-deduped");
+                    deduped
+                } else {
+                    raw_name.to_string()
+                }
+            };
+            let name: &str = &name_owned;
             // Accept "backend" (preferred) or "command" (deprecated) for the CLI tool name.
             // Default to "claude" if neither is specified.
             let command = args["backend"]
