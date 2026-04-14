@@ -5,15 +5,15 @@ use serde::{Deserialize, Serialize};
 /// Known backend presets. Serde names match the actual CLI command.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Backend {
-    #[serde(rename = "claude")]
+    #[serde(rename = "claude", alias = "claude-code")]
     ClaudeCode,
     #[serde(rename = "kiro-cli", alias = "kiro")]
     KiroCli,
-    #[serde(rename = "codex")]
+    #[serde(rename = "codex", alias = "codex-cli")]
     Codex,
-    #[serde(rename = "opencode")]
+    #[serde(rename = "opencode", alias = "opencode-cli")]
     OpenCode,
-    #[serde(rename = "gemini")]
+    #[serde(rename = "gemini", alias = "gemini-cli")]
     Gemini,
 }
 
