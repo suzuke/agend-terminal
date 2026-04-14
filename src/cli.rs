@@ -107,6 +107,12 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
                     args.push("--settings".to_string());
                     args.push(settings.display().to_string());
                 }
+                // MCP config for agend-terminal tools
+                let mcp_config = dir.join("mcp-config.json");
+                if mcp_config.exists() {
+                    args.push("--mcp-config".to_string());
+                    args.push(mcp_config.display().to_string());
+                }
             }
 
             agents.push((
