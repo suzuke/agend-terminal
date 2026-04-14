@@ -554,13 +554,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                             let preserve = ["--mcp-config", "--settings"];
                             let mut i = 0;
                             while i < config.args.len() {
-                                if preserve.contains(&config.args[i].as_str()) {
-                                    if i + 1 < config.args.len() {
-                                        respawn_args.push(config.args[i].clone());
-                                        respawn_args.push(config.args[i + 1].clone());
-                                        i += 2;
-                                        continue;
-                                    }
+                                if preserve.contains(&config.args[i].as_str())
+                                    && i + 1 < config.args.len()
+                                {
+                                    respawn_args.push(config.args[i].clone());
+                                    respawn_args.push(config.args[i + 1].clone());
+                                    i += 2;
+                                    continue;
                                 }
                                 i += 1;
                             }
