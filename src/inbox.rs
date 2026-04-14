@@ -92,7 +92,14 @@ pub fn notify_agent(home: &Path, agent_name: &str, from: &str, text: &str, submi
     } else {
         text.to_string()
     };
-    let notification = format!("[{from}] {display_text}{submit_key}");
+    let hint = if from.contains("via telegram") {
+        "\n(Reply using the reply tool — do NOT respond with direct text)".to_string()
+    } else if let Some(sender) = from.strip_prefix("from:") {
+        format!("\n(Reply using the send_to_instance tool with target \"{sender}\")")
+    } else {
+        String::new()
+    };
+    let notification = format!("[{from}] {display_text}{hint}{submit_key}");
 
     // Use API socket to inject (doesn't kick attach clients)
     let _ = crate::api::call(
@@ -307,26 +314,29 @@ mod tests {
 
     #[test]
     fn notify_format_telegram_has_reply_hint() {
-        // We can't easily call notify_agent (needs API), but we can test
-        // the hint logic by checking the format string construction.
         let from = "user:chiacheng via telegram";
         let hint = if from.contains("via telegram") {
-            " (reply: agend-terminal agent reply \"your response\")"
+            "\n(Reply using the reply tool — do NOT respond with direct text)".to_string()
+        } else if let Some(sender) = from.strip_prefix("from:") {
+            format!("\n(Reply using the send_to_instance tool with target \"{sender}\")")
         } else {
-            ""
+            String::new()
         };
-        assert!(hint.contains("agent reply"));
+        assert!(hint.contains("reply tool"));
     }
 
     #[test]
     fn notify_format_agent_has_send_hint() {
         let from = "from:dev";
-        let hint = if let Some(target) = from.strip_prefix("from:") {
-            format!(" (reply: agend-terminal agent send {target} \"your response\")")
+        let hint = if from.contains("via telegram") {
+            "\n(Reply using the reply tool — do NOT respond with direct text)".to_string()
+        } else if let Some(sender) = from.strip_prefix("from:") {
+            format!("\n(Reply using the send_to_instance tool with target \"{sender}\")")
         } else {
             String::new()
         };
-        assert!(hint.contains("agent send dev"));
+        assert!(hint.contains("send_to_instance"));
+        assert!(hint.contains("dev"));
     }
 
     #[test]
