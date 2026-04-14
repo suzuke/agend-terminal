@@ -464,10 +464,40 @@ fn try_dismiss_dialog(
     for (pattern, key_seq) in dismiss_patterns {
         if clean.contains(pattern.as_str()) {
             tracing::info!(agent = name, pattern, "auto-dismissing dialog");
-            let _ = pty_writer
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .write_all(key_seq);
+            // Delayed write: TUI escape-sequence parsers need time to distinguish
+            // \x1b (ESC key) from \x1b[ (CSI start).  Writing immediately causes
+            // Ink-based TUIs (kiro-cli) to interpret \x1b as "ESC to cancel".
+            let writer = Arc::clone(pty_writer);
+            let keys = key_seq.clone();
+            let agent = name.to_string();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                // Send keys in chunks split on \r/\n boundaries with delay between,
+                // so TUI frameworks process navigation before confirmation.
+                let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                let mut start = 0;
+                for (i, &b) in keys.iter().enumerate() {
+                    if b == b'\r' || b == b'\n' {
+                        // Send everything up to (not including) this Enter
+                        if start < i {
+                            let _ = w.write_all(&keys[start..i]);
+                            let _ = w.flush();
+                            drop(w);
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                        }
+                        // Send the Enter
+                        let _ = w.write_all(&keys[i..=i]);
+                        let _ = w.flush();
+                        start = i + 1;
+                    }
+                }
+                if start < keys.len() {
+                    let _ = w.write_all(&keys[start..]);
+                    let _ = w.flush();
+                }
+                tracing::debug!(agent = %agent, "dismiss keystrokes sent");
+            });
             detect_buf.clear();
             return true;
         }
