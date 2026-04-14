@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum Backend {
     #[serde(rename = "claude")]
     ClaudeCode,
-    #[serde(rename = "kiro-cli")]
+    #[serde(rename = "kiro-cli", alias = "kiro")]
     KiroCli,
     #[serde(rename = "codex")]
     Codex,
