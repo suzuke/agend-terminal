@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-TMPDIR=$(mktemp -d)
-trap "rm -rf $TMPDIR" EXIT
+BENCHDIR=$(mktemp -d)
+trap '[[ -d "$BENCHDIR" ]] && rm -rf "$BENCHDIR"' EXIT
 
 echo "============================================="
 echo "Context Cost Benchmark: MCP vs CLI"
@@ -18,26 +18,24 @@ echo ""
 # --- Helper ---
 measure() {
     local label=$1; shift
-    local dir="$TMPDIR/$label"
+    local dir="$BENCHDIR/$label"
     mkdir -p "$dir"
-    
-    # Run claude and extract token usage
+
     local result
-    result=$(cd "$dir" && claude --print --output-format json \
+    result=$(cd "$dir" && claude --output-format json \
         --dangerously-skip-permissions "$@" \
         -p "reply with just 'ok'" 2>/dev/null)
-    
-    local input cache_create cache_read output
-    input=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['input_tokens'])")
-    cache_create=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['cache_creation_input_tokens'])")
-    cache_read=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['cache_read_input_tokens'])")
-    output=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['usage']['output_tokens'])")
-    
-    echo "$label|$cache_create|$cache_read|$input|$output"
+
+    local tokens
+    tokens=$(echo "$result" | python3 -c "
+import sys,json; u=json.load(sys.stdin)['usage']
+print(u['cache_creation_input_tokens'], u['cache_read_input_tokens'], u['input_tokens'], u['output_tokens'])")
+
+    echo "$label|$tokens"
 }
 
 # --- 1. Fake MCP server with 37 tools ---
-cat > "$TMPDIR/mcp-server.py" << 'PYEOF'
+cat > "$BENCHDIR/mcp-server.py" << 'PYEOF'
 import json, sys
 def handle(req):
     m = req.get("method", "")
@@ -99,13 +97,14 @@ for line in sys.stdin:
 PYEOF
 
 # --- 2. MCP config ---
-cat > "$TMPDIR/mcp-37.json" << JSON
-{"mcpServers":{"agend":{"command":"python3","args":["$TMPDIR/mcp-server.py"]}}}
+cat > "$BENCHDIR/mcp-37.json" << JSON
+{"mcpServers":{"agend":{"command":"python3","args":["$BENCHDIR/mcp-server.py"]}}}
 JSON
 
-# --- 3. CLI instruction file ---
-mkdir -p "$TMPDIR/cli/.claude/rules"
-cat > "$TMPDIR/cli/.claude/rules/agend.md" << 'MD'
+# --- 3. CLI instruction (needs git init for Claude Code to load rules) ---
+mkdir -p "$BENCHDIR/cli/.claude/rules"
+(cd "$BENCHDIR/cli" && git init -q)
+cat > "$BENCHDIR/cli/.claude/rules/agend.md" << 'MD'
 # AgEnD Terminal Tools
 
 This project uses `agend_*` CLI tools for message routing.
@@ -146,10 +145,10 @@ R1=$(measure "baseline")
 echo "done"
 
 echo -n "[2/3] MCP 37 tools... "
-R2=$(measure "mcp37" --mcp-config "$TMPDIR/mcp-37.json")
+R2=$(measure "mcp37" --mcp-config "$BENCHDIR/mcp-37.json")
 echo "done"
 
-echo -n "[3/3] CLI instruction... "
+echo -n "[3/3] CLI instruction (.claude/rules/)... "
 R3=$(measure "cli")
 echo "done"
 
@@ -168,32 +167,34 @@ $R3""".strip().split("\n")
 data = []
 for row in rows:
     parts = row.split("|")
+    label = parts[0]
+    nums = parts[1].split()
     data.append({
-        "label": parts[0],
-        "cache_create": int(parts[1]),
-        "cache_read": int(parts[2]),
-        "input": int(parts[3]),
-        "output": int(parts[4]),
+        "label": label,
+        "cache_create": int(nums[0]),
+        "cache_read": int(nums[1]),
+        "input": int(nums[2]),
+        "output": int(nums[3]),
     })
 
 baseline = data[0]["cache_create"]
 
-print(f"{'Scenario':<25} {'cache_create':>12} {'cache_read':>11} {'delta':>8} {'% of 200K':>10}")
-print("-" * 68)
+print(f"{'Scenario':<30} {'cache_create':>12} {'cache_read':>11} {'delta':>8} {'% of 200K':>10}")
+print("-" * 73)
 for d in data:
     delta = d["cache_create"] - baseline
     pct = delta / 200000 * 100
     delta_str = f"+{delta}" if delta > 0 else "—"
     pct_str = f"{pct:.3f}%" if delta > 0 else "—"
-    print(f"{d['label']:<25} {d['cache_create']:>12,} {d['cache_read']:>11,} {delta_str:>8} {pct_str:>10}")
+    print(f"{d['label']:<30} {d['cache_create']:>12,} {d['cache_read']:>11,} {delta_str:>8} {pct_str:>10}")
 
 print()
 mcp_delta = data[1]["cache_create"] - baseline
 cli_delta = data[2]["cache_create"] - baseline
-print(f"MCP 37 tools overhead:  {mcp_delta:>6} tokens")
-print(f"CLI instruction overhead: {cli_delta:>5} tokens")
+print(f"MCP 37 tools overhead:    {mcp_delta:>6} tokens")
+print(f"CLI instruction overhead:  {cli_delta:>5} tokens")
 if cli_delta > 0:
-    print(f"MCP / CLI ratio:        {mcp_delta/cli_delta:.1f}x")
+    print(f"MCP / CLI ratio:          {mcp_delta/cli_delta:.1f}x")
 print()
 print(f"On 200K context: MCP={mcp_delta/200000*100:.3f}%, CLI={cli_delta/200000*100:.3f}%")
 print(f"On 128K context: MCP={mcp_delta/128000*100:.3f}%, CLI={cli_delta/128000*100:.3f}%")
