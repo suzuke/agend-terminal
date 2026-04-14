@@ -1,6 +1,6 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
-use super::telegram;
+use crate::telegram;
 use serde_json::{json, Value};
 
 pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name: &str) -> Value {

@@ -4,7 +4,6 @@
 //! Runs synchronously (no tokio needed).
 
 pub mod handlers;
-pub mod telegram;
 pub mod tools;
 
 use serde::Deserialize;
