@@ -208,9 +208,7 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
         return json!({"error": e});
     }
     // Resolve to actual CLI command via preset (e.g. "kiro" → "kiro-cli").
-    let raw_backend = args["backend"]
-        .as_str()
-        .unwrap_or("claude");
+    let raw_backend = args["backend"].as_str().unwrap_or("claude");
     let command = crate::backend::Backend::from_command(raw_backend)
         .map(|b| b.preset().command)
         .unwrap_or(raw_backend);

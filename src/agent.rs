@@ -451,7 +451,14 @@ fn try_dismiss_dialog(
 
     // DEBUG: log what dismiss sees (remove after fixing kiro TUI issue)
     if clean.len() > 50 {
-        let tail: String = clean.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
+        let tail: String = clean
+            .chars()
+            .rev()
+            .take(200)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         tracing::debug!(agent = name, patterns = dismiss_patterns.len(), clean_tail = %tail, "dismiss_check");
     }
 

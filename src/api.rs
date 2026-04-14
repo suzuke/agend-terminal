@@ -215,8 +215,7 @@ fn handle_session(
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
                 }
-                let command = params["backend"].as_str()
-                    .unwrap_or("bash");
+                let command = params["backend"].as_str().unwrap_or("bash");
                 let args: Vec<String> = params["args"]
                     .as_str()
                     .map(|s| s.split_whitespace().map(String::from).collect())

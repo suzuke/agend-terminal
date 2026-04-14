@@ -399,7 +399,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             match config.resolve_instance(name) {
                 Some(resolved) => {
                     let mut cmd_args = resolved.args.join(" ");
-                    if let Some(ref b) = crate::backend::Backend::from_command(&resolved.backend_command) {
+                    if let Some(ref b) =
+                        crate::backend::Backend::from_command(&resolved.backend_command)
+                    {
                         let resume = b.preset().resume_mode.args_for(&home, name);
                         if !resume.is_empty() {
                             if !cmd_args.is_empty() {
