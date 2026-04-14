@@ -540,7 +540,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
                             // After a crash, start fresh — use backend's fresh_args to avoid
                             // crash loops from stale resume (--continue, --resume <id>, etc.)
-                            let respawn_args: Vec<String> = if let Some(b) = crate::backend::Backend::from_command(&config.backend_command) {
+                            let mut respawn_args: Vec<String> = if let Some(b) = crate::backend::Backend::from_command(&config.backend_command) {
                                 let p = b.preset();
                                 p.fresh_args.unwrap_or(p.args)
                                     .iter()
@@ -550,6 +550,20 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                 // Unknown backend: strip common resume flags as best effort
                                 strip_resume_args(&config.args)
                             };
+                            // Preserve non-resume flags from original args (--mcp-config, --settings, etc.)
+                            let preserve = ["--mcp-config", "--settings"];
+                            let mut i = 0;
+                            while i < config.args.len() {
+                                if preserve.contains(&config.args[i].as_str()) {
+                                    if i + 1 < config.args.len() {
+                                        respawn_args.push(config.args[i].clone());
+                                        respawn_args.push(config.args[i + 1].clone());
+                                        i += 2;
+                                        continue;
+                                    }
+                                }
+                                i += 1;
+                            }
                             match agent::spawn_agent(
                                 &agent::SpawnConfig {
                                     name: &config.name, backend_command: &config.backend_command, args: &respawn_args,
