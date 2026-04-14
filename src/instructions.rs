@@ -6,7 +6,7 @@ const INSTRUCTIONS_VERSION: &str = "v7-cli";
 const AGEND_RULES: &str = r#"# AgEnD Terminal Communication
 <!-- agend-terminal instructions v7-cli -->
 
-You are an AgEnD Terminal agent. You communicate ONLY by running shell commands.
+You are an AgEnD Terminal agent. You communicate ONLY by running shell commands via the `shell` tool.
 Your text output is NOT visible to anyone. Only shell command results are delivered.
 If you respond with plain text, the user will see nothing.
 
@@ -222,9 +222,31 @@ fn generate_claude(working_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Kiro: AGENTS.md (always included by kiro)
+/// Kiro: .kiro/agents/agend.json + .kiro/prompts/agend.md
 fn generate_kiro(working_dir: &Path) -> Result<()> {
-    write_with_marker(&working_dir.join("AGENTS.md"), AGEND_RULES)
+    // Prompt file with agend instructions
+    let prompts_dir = working_dir.join(".kiro").join("prompts");
+    let prompt_path = prompts_dir.join("agend.md");
+    if !is_current(&prompt_path) {
+        std::fs::create_dir_all(&prompts_dir)?;
+        std::fs::write(&prompt_path, format!("{}\n{}\n", AGEND_RULES, AGEND_MARKER_END))?;
+    }
+    // Agent config referencing prompt via absolute file:// URI
+    let agent_dir = working_dir.join(".kiro").join("agents");
+    let agent_path = agent_dir.join("agend.json");
+    if !is_current(&agent_path) {
+        std::fs::create_dir_all(&agent_dir)?;
+        let agent = serde_json::json!({
+            "name": "agend",
+            "description": "AgEnD Terminal agent - communicates via agend_* shell commands",
+            "prompt": format!("file://{}", prompt_path.display()),
+            "tools": ["shell", "read", "write", "grep", "glob", "code"],
+            "allowedTools": ["shell", "read", "grep", "glob"]
+        });
+        std::fs::write(&agent_path, serde_json::to_string_pretty(&agent)?)?;
+        eprintln!("[info] Generated agent config: {}", agent_path.display());
+    }
+    Ok(())
 }
 
 /// Codex: AGENTS.md (marker append/replace) + auto-trust working directory
@@ -456,9 +478,13 @@ mod tests {
     fn generate_kiro_creates_steering() {
         let dir = tmp_dir("gen_kiro");
         generate(&dir, "kiro-cli");
-        assert!(dir.join("AGENTS.md").exists(), "missing AGENTS.md");
-        let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        assert!(content.contains("v7-cli"));
+        assert!(dir.join(".kiro/agents/agend.json").exists(), "missing agend.json");
+        assert!(dir.join(".kiro/prompts/agend.md").exists(), "missing prompt");
+        let prompt = std::fs::read_to_string(dir.join(".kiro/prompts/agend.md")).unwrap();
+        assert!(prompt.contains("v7-cli"));
+        let agent = std::fs::read_to_string(dir.join(".kiro/agents/agend.json")).unwrap();
+        assert!(agent.contains("file://"));
+        assert!(agent.contains("\"shell\""));
         std::fs::remove_dir_all(&dir).ok();
     }
 

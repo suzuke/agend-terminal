@@ -667,6 +667,7 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
             ".kiro/steering/agend.md",
             ".kiro/agents/agend.json",
             ".kiro/agents/agend-prompt.md",
+            ".kiro/prompts/agend.md",
             ".kiro/settings.json",
         ];
         for file in &agend_files {
