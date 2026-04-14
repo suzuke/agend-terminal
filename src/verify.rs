@@ -365,7 +365,7 @@ fn test_send(home: &Path) -> TestResult {
 fn test_create_delete(home: &Path) -> TestResult {
     if api::call(
         home,
-        &json!({"method": "spawn", "params": {"name": "verify-dynamic", "command": "/bin/bash"}}),
+        &json!({"method": "spawn", "params": {"name": "verify-dynamic", "backend": "/bin/bash"}}),
     )
     .is_err()
     {

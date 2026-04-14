@@ -124,7 +124,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 "method": "spawn",
                 "params": {
                     "name": inst_name,
-                    "command": command,
+                    "backend": command,
                     "working_directory": work_dir,
                 }
             }),

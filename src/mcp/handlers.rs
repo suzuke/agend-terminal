@@ -413,7 +413,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                     match crate::api::call(
                         &home,
                         &json!({"method": "spawn", "params": {
-                            "name": name, "command": resolved.backend_command, "args": cmd_args,
+                            "name": name, "backend": resolved.backend_command, "args": cmd_args,
                             "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
                         }}),
                     ) {
