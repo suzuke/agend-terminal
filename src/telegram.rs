@@ -12,6 +12,47 @@ use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ThreadId};
 
+// ---------------------------------------------------------------------------
+// Topic registry — persists topic_id → instance_name in $AGEND_HOME/topics.json
+// so we can detect orphaned topics on daemon restart.
+// ---------------------------------------------------------------------------
+
+fn topic_registry_path(home: &Path) -> PathBuf {
+    home.join("topics.json")
+}
+
+fn load_topic_registry(home: &Path) -> HashMap<i32, String> {
+    let path = topic_registry_path(home);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, v)| k.parse::<i32>().ok().map(|id| (id, v)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_topic_registry(home: &Path, registry: &HashMap<i32, String>) {
+    let map: HashMap<String, &String> = registry.iter().map(|(k, v)| (k.to_string(), v)).collect();
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(topic_registry_path(home), json);
+    }
+}
+
+fn register_topic(home: &Path, topic_id: i32, instance_name: &str) {
+    let mut reg = load_topic_registry(home);
+    reg.insert(topic_id, instance_name.to_string());
+    save_topic_registry(home, &reg);
+}
+
+fn unregister_topic(home: &Path, topic_id: i32) {
+    let mut reg = load_topic_registry(home);
+    reg.remove(&topic_id);
+    save_topic_registry(home, &reg);
+}
+
 /// Shared tokio runtime for all Telegram sync→async calls.
 fn telegram_runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -251,6 +292,32 @@ pub fn init_from_config(
         }
     };
 
+    // Clean up orphaned topics: exist in registry but not in fleet.yaml
+    let registry = load_topic_registry(home);
+    let instance_names: std::collections::HashSet<&String> = config.instances.keys().collect();
+    let bot = teloxide::Bot::new(&token);
+    let chat_id = teloxide::types::ChatId(*group_id);
+    let mut orphans = Vec::new();
+    for (tid, inst_name) in &registry {
+        if *tid != 1 && !instance_names.contains(inst_name) {
+            eprintln!("[telegram] orphaned topic {tid} ('{inst_name}' no longer in fleet), deleting");
+            let thread_id = ThreadId(MessageId(*tid));
+            let _ = telegram_runtime().block_on(async {
+                let _ = bot.close_forum_topic(chat_id, thread_id).await;
+                bot.delete_forum_topic(chat_id, thread_id).await
+            });
+            orphans.push(*tid);
+        }
+    }
+    if !orphans.is_empty() {
+        let mut reg = registry;
+        for tid in &orphans {
+            reg.remove(tid);
+        }
+        save_topic_registry(home, &reg);
+        eprintln!("[telegram] cleaned up {} orphaned topic(s)", orphans.len());
+    }
+
     let mut topic_map: HashMap<String, i32> = config
         .instances
         .iter()
@@ -258,30 +325,27 @@ pub fn init_from_config(
         .collect();
 
     // Auto-create topics for instances without topic_id
-    let bot = teloxide::Bot::new(&token);
-    let chat_id = teloxide::types::ChatId(*group_id);
     for (name, inst) in &config.instances {
         if name == "general" && inst.topic_id.is_none() {
             topic_map.insert("general".to_string(), 1);
         } else if inst.topic_id.is_none() {
             eprintln!("[telegram] creating topic for '{name}'...");
+            match telegram_runtime()
+                .block_on(async { bot.create_forum_topic(chat_id, name, 0x6FB9F0, "").await })
             {
-                match telegram_runtime()
-                    .block_on(async { bot.create_forum_topic(chat_id, name, 0x6FB9F0, "").await })
-                {
-                    Ok(topic) => {
-                        let tid = topic.thread_id.0 .0;
-                        eprintln!("[telegram] created topic '{name}' → {tid}");
-                        topic_map.insert(name.clone(), tid);
-                    }
-                    Err(e) => eprintln!("[telegram] failed to create topic for '{name}': {e}"),
+                Ok(topic) => {
+                    let tid = topic.thread_id.0 .0;
+                    eprintln!("[telegram] created topic '{name}' → {tid}");
+                    topic_map.insert(name.clone(), tid);
                 }
+                Err(e) => eprintln!("[telegram] failed to create topic for '{name}': {e}"),
             }
         }
     }
 
-    // Write back topic_ids
+    // Write back topic_ids + update registry
     if home.join("fleet.yaml").exists() && !topic_map.is_empty() {
+        let mut reg = load_topic_registry(home);
         for (name, tid) in &topic_map {
             let _ = crate::fleet::update_instance_field(
                 home,
@@ -289,7 +353,9 @@ pub fn init_from_config(
                 "topic_id",
                 serde_yaml::Value::Number(serde_yaml::Number::from(*tid)),
             );
+            reg.insert(*tid, name.clone());
         }
+        save_topic_registry(home, &reg);
         eprintln!("[telegram] updated fleet.yaml with topic_ids");
     }
 
@@ -527,6 +593,7 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
                         "topic_id",
                         serde_yaml::Value::Number(serde_yaml::Number::from(tid)),
                     );
+                    register_topic(home, tid, instance_name);
                     Some(tid)
                 }
                 Err(e) => {
@@ -563,6 +630,7 @@ pub fn delete_topic(home: &std::path::Path, topic_id: i32) {
         let _ = bot.close_forum_topic(chat_id, tid).await;
         bot.delete_forum_topic(chat_id, tid).await
     });
+    unregister_topic(home, topic_id);
     eprintln!("[telegram] deleted topic {topic_id}");
 }
 
@@ -762,5 +830,47 @@ instances:
         assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Topic registry tests ---
+
+    #[test]
+    fn topic_registry_roundtrip() {
+        let home = tmp_home("registry_roundtrip");
+        assert!(load_topic_registry(&home).is_empty());
+
+        register_topic(&home, 100, "alice");
+        register_topic(&home, 200, "bob");
+
+        let reg = load_topic_registry(&home);
+        assert_eq!(reg.get(&100), Some(&"alice".to_string()));
+        assert_eq!(reg.get(&200), Some(&"bob".to_string()));
+
+        unregister_topic(&home, 100);
+        let reg = load_topic_registry(&home);
+        assert!(!reg.contains_key(&100));
+        assert_eq!(reg.get(&200), Some(&"bob".to_string()));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn topic_registry_overwrite() {
+        let home = tmp_home("registry_overwrite");
+        register_topic(&home, 100, "alice");
+        register_topic(&home, 100, "bob");
+
+        let reg = load_topic_registry(&home);
+        assert_eq!(reg.get(&100), Some(&"bob".to_string()));
+        assert_eq!(reg.len(), 1);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn topic_registry_missing_file() {
+        let home = PathBuf::from("/tmp/agend-test-nonexistent-dir-12345");
+        let reg = load_topic_registry(&home);
+        assert!(reg.is_empty());
     }
 }
