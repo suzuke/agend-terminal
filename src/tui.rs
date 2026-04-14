@@ -118,7 +118,7 @@ pub fn attach(socket_path: &str) -> anyhow::Result<()> {
 }
 
 /// Convert crossterm KeyEvent to terminal bytes.
-fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
+pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let alt = modifiers.contains(KeyModifiers::ALT);
     match code {

@@ -1,5 +1,6 @@
 mod agent;
 mod api;
+mod app;
 mod backend;
 mod bugreport;
 mod channel;
@@ -26,6 +27,9 @@ mod store;
 mod tasks;
 mod teams;
 mod telegram;
+mod keybinds;
+mod layout;
+mod render;
 mod tui;
 mod verify;
 mod vterm;
@@ -173,6 +177,8 @@ enum Commands {
         #[arg(last = true)]
         extra_args: Vec<String>,
     },
+    /// Launch terminal app — multi-tab/pane TUI with agent management
+    App,
     /// Stop the daemon
     Stop,
     /// Kill a specific agent
@@ -257,10 +263,12 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => {
-            // Print help
             use clap::CommandFactory;
             Cli::command().print_help()?;
             println!();
+        }
+        Some(Commands::App) => {
+            app::run()?;
         }
         Some(Commands::Start) => {
             let fleet_path = home.join("fleet.yaml");

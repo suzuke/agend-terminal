@@ -69,7 +69,7 @@ pub fn generate(working_dir: &Path, command: &str) {
         _ => Ok(()),
     };
     if let Err(e) = result {
-        eprintln!("[warn] Failed to generate backend config: {e:#}");
+        tracing::warn!(error = %e, "failed to generate backend config");
     }
 
     // MCP config for all backends

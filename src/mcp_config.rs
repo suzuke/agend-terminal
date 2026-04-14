@@ -47,7 +47,7 @@ fn upsert_mcp_servers(path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
-    eprintln!("[info] Configured MCP: {}", path.display());
+    tracing::debug!(path = %path.display(), "configured MCP");
     Ok(())
 }
 
@@ -104,7 +104,7 @@ fn configure_claude(working_dir: &Path) -> Result<()> {
         }
     });
     std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-    eprintln!("[info] Claude settings: {}", settings_path.display());
+    tracing::debug!(path = %settings_path.display(), "Claude settings written");
 
     Ok(())
 }
@@ -157,7 +157,7 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
         "args": []
     });
     std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
-    eprintln!("[info] Configured MCP: {}", path.display());
+    tracing::debug!(path = %path.display(), "configured MCP");
 
     Ok(())
 }
@@ -199,7 +199,7 @@ fn configure_opencode(working_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
-    eprintln!("[info] Configured MCP: {}", path.display());
+    tracing::debug!(path = %path.display(), "configured MCP");
     Ok(())
 }
 
@@ -242,7 +242,7 @@ args = ["mcp"]
 AGEND_HOME = "{home}""#
         )?;
     }
-    eprintln!("[info] Configured MCP: {}", config_path.display());
+    tracing::debug!(path = %config_path.display(), "configured MCP");
 
     // Auto-trust working directory in ~/.codex/config.toml
     codex_trust_directory(working_dir);
@@ -275,7 +275,7 @@ fn codex_trust_directory(dir: &Path) {
             "\n"
         };
         let _ = writeln!(f, "{prefix}{toml_key}\ntrust_level = \"trusted\"");
-        eprintln!("[info] Codex: trusted {dir_str}");
+        tracing::debug!(dir = %dir_str, "Codex directory trusted");
     }
 }
 
@@ -296,7 +296,7 @@ pub fn configure(working_dir: &Path, command: &str) {
     };
 
     if let Err(e) = result {
-        eprintln!("[warn] Failed to configure MCP: {e:#}");
+        tracing::warn!(error = %e, "failed to configure MCP");
     }
 }
 
