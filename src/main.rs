@@ -229,6 +229,7 @@ fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agend_terminal=info")),
         )
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
