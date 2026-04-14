@@ -178,13 +178,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
             let current_path = std::env::var("PATH").unwrap_or_default();
-            let mut path_parts = vec![bin_dir.display().to_string()];
-            // Add .agend-bin/ wrapper scripts to PATH (short command aliases)
-            if let Some(dir) = working_dir {
-                path_parts.push(dir.join(".agend-bin").display().to_string());
-            }
-            path_parts.push(current_path);
-            cmd.env("PATH", path_parts.join(":"));
+            cmd.env("PATH", format!("{}:{current_path}", bin_dir.display()));
         }
     }
 

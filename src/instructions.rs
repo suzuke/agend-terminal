@@ -1,51 +1,27 @@
 use anyhow::Result;
 use std::path::Path;
 
-const INSTRUCTIONS_VERSION: &str = "v7-cli";
+const INSTRUCTIONS_VERSION: &str = "v8-mcp";
 
-const AGEND_RULES: &str = r#"# AgEnD Terminal Tools
-<!-- agend-terminal instructions v7-cli -->
+const AGEND_RULES: &str = r#"# AgEnD Terminal Communication
+<!-- agend-terminal instructions v8-mcp -->
 
-This project uses `agend_*` CLI tools for message routing. Users communicate via Telegram and other platforms — messages must be sent through these tools so they are properly delivered.
+## Message Types
 
-## How to respond
+You will receive two types of messages:
 
-- When you see `[user:NAME via telegram]`, use `agend_reply` to send your response to their Telegram.
-- When you see `[from:INSTANCE]`, use `agend_send INSTANCE` to reply to that agent.
-- For long or multi-line replies, use heredoc syntax:
+1. **`[user:NAME via telegram] text`** — A human user sent you a message via Telegram.
+   → Respond using the **`reply`** MCP tool.
 
-```bash
-agend_reply <<'EOF'
-Your message here
-EOF
-```
+2. **`[from:INSTANCE-NAME] text`** — Another agent instance sent you a message.
+   → Respond using the **`send_to_instance`** MCP tool with `instance_name` set to the instance name.
 
-## Available tools
+## Rules
 
-```
-agend_reply "text"                   Send reply to the current user
-agend_send TARGET "text"             Message another agent
-agend_delegate TARGET "task"         Assign work to an agent
-agend_report TARGET "summary"        Report results to an agent
-agend_ask TARGET "question"          Request info from an agent
-agend_broadcast "message"            Message all agents
-agend_inbox                          Check incoming messages
-agend_list                           List available agents
-agend_spawn NAME --backend claude    Create a new agent
-agend_delete NAME                    Remove an agent
-agend_describe NAME                  Get agent details
-agend_task create/list/claim/done    Task board operations
-agend_team create/list/delete        Team management
-agend_schedule create/list/delete    Scheduling
-```
-
-## Examples
-
-User message: `[user:alice via telegram] hi`
-→ Run: `agend_reply "Hello! How can I help?"`
-
-Agent message: `[from:dev] Can you review the auth module?`
-→ Run: `agend_send dev "Sure, I'll review it now."`
+- `[user:... via telegram]` → use **reply** (NOT send_to_instance)
+- `[from:INSTANCE]` → use **send_to_instance** with instance_name=INSTANCE (NOT reply)
+- For long messages, use **inbox** to see the full content
+- Keep replies concise and direct
 "#;
 
 const AGEND_MARKER_START: &str = "<!-- agend-terminal instructions";
@@ -137,45 +113,7 @@ fn write_with_marker(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Wrapper commands: short name → `agend-terminal agent <subcommand>`.
-const WRAPPER_COMMANDS: &[&str] = &[
-    "reply", "send", "delegate", "report", "ask", "broadcast", "inbox", "list",
-    "spawn", "start", "delete", "describe", "replace", "rename", "set-description",
-    "task", "decision", "team", "schedule", "deploy", "repo", "ci", "channel",
-    "react", "edit-message", "download",
-];
-
-/// Generate executable wrapper scripts in `{working_dir}/.agend-bin/`.
-fn generate_wrapper_scripts(working_dir: &Path) -> Result<()> {
-    let bin_dir = working_dir.join(".agend-bin");
-    // Skip if already populated with current version
-    let marker = bin_dir.join(".version");
-    if marker.exists()
-        && std::fs::read_to_string(&marker)
-            .map(|c| c.trim() == INSTRUCTIONS_VERSION)
-            .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&bin_dir)?;
-    for cmd in WRAPPER_COMMANDS {
-        let path = bin_dir.join(format!("agend_{cmd}"));
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\nexec agend-terminal agent {cmd} \"$@\"\n"),
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-        }
-    }
-    std::fs::write(&marker, INSTRUCTIONS_VERSION)?;
-    eprintln!("[info] Generated wrapper scripts: {}", bin_dir.display());
-    Ok(())
-}
-
-/// Claude Code: .claude/rules/agend.md + statusline for session ID capture
+/// Claude Code: .claude/rules/agend.md + statusline
 fn generate_claude(working_dir: &Path) -> Result<()> {
     write_file(
         &working_dir.join(".claude").join("rules").join("agend.md"),
@@ -208,34 +146,15 @@ fn generate_claude(working_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Kiro: .kiro/agents/agend.json + .kiro/prompts/agend.md
+/// Kiro: .kiro/steering/agend.md
 fn generate_kiro(working_dir: &Path) -> Result<()> {
-    // Prompt file with agend instructions
-    let prompts_dir = working_dir.join(".kiro").join("prompts");
-    let prompt_path = prompts_dir.join("agend.md");
-    if !is_current(&prompt_path) {
-        std::fs::create_dir_all(&prompts_dir)?;
-        std::fs::write(&prompt_path, format!("{}\n{}\n", AGEND_RULES, AGEND_MARKER_END))?;
-    }
-    // Agent config referencing prompt via absolute file:// URI
-    let agent_dir = working_dir.join(".kiro").join("agents");
-    let agent_path = agent_dir.join("agend.json");
-    if !is_current(&agent_path) {
-        std::fs::create_dir_all(&agent_dir)?;
-        let agent = serde_json::json!({
-            "name": "agend",
-            "description": "AgEnD Terminal agent - communicates via agend_* shell commands",
-            "prompt": format!("file://{}", prompt_path.display()),
-            "tools": ["shell", "read", "write", "grep", "glob", "code"],
-            "allowedTools": ["shell", "read", "grep", "glob"]
-        });
-        std::fs::write(&agent_path, serde_json::to_string_pretty(&agent)?)?;
-        eprintln!("[info] Generated agent config: {}", agent_path.display());
-    }
-    Ok(())
+    write_file(
+        &working_dir.join(".kiro").join("steering").join("agend.md"),
+        AGEND_RULES,
+    )
 }
 
-/// Codex: AGENTS.md (marker append/replace) + auto-trust working directory
+/// Codex: AGENTS.md + auto-trust
 fn generate_codex(working_dir: &Path) -> Result<()> {
     write_with_marker(&working_dir.join("AGENTS.md"), AGEND_RULES)?;
     codex_trust_directory(working_dir);
@@ -269,17 +188,17 @@ fn codex_trust_directory(dir: &Path) {
     }
 }
 
-/// Gemini: GEMINI.md (marker append/replace)
+/// Gemini: GEMINI.md
 fn generate_gemini(working_dir: &Path) -> Result<()> {
     write_with_marker(&working_dir.join("GEMINI.md"), AGEND_RULES)
 }
 
-/// OpenCode: AGENTS.md (auto-discovered by opencode)
+/// OpenCode: AGENTS.md
 fn generate_opencode(working_dir: &Path) -> Result<()> {
     write_with_marker(&working_dir.join("AGENTS.md"), AGEND_RULES)
 }
 
-/// Detect backend from command name and generate appropriate instructions.
+/// Detect backend from command name and generate appropriate instructions + MCP config.
 pub fn generate(working_dir: &Path, command: &str) {
     let backend = crate::backend::Backend::from_command(command);
     let result = match backend {
@@ -295,9 +214,8 @@ pub fn generate(working_dir: &Path, command: &str) {
         eprintln!("[warn] Failed to generate instructions: {e:#}");
     }
 
-    if let Err(e) = generate_wrapper_scripts(working_dir) {
-        eprintln!("[warn] Failed to generate wrapper scripts: {e:#}");
-    }
+    // Generate MCP config for the backend
+    crate::mcp_config::configure(working_dir, command);
 }
 
 #[cfg(test)]
@@ -322,7 +240,7 @@ mod tests {
     fn write_with_marker_creates_new_file() {
         let dir = tmp_dir("new_file");
         let path = dir.join("AGENTS.md");
-        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v7-cli -->")
+        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v8-mcp -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# Test"));
@@ -335,12 +253,12 @@ mod tests {
         let dir = tmp_dir("before");
         let path = dir.join("AGENTS.md");
         std::fs::write(&path, "# My Custom Rules\n\nDo not delete files.\n").ok();
-        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v7-cli -->")
+        write_with_marker(&path, "# Test\n<!-- agend-terminal instructions v8-mcp -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# My Custom Rules"));
         assert!(content.contains("Do not delete files."));
-        assert!(content.contains("v7-cli"));
+        assert!(content.contains("v8-mcp"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -354,11 +272,11 @@ mod tests {
             AGEND_MARKER_END
         );
         std::fs::write(&path, &initial).ok();
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v7-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v8-mcp -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# Preamble"));
-        assert!(content.contains("v7-cli"));
+        assert!(content.contains("v8-mcp"));
         assert!(!content.contains("v3-mcp"));
         assert!(!content.contains("old stuff"));
         assert!(content.contains("# My Notes"));
@@ -373,10 +291,10 @@ mod tests {
         write_with_marker(&path, "# Old\n<!-- agend-terminal instructions v3-mcp -->")
             .expect("first write");
         // Force re-write by bumping version
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v7-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v8-mcp -->")
             .expect("second write");
         let content = std::fs::read_to_string(&path).expect("read");
-        assert!(content.contains("v7-cli"));
+        assert!(content.contains("v8-mcp"));
         assert!(!content.contains("v3-mcp"));
         // Should have exactly one end marker
         assert_eq!(
@@ -391,7 +309,7 @@ mod tests {
     fn write_with_marker_idempotent() {
         let dir = tmp_dir("idempotent");
         let path = dir.join("AGENTS.md");
-        let content = format!("# Test\n<!-- agend-terminal instructions v7-cli -->\nstuff\n");
+        let content = format!("# Test\n<!-- agend-terminal instructions v8-mcp -->\nstuff\n");
         write_with_marker(&path, &content).expect("first");
         let first = std::fs::read_to_string(&path).expect("read");
         write_with_marker(&path, &content).expect("second");
@@ -413,11 +331,11 @@ mod tests {
             "# User stuff\n\n<!-- agend-terminal instructions v3-mcp -->\nold agend content\n",
         )
         .ok();
-        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v7-cli -->")
+        write_with_marker(&path, "# New\n<!-- agend-terminal instructions v8-mcp -->")
             .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(content.contains("# User stuff"));
-        assert!(content.contains("v7-cli"));
+        assert!(content.contains("v8-mcp"));
         assert!(!content.contains("old agend content"));
         assert!(content.contains(AGEND_MARKER_END));
         std::fs::remove_dir_all(&dir).ok();
@@ -429,7 +347,7 @@ mod tests {
         let path = dir.join("test.md");
         write_file(
             &path,
-            "# Rules\n<!-- agend-terminal instructions v7-cli -->",
+            "# Rules\n<!-- agend-terminal instructions v8-mcp -->",
         )
         .expect("write");
         let content = std::fs::read_to_string(&path).expect("read");
@@ -464,13 +382,12 @@ mod tests {
     fn generate_kiro_creates_steering() {
         let dir = tmp_dir("gen_kiro");
         generate(&dir, "kiro-cli");
-        assert!(dir.join(".kiro/agents/agend.json").exists(), "missing agend.json");
-        assert!(dir.join(".kiro/prompts/agend.md").exists(), "missing prompt");
-        let prompt = std::fs::read_to_string(dir.join(".kiro/prompts/agend.md")).unwrap();
-        assert!(prompt.contains("v7-cli"));
-        let agent = std::fs::read_to_string(dir.join(".kiro/agents/agend.json")).unwrap();
-        assert!(agent.contains("file://"));
-        assert!(agent.contains("\"shell\""));
+        assert!(
+            dir.join(".kiro/steering/agend.md").exists(),
+            "missing .kiro/steering/agend.md"
+        );
+        let content = std::fs::read_to_string(dir.join(".kiro/steering/agend.md")).unwrap();
+        assert!(content.contains("v8-mcp"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -480,7 +397,7 @@ mod tests {
         generate(&dir, "codex");
         assert!(dir.join("AGENTS.md").exists(), "missing AGENTS.md");
         let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        assert!(content.contains("v7-cli"));
+        assert!(content.contains("v8-mcp"));
         assert!(content.contains(AGEND_MARKER_END));
         // Trust: check ~/.codex/config.toml has the directory
         let home = std::env::var("HOME").unwrap_or_default();
@@ -502,7 +419,7 @@ mod tests {
         generate(&dir, "gemini");
         assert!(dir.join("GEMINI.md").exists(), "missing GEMINI.md");
         let content = std::fs::read_to_string(dir.join("GEMINI.md")).unwrap();
-        assert!(content.contains("v7-cli"));
+        assert!(content.contains("v8-mcp"));
         assert!(content.contains(AGEND_MARKER_END));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -513,7 +430,7 @@ mod tests {
         generate(&dir, "opencode");
         assert!(dir.join("AGENTS.md").exists(), "missing AGENTS.md");
         let content = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        assert!(content.contains("v7-cli"));
+        assert!(content.contains("v8-mcp"));
         assert!(content.contains(AGEND_MARKER_END));
         std::fs::remove_dir_all(&dir).ok();
     }

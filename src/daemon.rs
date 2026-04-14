@@ -616,30 +616,26 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
     }
 
-    // Shutdown: clean up generated files + print residual worktrees
+    // Shutdown: print residual worktrees
     {
         let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
         let mut seen = std::collections::HashSet::new();
         for config in cfgs.values() {
-            // Clean up wrapper scripts (per working_dir, deduplicated)
-            if let Some(ref wd) = config.working_dir {
-                if seen.insert(wd.clone()) {
-                    let _ = std::fs::remove_dir_all(wd.join(".agend-bin"));
-                }
-            }
             // Use worktree_source (original repo) if available, otherwise working_dir
             let repo = config
                 .worktree_source
                 .as_ref()
                 .or(config.working_dir.as_ref());
             if let Some(dir) = repo {
-                let residual = crate::worktree::list_residual(dir);
-                if !residual.is_empty() {
-                    tracing::info!(
-                        repo = %dir.display(),
-                        residual = ?residual,
-                        "residual worktrees found (use `git worktree remove` to clean)"
-                    );
+                if seen.insert(dir.clone()) {
+                    let residual = crate::worktree::list_residual(dir);
+                    if !residual.is_empty() {
+                        tracing::info!(
+                            repo = %dir.display(),
+                            residual = ?residual,
+                            "residual worktrees found (use `git worktree remove` to clean)"
+                        );
+                    }
                 }
             }
         }
