@@ -305,7 +305,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
 
             match crate::api::call(
                 &home,
-                &json!({"method": "spawn", "params": {"name": name, "command": command, "args": &cmd_args, "working_directory": work_dir}}),
+                &json!({"method": "spawn", "params": {"name": name, "backend": command, "args": &cmd_args, "working_directory": work_dir}}),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     let entry = crate::fleet::InstanceYamlEntry {
