@@ -121,7 +121,12 @@ impl Backend {
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
                 ready_timeout_secs: 30,
-                dismiss_patterns: &[],
+                dismiss_patterns: &[
+                    // TUI trust confirmation: ❯ already on target → just Enter
+                    ("\u{276f} Yes, I accept", b"\r"),
+                    // ❯ elsewhere (e.g. "No, exit") → Down to "Yes, I accept" → Enter
+                    ("Yes, I accept", b"\x1b[B\r"),
+                ],
                 fresh_args: None, // same as args
             },
             Backend::Codex => BackendPreset {
