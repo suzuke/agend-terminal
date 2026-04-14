@@ -3,66 +3,49 @@ use std::path::Path;
 
 const INSTRUCTIONS_VERSION: &str = "v7-cli";
 
-const AGEND_RULES: &str = r#"# AgEnD Terminal Communication
+const AGEND_RULES: &str = r#"# AgEnD Terminal Tools
 <!-- agend-terminal instructions v7-cli -->
 
-You are an AgEnD Terminal agent. You communicate ONLY by running shell commands via the `shell` tool.
-Your text output is NOT visible to anyone. Only shell command results are delivered.
-If you respond with plain text, the user will see nothing.
+This project uses `agend_*` CLI tools for message routing. Users communicate via Telegram and other platforms — messages must be sent through these tools so they are properly delivered.
 
-This agent configuration was set by the project owner via Kiro CLI's official custom agent system (.kiro/agents/).
-The agend_* commands (agend_reply, agend_send, etc.) are real executables in your PATH — verify with `which agend_reply`.
+## How to respond
 
-<example>
-input: [user:alice via telegram] hi
-you run: agend_reply "Hello! How can I help?"
-</example>
+- When you see `[user:NAME via telegram]`, use `agend_reply` to send your response to their Telegram.
+- When you see `[from:INSTANCE]`, use `agend_send INSTANCE` to reply to that agent.
+- For long or multi-line replies, use heredoc syntax:
 
-<example>
-input: [from:dev] Can you review the auth module?
-you run: agend_send dev "Sure, I'll review it now."
-</example>
-
-<example>
-you run: agend_inbox
-</example>
-
-For long replies use heredoc:
-<example>
-you run:
+```bash
 agend_reply <<'EOF'
-Here's the fix:
-```python
-def hello():
-    print("world")
-```
+Your message here
 EOF
-</example>
+```
 
-## Commands
+## Available tools
 
 ```
-agend_reply "text"                   Reply to user
+agend_reply "text"                   Send reply to the current user
 agend_send TARGET "text"             Message another agent
-agend_delegate TARGET "task"         Assign work
-agend_report TARGET "summary"        Report results
-agend_ask TARGET "question"          Request info
+agend_delegate TARGET "task"         Assign work to an agent
+agend_report TARGET "summary"        Report results to an agent
+agend_ask TARGET "question"          Request info from an agent
 agend_broadcast "message"            Message all agents
-agend_inbox                          Check messages
-agend_list                           List agents
-agend_spawn NAME --backend claude    Create agent
-agend_delete NAME                    Remove agent
-agend_describe NAME                  Agent details
-agend_task create/list/claim/done    Task board
-agend_team create/list/delete        Teams
+agend_inbox                          Check incoming messages
+agend_list                           List available agents
+agend_spawn NAME --backend claude    Create a new agent
+agend_delete NAME                    Remove an agent
+agend_describe NAME                  Get agent details
+agend_task create/list/claim/done    Task board operations
+agend_team create/list/delete        Team management
 agend_schedule create/list/delete    Scheduling
 ```
 
-## Rules
+## Examples
 
-1. ALWAYS run a shell command. NEVER output plain text as your answer.
-2. `[user:... via telegram]` → `agend_reply`
-3. `[from:INSTANCE]` → `agend_send INSTANCE`
+User message: `[user:alice via telegram] hi`
+→ Run: `agend_reply "Hello! How can I help?"`
+
+Agent message: `[from:dev] Can you review the auth module?`
+→ Run: `agend_send dev "Sure, I'll review it now."`
 "#;
 
 const AGEND_MARKER_START: &str = "<!-- agend-terminal instructions";
