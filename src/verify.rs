@@ -47,7 +47,7 @@ impl TestResult {
 fn test_spawn_config<'a>(name: &'a str, home: Option<&'a Path>) -> agent::SpawnConfig<'a> {
     agent::SpawnConfig {
         name,
-        command: "/bin/bash",
+        backend_command: "/bin/bash",
         args: &[],
         cols: 80,
         rows: 24,
@@ -443,7 +443,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let spawn_result = agent::spawn_agent(
         &agent::SpawnConfig {
             name: &agent_name,
-            command: preset.command,
+            backend_command: preset.command,
             args: &args,
             cols: 120,
             rows: 40,

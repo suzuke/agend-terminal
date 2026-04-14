@@ -86,7 +86,7 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
             for a in &snapshot.agents {
                 out.push_str(&format!(
                     "  {} state={} health={} cmd={}\n",
-                    a.name, a.agent_state, a.health_state, a.command
+                    a.name, a.agent_state, a.health_state, a.backend_command
                 ));
             }
         }

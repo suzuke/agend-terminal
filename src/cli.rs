@@ -84,12 +84,12 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
 
             // Generate instructions + MCP config
             if let Some(ref dir) = resolved.working_directory {
-                crate::instructions::generate(dir, &resolved.command);
+                crate::instructions::generate(dir, &resolved.backend_command);
             }
 
             // Add resume args to continue previous session
             let mut args = resolved.args;
-            if let Some(ref b) = backend::Backend::from_command(&resolved.command) {
+            if let Some(ref b) = backend::Backend::from_command(&resolved.backend_command) {
                 let p = b.preset();
                 args.extend(p.resume_mode.args_for(home, &name));
             }
@@ -111,7 +111,7 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
 
             agents.push((
                 resolved.name,
-                resolved.command,
+                resolved.backend_command,
                 args,
                 Some(resolved.env),
                 resolved.working_directory,
@@ -157,7 +157,7 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: &name,
-            command: preset.command,
+            backend_command: preset.command,
             args: &args,
             cols: 120,
             rows: 40,
@@ -235,7 +235,7 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: "test-attach",
-            command: "/bin/bash",
+            backend_command: "/bin/bash",
             args: &args,
             cols: 80,
             rows: 24,
@@ -372,7 +372,7 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
                 println!(" ✓ ({} instances)", config.instances.len());
                 for name in config.instance_names() {
                     if let Some(r) = config.resolve_instance(&name) {
-                        println!("    {name}: {} {}", r.command, r.args.join(" "));
+                        println!("    {name}: {} {}", r.backend_command, r.args.join(" "));
                     }
                 }
             }
@@ -446,7 +446,7 @@ pub fn run_demo() -> anyhow::Result<()> {
         agent::spawn_agent(
             &agent::SpawnConfig {
                 name,
-                command: "/bin/bash",
+                backend_command: "/bin/bash",
                 args: &args,
                 cols: 60,
                 rows: 8,

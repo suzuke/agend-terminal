@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct AgentConfig {
     pub name: String,
-    pub command: String,
+    pub backend_command: String,
     pub args: Vec<String>,
     pub env: Option<HashMap<String, String>>,
     pub working_dir: Option<PathBuf>,
@@ -263,7 +263,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             name.clone(),
             AgentConfig {
                 name: name.clone(),
-                command: command.clone(),
+                backend_command: command.clone(),
                 args: args.clone(),
                 env: env.clone(),
                 working_dir: working_dir.clone(),
@@ -276,7 +276,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         agent::spawn_agent(
             &agent::SpawnConfig {
                 name,
-                command,
+                backend_command: command,
                 args,
                 cols,
                 rows,
@@ -405,7 +405,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     let cfg = cfgs.get(name);
                     crate::snapshot::AgentSnapshot {
                         name: name.clone(),
-                        command: handle.command.clone(),
+                        backend_command: handle.backend_command.clone(),
                         args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
                         working_dir: cfg
                             .and_then(|c| c.working_dir.as_ref())
@@ -540,7 +540,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
                             // After a crash, start fresh — use backend's fresh_args to avoid
                             // crash loops from stale resume (--continue, --resume <id>, etc.)
-                            let respawn_args: Vec<String> = if let Some(b) = crate::backend::Backend::from_command(&config.command) {
+                            let respawn_args: Vec<String> = if let Some(b) = crate::backend::Backend::from_command(&config.backend_command) {
                                 let p = b.preset();
                                 p.fresh_args.unwrap_or(p.args)
                                     .iter()
@@ -552,7 +552,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                             };
                             match agent::spawn_agent(
                                 &agent::SpawnConfig {
-                                    name: &config.name, command: &config.command, args: &respawn_args,
+                                    name: &config.name, backend_command: &config.backend_command, args: &respawn_args,
                                     cols, rows,
                                     env: config.env.as_ref(), working_dir: config.working_dir.as_deref(),
                                     submit_key: &config.submit_key, home: Some(&home), crash_tx: Some(tx),
@@ -616,26 +616,30 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
     }
 
-    // Shutdown: print residual worktrees
+    // Shutdown: clean up generated files + print residual worktrees
     {
         let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
         let mut seen = std::collections::HashSet::new();
         for config in cfgs.values() {
+            // Clean up wrapper scripts (per working_dir, deduplicated)
+            if let Some(ref wd) = config.working_dir {
+                if seen.insert(wd.clone()) {
+                    let _ = std::fs::remove_dir_all(wd.join(".agend-bin"));
+                }
+            }
             // Use worktree_source (original repo) if available, otherwise working_dir
             let repo = config
                 .worktree_source
                 .as_ref()
                 .or(config.working_dir.as_ref());
             if let Some(dir) = repo {
-                if seen.insert(dir.clone()) {
-                    let residual = crate::worktree::list_residual(dir);
-                    if !residual.is_empty() {
-                        tracing::info!(
-                            repo = %dir.display(),
-                            residual = ?residual,
-                            "residual worktrees found (use `git worktree remove` to clean)"
-                        );
-                    }
+                let residual = crate::worktree::list_residual(dir);
+                if !residual.is_empty() {
+                    tracing::info!(
+                        repo = %dir.display(),
+                        residual = ?residual,
+                        "residual worktrees found (use `git worktree remove` to clean)"
+                    );
                 }
             }
         }

@@ -112,7 +112,7 @@ fn handle_session(
                     let (agent_state, health_state) = handle.core.lock()
                         .map(|c| (c.state.get_state().display_name().to_string(), c.health.state.display_name().to_string()))
                         .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
-                    json!({"name": name, "command": handle.command, "submit_key": handle.submit_key,
+                    json!({"name": name, "backend": handle.backend_command, "submit_key": handle.submit_key,
                            "inject_prefix": handle.inject_prefix, "agent_state": agent_state, "health_state": health_state})
                 }).collect();
                 json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
@@ -215,7 +215,8 @@ fn handle_session(
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
                 }
-                let command = params["command"].as_str().unwrap_or("bash");
+                let command = params["backend"].as_str()
+                    .unwrap_or("bash");
                 let args: Vec<String> = params["args"]
                     .as_str()
                     .map(|s| s.split_whitespace().map(String::from).collect())
@@ -230,7 +231,7 @@ fn handle_session(
                 match agent::spawn_agent(
                     &agent::SpawnConfig {
                         name,
-                        command,
+                        backend_command: command,
                         args: &args,
                         cols,
                         rows,
@@ -304,7 +305,7 @@ fn handle_session(
                         "agents": snapshot.agents.iter().map(|a| {
                             json!({
                                 "name": a.name,
-                                "command": a.command,
+                                "backend": a.backend_command,
                                 "args": a.args,
                                 "working_dir": a.working_dir,
                                 "submit_key": a.submit_key,

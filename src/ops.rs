@@ -206,11 +206,9 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
     if let Err(e) = crate::agent::validate_name(name) {
         return json!({"error": e});
     }
-    // Accept "backend" (preferred) or "command" (deprecated).
     // Resolve to actual CLI command via preset (e.g. "kiro" → "kiro-cli").
     let raw_backend = args["backend"]
         .as_str()
-        .or_else(|| args["command"].as_str())
         .unwrap_or("claude");
     let command = crate::backend::Backend::from_command(raw_backend)
         .map(|b| b.preset().command)
@@ -288,7 +286,7 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
     let work_dir_clone = work_dir.clone();
     match crate::api::call(
         home,
-        &json!({"method": "spawn", "params": {"name": name, "command": command, "args": &cmd_args, "working_directory": work_dir}}),
+        &json!({"method": "spawn", "params": {"name": name, "backend": command, "args": &cmd_args, "working_directory": work_dir}}),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
             let entry = crate::fleet::InstanceYamlEntry {
@@ -380,7 +378,7 @@ pub fn start_instance(home: &Path, args: &Value) -> Value {
     match config.resolve_instance(name) {
         Some(resolved) => {
             let mut cmd_args = resolved.args.join(" ");
-            if let Some(ref b) = crate::backend::Backend::from_command(&resolved.command) {
+            if let Some(ref b) = crate::backend::Backend::from_command(&resolved.backend_command) {
                 let resume = b.preset().resume_mode.args_for(home, name);
                 if !resume.is_empty() {
                     if !cmd_args.is_empty() {
@@ -392,7 +390,7 @@ pub fn start_instance(home: &Path, args: &Value) -> Value {
             match crate::api::call(
                 home,
                 &json!({"method": "spawn", "params": {
-                    "name": name, "command": resolved.command, "args": cmd_args,
+                    "name": name, "backend": resolved.backend_command, "args": cmd_args,
                     "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
                 }}),
             ) {
@@ -667,6 +665,9 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
             ".kiro/settings/mcp.json",
             ".kiro/settings/agend-mcp-wrapper.sh",
             ".kiro/steering/agend.md",
+            ".kiro/agents/agend.json",
+            ".kiro/agents/agend-prompt.md",
+            ".kiro/settings.json",
         ];
         for file in &agend_files {
             let path = working_dir.join(file);

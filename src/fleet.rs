@@ -104,7 +104,7 @@ impl FleetConfig {
         let preset = backend.map(|b| b.preset());
 
         // Command: instance > defaults > preset > "claude"
-        let command = inst
+        let backend_cmd = inst
             .command
             .clone()
             .or_else(|| defaults.command.clone())
@@ -112,10 +112,10 @@ impl FleetConfig {
             .unwrap_or_else(|| "claude".to_string());
 
         // Args: instance > defaults > preset (only if command basename matches preset)
-        let command_basename = std::path::Path::new(&command)
+        let command_basename = std::path::Path::new(&backend_cmd)
             .file_name()
             .and_then(|f| f.to_str())
-            .unwrap_or(&command)
+            .unwrap_or(&backend_cmd)
             .to_lowercase();
         let command_matches_preset = preset
             .as_ref()
@@ -182,7 +182,7 @@ impl FleetConfig {
 
         Some(ResolvedInstance {
             name: name.to_string(),
-            command,
+            backend_command: backend_cmd,
             args,
             env,
             working_directory,
@@ -207,7 +207,7 @@ impl FleetConfig {
 #[allow(dead_code)]
 pub struct ResolvedInstance {
     pub name: String,
-    pub command: String,
+    pub backend_command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub working_directory: Option<PathBuf>,
@@ -363,7 +363,7 @@ instances:
         let config = FleetConfig::load(&path).expect("load");
         let resolved = config.resolve_instance("test").expect("resolve");
 
-        assert_eq!(resolved.command, "/bin/bash");
+        assert_eq!(resolved.backend_command, "/bin/bash");
         // Preset args (--dangerously-skip-permissions) should NOT be applied
         assert!(
             resolved.args.is_empty(),
@@ -392,7 +392,7 @@ instances:
         let config = FleetConfig::load(&path).expect("load");
         let resolved = config.resolve_instance("test").expect("resolve");
 
-        assert_eq!(resolved.command, "claude");
+        assert_eq!(resolved.backend_command, "claude");
         assert!(!resolved.args.is_empty(), "preset args should be applied");
         assert!(resolved
             .args
@@ -602,7 +602,7 @@ instances:
         assert!(config.defaults.command.is_none());
         assert!(config.defaults.model.is_none());
         let resolved = config.resolve_instance("agent1").expect("resolve");
-        assert_eq!(resolved.command, "/bin/bash");
+        assert_eq!(resolved.backend_command, "/bin/bash");
 
         fs::remove_dir_all(&dir).ok();
     }

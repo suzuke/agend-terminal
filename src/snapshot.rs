@@ -12,7 +12,7 @@ pub struct FleetSnapshot {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AgentSnapshot {
     pub name: String,
-    pub command: String,
+    pub backend_command: String,
     pub args: Vec<String>,
     pub working_dir: Option<String>,
     pub submit_key: String,
@@ -55,7 +55,7 @@ mod tests {
     fn make_agent(name: &str, state: &str) -> AgentSnapshot {
         AgentSnapshot {
             name: name.to_string(),
-            command: "claude".to_string(),
+            backend_command: "claude".to_string(),
             args: vec!["--dangerously-skip-permissions".to_string()],
             working_dir: Some("/tmp/work".to_string()),
             submit_key: "\r".to_string(),
@@ -97,7 +97,7 @@ mod tests {
         let a = &snapshot.agents[0];
         assert_eq!(a.agent_state, "working");
         assert_eq!(a.health_state, "healthy");
-        assert_eq!(a.command, "claude");
+        assert_eq!(a.backend_command, "claude");
         assert_eq!(a.args, vec!["--dangerously-skip-permissions"]);
         assert_eq!(a.working_dir.as_deref(), Some("/tmp/work"));
         assert_eq!(a.submit_key, "\r");

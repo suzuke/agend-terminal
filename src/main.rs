@@ -382,7 +382,8 @@ fn main() -> anyhow::Result<()> {
                                     a["name"].as_str().unwrap_or("?"),
                                     a["agent_state"].as_str().unwrap_or("?"),
                                     a["health_state"].as_str().unwrap_or("?"),
-                                    a["command"].as_str().unwrap_or("?")
+                                    a["backend"].as_str()
+                                        .unwrap_or("?")
                                 );
                             }
                         }

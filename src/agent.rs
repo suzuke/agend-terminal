@@ -26,7 +26,7 @@ pub struct AgentCore {
 #[allow(dead_code)]
 pub struct AgentHandle {
     pub name: String,
-    pub command: String,
+    pub backend_command: String,
     pub pty_writer: PtyWriter,
     pub pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub core: Arc<Mutex<AgentCore>>,
@@ -120,7 +120,7 @@ pub type CrashChannel = crossbeam::channel::Sender<String>;
 /// Configuration for spawning an agent.
 pub struct SpawnConfig<'a> {
     pub name: &'a str,
-    pub command: &'a str,
+    pub backend_command: &'a str,
     pub args: &'a [String],
     pub cols: u16,
     pub rows: u16,
@@ -135,7 +135,7 @@ pub struct SpawnConfig<'a> {
 pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Result<()> {
     let SpawnConfig {
         name,
-        command,
+        backend_command,
         args,
         cols,
         rows,
@@ -156,7 +156,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         })
         .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
 
-    let mut cmd = CommandBuilder::new(command);
+    let mut cmd = CommandBuilder::new(backend_command);
     cmd.args(*args);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
@@ -178,7 +178,13 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
             let current_path = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", format!("{}:{current_path}", bin_dir.display()));
+            let mut path_parts = vec![bin_dir.display().to_string()];
+            // Add .agend-bin/ wrapper scripts to PATH (short command aliases)
+            if let Some(dir) = working_dir {
+                path_parts.push(dir.join(".agend-bin").display().to_string());
+            }
+            path_parts.push(current_path);
+            cmd.env("PATH", path_parts.join(":"));
         }
     }
 
@@ -190,7 +196,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     let child = pair
         .slave
         .spawn_command(cmd)
-        .map_err(|e| anyhow::anyhow!("Failed to spawn '{command}': {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to spawn '{backend_command}': {e}"))?;
     drop(pair.slave);
 
     let pty_writer: PtyWriter = Arc::new(Mutex::new(
@@ -204,7 +210,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
     let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
-    let detected_backend = Backend::from_command(command);
+    let detected_backend = Backend::from_command(backend_command);
     let core = Arc::new(Mutex::new(AgentCore {
         vterm: VTerm::new(*cols, *rows),
         subscribers: Vec::new(),
@@ -219,7 +225,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             name.to_string(),
             AgentHandle {
                 name: name.to_string(),
-                command: command.to_string(),
+                backend_command: backend_command.to_string(),
                 pty_writer: Arc::clone(&pty_writer),
                 pty_master: Arc::clone(&pty_master),
                 core: Arc::clone(&core),
@@ -271,7 +277,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             pty_read_loop(&mut pty_reader, &ctx);
         })?;
 
-    tracing::info!(agent = name, command, args = %args.join(" "), "spawned");
+    tracing::info!(agent = name, backend = backend_command, args = %args.join(" "), "spawned");
     Ok(())
 }
 
@@ -448,6 +454,12 @@ fn try_dismiss_dialog(
         detect_buf.drain(..d);
     }
     let clean = strip_ansi(&String::from_utf8_lossy(detect_buf));
+
+    // DEBUG: log what dismiss sees (remove after fixing kiro TUI issue)
+    if clean.len() > 50 {
+        let tail: String = clean.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
+        tracing::debug!(agent = name, patterns = dismiss_patterns.len(), clean_tail = %tail, "dismiss_check");
+    }
 
     for (pattern, key_seq) in dismiss_patterns {
         if clean.contains(pattern.as_str()) {
