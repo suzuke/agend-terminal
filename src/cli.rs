@@ -100,18 +100,19 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
                 args.push(model.clone());
             }
 
-            // Claude: --settings for statusline (session ID capture for --resume)
+            // Inject Claude-specific flags
             if let Some(ref dir) = resolved.working_directory {
-                let settings = dir.join("claude-settings.json");
-                if settings.exists() {
-                    args.push("--settings".to_string());
-                    args.push(settings.display().to_string());
-                }
-                // MCP config for agend-terminal tools
-                let mcp_config = dir.join("mcp-config.json");
-                if mcp_config.exists() {
-                    args.push("--mcp-config".to_string());
-                    args.push(mcp_config.display().to_string());
+                if resolved.backend_command.contains("claude") {
+                    let mcp_config = dir.join("mcp-config.json");
+                    if mcp_config.exists() {
+                        args.push("--mcp-config".to_string());
+                        args.push(mcp_config.display().to_string());
+                    }
+                    let settings = dir.join("claude-settings.json");
+                    if settings.exists() {
+                        args.push("--settings".to_string());
+                        args.push(settings.display().to_string());
+                    }
                 }
             }
 
