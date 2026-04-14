@@ -226,23 +226,17 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             if let Err(e) = crate::agent::validate_name(raw_name) {
                 return json!({"error": e});
             }
-            // Auto-dedup: append short random suffix if name already exists
             let name_owned = {
+                use std::sync::atomic::{AtomicU16, Ordering};
+                static DEDUP_SEQ: AtomicU16 = AtomicU16::new(0);
+
                 let existing: std::collections::HashSet<String> =
                     crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
                         .map(|c| c.instance_names().into_iter().collect())
                         .unwrap_or_default();
                 if existing.contains(raw_name) {
-                    let suffix = format!(
-                        "{:04x}",
-                        (std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos()
-                            ^ std::process::id())
-                            & 0xFFFF
-                    );
-                    let deduped = format!("{raw_name}-{suffix}");
+                    let seq = DEDUP_SEQ.fetch_add(1, Ordering::Relaxed);
+                    let deduped = format!("{raw_name}-{seq:04x}");
                     tracing::info!(original = raw_name, deduped = %deduped, "name conflict, auto-deduped");
                     deduped
                 } else {

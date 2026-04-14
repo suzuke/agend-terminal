@@ -293,30 +293,23 @@ pub fn init_from_config(
     };
 
     // Clean up orphaned topics: exist in registry but not in fleet.yaml
-    let registry = load_topic_registry(home);
+    let mut reg = load_topic_registry(home);
     let instance_names: std::collections::HashSet<&String> = config.instances.keys().collect();
+    let mut orphan_count = 0;
+    for (tid, inst_name) in reg.clone() {
+        if tid != 1 && !instance_names.contains(&inst_name) {
+            eprintln!("[telegram] orphaned topic {tid} ('{inst_name}' no longer in fleet), deleting");
+            delete_topic(home, tid); // also removes from registry
+            orphan_count += 1;
+        }
+    }
+    if orphan_count > 0 {
+        reg = load_topic_registry(home); // reload after deletions
+        eprintln!("[telegram] cleaned up {orphan_count} orphaned topic(s)");
+    }
+
     let bot = teloxide::Bot::new(&token);
     let chat_id = teloxide::types::ChatId(*group_id);
-    let mut orphans = Vec::new();
-    for (tid, inst_name) in &registry {
-        if *tid != 1 && !instance_names.contains(inst_name) {
-            eprintln!("[telegram] orphaned topic {tid} ('{inst_name}' no longer in fleet), deleting");
-            let thread_id = ThreadId(MessageId(*tid));
-            let _ = telegram_runtime().block_on(async {
-                let _ = bot.close_forum_topic(chat_id, thread_id).await;
-                bot.delete_forum_topic(chat_id, thread_id).await
-            });
-            orphans.push(*tid);
-        }
-    }
-    if !orphans.is_empty() {
-        let mut reg = registry;
-        for tid in &orphans {
-            reg.remove(tid);
-        }
-        save_topic_registry(home, &reg);
-        eprintln!("[telegram] cleaned up {} orphaned topic(s)", orphans.len());
-    }
 
     let mut topic_map: HashMap<String, i32> = config
         .instances
@@ -343,9 +336,8 @@ pub fn init_from_config(
         }
     }
 
-    // Write back topic_ids + update registry
+    // Write back topic_ids + update registry in one pass
     if home.join("fleet.yaml").exists() && !topic_map.is_empty() {
-        let mut reg = load_topic_registry(home);
         for (name, tid) in &topic_map {
             let _ = crate::fleet::update_instance_field(
                 home,

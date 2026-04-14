@@ -85,6 +85,16 @@ pub fn deliver(
 /// Inject a notification into an agent's PTY.
 /// When called from daemon (has registry), uses direct write.
 /// When called from external process (MCP), uses API socket.
+fn reply_hint(from: &str) -> String {
+    if from.contains("via telegram") {
+        "\n(Reply using the reply tool — do NOT respond with direct text)".into()
+    } else if let Some(sender) = from.strip_prefix("from:") {
+        format!("\n(Reply using the send_to_instance tool with target \"{sender}\")")
+    } else {
+        String::new()
+    }
+}
+
 pub fn notify_agent(home: &Path, agent_name: &str, from: &str, text: &str, submit_key: &str) {
     let display_text = if text.chars().count() > 200 {
         let truncated: String = text.chars().take(200).collect();
@@ -92,14 +102,7 @@ pub fn notify_agent(home: &Path, agent_name: &str, from: &str, text: &str, submi
     } else {
         text.to_string()
     };
-    let hint = if from.contains("via telegram") {
-        "\n(Reply using the reply tool — do NOT respond with direct text)".to_string()
-    } else if let Some(sender) = from.strip_prefix("from:") {
-        format!("\n(Reply using the send_to_instance tool with target \"{sender}\")")
-    } else {
-        String::new()
-    };
-    let notification = format!("[{from}] {display_text}{hint}{submit_key}");
+    let notification = format!("[{from}] {display_text}{}{submit_key}", reply_hint(from));
 
     // Use API socket to inject (doesn't kick attach clients)
     let _ = crate::api::call(
@@ -313,42 +316,19 @@ mod tests {
     // --- Reply hint tests ---
 
     #[test]
-    fn notify_format_telegram_has_reply_hint() {
-        let from = "user:chiacheng via telegram";
-        let hint = if from.contains("via telegram") {
-            "\n(Reply using the reply tool — do NOT respond with direct text)".to_string()
-        } else if let Some(sender) = from.strip_prefix("from:") {
-            format!("\n(Reply using the send_to_instance tool with target \"{sender}\")")
-        } else {
-            String::new()
-        };
-        assert!(hint.contains("reply tool"));
+    fn reply_hint_telegram() {
+        assert!(reply_hint("user:chiacheng via telegram").contains("reply tool"));
     }
 
     #[test]
-    fn notify_format_agent_has_send_hint() {
-        let from = "from:dev";
-        let hint = if from.contains("via telegram") {
-            "\n(Reply using the reply tool — do NOT respond with direct text)".to_string()
-        } else if let Some(sender) = from.strip_prefix("from:") {
-            format!("\n(Reply using the send_to_instance tool with target \"{sender}\")")
-        } else {
-            String::new()
-        };
-        assert!(hint.contains("send_to_instance"));
-        assert!(hint.contains("dev"));
+    fn reply_hint_agent() {
+        let h = reply_hint("from:dev");
+        assert!(h.contains("send_to_instance"));
+        assert!(h.contains("dev"));
     }
 
     #[test]
-    fn notify_format_system_no_hint() {
-        let from = "system:ci";
-        let hint = if from.contains("via telegram") {
-            "telegram".to_string()
-        } else if from.starts_with("from:") {
-            "agent".to_string()
-        } else {
-            String::new()
-        };
-        assert!(hint.is_empty());
+    fn reply_hint_system_empty() {
+        assert!(reply_hint("system:ci").is_empty());
     }
 }
