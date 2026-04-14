@@ -1,4 +1,5 @@
-//! Shared operations — called by both MCP handlers and agent CLI.
+#![allow(dead_code)]
+//! Shared operations — called by MCP handlers.
 
 use serde_json::{json, Value};
 use std::path::Path;
