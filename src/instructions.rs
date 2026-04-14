@@ -219,7 +219,7 @@ fn generate_kiro(working_dir: &Path) -> Result<()> {
     }
     // Agent config referencing prompt via absolute file:// URI
     let agent_dir = working_dir.join(".kiro").join("agents");
-    let agent_path = agent_dir.join("default.json");
+    let agent_path = agent_dir.join("agend.json");
     if !is_current(&agent_path) {
         std::fs::create_dir_all(&agent_dir)?;
         let agent = serde_json::json!({
@@ -464,11 +464,11 @@ mod tests {
     fn generate_kiro_creates_steering() {
         let dir = tmp_dir("gen_kiro");
         generate(&dir, "kiro-cli");
-        assert!(dir.join(".kiro/agents/default.json").exists(), "missing default.json");
+        assert!(dir.join(".kiro/agents/agend.json").exists(), "missing agend.json");
         assert!(dir.join(".kiro/prompts/agend.md").exists(), "missing prompt");
         let prompt = std::fs::read_to_string(dir.join(".kiro/prompts/agend.md")).unwrap();
         assert!(prompt.contains("v7-cli"));
-        let agent = std::fs::read_to_string(dir.join(".kiro/agents/default.json")).unwrap();
+        let agent = std::fs::read_to_string(dir.join(".kiro/agents/agend.json")).unwrap();
         assert!(agent.contains("file://"));
         assert!(agent.contains("\"shell\""));
         std::fs::remove_dir_all(&dir).ok();
