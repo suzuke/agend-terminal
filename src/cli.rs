@@ -94,10 +94,13 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
                 args.extend(p.resume_mode.args_for(home, &name));
             }
 
-            // Inject --model if specified
+            // Inject --model if specified (format for backend)
             if let Some(ref model) = resolved.model {
+                let model_val = backend::Backend::from_command(&resolved.backend_command)
+                    .map(|b| b.format_model_arg(model))
+                    .unwrap_or_else(|| model.clone());
                 args.push("--model".to_string());
-                args.push(model.clone());
+                args.push(model_val);
             }
 
             // Inject Claude-specific flags

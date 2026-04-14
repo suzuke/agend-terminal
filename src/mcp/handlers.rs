@@ -279,10 +279,13 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 .and_then(|v| v.as_str())
                 .filter(|m| !m.is_empty())
             {
+                let model_val = crate::backend::Backend::from_command(command)
+                    .map(|b| b.format_model_arg(model))
+                    .unwrap_or_else(|| model.to_string());
                 if !cmd_args.is_empty() {
                     cmd_args.push(' ');
                 }
-                cmd_args.push_str(&format!("--model {model}"));
+                cmd_args.push_str(&format!("--model {model_val}"));
             }
             // Validate working_directory: reject paths with ".." or relative paths
             if let Some(dir) = args.get("working_directory").and_then(|v| v.as_str()) {

@@ -229,6 +229,17 @@ impl Backend {
         ]
     }
 
+    /// Format a `--model` value for this backend.
+    /// OpenCode requires `provider/model` format — auto-prefixes `anthropic/`
+    /// if the value doesn't already contain a `/`.
+    pub fn format_model_arg(&self, model: &str) -> String {
+        if matches!(self, Backend::OpenCode) && !model.contains('/') {
+            format!("anthropic/{model}")
+        } else {
+            model.to_string()
+        }
+    }
+
     /// Display name matching the CLI command.
     pub fn name(&self) -> &'static str {
         match self {
@@ -418,5 +429,25 @@ mod tests {
                 backend
             );
         }
+    }
+
+    #[test]
+    fn format_model_arg_opencode_adds_prefix() {
+        assert_eq!(Backend::OpenCode.format_model_arg("opus"), "anthropic/opus");
+        assert_eq!(
+            Backend::OpenCode.format_model_arg("anthropic/opus"),
+            "anthropic/opus"
+        );
+        assert_eq!(
+            Backend::OpenCode.format_model_arg("openai/gpt-4"),
+            "openai/gpt-4"
+        );
+    }
+
+    #[test]
+    fn format_model_arg_other_backends_passthrough() {
+        assert_eq!(Backend::ClaudeCode.format_model_arg("opus"), "opus");
+        assert_eq!(Backend::Gemini.format_model_arg("gemini-2.5-pro"), "gemini-2.5-pro");
+        assert_eq!(Backend::Codex.format_model_arg("o3"), "o3");
     }
 }
