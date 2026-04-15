@@ -113,7 +113,7 @@ impl Backend {
             Backend::KiroCli => BackendPreset {
                 command: "kiro-cli",
                 args: &["chat", "--trust-all-tools"],
-                ready_pattern: "All tools are now trusted|!>",
+                ready_pattern: "Trust All Tools active|ask a question or describe a task|/quit to exit",
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,

@@ -41,12 +41,12 @@ enum SessionNode {
     },
 }
 
+/// Layout-only pane info. Agent config comes from fleet.yaml on restore.
 #[derive(Serialize, Deserialize)]
 struct SessionPane {
-    agent_name: String,
-    backend_command: String,
-    working_dir: Option<String>,
-    submit_key: String,
+    /// Fleet instance name (key in fleet.yaml). None for shell panes.
+    fleet_instance_name: Option<String>,
+    /// User-defined display name override.
     display_name: Option<String>,
 }
 
@@ -80,6 +80,30 @@ enum Overlay {
     Help,
     /// Keyboard scroll mode (j/k/PgUp/PgDn). Pane's scroll_offset is used directly.
     Scroll,
+    /// Command palette (:command input).
+    Command { input: String },
+    /// Decisions overlay panel (read-only, scrollable).
+    Decisions { items: Vec<crate::decisions::Decision>, scroll: usize },
+    /// Task board overlay panel (read-only, scrollable).
+    Tasks { items: Vec<crate::tasks::Task>, scroll: usize },
+}
+
+/// Handle j/k/PgUp/PgDn scroll for list overlays. Returns true if handled, false to close.
+fn handle_list_scroll(key: KeyCode, scroll: &mut usize, len: usize) -> bool {
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => { *scroll = scroll.saturating_sub(1); true }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if *scroll + 1 < len { *scroll += 1; }
+            true
+        }
+        KeyCode::PageUp => { *scroll = scroll.saturating_sub(10); true }
+        KeyCode::PageDown => {
+            *scroll = (*scroll + 10).min(len.saturating_sub(1));
+            true
+        }
+        KeyCode::Esc | KeyCode::Char('q') => false,
+        _ => true,
+    }
 }
 
 /// Run the terminal application.
@@ -90,7 +114,8 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     let log_path = home.join("app.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&log_path)
         .ok();
     if let Some(file) = log_file {
@@ -139,28 +164,26 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| home.join("fleet.yaml"));
 
-    // Try to restore saved session, otherwise start with a shell tab
-    let restored = restore_session(
-        &home, &mut layout, &registry, &wakeup_tx, &mut name_counter,
-        pane_cols, pane_rows,
+    // Reconcile fleet.yaml (agent definitions) with session.json (layout hint)
+    let started = restore_with_reconciliation(
+        &home, &fleet_path, &mut layout, &registry,
+        &wakeup_tx, &mut name_counter, pane_cols, pane_rows,
     );
-    if !restored {
+    if !started {
+        // Rule 4: nothing to restore → open shell tab
         spawn_pane_tab(
-        &mut layout,
-        &registry,
-        &home,
-        "shell",
-        &std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string()),
-        &[],
-        None,
-        &HashMap::new(),
-        "\r",
-        pane_cols,
-        pane_rows,
-        &wakeup_tx,
-        &mut name_counter,
-    )?;
+            &mut layout, &registry, &home, "shell",
+            &std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string()),
+            &[], None, &HashMap::new(), "\r",
+            pane_cols, pane_rows, &wakeup_tx, &mut name_counter,
+        )?;
     }
+
+    // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch)
+    let mut needs_resize = false;
+
+    // Detect Telegram status from fleet config
+    let telegram_status = detect_telegram_status(&fleet_path);
 
     // Crossterm event reader thread
     let (event_tx, event_rx) = crossbeam::channel::unbounded::<Event>();
@@ -176,10 +199,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         .ok();
 
     loop {
+        if needs_resize {
+            let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
+            let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
+            render::resize_panes(pane_area, &mut layout, &registry);
+            needs_resize = false;
+        }
+
         let repeat_mode = key_handler.in_repeat();
 
         terminal.draw(|frame| {
-            render::render(frame, &mut layout, repeat_mode, &registry);
+            render::render(frame, &mut layout, repeat_mode, &registry, telegram_status);
             match &overlay {
                 Overlay::NewTabMenu { items, selected }
                 | Overlay::SplitMenu { items, selected, .. } => {
@@ -207,6 +237,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                         .map(|p| p.scroll_offset)
                         .unwrap_or(0);
                     render::render_scroll_indicator(frame, so);
+                }
+                Overlay::Command { ref input } => {
+                    render::render_command_palette(frame, input);
+                }
+                Overlay::Decisions { ref items, scroll } => {
+                    render::render_decisions(frame, items, *scroll);
+                }
+                Overlay::Tasks { ref items, scroll } => {
+                    render::render_tasks(frame, items, *scroll);
                 }
                 Overlay::None => {}
             }
@@ -240,6 +279,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                     ) {
                                                         let tab_name = pane.agent_name.clone();
                                                         layout.add_tab(Tab::new(tab_name, pane));
+                                                        needs_resize = true;
                                                     }
                                                 }
                                             }
@@ -270,6 +310,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                             if let Some(tab) = layout.active_tab_mut() {
                                                                 tab.split_focused(split_dir, p);
                                                             }
+                                                            needs_resize = true;
                                                         }
                                                         Err(e) => tracing::error!(error = %e, "split failed"),
                                                     }
@@ -327,15 +368,34 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                             if is_tab {
                                                 if layout.tabs.len() > 1 {
                                                     let idx = layout.active;
+                                                    // Collect fleet names before closing tab
+                                                    let fleet_names: Vec<String> = layout.tabs.get(idx)
+                                                        .into_iter()
+                                                        .flat_map(|t| t.root().pane_ids().into_iter()
+                                                            .filter_map(|id| t.root().find_pane(id)
+                                                                .and_then(|p| p.fleet_instance_name.clone())))
+                                                        .collect();
+                                                    if !fleet_names.is_empty() {
+                                                        let _ = crate::fleet::remove_instances_from_yaml(&home, &fleet_names);
+                                                    }
                                                     if let Some(tab) = layout.close_tab(idx) {
                                                         for name in tab.root().agent_names() {
                                                             kill_agent(&registry, &name);
                                                         }
                                                     }
+                                                    needs_resize = true;
                                                 }
                                             } else if let Some(tab) = layout.active_tab_mut() {
+                                                // Remove from fleet.yaml before closing pane
+                                                let fid = tab.focus_id;
+                                                if let Some(pane) = tab.root().find_pane(fid) {
+                                                    if let Some(ref fleet_name) = pane.fleet_instance_name {
+                                                        let _ = crate::fleet::remove_instance_from_yaml(&home, fleet_name);
+                                                    }
+                                                }
                                                 if let Some(name) = tab.close_focused() {
                                                     kill_agent(&registry, &name);
+                                                    needs_resize = true;
                                                 }
                                             }
                                         }
@@ -369,6 +429,31 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                         _ => {}
                                     }
                                 }
+                                Overlay::Command { ref mut input } => {
+                                    match key.code {
+                                        KeyCode::Enter => {
+                                            let cmd = input.clone();
+                                            overlay = Overlay::None;
+                                            if execute_command(&cmd, &home, &mut layout, &registry, &wakeup_tx, &mut name_counter) {
+                                                needs_resize = true;
+                                            }
+                                        }
+                                        KeyCode::Esc => { overlay = Overlay::None; }
+                                        KeyCode::Backspace => { input.pop(); }
+                                        KeyCode::Char(c) => { input.push(c); }
+                                        _ => {}
+                                    }
+                                }
+                                Overlay::Decisions { ref items, ref mut scroll } => {
+                                    if !handle_list_scroll(key.code, scroll, items.len()) {
+                                        overlay = Overlay::None;
+                                    }
+                                }
+                                Overlay::Tasks { ref items, ref mut scroll } => {
+                                    if !handle_list_scroll(key.code, scroll, items.len()) {
+                                        overlay = Overlay::None;
+                                    }
+                                }
                                 Overlay::None => {}
                             }
                             continue;
@@ -400,19 +485,23 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             Action::NextTab => {
                                 last_tab = layout.active;
                                 layout.next_tab();
+                                needs_resize = true;
                             }
                             Action::PrevTab => {
                                 last_tab = layout.active;
                                 layout.prev_tab();
+                                needs_resize = true;
                             }
                             Action::LastTab => {
                                 let current = layout.active;
                                 layout.goto_tab(last_tab);
                                 last_tab = current;
+                                needs_resize = true;
                             }
                             Action::GotoTab(idx) => {
                                 last_tab = layout.active;
                                 layout.goto_tab(idx);
+                                needs_resize = true;
                             }
                             Action::RenamePane => {
                                 let current = layout.active_tab()
@@ -480,6 +569,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             Action::ScrollMode => {
                                 overlay = Overlay::Scroll;
                             }
+                            Action::CommandPalette => {
+                                overlay = Overlay::Command { input: String::new() };
+                            }
+                            Action::ShowDecisions => {
+                                let items = crate::decisions::list_all(&home);
+                                overlay = Overlay::Decisions { items, scroll: 0 };
+                            }
+                            Action::ShowTasks => {
+                                let items = crate::tasks::list_all(&home);
+                                overlay = Overlay::Tasks { items, scroll: 0 };
+                            }
                             Action::ShowHelp => {
                                 overlay = Overlay::Help;
                             }
@@ -488,6 +588,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 if let Some(tab) = layout.active_tab_mut() {
                                     tab.zoomed = !tab.zoomed;
                                 }
+                                needs_resize = true;
                             }
                             Action::None => {}
                         }
@@ -496,11 +597,20 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                         match mouse.kind {
                             MouseEventKind::ScrollUp => scroll_focused(&mut layout, 3),
                             MouseEventKind::ScrollDown => scroll_focused(&mut layout, -3),
+                            MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                            | MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                            | MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                                handle_mouse_selection(&mut layout, &mouse);
+                                // Separate call: can't clear selecting_pane inside handle_mouse_selection
+                                // because tab is mutably borrowed via root_mut().find_pane_mut()
+                                clear_selection_cache(&mut layout);
+                            }
                             _ => {}
                         }
                     }
-                    Event::Resize(_cols, _rows) => {
-                        // PTY + VTerm resize handled in render_node
+                    Event::Resize(cols, rows) => {
+                        let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
+                        render::resize_panes(pane_area, &mut layout, &registry);
                     }
                     _ => {}
                 }
@@ -514,8 +624,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
     }
 
-    // Save session before cleanup
-    save_session(&home, &layout, &registry);
+    // Sync fleet.yaml to match current state, then save layout
+    sync_fleet_yaml(&home, &layout);
+    save_session(&home, &layout);
 
     // Cleanup: kill all agents
     for tab in &layout.tabs {
@@ -525,6 +636,46 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     }
 
     Ok(())
+}
+
+/// Auto-start all fleet instances as tabs. Returns true if any were spawned.
+#[allow(clippy::too_many_arguments)]
+fn auto_start_fleet(
+    fleet_path: &Path,
+    layout: &mut Layout,
+    registry: &AgentRegistry,
+    home: &Path,
+    cols: u16,
+    rows: u16,
+    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    name_counter: &mut HashMap<String, usize>,
+) -> bool {
+    let fleet = match crate::fleet::FleetConfig::load(fleet_path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut names = fleet.instance_names();
+    if names.is_empty() {
+        return false;
+    }
+    names.sort();
+    let mut spawned = false;
+    for name in &names {
+        if let Some(resolved) = fleet.resolve_instance(name) {
+            match create_pane_from_resolved(
+                name, &resolved, layout, registry, home,
+                cols, rows, wakeup_tx, name_counter,
+            ) {
+                Ok(pane) => {
+                    let tab_name = pane.agent_name.clone();
+                    layout.add_tab(Tab::new(tab_name, pane));
+                    spawned = true;
+                }
+                Err(e) => tracing::error!(instance = name, error = %e, "fleet auto-start failed"),
+            }
+        }
+    }
+    spawned
 }
 
 /// Build menu items for new-tab selection.
@@ -602,22 +753,28 @@ fn pane_from_menu_item(
         }
         MenuItemKind::Backend(backend) => {
             let preset = backend.preset();
-            let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-            create_pane(
-                layout, registry, home, preset.command,
-                preset.command, &args, None, &HashMap::new(),
-                preset.submit_key, cols, rows, wakeup_tx, name_counter,
-            )
+            if let Err(e) = crate::fleet::add_instance_to_yaml(home, preset.command, &crate::fleet::InstanceYamlEntry {
+                backend: Some(backend.name().to_string()),
+                working_directory: None,
+                role: None,
+            }) {
+                tracing::warn!(error = %e, "failed to write fleet.yaml");
+            }
+            // Resolve from fleet to get defaults merged
+            let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+            if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(preset.command)) {
+                create_pane_from_resolved(preset.command, &resolved, layout, registry, home, cols, rows, wakeup_tx, name_counter)
+            } else {
+                let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
+                create_pane(layout, registry, home, preset.command, preset.command, &args, None, &HashMap::new(), preset.submit_key, cols, rows, wakeup_tx, name_counter)
+            }
         }
         MenuItemKind::FleetInstance(inst_name) => {
             let fleet = crate::fleet::FleetConfig::load(fleet_path)?;
             let resolved = fleet.resolve_instance(&inst_name)
                 .ok_or_else(|| anyhow::anyhow!("fleet instance '{inst_name}' not found"))?;
-            create_pane(
-                layout, registry, home, &inst_name,
-                &resolved.backend_command, &resolved.args,
-                resolved.working_directory.as_deref(),
-                &resolved.env, &resolved.submit_key,
+            create_pane_from_resolved(
+                &inst_name, &resolved, layout, registry, home,
                 cols, rows, wakeup_tx, name_counter,
             )
         }
@@ -761,24 +918,325 @@ fn create_pane(
         display_name: None,
         scroll_offset: 0,
         has_notification: false,
+        fleet_instance_name: None,
+        selection: None,
     })
 }
 
-/// Save current session layout to disk (including split tree structure).
-fn save_session(home: &Path, layout: &Layout, registry: &AgentRegistry) {
-    let reg = agent::lock_registry(registry);
+/// Create a pane from a fleet ResolvedInstance (full config: env, args, model, etc.).
+#[allow(clippy::too_many_arguments)]
+fn create_pane_from_resolved(
+    fleet_name: &str,
+    resolved: &crate::fleet::ResolvedInstance,
+    layout: &mut Layout,
+    registry: &AgentRegistry,
+    home: &Path,
+    cols: u16,
+    rows: u16,
+    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    name_counter: &mut HashMap<String, usize>,
+) -> Result<Pane> {
+    // Build fleet peer list for agent instructions
+    let fleet_path = home.join("fleet.yaml");
+    let peers: Vec<(String, Option<String>)> = crate::fleet::FleetConfig::load(&fleet_path)
+        .map(|f| {
+            f.instances.iter()
+                .map(|(n, c)| (n.clone(), c.role.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ctx = crate::instructions::AgentContext {
+        name: fleet_name,
+        role: resolved.role.as_deref(),
+        fleet_peers: &peers,
+    };
+
+    let mut pane = create_pane(
+        layout, registry, home, fleet_name,
+        &resolved.backend_command, &resolved.args,
+        resolved.working_directory.as_deref(),
+        &resolved.env, &resolved.submit_key,
+        cols, rows, wakeup_tx, name_counter,
+    )?;
+
+    // Overwrite basic instructions with fleet-aware version
+    if let Some(ref wd) = pane.working_dir {
+        crate::instructions::generate_with_context(wd, &resolved.backend_command, Some(&ctx));
+    }
+    pane.fleet_instance_name = Some(fleet_name.to_string());
+    Ok(pane)
+}
+
+/// Detect Telegram channel status from fleet config.
+fn detect_telegram_status(fleet_path: &Path) -> render::TelegramStatus {
+    let fleet = match crate::fleet::FleetConfig::load(fleet_path) {
+        Ok(f) => f,
+        Err(_) => return render::TelegramStatus::NotConfigured,
+    };
+    match fleet.channel {
+        Some(crate::fleet::ChannelConfig::Telegram { ref bot_token_env, .. }) => {
+            if std::env::var(bot_token_env).is_ok() {
+                render::TelegramStatus::Connected
+            } else {
+                render::TelegramStatus::NoToken
+            }
+        }
+        None => render::TelegramStatus::NotConfigured,
+    }
+}
+
+/// Resolve a backend command string into (command, args, submit_key).
+/// If `fresh` is true, uses fresh_args (no resume) when available.
+fn resolve_backend(backend_name: &str, fresh: bool) -> (String, Vec<String>, String) {
+    if let Some(b) = Backend::from_command(backend_name) {
+        let p = b.preset();
+        let args = if fresh {
+            p.fresh_args.unwrap_or(p.args)
+        } else {
+            p.args
+        };
+        (p.command.to_string(), args.iter().map(|s| s.to_string()).collect(), p.submit_key.to_string())
+    } else {
+        (backend_name.to_string(), vec![], "\r".to_string())
+    }
+}
+
+/// Execute a command palette command. Returns true if layout changed (needs resize).
+fn execute_command(
+    cmd: &str,
+    home: &Path,
+    layout: &mut Layout,
+    registry: &AgentRegistry,
+    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    name_counter: &mut HashMap<String, usize>,
+) -> bool {
+    let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
+    if parts.is_empty() {
+        return false;
+    }
+    match parts[0] {
+        "spawn" | "vsplit" | "hsplit" => {
+            let name = parts.get(1).unwrap_or(&"agent");
+            let backend_name = parts.get(2).unwrap_or(&"claude");
+            let fleet_path = home.join("fleet.yaml");
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+            let pc = cols.saturating_sub(2);
+            let pr = rows.saturating_sub(4);
+
+            // Check fleet.yaml first; if not there, add it
+            let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
+            let resolved = fleet.as_ref().and_then(|f| f.resolve_instance(name));
+            let pane_result = if let Some(resolved) = resolved {
+                create_pane_from_resolved(name, &resolved, layout, registry, home, pc, pr, wakeup_tx, name_counter)
+            } else {
+                if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &crate::fleet::InstanceYamlEntry {
+                    backend: Some(backend_name.to_string()),
+                    working_directory: None,
+                    role: None,
+                }) {
+                    tracing::warn!(name = *name, error = %e, "failed to write fleet.yaml");
+                }
+                // Resolve from updated fleet (gets defaults merged)
+                let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
+                if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(name)) {
+                    create_pane_from_resolved(name, &resolved, layout, registry, home, pc, pr, wakeup_tx, name_counter)
+                } else {
+                    // Fallback: direct spawn without fleet resolution
+                    let (command, args, submit_key) = resolve_backend(backend_name, false);
+                    create_pane(layout, registry, home, name, &command, &args, None, &HashMap::new(), &submit_key, pc, pr, wakeup_tx, name_counter)
+                }
+            };
+            match pane_result {
+                Ok(pane) => {
+                    match parts[0] {
+                        "vsplit" => {
+                            if let Some(tab) = layout.active_tab_mut() {
+                                tab.split_focused(SplitDir::Vertical, pane);
+                            }
+                        }
+                        "hsplit" => {
+                            if let Some(tab) = layout.active_tab_mut() {
+                                tab.split_focused(SplitDir::Horizontal, pane);
+                            }
+                        }
+                        _ => {
+                            let tab_name = pane.agent_name.clone();
+                            layout.add_tab(Tab::new(tab_name, pane));
+                        }
+                    }
+                    return true;
+                }
+                Err(e) => tracing::error!(name = *name, backend = *backend_name, error = %e, "spawn failed"),
+            }
+        }
+        "kill" => {
+            if let Some(name) = parts.get(1) {
+                remove_from_fleet(home, layout, name);
+                kill_agent(registry, name);
+                for i in (0..layout.tabs.len()).rev() {
+                    let names = layout.tabs[i].root().agent_names();
+                    if !names.iter().any(|n| n == name) {
+                        continue;
+                    }
+                    if layout.tabs[i].root().pane_count() == 1 {
+                        layout.close_tab(i);
+                    } else {
+                        let ids = layout.tabs[i].root().pane_ids();
+                        for id in ids {
+                            if layout.tabs[i].root().find_pane(id)
+                                .is_some_and(|p| p.agent_name == *name)
+                            {
+                                layout.tabs[i].focus_id = id;
+                                layout.tabs[i].close_focused();
+                                break;
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        "restart" => {
+            let target_name = parts.get(1).map(|s| s.to_string()).or_else(|| {
+                layout.active_tab()
+                    .and_then(|t| t.focused_pane())
+                    .map(|p| p.agent_name.clone())
+            });
+            if let Some(name) = target_name {
+                // Single pass: find pane info, fleet name, and location
+                let mut pane_info: Option<(String, Option<PathBuf>, Option<String>, Option<String>)> = None;
+                let mut pane_loc: Option<(usize, usize)> = None;
+                'outer: for (ti, tab) in layout.tabs.iter().enumerate() {
+                    for id in tab.root().pane_ids() {
+                        if let Some(p) = tab.root().find_pane(id) {
+                            if p.agent_name == name {
+                                let cmd = match &p.backend {
+                                    Some(b) => b.preset().command.to_string(),
+                                    None => {
+                                        tracing::warn!(agent = name, "cannot restart shell pane");
+                                        break 'outer;
+                                    }
+                                };
+                                pane_info = Some((cmd, p.working_dir.clone(), p.display_name.clone(), p.fleet_instance_name.clone()));
+                                pane_loc = Some((ti, id));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+
+                if let Some((backend_cmd, work_dir, display_name, fleet_name)) = pane_info {
+                    kill_agent(registry, &name);
+                    let _ = std::fs::remove_file(home.join("sessions").join(format!("{name}.sid")));
+
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+                    let pc = cols.saturating_sub(2);
+                    let pr = rows.saturating_sub(4);
+                    name_counter.remove(&name);
+
+                    let pane_result = if let Some(ref fname) = fleet_name {
+                        // Fleet agent — resolve from fleet.yaml (full config)
+                        let fleet_path = home.join("fleet.yaml");
+                        let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
+                        if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(fname)) {
+                            create_pane_from_resolved(fname, &resolved, layout, registry, home, pc, pr, wakeup_tx, name_counter)
+                        } else {
+                            let (command, args, submit_key) = resolve_backend(&backend_cmd, true);
+                            create_pane(layout, registry, home, &name, &command, &args, work_dir.as_deref(), &HashMap::new(), &submit_key, pc, pr, wakeup_tx, name_counter)
+                        }
+                    } else {
+                        // Non-fleet pane — use backend preset directly
+                        let (command, args, submit_key) = resolve_backend(&backend_cmd, true);
+                        create_pane(layout, registry, home, &name, &command, &args, work_dir.as_deref(), &HashMap::new(), &submit_key, pc, pr, wakeup_tx, name_counter)
+                    };
+                    if let Ok(mut new_pane) = pane_result {
+                        // Swap only vterm + rx into the existing pane slot
+                        if let Some((ti, pid)) = pane_loc {
+                            if let Some(pane) = layout.tabs[ti].root_mut().find_pane_mut(pid) {
+                                std::mem::swap(&mut pane.vterm, &mut new_pane.vterm);
+                                std::mem::swap(&mut pane.rx, &mut new_pane.rx);
+                                pane.agent_name = new_pane.agent_name;
+                                pane.display_name = display_name;
+                                pane.scroll_offset = 0;
+                                pane.has_notification = false;
+                                return true;
+                            }
+                        }
+                        // Fallback: add as new tab
+                        let tab_name = new_pane.agent_name.clone();
+                        layout.add_tab(Tab::new(tab_name, new_pane));
+                        return true;
+                    }
+                }
+            }
+        }
+        "send" => {
+            if parts.len() >= 3 {
+                if !agent::send_to_registry(registry, "user", parts[1], parts[2]) {
+                    tracing::warn!(target = parts[1], "send: agent not found in registry");
+                }
+            }
+        }
+        "broadcast" => {
+            if let Some(msg) = parts.get(1) {
+                agent::broadcast_registry(registry, "user", msg, None);
+            }
+        }
+        "status" => {
+            let reg = agent::lock_registry(registry);
+            for (name, handle) in reg.iter() {
+                if let Ok(core) = handle.core.lock() {
+                    tracing::info!(agent = name, state = ?core.state.get_state(), "status");
+                }
+            }
+        }
+        _ => {
+            tracing::warn!(cmd = cmd, "unknown command");
+        }
+    }
+    false
+}
+
+/// Sync fleet.yaml to match current pane state on detach.
+/// Removes fleet entries not present in any pane; adds panes with backend but missing from fleet.
+fn sync_fleet_yaml(home: &Path, layout: &Layout) {
+    let fleet_path = home.join("fleet.yaml");
+    let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
+
+    // Collect all fleet_instance_names currently in panes
+    let mut active_fleet_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for tab in &layout.tabs {
+        for id in tab.root().pane_ids() {
+            if let Some(pane) = tab.root().find_pane(id) {
+                if let Some(ref name) = pane.fleet_instance_name {
+                    active_fleet_names.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    // Batch-remove fleet entries not in any pane (single atomic write)
+    if let Some(ref f) = fleet {
+        let to_remove: Vec<String> = f.instance_names()
+            .into_iter()
+            .filter(|name| !active_fleet_names.contains(name))
+            .collect();
+        if !to_remove.is_empty() {
+            let _ = crate::fleet::remove_instances_from_yaml(home, &to_remove);
+        }
+    }
+}
+
+/// Save current session layout to disk. Only stores layout geometry, not agent config.
+fn save_session(home: &Path, layout: &Layout) {
     let tabs: Vec<SessionTab> = layout
         .tabs
         .iter()
-        .filter_map(|tab| {
-            let node = save_node(tab.root(), &reg)?;
-            Some(SessionTab {
-                name: tab.name.clone(),
-                root: node,
-            })
+        .map(|tab| SessionTab {
+            name: tab.name.clone(),
+            root: save_node(tab.root()),
         })
         .collect();
-    drop(reg);
 
     let session = Session {
         active_tab: layout.active,
@@ -792,34 +1250,26 @@ fn save_session(home: &Path, layout: &Layout, registry: &AgentRegistry) {
     }
 }
 
-fn save_node(
-    node: &crate::layout::PaneNode,
-    reg: &std::collections::HashMap<String, crate::agent::AgentHandle>,
-) -> Option<SessionNode> {
+fn save_node(node: &crate::layout::PaneNode) -> SessionNode {
     match node {
-        crate::layout::PaneNode::Leaf(pane) => {
-            let handle = reg.get(&pane.agent_name)?;
-            Some(SessionNode::Leaf(SessionPane {
-                agent_name: pane.agent_name.clone(),
-                backend_command: handle.backend_command.clone(),
-                working_dir: pane.working_dir.as_ref().map(|p| p.display().to_string()),
-                submit_key: handle.submit_key.clone(),
-                display_name: pane.display_name.clone(),
-            }))
-        }
-        crate::layout::PaneNode::Split { dir, first, second } => {
-            Some(SessionNode::Split {
-                dir: *dir,
-                first: Box::new(save_node(first, reg)?),
-                second: Box::new(save_node(second, reg)?),
-            })
-        }
+        crate::layout::PaneNode::Leaf(pane) => SessionNode::Leaf(SessionPane {
+            fleet_instance_name: pane.fleet_instance_name.clone(),
+            display_name: pane.display_name.clone(),
+        }),
+        crate::layout::PaneNode::Split { dir, first, second } => SessionNode::Split {
+            dir: *dir,
+            first: Box::new(save_node(first)),
+            second: Box::new(save_node(second)),
+        },
     }
 }
 
-/// Try to restore a saved session. Returns true if restored.
-fn restore_session(
+/// Restore with reconciliation: fleet.yaml is source of truth for agents,
+/// session.json is a layout hint. Returns true if anything was spawned.
+#[allow(clippy::too_many_arguments)]
+fn restore_with_reconciliation(
     home: &Path,
+    fleet_path: &Path,
     layout: &mut Layout,
     registry: &AgentRegistry,
     wakeup_tx: &crossbeam::channel::Sender<usize>,
@@ -827,38 +1277,70 @@ fn restore_session(
     cols: u16,
     rows: u16,
 ) -> bool {
-    let path = home.join("session.json");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let session: Session = match serde_json::from_str(&content) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    let fleet = crate::fleet::FleetConfig::load(fleet_path).ok();
+    let fleet_names: std::collections::HashSet<String> = fleet
+        .as_ref()
+        .map(|f| f.instance_names().into_iter().collect())
+        .unwrap_or_default();
 
-    if session.tabs.is_empty() {
-        return false;
-    }
+    // Try loading session.json as layout hint
+    let session_path = home.join("session.json");
+    let session: Option<Session> = std::fs::read_to_string(&session_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok());
 
-    let _ = std::fs::remove_file(&path);
+    if let Some(session) = session {
+        let _ = std::fs::remove_file(&session_path);
+        if !session.tabs.is_empty() {
+            let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for tab in &session.tabs {
-        if let Some(root_node) = restore_node(&tab.root, home, layout, registry, wakeup_tx, name_counter, cols, rows) {
-            layout.add_tab(Tab::with_root(tab.name.clone(), root_node));
+            for tab in &session.tabs {
+                if let Some(root_node) = restore_node_reconciled(
+                    &tab.root, fleet.as_ref(), home, layout, registry,
+                    wakeup_tx, name_counter, cols, rows, &mut placed,
+                ) {
+                    layout.add_tab(Tab::with_root(tab.name.clone(), root_node));
+                }
+            }
+
+            // Rule 3: fleet agents not in session → append as new tabs
+            let mut unplaced: Vec<String> = fleet_names.difference(&placed).cloned().collect();
+            unplaced.sort();
+            for name in &unplaced {
+                if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(name)) {
+                    if let Ok(pane) = create_pane_from_resolved(
+                        name, &resolved, layout, registry, home,
+                        cols, rows, wakeup_tx, name_counter,
+                    ) {
+                        let tab_name = pane.agent_name.clone();
+                        layout.add_tab(Tab::new(tab_name, pane));
+                    }
+                }
+            }
+
+            if session.active_tab < layout.tabs.len() {
+                layout.active = session.active_tab;
+            }
+
+            if !layout.tabs.is_empty() {
+                tracing::info!(tabs = layout.tabs.len(), "session restored with reconciliation");
+                return true;
+            }
         }
     }
 
-    if session.active_tab < layout.tabs.len() {
-        layout.active = session.active_tab;
+    // No session.json or empty → rule 1: auto-start fleet
+    if !fleet_names.is_empty() {
+        return auto_start_fleet(fleet_path, layout, registry, home, cols, rows, wakeup_tx, name_counter);
     }
 
-    tracing::info!(tabs = session.tabs.len(), "session restored");
-    true
+    // Rule 4: nothing → caller adds shell tab
+    false
 }
 
-fn restore_node(
+fn restore_node_reconciled(
     node: &SessionNode,
+    fleet: Option<&crate::fleet::FleetConfig>,
     home: &Path,
     layout: &mut Layout,
     registry: &AgentRegistry,
@@ -866,42 +1348,52 @@ fn restore_node(
     name_counter: &mut HashMap<String, usize>,
     cols: u16,
     rows: u16,
+    placed: &mut std::collections::HashSet<String>,
 ) -> Option<crate::layout::PaneNode> {
     match node {
         SessionNode::Leaf(sp) => {
-            let backend = Backend::from_command(&sp.backend_command);
-            let args: Vec<String> = backend
-                .as_ref()
-                .map(|b| {
-                    let preset = b.preset();
-                    let mut a: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-                    a.extend(preset.resume_mode.args_for(home, &sp.agent_name));
-                    a
-                })
-                .unwrap_or_default();
-
-            let submit_key = backend
-                .as_ref()
-                .map(|b| b.preset().submit_key.to_string())
-                .unwrap_or_else(|| sp.submit_key.clone());
-
-            let work_dir = sp.working_dir.as_ref().map(PathBuf::from);
-            let mut pane = create_pane(
-                layout, registry, home, &sp.agent_name, &sp.backend_command,
-                &args, work_dir.as_deref(), &HashMap::new(), &submit_key,
-                cols, rows, wakeup_tx, name_counter,
-            ).ok()?;
-            pane.display_name = sp.display_name.clone();
-            Some(crate::layout::PaneNode::Leaf(Box::new(pane)))
+            match &sp.fleet_instance_name {
+                Some(fleet_name) => {
+                    // Fleet agent — resolve from fleet.yaml, add resume args for session continuity.
+                    // Safe: preset.args should not contain resume flags (those live in resume_mode).
+                    let mut resolved = fleet?.resolve_instance(fleet_name)?;
+                    if let Some(backend) = Backend::from_command(&resolved.backend_command) {
+                        resolved.args.extend(backend.preset().resume_mode.args_for(home, fleet_name));
+                    }
+                    placed.insert(fleet_name.clone());
+                    let mut pane = create_pane_from_resolved(
+                        fleet_name, &resolved, layout, registry, home,
+                        cols, rows, wakeup_tx, name_counter,
+                    ).ok()?;
+                    pane.display_name = sp.display_name.clone();
+                    Some(crate::layout::PaneNode::Leaf(Box::new(pane)))
+                }
+                None => {
+                    // Shell pane — recreate fresh
+                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+                    let mut pane = create_pane(
+                        layout, registry, home, "shell", &shell,
+                        &[], None, &HashMap::new(), "\r",
+                        cols, rows, wakeup_tx, name_counter,
+                    ).ok()?;
+                    pane.display_name = sp.display_name.clone();
+                    Some(crate::layout::PaneNode::Leaf(Box::new(pane)))
+                }
+            }
         }
         SessionNode::Split { dir, first, second } => {
-            let first_node = restore_node(first, home, layout, registry, wakeup_tx, name_counter, cols, rows)?;
-            let second_node = restore_node(second, home, layout, registry, wakeup_tx, name_counter, cols, rows)?;
-            Some(crate::layout::PaneNode::Split {
-                dir: *dir,
-                first: Box::new(first_node),
-                second: Box::new(second_node),
-            })
+            let f = restore_node_reconciled(first, fleet, home, layout, registry, wakeup_tx, name_counter, cols, rows, placed);
+            let s = restore_node_reconciled(second, fleet, home, layout, registry, wakeup_tx, name_counter, cols, rows, placed);
+            match (f, s) {
+                (Some(f), Some(s)) => Some(crate::layout::PaneNode::Split {
+                    dir: *dir,
+                    first: Box::new(f),
+                    second: Box::new(s),
+                }),
+                // Rule 2: one side missing → collapse, sibling takes full space
+                (Some(node), None) | (None, Some(node)) => Some(node),
+                (None, None) => None,
+            }
         }
     }
 }
@@ -921,7 +1413,7 @@ fn scroll_focused(layout: &mut Layout, delta: i32) {
     }
 }
 
-/// Kill and remove an agent from the registry.
+/// Kill an agent and remove from both registry and fleet.yaml.
 fn kill_agent(registry: &AgentRegistry, name: &str) {
     let mut reg = agent::lock_registry(registry);
     if let Some(handle) = reg.get(name) {
@@ -929,6 +1421,22 @@ fn kill_agent(registry: &AgentRegistry, name: &str) {
         let _ = child.kill();
     }
     reg.remove(name);
+}
+
+/// Remove an agent's fleet.yaml entry by looking up its fleet_instance_name in the layout.
+fn remove_from_fleet(home: &Path, layout: &Layout, agent_name: &str) {
+    for tab in &layout.tabs {
+        for id in tab.root().pane_ids() {
+            if let Some(pane) = tab.root().find_pane(id) {
+                if pane.agent_name == agent_name {
+                    if let Some(ref fleet_name) = pane.fleet_instance_name {
+                        let _ = crate::fleet::remove_instance_from_yaml(home, fleet_name);
+                    }
+                    return;
+                }
+            }
+        }
+    }
 }
 
 // --- API server ---
@@ -978,5 +1486,109 @@ fn start_api_server(home: &Path, registry: &AgentRegistry) -> ApiGuard {
     tracing::info!(path = %run.display(), "in-process API server started");
     ApiGuard {
         run_dir: Some(run),
+    }
+}
+
+/// Handle mouse selection: down starts, drag extends, up copies to clipboard.
+/// Works on any pane (not just focused) by finding the pane under the cursor.
+fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEvent) {
+    let tab = match layout.active_tab_mut() {
+        Some(t) => t,
+        None => return,
+    };
+
+    // Down: hit-test pane_rects. Drag/Up: use cached selecting_pane.
+    let target_id = match mouse.kind {
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            tab.pane_rects.iter()
+                .find(|(_, &(px, py, pw, ph))| {
+                    mouse.column >= px && mouse.column < px + pw
+                        && mouse.row >= py && mouse.row < py + ph
+                })
+                .map(|(&id, _)| id)
+        }
+        _ => tab.selecting_pane,
+    };
+    let target_id = match target_id {
+        Some(id) => id,
+        None => return,
+    };
+
+    // Cache selection target on Down, clear on Up
+    if matches!(mouse.kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+        tab.selecting_pane = Some(target_id);
+    }
+
+    let rect = tab.pane_rects.get(&target_id).copied();
+    let pane = match tab.root_mut().find_pane_mut(target_id) {
+        Some(p) => p,
+        None => return,
+    };
+    let (px, py, pw, ph) = match rect {
+        Some(r) => r,
+        None => return,
+    };
+    let inner_x = px + 1;
+    let inner_y = py + 1;
+    let inner_w = pw.saturating_sub(2);
+    let inner_h = ph.saturating_sub(2);
+    if inner_w == 0 || inner_h == 0 {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            if mouse.column >= inner_x && mouse.column < inner_x + inner_w
+                && mouse.row >= inner_y && mouse.row < inner_y + inner_h
+            {
+                let col = mouse.column - inner_x;
+                let row = mouse.row - inner_y;
+                pane.selection = Some(crate::layout::Selection {
+                    start: (row, col),
+                    end: (row, col),
+                });
+            }
+        }
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+            let col = mouse.column.max(inner_x).min(inner_x + inner_w - 1) - inner_x;
+            let row = mouse.row.max(inner_y).min(inner_y + inner_h - 1) - inner_y;
+            if let Some(ref mut sel) = pane.selection {
+                sel.end = (row, col);
+            }
+        }
+        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+            if let Some(ref sel) = pane.selection {
+                let text = pane.vterm.extract_text(sel.start, sel.end, pane.scroll_offset);
+                if !text.is_empty() {
+                    copy_to_clipboard(&text);
+                }
+            }
+            pane.selection = None;
+            // Can't access tab here (already borrowed), so set a flag
+        }
+        _ => {}
+    }
+}
+
+/// Clear selecting_pane cache after mouse up. Called after handle_mouse_selection.
+fn clear_selection_cache(layout: &mut Layout) {
+    if let Some(tab) = layout.active_tab_mut() {
+        if tab.selecting_pane.is_some() {
+            // Check if selection was cleared (mouse up happened)
+            let still_selecting = tab.selecting_pane
+                .and_then(|id| tab.root().find_pane(id))
+                .is_some_and(|p| p.selection.is_some());
+            if !still_selecting {
+                tab.selecting_pane = None;
+            }
+        }
+    }
+}
+
+/// Copy text to system clipboard (macOS / Linux / Windows).
+fn copy_to_clipboard(text: &str) {
+    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+        Ok(()) => {}
+        Err(e) => tracing::warn!(error = %e, "clipboard copy failed"),
     }
 }
