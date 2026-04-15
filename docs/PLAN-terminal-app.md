@@ -361,39 +361,44 @@ ratatui = "0.29"   # 確認實作時的最新穩定版
 
 ---
 
-## 實作順序
+## 實作進度
 
-```
-Phase 1.1  多 Tab TUI 框架（app.rs + layout.rs + keybinds.rs）
-    ↓
-Phase 1.2  Pane Local VTerm + subscriber 接線
-    ↓
-Phase 1.3  VTermWidget render（render.rs + vterm.rs 改動）
-    ↓
-Phase 1.4  In-process daemon（daemon.rs DaemonCore 抽取）
-    ↓
-Phase 2.1  新建 tab = spawn agent
-    ↓
-Phase 2.2  Fleet 一鍵啟動
-    ↓
-Phase 2.3  狀態即時顯示
-    ↓
-Phase 3.1  訊息通知
-    ↓
-Phase 3.2  決策/任務面板
-    ↓
-Phase 4.1  Session 持久化
-    ↓
-Phase 4.2  Command palette
-    ↓
-Phase 4.3  Mouse 與 clipboard
-    ↓
-Phase 4.4  Telegram 整合
-```
+### 已完成 ✅
 
-Phase 1 完成後就能用——一個多 tab 的 terminal，每個 tab 是一個 agent PTY。
-Phase 2 完成後是完整體驗——開 terminal 就自動跑 fleet，agent 自動有 MCP tools。
-Phase 3-4 是錦上添花。
+| Phase | 功能 | 說明 |
+|-------|------|------|
+| 1.1 | 多 Tab TUI 框架 | app.rs + layout.rs + keybinds.rs + render.rs |
+| 1.2 | Pane Local VTerm | subscriber 接線，避免 lock contention |
+| 1.3 | VTermWidget render | render_to_buffer + Color/Flags 映射 + scrollback |
+| 1.4 | In-process daemon | 共用 AgentRegistry，API server + MCP tools 自動可用 |
+| 2.1 | 新建 tab = spawn agent | Ctrl+B c 選單（fleet/backend/shell） |
+| 2.2 | Fleet 啟動 | `--fleet` flag 指定 fleet.yaml |
+| 2.3 | 狀態即時顯示 | 14 states 完整顏色映射，tab 標題即時更新 |
+| 3.1 | 訊息通知 | Tab badge `!`，`[from:...]` 偵測 |
+| 4.1 | Session 持久化 | Ctrl+B d 保存 tree layout，下次 resume |
+| 4.3 | Mouse scroll | 滑鼠滾輪 per-pane scroll |
+| - | Unified PTY flow | app 用 spawn_agent()，auto-dismiss/state/broadcast 繼承 daemon |
+| - | Connect command | `agend-terminal connect` 動態連接外部 agent |
+| - | ExternalRegistry | 外部 agent 註冊、PID liveness check |
+| - | Split tree | 巢狀 split + 空間方向導航 + split 持久化 |
+| - | Tmux 快捷鍵 | c/n/p/l/0-9/&/,/./w/"//%/o/x/z/[/d/? + repeat mode |
+| - | Pane display name | Ctrl+B . 重命名，agent_name 路由不動 |
+| - | Close confirmation | Ctrl+B x / & 確認對話框 |
+| - | Self-send guard | 擋自己發給自己 + shells 從 list_instances 隱藏 |
+| - | IME cursor | terminal cursor 定位在 focused pane，中文輸入正常 |
+| - | Color fallback | RGB→256 for macOS Terminal.app |
+
+### 未完成 ❌
+
+| Phase | 功能 | 複雜度 | 說明 |
+|-------|------|--------|------|
+| 2.2 | Fleet 自動啟動 | 低 | 無參數啟動時自動載入 fleet.yaml（目前停用避免衝突） |
+| 3.2 | 決策/任務面板 | 中 | Ctrl+B D/T overlay，顯示 decisions.rs / tasks.rs |
+| 4.2 | Command palette | 中 | Ctrl+B : 輸入指令（spawn/kill/send/broadcast） |
+| 4.4 | Telegram 整合顯示 | 低 | Status bar 顯示 Telegram 連線狀態 |
+| - | Clipboard | 中 | Pane 內文字選取 + 複製（需要自訂 copy mode） |
+| - | Agent instructions | 低 | 自動寫入 `.claude/rules/agend.md` 等指引檔案 |
+| - | Resize propagation | 低 | 精確的 resize 從 render layout → PTY（目前在 render 時做） |
 
 ---
 
