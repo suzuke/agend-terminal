@@ -1,9 +1,11 @@
 mod agent;
 mod api;
+mod app;
 mod backend;
 mod bugreport;
 mod channel;
 mod cli;
+mod connect;
 mod daemon;
 mod decisions;
 mod deployments;
@@ -25,6 +27,9 @@ mod store;
 mod tasks;
 mod teams;
 mod telegram;
+mod keybinds;
+mod layout;
+mod render;
 mod tui;
 mod verify;
 mod vterm;
@@ -158,6 +163,26 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Connect a local agent to the running daemon
+    Connect {
+        /// Agent name (unique identifier)
+        name: String,
+        /// Backend command (claude, kiro-cli, codex, opencode, gemini)
+        #[arg(long)]
+        backend: String,
+        /// Working directory (default: current dir)
+        #[arg(long)]
+        working_dir: Option<String>,
+        /// Extra args passed to backend
+        #[arg(last = true)]
+        extra_args: Vec<String>,
+    },
+    /// Launch terminal app — multi-tab/pane TUI with agent management
+    App {
+        /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml)
+        #[arg(long)]
+        fleet: Option<String>,
+    },
     /// Stop the daemon
     Stop,
     /// Kill a specific agent
@@ -224,28 +249,35 @@ enum FleetCommands {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agend_terminal=info")),
-        )
-        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .init();
-
     load_dotenv();
 
     let cli = Cli::parse();
+
+    // App mode redirects tracing to a log file (stderr is owned by ratatui).
+    // All other commands use stderr.
+    let is_app = matches!(cli.command, Some(Commands::App { .. }));
+    if !is_app {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agend_terminal=info")),
+            )
+            .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .init();
+    }
     let home = home_dir();
     std::fs::create_dir_all(&home)?;
 
     match cli.command {
         None => {
-            // Print help
             use clap::CommandFactory;
             Cli::command().print_help()?;
             println!();
+        }
+        Some(Commands::App { fleet }) => {
+            app::run(fleet.as_deref())?;
         }
         Some(Commands::Start) => {
             let fleet_path = home.join("fleet.yaml");
@@ -297,6 +329,14 @@ fn main() -> anyhow::Result<()> {
                     .collect()
             };
             daemon::run(&home, agents)?;
+        }
+        Some(Commands::Connect {
+            name,
+            backend,
+            working_dir,
+            extra_args,
+        }) => {
+            connect::run(&home, &name, &backend, working_dir.as_deref(), &extra_args)?;
         }
         Some(Commands::Attach { name }) => {
             let sock = daemon::agent_socket_path(&home, &name);

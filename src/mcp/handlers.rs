@@ -74,6 +74,9 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             if let Err(e) = crate::agent::validate_name(target) {
                 return json!({"error": e});
             }
+            if target == instance_name {
+                return json!({"error": "cannot send to self — use a different instance_name"});
+            }
             let text = args["message"]
                 .as_str()
                 .or_else(|| args["text"].as_str())
@@ -205,9 +208,18 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 if let Some(agents) = resp["result"]["agents"].as_array() {
                     let instances: Vec<Value> = agents
                         .iter()
+                        .filter(|a| {
+                            // Hide non-agent backends (shells) from MCP tool results
+                            let backend = a["backend"].as_str().unwrap_or("");
+                            crate::backend::Backend::from_command(backend).is_some()
+                        })
                         .map(|a| {
                             let mut info = a.clone();
-                            merge_metadata(&home, a["name"].as_str().unwrap_or(""), &mut info);
+                            let name = a["name"].as_str().unwrap_or("");
+                            merge_metadata(&home, name, &mut info);
+                            if name == instance_name {
+                                info["is_self"] = json!(true);
+                            }
                             info
                         })
                         .collect();

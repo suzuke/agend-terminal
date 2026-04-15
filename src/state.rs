@@ -95,140 +95,140 @@ impl StatePatterns {
         let patterns = match backend {
             // Claude Code v2.1.89
             Backend::ClaudeCode => vec![
-                // [文件] Claude Code SDK error handling
+                // [docs] Claude Code SDK error handling
                 (
                     AgentState::AuthError,
                     r"API key|authentication failed|unauthorized",
                 ),
-                // [文件] SDK retry logic for 429/overloaded
+                // [docs] SDK retry logic for 429/overloaded
                 (AgentState::RateLimit, r"overloaded|rate.?limit|429"),
-                // [文件] Auto-compaction on context limit
+                // [docs] Auto-compaction on context limit
                 (
                     AgentState::ContextFull,
                     r"compacting context|context.*(full|limit)",
                 ),
-                // [推測] Ink select component for permissions
+                // [estimated] Ink select component for permissions
                 (
                     AgentState::PermissionPrompt,
                     r"Allow once|Allow always|approve",
                 ),
-                // [推測] Ink render during processing
+                // [estimated] Ink render during processing
                 (AgentState::Thinking, r"Thinking"),
-                // [推測] Tool name with spinner/status icon prefix
+                // [estimated] Tool name with spinner/status icon prefix
                 (
                     AgentState::ToolUse,
                     r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●].*(Read|Bash|Edit|Write|Grep|Glob)",
                 ),
-                // [実測] Prompt symbol in idle state
+                // [measured] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
-                // [実測] Shown after startup with --dangerously-skip-permissions
+                // [measured] Shown after startup with --dangerously-skip-permissions
                 (AgentState::Ready, r"bypass permissions"),
             ],
             // Kiro CLI (version TBD)
             Backend::KiroCli => vec![
-                // [文件] Kiro auth error messages
+                // [docs] Kiro auth error messages
                 (
                     AgentState::AuthError,
                     r"Not authenticated|AccessDenied|denied access",
                 ),
-                // [文件] AWS quota errors
+                // [docs] AWS quota errors
                 (
                     AgentState::UsageLimit,
                     r"ServiceQuotaExceeded|InsufficientModelCapacity",
                 ),
-                // [文件] HTTP 429 handling
+                // [docs] HTTP 429 handling
                 (
                     AgentState::RateLimit,
                     r"Too Many Requests|ThrottlingError|429",
                 ),
-                // [文件] Context overflow triggers compaction
+                // [docs] Context overflow triggers compaction
                 (AgentState::ContextFull, r"context window overflow|/compact"),
-                // [文件] Trust-based permission system
+                // [docs] Trust-based permission system
                 (AgentState::PermissionPrompt, r"Allow this action|y/n/t"),
-                // [文件] Processing indicator
+                // [docs] Processing indicator
                 (AgentState::Thinking, r"Generating"),
-                // [文件] Tool names in output
+                // [docs] Tool names in output
                 (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
-                // [実測] Idle prompt with percentage
-                (AgentState::Idle, r"\d+%\s*!>"),
-                // [実測] Trust dialog completion
-                (AgentState::Ready, r"All tools are now trusted"),
+                // [measured] Idle prompt
+                (AgentState::Idle, r"\d+%\s*$|ask a question or describe a task"),
+                // [measured] Trust dialog completion / ready state
+                (AgentState::Ready, r"Trust All Tools active|/quit to exit"),
             ],
             // Codex v0.118.0
             Backend::Codex => vec![
-                // [文件] Requires OPENAI_API_KEY env
+                // [docs] Requires OPENAI_API_KEY env
                 (AgentState::AuthError, r"OPENAI_API_KEY|api.?key"),
                 // [実測 v0.118.0] Quota exhausted message
                 (AgentState::UsageLimit, r"hit your usage limit|try again at"),
-                // [文件] HTTP 429 handling
+                // [docs] HTTP 429 handling
                 (AgentState::RateLimit, r"rate.?limit|429"),
-                // [文件] Context overflow error
+                // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
-                // [文件] Permission approval flow
+                // [docs] Permission approval flow
                 (
                     AgentState::PermissionPrompt,
                     r"Request approval|approve|deny",
                 ),
-                // [推測] Processing state
+                // [estimated] Processing state
                 (AgentState::Thinking, r"Thinking"),
-                // [推測] Patch tool
+                // [estimated] Patch tool
                 (AgentState::ToolUse, r"apply_patch"),
-                // [実測] Prompt symbol + model info in status
+                // [measured] Prompt symbol + model info in status
                 (AgentState::Idle, r"›"),
-                // [実測] Version + model display
+                // [measured] Version + model display
                 (AgentState::Ready, r"OpenAI Codex|gpt-.*left"),
             ],
             // OpenCode v1.4.0
             Backend::OpenCode => vec![
-                // [文件] HTTP error handling
+                // [docs] HTTP error handling
                 (AgentState::RateLimit, r"rate.?limit|429"),
-                // [文件] Context overflow
+                // [docs] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
-                // [文件] Permission UI
+                // [docs] Permission UI
                 (
                     AgentState::PermissionPrompt,
                     r"Permission required|Allow once|Allow always",
                 ),
-                // [文件] Busy text
+                // [docs] Busy text
                 (AgentState::Thinking, r"Working"),
-                // [実測] Update dialog that may block
+                // [measured] Update dialog that may block
                 (
                     AgentState::PermissionPrompt,
                     r"Update Available|Skip\s+Confirm",
                 ),
-                // [実測] Input prompt text
+                // [measured] Input prompt text
                 (AgentState::Idle, r"Ask anything"),
-                // [実測] Ready state with keybinding hints
+                // [measured] Ready state with keybinding hints
                 (AgentState::Ready, r"Ask anything|tab agents"),
             ],
             // Gemini CLI v0.37.1
             Backend::Gemini => vec![
-                // [文件] OAuth errors from API
+                // [docs] OAuth errors from API
                 (
                     AgentState::AuthError,
                     r"OAuth not authenticated|OAuth expired|UNAUTHENTICATED|check API key",
                 ),
-                // [文件] Usage limit messages
+                // [docs] Usage limit messages
                 (
                     AgentState::UsageLimit,
                     r"Usage limit reached|Access resets at",
                 ),
-                // [文件] API resource exhaustion
+                // [docs] API resource exhaustion
                 (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|429"),
-                // [文件] Token/quota limit
+                // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
-                // [文件] Permission select options
+                // [docs] Permission select options
                 (
                     AgentState::PermissionPrompt,
                     r"Allow once|Allow for this session|suggest changes",
                 ),
-                // [推測] Processing indicator
+                // [estimated] Processing indicator
                 (AgentState::Thinking, r"Thinking"),
-                // [推測] MCP tool execution
+                // [estimated] MCP tool execution
                 (AgentState::ToolUse, r"tool.*call|MCP.*tool"),
-                // [実測] Input prompt text
+                // [measured] Input prompt text
                 (AgentState::Idle, r"Type your message"),
-                // [実測] Full ready prompt + YOLO mode
+                // [measured] Full ready prompt + YOLO mode
                 (AgentState::Ready, r"Type your message|YOLO"),
             ],
         };

@@ -240,6 +240,9 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
+    // External agents registry (connected via `agend-terminal connect`)
+    let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+
     // Crash channel for auto-respawn
     let (crash_tx, crash_rx) = crossbeam::channel::unbounded::<String>();
 
@@ -310,9 +313,12 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     let api_home = home.to_path_buf();
     let api_shutdown = Arc::clone(&shutdown);
     let api_configs = Arc::clone(&configs);
+    let api_externals = Arc::clone(&externals);
     std::thread::Builder::new()
         .name("api_server".into())
-        .spawn(move || crate::api::serve(&api_home, api_reg, api_shutdown, api_configs))?;
+        .spawn(move || {
+            crate::api::serve(&api_home, api_reg, api_shutdown, api_configs, api_externals)
+        })?;
 
     let shutdown2 = Arc::clone(&shutdown);
     match ctrlc::set_handler(move || {
@@ -383,6 +389,19 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        // Liveness check for external agents
+        {
+            let mut ext = crate::agent::lock_external(&externals);
+            ext.retain(|name, handle| {
+                let alive = unsafe { nix::libc::kill(handle.pid as i32, 0) == 0 };
+                if !alive {
+                    tracing::info!(agent = %name, pid = handle.pid, "external agent gone, deregistering");
+                    crate::event_log::log(home, "disconnect", name, "external agent PID gone");
+                }
+                alive
+            });
         }
 
         // Periodic snapshot: save fleet state (only if changed)

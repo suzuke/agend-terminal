@@ -3,7 +3,7 @@
 //! Protocol: NDJSON (one JSON request per line, one JSON response per line).
 //! Socket: {home}/api.sock
 
-use crate::agent::{self, AgentRegistry};
+use crate::agent::{self, AgentRegistry, ExternalRegistry};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -20,6 +20,7 @@ pub fn serve(
     registry: AgentRegistry,
     shutdown: Arc<AtomicBool>,
     configs: ConfigRegistry,
+    externals: ExternalRegistry,
 ) {
     let sock = api_socket_path(home);
     let _ = std::fs::remove_file(&sock);
@@ -38,9 +39,10 @@ pub fn serve(
         let home = home.to_path_buf();
         let shutdown = Arc::clone(&shutdown);
         let cfgs = Arc::clone(&configs);
+        let ext = Arc::clone(&externals);
         std::thread::Builder::new()
             .name("api_handler".into())
-            .spawn(move || handle_session(stream, &reg, &home, &shutdown, &cfgs))
+            .spawn(move || handle_session(stream, &reg, &home, &shutdown, &cfgs, &ext))
             .ok();
     }
 }
@@ -69,6 +71,7 @@ fn handle_session(
     home: &Path,
     shutdown: &Arc<AtomicBool>,
     configs: &ConfigRegistry,
+    externals: &ExternalRegistry,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -108,13 +111,24 @@ fn handle_session(
         let response = match method {
             "list" => {
                 let reg = agent::lock_registry(registry);
-                let agents: Vec<Value> = reg.iter().map(|(name, handle)| {
-                    let (agent_state, health_state) = handle.core.lock()
-                        .map(|c| (c.state.get_state().display_name().to_string(), c.health.state.display_name().to_string()))
-                        .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
-                    json!({"name": name, "backend": handle.backend_command, "submit_key": handle.submit_key,
-                           "inject_prefix": handle.inject_prefix, "agent_state": agent_state, "health_state": health_state})
-                }).collect();
+                let mut agents: Vec<Value> = reg.iter()
+                    .map(|(name, handle)| {
+                        let (agent_state, health_state) = handle.core.lock()
+                            .map(|c| (c.state.get_state().display_name().to_string(), c.health.state.display_name().to_string()))
+                            .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
+                        json!({"name": name, "backend": handle.backend_command, "submit_key": handle.submit_key,
+                               "inject_prefix": handle.inject_prefix, "agent_state": agent_state, "health_state": health_state,
+                               "kind": "managed"})
+                    }).collect();
+                drop(reg);
+                let ext = agent::lock_external(externals);
+                for (name, handle) in ext.iter() {
+                    agents.push(json!({
+                        "name": name, "backend": handle.backend_command,
+                        "agent_state": "external", "health_state": "connected",
+                        "kind": "external", "pid": handle.pid
+                    }));
+                }
                 json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
             }
             "inject" => {
@@ -149,7 +163,14 @@ fn handle_session(
                             }
                         }
                     }
-                    None => json!({"ok": false, "error": format!("agent '{name}' not found")}),
+                    None => {
+                        let ext = agent::lock_external(externals);
+                        if ext.contains_key(name) {
+                            json!({"ok": false, "error": format!("agent '{name}' is external — use send instead of inject")})
+                        } else {
+                            json!({"ok": false, "error": format!("agent '{name}' not found")})
+                        }
+                    }
                 }
             }
             "kill" => {
@@ -171,7 +192,17 @@ fn handle_session(
                         crate::event_log::log(home, "kill", name, "killed via API");
                         json!({"ok": true})
                     }
-                    None => json!({"ok": false, "error": format!("agent '{name}' not found")}),
+                    None => {
+                        // Try external registry
+                        drop(reg);
+                        let mut ext = agent::lock_external(externals);
+                        if ext.remove(name).is_some() {
+                            crate::event_log::log(home, "kill", name, "external agent removed");
+                            json!({"ok": true})
+                        } else {
+                            json!({"ok": false, "error": format!("agent '{name}' not found")})
+                        }
+                    }
                 }
             }
             "delete" => {
@@ -180,6 +211,16 @@ fn handle_session(
                 if let Err(e) = agent::validate_name(name) {
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
+                }
+                // Check external registry first
+                {
+                    let mut ext = agent::lock_external(externals);
+                    if ext.remove(name).is_some() {
+                        crate::event_log::log(home, "delete", name, "external agent deleted");
+                        let _ = writeln!(writer, "{}", json!({"ok": true}));
+                        let _ = writer.flush();
+                        continue;
+                    }
                 }
                 // Kill and remove from registry first — this prevents the PTY close
                 // handler from sending a crash event (agent not in registry = no crash).
@@ -266,6 +307,10 @@ fn handle_session(
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
                 }
+                if from == target {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": "cannot send to self"}));
+                    continue;
+                }
                 let _ = crate::inbox::enqueue(
                     home,
                     target,
@@ -279,21 +324,25 @@ fn handle_session(
                         timestamp: chrono::Utc::now().to_rfc3339(),
                     },
                 );
+                let display_text = if text.chars().count() > 200 {
+                    format!(
+                        "{}... (use inbox tool)",
+                        text.chars().take(200).collect::<String>()
+                    )
+                } else {
+                    text.to_string()
+                };
+                let inject_msg = format!("[from:{from}] {display_text} (Reply using send_to_instance MCP tool, NOT direct text)");
+
+                // Try managed agent first
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(target) {
-                    let display_text = if text.chars().count() > 200 {
-                        format!(
-                            "{}... (use inbox tool)",
-                            text.chars().take(200).collect::<String>()
-                        )
-                    } else {
-                        text.to_string()
-                    };
                     let _ = agent::inject_to_agent(
                         handle,
-                        format!("[from:{from}] {display_text}").as_bytes(),
+                        inject_msg.as_bytes(),
                     );
                 }
+                // External agents receive messages via inbox only (no PTY injection)
                 json!({"ok": true})
             }
             "status" => match crate::snapshot::load(home) {
@@ -316,6 +365,57 @@ fn handle_session(
                 }
                 None => json!({"ok": true, "result": {"agents": [], "timestamp": null}}),
             },
+            "register_external" => {
+                let name = match params["name"].as_str() {
+                    Some(n) => n,
+                    None => {
+                        let _ = writeln!(writer, "{}", json!({"ok": false, "error": "missing name"}));
+                        continue;
+                    }
+                };
+                if let Err(e) = agent::validate_name(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
+                    continue;
+                }
+                // Atomic check-and-insert: lock order is always registry → external
+                let reg = agent::lock_registry(registry);
+                if reg.contains_key(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")}));
+                    continue;
+                }
+                let mut ext = agent::lock_external(externals);
+                if ext.contains_key(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": format!("agent '{name}' already exists (external)")}));
+                    continue;
+                }
+                let backend = params["backend"].as_str().unwrap_or("unknown");
+                let pid = params["pid"].as_u64().unwrap_or(0) as u32;
+                ext.insert(name.to_string(), agent::ExternalAgentHandle {
+                    backend_command: backend.to_string(),
+                    pid,
+                });
+                drop(reg);
+                drop(ext);
+                crate::event_log::log(home, "connect", name, &format!("external agent registered (pid={pid}, backend={backend})"));
+                tracing::info!(agent = name, pid, backend, "external agent registered");
+                json!({"ok": true})
+            }
+            "deregister_external" => {
+                let name = params["name"].as_str().unwrap_or("");
+                if let Err(e) = agent::validate_name(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
+                    continue;
+                }
+                let mut ext = agent::lock_external(externals);
+                if ext.remove(name).is_some() {
+                    drop(ext);
+                    crate::event_log::log(home, "disconnect", name, "external agent deregistered");
+                    tracing::info!(agent = name, "external agent deregistered");
+                    json!({"ok": true})
+                } else {
+                    json!({"ok": false, "error": format!("external agent '{name}' not found")})
+                }
+            }
             "shutdown" => {
                 tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

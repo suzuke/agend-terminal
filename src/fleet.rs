@@ -317,6 +317,21 @@ pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
     })
 }
 
+/// Remove multiple instances from fleet.yaml in a single atomic write.
+pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    mutate_fleet_yaml(home, "", |doc| {
+        if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
+            for name in names {
+                instances.remove(serde_yaml::Value::String(name.clone()));
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Update a specific field of an instance in fleet.yaml. Uses file lock + atomic write.
 pub fn update_instance_field(
     home: &Path,

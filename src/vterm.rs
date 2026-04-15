@@ -14,6 +14,15 @@ impl EventListener for NoopListener {
     fn send_event(&self, _event: Event) {}
 }
 
+/// Cached once: whether terminal supports true color (avoids env var lookup per cell).
+fn supports_truecolor() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let val = std::env::var("COLORTERM").unwrap_or_default();
+        val.contains("truecolor") || val.contains("24bit")
+    })
+}
+
 struct VTermSize {
     cols: u16,
     rows: u16,
@@ -41,7 +50,7 @@ impl VTerm {
     pub fn new(cols: u16, rows: u16) -> Self {
         let size = VTermSize { cols, rows };
         let config = Config {
-            scrolling_history: 0,
+            scrolling_history: 10000,
             ..Default::default()
         };
         let term = term::Term::new(config, &size, NoopListener);
@@ -53,6 +62,14 @@ impl VTerm {
         }
     }
 
+    pub fn cols(&self) -> u16 {
+        self.cols
+    }
+
+    pub fn rows(&self) -> u16 {
+        self.rows
+    }
+
     pub fn process(&mut self, data: &[u8]) {
         self.processor.advance(&mut self.term, data);
     }
@@ -62,6 +79,114 @@ impl VTerm {
         self.cols = cols;
         self.rows = rows;
         self.term.resize(VTermSize { cols, rows });
+    }
+
+    /// Render current screen into a ratatui Buffer for TUI display.
+    /// `scroll_offset` = lines scrolled back (0 = live view).
+    pub fn render_to_buffer(
+        &self,
+        buf: &mut ratatui::buffer::Buffer,
+        area: ratatui::layout::Rect,
+        scroll_offset: usize,
+        show_block_cursor: bool,
+    ) {
+        let grid = self.term.grid();
+        let rows = self.rows.min(area.height);
+        let cols = self.cols.min(area.width);
+        let offset = scroll_offset as i32;
+
+        for row in 0..rows {
+            // With scroll_offset, shift grid line index into scrollback
+            let grid_line = Line(row as i32 - offset);
+            let mut col = 0u16;
+            while col < cols {
+                let cell = &grid[Point::new(grid_line, Column(col as usize))];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    col += 1;
+                    continue;
+                }
+                let style = cell_to_ratatui_style(cell.fg, cell.bg, cell.flags);
+                let x = area.x + col;
+                let y = area.y + row;
+                if x >= buf.area().x + buf.area().width || y >= buf.area().y + buf.area().height {
+                    col += 1;
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                let buf_cell = &mut buf[(x, y)];
+                buf_cell.set_char(ch).set_style(style);
+                if cell.flags.contains(Flags::WIDE_CHAR) {
+                    col += 2;
+                } else {
+                    col += 1;
+                }
+            }
+        }
+
+        // Reversed block cursor for unfocused panes (focused panes use terminal cursor)
+        if show_block_cursor && scroll_offset == 0 {
+            let cursor = grid.cursor.point;
+            let cx = area.x + cursor.column.0 as u16;
+            let cy = area.y + cursor.line.0 as u16;
+            if cx < area.x + area.width && cy < area.y + area.height {
+                let buf_cell = &mut buf[(cx, cy)];
+                let style = buf_cell.style().add_modifier(ratatui::style::Modifier::REVERSED);
+                buf_cell.set_style(style);
+            }
+        }
+    }
+
+    /// Maximum scroll offset (history size).
+    pub fn max_scroll(&self) -> usize {
+        use alacritty_terminal::grid::Dimensions;
+        let total = self.term.grid().total_lines();
+        let screen = self.term.grid().screen_lines();
+        total.saturating_sub(screen)
+    }
+
+    /// Get cursor position (line, column).
+    #[allow(dead_code)]
+    pub fn cursor_pos(&self) -> (u16, u16) {
+        let c = self.term.grid().cursor.point;
+        (c.line.0 as u16, c.column.0 as u16)
+    }
+
+    /// Extract text from a selection range (grid coordinates), accounting for scroll offset.
+    pub fn extract_text(&self, start: (u16, u16), end: (u16, u16), scroll_offset: usize) -> String {
+        let grid = self.term.grid();
+        let offset = scroll_offset as i32;
+
+        // Normalize start/end so start is before end
+        let (s, e) = if start <= end { (start, end) } else { (end, start) };
+        let (s_row, s_col) = s;
+        let (e_row, e_col) = e;
+
+        let mut text = String::new();
+        for row in s_row..=e_row {
+            let grid_line = Line(row as i32 - offset);
+            let col_start = if row == s_row { s_col } else { 0 };
+            let col_end = if row == e_row { e_col } else { self.cols.saturating_sub(1) };
+
+            let mut line = String::new();
+            for col in col_start..=col_end {
+                if (col as usize) >= self.cols as usize {
+                    break;
+                }
+                let cell = &grid[Point::new(grid_line, Column(col as usize))];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                line.push(ch);
+            }
+            // Trim trailing spaces per line
+            let trimmed = line.trim_end();
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(trimmed);
+        }
+        text
     }
 
     /// Dump current screen as ANSI escape sequences for full redraw.
@@ -152,6 +277,99 @@ impl VTerm {
         );
         out
     }
+}
+
+/// Convert alacritty Color to ratatui Color.
+fn color_to_ratatui(color: Color) -> Option<ratatui::style::Color> {
+    match color {
+        Color::Named(n) => {
+            use ratatui::style::Color as RC;
+            match n {
+                NamedColor::Black | NamedColor::DimBlack => Some(RC::Black),
+                NamedColor::Red | NamedColor::DimRed => Some(RC::Red),
+                NamedColor::Green | NamedColor::DimGreen => Some(RC::Green),
+                NamedColor::Yellow | NamedColor::DimYellow => Some(RC::Yellow),
+                NamedColor::Blue | NamedColor::DimBlue => Some(RC::Blue),
+                NamedColor::Magenta | NamedColor::DimMagenta => Some(RC::Magenta),
+                NamedColor::Cyan | NamedColor::DimCyan => Some(RC::Cyan),
+                NamedColor::White | NamedColor::DimWhite => Some(RC::White),
+                NamedColor::BrightBlack => Some(RC::DarkGray),
+                NamedColor::BrightRed => Some(RC::LightRed),
+                NamedColor::BrightGreen => Some(RC::LightGreen),
+                NamedColor::BrightYellow => Some(RC::LightYellow),
+                NamedColor::BrightBlue => Some(RC::LightBlue),
+                NamedColor::BrightMagenta => Some(RC::LightMagenta),
+                NamedColor::BrightCyan => Some(RC::LightCyan),
+                NamedColor::BrightWhite => Some(RC::White),
+                NamedColor::Foreground | NamedColor::Background => None,
+                _ => None,
+            }
+        }
+        Color::Spec(rgb) => {
+            // Use RGB directly — terminals that don't support true color
+            // (e.g., macOS Terminal.app) will get the nearest 256-color via Indexed fallback.
+            if supports_truecolor() {
+                Some(ratatui::style::Color::Rgb(rgb.r, rgb.g, rgb.b))
+            } else {
+                // Fallback: convert RGB to nearest 256-color index
+                Some(ratatui::style::Color::Indexed(rgb_to_256(rgb.r, rgb.g, rgb.b)))
+            }
+        }
+        Color::Indexed(idx) => Some(ratatui::style::Color::Indexed(idx)),
+    }
+}
+
+/// Convert RGB to the nearest 256-color index (for terminals without true color).
+fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
+    // Check grayscale ramp (232-255) first
+    if r == g && g == b {
+        if r < 8 {
+            return 16; // black
+        }
+        if r > 248 {
+            return 231; // white
+        }
+        return (((r as u16 - 8) * 24 / 247) as u8) + 232;
+    }
+    // Map to 6x6x6 color cube (indices 16-231)
+    let ri = ((r as u16) * 5 / 255) as u8;
+    let gi = ((g as u16) * 5 / 255) as u8;
+    let bi = ((b as u16) * 5 / 255) as u8;
+    16 + 36 * ri + 6 * gi + bi
+}
+
+/// Convert alacritty cell attributes to ratatui Style.
+fn cell_to_ratatui_style(fg: Color, bg: Color, flags: Flags) -> ratatui::style::Style {
+    let mut style = ratatui::style::Style::default();
+    if let Some(c) = color_to_ratatui(fg) {
+        style = style.fg(c);
+    }
+    if let Some(c) = color_to_ratatui(bg) {
+        style = style.bg(c);
+    }
+    let mut mods = ratatui::style::Modifier::empty();
+    if flags.contains(Flags::BOLD) {
+        mods |= ratatui::style::Modifier::BOLD;
+    }
+    if flags.contains(Flags::DIM) {
+        mods |= ratatui::style::Modifier::DIM;
+    }
+    if flags.contains(Flags::ITALIC) {
+        mods |= ratatui::style::Modifier::ITALIC;
+    }
+    if flags.contains(Flags::UNDERLINE) {
+        mods |= ratatui::style::Modifier::UNDERLINED;
+    }
+    if flags.contains(Flags::INVERSE) {
+        mods |= ratatui::style::Modifier::REVERSED;
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        mods |= ratatui::style::Modifier::CROSSED_OUT;
+    }
+    if !mods.is_empty() {
+        style = style.add_modifier(mods);
+    }
+    style
 }
 
 fn write_color(out: &mut Vec<u8>, color: Color, is_fg: bool) {

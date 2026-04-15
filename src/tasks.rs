@@ -32,6 +32,11 @@ fn load(home: &Path) -> TaskStore {
     crate::store::load(&store_path(home))
 }
 
+/// Return all tasks as typed structs (no JSON round-trip).
+pub fn list_all(home: &Path) -> Vec<Task> {
+    load(home).tasks
+}
+
 pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
     let action = match args["action"].as_str() {
         Some(a) => a,
