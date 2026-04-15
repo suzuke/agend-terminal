@@ -1,73 +1,51 @@
 //! Tab and pane layout management — tree-based nested splits.
 
 use crate::backend::Backend;
-use crate::state::{AgentState, StateTracker};
 use crate::vterm::VTerm;
-use portable_pty::PtySize;
-use std::io::Write;
-use std::sync::{Arc, Mutex};
-
-pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+use std::path::PathBuf;
 
 /// A single pane displaying one agent's terminal output.
+/// PTY ownership is in AgentRegistry — pane only has subscriber channel + local VTerm.
 pub struct Pane {
     pub agent_name: String,
     pub vterm: VTerm,
     pub rx: crossbeam::channel::Receiver<Vec<u8>>,
     pub id: usize,
     pub backend: Option<Backend>,
-    pub state_tracker: StateTracker,
-    pub pty_writer: PtyWriter,
-    #[allow(dead_code)] // used by resize()
-    pub pty_master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
-    pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
+    /// Working directory this pane was spawned in.
+    pub working_dir: Option<PathBuf>,
+    /// User-defined display name (shown in pane border). agent_name is used if None.
+    pub display_name: Option<String>,
+    /// Scroll offset (lines from bottom). 0 = live view.
+    pub scroll_offset: usize,
+    /// True when an unread `[from:...]` message was detected.
+    pub has_notification: bool,
 }
 
 impl Pane {
-    pub fn state(&self) -> AgentState {
-        self.state_tracker.get_state()
+    /// Display label: display_name if set, otherwise agent_name.
+    pub fn label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.agent_name)
     }
 
+    /// Drain pending output into the local VTerm.
     pub fn drain_output(&mut self) {
         while let Ok(data) = self.rx.try_recv() {
             self.vterm.process(&data);
             if self.backend.is_some() {
                 let text = String::from_utf8_lossy(&data);
-                let stripped = crate::agent::strip_ansi_pub(&text);
-                self.state_tracker.feed(&stripped);
+                if text.contains("[from:") {
+                    self.has_notification = true;
+                }
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.vterm.resize(cols, rows);
-        if let Ok(master) = self.pty_master.lock() {
-            let _ = master.resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
-        }
-    }
-
-    pub fn write_to_pty(&self, data: &[u8]) {
-        if let Ok(mut w) = self.pty_writer.lock() {
-            let _ = w.write_all(data);
-            let _ = w.flush();
-        }
-    }
-
-    fn kill(&self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-        }
+        // Don't auto-scroll if user has scrolled back (they're reading history).
+        // User scrolls back to bottom manually via mouse or Ctrl+B [ → j.
     }
 }
 
 /// Split direction.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SplitDir {
     Horizontal,
     Vertical,
@@ -84,7 +62,6 @@ pub enum PaneNode {
 }
 
 impl PaneNode {
-    /// Collect all pane IDs in tree order.
     pub fn pane_ids(&self) -> Vec<usize> {
         match self {
             PaneNode::Leaf(p) => vec![p.id],
@@ -96,7 +73,6 @@ impl PaneNode {
         }
     }
 
-    /// Find a pane by ID.
     pub fn find_pane(&self, id: usize) -> Option<&Pane> {
         match self {
             PaneNode::Leaf(p) if p.id == id => Some(p),
@@ -107,7 +83,6 @@ impl PaneNode {
         }
     }
 
-    /// Find a pane by ID (mutable).
     pub fn find_pane_mut(&mut self, id: usize) -> Option<&mut Pane> {
         match self {
             PaneNode::Leaf(p) if p.id == id => Some(p),
@@ -118,7 +93,6 @@ impl PaneNode {
         }
     }
 
-    /// Get the first pane (for tab state display).
     pub fn first_pane(&self) -> &Pane {
         match self {
             PaneNode::Leaf(p) => p,
@@ -126,7 +100,6 @@ impl PaneNode {
         }
     }
 
-    /// Count total panes.
     pub fn pane_count(&self) -> usize {
         match self {
             PaneNode::Leaf(_) => 1,
@@ -134,18 +107,28 @@ impl PaneNode {
         }
     }
 
-    /// Count panes with a backend (agents, not shells).
     pub fn agent_count(&self) -> usize {
         match self {
             PaneNode::Leaf(p) => usize::from(p.backend.is_some()),
             PaneNode::Split { first, second, .. } => first.agent_count() + second.agent_count(),
         }
     }
+
+    /// Collect all agent names in the tree.
+    pub fn agent_names(&self) -> Vec<String> {
+        match self {
+            PaneNode::Leaf(p) => vec![p.agent_name.clone()],
+            PaneNode::Split { first, second, .. } => {
+                let mut names = first.agent_names();
+                names.extend(second.agent_names());
+                names
+            }
+        }
+    }
 }
 
-// --- Ownership-based tree transforms (avoid dummy values) ---
+// --- Ownership-based tree transforms ---
 
-/// Split the leaf with `target_id` into a Split node. Returns remaining pane if not found.
 fn split_in_tree(
     node: PaneNode,
     target_id: usize,
@@ -192,36 +175,30 @@ fn split_in_tree(
     }
 }
 
-/// Remove a leaf with `target_id`. The sibling replaces the parent Split.
 fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, Option<Pane>) {
     match node {
-        PaneNode::Leaf(p) => (PaneNode::Leaf(p), None), // can't remove root leaf
+        PaneNode::Leaf(p) => (PaneNode::Leaf(p), None),
         PaneNode::Split {
             dir,
             first,
             second,
         } => {
-            // Check if first child is the target
             if let PaneNode::Leaf(ref p) = *first {
                 if p.id == target_id {
                     let PaneNode::Leaf(removed) = *first else {
                         unreachable!()
                     };
-                    removed.kill();
                     return (*second, Some(*removed));
                 }
             }
-            // Check if second child is the target
             if let PaneNode::Leaf(ref p) = *second {
                 if p.id == target_id {
                     let PaneNode::Leaf(removed) = *second else {
                         unreachable!()
                     };
-                    removed.kill();
                     return (*first, Some(*removed));
                 }
             }
-            // Recurse into first
             let (new_first, removed) = remove_from_tree(*first, target_id);
             if removed.is_some() {
                 return (
@@ -233,7 +210,6 @@ fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, Option<Pane>
                     removed,
                 );
             }
-            // Recurse into second
             let (new_second, removed) = remove_from_tree(*second, target_id);
             (
                 PaneNode::Split {
@@ -247,24 +223,13 @@ fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, Option<Pane>
     }
 }
 
-/// Kill all panes in a tree.
-fn kill_all(node: &PaneNode) {
-    match node {
-        PaneNode::Leaf(p) => p.kill(),
-        PaneNode::Split { first, second, .. } => {
-            kill_all(first);
-            kill_all(second);
-        }
-    }
-}
+// --- Spatial navigation helpers ---
 
-/// Center point of a rect (x, y, w, h).
 fn center(rect: (u16, u16, u16, u16)) -> (i32, i32) {
     let (x, y, w, h) = rect;
     (x as i32 + w as i32 / 2, y as i32 + h as i32 / 2)
 }
 
-/// Check if two rects overlap on the Y axis (for Left/Right navigation).
 fn overlaps_y(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> bool {
     let a_top = a.1 as i32;
     let a_bot = a.1 as i32 + a.3 as i32;
@@ -273,7 +238,6 @@ fn overlaps_y(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> bool {
     a_top < b_bot && b_top < a_bot
 }
 
-/// Check if two rects overlap on the X axis (for Up/Down navigation).
 fn overlaps_x(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> bool {
     let a_left = a.0 as i32;
     let a_right = a.0 as i32 + a.2 as i32;
@@ -282,7 +246,6 @@ fn overlaps_x(a: (u16, u16, u16, u16), b: (u16, u16, u16, u16)) -> bool {
     a_left < b_right && b_left < a_right
 }
 
-/// Direction for spatial pane navigation.
 #[derive(Clone, Copy)]
 pub enum Direction {
     Up,
@@ -294,12 +257,10 @@ pub enum Direction {
 /// A tab containing a tree of panes.
 pub struct Tab {
     pub name: String,
-    /// Always Some except during tree transforms.
     root: Option<PaneNode>,
     pub focus_id: usize,
     pub zoomed: bool,
-    /// Cached pane positions from last render (pane_id → Rect).
-    pub pane_rects: std::collections::HashMap<usize, (u16, u16, u16, u16)>, // x, y, w, h
+    pub pane_rects: std::collections::HashMap<usize, (u16, u16, u16, u16)>,
 }
 
 impl Tab {
@@ -309,6 +270,18 @@ impl Tab {
             name,
             root: Some(PaneNode::Leaf(Box::new(pane))),
             focus_id: id,
+            zoomed: false,
+            pane_rects: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Construct a tab from an existing pane tree (used by session restore).
+    pub fn with_root(name: String, root: PaneNode) -> Self {
+        let first_id = root.first_pane().id;
+        Self {
+            name,
+            root: Some(root),
+            focus_id: first_id,
             zoomed: false,
             pane_rects: std::collections::HashMap::new(),
         }
@@ -326,7 +299,6 @@ impl Tab {
         self.root().find_pane(self.focus_id)
     }
 
-    /// Cycle focus to the next pane.
     pub fn cycle_focus(&mut self) {
         let ids = self.root().pane_ids();
         if let Some(pos) = ids.iter().position(|&id| id == self.focus_id) {
@@ -334,19 +306,6 @@ impl Tab {
         }
     }
 
-    /// Move focus by delta (+1 forward, -1 backward) in tree order.
-    #[allow(dead_code)]
-    pub fn move_focus(&mut self, delta: i32) {
-        let ids = self.root().pane_ids();
-        if let Some(pos) = ids.iter().position(|&id| id == self.focus_id) {
-            let new = (pos as i32 + delta).rem_euclid(ids.len() as i32) as usize;
-            self.focus_id = ids[new];
-        }
-    }
-
-    /// Move focus spatially based on pane positions from last render.
-    /// Prioritizes panes that overlap on the perpendicular axis (e.g., pressing
-    /// Right prefers panes at the same vertical position).
     pub fn focus_direction(&mut self, dir: Direction) {
         if self.pane_rects.len() < 2 {
             let delta = match dir {
@@ -366,9 +325,7 @@ impl Tab {
         };
         let (cx, cy) = center(cur);
 
-        // Collect candidates in the target direction
-        let mut candidates: Vec<(usize, i32, bool)> = Vec::new(); // (id, distance, overlaps)
-
+        let mut candidates: Vec<(usize, i32, bool)> = Vec::new();
         for (&id, &rect) in &self.pane_rects {
             if id == self.focus_id {
                 continue;
@@ -383,7 +340,6 @@ impl Tab {
             if !in_direction {
                 continue;
             }
-            // Check overlap on the perpendicular axis
             let has_overlap = match dir {
                 Direction::Left | Direction::Right => overlaps_y(cur, rect),
                 Direction::Up | Direction::Down => overlaps_x(cur, rect),
@@ -395,7 +351,6 @@ impl Tab {
             candidates.push((id, dist, has_overlap));
         }
 
-        // Prefer overlapping candidates; among those, pick nearest
         let best = candidates
             .iter()
             .filter(|(_, _, overlaps)| *overlaps)
@@ -405,8 +360,8 @@ impl Tab {
         if let Some(&(id, _, _)) = best {
             self.focus_id = id;
         } else {
-            // Wrap: find farthest pane in opposite direction with overlap
-            let mut wrap_candidates: Vec<(usize, i32, bool)> = Vec::new();
+            // Wrap around
+            let mut wrap: Vec<(usize, i32, bool)> = Vec::new();
             for (&id, &rect) in &self.pane_rects {
                 if id == self.focus_id {
                     continue;
@@ -420,20 +375,19 @@ impl Tab {
                     Direction::Up | Direction::Down => (ry - cy).abs(),
                     Direction::Left | Direction::Right => (rx - cx).abs(),
                 };
-                wrap_candidates.push((id, dist, has_overlap));
+                wrap.push((id, dist, has_overlap));
             }
-            let farthest = wrap_candidates
+            let farthest = wrap
                 .iter()
-                .filter(|(_, _, overlaps)| *overlaps)
-                .max_by_key(|(_, dist, _)| *dist)
-                .or_else(|| wrap_candidates.iter().max_by_key(|(_, dist, _)| *dist));
+                .filter(|(_, _, o)| *o)
+                .max_by_key(|(_, d, _)| *d)
+                .or_else(|| wrap.iter().max_by_key(|(_, d, _)| *d));
             if let Some(&(id, _, _)) = farthest {
                 self.focus_id = id;
             }
         }
     }
 
-    /// Split the focused pane. The new pane becomes the second child.
     pub fn split_focused(&mut self, dir: SplitDir, new_pane: Pane) -> bool {
         let root = self.root.take().expect("root is always Some");
         let (new_root, remaining) = split_in_tree(root, self.focus_id, dir, new_pane);
@@ -441,10 +395,10 @@ impl Tab {
         remaining.is_none()
     }
 
-    /// Close the focused pane. Returns false if it's the only pane.
-    pub fn close_focused(&mut self) -> bool {
+    /// Close the focused pane. Returns the removed pane's agent_name.
+    pub fn close_focused(&mut self) -> Option<String> {
         if self.root().pane_count() <= 1 {
-            return false;
+            return None;
         }
         let ids = self.root().pane_ids();
         let next_id = ids
@@ -454,15 +408,10 @@ impl Tab {
             .unwrap_or(self.focus_id);
 
         let root = self.root.take().expect("root is always Some");
-        let (new_root, _removed) = remove_from_tree(root, self.focus_id);
+        let (new_root, removed) = remove_from_tree(root, self.focus_id);
         self.root = Some(new_root);
         self.focus_id = next_id;
-        true
-    }
-
-    /// Kill all child processes.
-    pub fn kill_all(&self) {
-        kill_all(self.root());
+        removed.map(|p| p.agent_name)
     }
 }
 

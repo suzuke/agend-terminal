@@ -111,14 +111,15 @@ fn handle_session(
         let response = match method {
             "list" => {
                 let reg = agent::lock_registry(registry);
-                let mut agents: Vec<Value> = reg.iter().map(|(name, handle)| {
-                    let (agent_state, health_state) = handle.core.lock()
-                        .map(|c| (c.state.get_state().display_name().to_string(), c.health.state.display_name().to_string()))
-                        .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
-                    json!({"name": name, "backend": handle.backend_command, "submit_key": handle.submit_key,
-                           "inject_prefix": handle.inject_prefix, "agent_state": agent_state, "health_state": health_state,
-                           "kind": "managed"})
-                }).collect();
+                let mut agents: Vec<Value> = reg.iter()
+                    .map(|(name, handle)| {
+                        let (agent_state, health_state) = handle.core.lock()
+                            .map(|c| (c.state.get_state().display_name().to_string(), c.health.state.display_name().to_string()))
+                            .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
+                        json!({"name": name, "backend": handle.backend_command, "submit_key": handle.submit_key,
+                               "inject_prefix": handle.inject_prefix, "agent_state": agent_state, "health_state": health_state,
+                               "kind": "managed"})
+                    }).collect();
                 drop(reg);
                 let ext = agent::lock_external(externals);
                 for (name, handle) in ext.iter() {
@@ -306,6 +307,10 @@ fn handle_session(
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
                 }
+                if from == target {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": "cannot send to self"}));
+                    continue;
+                }
                 let _ = crate::inbox::enqueue(
                     home,
                     target,
@@ -319,20 +324,36 @@ fn handle_session(
                         timestamp: chrono::Utc::now().to_rfc3339(),
                     },
                 );
+                let display_text = if text.chars().count() > 200 {
+                    format!(
+                        "{}... (use inbox tool)",
+                        text.chars().take(200).collect::<String>()
+                    )
+                } else {
+                    text.to_string()
+                };
+                let inject_msg = format!("[from:{from}] {display_text} (Reply using send_to_instance MCP tool, NOT direct text)");
+
+                // Try managed agent first
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(target) {
-                    let display_text = if text.chars().count() > 200 {
-                        format!(
-                            "{}... (use inbox tool)",
-                            text.chars().take(200).collect::<String>()
-                        )
-                    } else {
-                        text.to_string()
-                    };
                     let _ = agent::inject_to_agent(
                         handle,
-                        format!("[from:{from}] {display_text}").as_bytes(),
+                        inject_msg.as_bytes(),
                     );
+                } else {
+                    drop(reg);
+                    // Try external agent with pty_writer
+                    let ext = agent::lock_external(externals);
+                    if let Some(handle) = ext.get(target) {
+                        if let Some(ref writer) = handle.pty_writer {
+                            if let Ok(mut w) = writer.lock() {
+                                let msg = format!("{inject_msg}{}\r", handle.submit_key);
+                                let _ = w.write_all(msg.as_bytes());
+                                let _ = w.flush();
+                            }
+                        }
+                    }
                 }
                 json!({"ok": true})
             }
@@ -382,6 +403,8 @@ fn handle_session(
                 ext.insert(name.to_string(), agent::ExternalAgentHandle {
                     backend_command: backend.to_string(),
                     pid,
+                    pty_writer: None,
+                    submit_key: "\r".to_string(),
                 });
                 drop(ext);
                 crate::event_log::log(home, "connect", name, &format!("external agent registered (pid={pid}, backend={backend})"));

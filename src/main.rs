@@ -178,7 +178,11 @@ enum Commands {
         extra_args: Vec<String>,
     },
     /// Launch terminal app — multi-tab/pane TUI with agent management
-    App,
+    App {
+        /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml)
+        #[arg(long)]
+        fleet: Option<String>,
+    },
     /// Stop the daemon
     Stop,
     /// Kill a specific agent
@@ -245,19 +249,24 @@ enum FleetCommands {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agend_terminal=info")),
-        )
-        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .init();
-
     load_dotenv();
 
     let cli = Cli::parse();
+
+    // App mode redirects tracing to a log file (stderr is owned by ratatui).
+    // All other commands use stderr.
+    let is_app = matches!(cli.command, Some(Commands::App { .. }));
+    if !is_app {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("agend_terminal=info")),
+            )
+            .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .init();
+    }
     let home = home_dir();
     std::fs::create_dir_all(&home)?;
 
@@ -267,8 +276,8 @@ fn main() -> anyhow::Result<()> {
             Cli::command().print_help()?;
             println!();
         }
-        Some(Commands::App) => {
-            app::run()?;
+        Some(Commands::App { fleet }) => {
+            app::run(fleet.as_deref())?;
         }
         Some(Commands::Start) => {
             let fleet_path = home.join("fleet.yaml");

@@ -79,10 +79,11 @@ impl VTerm {
         buf: &mut ratatui::buffer::Buffer,
         area: ratatui::layout::Rect,
         scroll_offset: usize,
+        show_cursor: bool,
     ) {
         let grid = self.term.grid();
-        let rows = (self.rows as u16).min(area.height);
-        let cols = (self.cols as u16).min(area.width);
+        let rows = self.rows.min(area.height);
+        let cols = self.cols.min(area.width);
         let offset = scroll_offset as i32;
 
         for row in 0..rows {
@@ -113,8 +114,8 @@ impl VTerm {
             }
         }
 
-        // Render cursor only when not scrolled back
-        if scroll_offset == 0 {
+        // Render cursor only for focused pane when not scrolled back
+        if show_cursor && scroll_offset == 0 {
             let cursor = grid.cursor.point;
             let cx = area.x + cursor.column.0 as u16;
             let cy = area.y + cursor.line.0 as u16;
@@ -257,9 +258,39 @@ fn color_to_ratatui(color: Color) -> Option<ratatui::style::Color> {
                 _ => None,
             }
         }
-        Color::Spec(rgb) => Some(ratatui::style::Color::Rgb(rgb.r, rgb.g, rgb.b)),
+        Color::Spec(rgb) => {
+            // Use RGB directly — terminals that don't support true color
+            // (e.g., macOS Terminal.app) will get the nearest 256-color via Indexed fallback.
+            if std::env::var("COLORTERM").unwrap_or_default().contains("truecolor")
+                || std::env::var("COLORTERM").unwrap_or_default().contains("24bit")
+            {
+                Some(ratatui::style::Color::Rgb(rgb.r, rgb.g, rgb.b))
+            } else {
+                // Fallback: convert RGB to nearest 256-color index
+                Some(ratatui::style::Color::Indexed(rgb_to_256(rgb.r, rgb.g, rgb.b)))
+            }
+        }
         Color::Indexed(idx) => Some(ratatui::style::Color::Indexed(idx)),
     }
+}
+
+/// Convert RGB to the nearest 256-color index (for terminals without true color).
+fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
+    // Check grayscale ramp (232-255) first
+    if r == g && g == b {
+        if r < 8 {
+            return 16; // black
+        }
+        if r > 248 {
+            return 231; // white
+        }
+        return (((r as u16 - 8) * 24 / 247) as u8) + 232;
+    }
+    // Map to 6x6x6 color cube (indices 16-231)
+    let ri = ((r as u16) * 5 / 255) as u8;
+    let gi = ((g as u16) * 5 / 255) as u8;
+    let bi = ((b as u16) * 5 / 255) as u8;
+    16 + 36 * ri + 6 * gi + bi
 }
 
 /// Convert alacritty cell attributes to ratatui Style.

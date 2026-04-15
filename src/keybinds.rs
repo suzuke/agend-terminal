@@ -29,6 +29,7 @@ pub enum Action {
     CloseTab,
     ToggleZoom,
     RenameTab,
+    RenamePane,
     ListTabs,
     ScrollMode,
     Detach,
@@ -132,6 +133,7 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('o') => Action::CycleFocus,
         KeyCode::Char('x') => Action::ClosePane,
         KeyCode::Char('z') => Action::ToggleZoom,
+        KeyCode::Char('.') => Action::RenamePane,
 
         // Directional pane focus
         KeyCode::Up => Action::FocusUp,

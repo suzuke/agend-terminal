@@ -42,6 +42,10 @@ pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
 pub struct ExternalAgentHandle {
     pub backend_command: String,
     pub pid: u32,
+    /// PTY writer for direct message injection (Some when agent runs in terminal app).
+    pub pty_writer: Option<std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
+    /// Submit key sequence (e.g., "\r") for PTY injection.
+    pub submit_key: String,
 }
 
 pub type ExternalRegistry = Arc<Mutex<HashMap<String, ExternalAgentHandle>>>;
@@ -447,7 +451,7 @@ fn handle_pty_close(
 }
 
 /// Try to auto-dismiss dialogs using backend-configurable patterns. Returns true if dismissed.
-fn try_dismiss_dialog(
+pub fn try_dismiss_dialog(
     name: &str,
     data: &[u8],
     detect_buf: &mut Vec<u8>,
