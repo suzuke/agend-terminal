@@ -109,6 +109,11 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     }
 }
 
+/// Return active decisions as typed structs (no JSON round-trip).
+pub fn list_all(home: &Path) -> Vec<Decision> {
+    load_all(home).into_iter().filter(|d| !d.archived).collect()
+}
+
 pub fn list(home: &Path, args: &Value) -> Value {
     let include_archived = args["include_archived"].as_bool().unwrap_or(false);
     let filter_tags: Vec<String> = args["tags"]

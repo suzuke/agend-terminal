@@ -5,10 +5,22 @@ use crate::app::MenuItem;
 use crate::layout::{Layout, PaneNode, SplitDir};
 use crate::state::AgentState;
 use ratatui::layout::{Constraint, Direction, Rect};
+use unicode_width::UnicodeWidthStr;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+
+/// Telegram connection status for status bar display.
+#[derive(Clone, Copy)]
+pub enum TelegramStatus {
+    /// No Telegram channel config in fleet.yaml.
+    NotConfigured,
+    /// Configured but token env var is missing.
+    NoToken,
+    /// Configured and token present (polling should be active).
+    Connected,
+}
 
 fn state_color(state: AgentState) -> Color {
     match state {
@@ -37,6 +49,7 @@ pub fn render(
     layout: &mut Layout,
     repeat_mode: bool,
     registry: &AgentRegistry,
+    telegram: TelegramStatus,
 ) {
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
@@ -49,7 +62,23 @@ pub fn render(
 
     render_pane_tree(frame, chunks[1], layout, repeat_mode, registry);
     render_tab_bar(frame, chunks[0], layout, registry);
-    render_status_bar(frame, chunks[2], layout);
+    render_status_bar(frame, chunks[2], layout, telegram);
+}
+
+/// Get the highest-priority state across all panes in a tab.
+fn highest_priority_state(tab: &crate::layout::Tab, registry: &AgentRegistry) -> AgentState {
+    let mut best = AgentState::Idle;
+    for id in tab.root().pane_ids() {
+        if let Some(pane) = tab.root().find_pane(id) {
+            if pane.backend.is_some() {
+                let s = get_agent_state(registry, &pane.agent_name);
+                if s.priority() > best.priority() {
+                    best = s;
+                }
+            }
+        }
+    }
+    best
 }
 
 fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &AgentRegistry) {
@@ -57,12 +86,8 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
 
     for (i, tab) in layout.tabs.iter().enumerate() {
         let is_active = i == layout.active;
-        let first = tab.root().first_pane();
-        let state = if first.backend.is_some() {
-            get_agent_state(registry, &first.agent_name)
-        } else {
-            AgentState::Idle
-        };
+        // Show the highest-priority state across all panes in this tab
+        let state = highest_priority_state(tab, registry);
         let sc = state_color(state);
 
         let style = if is_active {
@@ -82,15 +107,9 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
             Span::styled("*", Style::default().fg(sc))
         };
 
-        let has_backend = first.backend.is_some();
         let has_notif = has_notification_in_tree(tab.root());
         let badge = if has_notif && !is_active { " !" } else { "" };
-
-        let label = if has_backend {
-            format!(" {} [{}]{badge} ", tab.name, state.display_name())
-        } else {
-            format!(" {}{badge} ", tab.name)
-        };
+        let label = format!(" {}{badge} ", tab.name);
 
         spans.push(dot);
         spans.push(Span::styled(label, style));
@@ -106,6 +125,87 @@ fn has_notification_in_tree(node: &PaneNode) -> bool {
         PaneNode::Leaf(p) => p.has_notification,
         PaneNode::Split { first, second, .. } => {
             has_notification_in_tree(first) || has_notification_in_tree(second)
+        }
+    }
+}
+
+fn split_chunks(area: Rect, dir: &SplitDir) -> [Rect; 2] {
+    let direction = match dir {
+        SplitDir::Horizontal => Direction::Vertical,
+        SplitDir::Vertical => Direction::Horizontal,
+    };
+    let chunks = ratatui::layout::Layout::default()
+        .direction(direction)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    [chunks[0], chunks[1]]
+}
+
+/// Resize pass — sync VTerm + PTY sizes to match render layout.
+/// Call this after terminal resize, split/close, zoom toggle, or tab switch.
+pub fn resize_panes(pane_area: Rect, layout: &mut Layout, registry: &AgentRegistry) {
+    let tab = match layout.tabs.get_mut(layout.active) {
+        Some(t) => t,
+        None => return,
+    };
+    let mut resizes = Vec::new();
+    if tab.zoomed {
+        let focus_id = tab.focus_id;
+        if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
+            let w = pane_area.width.saturating_sub(2);
+            let h = pane_area.height.saturating_sub(2);
+            if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
+                pane.vterm.resize(w, h);
+                resizes.push((pane.agent_name.clone(), w, h));
+            }
+        }
+    } else {
+        let mut rects = std::mem::take(&mut tab.pane_rects);
+        rects.clear();
+        collect_resize_needs(pane_area, tab.root_mut(), &mut rects, &mut resizes);
+        tab.pane_rects = rects;
+    }
+    apply_pty_resizes(&resizes, registry);
+}
+
+/// Collect (pane_name, width, height) for all panes that need resizing.
+fn collect_resize_needs(
+    area: Rect,
+    node: &mut PaneNode,
+    rects: &mut std::collections::HashMap<usize, (u16, u16, u16, u16)>,
+    resizes: &mut Vec<(String, u16, u16)>,
+) {
+    match node {
+        PaneNode::Leaf(pane) => {
+            rects.insert(pane.id, (area.x, area.y, area.width, area.height));
+            let w = area.width.saturating_sub(2);
+            let h = area.height.saturating_sub(2);
+            if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
+                pane.vterm.resize(w, h);
+                resizes.push((pane.agent_name.clone(), w, h));
+            }
+        }
+        PaneNode::Split { dir, first, second } => {
+            let [c0, c1] = split_chunks(area, dir);
+            collect_resize_needs(c0, first, rects, resizes);
+            collect_resize_needs(c1, second, rects, resizes);
+        }
+    }
+}
+
+/// Apply PTY resizes with a single registry lock.
+fn apply_pty_resizes(resizes: &[(String, u16, u16)], registry: &AgentRegistry) {
+    if resizes.is_empty() {
+        return;
+    }
+    let reg = agent::lock_registry(registry);
+    for (name, cols, rows) in resizes {
+        if let Some(handle) = reg.get(name.as_str()) {
+            if let Ok(master) = handle.pty_master.lock() {
+                let _ = master.resize(portable_pty::PtySize {
+                    rows: *rows, cols: *cols, pixel_width: 0, pixel_height: 0,
+                });
+            }
         }
     }
 }
@@ -154,35 +254,12 @@ fn render_node(
         PaneNode::Leaf(pane) => {
             rects.insert(pane.id, (area.x, area.y, area.width, area.height));
             let focused = pane.id == focus_id;
-            let inner_w = area.width.saturating_sub(2);
-            let inner_h = area.height.saturating_sub(2);
-            if inner_w > 0 && inner_h > 0
-                && (inner_w != pane.vterm.cols() || inner_h != pane.vterm.rows())
-            {
-                pane.vterm.resize(inner_w, inner_h);
-                let reg = agent::lock_registry(registry);
-                if let Some(handle) = reg.get(&pane.agent_name) {
-                    if let Ok(master) = handle.pty_master.lock() {
-                        let _ = master.resize(portable_pty::PtySize {
-                            rows: inner_h, cols: inner_w, pixel_width: 0, pixel_height: 0,
-                        });
-                    }
-                }
-            }
             render_pane(frame, area, pane, focused, repeat_mode, registry);
         }
         PaneNode::Split { dir, first, second } => {
-            let direction = match dir {
-                SplitDir::Horizontal => Direction::Vertical,
-                SplitDir::Vertical => Direction::Horizontal,
-            };
-            let chunks = ratatui::layout::Layout::default()
-                .direction(direction)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(area);
-
-            render_node(frame, chunks[0], first, focus_id, rects, repeat_mode, registry);
-            render_node(frame, chunks[1], second, focus_id, rects, repeat_mode, registry);
+            let [c0, c1] = split_chunks(area, dir);
+            render_node(frame, c0, first, focus_id, rects, repeat_mode, registry);
+            render_node(frame, c1, second, focus_id, rects, repeat_mode, registry);
         }
     }
 }
@@ -242,10 +319,26 @@ fn render_pane(
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    pane.vterm.render_to_buffer(frame.buffer_mut(), inner, pane.scroll_offset, focused);
+    pane.vterm.render_to_buffer(frame.buffer_mut(), inner, pane.scroll_offset, !focused);
 
-    // Set terminal cursor at VTerm cursor position for the focused pane.
-    // This is needed for IME (input method) to show candidates at the right place.
+    // Highlight text selection
+    if let Some(ref sel) = pane.selection {
+        let (s, e) = if sel.start <= sel.end { (sel.start, sel.end) } else { (sel.end, sel.start) };
+        for row in s.0..=e.0 {
+            let col_start = if row == s.0 { s.1 } else { 0 };
+            let col_end = if row == e.0 { e.1 } else { inner.width.saturating_sub(1) };
+            for col in col_start..=col_end {
+                let x = inner.x + col;
+                let y = inner.y + row;
+                if x < inner.x + inner.width && y < inner.y + inner.height {
+                    let cell = &mut frame.buffer_mut()[(x, y)];
+                    let style = cell.style().add_modifier(Modifier::REVERSED);
+                    cell.set_style(style);
+                }
+            }
+        }
+    }
+
     if focused && pane.scroll_offset == 0 {
         let (cursor_line, cursor_col) = pane.vterm.cursor_pos();
         let cx = inner.x + cursor_col;
@@ -256,7 +349,7 @@ fn render_pane(
     }
 }
 
-fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout) {
+fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout, telegram: TelegramStatus) {
     let mut spans = Vec::new();
 
     let mut agent_count = 0;
@@ -273,8 +366,18 @@ fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout) {
         spans.push(Span::styled(format!(" {total} pane(s) "), Style::default().fg(Color::White)));
     }
 
+    match telegram {
+        TelegramStatus::Connected => {
+            spans.push(Span::styled(" TG ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+        }
+        TelegramStatus::NoToken => {
+            spans.push(Span::styled(" TG(no token) ", Style::default().fg(Color::Yellow)));
+        }
+        TelegramStatus::NotConfigured => {}
+    }
+
     spans.push(Span::styled(
-        " | Ctrl+B c new | n/p switch | d detach | ? help ",
+        " | Ctrl+B c new | : cmd | n/p switch | d detach | ? help ",
         Style::default().fg(Color::DarkGray),
     ));
 
@@ -316,7 +419,7 @@ pub fn render_rename(frame: &mut Frame, input: &str) {
     let inner = block.inner(ra);
     frame.render_widget(block, ra);
     frame.render_widget(Paragraph::new(format!("{input}_")).style(Style::default().fg(Color::White)), inner);
-    let cursor_x = inner.x + input.len() as u16;
+    let cursor_x = inner.x + input.width() as u16;
     if cursor_x < inner.x + inner.width {
         frame.set_cursor_position(ratatui::layout::Position::new(cursor_x, inner.y));
     }
@@ -373,11 +476,21 @@ pub fn render_help(frame: &mut Frame) {
         "    Ctrl+B .       Rename pane",
         "", "  Scroll", "    Mouse wheel    Scroll focused pane",
         "    Ctrl+B [       Keyboard scroll mode", "    Shift+drag     Select text (native)",
-        "", "  Other", "    Ctrl+B d       Detach (exit)",
+        "", "  Panels & Commands", "    Ctrl+B :       Command palette",
+        "      :spawn <n> [backend]  New tab",
+        "      :vsplit <n> [backend] V-split",
+        "      :hsplit <n> [backend] H-split",
+        "      :kill <name>          Kill agent",
+        "      :restart [name]       Restart agent",
+        "      :send <to> <msg>      Send message",
+        "      :broadcast <msg>      Broadcast",
+        "    Ctrl+B D       Decisions panel", "    Ctrl+B T       Task board",
+        "", "  Other", "    Ctrl+B Ctrl+B  Send Ctrl+B to pane",
+        "    Ctrl+B d       Detach (exit)",
         "    Ctrl+B ?       This help", "", "  Press any key to close"];
     let area = frame.area();
-    let h = (help.len() as u16 + 2).min(area.height - 2);
-    let w = 48u16.min(area.width - 4);
+    let h = (help.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let w = 48u16.min(area.width.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let ha = Rect::new(x, y, w, h);
@@ -396,4 +509,123 @@ pub fn render_scroll_indicator(frame: &mut Frame, offset: usize) {
     let w = s.len() as u16;
     let ba = Rect::new(area.width.saturating_sub(w), 0, w, 1);
     frame.render_widget(Paragraph::new(Span::styled(s, Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))), ba);
+}
+
+/// Render a centered overlay frame with border and title. Returns the inner area.
+fn render_overlay_frame(frame: &mut Frame, color: Color, title: &str) -> Rect {
+    let area = frame.area();
+    let h = area.height.saturating_sub(4).max(10);
+    let w = area.width.saturating_sub(6).max(40);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let oa = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, oa);
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(color))
+        .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)));
+    let inner = block.inner(oa);
+    frame.render_widget(block, oa);
+    inner
+}
+
+pub fn render_command_palette(frame: &mut Frame, input: &str) {
+    let area = frame.area();
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = area.height / 3;
+    let ra = Rect::new(x, y, w, 3);
+    frame.render_widget(Clear, ra);
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" : Command (Enter, Esc) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let inner = block.inner(ra);
+    frame.render_widget(block, ra);
+    frame.render_widget(Paragraph::new(format!(":{input}_")).style(Style::default().fg(Color::White)), inner);
+    let cursor_x = inner.x + 1 + input.width() as u16;
+    if cursor_x < inner.x + inner.width {
+        frame.set_cursor_position(ratatui::layout::Position::new(cursor_x, inner.y));
+    }
+}
+
+pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision], scroll: usize) {
+    let count = items.len();
+    let title = format!(" Decisions ({count}) | j/k scroll | q close ");
+    let inner = render_overlay_frame(frame, Color::Yellow, &title);
+
+    if items.is_empty() {
+        frame.render_widget(Paragraph::new("  No decisions yet.").style(Style::default().fg(Color::DarkGray)), inner);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, d) in items.iter().enumerate() {
+        let marker = if i == scroll { "> " } else { "  " };
+        let style = if i == scroll {
+            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(format!("{marker}[{}] {}", d.scope, d.title), style)));
+        if i == scroll {
+            // Show detail for selected decision
+            lines.push(Line::from(Span::styled(format!("    by {} | {}", d.author, &d.created_at.get(..10).unwrap_or(&d.created_at)), Style::default().fg(Color::DarkGray))));
+            for line in d.content.lines() {
+                lines.push(Line::from(Span::styled(format!("    {line}"), Style::default().fg(Color::Gray))));
+            }
+            if !d.tags.is_empty() {
+                lines.push(Line::from(Span::styled(format!("    tags: {}", d.tags.join(", ")), Style::default().fg(Color::Cyan))));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+pub fn render_tasks(frame: &mut Frame, items: &[crate::tasks::Task], scroll: usize) {
+    let count = items.len();
+    let title = format!(" Tasks ({count}) | j/k scroll | q close ");
+    let inner = render_overlay_frame(frame, Color::Blue, &title);
+
+    if items.is_empty() {
+        frame.render_widget(Paragraph::new("  No tasks yet.").style(Style::default().fg(Color::DarkGray)), inner);
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, t) in items.iter().enumerate() {
+        let marker = if i == scroll { "> " } else { "  " };
+        let status_color = match t.status.as_str() {
+            "open" => Color::Green,
+            "claimed" => Color::Yellow,
+            "done" => Color::DarkGray,
+            "blocked" => Color::Red,
+            _ => Color::White,
+        };
+        let pri_color = match t.priority.as_str() {
+            "urgent" => Color::Red,
+            "high" => Color::Yellow,
+            _ => Color::White,
+        };
+        let style = if i == scroll {
+            Style::default().fg(Color::Black).bg(Color::Blue).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let assignee = t.assignee.as_deref().unwrap_or("-");
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(format!("[{}] ", t.status), Style::default().fg(status_color)),
+            Span::styled(&t.title, if i == scroll { style } else { Style::default().fg(Color::White) }),
+            Span::styled(format!("  ({}) @{assignee}", t.priority), Style::default().fg(pri_color)),
+        ]));
+        if i == scroll {
+            if !t.description.is_empty() {
+                lines.push(Line::from(Span::styled(format!("    {}", t.description), Style::default().fg(Color::Gray))));
+            }
+            if let Some(ref result) = t.result {
+                lines.push(Line::from(Span::styled(format!("    result: {result}"), Style::default().fg(Color::Green))));
+            }
+            lines.push(Line::from(Span::styled(format!("    by {} | {}", t.created_by, &t.created_at.get(..10).unwrap_or(&t.created_at)), Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(""));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }

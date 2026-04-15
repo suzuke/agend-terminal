@@ -50,3 +50,5 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
+arboard = "3.6.1"
+unicode-width = "0.2"

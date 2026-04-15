@@ -20,6 +20,19 @@ pub struct Pane {
     pub scroll_offset: usize,
     /// True when an unread `[from:...]` message was detected.
     pub has_notification: bool,
+    /// Fleet instance name (key in fleet.yaml). None for shell panes.
+    pub fleet_instance_name: Option<String>,
+    /// Active text selection (grid coordinates within this pane's VTerm).
+    pub selection: Option<Selection>,
+}
+
+/// Text selection within a pane's VTerm grid.
+#[derive(Clone)]
+pub struct Selection {
+    /// Start position (row, col) in VTerm grid coordinates.
+    pub start: (u16, u16),
+    /// End position (row, col) — may be before or after start.
+    pub end: (u16, u16),
 }
 
 impl Pane {
@@ -261,6 +274,8 @@ pub struct Tab {
     pub focus_id: usize,
     pub zoomed: bool,
     pub pane_rects: std::collections::HashMap<usize, (u16, u16, u16, u16)>,
+    /// Pane currently being selected with mouse (cached to avoid lookup on drag).
+    pub selecting_pane: Option<usize>,
 }
 
 impl Tab {
@@ -272,6 +287,7 @@ impl Tab {
             focus_id: id,
             zoomed: false,
             pane_rects: std::collections::HashMap::new(),
+            selecting_pane: None,
         }
     }
 
@@ -284,6 +300,7 @@ impl Tab {
             focus_id: first_id,
             zoomed: false,
             pane_rects: std::collections::HashMap::new(),
+            selecting_pane: None,
         }
     }
 

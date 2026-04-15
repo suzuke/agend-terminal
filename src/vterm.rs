@@ -14,6 +14,15 @@ impl EventListener for NoopListener {
     fn send_event(&self, _event: Event) {}
 }
 
+/// Cached once: whether terminal supports true color (avoids env var lookup per cell).
+fn supports_truecolor() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let val = std::env::var("COLORTERM").unwrap_or_default();
+        val.contains("truecolor") || val.contains("24bit")
+    })
+}
+
 struct VTermSize {
     cols: u16,
     rows: u16,
@@ -79,7 +88,7 @@ impl VTerm {
         buf: &mut ratatui::buffer::Buffer,
         area: ratatui::layout::Rect,
         scroll_offset: usize,
-        show_cursor: bool,
+        show_block_cursor: bool,
     ) {
         let grid = self.term.grid();
         let rows = self.rows.min(area.height);
@@ -114,8 +123,8 @@ impl VTerm {
             }
         }
 
-        // Render cursor only for focused pane when not scrolled back
-        if show_cursor && scroll_offset == 0 {
+        // Reversed block cursor for unfocused panes (focused panes use terminal cursor)
+        if show_block_cursor && scroll_offset == 0 {
             let cursor = grid.cursor.point;
             let cx = area.x + cursor.column.0 as u16;
             let cy = area.y + cursor.line.0 as u16;
@@ -140,6 +149,44 @@ impl VTerm {
     pub fn cursor_pos(&self) -> (u16, u16) {
         let c = self.term.grid().cursor.point;
         (c.line.0 as u16, c.column.0 as u16)
+    }
+
+    /// Extract text from a selection range (grid coordinates), accounting for scroll offset.
+    pub fn extract_text(&self, start: (u16, u16), end: (u16, u16), scroll_offset: usize) -> String {
+        let grid = self.term.grid();
+        let offset = scroll_offset as i32;
+
+        // Normalize start/end so start is before end
+        let (s, e) = if start <= end { (start, end) } else { (end, start) };
+        let (s_row, s_col) = s;
+        let (e_row, e_col) = e;
+
+        let mut text = String::new();
+        for row in s_row..=e_row {
+            let grid_line = Line(row as i32 - offset);
+            let col_start = if row == s_row { s_col } else { 0 };
+            let col_end = if row == e_row { e_col } else { self.cols.saturating_sub(1) };
+
+            let mut line = String::new();
+            for col in col_start..=col_end {
+                if (col as usize) >= self.cols as usize {
+                    break;
+                }
+                let cell = &grid[Point::new(grid_line, Column(col as usize))];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                line.push(ch);
+            }
+            // Trim trailing spaces per line
+            let trimmed = line.trim_end();
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(trimmed);
+        }
+        text
     }
 
     /// Dump current screen as ANSI escape sequences for full redraw.
@@ -261,9 +308,7 @@ fn color_to_ratatui(color: Color) -> Option<ratatui::style::Color> {
         Color::Spec(rgb) => {
             // Use RGB directly — terminals that don't support true color
             // (e.g., macOS Terminal.app) will get the nearest 256-color via Indexed fallback.
-            if std::env::var("COLORTERM").unwrap_or_default().contains("truecolor")
-                || std::env::var("COLORTERM").unwrap_or_default().contains("24bit")
-            {
+            if supports_truecolor() {
                 Some(ratatui::style::Color::Rgb(rgb.r, rgb.g, rgb.b))
             } else {
                 // Fallback: convert RGB to nearest 256-color index

@@ -32,6 +32,9 @@ pub enum Action {
     RenamePane,
     ListTabs,
     ScrollMode,
+    CommandPalette,
+    ShowDecisions,
+    ShowTasks,
     Detach,
     ShowHelp,
     None,
@@ -76,7 +79,11 @@ impl KeyHandler {
                 Action::Forward(key)
             }
             PrefixState::WaitingFirst => {
-                // First key after prefix — no timeout, always dispatch
+                // Ctrl+B Ctrl+B → forward Ctrl+B to PTY
+                if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.state = PrefixState::Normal;
+                    return Action::Forward(key);
+                }
                 let action = dispatch_prefix(key);
                 self.state = if is_repeatable(&action) {
                     PrefixState::Repeat {
@@ -143,6 +150,9 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
 
         // Modes
         KeyCode::Char('[') => Action::ScrollMode,
+        KeyCode::Char(':') => Action::CommandPalette,
+        KeyCode::Char('D') => Action::ShowDecisions,
+        KeyCode::Char('T') => Action::ShowTasks,
         KeyCode::Char('d') => Action::Detach,
         KeyCode::Char('?') => Action::ShowHelp,
 
