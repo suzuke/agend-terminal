@@ -387,18 +387,76 @@ ratatui = "0.29"   # 確認實作時的最新穩定版
 | - | Self-send guard | 擋自己發給自己 + shells 從 list_instances 隱藏 |
 | - | IME cursor | terminal cursor 定位在 focused pane，中文輸入正常 |
 | - | Color fallback | RGB→256 for macOS Terminal.app |
+| 2.2 | Fleet 自動啟動 | 無參數啟動時自動載入 fleet.yaml，無 fleet 則開 shell |
+| 3.2 | 決策/任務面板 | Ctrl+B D/T overlay，j/k 捲動，展開選中項目詳情 |
+| 4.2 | Command palette | Ctrl+B : 輸入 spawn/kill/send/broadcast/status |
+| - | Resize propagation | 獨立 resize pass，Event::Resize 觸發，render 不再 resize |
+
+| 4.4 | Telegram 整合顯示 | Status bar 顯示 TG 連線狀態（configured/no token/not configured） |
+| - | Clipboard | Per-pane 滑鼠選取 + arboard 跨平台 clipboard |
+| - | Agent instructions | 自動寫入 agend.md，含 identity/role/peers/MCP 通訊指引 |
+| - | Cursor fix | Focused pane 用 terminal cursor，unfocused 用 reversed-cell |
+| - | IME width fix | Command palette / rename 用 unicode-width 算 cursor 位置 |
+| - | fleet.yaml single source | fleet.yaml = agent 定義，session.json = 純 layout，reconciliation |
 
 ### 未完成 ❌
 
-| Phase | 功能 | 複雜度 | 說明 |
-|-------|------|--------|------|
-| 2.2 | Fleet 自動啟動 | 低 | 無參數啟動時自動載入 fleet.yaml（目前停用避免衝突） |
-| 3.2 | 決策/任務面板 | 中 | Ctrl+B D/T overlay，顯示 decisions.rs / tasks.rs |
-| 4.2 | Command palette | 中 | Ctrl+B : 輸入指令（spawn/kill/send/broadcast） |
-| 4.4 | Telegram 整合顯示 | 低 | Status bar 顯示 Telegram 連線狀態 |
-| - | Clipboard | 中 | Pane 內文字選取 + 複製（需要自訂 copy mode） |
-| - | Agent instructions | 低 | 自動寫入 `.claude/rules/agend.md` 等指引檔案 |
-| - | Resize propagation | 低 | 精確的 resize 從 render layout → PTY（目前在 render 時做） |
+（全部完成）
+
+---
+
+## Backend 對應檔案路徑
+
+每個 backend 在 agent 的 working directory 中生成以下檔案：
+
+### 通用（所有 backend）
+
+| 檔案 | 用途 | 生成者 |
+|------|------|--------|
+| `{instructions_path}` | Agent 指引（identity, role, peers, MCP tools） | `instructions.rs` |
+
+### Claude Code
+
+| 檔案 | 用途 |
+|------|------|
+| `.claude/rules/agend.md` | Agent instructions |
+| `mcp-config.json` | MCP server config（agend-terminal stdio） |
+| `claude-settings.json` | Statusline command 設定 |
+| `statusline.sh` | Statusline script（捕獲 session ID） |
+| `statusline.json` | Statusline output（runtime） |
+
+### Kiro CLI
+
+| 檔案 | 用途 |
+|------|------|
+| `.kiro/steering/agend.md` | Agent instructions |
+| `.kiro/settings/mcp.json` | MCP server config |
+| `.kiro/settings/agend-mcp-wrapper.sh` | MCP wrapper script |
+
+### Codex
+
+| 檔案 | 用途 |
+|------|------|
+| `AGENTS.md` | Agent instructions |
+| `.codex/config.toml` | Trust + MCP config |
+
+### OpenCode
+
+| 檔案 | 用途 |
+|------|------|
+| `AGENTS.md` | Agent instructions |
+| `opencode.json` | MCP server config |
+
+### Gemini CLI
+
+| 檔案 | 用途 |
+|------|------|
+| `GEMINI.md` | Agent instructions |
+| `.gemini/settings.json` | MCP server config |
+
+### Cleanup
+
+`ops.rs` 和 `mcp/handlers.rs` 的 `delete_instance` 會清除上述所有檔案。
 
 ---
 
