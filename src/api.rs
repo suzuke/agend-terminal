@@ -341,20 +341,8 @@ fn handle_session(
                         handle,
                         inject_msg.as_bytes(),
                     );
-                } else {
-                    drop(reg);
-                    // Try external agent with pty_writer
-                    let ext = agent::lock_external(externals);
-                    if let Some(handle) = ext.get(target) {
-                        if let Some(ref writer) = handle.pty_writer {
-                            if let Ok(mut w) = writer.lock() {
-                                let msg = format!("{inject_msg}{}\r", handle.submit_key);
-                                let _ = w.write_all(msg.as_bytes());
-                                let _ = w.flush();
-                            }
-                        }
-                    }
                 }
+                // External agents receive messages via inbox only (no PTY injection)
                 json!({"ok": true})
             }
             "status" => match crate::snapshot::load(home) {
@@ -389,23 +377,24 @@ fn handle_session(
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
                 }
-                // Check conflicts in both registries
-                {
-                    let reg = agent::lock_registry(registry);
-                    if reg.contains_key(name) {
-                        let _ = writeln!(writer, "{}", json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")}));
-                        continue;
-                    }
+                // Atomic check-and-insert: lock order is always registry → external
+                let reg = agent::lock_registry(registry);
+                if reg.contains_key(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")}));
+                    continue;
+                }
+                let mut ext = agent::lock_external(externals);
+                if ext.contains_key(name) {
+                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": format!("agent '{name}' already exists (external)")}));
+                    continue;
                 }
                 let backend = params["backend"].as_str().unwrap_or("unknown");
                 let pid = params["pid"].as_u64().unwrap_or(0) as u32;
-                let mut ext = agent::lock_external(externals);
                 ext.insert(name.to_string(), agent::ExternalAgentHandle {
                     backend_command: backend.to_string(),
                     pid,
-                    pty_writer: None,
-                    submit_key: "\r".to_string(),
                 });
+                drop(reg);
                 drop(ext);
                 crate::event_log::log(home, "connect", name, &format!("external agent registered (pid={pid}, backend={backend})"));
                 tracing::info!(agent = name, pid, backend, "external agent registered");

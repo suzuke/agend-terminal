@@ -42,10 +42,6 @@ pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
 pub struct ExternalAgentHandle {
     pub backend_command: String,
     pub pid: u32,
-    /// PTY writer for direct message injection (Some when agent runs in terminal app).
-    pub pty_writer: Option<std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>>,
-    /// Submit key sequence (e.g., "\r") for PTY injection.
-    pub submit_key: String,
 }
 
 pub type ExternalRegistry = Arc<Mutex<HashMap<String, ExternalAgentHandle>>>;
@@ -580,6 +576,49 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
     w.write_all(submit)?;
     w.flush()?;
     Ok(())
+}
+
+/// Send a message to a named agent via direct registry injection.
+/// Returns true if the agent was found and injected.
+pub fn send_to_registry(
+    registry: &AgentRegistry,
+    from: &str,
+    target: &str,
+    text: &str,
+) -> bool {
+    let reg = lock_registry(registry);
+    if let Some(handle) = reg.get(target) {
+        let msg = format!("[from:{from}] {text}");
+        let _ = inject_to_agent(handle, msg.as_bytes());
+        true
+    } else {
+        false
+    }
+}
+
+/// Broadcast a message to all agents with recognized backends.
+/// Skips `exclude` (typically the sender) if provided.
+pub fn broadcast_registry(
+    registry: &AgentRegistry,
+    from: &str,
+    text: &str,
+    exclude: Option<&str>,
+) -> Vec<String> {
+    let msg = format!("[from:{from}] {text}");
+    let msg_bytes = msg.as_bytes();
+    let reg = lock_registry(registry);
+    let targets: Vec<String> = reg
+        .iter()
+        .filter(|(name, handle)| {
+            exclude.map_or(true, |ex| name.as_str() != ex)
+                && crate::backend::Backend::from_command(&handle.backend_command).is_some()
+        })
+        .map(|(name, handle)| {
+            let _ = inject_to_agent(handle, msg_bytes);
+            name.clone()
+        })
+        .collect();
+    targets
 }
 
 /// Get atomic subscribe + screen dump (under core lock — no output gap).

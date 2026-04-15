@@ -52,15 +52,20 @@ pub fn run(
         None => (backend_name.to_string(), Vec::new()),
     };
 
-    // 5. Resolve working directory
+    // 5. Resolve working directory (expand ~ and ~/)
     let work_dir = match working_dir {
         Some(d) => {
-            let p = PathBuf::from(d);
-            if p.starts_with("~/") {
-                let home_str = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                PathBuf::from(home_str).join(p.strip_prefix("~/").unwrap_or(&p))
+            if d == "~" || d.starts_with("~/") {
+                let home_dir = std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .map_err(|_| anyhow::anyhow!("HOME not set, cannot expand ~"))?;
+                if d == "~" {
+                    home_dir
+                } else {
+                    home_dir.join(d.strip_prefix("~/").unwrap_or(d))
+                }
             } else {
-                p
+                PathBuf::from(d)
             }
         }
         None => std::env::current_dir()?,
@@ -134,10 +139,39 @@ pub fn run(
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
 
+    // Install signal handler to kill child and deregister on SIGINT/SIGTERM
+    let child_id = child.id();
+    let deregister_name = name.to_string();
+    let deregister_home = home.to_path_buf();
+    let cleanup = move || {
+        unsafe { nix::libc::kill(child_id as i32, nix::libc::SIGTERM); }
+        let _ = crate::api::call(
+            &deregister_home,
+            &serde_json::json!({
+                "method": "deregister_external",
+                "params": { "name": deregister_name }
+            }),
+        );
+    };
+    let cleanup_for_handler = std::sync::Arc::new(std::sync::Mutex::new(Some(cleanup)));
+    let handler_ref = cleanup_for_handler.clone();
+    ctrlc::set_handler(move || {
+        if let Ok(mut guard) = handler_ref.lock() {
+            if let Some(f) = guard.take() {
+                f();
+            }
+        }
+        std::process::exit(130);
+    }).ok();
+
     // 11. Wait for child to exit
     let status = child.wait()?;
 
-    // 12. Deregister from daemon
+    // 12. Deregister from daemon (normal exit path — handler not triggered)
+    // Consume the handler so it won't run again
+    if let Ok(mut guard) = cleanup_for_handler.lock() {
+        guard.take();
+    }
     let _ = crate::api::call(
         home,
         &serde_json::json!({
