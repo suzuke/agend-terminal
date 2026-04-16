@@ -129,14 +129,21 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 
     let fleet_path = fleet_path_override.map(PathBuf::from);
 
-    // Enable mouse support for scroll
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).ok();
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
+    ).ok();
 
     let mut terminal = ratatui::init();
     let result = run_app(&mut terminal, fleet_path.as_deref());
     ratatui::restore();
 
-    crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture).ok();
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste,
+    ).ok();
     result
 }
 
@@ -179,8 +186,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         )?;
     }
 
-    // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch)
-    let mut needs_resize = false;
+    // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
+    // Start true so restored split panes get correct sizes before first draw.
+    let mut needs_resize = true;
 
     // Detect Telegram status from fleet config
     let telegram_status = detect_telegram_status(&fleet_path);
@@ -462,18 +470,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                         let action = key_handler.handle(key);
                         match action {
                             Action::Forward(key) => {
-                                // Forward key to focused pane's PTY via registry
-                                if let Some(name) = layout.active_tab()
-                                    .and_then(|t| t.focused_pane())
-                                    .map(|p| p.agent_name.clone())
-                                {
-                                    let bytes = crate::tui::key_to_bytes(key.code, key.modifiers);
-                                    if !bytes.is_empty() {
-                                        let reg = agent::lock_registry(&registry);
-                                        if let Some(handle) = reg.get(&name) {
-                                            let _ = agent::write_to_agent(handle, &bytes);
-                                        }
-                                    }
+                                let bytes = crate::tui::key_to_bytes(key.code, key.modifiers);
+                                if !bytes.is_empty() {
+                                    write_to_focused(&layout, &registry, &bytes);
                                 }
                             }
                             Action::NewTab => {
@@ -597,8 +596,28 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                         match mouse.kind {
                             MouseEventKind::ScrollUp => scroll_focused(&mut layout, 3),
                             MouseEventKind::ScrollDown => scroll_focused(&mut layout, -3),
-                            MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                            | MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                                if mouse.row == 0 {
+                                    match tab_bar_hit_test(&layout, mouse.column) {
+                                        Some(TabBarClick::Tab(idx)) => {
+                                            last_tab = layout.active;
+                                            layout.goto_tab(idx);
+                                            needs_resize = true;
+                                        }
+                                        Some(TabBarClick::NewTab) => {
+                                            overlay = Overlay::NewTabMenu {
+                                                items: build_menu_items(&fleet_path, &registry),
+                                                selected: 0,
+                                            };
+                                        }
+                                        None => {}
+                                    }
+                                } else {
+                                    handle_mouse_selection(&mut layout, &mouse);
+                                    clear_selection_cache(&mut layout);
+                                }
+                            }
+                            MouseEventKind::Drag(crossterm::event::MouseButton::Left)
                             | MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                                 handle_mouse_selection(&mut layout, &mouse);
                                 // Separate call: can't clear selecting_pane inside handle_mouse_selection
@@ -606,6 +625,19 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 clear_selection_cache(&mut layout);
                             }
                             _ => {}
+                        }
+                    }
+                    Event::Paste(text) => {
+                        match &mut overlay {
+                            Overlay::RenameTab { ref mut input }
+                            | Overlay::RenamePane { ref mut input }
+                            | Overlay::Command { ref mut input } => {
+                                input.push_str(&text);
+                            }
+                            Overlay::None => {
+                                write_to_focused(&layout, &registry, text.as_bytes());
+                            }
+                            _ => {} // ignore paste in non-input overlays
                         }
                     }
                     Event::Resize(cols, rows) => {
@@ -623,6 +655,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             }
         }
     }
+
+    // Save session IDs so resume works after reattach
+    save_all_session_ids(&home, &layout);
 
     // Sync fleet.yaml to match current state, then save layout
     sync_fleet_yaml(&home, &layout);
@@ -1197,6 +1232,21 @@ fn execute_command(
     false
 }
 
+/// Persist agent session IDs on detach so resume works after reattach.
+fn save_all_session_ids(home: &Path, layout: &Layout) {
+    for tab in &layout.tabs {
+        for id in tab.root().pane_ids() {
+            let Some(pane) = tab.root().find_pane(id) else { continue };
+            if pane.backend.is_none() { continue; }
+            let Some(ref dir) = pane.working_dir else { continue };
+            let name = pane.fleet_instance_name.as_deref().unwrap_or(&pane.agent_name);
+            if let Some(sid) = crate::backend::read_session_id(dir) {
+                crate::backend::save_session_id(home, name, &sid);
+            }
+        }
+    }
+}
+
 /// Sync fleet.yaml to match current pane state on detach.
 /// Removes fleet entries not present in any pane; adds panes with backend but missing from fleet.
 fn sync_fleet_yaml(home: &Path, layout: &Layout) {
@@ -1399,6 +1449,19 @@ fn restore_node_reconciled(
 }
 
 /// Adjust scroll offset of the focused pane by `delta` lines (positive = up, negative = down).
+/// Write bytes to the focused pane's PTY.
+fn write_to_focused(layout: &Layout, registry: &AgentRegistry, bytes: &[u8]) {
+    if let Some(name) = layout.active_tab()
+        .and_then(|t| t.focused_pane())
+        .map(|p| p.agent_name.clone())
+    {
+        let reg = agent::lock_registry(registry);
+        if let Some(handle) = reg.get(&name) {
+            let _ = agent::write_to_agent(handle, bytes);
+        }
+    }
+}
+
 fn scroll_focused(layout: &mut Layout, delta: i32) {
     if let Some(tab) = layout.active_tab_mut() {
         let fid = tab.focus_id;
@@ -1489,6 +1552,35 @@ fn start_api_server(home: &Path, registry: &AgentRegistry) -> ApiGuard {
     }
 }
 
+enum TabBarClick {
+    Tab(usize),
+    NewTab,
+}
+
+/// Hit-test the tab bar at the given column.
+/// SYNC: layout math must match render_tab_bar() in render.rs.
+fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
+    use unicode_width::UnicodeWidthStr;
+    let mut x: u16 = 0;
+    for (i, tab) in layout.tabs.iter().enumerate() {
+        if i > 0 { x += 1; } // separator space
+        let is_active = i == layout.active;
+        let has_notif = tab.root().has_notification();
+        let badge = if has_notif && !is_active { " !" } else { "" };
+        let label = format!(" {}{badge} ", tab.name);
+        let tab_w = 1 + label.width() as u16; // "*" + label
+        if col >= x && col < x + tab_w {
+            return Some(TabBarClick::Tab(i));
+        }
+        x += tab_w;
+    }
+    // " [+] " button
+    if col >= x && col < x + 5 {
+        return Some(TabBarClick::NewTab);
+    }
+    None
+}
+
 /// Handle mouse selection: down starts, drag extends, up copies to clipboard.
 /// Works on any pane (not just focused) by finding the pane under the cursor.
 fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEvent) {
@@ -1514,8 +1606,9 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
         None => return,
     };
 
-    // Cache selection target on Down, clear on Up
+    // Focus clicked pane and cache selection target on Down
     if matches!(mouse.kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+        tab.focus_id = target_id;
         tab.selecting_pane = Some(target_id);
     }
 

@@ -127,6 +127,16 @@ impl PaneNode {
         }
     }
 
+    /// True if any pane in this subtree has an unread notification.
+    pub fn has_notification(&self) -> bool {
+        match self {
+            PaneNode::Leaf(p) => p.has_notification,
+            PaneNode::Split { first, second, .. } => {
+                first.has_notification() || second.has_notification()
+            }
+        }
+    }
+
     /// Collect all agent names in the tree.
     pub fn agent_names(&self) -> Vec<String> {
         match self {

@@ -81,6 +81,7 @@ fn highest_priority_state(tab: &crate::layout::Tab, registry: &AgentRegistry) ->
     best
 }
 
+/// SYNC: layout math (label width, spacing) must match tab_bar_hit_test() in app.rs.
 fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &AgentRegistry) {
     let mut spans = Vec::new();
 
@@ -107,7 +108,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
             Span::styled("*", Style::default().fg(sc))
         };
 
-        let has_notif = has_notification_in_tree(tab.root());
+        let has_notif = tab.root().has_notification();
         let badge = if has_notif && !is_active { " !" } else { "" };
         let label = format!(" {}{badge} ", tab.name);
 
@@ -118,15 +119,6 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
     spans.push(Span::styled(" [+] ", Style::default().fg(Color::DarkGray)));
     let tabs = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(tabs, area);
-}
-
-fn has_notification_in_tree(node: &PaneNode) -> bool {
-    match node {
-        PaneNode::Leaf(p) => p.has_notification,
-        PaneNode::Split { first, second, .. } => {
-            has_notification_in_tree(first) || has_notification_in_tree(second)
-        }
-    }
 }
 
 fn split_chunks(area: Rect, dir: &SplitDir) -> [Rect; 2] {

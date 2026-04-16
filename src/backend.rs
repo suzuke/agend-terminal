@@ -56,6 +56,14 @@ impl ResumeMode {
     }
 }
 
+/// Read session_id from an agent's statusline.json.
+pub fn read_session_id(working_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(working_dir.join("statusline.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|d| d.get("session_id").and_then(|v| v.as_str()).map(String::from))
+}
+
 /// Save a captured session ID for an instance.
 pub fn save_session_id(home: &std::path::Path, instance_name: &str, session_id: &str) {
     let dir = home.join("sessions");

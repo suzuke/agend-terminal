@@ -452,15 +452,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
             for (name, config) in cfgs.iter() {
                 if let Some(ref dir) = config.working_dir {
-                    if let Some(sid) = std::fs::read_to_string(dir.join("statusline.json"))
-                        .ok()
-                        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                        .and_then(|d| {
-                            d.get("session_id")
-                                .and_then(|v| v.as_str())
-                                .map(String::from)
-                        })
-                    {
+                    if let Some(sid) = crate::backend::read_session_id(dir) {
                         crate::backend::save_session_id(home, name, &sid);
                     }
                 }
