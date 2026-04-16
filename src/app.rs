@@ -1172,16 +1172,6 @@ fn telegram_status_from_config(config: &crate::fleet::FleetConfig) -> render::Te
     }
 }
 
-/// Lock TelegramState, recovering from poison (logs a warning).
-fn lock_tg(
-    tg: &Arc<Mutex<crate::telegram::TelegramState>>,
-) -> std::sync::MutexGuard<'_, crate::telegram::TelegramState> {
-    tg.lock().unwrap_or_else(|e| {
-        tracing::warn!("TelegramState mutex poisoned, recovering");
-        e.into_inner()
-    })
-}
-
 /// Create a Telegram topic for a newly spawned fleet instance (non-blocking).
 /// Spawns a background thread for the Telegram API call to avoid freezing the TUI.
 fn maybe_create_telegram_topic(
@@ -1195,7 +1185,7 @@ fn maybe_create_telegram_topic(
         return;
     };
     {
-        let s = lock_tg(tg);
+        let s = crate::telegram::lock_state(tg);
         if s.instance_to_topic.contains_key(fleet_name) {
             return;
         }
@@ -1212,7 +1202,7 @@ fn maybe_create_telegram_topic(
     std::thread::spawn(move || {
         match crate::telegram::create_topic_for_instance(&home, &fleet_name) {
             Some(tid) => {
-                let mut s = lock_tg(&tg);
+                let mut s = crate::telegram::lock_state(&tg);
                 s.instance_to_topic.insert(fleet_name.clone(), tid);
                 s.topic_to_instance.insert(tid, fleet_name.clone());
                 s.submit_keys.insert(fleet_name, submit_key);
@@ -1231,7 +1221,7 @@ fn maybe_delete_telegram_topic(
 ) {
     let Some(tg) = tg else { return };
     let tid = {
-        let mut s = lock_tg(tg);
+        let mut s = crate::telegram::lock_state(tg);
         match s.instance_to_topic.remove(fleet_name) {
             Some(tid) => {
                 s.topic_to_instance.remove(&tid);

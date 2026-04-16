@@ -12,6 +12,18 @@ use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ThreadId};
 
+/// Lock TelegramState, recovering from poison.
+/// Mutex poisoning can occur if a background thread panics while holding the lock.
+/// We recover rather than propagate the panic to keep the TUI responsive.
+pub(crate) fn lock_state(
+    tg: &Arc<Mutex<TelegramState>>,
+) -> std::sync::MutexGuard<'_, TelegramState> {
+    tg.lock().unwrap_or_else(|e| {
+        tracing::warn!("TelegramState mutex poisoned, recovering");
+        e.into_inner()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Topic registry — persists topic_id → instance_name in $AGEND_HOME/topics.json
 // so we can detect orphaned topics on daemon restart.
@@ -144,7 +156,7 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
                 return;
             };
             rt.block_on(async {
-                let bot = state.lock().unwrap_or_else(|e| e.into_inner()).bot.clone();
+                let bot = lock_state(&state).bot.clone();
                 let state2 = Arc::clone(&state);
                 let handler = Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
                     let state = Arc::clone(&state2);
@@ -189,7 +201,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     if msg.forum_topic_closed().is_some() {
         let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
         if let Some(tid) = thread_id {
-            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut s = lock_state(state);
             if let Some(instance_name) = s.topic_to_instance.remove(&tid) {
                 s.instance_to_topic.remove(&instance_name);
                 let home = s.home.clone();
@@ -225,7 +237,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
 
     let (instance_name, home, submit_key) = {
-        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = lock_state(state);
         let name = resolve_topic(&mut s, thread_id);
         let sk = s
             .submit_keys
@@ -263,7 +275,7 @@ pub fn send_reply(
     instance_name: &str,
     text: &str,
 ) -> anyhow::Result<()> {
-    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let s = lock_state(state);
     let (bot, group_id, topic_id) = (
         s.bot.clone(),
         s.group_id,
@@ -369,7 +381,7 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
     }
 
     fn send_reply(&self, instance_name: &str, text: &str) -> crate::channel::SendResult {
-        let s = self.lock().unwrap_or_else(|e| e.into_inner());
+        let s = lock_state(self);
         let (bot, group_id, topic_id) = (
             s.bot.clone(),
             s.group_id,
@@ -393,7 +405,7 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
         message_id: &str,
         text: &str,
     ) -> crate::channel::SendResult {
-        let s = self.lock().unwrap_or_else(|e| e.into_inner());
+        let s = lock_state(self);
         let (bot, group_id) = (s.bot.clone(), s.group_id);
         drop(s);
         let Ok(mid) = message_id.parse::<i32>() else {
