@@ -138,7 +138,7 @@ pub fn drain_inbox(home: &Path, instance_name: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 pub fn reply(home: &Path, instance_name: &str, text: &str) -> Value {
-    eprintln!("[agend] reply from {instance_name}: {text}");
+    tracing::info!(from = %instance_name, %text, "reply");
     let fleet_path = home.join("fleet.yaml");
     if fleet_path.exists() {
         match crate::telegram::try_telegram_reply(instance_name, text) {
@@ -298,7 +298,7 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
                 role,
             };
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
-                eprintln!("[agend] failed to persist to fleet.yaml: {e}");
+                tracing::warn!(error = %e, "failed to persist to fleet.yaml");
             }
             let topic_id = crate::telegram::create_topic_for_instance(home, name);
             if let Some(ref task_text) = task {
@@ -345,7 +345,7 @@ pub fn delete_instance(home: &Path, args: &Value) -> Value {
 
     let _ = crate::api::call(home, &json!({"method": "delete", "params": {"name": name}}));
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
-        eprintln!("[agend] failed to remove from fleet.yaml: {e}");
+        tracing::warn!(error = %e, "failed to remove from fleet.yaml");
     }
     // Delete the Telegram topic if one exists
     if let Some(tid) = topic_id {
@@ -458,7 +458,7 @@ pub fn replace_instance(home: &Path, name: &str, reason: &str) -> Value {
             timestamp: chrono::Utc::now().to_rfc3339(),
         },
     );
-    eprintln!("[agend] replace_instance {name}: {reason}");
+    tracing::info!(%name, %reason, "replace_instance");
     json!({"name": name, "reason": reason, "note": "Instance killed. Auto-respawn will create fresh instance with handover context."})
 }
 
@@ -640,7 +640,7 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
         if let Err(e) = std::fs::remove_dir_all(working_dir) {
             tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove workspace");
         } else {
-            eprintln!("[cleanup] removed workspace {}", working_dir.display());
+            tracing::info!(dir = %working_dir.display(), "removed workspace");
         }
     } else {
         // User-provided working directory: only remove agend-generated files
@@ -689,7 +689,7 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
                 ])
                 .current_dir(working_dir)
                 .output();
-            eprintln!("[cleanup] removed worktree {}", wt_dir.display());
+            tracing::info!(dir = %wt_dir.display(), "removed worktree");
         }
     }
 

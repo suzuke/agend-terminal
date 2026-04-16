@@ -60,7 +60,7 @@ pub fn attach(socket_path: &str) -> anyhow::Result<()> {
                     Err(_) => break,
                 }
             }
-            eprintln!("\r\n[Connection closed]");
+            tracing::info!("connection closed");
         })?;
 
     // Input loop: crossterm events → agent
@@ -77,7 +77,7 @@ pub fn attach(socket_path: &str) -> anyhow::Result<()> {
                 if ctrl_b_pressed {
                     ctrl_b_pressed = false;
                     if code == KeyCode::Char('d') && modifiers.is_empty() {
-                        eprintln!("\r\n[Detached]");
+                        tracing::info!("detached");
                         break;
                     }
                     // Not 'd' — send Ctrl+B + current key

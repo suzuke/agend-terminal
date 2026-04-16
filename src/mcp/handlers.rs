@@ -15,7 +15,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
         // --- Channel ---
         "reply" => {
             let text = args["text"].as_str().unwrap_or("");
-            eprintln!("[mcp] reply from {instance_name}: {text}");
+            tracing::info!(from = %instance_name, %text, "reply");
             let fleet_path = home.join("fleet.yaml");
             if fleet_path.exists() {
                 match telegram::try_telegram_reply(&instance_name, text) {
@@ -352,7 +352,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                         role,
                     };
                     if let Err(e) = crate::fleet::add_instance_to_yaml(&home, name, &entry) {
-                        eprintln!("[mcp] failed to persist to fleet.yaml: {e}");
+                        tracing::warn!(error = %e, "failed to persist to fleet.yaml");
                     }
                     let topic_id = telegram::create_topic_for_instance(&home, name);
                     if let Some(ref task_text) = task {
@@ -401,7 +401,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                 &json!({"method": "delete", "params": {"name": name}}),
             );
             if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, name) {
-                eprintln!("[mcp] failed to remove from fleet.yaml: {e}");
+                tracing::warn!(error = %e, "failed to remove from fleet.yaml");
             }
             // Delete the Telegram topic if one exists
             if let Some(tid) = topic_id {
@@ -509,7 +509,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                     timestamp: chrono::Utc::now().to_rfc3339(),
                 },
             );
-            eprintln!("[mcp] replace_instance {name}: {reason}");
+            tracing::info!(%name, %reason, "replace_instance");
             json!({"name": name, "reason": reason, "note": "Instance killed. Auto-respawn will create fresh instance with handover context."})
         }
         "set_display_name" => {
@@ -736,7 +736,7 @@ fn cleanup_working_dir(home: &std::path::Path, name: &str, working_dir: &std::pa
         if let Err(e) = std::fs::remove_dir_all(working_dir) {
             tracing::debug!(dir = %working_dir.display(), error = %e, "cleanup: remove workspace");
         } else {
-            eprintln!("[cleanup] removed workspace {}", working_dir.display());
+            tracing::info!(dir = %working_dir.display(), "removed workspace");
         }
     } else {
         // User-provided working directory: only remove agend-generated files
@@ -780,7 +780,7 @@ fn cleanup_working_dir(home: &std::path::Path, name: &str, working_dir: &std::pa
                 ])
                 .current_dir(working_dir)
                 .output();
-            eprintln!("[cleanup] removed worktree {}", wt_dir.display());
+            tracing::info!(dir = %wt_dir.display(), "removed worktree");
         }
     }
 

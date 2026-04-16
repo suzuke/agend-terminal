@@ -74,7 +74,7 @@ pub fn run(
 
     // 6. Generate MCP config
     crate::instructions::generate(&work_dir, &command);
-    eprintln!("[connect] MCP config written to {}", work_dir.display());
+    tracing::info!(dir = %work_dir.display(), "MCP config written");
 
     // 7. Register with daemon
     let pid = std::process::id();
@@ -95,7 +95,7 @@ pub fn run(
         Err(e) => bail!("Failed to connect to daemon: {e}"),
     }
 
-    eprintln!("[connect] Registered '{name}' with daemon (pid={pid})");
+    tracing::info!(%name, %pid, "registered with daemon");
 
     // 8. Build command args
     let mut args = default_args;
@@ -127,7 +127,7 @@ pub fn run(
     };
 
     // 10. Spawn backend process
-    eprintln!("[connect] Starting {command} {}", args.join(" "));
+    tracing::info!(%command, args = %args.join(" "), "starting backend");
     let mut child = std::process::Command::new(&command)
         .args(&args)
         .current_dir(&work_dir)
@@ -179,7 +179,7 @@ pub fn run(
             "params": { "name": name }
         }),
     );
-    eprintln!("[connect] Agent '{name}' disconnected");
+    tracing::info!(%name, "agent disconnected");
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));

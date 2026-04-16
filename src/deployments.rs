@@ -100,16 +100,13 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 .output()
             {
                 Ok(o) if o.status.success() => {
-                    eprintln!("[deploy] created worktree {inst_name} on branch {branch_name}");
+                    tracing::info!(%inst_name, %branch_name, "created worktree");
                 }
                 Ok(o) => {
-                    eprintln!(
-                        "[deploy] worktree failed for {inst_name}: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    );
+                    tracing::warn!(%inst_name, error = %String::from_utf8_lossy(&o.stderr).trim(), "worktree failed");
                 }
                 Err(e) => {
-                    eprintln!("[deploy] git not available: {e}");
+                    tracing::warn!(error = %e, "git not available");
                 }
             }
             wt.display().to_string()

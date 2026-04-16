@@ -140,7 +140,7 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
                 .enable_all()
                 .build()
             else {
-                eprintln!("[telegram] failed to build tokio runtime");
+                tracing::error!("failed to build tokio runtime");
                 return;
             };
             rt.block_on(async {
@@ -153,12 +153,12 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
                         respond(())
                     }
                 });
-                eprintln!("[telegram] polling started");
+                tracing::info!("polling started");
                 Dispatcher::builder(bot, handler).build().dispatch().await;
             });
         })
     {
-        eprintln!("[telegram] failed to spawn polling thread: {e}");
+        tracing::error!(error = %e, "failed to spawn polling thread");
     }
 }
 
@@ -194,7 +194,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                 s.instance_to_topic.remove(&instance_name);
                 let home = s.home.clone();
                 drop(s);
-                eprintln!("[telegram] topic {tid} closed, deleting instance '{instance_name}'");
+                tracing::info!(topic_id = tid, instance = %instance_name, "topic closed, deleting instance");
                 // Kill + remove via API
                 let _ = crate::api::call(
                     &home,
@@ -202,12 +202,12 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                 );
                 // Remove from fleet.yaml
                 if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, &instance_name) {
-                    eprintln!("[telegram] failed to remove '{instance_name}' from fleet.yaml: {e}");
+                    tracing::warn!(instance = %instance_name, error = %e, "failed to remove from fleet.yaml");
                 }
                 return;
             }
         }
-        eprintln!("[telegram] topic closed (no matching instance)");
+        tracing::warn!("topic closed (no matching instance)");
         return;
     }
 
@@ -235,7 +235,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         (name, s.home.clone(), sk)
     };
 
-    eprintln!("[telegram] {username} → {instance_name}: {text}");
+    tracing::info!(from = username, to = %instance_name, %text, "inbound message");
 
     // Enqueue in inbox
     let msg_obj = InboxMessage {
@@ -287,7 +287,7 @@ pub fn init_from_config(
     let token = match std::env::var(bot_token_env) {
         Ok(t) => t,
         Err(_) => {
-            eprintln!("[telegram] bot token env '{bot_token_env}' not set, skipping");
+            tracing::info!(env = %bot_token_env, "bot token env not set, skipping");
             return None;
         }
     };
@@ -298,14 +298,14 @@ pub fn init_from_config(
     let mut orphan_count = 0;
     for (tid, inst_name) in reg.clone() {
         if tid != 1 && !instance_names.contains(&inst_name) {
-            eprintln!("[telegram] orphaned topic {tid} ('{inst_name}' no longer in fleet), deleting");
+            tracing::info!(topic_id = tid, instance = %inst_name, "orphaned topic, deleting");
             delete_topic(home, tid); // also removes from registry
             orphan_count += 1;
         }
     }
     if orphan_count > 0 {
         reg = load_topic_registry(home); // reload after deletions
-        eprintln!("[telegram] cleaned up {orphan_count} orphaned topic(s)");
+        tracing::info!(count = orphan_count, "cleaned up orphaned topics");
     }
 
     let bot = teloxide::Bot::new(&token);
@@ -322,16 +322,16 @@ pub fn init_from_config(
         if name == "general" && inst.topic_id.is_none() {
             topic_map.insert("general".to_string(), 1);
         } else if inst.topic_id.is_none() {
-            eprintln!("[telegram] creating topic for '{name}'...");
+            tracing::info!(instance = %name, "creating topic");
             match telegram_runtime()
                 .block_on(async { bot.create_forum_topic(chat_id, name, 0x6FB9F0, "").await })
             {
                 Ok(topic) => {
                     let tid = topic.thread_id.0 .0;
-                    eprintln!("[telegram] created topic '{name}' → {tid}");
+                    tracing::info!(instance = %name, topic_id = tid, "created topic");
                     topic_map.insert(name.clone(), tid);
                 }
-                Err(e) => eprintln!("[telegram] failed to create topic for '{name}': {e}"),
+                Err(e) => tracing::error!(instance = %name, error = %e, "failed to create topic"),
             }
         }
     }
@@ -348,7 +348,7 @@ pub fn init_from_config(
             reg.insert(*tid, name.clone());
         }
         save_topic_registry(home, &reg);
-        eprintln!("[telegram] updated fleet.yaml with topic_ids");
+        tracing::info!("updated fleet.yaml with topic_ids");
     }
 
     let state = Arc::new(Mutex::new(TelegramState::new(
@@ -574,7 +574,7 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
         Ok::<i32, anyhow::Error>(topic.thread_id.0 .0)
     }) {
         Ok(tid) => {
-            eprintln!("[telegram] created topic for '{instance_name}' -> {tid}");
+            tracing::info!(instance = %instance_name, topic_id = tid, "created topic");
             let _ = crate::fleet::update_instance_field(
                 home,
                 instance_name,
@@ -585,7 +585,7 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
             Some(tid)
         }
         Err(e) => {
-            eprintln!("[telegram] failed to create topic for '{instance_name}': {e}");
+            tracing::error!(instance = %instance_name, error = %e, "failed to create topic");
             None
         }
     }
@@ -605,7 +605,7 @@ pub fn delete_topic(home: &std::path::Path, topic_id: i32) {
         bot.delete_forum_topic(chat_id, tid).await
     });
     unregister_topic(home, topic_id);
-    eprintln!("[telegram] deleted topic {topic_id}");
+    tracing::info!(topic_id, "deleted topic");
 }
 
 /// Download an attachment by file_id.

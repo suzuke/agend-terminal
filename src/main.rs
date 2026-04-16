@@ -346,7 +346,7 @@ fn main() -> anyhow::Result<()> {
                     if daemon::find_active_run_dir(&home).is_none() {
                         daemon_not_running_hint();
                     } else {
-                        eprintln!("Agent '{name}' not found.");
+                        tracing::error!(%name, "agent not found");
                         list_running_agents(&home);
                     }
                 } else {
@@ -364,9 +364,9 @@ fn main() -> anyhow::Result<()> {
                 &serde_json::json!({"method": "inject", "params": {"name": name, "data": text}}),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => println!("Injected: {text}"),
-                Ok(resp) => eprintln!(
-                    "Inject failed: {}",
-                    resp["error"].as_str().unwrap_or("unknown")
+                Ok(resp) => tracing::error!(
+                    error = resp["error"].as_str().unwrap_or("unknown"),
+                    "inject failed"
                 ),
                 Err(_) => daemon_not_running_hint(),
             }
@@ -376,7 +376,7 @@ fn main() -> anyhow::Result<()> {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     println!("Daemon shutdown initiated.")
                 }
-                Ok(_) => eprintln!("Shutdown request failed."),
+                Ok(_) => tracing::error!("shutdown request failed"),
                 Err(_) => daemon_not_running_hint(),
             }
         }
@@ -436,9 +436,9 @@ fn main() -> anyhow::Result<()> {
                 &serde_json::json!({"method": "kill", "params": {"name": name}}),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => println!("Killed {name}"),
-                Ok(resp) => eprintln!(
-                    "Kill failed: {}",
-                    resp["error"].as_str().unwrap_or("unknown")
+                Ok(resp) => tracing::error!(
+                    error = resp["error"].as_str().unwrap_or("unknown"),
+                    "kill failed"
                 ),
                 Err(_) => daemon_not_running_hint(),
             }
@@ -470,18 +470,18 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Mcp) => {
             let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
             if instance_name.is_empty() {
-                eprintln!("[mcp] AGEND_INSTANCE_NAME not set, running in standalone mode");
+                tracing::warn!("AGEND_INSTANCE_NAME not set, running in standalone mode");
             }
             mcp::run(&daemon::agent_socket_path(&home, &instance_name))?;
         }
         Some(Commands::Capture { backend, seconds }) => {
             let b: backend::Backend = serde_json::from_str(&format!("\"{backend}\""))
                 .unwrap_or_else(|_| {
-                    eprintln!("Unknown backend: {backend}");
+                    tracing::error!(%backend, "unknown backend");
                     std::process::exit(1);
                 });
             if !b.is_installed() {
-                eprintln!("{} ({}) not found in PATH", backend, b.preset().command);
+                tracing::error!(%backend, command = b.preset().command, "not found in PATH");
                 std::process::exit(1);
             }
             cli::capture_backend(&b, seconds)?;
@@ -507,18 +507,16 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn daemon_not_running_hint() {
-    eprintln!("Daemon is not running.");
-    eprintln!("  Start it with:  agend-terminal start");
-    eprintln!("  Or first setup: agend-terminal quickstart");
+    tracing::error!("daemon is not running — start with: agend-terminal start, or first setup: agend-terminal quickstart");
 }
 
 fn list_running_agents(home: &std::path::Path) {
     if let Ok(resp) = api::call(home, &serde_json::json!({"method": "list"})) {
         if let Some(agents) = resp["result"]["agents"].as_array() {
             if !agents.is_empty() {
-                eprintln!("Running agents:");
+                tracing::info!("running agents:");
                 for a in agents {
-                    eprintln!("  - {}", a["name"].as_str().unwrap_or("?"));
+                    tracing::info!("  - {}", a["name"].as_str().unwrap_or("?"));
                 }
             }
         }

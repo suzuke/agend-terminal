@@ -63,7 +63,7 @@ fn write_message(stdout: &mut io::Stdout, json: &str) -> anyhow::Result<()> {
 
 pub fn run(agent_socket: &str) -> anyhow::Result<()> {
     let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
-    eprintln!("[mcp] server starting for '{instance_name}'");
+    tracing::info!(%instance_name, "server starting");
 
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -78,7 +78,7 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
         let req: JsonRpcRequest = match serde_json::from_str(&body) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[mcp] invalid JSON-RPC: {e}");
+                tracing::warn!(error = %e, "invalid JSON-RPC");
                 continue;
             }
         };
@@ -128,7 +128,7 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
         write_message(&mut stdout, &response.to_string())?;
     }
 
-    eprintln!("[mcp] server exiting");
+    tracing::info!("server exiting");
     Ok(())
 }
 

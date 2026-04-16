@@ -479,11 +479,11 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
                 if let Some(handle) = reg.get(&agent_name) {
                     let dump = handle.core.lock().unwrap().vterm.dump_screen();
                     let stripped = crate::agent::strip_ansi_pub(&String::from_utf8_lossy(&dump));
-                    eprintln!("[debug] {name} VTerm at timeout:");
+                    tracing::debug!(%name, "VTerm at timeout:");
                     for (i, line) in stripped.lines().enumerate() {
                         let t = line.trim_end();
                         if !t.is_empty() {
-                            eprintln!("  {:>3}| {}", i + 1, t);
+                            tracing::debug!("  {:>3}| {}", i + 1, t);
                         }
                     }
                 }

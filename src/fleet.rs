@@ -301,7 +301,7 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
             serde_yaml::Value::String(name.to_string()),
             serde_yaml::Value::Mapping(inst),
         );
-        eprintln!("[fleet] added instance '{name}' to fleet.yaml");
+        tracing::info!(%name, "added instance to fleet.yaml");
         Ok(())
     })
 }
@@ -312,7 +312,7 @@ pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
             instances.remove(serde_yaml::Value::String(name.to_string()));
         }
-        eprintln!("[fleet] removed instance '{name}' from fleet.yaml");
+        tracing::info!(%name, "removed instance from fleet.yaml");
         Ok(())
     })
 }

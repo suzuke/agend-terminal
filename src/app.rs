@@ -190,8 +190,27 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // Start true so restored split panes get correct sizes before first draw.
     let mut needs_resize = true;
 
-    // Detect Telegram status from fleet config
-    let telegram_status = detect_telegram_status(&fleet_path);
+    // Initialize Telegram: start polling, auto-create topics, update status
+    let (telegram_state, telegram_status) = {
+        let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
+        if let Some(ref config) = fleet {
+            let submit_keys: HashMap<String, String> = config
+                .instances
+                .keys()
+                .filter_map(|name| {
+                    config
+                        .resolve_instance(name)
+                        .map(|r| (name.clone(), r.submit_key))
+                })
+                .collect();
+            match crate::telegram::init_from_config(config, &home, submit_keys) {
+                Some(state) => (Some(state), render::TelegramStatus::Connected),
+                None => (None, telegram_status_from_config(config)),
+            }
+        } else {
+            (None, render::TelegramStatus::NotConfigured)
+        }
+    };
 
     // Crossterm event reader thread
     let (event_tx, event_rx) = crossbeam::channel::unbounded::<Event>();
@@ -285,6 +304,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                         item, &fleet_path, &mut layout, &registry, &home,
                                                         pc, pr, &wakeup_tx, &mut name_counter,
                                                     ) {
+                                                        maybe_create_telegram_topic(&telegram_state, &registry, &home, &pane);
                                                         let tab_name = pane.agent_name.clone();
                                                         layout.add_tab(Tab::new(tab_name, pane));
                                                         needs_resize = true;
@@ -315,6 +335,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                         pc, pr, &wakeup_tx, &mut name_counter,
                                                     ) {
                                                         Ok(p) => {
+                                                            maybe_create_telegram_topic(&telegram_state, &registry, &home, &p);
                                                             if let Some(tab) = layout.active_tab_mut() {
                                                                 tab.split_focused(split_dir, p);
                                                             }
@@ -383,6 +404,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                             .filter_map(|id| t.root().find_pane(id)
                                                                 .and_then(|p| p.fleet_instance_name.clone())))
                                                         .collect();
+                                                    for fname in &fleet_names {
+                                                        maybe_delete_telegram_topic(&telegram_state, &home, fname);
+                                                    }
                                                     if !fleet_names.is_empty() {
                                                         let _ = crate::fleet::remove_instances_from_yaml(&home, &fleet_names);
                                                     }
@@ -398,6 +422,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                 let fid = tab.focus_id;
                                                 if let Some(pane) = tab.root().find_pane(fid) {
                                                     if let Some(ref fleet_name) = pane.fleet_instance_name {
+                                                        maybe_delete_telegram_topic(&telegram_state, &home, fleet_name);
                                                         let _ = crate::fleet::remove_instance_from_yaml(&home, fleet_name);
                                                     }
                                                 }
@@ -442,7 +467,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                         KeyCode::Enter => {
                                             let cmd = input.clone();
                                             overlay = Overlay::None;
-                                            if execute_command(&cmd, &home, &mut layout, &registry, &wakeup_tx, &mut name_counter) {
+                                            if execute_command(&cmd, &home, &mut layout, &registry, &wakeup_tx, &mut name_counter, &telegram_state) {
                                                 needs_resize = true;
                                             }
                                         }
@@ -788,7 +813,8 @@ fn pane_from_menu_item(
         }
         MenuItemKind::Backend(backend) => {
             let preset = backend.preset();
-            if let Err(e) = crate::fleet::add_instance_to_yaml(home, preset.command, &crate::fleet::InstanceYamlEntry {
+            let inst_name = unique_fleet_name(home, preset.command);
+            if let Err(e) = crate::fleet::add_instance_to_yaml(home, &inst_name, &crate::fleet::InstanceYamlEntry {
                 backend: Some(backend.name().to_string()),
                 working_directory: None,
                 role: None,
@@ -797,11 +823,11 @@ fn pane_from_menu_item(
             }
             // Resolve from fleet to get defaults merged
             let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
-            if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(preset.command)) {
-                create_pane_from_resolved(preset.command, &resolved, layout, registry, home, cols, rows, wakeup_tx, name_counter)
+            if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
+                create_pane_from_resolved(&inst_name, &resolved, layout, registry, home, cols, rows, wakeup_tx, name_counter)
             } else {
                 let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-                create_pane(layout, registry, home, preset.command, preset.command, &args, None, &HashMap::new(), preset.submit_key, cols, rows, wakeup_tx, name_counter)
+                create_pane(layout, registry, home, &inst_name, preset.command, &args, None, &HashMap::new(), preset.submit_key, cols, rows, wakeup_tx, name_counter)
             }
         }
         MenuItemKind::FleetInstance(inst_name) => {
@@ -1002,13 +1028,9 @@ fn create_pane_from_resolved(
     Ok(pane)
 }
 
-/// Detect Telegram channel status from fleet config.
-fn detect_telegram_status(fleet_path: &Path) -> render::TelegramStatus {
-    let fleet = match crate::fleet::FleetConfig::load(fleet_path) {
-        Ok(f) => f,
-        Err(_) => return render::TelegramStatus::NotConfigured,
-    };
-    match fleet.channel {
+/// Derive Telegram status from an already-loaded FleetConfig (no disk I/O).
+fn telegram_status_from_config(config: &crate::fleet::FleetConfig) -> render::TelegramStatus {
+    match config.channel {
         Some(crate::fleet::ChannelConfig::Telegram { ref bot_token_env, .. }) => {
             if std::env::var(bot_token_env).is_ok() {
                 render::TelegramStatus::Connected
@@ -1018,6 +1040,66 @@ fn detect_telegram_status(fleet_path: &Path) -> render::TelegramStatus {
         }
         None => render::TelegramStatus::NotConfigured,
     }
+}
+
+/// Create a Telegram topic for a newly spawned fleet instance (non-blocking).
+/// Spawns a background thread for the Telegram API call to avoid freezing the TUI.
+fn maybe_create_telegram_topic(
+    tg: &Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    registry: &AgentRegistry,
+    home: &Path,
+    pane: &Pane,
+) {
+    let Some(tg) = tg else { return };
+    let Some(fleet_name) = &pane.fleet_instance_name else { return };
+    {
+        let s = tg.lock().unwrap_or_else(|e| e.into_inner());
+        if s.instance_to_topic.contains_key(fleet_name) {
+            return;
+        }
+    }
+    let submit_key = {
+        let reg = agent::lock_registry(registry);
+        reg.get(&pane.agent_name)
+            .map(|h| h.submit_key.clone())
+            .unwrap_or_else(|| "\r".to_string())
+    };
+    let tg = Arc::clone(tg);
+    let home = home.to_path_buf();
+    let fleet_name = fleet_name.clone();
+    std::thread::spawn(move || {
+        if let Some(tid) = crate::telegram::create_topic_for_instance(&home, &fleet_name) {
+            let mut s = tg.lock().unwrap_or_else(|e| e.into_inner());
+            s.instance_to_topic.insert(fleet_name.clone(), tid);
+            s.topic_to_instance.insert(tid, fleet_name.clone());
+            s.submit_keys.insert(fleet_name, submit_key);
+        }
+    });
+}
+
+/// Delete Telegram topic for a fleet instance (non-blocking).
+/// State is updated immediately; the Telegram API call runs on a background thread.
+fn maybe_delete_telegram_topic(
+    tg: &Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    home: &Path,
+    fleet_name: &str,
+) {
+    let Some(tg) = tg else { return };
+    let tid = {
+        let mut s = tg.lock().unwrap_or_else(|e| e.into_inner());
+        match s.instance_to_topic.remove(fleet_name) {
+            Some(tid) => {
+                s.topic_to_instance.remove(&tid);
+                s.submit_keys.remove(fleet_name);
+                tid
+            }
+            None => return,
+        }
+    };
+    let home = home.to_path_buf();
+    std::thread::spawn(move || {
+        crate::telegram::delete_topic(&home, tid);
+    });
 }
 
 /// Resolve a backend command string into (command, args, submit_key).
@@ -1044,6 +1126,7 @@ fn execute_command(
     registry: &AgentRegistry,
     wakeup_tx: &crossbeam::channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
+    telegram_state: &Option<Arc<Mutex<crate::telegram::TelegramState>>>,
 ) -> bool {
     let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
     if parts.is_empty() {
@@ -1051,38 +1134,32 @@ fn execute_command(
     }
     match parts[0] {
         "spawn" | "vsplit" | "hsplit" => {
-            let name = parts.get(1).unwrap_or(&"agent");
+            let base_name = parts.get(1).unwrap_or(&"agent");
             let backend_name = parts.get(2).unwrap_or(&"claude");
             let fleet_path = home.join("fleet.yaml");
             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
             let pc = cols.saturating_sub(2);
             let pr = rows.saturating_sub(4);
 
-            // Check fleet.yaml first; if not there, add it
+            // unique_fleet_name guarantees inst_name is not yet in fleet.yaml
+            let inst_name = unique_fleet_name(home, base_name);
+            if let Err(e) = crate::fleet::add_instance_to_yaml(home, &inst_name, &crate::fleet::InstanceYamlEntry {
+                backend: Some(backend_name.to_string()),
+                working_directory: None,
+                role: None,
+            }) {
+                tracing::warn!(name = %inst_name, error = %e, "failed to write fleet.yaml");
+            }
             let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-            let resolved = fleet.as_ref().and_then(|f| f.resolve_instance(name));
-            let pane_result = if let Some(resolved) = resolved {
-                create_pane_from_resolved(name, &resolved, layout, registry, home, pc, pr, wakeup_tx, name_counter)
+            let pane_result = if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
+                create_pane_from_resolved(&inst_name, &resolved, layout, registry, home, pc, pr, wakeup_tx, name_counter)
             } else {
-                if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &crate::fleet::InstanceYamlEntry {
-                    backend: Some(backend_name.to_string()),
-                    working_directory: None,
-                    role: None,
-                }) {
-                    tracing::warn!(name = *name, error = %e, "failed to write fleet.yaml");
-                }
-                // Resolve from updated fleet (gets defaults merged)
-                let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-                if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(name)) {
-                    create_pane_from_resolved(name, &resolved, layout, registry, home, pc, pr, wakeup_tx, name_counter)
-                } else {
-                    // Fallback: direct spawn without fleet resolution
-                    let (command, args, submit_key) = resolve_backend(backend_name, false);
-                    create_pane(layout, registry, home, name, &command, &args, None, &HashMap::new(), &submit_key, pc, pr, wakeup_tx, name_counter)
-                }
+                let (command, args, submit_key) = resolve_backend(backend_name, false);
+                create_pane(layout, registry, home, &inst_name, &command, &args, None, &HashMap::new(), &submit_key, pc, pr, wakeup_tx, name_counter)
             };
             match pane_result {
                 Ok(pane) => {
+                    maybe_create_telegram_topic(telegram_state, registry, home, &pane);
                     match parts[0] {
                         "vsplit" => {
                             if let Some(tab) = layout.active_tab_mut() {
@@ -1101,12 +1178,15 @@ fn execute_command(
                     }
                     return true;
                 }
-                Err(e) => tracing::error!(name = *name, backend = *backend_name, error = %e, "spawn failed"),
+                Err(e) => tracing::error!(name = %inst_name, backend = *backend_name, error = %e, "spawn failed"),
             }
         }
         "kill" => {
             if let Some(name) = parts.get(1) {
-                remove_from_fleet(home, layout, name);
+                if let Some(fleet_name) = lookup_fleet_name(layout, name) {
+                    maybe_delete_telegram_topic(telegram_state, home, &fleet_name);
+                    let _ = crate::fleet::remove_instance_from_yaml(home, &fleet_name);
+                }
                 kill_agent(registry, name);
                 for i in (0..layout.tabs.len()).rev() {
                     let names = layout.tabs[i].root().agent_names();
@@ -1448,7 +1528,6 @@ fn restore_node_reconciled(
     }
 }
 
-/// Adjust scroll offset of the focused pane by `delta` lines (positive = up, negative = down).
 /// Write bytes to the focused pane's PTY.
 fn write_to_focused(layout: &Layout, registry: &AgentRegistry, bytes: &[u8]) {
     if let Some(name) = layout.active_tab()
@@ -1462,6 +1541,7 @@ fn write_to_focused(layout: &Layout, registry: &AgentRegistry, bytes: &[u8]) {
     }
 }
 
+/// Adjust scroll offset of the focused pane by `delta` lines (positive = up, negative = down).
 fn scroll_focused(layout: &mut Layout, delta: i32) {
     if let Some(tab) = layout.active_tab_mut() {
         let fid = tab.focus_id;
@@ -1486,20 +1566,31 @@ fn kill_agent(registry: &AgentRegistry, name: &str) {
     reg.remove(name);
 }
 
-/// Remove an agent's fleet.yaml entry by looking up its fleet_instance_name in the layout.
-fn remove_from_fleet(home: &Path, layout: &Layout, agent_name: &str) {
+/// Generate a unique fleet instance name by checking fleet.yaml for collisions.
+fn unique_fleet_name(home: &Path, base: &str) -> String {
+    let Some(fleet) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok() else {
+        return base.to_string();
+    };
+    if !fleet.instances.contains_key(base) {
+        return base.to_string();
+    }
+    (2..).map(|n| format!("{base}-{n}"))
+        .find(|c| !fleet.instances.contains_key(c))
+        .unwrap()
+}
+
+/// Look up the fleet_instance_name for an agent by scanning the layout.
+fn lookup_fleet_name(layout: &Layout, agent_name: &str) -> Option<String> {
     for tab in &layout.tabs {
         for id in tab.root().pane_ids() {
             if let Some(pane) = tab.root().find_pane(id) {
                 if pane.agent_name == agent_name {
-                    if let Some(ref fleet_name) = pane.fleet_instance_name {
-                        let _ = crate::fleet::remove_instance_from_yaml(home, fleet_name);
-                    }
-                    return;
+                    return pane.fleet_instance_name.clone();
                 }
             }
         }
     }
+    None
 }
 
 // --- API server ---

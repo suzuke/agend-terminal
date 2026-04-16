@@ -131,7 +131,7 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
     }
 
     if agents.is_empty() {
-        eprintln!("No instances found in fleet.yaml");
+        tracing::error!("no instances found in fleet.yaml");
         std::process::exit(1);
     }
 
@@ -156,12 +156,7 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     let preset = b.preset();
     let name = format!("capture-{}", b.name());
     let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-    eprintln!(
-        "[capture] Spawning {} ({} {}) for {seconds}s...",
-        b.name(),
-        preset.command,
-        args.join(" ")
-    );
+    tracing::info!(backend = b.name(), command = preset.command, args = %args.join(" "), %seconds, "capture: spawning");
 
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     agent::spawn_agent(
@@ -181,7 +176,7 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
         &registry,
     )?;
 
-    eprintln!("[capture] Waiting {seconds}s for output...");
+    tracing::info!(%seconds, "capture: waiting for output");
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 
     let stripped = {
@@ -192,7 +187,7 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
                 agent::strip_ansi_pub(&String::from_utf8_lossy(&raw))
             }
             None => {
-                eprintln!("[capture] Agent exited before capture");
+                tracing::warn!("capture: agent exited before capture");
                 return Ok(());
             }
         }
@@ -229,7 +224,7 @@ pub fn run_tests(subcmd: &str, home: &Path) -> anyhow::Result<()> {
             test_inbox(home)?;
         }
         _ => {
-            eprintln!("Unknown test: {subcmd}. Available: mcp, attach, inbox, api, all");
+            tracing::error!(%subcmd, "unknown test — available: mcp, attach, inbox, api, all");
             std::process::exit(1);
         }
     }
@@ -238,7 +233,7 @@ pub fn run_tests(subcmd: &str, home: &Path) -> anyhow::Result<()> {
 
 #[allow(clippy::unwrap_used)]
 fn test_attach(_home: &Path) -> anyhow::Result<()> {
-    eprintln!("[test:attach] Spawning bash...");
+    tracing::info!("test:attach — spawning bash");
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let args: Vec<String> = vec![];
 
@@ -261,7 +256,7 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
 
     std::thread::sleep(std::time::Duration::from_secs(1));
 
-    eprintln!("[test:attach] Injecting test command...");
+    tracing::info!("test:attach — injecting test command");
     {
         let reg = registry.lock().unwrap();
         let handle = reg.get("test-attach").unwrap();
@@ -279,9 +274,9 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     };
 
     if output.contains("AGEND_TEST_OK") {
-        eprintln!("[test:attach] PASS — PTY spawn + inject + VTerm output verified");
+        tracing::info!("test:attach — PASS — PTY spawn + inject + VTerm output verified");
     } else {
-        eprintln!("[test:attach] FAIL — 'AGEND_TEST_OK' not found in VTerm output");
+        tracing::error!("test:attach — FAIL — 'AGEND_TEST_OK' not found in VTerm output");
         std::process::exit(1);
     }
 
@@ -292,24 +287,21 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
         let _ = child.kill();
     }
 
-    eprintln!("[test:attach] Cleanup done");
+    tracing::info!("test:attach — cleanup done");
     Ok(())
 }
 
 fn test_mcp(_home: &Path) -> anyhow::Result<()> {
-    eprintln!("[test:mcp] Testing MCP protocol...");
+    tracing::info!("test:mcp — testing MCP protocol");
     let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
     let init_frame = format!("Content-Length: {}\r\n\r\n{}", init_req.len(), init_req);
-    eprintln!(
-        "[test:mcp] Content-Length frame format: OK ({} bytes)",
-        init_frame.len()
-    );
-    eprintln!("[test:mcp] PASS — MCP framing verified");
+    tracing::info!(bytes = init_frame.len(), "test:mcp — Content-Length frame format OK");
+    tracing::info!("test:mcp — PASS — MCP framing verified");
     Ok(())
 }
 
 fn test_inbox(home: &Path) -> anyhow::Result<()> {
-    eprintln!("[test:inbox] Testing inbox enqueue + drain...");
+    tracing::info!("test:inbox — testing enqueue + drain");
 
     let test_name = "test-inbox-agent";
 
@@ -341,12 +333,12 @@ fn test_inbox(home: &Path) -> anyhow::Result<()> {
 
     let _ = std::fs::remove_file(home.join("inbox").join(format!("{test_name}.jsonl")));
 
-    eprintln!("[test:inbox] PASS — enqueue + drain + empty verified");
+    tracing::info!("test:inbox — PASS — enqueue + drain + empty verified");
     Ok(())
 }
 
 fn test_api(home: &Path) -> anyhow::Result<()> {
-    eprintln!("[test:api] Checking for running daemon...");
+    tracing::info!("test:api — checking for running daemon");
 
     match api::call(home, &serde_json::json!({"method": "list"})) {
         Ok(resp) => {
@@ -354,10 +346,10 @@ fn test_api(home: &Path) -> anyhow::Result<()> {
                 .as_array()
                 .map(|a| a.len())
                 .unwrap_or(0);
-            eprintln!("[test:api] PASS — API socket responsive, {agents} agents");
+            tracing::info!(%agents, "test:api — PASS — API socket responsive");
         }
         Err(e) => {
-            eprintln!("[test:api] SKIP — daemon not running ({e})");
+            tracing::warn!(error = %e, "test:api — SKIP — daemon not running");
         }
     }
 
