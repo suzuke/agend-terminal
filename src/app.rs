@@ -1681,14 +1681,19 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
     };
 
     // Down: hit-test pane_rects. Drag/Up: use cached selecting_pane.
+    // When zoomed, only the focused pane is visible — skip hit-test.
     let target_id = match mouse.kind {
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            tab.pane_rects.iter()
-                .find(|(_, &(px, py, pw, ph))| {
-                    mouse.column >= px && mouse.column < px + pw
-                        && mouse.row >= py && mouse.row < py + ph
-                })
-                .map(|(&id, _)| id)
+            if tab.zoomed {
+                Some(tab.focus_id)
+            } else {
+                tab.pane_rects.iter()
+                    .find(|(_, &(px, py, pw, ph))| {
+                        mouse.column >= px && mouse.column < px + pw
+                            && mouse.row >= py && mouse.row < py + ph
+                    })
+                    .map(|(&id, _)| id)
+            }
         }
         _ => tab.selecting_pane,
     };

@@ -225,6 +225,8 @@ fn render_pane_tree(
         if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
             render_pane(frame, area, pane, true, false, registry);
         }
+        tab.pane_rects.clear();
+        tab.pane_rects.insert(focus_id, (area.x, area.y, area.width, area.height));
         return;
     }
 
