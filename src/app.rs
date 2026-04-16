@@ -245,10 +245,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             let submit_keys: HashMap<String, String> = config
                 .instances
                 .keys()
-                .filter_map(|name| {
-                    config
-                        .resolve_instance(name)
-                        .map(|r| (name.clone(), r.submit_key))
+                .filter_map(|name| match config.resolve_instance(name) {
+                    Some(r) => Some((name.clone(), r.submit_key)),
+                    None => {
+                        tracing::warn!(%name, "failed to resolve fleet instance");
+                        None
+                    }
                 })
                 .collect();
             match crate::telegram::init_from_config(config, &home, submit_keys) {
@@ -1170,6 +1172,16 @@ fn telegram_status_from_config(config: &crate::fleet::FleetConfig) -> render::Te
     }
 }
 
+/// Lock TelegramState, recovering from poison (logs a warning).
+fn lock_tg(
+    tg: &Arc<Mutex<crate::telegram::TelegramState>>,
+) -> std::sync::MutexGuard<'_, crate::telegram::TelegramState> {
+    tg.lock().unwrap_or_else(|e| {
+        tracing::warn!("TelegramState mutex poisoned, recovering");
+        e.into_inner()
+    })
+}
+
 /// Create a Telegram topic for a newly spawned fleet instance (non-blocking).
 /// Spawns a background thread for the Telegram API call to avoid freezing the TUI.
 fn maybe_create_telegram_topic(
@@ -1183,7 +1195,7 @@ fn maybe_create_telegram_topic(
         return;
     };
     {
-        let s = tg.lock().unwrap_or_else(|e| e.into_inner());
+        let s = lock_tg(tg);
         if s.instance_to_topic.contains_key(fleet_name) {
             return;
         }
@@ -1198,11 +1210,14 @@ fn maybe_create_telegram_topic(
     let home = home.to_path_buf();
     let fleet_name = fleet_name.clone();
     std::thread::spawn(move || {
-        if let Some(tid) = crate::telegram::create_topic_for_instance(&home, &fleet_name) {
-            let mut s = tg.lock().unwrap_or_else(|e| e.into_inner());
-            s.instance_to_topic.insert(fleet_name.clone(), tid);
-            s.topic_to_instance.insert(tid, fleet_name.clone());
-            s.submit_keys.insert(fleet_name, submit_key);
+        match crate::telegram::create_topic_for_instance(&home, &fleet_name) {
+            Some(tid) => {
+                let mut s = lock_tg(&tg);
+                s.instance_to_topic.insert(fleet_name.clone(), tid);
+                s.topic_to_instance.insert(tid, fleet_name.clone());
+                s.submit_keys.insert(fleet_name, submit_key);
+            }
+            None => tracing::warn!(%fleet_name, "failed to create Telegram topic"),
         }
     });
 }
@@ -1216,7 +1231,7 @@ fn maybe_delete_telegram_topic(
 ) {
     let Some(tg) = tg else { return };
     let tid = {
-        let mut s = tg.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = lock_tg(tg);
         match s.instance_to_topic.remove(fleet_name) {
             Some(tid) => {
                 s.topic_to_instance.remove(&tid);
