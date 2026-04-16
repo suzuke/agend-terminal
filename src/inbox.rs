@@ -139,7 +139,7 @@ pub fn notify_agent(
     let _ = crate::api::call(
         home,
         &serde_json::json!({
-            "method": "inject",
+            "method": crate::api::method::INJECT,
             "params": {"name": agent_name, "data": notification}
         }),
     );

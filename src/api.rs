@@ -14,13 +14,33 @@ use std::sync::{Arc, Mutex};
 
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
+/// API method name constants — single source of truth for the NDJSON protocol.
+pub mod method {
+    pub const LIST: &str = "list";
+    pub const INJECT: &str = "inject";
+    pub const KILL: &str = "kill";
+    pub const DELETE: &str = "delete";
+    pub const SPAWN: &str = "spawn";
+    pub const SEND: &str = "send";
+    pub const STATUS: &str = "status";
+    pub const REGISTER_EXTERNAL: &str = "register_external";
+    pub const DEREGISTER_EXTERNAL: &str = "deregister_external";
+    pub const CREATE_TEAM: &str = "create_team";
+    pub const SHUTDOWN: &str = "shutdown";
+}
+
 /// Start API socket server (blocks calling thread).
+///
+/// `tui_tx`: when running inside the TUI app, `Some(sender)` to notify the
+/// event loop about instance/team creation and deletion. Daemon mode passes
+/// `None` and events are silently dropped.
 pub fn serve(
     home: &Path,
     registry: AgentRegistry,
     shutdown: Arc<AtomicBool>,
     configs: ConfigRegistry,
     externals: ExternalRegistry,
+    tui_tx: Option<crate::app::TuiEventSender>,
 ) {
     let sock = api_socket_path(home);
     let _ = std::fs::remove_file(&sock);
@@ -40,9 +60,12 @@ pub fn serve(
         let shutdown = Arc::clone(&shutdown);
         let cfgs = Arc::clone(&configs);
         let ext = Arc::clone(&externals);
+        let tui = tui_tx.clone();
         std::thread::Builder::new()
             .name("api_handler".into())
-            .spawn(move || handle_session(stream, &reg, &home, &shutdown, &cfgs, &ext))
+            .spawn(move || {
+                handle_session(stream, &reg, &home, &shutdown, &cfgs, &ext, tui.as_ref())
+            })
             .ok();
     }
 }
@@ -72,6 +95,7 @@ fn handle_session(
     shutdown: &Arc<AtomicBool>,
     configs: &ConfigRegistry,
     externals: &ExternalRegistry,
+    tui_tx: Option<&crate::app::TuiEventSender>,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -109,7 +133,7 @@ fn handle_session(
         let params = &req["params"];
 
         let response = match method {
-            "list" => {
+            method::LIST => {
                 let reg = agent::lock_registry(registry);
                 let mut agents: Vec<Value> = reg.iter()
                     .map(|(name, handle)| {
@@ -131,7 +155,7 @@ fn handle_session(
                 }
                 json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
             }
-            "inject" => {
+            method::INJECT => {
                 let name = params["name"].as_str().unwrap_or("");
                 if let Err(e) = agent::validate_name(name) {
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
@@ -173,7 +197,7 @@ fn handle_session(
                     }
                 }
             }
-            "kill" => {
+            method::KILL => {
                 let name = params["name"].as_str().unwrap_or("");
                 if let Err(e) = agent::validate_name(name) {
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
@@ -205,7 +229,7 @@ fn handle_session(
                     }
                 }
             }
-            "delete" => {
+            method::DELETE => {
                 // Kill + remove from registry + configs
                 let name = params["name"].as_str().unwrap_or("");
                 if let Err(e) = agent::validate_name(name) {
@@ -241,9 +265,17 @@ fn handle_session(
                 let sock = crate::daemon::agent_socket_path(home, name);
                 let _ = std::fs::remove_file(&sock);
                 crate::event_log::log(home, "delete", name, "deleted via API");
+                // Notify TUI to close the corresponding pane
+                if let Some(tx) = tui_tx {
+                    if let Err(e) = tx.try_send(crate::app::TuiEvent::InstanceDeleted {
+                        name: name.to_string(),
+                    }) {
+                        tracing::warn!("TUI event send failed (delete {}): {e}", name);
+                    }
+                }
                 json!({"ok": true})
             }
-            "spawn" => {
+            method::SPAWN => {
                 let name = match params["name"].as_str() {
                     Some(n) => n,
                     None => {
@@ -256,7 +288,18 @@ fn handle_session(
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
                 }
-                let command = params["backend"].as_str().unwrap_or("bash");
+                let command = params["backend"]
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| {
+                        crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                            .ok()
+                            .and_then(|f| {
+                                f.defaults.backend.map(|b| b.preset().command.to_string())
+                            })
+                            .unwrap_or_else(|| "claude".to_string())
+                    });
+                let command = command.as_str();
                 let args: Vec<String> = params["args"]
                     .as_str()
                     .map(|s| s.split_whitespace().map(String::from).collect())
@@ -265,39 +308,32 @@ fn handle_session(
                     .as_str()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| home.join("workspace").join(name));
-                std::fs::create_dir_all(&work_dir).ok();
-                let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+                let size = crossterm::terminal::size().unwrap_or((120, 40));
 
-                match agent::spawn_agent(
-                    &agent::SpawnConfig {
-                        name,
-                        backend_command: command,
-                        args: &args,
-                        cols,
-                        rows,
-                        env: None,
-                        working_dir: Some(work_dir.as_path()),
-                        submit_key: "\r",
-                        home: Some(home),
-                        crash_tx: None,
-                        shutdown: None,
-                    },
-                    registry,
-                ) {
+                match spawn_one(home, registry, name, command, &args, &work_dir, size) {
                     Ok(()) => {
-                        let sock = crate::daemon::agent_socket_path(home, name);
-                        let reg = Arc::clone(registry);
-                        let n = name.to_string();
-                        std::thread::Builder::new()
-                            .name(format!("{n}_tui"))
-                            .spawn(move || crate::daemon::serve_agent_tui(&n, &sock, &reg))
-                            .ok();
+                        if let Some(tx) = tui_tx {
+                            let layout_hint = crate::app::LayoutHint::from_str(
+                                params["layout"].as_str().unwrap_or("tab"),
+                            );
+                            let spawner = params["spawner"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
+                            if let Err(e) = tx.try_send(crate::app::TuiEvent::InstanceCreated {
+                                name: name.to_string(),
+                                layout: layout_hint,
+                                spawner,
+                            }) {
+                                tracing::warn!("TUI event send failed (spawn {}): {e}", name);
+                            }
+                        }
                         json!({"ok": true, "result": {"name": name}})
                     }
                     Err(e) => json!({"ok": false, "error": format!("{e}")}),
                 }
             }
-            "send" => {
+            method::SEND => {
                 let (from, target, text) = (
                     params["from"].as_str().unwrap_or("unknown"),
                     params["target"].as_str().unwrap_or(""),
@@ -346,7 +382,7 @@ fn handle_session(
                 // External agents receive messages via inbox only (no PTY injection)
                 json!({"ok": true})
             }
-            "status" => match crate::snapshot::load(home) {
+            method::STATUS => match crate::snapshot::load(home) {
                 Some(snapshot) => {
                     json!({"ok": true, "result": {
                         "protocol_version": crate::framing::PROTOCOL_VERSION,
@@ -366,7 +402,7 @@ fn handle_session(
                 }
                 None => json!({"ok": true, "result": {"agents": [], "timestamp": null}}),
             },
-            "register_external" => {
+            method::REGISTER_EXTERNAL => {
                 let name = match params["name"].as_str() {
                     Some(n) => n,
                     None => {
@@ -418,7 +454,7 @@ fn handle_session(
                 tracing::info!(agent = name, pid, backend, "external agent registered");
                 json!({"ok": true})
             }
-            "deregister_external" => {
+            method::DEREGISTER_EXTERNAL => {
                 let name = params["name"].as_str().unwrap_or("");
                 if let Err(e) = agent::validate_name(name) {
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
@@ -434,7 +470,97 @@ fn handle_session(
                     json!({"ok": false, "error": format!("external agent '{name}' not found")})
                 }
             }
-            "shutdown" => {
+            method::CREATE_TEAM => {
+                let team_name = match params["name"].as_str() {
+                    Some(n) => n,
+                    None => {
+                        let _ =
+                            writeln!(writer, "{}", json!({"ok": false, "error": "missing name"}));
+                        continue;
+                    }
+                };
+                let count = params["count"].as_u64().unwrap_or(0) as usize;
+                let backend = params["backend"].as_str().unwrap_or("claude");
+
+                let mut spawned: Vec<String> = Vec::new();
+                let mut failed: Vec<String> = Vec::new();
+                let size = crossterm::terminal::size().unwrap_or((120, 40));
+                for i in 1..=count {
+                    let inst_name = format!("{team_name}-{i}");
+                    let work_dir = home.join("workspace").join(&inst_name);
+                    match spawn_one(home, registry, &inst_name, backend, &[], &work_dir, size) {
+                        Ok(()) => spawned.push(inst_name),
+                        Err(e) => {
+                            tracing::warn!("failed to spawn team member {}: {e}", inst_name);
+                            failed.push(format!("{inst_name}: {e}"));
+                        }
+                    }
+                }
+                if count > 0 && spawned.is_empty() {
+                    let _ = writeln!(
+                        writer,
+                        "{}",
+                        json!({"ok": false, "error": format!("all {} spawns failed: {}", count, failed.join("; "))})
+                    );
+                    continue;
+                }
+
+                let existing: Vec<String> = params["members"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let all_members: Vec<String> = existing
+                    .into_iter()
+                    .chain(spawned.iter().cloned())
+                    .collect();
+
+                if !spawned.is_empty() {
+                    let entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = spawned
+                        .iter()
+                        .map(|name| {
+                            (
+                                name.clone(),
+                                crate::fleet::InstanceYamlEntry {
+                                    backend: Some(backend.to_string()),
+                                    working_directory: Some(
+                                        home.join("workspace").join(name).display().to_string(),
+                                    ),
+                                    role: None,
+                                },
+                            )
+                        })
+                        .collect();
+                    let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
+                        entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
+                    if let Err(e) = crate::fleet::add_instances_to_yaml(home, &refs) {
+                        tracing::warn!(error = %e, "failed to persist team to fleet.yaml");
+                    }
+                }
+
+                let team_params = json!({"name": team_name, "members": all_members, "description": params["description"]});
+                let result = crate::teams::create(home, &team_params);
+
+                if let Some(tx) = tui_tx {
+                    if !spawned.is_empty() {
+                        if let Err(e) = tx.try_send(crate::app::TuiEvent::TeamCreated {
+                            name: team_name.to_string(),
+                            members: spawned.clone(),
+                        }) {
+                            tracing::warn!("TUI event send failed (team {}): {e}", team_name);
+                        }
+                    }
+                }
+                let mut resp = json!({"ok": true, "result": result, "spawned": &spawned});
+                if !failed.is_empty() {
+                    resp["failed"] = json!(failed);
+                }
+                resp
+            }
+            method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                 json!({"ok": true})
@@ -445,6 +571,44 @@ fn handle_session(
         let _ = writeln!(writer, "{}", response);
         let _ = writer.flush();
     }
+}
+
+/// Spawn a single agent, register it, and start its TUI socket thread.
+/// Shared by the SPAWN and CREATE_TEAM API handlers.
+fn spawn_one(
+    home: &Path,
+    registry: &AgentRegistry,
+    name: &str,
+    backend: &str,
+    args: &[String],
+    work_dir: &Path,
+    size: (u16, u16),
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(work_dir).ok();
+    agent::spawn_agent(
+        &agent::SpawnConfig {
+            name,
+            backend_command: backend,
+            args,
+            cols: size.0,
+            rows: size.1,
+            env: None,
+            working_dir: Some(work_dir),
+            submit_key: "\r",
+            home: Some(home),
+            crash_tx: None,
+            shutdown: None,
+        },
+        registry,
+    )?;
+    let sock = crate::daemon::agent_socket_path(home, name);
+    let reg = Arc::clone(registry);
+    let n = name.to_string();
+    std::thread::Builder::new()
+        .name(format!("{n}_tui"))
+        .spawn(move || crate::daemon::serve_agent_tui(&n, &sock, &reg))
+        .ok();
+    Ok(())
 }
 
 /// Send a request to the API socket and get response.

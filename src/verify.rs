@@ -116,7 +116,7 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
                 let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let configs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
                 let externals = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-                api::serve(&api_home, api_reg, shutdown, configs, externals)
+                api::serve(&api_home, api_reg, shutdown, configs, externals, None)
             })
             .ok();
 
@@ -331,7 +331,7 @@ fn test_instructions(home: &Path) -> TestResult {
 }
 
 fn test_api(home: &Path) -> TestResult {
-    match api::call(home, &json!({"method": "list"})) {
+    match api::call(home, &json!({"method": api::method::LIST})) {
         Ok(resp) => {
             let agents = resp["result"]["agents"]
                 .as_array()
@@ -349,7 +349,7 @@ fn test_api(home: &Path) -> TestResult {
 }
 
 fn test_send(home: &Path) -> TestResult {
-    if api::call(home, &json!({"method": "send", "params": {"from": "test-a", "target": "test-b", "text": "verify-send-ok"}})).is_err() {
+    if api::call(home, &json!({"method": api::method::SEND, "params": {"from": "test-a", "target": "test-b", "text": "verify-send-ok"}})).is_err() {
         return TestResult::fail("send", "API send failed");
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -366,7 +366,7 @@ fn test_send(home: &Path) -> TestResult {
 fn test_create_delete(home: &Path) -> TestResult {
     if api::call(
         home,
-        &json!({"method": "spawn", "params": {"name": "verify-dynamic", "backend": "/bin/bash"}}),
+        &json!({"method": api::method::SPAWN, "params": {"name": "verify-dynamic", "backend": "/bin/bash"}}),
     )
     .is_err()
     {
@@ -375,7 +375,7 @@ fn test_create_delete(home: &Path) -> TestResult {
     std::thread::sleep(std::time::Duration::from_secs(1));
 
     let has_agent = |name: &str| -> bool {
-        api::call(home, &json!({"method": "list"}))
+        api::call(home, &json!({"method": api::method::LIST}))
             .ok()
             .and_then(|r| r["result"]["agents"].as_array().cloned())
             .map(|a| a.iter().any(|x| x["name"].as_str() == Some(name)))
@@ -384,7 +384,7 @@ fn test_create_delete(home: &Path) -> TestResult {
     let found = has_agent("verify-dynamic");
     let _ = api::call(
         home,
-        &json!({"method": "kill", "params": {"name": "verify-dynamic"}}),
+        &json!({"method": api::method::KILL, "params": {"name": "verify-dynamic"}}),
     );
     std::thread::sleep(std::time::Duration::from_millis(500));
     let removed = !has_agent("verify-dynamic");

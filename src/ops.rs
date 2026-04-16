@@ -21,7 +21,7 @@ pub fn send_message(
     match crate::api::call(
         home,
         &json!({
-            "method": "send",
+            "method": crate::api::method::SEND,
             "params": { "from": from, "target": target, "text": text, "kind": kind }
         }),
     ) {
@@ -179,7 +179,7 @@ pub fn download_attachment(instance_name: &str, file_id: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 pub fn list_instances(home: &Path) -> Value {
-    match crate::api::call(home, &json!({"method": "list"})) {
+    match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
         Ok(resp) => {
             if let Some(agents) = resp["result"]["agents"].as_array() {
                 let instances: Vec<Value> = agents
@@ -285,7 +285,7 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
     let work_dir_clone = work_dir.clone();
     match crate::api::call(
         home,
-        &json!({"method": "spawn", "params": {"name": name, "backend": command, "args": &cmd_args, "working_directory": work_dir}}),
+        &json!({"method": crate::api::method::SPAWN, "params": {"name": name, "backend": command, "args": &cmd_args, "working_directory": work_dir}}),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
             let entry = crate::fleet::InstanceYamlEntry {
@@ -305,7 +305,7 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 let _ = crate::api::call(
                     home,
-                    &json!({"method": "inject", "params": {"name": name, "data": task_text}}),
+                    &json!({"method": crate::api::method::INJECT, "params": {"name": name, "data": task_text}}),
                 );
             }
             let mut result = json!({"name": name, "backend": command});
@@ -343,7 +343,10 @@ pub fn delete_instance(home: &Path, args: &Value) -> Value {
         })
         .unwrap_or((None, None));
 
-    let _ = crate::api::call(home, &json!({"method": "delete", "params": {"name": name}}));
+    let _ = crate::api::call(
+        home,
+        &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
+    );
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         tracing::warn!(error = %e, "failed to remove from fleet.yaml");
     }
@@ -388,7 +391,7 @@ pub fn start_instance(home: &Path, args: &Value) -> Value {
             }
             match crate::api::call(
                 home,
-                &json!({"method": "spawn", "params": {
+                &json!({"method": crate::api::method::SPAWN, "params": {
                     "name": name, "backend": resolved.backend_command, "args": cmd_args,
                     "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
                 }}),
@@ -408,7 +411,7 @@ pub fn describe_instance(home: &Path, name: &str) -> Value {
     if let Err(e) = crate::agent::validate_name(name) {
         return json!({"error": e});
     }
-    match crate::api::call(home, &json!({"method": "list"})) {
+    match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
         Ok(resp) => {
             match resp["result"]["agents"]
                 .as_array()
@@ -430,7 +433,7 @@ pub fn replace_instance(home: &Path, name: &str, reason: &str) -> Value {
     if let Err(e) = crate::agent::validate_name(name) {
         return json!({"error": e});
     }
-    let handover = crate::api::call(home, &json!({"method": "list"}))
+    let handover = crate::api::call(home, &json!({"method": crate::api::method::LIST}))
         .ok()
         .and_then(|resp| {
             resp["result"]["agents"]
@@ -447,7 +450,10 @@ pub fn replace_instance(home: &Path, name: &str, reason: &str) -> Value {
         })
         .unwrap_or_else(|| format!("Replaced due to: {reason}"));
 
-    let _ = crate::api::call(home, &json!({"method": "kill", "params": {"name": name}}));
+    let _ = crate::api::call(
+        home,
+        &json!({"method": crate::api::method::KILL, "params": {"name": name}}),
+    );
     let _ = crate::inbox::enqueue(
         home,
         name,
@@ -529,7 +535,7 @@ pub fn checkout_repo(home: &Path, instance_name: &str, source: &str, branch: &st
             })
             .unwrap_or_else(|| source.to_string())
     } else {
-        crate::api::call(home, &json!({"method": "list"}))
+        crate::api::call(home, &json!({"method": crate::api::method::LIST}))
             .ok()
             .and_then(|r| {
                 r["result"]["agents"]
@@ -708,7 +714,7 @@ pub fn send_to(home: &Path, from: &str, target: &str, text: &str, kind: &str) ->
     match crate::api::call(
         home,
         &json!({
-            "method": "send",
+            "method": crate::api::method::SEND,
             "params": { "from": from, "target": target, "text": text, "kind": kind }
         }),
     ) {

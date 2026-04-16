@@ -124,8 +124,8 @@ fn test_tools_list_count() {
         .as_array()
         .expect("tools array");
     assert!(
-        tools.len() >= 35,
-        "should have at least 35 tools, got {}",
+        tools.len() >= 34,
+        "should have at least 34 tools, got {}",
         tools.len()
     );
 
@@ -135,7 +135,7 @@ fn test_tools_list_count() {
     assert!(tool_names.contains(&"delegate_task"));
     assert!(tool_names.contains(&"post_decision"));
     assert!(tool_names.contains(&"task"));
-    assert!(tool_names.contains(&"create_team"));
+    assert!(tool_names.contains(&"delete_team"));
     assert!(tool_names.contains(&"create_schedule"));
     assert!(tool_names.contains(&"checkout_repo"));
     assert!(tool_names.contains(&"deploy_template"));

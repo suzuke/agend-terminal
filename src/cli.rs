@@ -343,7 +343,7 @@ fn test_inbox(home: &Path) -> anyhow::Result<()> {
 fn test_api(home: &Path) -> anyhow::Result<()> {
     tracing::info!("test:api — checking for running daemon");
 
-    match api::call(home, &serde_json::json!({"method": "list"})) {
+    match api::call(home, &serde_json::json!({"method": api::method::LIST})) {
         Ok(resp) => {
             let agents = resp["result"]["agents"]
                 .as_array()

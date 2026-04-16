@@ -23,7 +23,10 @@ pub fn run(
     crate::agent::validate_name(name).map_err(|e| anyhow::anyhow!(e))?;
 
     // 3. Check name not already taken
-    if let Ok(resp) = crate::api::call(home, &serde_json::json!({"method": "list"})) {
+    if let Ok(resp) = crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::LIST}),
+    ) {
         if let Some(agents) = resp["result"]["agents"].as_array() {
             for a in agents {
                 if a["name"].as_str() == Some(name) {
@@ -81,7 +84,7 @@ pub fn run(
     match crate::api::call(
         home,
         &serde_json::json!({
-            "method": "register_external",
+            "method": crate::api::method::REGISTER_EXTERNAL,
             "params": { "name": name, "backend": backend_name, "pid": pid }
         }),
     ) {
@@ -150,7 +153,7 @@ pub fn run(
         let _ = crate::api::call(
             &deregister_home,
             &serde_json::json!({
-                "method": "deregister_external",
+                "method": crate::api::method::DEREGISTER_EXTERNAL,
                 "params": { "name": deregister_name }
             }),
         );
@@ -178,7 +181,7 @@ pub fn run(
     let _ = crate::api::call(
         home,
         &serde_json::json!({
-            "method": "deregister_external",
+            "method": crate::api::method::DEREGISTER_EXTERNAL,
             "params": { "name": name }
         }),
     );

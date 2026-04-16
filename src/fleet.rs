@@ -278,6 +278,14 @@ fn mutate_fleet_yaml(
 
 /// Add a new instance entry to fleet.yaml. Uses file lock + atomic write.
 pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry) -> Result<()> {
+    add_instances_to_yaml(home, &[(name, config)])
+}
+
+/// Add multiple instance entries to fleet.yaml in a single lock+write cycle.
+pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
     mutate_fleet_yaml(home, "instances: {}\n", |doc| {
         if doc.get("instances").is_none() {
             doc["instances"] = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
@@ -287,21 +295,23 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
             .and_then(|v| v.as_mapping_mut())
             .context("instances is not a mapping")?;
 
-        let mut inst = serde_yaml::Mapping::new();
-        for (key, val) in [
-            ("backend", &config.backend),
-            ("working_directory", &config.working_directory),
-            ("role", &config.role),
-        ] {
-            if let Some(ref v) = val {
-                inst.insert(key.into(), serde_yaml::Value::String(v.clone()));
+        for (name, config) in entries {
+            let mut inst = serde_yaml::Mapping::new();
+            for (key, val) in [
+                ("backend", &config.backend),
+                ("working_directory", &config.working_directory),
+                ("role", &config.role),
+            ] {
+                if let Some(ref v) = val {
+                    inst.insert(key.into(), serde_yaml::Value::String(v.clone()));
+                }
             }
+            instances.insert(
+                serde_yaml::Value::String(name.to_string()),
+                serde_yaml::Value::Mapping(inst),
+            );
+            tracing::info!(%name, "added instance to fleet.yaml");
         }
-        instances.insert(
-            serde_yaml::Value::String(name.to_string()),
-            serde_yaml::Value::Mapping(inst),
-        );
-        tracing::info!(%name, "added instance to fleet.yaml");
         Ok(())
     })
 }

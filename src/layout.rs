@@ -148,6 +148,27 @@ impl PaneNode {
             }
         }
     }
+
+    /// Check if any pane in the tree has the given agent name (no allocation).
+    pub fn has_agent(&self, name: &str) -> bool {
+        match self {
+            PaneNode::Leaf(p) => p.agent_name == name,
+            PaneNode::Split { first, second, .. } => {
+                first.has_agent(name) || second.has_agent(name)
+            }
+        }
+    }
+
+    /// Find the pane ID for a given agent name.
+    pub fn find_pane_id_by_agent(&self, name: &str) -> Option<usize> {
+        match self {
+            PaneNode::Leaf(p) if p.agent_name == name => Some(p.id),
+            PaneNode::Leaf(_) => None,
+            PaneNode::Split { first, second, .. } => first
+                .find_pane_id_by_agent(name)
+                .or_else(|| second.find_pane_id_by_agent(name)),
+        }
+    }
 }
 
 // --- Ownership-based tree transforms ---
@@ -420,20 +441,28 @@ impl Tab {
 
     /// Close the focused pane. Returns the removed pane's agent_name.
     pub fn close_focused(&mut self) -> Option<String> {
+        self.close_pane_by_id(self.focus_id)
+    }
+
+    /// Close a pane by ID. Returns the removed pane's agent_name, or None if
+    /// this is the last pane (tab should be removed instead).
+    pub fn close_pane_by_id(&mut self, pane_id: usize) -> Option<String> {
         if self.root().pane_count() <= 1 {
             return None;
         }
         let ids = self.root().pane_ids();
         let next_id = ids
             .iter()
-            .find(|&&id| id != self.focus_id)
+            .find(|&&id| id != pane_id)
             .copied()
-            .unwrap_or(self.focus_id);
+            .unwrap_or(pane_id);
 
         let root = self.root.take().expect("root is always Some");
-        let (new_root, removed) = remove_from_tree(root, self.focus_id);
+        let (new_root, removed) = remove_from_tree(root, pane_id);
         self.root = Some(new_root);
-        self.focus_id = next_id;
+        if self.focus_id == pane_id {
+            self.focus_id = next_id;
+        }
         removed.map(|p| p.agent_name)
     }
 }

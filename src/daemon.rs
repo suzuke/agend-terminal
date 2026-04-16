@@ -317,7 +317,14 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     std::thread::Builder::new()
         .name("api_server".into())
         .spawn(move || {
-            crate::api::serve(&api_home, api_reg, api_shutdown, api_configs, api_externals)
+            crate::api::serve(
+                &api_home,
+                api_reg,
+                api_shutdown,
+                api_configs,
+                api_externals,
+                None,
+            )
         })?;
 
     let shutdown2 = Arc::clone(&shutdown);

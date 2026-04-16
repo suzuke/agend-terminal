@@ -18,6 +18,45 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Events sent from the API server to the TUI event loop when agents or teams
+/// are created/deleted via MCP tools. The TUI reacts by auto-creating or
+/// removing tabs/panes.
+#[derive(Debug, Clone)]
+pub(crate) enum TuiEvent {
+    InstanceCreated {
+        name: String,
+        layout: LayoutHint,
+        spawner: Option<String>,
+    },
+    InstanceDeleted {
+        name: String,
+    },
+    TeamCreated {
+        name: String,
+        members: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) enum LayoutHint {
+    #[default]
+    Tab,
+    SplitRight,
+    SplitBelow,
+}
+
+impl LayoutHint {
+    pub(crate) fn from_str(s: &str) -> Self {
+        match s {
+            "split-right" => Self::SplitRight,
+            "split-below" => Self::SplitBelow,
+            _ => Self::Tab,
+        }
+    }
+}
+
+pub(crate) type TuiEventSender = crossbeam::channel::Sender<TuiEvent>;
+
 /// Saved session layout for persistence across restarts.
 #[derive(Serialize, Deserialize)]
 struct Session {
@@ -185,7 +224,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-    let _api_guard = start_api_server(&home, &registry);
+    let (tui_event_tx, tui_event_rx) = crossbeam::channel::bounded::<TuiEvent>(256);
+    let _api_guard = start_api_server(&home, &registry, tui_event_tx);
 
     let mut layout = Layout::new();
     let mut key_handler = KeyHandler::new();
@@ -728,6 +768,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             recv(wakeup_rx) -> _ => {
                 // Wakeup from PTY output — triggers redraw
             }
+            recv(tui_event_rx) -> ev => {
+                if let Ok(event) = ev {
+                    handle_tui_event(
+                        event,
+                        &mut layout,
+                        &registry,
+                        &wakeup_tx,
+                    );
+                    needs_resize = true;
+                }
+            }
             default(std::time::Duration::from_millis(50)) => {
                 // Periodic redraw for state updates
             }
@@ -1103,6 +1154,64 @@ fn create_pane(
     })
 }
 
+/// Attach a pane to an already-running agent (no spawn — subscribe only).
+/// Used when the API server creates an agent via MCP and the TUI needs to show it.
+fn attach_pane(
+    name: &str,
+    registry: &AgentRegistry,
+    cols: u16,
+    rows: u16,
+    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    layout: &mut Layout,
+) -> Result<Pane> {
+    let (rx, dump, backend_command) = {
+        let reg = agent::lock_registry(registry);
+        let handle = reg
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found in registry"))?;
+        let (rx, dump) = agent::subscribe_with_dump(handle);
+        (rx, dump, handle.backend_command.clone())
+    };
+
+    let mut vterm = VTerm::new(cols, rows);
+    vterm.process(&dump);
+
+    let pane_id = layout.next_pane_id();
+    let tx = wakeup_tx.clone();
+    let pane_rx = {
+        let n = name.to_string();
+        let (fwd_tx, fwd_rx) = crossbeam::channel::unbounded::<Vec<u8>>();
+        std::thread::Builder::new()
+            .name(format!("{n}_fwd"))
+            .spawn(move || {
+                while let Ok(data) = rx.recv() {
+                    if fwd_tx.send(data).is_err() {
+                        break;
+                    }
+                    let _ = tx.send(pane_id);
+                }
+            })
+            .ok();
+        fwd_rx
+    };
+
+    let backend = Backend::from_command(&backend_command);
+
+    Ok(Pane {
+        agent_name: name.to_string(),
+        vterm,
+        rx: pane_rx,
+        id: pane_id,
+        backend,
+        working_dir: None,
+        display_name: None,
+        scroll_offset: 0,
+        has_notification: false,
+        fleet_instance_name: Some(name.to_string()),
+        selection: None,
+    })
+}
+
 /// Create a pane from a fleet ResolvedInstance (full config: env, args, model, etc.).
 #[allow(clippy::too_many_arguments)]
 fn create_pane_from_resolved(
@@ -1359,29 +1468,8 @@ fn execute_command(
                     let _ = crate::fleet::remove_instance_from_yaml(home, &fleet_name);
                 }
                 kill_agent(registry, name);
-                for i in (0..layout.tabs.len()).rev() {
-                    let names = layout.tabs[i].root().agent_names();
-                    if !names.iter().any(|n| n == name) {
-                        continue;
-                    }
-                    if layout.tabs[i].root().pane_count() == 1 {
-                        layout.close_tab(i);
-                    } else {
-                        let ids = layout.tabs[i].root().pane_ids();
-                        for id in ids {
-                            if layout.tabs[i]
-                                .root()
-                                .find_pane(id)
-                                .is_some_and(|p| p.agent_name == *name)
-                            {
-                                layout.tabs[i].focus_id = id;
-                                layout.tabs[i].close_focused();
-                                break;
-                            }
-                        }
-                    }
-                    return true;
-                }
+                remove_agent_pane(name, layout);
+                return true;
             }
         }
         "restart" => {
@@ -1847,6 +1935,160 @@ fn write_to_focused(layout: &Layout, registry: &AgentRegistry, bytes: &[u8]) {
     }
 }
 
+/// Handle a TuiEvent from the API server (auto-create/remove tabs/panes).
+fn handle_tui_event(
+    event: TuiEvent,
+    layout: &mut Layout,
+    registry: &AgentRegistry,
+    wakeup_tx: &crossbeam::channel::Sender<usize>,
+) {
+    match event {
+        TuiEvent::InstanceCreated {
+            name,
+            layout: hint,
+            spawner,
+        } => {
+            handle_instance_created(&name, hint, spawner.as_deref(), layout, registry, wakeup_tx);
+        }
+        TuiEvent::InstanceDeleted { name } => {
+            handle_instance_deleted(&name, layout);
+        }
+        TuiEvent::TeamCreated { name, members } => {
+            handle_team_created(&name, &members, layout, registry, wakeup_tx);
+        }
+    }
+}
+
+fn handle_instance_created(
+    name: &str,
+    hint: LayoutHint,
+    spawner: Option<&str>,
+    layout: &mut Layout,
+    registry: &AgentRegistry,
+    wakeup_tx: &crossbeam::channel::Sender<usize>,
+) {
+    if layout.tabs.iter().any(|tab| tab.root().has_agent(name)) {
+        return;
+    }
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    let pane = match attach_pane(
+        name,
+        registry,
+        cols,
+        rows.saturating_sub(4),
+        wakeup_tx,
+        layout,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(agent = name, error = %e, "failed to attach pane for new instance");
+            return;
+        }
+    };
+
+    match hint {
+        LayoutHint::Tab => {
+            layout.add_tab(Tab::new(name.to_string(), pane));
+        }
+        LayoutHint::SplitRight | LayoutHint::SplitBelow => {
+            let dir = match hint {
+                LayoutHint::SplitRight => SplitDir::Horizontal,
+                _ => SplitDir::Vertical,
+            };
+            let split_done = spawner
+                .and_then(|spawner_name| {
+                    layout
+                        .tabs
+                        .iter_mut()
+                        .find(|tab| tab.root().has_agent(spawner_name))
+                })
+                .map(|tab| tab.split_focused(dir, pane))
+                .unwrap_or(false);
+            if !split_done {
+                let pane = match attach_pane(
+                    name,
+                    registry,
+                    cols,
+                    rows.saturating_sub(4),
+                    wakeup_tx,
+                    layout,
+                ) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                layout.add_tab(Tab::new(name.to_string(), pane));
+            }
+        }
+    }
+}
+
+fn handle_instance_deleted(name: &str, layout: &mut Layout) {
+    remove_agent_pane(name, layout);
+}
+
+fn handle_team_created(
+    team_name: &str,
+    members: &[String],
+    layout: &mut Layout,
+    registry: &AgentRegistry,
+    wakeup_tx: &crossbeam::channel::Sender<usize>,
+) {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    let pane_rows = rows.saturating_sub(4);
+
+    let running: Vec<&str> = {
+        let reg = agent::lock_registry(registry);
+        members
+            .iter()
+            .filter(|m| reg.contains_key(m.as_str()))
+            .map(|m| m.as_str())
+            .collect()
+    };
+
+    if running.is_empty() {
+        return;
+    }
+
+    let first_pane = match attach_pane(running[0], registry, cols, pane_rows, wakeup_tx, layout) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(team = team_name, error = %e, "failed to create team tab");
+            return;
+        }
+    };
+
+    let mut tab = Tab::new(team_name.to_string(), first_pane);
+
+    for member in &running[1..] {
+        if let Ok(pane) = attach_pane(member, registry, cols, pane_rows, wakeup_tx, layout) {
+            tab.split_focused(SplitDir::Horizontal, pane);
+        }
+    }
+
+    layout.add_tab(tab);
+}
+
+/// Remove ALL panes for the given agent from every tab. Cleans up empty tabs.
+fn remove_agent_pane(name: &str, layout: &mut Layout) {
+    loop {
+        let target = layout.tabs.iter().enumerate().find_map(|(tab_idx, tab)| {
+            tab.root()
+                .find_pane_id_by_agent(name)
+                .map(|pane_id| (tab_idx, pane_id))
+        });
+        let (tab_idx, pane_id) = match target {
+            Some(t) => t,
+            None => break,
+        };
+        if layout.tabs[tab_idx].root().pane_count() <= 1 {
+            layout.close_tab(tab_idx);
+        } else {
+            layout.tabs[tab_idx].close_pane_by_id(pane_id);
+        }
+    }
+}
+
 /// Adjust scroll offset of the focused pane by `delta` lines (positive = up, negative = down).
 fn scroll_focused(layout: &mut Layout, delta: i32) {
     if let Some(tab) = layout.active_tab_mut() {
@@ -1915,7 +2157,7 @@ impl Drop for ApiGuard {
     }
 }
 
-fn start_api_server(home: &Path, registry: &AgentRegistry) -> ApiGuard {
+fn start_api_server(home: &Path, registry: &AgentRegistry, tui_tx: TuiEventSender) -> ApiGuard {
     if crate::daemon::find_active_run_dir(home).is_some() {
         tracing::info!("existing daemon found, skipping in-process API server");
         return ApiGuard { run_dir: None };
@@ -1941,7 +2183,14 @@ fn start_api_server(home: &Path, registry: &AgentRegistry) -> ApiGuard {
     std::thread::Builder::new()
         .name("app_api_server".into())
         .spawn(move || {
-            crate::api::serve(&api_home, api_registry, shutdown, configs, externals);
+            crate::api::serve(
+                &api_home,
+                api_registry,
+                shutdown,
+                configs,
+                externals,
+                Some(tui_tx),
+            );
         })
         .ok();
 

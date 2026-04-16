@@ -210,7 +210,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                 // Kill + remove via API
                 let _ = crate::api::call(
                     &home,
-                    &serde_json::json!({"method": "delete", "params": {"name": instance_name}}),
+                    &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": instance_name}}),
                 );
                 // Remove from fleet.yaml
                 if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, &instance_name) {

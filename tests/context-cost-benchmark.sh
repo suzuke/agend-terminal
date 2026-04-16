@@ -103,7 +103,6 @@ def handle(req):
             {"name":"task_claim","description":"Claim a task.","inputSchema":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}},
             {"name":"task_done","description":"Mark task done.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"summary":{"type":"string"}},"required":["id"]}},
             {"name":"task_update","description":"Update a task.","inputSchema":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"description":{"type":"string"}},"required":["id"]}},
-            {"name":"create_team","description":"Create a team.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"members":{"type":"array","items":{"type":"string"}}},"required":["name","members"]}},
             {"name":"list_teams","description":"List teams.","inputSchema":{"type":"object","properties":{}}},
             {"name":"delete_team","description":"Delete a team.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
             {"name":"update_team","description":"Update a team.","inputSchema":{"type":"object","properties":{"name":{"type":"string"},"members":{"type":"array","items":{"type":"string"}}},"required":["name"]}},

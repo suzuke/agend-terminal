@@ -68,7 +68,10 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
 
     // Daemon status
     section(&mut out, "Daemon Status");
-    match crate::api::call(home, &serde_json::json!({"method": "list"})) {
+    match crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::LIST}),
+    ) {
         Ok(resp) => out.push_str(&serde_json::to_string_pretty(&resp).unwrap_or_default()),
         Err(e) => out.push_str(&format!("(daemon not running: {e})")),
     }

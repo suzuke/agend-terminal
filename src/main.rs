@@ -361,7 +361,7 @@ fn main() -> anyhow::Result<()> {
             }
             match api::call(
                 &home,
-                &serde_json::json!({"method": "inject", "params": {"name": name, "data": text}}),
+                &serde_json::json!({"method": api::method::INJECT, "params": {"name": name, "data": text}}),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => println!("Injected: {text}"),
                 Ok(resp) => eprintln!(
@@ -372,7 +372,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Stop) => {
-            match api::call(&home, &serde_json::json!({"method": "shutdown"})) {
+            match api::call(&home, &serde_json::json!({"method": api::method::SHUTDOWN})) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     println!("Daemon shutdown initiated.")
                 }
@@ -404,7 +404,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Status { json }) => {
-            match api::call(&home, &serde_json::json!({"method": "list"})) {
+            match api::call(&home, &serde_json::json!({"method": api::method::LIST})) {
                 Ok(resp) => {
                     if json {
                         println!(
@@ -433,7 +433,7 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Kill { name }) => {
             match api::call(
                 &home,
-                &serde_json::json!({"method": "kill", "params": {"name": name}}),
+                &serde_json::json!({"method": api::method::KILL, "params": {"name": name}}),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => println!("Killed {name}"),
                 Ok(resp) => eprintln!(
@@ -450,22 +450,24 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| home.join("fleet.yaml"));
                 cli::start_with_fleet(&home, &fleet_path)?;
             }
-            FleetCommands::Stop => match api::call(&home, &serde_json::json!({"method": "list"})) {
-                Ok(resp) => {
-                    if let Some(agents) = resp["result"]["agents"].as_array() {
-                        for a in agents {
-                            let name = a["name"].as_str().unwrap_or("");
-                            let _ = api::call(
-                                &home,
-                                &serde_json::json!({"method": "kill", "params": {"name": name}}),
-                            );
-                            println!("  Stopped {name}");
+            FleetCommands::Stop => {
+                match api::call(&home, &serde_json::json!({"method": api::method::LIST})) {
+                    Ok(resp) => {
+                        if let Some(agents) = resp["result"]["agents"].as_array() {
+                            for a in agents {
+                                let name = a["name"].as_str().unwrap_or("");
+                                let _ = api::call(
+                                    &home,
+                                    &serde_json::json!({"method": api::method::KILL, "params": {"name": name}}),
+                                );
+                                println!("  Stopped {name}");
+                            }
+                            println!("Fleet stopped ({} agents)", agents.len());
                         }
-                        println!("Fleet stopped ({} agents)", agents.len());
                     }
+                    Err(_) => daemon_not_running_hint(),
                 }
-                Err(_) => daemon_not_running_hint(),
-            },
+            }
         },
         Some(Commands::Mcp) => {
             let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
@@ -513,7 +515,7 @@ fn daemon_not_running_hint() {
 }
 
 fn list_running_agents(home: &std::path::Path) {
-    if let Ok(resp) = api::call(home, &serde_json::json!({"method": "list"})) {
+    if let Ok(resp) = api::call(home, &serde_json::json!({"method": api::method::LIST})) {
         if let Some(agents) = resp["result"]["agents"].as_array() {
             if !agents.is_empty() {
                 eprintln!("Running agents:");

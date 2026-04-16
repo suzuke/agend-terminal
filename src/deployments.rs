@@ -118,7 +118,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         let _ = crate::api::call(
             home,
             &serde_json::json!({
-                "method": "spawn",
+                "method": crate::api::method::SPAWN,
                 "params": {
                     "name": inst_name,
                     "backend": command,
@@ -178,7 +178,7 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
     for inst in &deployment.instances {
         let _ = crate::api::call(
             home,
-            &serde_json::json!({"method": "kill", "params": {"name": inst}}),
+            &serde_json::json!({"method": crate::api::method::KILL, "params": {"name": inst}}),
         );
     }
 
