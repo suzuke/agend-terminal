@@ -1388,6 +1388,7 @@ fn execute_command(
             });
             if let Some(name) = target_name {
                 // Single pass: find pane info, fleet name, and location
+                #[allow(clippy::type_complexity)]
                 let mut pane_info: Option<(
                     String,
                     Option<PathBuf>,
@@ -1505,10 +1506,8 @@ fn execute_command(
             }
         }
         "send" => {
-            if parts.len() >= 3 {
-                if !agent::send_to_registry(registry, "user", parts[1], parts[2]) {
-                    tracing::warn!(target = parts[1], "send: agent not found in registry");
-                }
+            if parts.len() >= 3 && !agent::send_to_registry(registry, "user", parts[1], parts[2]) {
+                tracing::warn!(target = parts[1], "send: agent not found in registry");
             }
         }
         "broadcast" => {
@@ -1725,6 +1724,7 @@ fn restore_with_reconciliation(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn restore_node_reconciled(
     node: &SessionNode,
     fleet: Option<&crate::fleet::FleetConfig>,
@@ -1875,10 +1875,11 @@ fn unique_fleet_name(home: &Path, base: &str) -> String {
     if !fleet.instances.contains_key(base) {
         return base.to_string();
     }
+    // Infinite iterator over 2.. always finds a unique name
     (2..)
         .map(|n| format!("{base}-{n}"))
         .find(|c| !fleet.instances.contains_key(c))
-        .unwrap()
+        .expect("infinite iterator")
 }
 
 /// Look up the fleet_instance_name for an agent by scanning the layout.

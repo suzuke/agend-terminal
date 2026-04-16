@@ -605,7 +605,7 @@ pub fn broadcast_registry(
     let targets: Vec<String> = reg
         .iter()
         .filter(|(name, handle)| {
-            exclude.map_or(true, |ex| name.as_str() != ex)
+            (exclude != Some(name.as_str()))
                 && crate::backend::Backend::from_command(&handle.backend_command).is_some()
         })
         .map(|(name, handle)| {
