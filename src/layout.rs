@@ -201,11 +201,7 @@ fn split_in_tree(
 fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, Option<Pane>) {
     match node {
         PaneNode::Leaf(p) => (PaneNode::Leaf(p), None),
-        PaneNode::Split {
-            dir,
-            first,
-            second,
-        } => {
+        PaneNode::Split { dir, first, second } => {
             if let PaneNode::Leaf(ref p) = *first {
                 if p.id == target_id {
                     let PaneNode::Leaf(removed) = *first else {

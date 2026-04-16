@@ -108,7 +108,8 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
     content.push_str("- `report_result` — reply with task results\n");
     content.push_str("- `request_information` — ask another agent a question\n");
     content.push_str("- `list_instances` — see all running agents\n\n");
-    content.push_str("Always reply to messages using `send_to_instance`, NOT direct text output.\n");
+    content
+        .push_str("Always reply to messages using `send_to_instance`, NOT direct text output.\n");
     content.push_str("Check your `inbox` periodically for pending messages.\n");
 
     let _ = std::fs::write(&instr_path, &content);
@@ -217,7 +218,10 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("v3-mcp"), "missing v3-mcp");
         assert!(content.contains("reply"), "missing reply reference");
-        assert!(content.contains("send_to_instance"), "missing send_to_instance");
+        assert!(
+            content.contains("send_to_instance"),
+            "missing send_to_instance"
+        );
         assert!(content.contains("inbox"), "missing inbox");
         assert!(content.contains("dev"), "missing agent name");
         assert!(content.contains("developer"), "missing role");
@@ -232,7 +236,10 @@ mod tests {
         let path = dir.join(".kiro").join("steering").join("agend.md");
         assert!(path.exists(), "missing kiro agend.md");
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("send_to_instance"), "missing communication guide");
+        assert!(
+            content.contains("send_to_instance"),
+            "missing communication guide"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

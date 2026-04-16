@@ -130,7 +130,10 @@ pub fn notify_agent(
     } else {
         text.to_string()
     };
-    let notification = format!("[{source}] {display_text}{}{submit_key}", source.reply_hint());
+    let notification = format!(
+        "[{source}] {display_text}{}{submit_key}",
+        source.reply_hint()
+    );
 
     // Use API socket to inject (doesn't kick attach clients)
     let _ = crate::api::call(
@@ -255,7 +258,14 @@ mod tests {
         let home = tmp_home("deliver-short");
         // deliver with short text — should NOT write to inbox file
         // (notify_agent will fail because no daemon, but enqueue should not be called)
-        deliver(&home, "agent1", &NotifySource::Telegram("user"), "short msg", "\r", None);
+        deliver(
+            &home,
+            "agent1",
+            &NotifySource::Telegram("user"),
+            "short msg",
+            "\r",
+            None,
+        );
         let msgs = drain(&home, "agent1");
         assert!(msgs.is_empty(), "short messages bypass inbox");
 

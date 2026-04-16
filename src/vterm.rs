@@ -130,7 +130,9 @@ impl VTerm {
             let cy = area.y + cursor.line.0 as u16;
             if cx < area.x + area.width && cy < area.y + area.height {
                 let buf_cell = &mut buf[(cx, cy)];
-                let style = buf_cell.style().add_modifier(ratatui::style::Modifier::REVERSED);
+                let style = buf_cell
+                    .style()
+                    .add_modifier(ratatui::style::Modifier::REVERSED);
                 buf_cell.set_style(style);
             }
         }
@@ -157,7 +159,11 @@ impl VTerm {
         let offset = scroll_offset as i32;
 
         // Normalize start/end so start is before end
-        let (s, e) = if start <= end { (start, end) } else { (end, start) };
+        let (s, e) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
         let (s_row, s_col) = s;
         let (e_row, e_col) = e;
 
@@ -165,7 +171,11 @@ impl VTerm {
         for row in s_row..=e_row {
             let grid_line = Line(row as i32 - offset);
             let col_start = if row == s_row { s_col } else { 0 };
-            let col_end = if row == e_row { e_col } else { self.cols.saturating_sub(1) };
+            let col_end = if row == e_row {
+                e_col
+            } else {
+                self.cols.saturating_sub(1)
+            };
 
             let mut line = String::new();
             for col in col_start..=col_end {
@@ -312,7 +322,9 @@ fn color_to_ratatui(color: Color) -> Option<ratatui::style::Color> {
                 Some(ratatui::style::Color::Rgb(rgb.r, rgb.g, rgb.b))
             } else {
                 // Fallback: convert RGB to nearest 256-color index
-                Some(ratatui::style::Color::Indexed(rgb_to_256(rgb.r, rgb.g, rgb.b)))
+                Some(ratatui::style::Color::Indexed(rgb_to_256(
+                    rgb.r, rgb.g, rgb.b,
+                )))
             }
         }
         Color::Indexed(idx) => Some(ratatui::style::Color::Indexed(idx)),

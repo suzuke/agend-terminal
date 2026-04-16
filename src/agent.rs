@@ -580,12 +580,7 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
 
 /// Send a message to a named agent via direct registry injection.
 /// Returns true if the agent was found and injected.
-pub fn send_to_registry(
-    registry: &AgentRegistry,
-    from: &str,
-    target: &str,
-    text: &str,
-) -> bool {
+pub fn send_to_registry(registry: &AgentRegistry, from: &str, target: &str, text: &str) -> bool {
     let reg = lock_registry(registry);
     if let Some(handle) = reg.get(target) {
         let msg = format!("[from:{from}] {text}");

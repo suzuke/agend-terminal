@@ -70,33 +70,64 @@ enum CloseTarget {
 enum Overlay {
     None,
     /// New tab selection menu.
-    NewTabMenu { items: Vec<MenuItem>, selected: usize },
+    NewTabMenu {
+        items: Vec<MenuItem>,
+        selected: usize,
+    },
     /// Split pane selection menu — choose what to run in the new pane.
-    SplitMenu { items: Vec<MenuItem>, selected: usize, dir: SplitDir },
-    RenameTab { input: String },
-    RenamePane { input: String },
-    ConfirmClose { target: CloseTarget },
-    TabList { selected: usize },
+    SplitMenu {
+        items: Vec<MenuItem>,
+        selected: usize,
+        dir: SplitDir,
+    },
+    RenameTab {
+        input: String,
+    },
+    RenamePane {
+        input: String,
+    },
+    ConfirmClose {
+        target: CloseTarget,
+    },
+    TabList {
+        selected: usize,
+    },
     Help,
     /// Keyboard scroll mode (j/k/PgUp/PgDn). Pane's scroll_offset is used directly.
     Scroll,
     /// Command palette (:command input).
-    Command { input: String },
+    Command {
+        input: String,
+    },
     /// Decisions overlay panel (read-only, scrollable).
-    Decisions { items: Vec<crate::decisions::Decision>, scroll: usize },
+    Decisions {
+        items: Vec<crate::decisions::Decision>,
+        scroll: usize,
+    },
     /// Task board overlay panel (read-only, scrollable).
-    Tasks { items: Vec<crate::tasks::Task>, scroll: usize },
+    Tasks {
+        items: Vec<crate::tasks::Task>,
+        scroll: usize,
+    },
 }
 
 /// Handle j/k/PgUp/PgDn scroll for list overlays. Returns true if handled, false to close.
 fn handle_list_scroll(key: KeyCode, scroll: &mut usize, len: usize) -> bool {
     match key {
-        KeyCode::Up | KeyCode::Char('k') => { *scroll = scroll.saturating_sub(1); true }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if *scroll + 1 < len { *scroll += 1; }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *scroll = scroll.saturating_sub(1);
             true
         }
-        KeyCode::PageUp => { *scroll = scroll.saturating_sub(10); true }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if *scroll + 1 < len {
+                *scroll += 1;
+            }
+            true
+        }
+        KeyCode::PageUp => {
+            *scroll = scroll.saturating_sub(10);
+            true
+        }
         KeyCode::PageDown => {
             *scroll = (*scroll + 10).min(len.saturating_sub(1));
             true
@@ -133,7 +164,8 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste,
-    ).ok();
+    )
+    .ok();
 
     let mut terminal = ratatui::init();
     let result = run_app(&mut terminal, fleet_path.as_deref());
@@ -143,7 +175,8 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
-    ).ok();
+    )
+    .ok();
     result
 }
 
@@ -173,16 +206,31 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
 
     // Reconcile fleet.yaml (agent definitions) with session.json (layout hint)
     let started = restore_with_reconciliation(
-        &home, &fleet_path, &mut layout, &registry,
-        &wakeup_tx, &mut name_counter, pane_cols, pane_rows,
+        &home,
+        &fleet_path,
+        &mut layout,
+        &registry,
+        &wakeup_tx,
+        &mut name_counter,
+        pane_cols,
+        pane_rows,
     );
     if !started {
         // Rule 4: nothing to restore → open shell tab
         spawn_pane_tab(
-            &mut layout, &registry, &home, "shell",
+            &mut layout,
+            &registry,
+            &home,
+            "shell",
             &std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string()),
-            &[], None, &HashMap::new(), "\r",
-            pane_cols, pane_rows, &wakeup_tx, &mut name_counter,
+            &[],
+            None,
+            &HashMap::new(),
+            "\r",
+            pane_cols,
+            pane_rows,
+            &wakeup_tx,
+            &mut name_counter,
         )?;
     }
 
@@ -239,7 +287,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             render::render(frame, &mut layout, repeat_mode, &registry, telegram_status);
             match &overlay {
                 Overlay::NewTabMenu { items, selected }
-                | Overlay::SplitMenu { items, selected, .. } => {
+                | Overlay::SplitMenu {
+                    items, selected, ..
+                } => {
                     render::render_menu(frame, items, *selected);
                 }
                 Overlay::RenameTab { input } | Overlay::RenamePane { input } => {
@@ -259,7 +309,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     render::render_help(frame);
                 }
                 Overlay::Scroll => {
-                    let so = layout.active_tab()
+                    let so = layout
+                        .active_tab()
                         .and_then(|t| t.focused_pane())
                         .map(|p| p.scroll_offset)
                         .unwrap_or(0);
@@ -723,8 +774,15 @@ fn auto_start_fleet(
     for name in &names {
         if let Some(resolved) = fleet.resolve_instance(name) {
             match create_pane_from_resolved(
-                name, &resolved, layout, registry, home,
-                cols, rows, wakeup_tx, name_counter,
+                name,
+                &resolved,
+                layout,
+                registry,
+                home,
+                cols,
+                rows,
+                wakeup_tx,
+                name_counter,
             ) {
                 Ok(pane) => {
                     let tab_name = pane.agent_name.clone();
@@ -754,9 +812,9 @@ fn build_menu_items(fleet_path: &Path, registry: &AgentRegistry) -> Vec<MenuItem
         names.sort();
         for name in names {
             // Skip if exact name or deduped variant (name-1, name-2...) is running
-            let already_open = running.iter().any(|r| {
-                r == &name || r.starts_with(&format!("{name}-"))
-            });
+            let already_open = running
+                .iter()
+                .any(|r| r == &name || r.starts_with(&format!("{name}-")));
             if already_open {
                 continue;
             }
@@ -806,37 +864,83 @@ fn pane_from_menu_item(
         MenuItemKind::Shell => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
             create_pane(
-                layout, registry, home, "shell", &shell,
-                &[], None, &HashMap::new(), "\r",
-                cols, rows, wakeup_tx, name_counter,
+                layout,
+                registry,
+                home,
+                "shell",
+                &shell,
+                &[],
+                None,
+                &HashMap::new(),
+                "\r",
+                cols,
+                rows,
+                wakeup_tx,
+                name_counter,
             )
         }
         MenuItemKind::Backend(backend) => {
             let preset = backend.preset();
             let inst_name = unique_fleet_name(home, preset.command);
-            if let Err(e) = crate::fleet::add_instance_to_yaml(home, &inst_name, &crate::fleet::InstanceYamlEntry {
-                backend: Some(backend.name().to_string()),
-                working_directory: None,
-                role: None,
-            }) {
+            if let Err(e) = crate::fleet::add_instance_to_yaml(
+                home,
+                &inst_name,
+                &crate::fleet::InstanceYamlEntry {
+                    backend: Some(backend.name().to_string()),
+                    working_directory: None,
+                    role: None,
+                },
+            ) {
                 tracing::warn!(error = %e, "failed to write fleet.yaml");
             }
             // Resolve from fleet to get defaults merged
             let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
             if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
-                create_pane_from_resolved(&inst_name, &resolved, layout, registry, home, cols, rows, wakeup_tx, name_counter)
+                create_pane_from_resolved(
+                    &inst_name,
+                    &resolved,
+                    layout,
+                    registry,
+                    home,
+                    cols,
+                    rows,
+                    wakeup_tx,
+                    name_counter,
+                )
             } else {
                 let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-                create_pane(layout, registry, home, &inst_name, preset.command, &args, None, &HashMap::new(), preset.submit_key, cols, rows, wakeup_tx, name_counter)
+                create_pane(
+                    layout,
+                    registry,
+                    home,
+                    &inst_name,
+                    preset.command,
+                    &args,
+                    None,
+                    &HashMap::new(),
+                    preset.submit_key,
+                    cols,
+                    rows,
+                    wakeup_tx,
+                    name_counter,
+                )
             }
         }
         MenuItemKind::FleetInstance(inst_name) => {
             let fleet = crate::fleet::FleetConfig::load(fleet_path)?;
-            let resolved = fleet.resolve_instance(&inst_name)
+            let resolved = fleet
+                .resolve_instance(&inst_name)
                 .ok_or_else(|| anyhow::anyhow!("fleet instance '{inst_name}' not found"))?;
             create_pane_from_resolved(
-                &inst_name, &resolved, layout, registry, home,
-                cols, rows, wakeup_tx, name_counter,
+                &inst_name,
+                &resolved,
+                layout,
+                registry,
+                home,
+                cols,
+                rows,
+                wakeup_tx,
+                name_counter,
             )
         }
     }
@@ -860,8 +964,19 @@ fn spawn_pane_tab(
     name_counter: &mut HashMap<String, usize>,
 ) -> Result<()> {
     let pane = create_pane(
-        layout, registry, home, base_name, command, args, working_dir,
-        env, submit_key, cols, rows, wakeup_tx, name_counter,
+        layout,
+        registry,
+        home,
+        base_name,
+        command,
+        args,
+        working_dir,
+        env,
+        submit_key,
+        cols,
+        rows,
+        wakeup_tx,
+        name_counter,
     )?;
     let tab_name = pane.agent_name.clone();
     layout.add_tab(Tab::new(tab_name, pane));
@@ -940,7 +1055,9 @@ fn create_pane(
     // Subscribe to the agent's output
     let (rx, dump) = {
         let reg = agent::lock_registry(registry);
-        let handle = reg.get(&name).ok_or_else(|| anyhow::anyhow!("agent not found after spawn"))?;
+        let handle = reg
+            .get(&name)
+            .ok_or_else(|| anyhow::anyhow!("agent not found after spawn"))?;
         agent::subscribe_with_dump(handle)
     };
 
@@ -1001,7 +1118,8 @@ fn create_pane_from_resolved(
     let fleet_path = home.join("fleet.yaml");
     let peers: Vec<(String, Option<String>)> = crate::fleet::FleetConfig::load(&fleet_path)
         .map(|f| {
-            f.instances.iter()
+            f.instances
+                .iter()
                 .map(|(n, c)| (n.clone(), c.role.clone()))
                 .collect()
         })
@@ -1013,11 +1131,19 @@ fn create_pane_from_resolved(
     };
 
     let mut pane = create_pane(
-        layout, registry, home, fleet_name,
-        &resolved.backend_command, &resolved.args,
+        layout,
+        registry,
+        home,
+        fleet_name,
+        &resolved.backend_command,
+        &resolved.args,
         resolved.working_directory.as_deref(),
-        &resolved.env, &resolved.submit_key,
-        cols, rows, wakeup_tx, name_counter,
+        &resolved.env,
+        &resolved.submit_key,
+        cols,
+        rows,
+        wakeup_tx,
+        name_counter,
     )?;
 
     // Overwrite basic instructions with fleet-aware version
@@ -1031,7 +1157,9 @@ fn create_pane_from_resolved(
 /// Derive Telegram status from an already-loaded FleetConfig (no disk I/O).
 fn telegram_status_from_config(config: &crate::fleet::FleetConfig) -> render::TelegramStatus {
     match config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram { ref bot_token_env, .. }) => {
+        Some(crate::fleet::ChannelConfig::Telegram {
+            ref bot_token_env, ..
+        }) => {
             if std::env::var(bot_token_env).is_ok() {
                 render::TelegramStatus::Connected
             } else {
@@ -1051,7 +1179,9 @@ fn maybe_create_telegram_topic(
     pane: &Pane,
 ) {
     let Some(tg) = tg else { return };
-    let Some(fleet_name) = &pane.fleet_instance_name else { return };
+    let Some(fleet_name) = &pane.fleet_instance_name else {
+        return;
+    };
     {
         let s = tg.lock().unwrap_or_else(|e| e.into_inner());
         if s.instance_to_topic.contains_key(fleet_name) {
@@ -1112,7 +1242,11 @@ fn resolve_backend(backend_name: &str, fresh: bool) -> (String, Vec<String>, Str
         } else {
             p.args
         };
-        (p.command.to_string(), args.iter().map(|s| s.to_string()).collect(), p.submit_key.to_string())
+        (
+            p.command.to_string(),
+            args.iter().map(|s| s.to_string()).collect(),
+            p.submit_key.to_string(),
+        )
     } else {
         (backend_name.to_string(), vec![], "\r".to_string())
     }
@@ -1143,19 +1277,49 @@ fn execute_command(
 
             // unique_fleet_name guarantees inst_name is not yet in fleet.yaml
             let inst_name = unique_fleet_name(home, base_name);
-            if let Err(e) = crate::fleet::add_instance_to_yaml(home, &inst_name, &crate::fleet::InstanceYamlEntry {
-                backend: Some(backend_name.to_string()),
-                working_directory: None,
-                role: None,
-            }) {
+            if let Err(e) = crate::fleet::add_instance_to_yaml(
+                home,
+                &inst_name,
+                &crate::fleet::InstanceYamlEntry {
+                    backend: Some(backend_name.to_string()),
+                    working_directory: None,
+                    role: None,
+                },
+            ) {
                 tracing::warn!(name = %inst_name, error = %e, "failed to write fleet.yaml");
             }
             let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-            let pane_result = if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
-                create_pane_from_resolved(&inst_name, &resolved, layout, registry, home, pc, pr, wakeup_tx, name_counter)
+            let pane_result = if let Some(resolved) =
+                fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name))
+            {
+                create_pane_from_resolved(
+                    &inst_name,
+                    &resolved,
+                    layout,
+                    registry,
+                    home,
+                    pc,
+                    pr,
+                    wakeup_tx,
+                    name_counter,
+                )
             } else {
                 let (command, args, submit_key) = resolve_backend(backend_name, false);
-                create_pane(layout, registry, home, &inst_name, &command, &args, None, &HashMap::new(), &submit_key, pc, pr, wakeup_tx, name_counter)
+                create_pane(
+                    layout,
+                    registry,
+                    home,
+                    &inst_name,
+                    &command,
+                    &args,
+                    None,
+                    &HashMap::new(),
+                    &submit_key,
+                    pc,
+                    pr,
+                    wakeup_tx,
+                    name_counter,
+                )
             };
             match pane_result {
                 Ok(pane) => {
@@ -1178,7 +1342,9 @@ fn execute_command(
                     }
                     return true;
                 }
-                Err(e) => tracing::error!(name = %inst_name, backend = *backend_name, error = %e, "spawn failed"),
+                Err(e) => {
+                    tracing::error!(name = %inst_name, backend = *backend_name, error = %e, "spawn failed")
+                }
             }
         }
         "kill" => {
@@ -1198,7 +1364,9 @@ fn execute_command(
                     } else {
                         let ids = layout.tabs[i].root().pane_ids();
                         for id in ids {
-                            if layout.tabs[i].root().find_pane(id)
+                            if layout.tabs[i]
+                                .root()
+                                .find_pane(id)
                                 .is_some_and(|p| p.agent_name == *name)
                             {
                                 layout.tabs[i].focus_id = id;
@@ -1213,13 +1381,19 @@ fn execute_command(
         }
         "restart" => {
             let target_name = parts.get(1).map(|s| s.to_string()).or_else(|| {
-                layout.active_tab()
+                layout
+                    .active_tab()
                     .and_then(|t| t.focused_pane())
                     .map(|p| p.agent_name.clone())
             });
             if let Some(name) = target_name {
                 // Single pass: find pane info, fleet name, and location
-                let mut pane_info: Option<(String, Option<PathBuf>, Option<String>, Option<String>)> = None;
+                let mut pane_info: Option<(
+                    String,
+                    Option<PathBuf>,
+                    Option<String>,
+                    Option<String>,
+                )> = None;
                 let mut pane_loc: Option<(usize, usize)> = None;
                 'outer: for (ti, tab) in layout.tabs.iter().enumerate() {
                     for id in tab.root().pane_ids() {
@@ -1232,7 +1406,12 @@ fn execute_command(
                                         break 'outer;
                                     }
                                 };
-                                pane_info = Some((cmd, p.working_dir.clone(), p.display_name.clone(), p.fleet_instance_name.clone()));
+                                pane_info = Some((
+                                    cmd,
+                                    p.working_dir.clone(),
+                                    p.display_name.clone(),
+                                    p.fleet_instance_name.clone(),
+                                ));
                                 pane_loc = Some((ti, id));
                                 break 'outer;
                             }
@@ -1253,16 +1432,56 @@ fn execute_command(
                         // Fleet agent — resolve from fleet.yaml (full config)
                         let fleet_path = home.join("fleet.yaml");
                         let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-                        if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(fname)) {
-                            create_pane_from_resolved(fname, &resolved, layout, registry, home, pc, pr, wakeup_tx, name_counter)
+                        if let Some(resolved) =
+                            fleet.as_ref().and_then(|f| f.resolve_instance(fname))
+                        {
+                            create_pane_from_resolved(
+                                fname,
+                                &resolved,
+                                layout,
+                                registry,
+                                home,
+                                pc,
+                                pr,
+                                wakeup_tx,
+                                name_counter,
+                            )
                         } else {
                             let (command, args, submit_key) = resolve_backend(&backend_cmd, true);
-                            create_pane(layout, registry, home, &name, &command, &args, work_dir.as_deref(), &HashMap::new(), &submit_key, pc, pr, wakeup_tx, name_counter)
+                            create_pane(
+                                layout,
+                                registry,
+                                home,
+                                &name,
+                                &command,
+                                &args,
+                                work_dir.as_deref(),
+                                &HashMap::new(),
+                                &submit_key,
+                                pc,
+                                pr,
+                                wakeup_tx,
+                                name_counter,
+                            )
                         }
                     } else {
                         // Non-fleet pane — use backend preset directly
                         let (command, args, submit_key) = resolve_backend(&backend_cmd, true);
-                        create_pane(layout, registry, home, &name, &command, &args, work_dir.as_deref(), &HashMap::new(), &submit_key, pc, pr, wakeup_tx, name_counter)
+                        create_pane(
+                            layout,
+                            registry,
+                            home,
+                            &name,
+                            &command,
+                            &args,
+                            work_dir.as_deref(),
+                            &HashMap::new(),
+                            &submit_key,
+                            pc,
+                            pr,
+                            wakeup_tx,
+                            name_counter,
+                        )
                     };
                     if let Ok(mut new_pane) = pane_result {
                         // Swap only vterm + rx into the existing pane slot
@@ -1316,10 +1535,19 @@ fn execute_command(
 fn save_all_session_ids(home: &Path, layout: &Layout) {
     for tab in &layout.tabs {
         for id in tab.root().pane_ids() {
-            let Some(pane) = tab.root().find_pane(id) else { continue };
-            if pane.backend.is_none() { continue; }
-            let Some(ref dir) = pane.working_dir else { continue };
-            let name = pane.fleet_instance_name.as_deref().unwrap_or(&pane.agent_name);
+            let Some(pane) = tab.root().find_pane(id) else {
+                continue;
+            };
+            if pane.backend.is_none() {
+                continue;
+            }
+            let Some(ref dir) = pane.working_dir else {
+                continue;
+            };
+            let name = pane
+                .fleet_instance_name
+                .as_deref()
+                .unwrap_or(&pane.agent_name);
             if let Some(sid) = crate::backend::read_session_id(dir) {
                 crate::backend::save_session_id(home, name, &sid);
             }
@@ -1334,7 +1562,8 @@ fn sync_fleet_yaml(home: &Path, layout: &Layout) {
     let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
 
     // Collect all fleet_instance_names currently in panes
-    let mut active_fleet_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut active_fleet_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for tab in &layout.tabs {
         for id in tab.root().pane_ids() {
             if let Some(pane) = tab.root().find_pane(id) {
@@ -1347,7 +1576,8 @@ fn sync_fleet_yaml(home: &Path, layout: &Layout) {
 
     // Batch-remove fleet entries not in any pane (single atomic write)
     if let Some(ref f) = fleet {
-        let to_remove: Vec<String> = f.instance_names()
+        let to_remove: Vec<String> = f
+            .instance_names()
             .into_iter()
             .filter(|name| !active_fleet_names.contains(name))
             .collect();
@@ -1426,8 +1656,16 @@ fn restore_with_reconciliation(
 
             for tab in &session.tabs {
                 if let Some(root_node) = restore_node_reconciled(
-                    &tab.root, fleet.as_ref(), home, layout, registry,
-                    wakeup_tx, name_counter, cols, rows, &mut placed,
+                    &tab.root,
+                    fleet.as_ref(),
+                    home,
+                    layout,
+                    registry,
+                    wakeup_tx,
+                    name_counter,
+                    cols,
+                    rows,
+                    &mut placed,
                 ) {
                     layout.add_tab(Tab::with_root(tab.name.clone(), root_node));
                 }
@@ -1439,8 +1677,15 @@ fn restore_with_reconciliation(
             for name in &unplaced {
                 if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(name)) {
                     if let Ok(pane) = create_pane_from_resolved(
-                        name, &resolved, layout, registry, home,
-                        cols, rows, wakeup_tx, name_counter,
+                        name,
+                        &resolved,
+                        layout,
+                        registry,
+                        home,
+                        cols,
+                        rows,
+                        wakeup_tx,
+                        name_counter,
                     ) {
                         let tab_name = pane.agent_name.clone();
                         layout.add_tab(Tab::new(tab_name, pane));
@@ -1453,7 +1698,10 @@ fn restore_with_reconciliation(
             }
 
             if !layout.tabs.is_empty() {
-                tracing::info!(tabs = layout.tabs.len(), "session restored with reconciliation");
+                tracing::info!(
+                    tabs = layout.tabs.len(),
+                    "session restored with reconciliation"
+                );
                 return true;
             }
         }
@@ -1461,7 +1709,16 @@ fn restore_with_reconciliation(
 
     // No session.json or empty → rule 1: auto-start fleet
     if !fleet_names.is_empty() {
-        return auto_start_fleet(fleet_path, layout, registry, home, cols, rows, wakeup_tx, name_counter);
+        return auto_start_fleet(
+            fleet_path,
+            layout,
+            registry,
+            home,
+            cols,
+            rows,
+            wakeup_tx,
+            name_counter,
+        );
     }
 
     // Rule 4: nothing → caller adds shell tab
@@ -1488,13 +1745,23 @@ fn restore_node_reconciled(
                     // Safe: preset.args should not contain resume flags (those live in resume_mode).
                     let mut resolved = fleet?.resolve_instance(fleet_name)?;
                     if let Some(backend) = Backend::from_command(&resolved.backend_command) {
-                        resolved.args.extend(backend.preset().resume_mode.args_for(home, fleet_name));
+                        resolved
+                            .args
+                            .extend(backend.preset().resume_mode.args_for(home, fleet_name));
                     }
                     placed.insert(fleet_name.clone());
                     let mut pane = create_pane_from_resolved(
-                        fleet_name, &resolved, layout, registry, home,
-                        cols, rows, wakeup_tx, name_counter,
-                    ).ok()?;
+                        fleet_name,
+                        &resolved,
+                        layout,
+                        registry,
+                        home,
+                        cols,
+                        rows,
+                        wakeup_tx,
+                        name_counter,
+                    )
+                    .ok()?;
                     pane.display_name = sp.display_name.clone();
                     Some(crate::layout::PaneNode::Leaf(Box::new(pane)))
                 }
@@ -1502,18 +1769,51 @@ fn restore_node_reconciled(
                     // Shell pane — recreate fresh
                     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
                     let mut pane = create_pane(
-                        layout, registry, home, "shell", &shell,
-                        &[], None, &HashMap::new(), "\r",
-                        cols, rows, wakeup_tx, name_counter,
-                    ).ok()?;
+                        layout,
+                        registry,
+                        home,
+                        "shell",
+                        &shell,
+                        &[],
+                        None,
+                        &HashMap::new(),
+                        "\r",
+                        cols,
+                        rows,
+                        wakeup_tx,
+                        name_counter,
+                    )
+                    .ok()?;
                     pane.display_name = sp.display_name.clone();
                     Some(crate::layout::PaneNode::Leaf(Box::new(pane)))
                 }
             }
         }
         SessionNode::Split { dir, first, second } => {
-            let f = restore_node_reconciled(first, fleet, home, layout, registry, wakeup_tx, name_counter, cols, rows, placed);
-            let s = restore_node_reconciled(second, fleet, home, layout, registry, wakeup_tx, name_counter, cols, rows, placed);
+            let f = restore_node_reconciled(
+                first,
+                fleet,
+                home,
+                layout,
+                registry,
+                wakeup_tx,
+                name_counter,
+                cols,
+                rows,
+                placed,
+            );
+            let s = restore_node_reconciled(
+                second,
+                fleet,
+                home,
+                layout,
+                registry,
+                wakeup_tx,
+                name_counter,
+                cols,
+                rows,
+                placed,
+            );
             match (f, s) {
                 (Some(f), Some(s)) => Some(crate::layout::PaneNode::Split {
                     dir: *dir,
@@ -1530,7 +1830,8 @@ fn restore_node_reconciled(
 
 /// Write bytes to the focused pane's PTY.
 fn write_to_focused(layout: &Layout, registry: &AgentRegistry, bytes: &[u8]) {
-    if let Some(name) = layout.active_tab()
+    if let Some(name) = layout
+        .active_tab()
         .and_then(|t| t.focused_pane())
         .map(|p| p.agent_name.clone())
     {
@@ -1574,7 +1875,8 @@ fn unique_fleet_name(home: &Path, base: &str) -> String {
     if !fleet.instances.contains_key(base) {
         return base.to_string();
     }
-    (2..).map(|n| format!("{base}-{n}"))
+    (2..)
+        .map(|n| format!("{base}-{n}"))
         .find(|c| !fleet.instances.contains_key(c))
         .unwrap()
 }
@@ -1638,9 +1940,7 @@ fn start_api_server(home: &Path, registry: &AgentRegistry) -> ApiGuard {
         .ok();
 
     tracing::info!(path = %run.display(), "in-process API server started");
-    ApiGuard {
-        run_dir: Some(run),
-    }
+    ApiGuard { run_dir: Some(run) }
 }
 
 enum TabBarClick {
@@ -1654,7 +1954,9 @@ fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
     use unicode_width::UnicodeWidthStr;
     let mut x: u16 = 0;
     for (i, tab) in layout.tabs.iter().enumerate() {
-        if i > 0 { x += 1; } // separator space
+        if i > 0 {
+            x += 1;
+        } // separator space
         let is_active = i == layout.active;
         let has_notif = tab.root().has_notification();
         let badge = if has_notif && !is_active { " !" } else { "" };
@@ -1687,10 +1989,13 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
             if tab.zoomed {
                 Some(tab.focus_id)
             } else {
-                tab.pane_rects.iter()
+                tab.pane_rects
+                    .iter()
                     .find(|(_, &(px, py, pw, ph))| {
-                        mouse.column >= px && mouse.column < px + pw
-                            && mouse.row >= py && mouse.row < py + ph
+                        mouse.column >= px
+                            && mouse.column < px + pw
+                            && mouse.row >= py
+                            && mouse.row < py + ph
                     })
                     .map(|(&id, _)| id)
             }
@@ -1703,7 +2008,10 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
     };
 
     // Focus clicked pane and cache selection target on Down
-    if matches!(mouse.kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
         tab.focus_id = target_id;
         tab.selecting_pane = Some(target_id);
     }
@@ -1727,8 +2035,10 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
 
     match mouse.kind {
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            if mouse.column >= inner_x && mouse.column < inner_x + inner_w
-                && mouse.row >= inner_y && mouse.row < inner_y + inner_h
+            if mouse.column >= inner_x
+                && mouse.column < inner_x + inner_w
+                && mouse.row >= inner_y
+                && mouse.row < inner_y + inner_h
             {
                 let col = mouse.column - inner_x;
                 let row = mouse.row - inner_y;
@@ -1747,7 +2057,9 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
         }
         MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
             if let Some(ref sel) = pane.selection {
-                let text = pane.vterm.extract_text(sel.start, sel.end, pane.scroll_offset);
+                let text = pane
+                    .vterm
+                    .extract_text(sel.start, sel.end, pane.scroll_offset);
                 if !text.is_empty() {
                     copy_to_clipboard(&text);
                 }
@@ -1764,7 +2076,8 @@ fn clear_selection_cache(layout: &mut Layout) {
     if let Some(tab) = layout.active_tab_mut() {
         if tab.selecting_pane.is_some() {
             // Check if selection was cleared (mouse up happened)
-            let still_selecting = tab.selecting_pane
+            let still_selecting = tab
+                .selecting_pane
                 .and_then(|id| tab.root().find_pane(id))
                 .is_some_and(|p| p.selection.is_some());
             if !still_selecting {

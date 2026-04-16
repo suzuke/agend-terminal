@@ -495,9 +495,7 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
             }
             Some(tid) => {
                 bot.send_message(chat_id, text)
-                    .message_thread_id(teloxide::types::ThreadId(
-                        teloxide::types::MessageId(tid),
-                    ))
+                    .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(tid)))
                     .await?
             }
         };

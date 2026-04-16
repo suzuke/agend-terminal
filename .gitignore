@@ -21,3 +21,7 @@ skills-lock.json
 .continue/
 .factory/
 .kiro/
+claude-settings.json
+statusline.json
+statusline.sh
+mcp-config.json

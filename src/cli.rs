@@ -295,7 +295,10 @@ fn test_mcp(_home: &Path) -> anyhow::Result<()> {
     tracing::info!("test:mcp — testing MCP protocol");
     let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
     let init_frame = format!("Content-Length: {}\r\n\r\n{}", init_req.len(), init_req);
-    tracing::info!(bytes = init_frame.len(), "test:mcp — Content-Length frame format OK");
+    tracing::info!(
+        bytes = init_frame.len(),
+        "test:mcp — Content-Length frame format OK"
+    );
     tracing::info!("test:mcp — PASS — MCP framing verified");
     Ok(())
 }

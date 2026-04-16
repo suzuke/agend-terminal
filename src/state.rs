@@ -150,7 +150,10 @@ impl StatePatterns {
                 // [docs] Tool names in output
                 (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
                 // [measured] Idle prompt
-                (AgentState::Idle, r"\d+%\s*$|ask a question or describe a task"),
+                (
+                    AgentState::Idle,
+                    r"\d+%\s*$|ask a question or describe a task",
+                ),
                 // [measured] Trust dialog completion / ready state
                 (AgentState::Ready, r"Trust All Tools active|/quit to exit"),
             ],

@@ -61,7 +61,11 @@ pub fn read_session_id(working_dir: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(working_dir.join("statusline.json"))
         .ok()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|d| d.get("session_id").and_then(|v| v.as_str()).map(String::from))
+        .and_then(|d| {
+            d.get("session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
 }
 
 /// Save a captured session ID for an instance.
@@ -121,7 +125,8 @@ impl Backend {
             Backend::KiroCli => BackendPreset {
                 command: "kiro-cli",
                 args: &["chat", "--trust-all-tools"],
-                ready_pattern: "Trust All Tools active|ask a question or describe a task|/quit to exit",
+                ready_pattern:
+                    "Trust All Tools active|ask a question or describe a task|/quit to exit",
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
@@ -455,7 +460,10 @@ mod tests {
     #[test]
     fn format_model_arg_other_backends_passthrough() {
         assert_eq!(Backend::ClaudeCode.format_model_arg("opus"), "opus");
-        assert_eq!(Backend::Gemini.format_model_arg("gemini-2.5-pro"), "gemini-2.5-pro");
+        assert_eq!(
+            Backend::Gemini.format_model_arg("gemini-2.5-pro"),
+            "gemini-2.5-pro"
+        );
         assert_eq!(Backend::Codex.format_model_arg("o3"), "o3");
     }
 }

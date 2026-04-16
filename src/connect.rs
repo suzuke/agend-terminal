@@ -144,7 +144,9 @@ pub fn run(
     let deregister_name = name.to_string();
     let deregister_home = home.to_path_buf();
     let cleanup = move || {
-        unsafe { nix::libc::kill(child_id as i32, nix::libc::SIGTERM); }
+        unsafe {
+            nix::libc::kill(child_id as i32, nix::libc::SIGTERM);
+        }
         let _ = crate::api::call(
             &deregister_home,
             &serde_json::json!({
@@ -162,7 +164,8 @@ pub fn run(
             }
         }
         std::process::exit(130);
-    }).ok();
+    })
+    .ok();
 
     // 11. Wait for child to exit
     let status = child.wait()?;

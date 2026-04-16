@@ -308,7 +308,11 @@ fn handle_session(
                     continue;
                 }
                 if from == target {
-                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": "cannot send to self"}));
+                    let _ = writeln!(
+                        writer,
+                        "{}",
+                        json!({"ok": false, "error": "cannot send to self"})
+                    );
                     continue;
                 }
                 let _ = crate::inbox::enqueue(
@@ -337,10 +341,7 @@ fn handle_session(
                 // Try managed agent first
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(target) {
-                    let _ = agent::inject_to_agent(
-                        handle,
-                        inject_msg.as_bytes(),
-                    );
+                    let _ = agent::inject_to_agent(handle, inject_msg.as_bytes());
                 }
                 // External agents receive messages via inbox only (no PTY injection)
                 json!({"ok": true})
@@ -369,7 +370,8 @@ fn handle_session(
                 let name = match params["name"].as_str() {
                     Some(n) => n,
                     None => {
-                        let _ = writeln!(writer, "{}", json!({"ok": false, "error": "missing name"}));
+                        let _ =
+                            writeln!(writer, "{}", json!({"ok": false, "error": "missing name"}));
                         continue;
                     }
                 };
@@ -380,23 +382,39 @@ fn handle_session(
                 // Atomic check-and-insert: lock order is always registry → external
                 let reg = agent::lock_registry(registry);
                 if reg.contains_key(name) {
-                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")}));
+                    let _ = writeln!(
+                        writer,
+                        "{}",
+                        json!({"ok": false, "error": format!("agent '{name}' already exists (managed)")})
+                    );
                     continue;
                 }
                 let mut ext = agent::lock_external(externals);
                 if ext.contains_key(name) {
-                    let _ = writeln!(writer, "{}", json!({"ok": false, "error": format!("agent '{name}' already exists (external)")}));
+                    let _ = writeln!(
+                        writer,
+                        "{}",
+                        json!({"ok": false, "error": format!("agent '{name}' already exists (external)")})
+                    );
                     continue;
                 }
                 let backend = params["backend"].as_str().unwrap_or("unknown");
                 let pid = params["pid"].as_u64().unwrap_or(0) as u32;
-                ext.insert(name.to_string(), agent::ExternalAgentHandle {
-                    backend_command: backend.to_string(),
-                    pid,
-                });
+                ext.insert(
+                    name.to_string(),
+                    agent::ExternalAgentHandle {
+                        backend_command: backend.to_string(),
+                        pid,
+                    },
+                );
                 drop(reg);
                 drop(ext);
-                crate::event_log::log(home, "connect", name, &format!("external agent registered (pid={pid}, backend={backend})"));
+                crate::event_log::log(
+                    home,
+                    "connect",
+                    name,
+                    &format!("external agent registered (pid={pid}, backend={backend})"),
+                );
                 tracing::info!(agent = name, pid, backend, "external agent registered");
                 json!({"ok": true})
             }

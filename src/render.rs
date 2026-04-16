@@ -5,11 +5,11 @@ use crate::app::MenuItem;
 use crate::layout::{Layout, PaneNode, SplitDir};
 use crate::state::AgentState;
 use ratatui::layout::{Constraint, Direction, Rect};
-use unicode_width::UnicodeWidthStr;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 /// Telegram connection status for status bar display.
 #[derive(Clone, Copy)]
@@ -92,7 +92,10 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         let sc = state_color(state);
 
         let style = if is_active {
-            Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Gray)
         };
@@ -101,9 +104,15 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
             spans.push(Span::raw(" "));
         }
 
-        let blink = matches!(state, AgentState::PermissionPrompt | AgentState::Hang | AgentState::Restarting);
+        let blink = matches!(
+            state,
+            AgentState::PermissionPrompt | AgentState::Hang | AgentState::Restarting
+        );
         let dot = if blink {
-            Span::styled("*", Style::default().fg(sc).add_modifier(Modifier::SLOW_BLINK))
+            Span::styled(
+                "*",
+                Style::default().fg(sc).add_modifier(Modifier::SLOW_BLINK),
+            )
         } else {
             Span::styled("*", Style::default().fg(sc))
         };
@@ -195,7 +204,10 @@ fn apply_pty_resizes(resizes: &[(String, u16, u16)], registry: &AgentRegistry) {
         if let Some(handle) = reg.get(name.as_str()) {
             if let Ok(master) = handle.pty_master.lock() {
                 let _ = master.resize(portable_pty::PtySize {
-                    rows: *rows, cols: *cols, pixel_width: 0, pixel_height: 0,
+                    rows: *rows,
+                    cols: *cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
                 });
             }
         }
@@ -226,12 +238,21 @@ fn render_pane_tree(
             render_pane(frame, area, pane, true, false, registry);
         }
         tab.pane_rects.clear();
-        tab.pane_rects.insert(focus_id, (area.x, area.y, area.width, area.height));
+        tab.pane_rects
+            .insert(focus_id, (area.x, area.y, area.width, area.height));
         return;
     }
 
     let mut rects = std::collections::HashMap::new();
-    render_node(frame, area, tab.root_mut(), focus_id, &mut rects, repeat_mode, registry);
+    render_node(
+        frame,
+        area,
+        tab.root_mut(),
+        focus_id,
+        &mut rects,
+        repeat_mode,
+        registry,
+    );
     tab.pane_rects = rects;
 }
 
@@ -299,9 +320,13 @@ fn render_pane(
     };
 
     let title_style = if focused && repeat_mode {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else if focused {
-        Style::default().fg(border_color).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(border_color)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -313,14 +338,23 @@ fn render_pane(
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    pane.vterm.render_to_buffer(frame.buffer_mut(), inner, pane.scroll_offset, !focused);
+    pane.vterm
+        .render_to_buffer(frame.buffer_mut(), inner, pane.scroll_offset, !focused);
 
     // Highlight text selection
     if let Some(ref sel) = pane.selection {
-        let (s, e) = if sel.start <= sel.end { (sel.start, sel.end) } else { (sel.end, sel.start) };
+        let (s, e) = if sel.start <= sel.end {
+            (sel.start, sel.end)
+        } else {
+            (sel.end, sel.start)
+        };
         for row in s.0..=e.0 {
             let col_start = if row == s.0 { s.1 } else { 0 };
-            let col_end = if row == e.0 { e.1 } else { inner.width.saturating_sub(1) };
+            let col_end = if row == e.0 {
+                e.1
+            } else {
+                inner.width.saturating_sub(1)
+            };
             for col in col_start..=col_end {
                 let x = inner.x + col;
                 let y = inner.y + row;
@@ -354,18 +388,32 @@ fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout, telegram: T
     }
 
     if agent_count > 0 {
-        spans.push(Span::styled(format!(" {agent_count} agent(s) "), Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled(
+            format!(" {agent_count} agent(s) "),
+            Style::default().fg(Color::Cyan),
+        ));
     }
     if total > agent_count {
-        spans.push(Span::styled(format!(" {total} pane(s) "), Style::default().fg(Color::White)));
+        spans.push(Span::styled(
+            format!(" {total} pane(s) "),
+            Style::default().fg(Color::White),
+        ));
     }
 
     match telegram {
         TelegramStatus::Connected => {
-            spans.push(Span::styled(" TG ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(
+                " TG ",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
         TelegramStatus::NoToken => {
-            spans.push(Span::styled(" TG(no token) ", Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(
+                " TG(no token) ",
+                Style::default().fg(Color::Yellow),
+            ));
         }
         TelegramStatus::NotConfigured => {}
     }
@@ -389,15 +437,33 @@ pub fn render_menu(frame: &mut Frame, items: &[MenuItem], selected: usize) {
     let y = (area.height.saturating_sub(menu_height)) / 2;
     let menu_area = Rect::new(x, y, menu_width, menu_height);
     frame.render_widget(Clear, menu_area);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" New Tab (Enter to select, Esc to cancel) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " New Tab (Enter to select, Esc to cancel) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(menu_area);
     frame.render_widget(block, menu_area);
-    let lines: Vec<Line> = items.iter().enumerate().map(|(i, item)| {
-        let style = if i == selected { Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
-        let prefix = if i == selected { "> " } else { "  " };
-        Line::from(Span::styled(format!("{prefix}{}", item.label), style))
-    }).collect();
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if i == selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if i == selected { "> " } else { "  " };
+            Line::from(Span::styled(format!("{prefix}{}", item.label), style))
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -408,11 +474,21 @@ pub fn render_rename(frame: &mut Frame, input: &str) {
     let y = area.height / 2 - 1;
     let ra = Rect::new(x, y, w, 3);
     frame.render_widget(Clear, ra);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(" Rename (Enter, Esc) ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Rename (Enter, Esc) ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(ra);
     frame.render_widget(block, ra);
-    frame.render_widget(Paragraph::new(format!("{input}_")).style(Style::default().fg(Color::White)), inner);
+    frame.render_widget(
+        Paragraph::new(format!("{input}_")).style(Style::default().fg(Color::White)),
+        inner,
+    );
     let cursor_x = inner.x + input.width() as u16;
     if cursor_x < inner.x + inner.width {
         frame.set_cursor_position(ratatui::layout::Position::new(cursor_x, inner.y));
@@ -427,21 +503,43 @@ pub fn render_tab_list(frame: &mut Frame, layout: &Layout, selected: usize) {
     let y = (area.height.saturating_sub(h)) / 2;
     let la = Rect::new(x, y, w, h);
     frame.render_widget(Clear, la);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" Windows (Enter, Esc) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Windows (Enter, Esc) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(la);
     frame.render_widget(block, la);
-    let lines: Vec<Line> = layout.tabs.iter().enumerate().map(|(i, tab)| {
-        let is_sel = i == selected;
-        let style = if is_sel { Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::White) };
-        let marker = if i == layout.active { "*" } else { " " };
-        let pc = tab.root().pane_count();
-        Line::from(vec![
-            Span::styled(format!("{marker} {i}: "), style),
-            Span::styled(tab.name.as_str(), style),
-            Span::styled(format!("  ({pc} pane{s})", s = if pc > 1 { "s" } else { "" }), Style::default().fg(Color::DarkGray)),
-        ])
-    }).collect();
+    let lines: Vec<Line> = layout
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            let is_sel = i == selected;
+            let style = if is_sel {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let marker = if i == layout.active { "*" } else { " " };
+            let pc = tab.root().pane_count();
+            Line::from(vec![
+                Span::styled(format!("{marker} {i}: "), style),
+                Span::styled(tab.name.as_str(), style),
+                Span::styled(
+                    format!("  ({pc} pane{s})", s = if pc > 1 { "s" } else { "" }),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -452,25 +550,48 @@ pub fn render_confirm(frame: &mut Frame, message: &str) {
     let y = area.height / 2 - 1;
     let ca = Rect::new(x, y, w, 3);
     frame.render_widget(Clear, ca);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Red));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
     let inner = block.inner(ca);
     frame.render_widget(block, ca);
     frame.render_widget(
-        Paragraph::new(Span::styled(message, Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
+        Paragraph::new(Span::styled(
+            message,
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
         inner,
     );
 }
 
 pub fn render_help(frame: &mut Frame) {
-    let help = vec!["", "  Tab Management", "    Ctrl+B c       New tab", "    Ctrl+B n / p   Next / previous tab",
-        "    Ctrl+B l       Last used tab", "    Ctrl+B 0-9     Go to tab N", "    Ctrl+B &       Close tab",
-        "    Ctrl+B ,       Rename tab", "    Ctrl+B w       List all tabs", "", "  Pane Management",
-        "    Ctrl+B \"       Split horizontal", "    Ctrl+B %       Split vertical", "    Ctrl+B o       Cycle pane focus",
-        "    Ctrl+B arrows  Directional focus", "    Ctrl+B x       Close pane", "    Ctrl+B z       Toggle zoom",
+    let help = vec![
+        "",
+        "  Tab Management",
+        "    Ctrl+B c       New tab",
+        "    Ctrl+B n / p   Next / previous tab",
+        "    Ctrl+B l       Last used tab",
+        "    Ctrl+B 0-9     Go to tab N",
+        "    Ctrl+B &       Close tab",
+        "    Ctrl+B ,       Rename tab",
+        "    Ctrl+B w       List all tabs",
+        "",
+        "  Pane Management",
+        "    Ctrl+B \"       Split horizontal",
+        "    Ctrl+B %       Split vertical",
+        "    Ctrl+B o       Cycle pane focus",
+        "    Ctrl+B arrows  Directional focus",
+        "    Ctrl+B x       Close pane",
+        "    Ctrl+B z       Toggle zoom",
         "    Ctrl+B .       Rename pane",
-        "", "  Scroll", "    Mouse wheel    Scroll focused pane",
-        "    Ctrl+B [       Keyboard scroll mode", "    Shift+drag     Select text (native)",
-        "", "  Panels & Commands", "    Ctrl+B :       Command palette",
+        "",
+        "  Scroll",
+        "    Mouse wheel    Scroll focused pane",
+        "    Ctrl+B [       Keyboard scroll mode",
+        "    Shift+drag     Select text (native)",
+        "",
+        "  Panels & Commands",
+        "    Ctrl+B :       Command palette",
         "      :spawn <n> [backend]  New tab",
         "      :vsplit <n> [backend] V-split",
         "      :hsplit <n> [backend] H-split",
@@ -478,10 +599,16 @@ pub fn render_help(frame: &mut Frame) {
         "      :restart [name]       Restart agent",
         "      :send <to> <msg>      Send message",
         "      :broadcast <msg>      Broadcast",
-        "    Ctrl+B D       Decisions panel", "    Ctrl+B T       Task board",
-        "", "  Other", "    Ctrl+B Ctrl+B  Send Ctrl+B to pane",
+        "    Ctrl+B D       Decisions panel",
+        "    Ctrl+B T       Task board",
+        "",
+        "  Other",
+        "    Ctrl+B Ctrl+B  Send Ctrl+B to pane",
         "    Ctrl+B d       Detach (exit)",
-        "    Ctrl+B ?       This help", "", "  Press any key to close"];
+        "    Ctrl+B ?       This help",
+        "",
+        "  Press any key to close",
+    ];
     let area = frame.area();
     let h = (help.len() as u16 + 2).min(area.height.saturating_sub(2));
     let w = 48u16.min(area.width.saturating_sub(4));
@@ -489,11 +616,21 @@ pub fn render_help(frame: &mut Frame) {
     let y = (area.height.saturating_sub(h)) / 2;
     let ha = Rect::new(x, y, w, h);
     frame.render_widget(Clear, ha);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow))
-        .title(Span::styled(" Keybindings ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " Keybindings ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(ha);
     frame.render_widget(block, ha);
-    let lines: Vec<Line> = help.iter().map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::White)))).collect();
+    let lines: Vec<Line> = help
+        .iter()
+        .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::White))))
+        .collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -502,7 +639,16 @@ pub fn render_scroll_indicator(frame: &mut Frame, offset: usize) {
     let s = format!(" [scroll] line +{offset} | j/k PgUp/PgDn | q exit ");
     let w = s.len() as u16;
     let ba = Rect::new(area.width.saturating_sub(w), 0, w, 1);
-    frame.render_widget(Paragraph::new(Span::styled(s, Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))), ba);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            s,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        ba,
+    );
 }
 
 /// Render a centered overlay frame with border and title. Returns the inner area.
@@ -514,8 +660,13 @@ fn render_overlay_frame(frame: &mut Frame, color: Color, title: &str) -> Rect {
     let y = (area.height.saturating_sub(h)) / 2;
     let oa = Rect::new(x, y, w, h);
     frame.render_widget(Clear, oa);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(color))
-        .title(Span::styled(title, Style::default().fg(color).add_modifier(Modifier::BOLD)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(oa);
     frame.render_widget(block, oa);
     inner
@@ -528,11 +679,21 @@ pub fn render_command_palette(frame: &mut Frame, input: &str) {
     let y = area.height / 3;
     let ra = Rect::new(x, y, w, 3);
     frame.render_widget(Clear, ra);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" : Command (Enter, Esc) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " : Command (Enter, Esc) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(ra);
     frame.render_widget(block, ra);
-    frame.render_widget(Paragraph::new(format!(":{input}_")).style(Style::default().fg(Color::White)), inner);
+    frame.render_widget(
+        Paragraph::new(format!(":{input}_")).style(Style::default().fg(Color::White)),
+        inner,
+    );
     let cursor_x = inner.x + 1 + input.width() as u16;
     if cursor_x < inner.x + inner.width {
         frame.set_cursor_position(ratatui::layout::Position::new(cursor_x, inner.y));
@@ -545,7 +706,10 @@ pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision],
     let inner = render_overlay_frame(frame, Color::Yellow, &title);
 
     if items.is_empty() {
-        frame.render_widget(Paragraph::new("  No decisions yet.").style(Style::default().fg(Color::DarkGray)), inner);
+        frame.render_widget(
+            Paragraph::new("  No decisions yet.").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
         return;
     }
 
@@ -553,19 +717,38 @@ pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision],
     for (i, d) in items.iter().enumerate() {
         let marker = if i == scroll { "> " } else { "  " };
         let style = if i == scroll {
-            Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
-        lines.push(Line::from(Span::styled(format!("{marker}[{}] {}", d.scope, d.title), style)));
+        lines.push(Line::from(Span::styled(
+            format!("{marker}[{}] {}", d.scope, d.title),
+            style,
+        )));
         if i == scroll {
             // Show detail for selected decision
-            lines.push(Line::from(Span::styled(format!("    by {} | {}", d.author, &d.created_at.get(..10).unwrap_or(&d.created_at)), Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    by {} | {}",
+                    d.author,
+                    &d.created_at.get(..10).unwrap_or(&d.created_at)
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
             for line in d.content.lines() {
-                lines.push(Line::from(Span::styled(format!("    {line}"), Style::default().fg(Color::Gray))));
+                lines.push(Line::from(Span::styled(
+                    format!("    {line}"),
+                    Style::default().fg(Color::Gray),
+                )));
             }
             if !d.tags.is_empty() {
-                lines.push(Line::from(Span::styled(format!("    tags: {}", d.tags.join(", ")), Style::default().fg(Color::Cyan))));
+                lines.push(Line::from(Span::styled(
+                    format!("    tags: {}", d.tags.join(", ")),
+                    Style::default().fg(Color::Cyan),
+                )));
             }
             lines.push(Line::from(""));
         }
@@ -579,7 +762,10 @@ pub fn render_tasks(frame: &mut Frame, items: &[crate::tasks::Task], scroll: usi
     let inner = render_overlay_frame(frame, Color::Blue, &title);
 
     if items.is_empty() {
-        frame.render_widget(Paragraph::new("  No tasks yet.").style(Style::default().fg(Color::DarkGray)), inner);
+        frame.render_widget(
+            Paragraph::new("  No tasks yet.").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
         return;
     }
 
@@ -599,25 +785,54 @@ pub fn render_tasks(frame: &mut Frame, items: &[crate::tasks::Task], scroll: usi
             _ => Color::White,
         };
         let style = if i == scroll {
-            Style::default().fg(Color::Black).bg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         let assignee = t.assignee.as_deref().unwrap_or("-");
         lines.push(Line::from(vec![
             Span::styled(marker, style),
-            Span::styled(format!("[{}] ", t.status), Style::default().fg(status_color)),
-            Span::styled(&t.title, if i == scroll { style } else { Style::default().fg(Color::White) }),
-            Span::styled(format!("  ({}) @{assignee}", t.priority), Style::default().fg(pri_color)),
+            Span::styled(
+                format!("[{}] ", t.status),
+                Style::default().fg(status_color),
+            ),
+            Span::styled(
+                &t.title,
+                if i == scroll {
+                    style
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            ),
+            Span::styled(
+                format!("  ({}) @{assignee}", t.priority),
+                Style::default().fg(pri_color),
+            ),
         ]));
         if i == scroll {
             if !t.description.is_empty() {
-                lines.push(Line::from(Span::styled(format!("    {}", t.description), Style::default().fg(Color::Gray))));
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", t.description),
+                    Style::default().fg(Color::Gray),
+                )));
             }
             if let Some(ref result) = t.result {
-                lines.push(Line::from(Span::styled(format!("    result: {result}"), Style::default().fg(Color::Green))));
+                lines.push(Line::from(Span::styled(
+                    format!("    result: {result}"),
+                    Style::default().fg(Color::Green),
+                )));
             }
-            lines.push(Line::from(Span::styled(format!("    by {} | {}", t.created_by, &t.created_at.get(..10).unwrap_or(&t.created_at)), Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    by {} | {}",
+                    t.created_by,
+                    &t.created_at.get(..10).unwrap_or(&t.created_at)
+                ),
+                Style::default().fg(Color::DarkGray),
+            )));
             lines.push(Line::from(""));
         }
     }
