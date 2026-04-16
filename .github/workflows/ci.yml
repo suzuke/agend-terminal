@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, worktree-windows-support-phase-a]
   pull_request:
     branches: [main]
 
@@ -38,3 +38,10 @@ jobs:
       - name: Integration tests
         run: cargo test --test integration
         if: runner.os != 'Windows'
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: agend-terminal-${{ runner.os }}-${{ runner.arch }}
+          path: target/release/agend-terminal
+          retention-days: 14
