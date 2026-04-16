@@ -147,9 +147,7 @@ pub fn run(
     let deregister_name = name.to_string();
     let deregister_home = home.to_path_buf();
     let cleanup = move || {
-        unsafe {
-            nix::libc::kill(child_id as i32, nix::libc::SIGTERM);
-        }
+        crate::process::terminate(child_id);
         let _ = crate::api::call(
             &deregister_home,
             &serde_json::json!({

@@ -155,7 +155,7 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
         let pid_str = entry.file_name().to_string_lossy().to_string();
         if let Ok(pid) = pid_str.parse::<u32>() {
             // Check if PID is alive
-            let alive = unsafe { nix::libc::kill(pid as i32, 0) == 0 };
+            let alive = crate::process::is_pid_alive(pid);
             if !alive {
                 tracing::info!(path = %entry.path().display(), "cleaning stale run dir");
                 let _ = std::fs::remove_dir_all(entry.path());
@@ -208,13 +208,10 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     std::fs::create_dir_all(home)?;
     let lock_path = home.join(".daemon.lock");
     let lock_file = std::fs::File::create(&lock_path)?;
-    use nix::fcntl::{Flock, FlockArg};
-    use std::os::fd::AsFd;
-    let _daemon_lock = Flock::lock(
-        lock_file.as_fd().try_clone_to_owned()?,
-        FlockArg::LockExclusiveNonblock,
-    )
-    .map_err(|(_, e)| anyhow::anyhow!("Another daemon is already running (lock held): {e}"))?;
+    use fs2::FileExt;
+    lock_file
+        .try_lock_exclusive()
+        .map_err(|e| anyhow::anyhow!("Another daemon is already running (lock held): {e}"))?;
 
     // Check for existing daemon (secondary check after lock acquired)
     if let Some(existing) = find_active_run_dir(home) {
@@ -402,7 +399,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         {
             let mut ext = crate::agent::lock_external(&externals);
             ext.retain(|name, handle| {
-                let alive = unsafe { nix::libc::kill(handle.pid as i32, 0) == 0 };
+                let alive = crate::process::is_pid_alive(handle.pid);
                 if !alive {
                     tracing::info!(agent = %name, pid = handle.pid, "external agent gone, deregistering");
                     crate::event_log::log(home, "disconnect", name, "external agent PID gone");

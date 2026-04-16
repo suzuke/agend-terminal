@@ -4,10 +4,16 @@ use std::path::Path;
 /// Claude Code: statusline for session ID capture
 fn generate_claude(working_dir: &Path) -> Result<()> {
     let statusline_path = working_dir.join("statusline.json");
-    let script_path = working_dir.join("statusline.sh");
+    let script_ext = if cfg!(windows) { "cmd" } else { "sh" };
+    let script_path = working_dir.join(format!("statusline.{script_ext}"));
     if !script_path.exists() {
-        let escaped = statusline_path.display().to_string().replace('\'', "'\\''");
-        let script = format!("#!/bin/bash\ncat > '{}'\necho ok\n", escaped);
+        let script = if cfg!(windows) {
+            let escaped = statusline_path.display().to_string().replace('"', "\"\"");
+            format!("@echo off\r\nfindstr \"^\" > \"{escaped}\"\r\necho ok\r\n")
+        } else {
+            let escaped = statusline_path.display().to_string().replace('\'', "'\\''");
+            format!("#!/bin/bash\ncat > '{escaped}'\necho ok\n")
+        };
         std::fs::write(&script_path, &script)?;
         #[cfg(unix)]
         {
@@ -30,10 +36,8 @@ fn generate_claude(working_dir: &Path) -> Result<()> {
 
 /// Codex: auto-trust working directory
 fn codex_trust_directory(dir: &Path) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let config_path = std::path::PathBuf::from(home)
-        .join(".codex")
-        .join("config.toml");
+    let home = crate::user_home_dir();
+    let config_path = home.join(".codex").join("config.toml");
     let content = std::fs::read_to_string(&config_path).unwrap_or_default();
     let dir_str = dir.display().to_string();
     let toml_key = format!("[projects.\"{dir_str}\"]");

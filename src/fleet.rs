@@ -222,7 +222,7 @@ pub struct ResolvedInstance {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    dirs::home_dir()
 }
 
 /// Entry for adding a dynamic instance to fleet.yaml.
@@ -244,7 +244,7 @@ fn atomic_write_yaml(home: &Path, doc: &serde_yaml::Value) -> Result<()> {
 }
 
 /// Acquire the fleet.yaml file lock via flock (auto-released on crash/drop).
-fn acquire_lock(home: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+fn acquire_lock(home: &Path) -> Result<std::fs::File> {
     let lock_path = home.join(".fleet.yaml.lock");
     let f = std::fs::OpenOptions::new()
         .write(true)
@@ -252,9 +252,8 @@ fn acquire_lock(home: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
         .truncate(true)
         .open(&lock_path)
         .context("failed to open lock file")?;
-    nix::fcntl::Flock::lock(f, nix::fcntl::FlockArg::LockExclusive)
-        .map_err(|(_, e)| anyhow::anyhow!("flock failed: {e}"))
-    // Lock auto-released when Flock is dropped
+    fs2::FileExt::lock_exclusive(&f).map_err(|e| anyhow::anyhow!("flock failed: {e}"))?;
+    Ok(f) // Lock released when File is dropped
 }
 
 /// Lock fleet.yaml, parse it, apply a mutation, and atomically write back.

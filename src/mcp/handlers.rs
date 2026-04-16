@@ -505,12 +505,7 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
             let source_path = if source.starts_with('/') || source.starts_with('~') {
                 source
                     .strip_prefix("~/")
-                    .map(|rest| {
-                        format!(
-                            "{}/{rest}",
-                            std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-                        )
-                    })
+                    .map(|rest| format!("{}/{rest}", crate::user_home_dir().display()))
                     .unwrap_or_else(|| source.to_string())
             } else {
                 crate::api::call(&home, &json!({"method": crate::api::method::LIST}))
