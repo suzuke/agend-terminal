@@ -28,6 +28,7 @@ pub enum Action {
     ClosePane,
     CloseTab,
     ToggleZoom,
+    NextLayout,
     RenameTab,
     RenamePane,
     ListTabs,
@@ -140,6 +141,7 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('o') => Action::CycleFocus,
         KeyCode::Char('x') => Action::ClosePane,
         KeyCode::Char('z') => Action::ToggleZoom,
+        KeyCode::Char(' ') => Action::NextLayout,
         KeyCode::Char('.') => Action::RenamePane,
 
         // Directional pane focus
@@ -171,5 +173,6 @@ fn is_repeatable(action: &Action) -> bool {
             | Action::FocusRight
             | Action::NextTab
             | Action::PrevTab
+            | Action::NextLayout
     )
 }

@@ -707,6 +707,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 }
                                 needs_resize = true;
                             }
+                            Action::NextLayout => {
+                                if let Some(tab) = layout.active_tab_mut() {
+                                    tab.next_layout();
+                                }
+                                needs_resize = true;
+                            }
                             Action::None => {}
                         }
                     }
@@ -1597,6 +1603,21 @@ fn execute_command(
                     }
                 }
             }
+        }
+        "layout" => {
+            let Some(tab) = layout.active_tab_mut() else {
+                return false;
+            };
+            let Some(name) = parts.get(1) else {
+                tab.next_layout();
+                return true;
+            };
+            let Some(preset) = crate::layout::LayoutPreset::from_name(name) else {
+                tracing::warn!(name = *name, valid = crate::layout::LayoutPreset::all_names(), "unknown layout preset");
+                return false;
+            };
+            tab.apply_layout(preset);
+            return true;
         }
         "send" => {
             if parts.len() >= 3 && !agent::send_to_registry(registry, "user", parts[1], parts[2]) {

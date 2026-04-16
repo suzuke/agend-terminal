@@ -400,6 +400,15 @@ fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout, telegram: T
         ));
     }
 
+    if let Some(tab) = layout.active_tab() {
+        if let Some(preset) = tab.last_layout {
+            spans.push(Span::styled(
+                format!(" [{}] ", preset.name()),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+
     match telegram {
         TelegramStatus::Connected => {
             spans.push(Span::styled(
@@ -583,6 +592,7 @@ pub fn render_help(frame: &mut Frame) {
         "    Ctrl+B arrows  Directional focus",
         "    Ctrl+B x       Close pane",
         "    Ctrl+B z       Toggle zoom",
+        "    Ctrl+B Space   Next layout preset",
         "    Ctrl+B .       Rename pane",
         "",
         "  Scroll",
@@ -595,6 +605,7 @@ pub fn render_help(frame: &mut Frame) {
         "      :spawn <n> [backend]  New tab",
         "      :vsplit <n> [backend] V-split",
         "      :hsplit <n> [backend] H-split",
+        "      :layout [name]        Arrange panes",
         "      :kill <name>          Kill agent",
         "      :restart [name]       Restart agent",
         "      :send <to> <msg>      Send message",
