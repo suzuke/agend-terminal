@@ -45,6 +45,19 @@ pub fn user_home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
+/// Default shell command used whenever no explicit agent command is given.
+/// Both `/bin/bash` (Unix) and `cmd.exe` (Windows) sit in the default PATH.
+pub fn default_shell() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cmd.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "/bin/bash"
+    }
+}
+
 pub fn home_dir() -> PathBuf {
     if let Ok(home) = std::env::var("AGEND_HOME") {
         return PathBuf::from(home);
@@ -294,7 +307,7 @@ fn main() -> anyhow::Result<()> {
                     &home,
                     vec![(
                         "shell".to_string(),
-                        "/bin/bash".to_string(),
+                        default_shell().to_string(),
                         Vec::new(),
                         None,
                         None,
@@ -307,7 +320,7 @@ fn main() -> anyhow::Result<()> {
             let agents: Vec<_> = if agents.is_empty() {
                 vec![(
                     "shell".into(),
-                    "/bin/bash".into(),
+                    default_shell().into(),
                     Vec::new(),
                     None,
                     None,

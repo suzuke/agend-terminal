@@ -273,7 +273,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             &registry,
             &home,
             "shell",
-            &std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string()),
+            &std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string()),
             &[],
             None,
             &HashMap::new(),
@@ -1051,7 +1051,8 @@ fn pane_from_menu_item(
 ) -> Result<Pane> {
     match item.kind {
         MenuItemKind::Shell => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let shell =
+                std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string());
             create_pane(
                 layout,
                 registry,
@@ -2008,7 +2009,8 @@ fn restore_node_reconciled(
                 }
                 None => {
                     // Shell pane — recreate fresh
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+                    let shell = std::env::var("SHELL")
+                        .unwrap_or_else(|_| crate::default_shell().to_string());
                     let mut pane = create_pane(
                         layout,
                         registry,
