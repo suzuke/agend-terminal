@@ -235,7 +235,7 @@ pub(super) fn restore_with_reconciliation(
 
     // No session.json or empty → rule 1: auto-start fleet
     if !fleet_names.is_empty() {
-        return super::auto_start_fleet(
+        return super::api_server::auto_start_fleet(
             fleet_path,
             layout,
             registry,
