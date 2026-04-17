@@ -834,7 +834,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                             hit.dir,
                                         );
                                     }
-                                    needs_resize = true;
+                                    // Don't fire PTY resize per-tick: the render
+                                    // loop recomputes pane_rects from the updated
+                                    // ratio so the drag is visually smooth, but
+                                    // resizing the PTY every mouse cell triggers
+                                    // the backend (Claude/etc.) to reflow its
+                                    // entire UI and floods us with redraw data.
+                                    // Defer the single PTY resize to mouse-up.
                                 } else if layout.active_tab().is_some_and(|t| t.dragging_pane.is_some()) {
                                     let target = layout.active_tab().and_then(|tab| {
                                         let source = tab.dragging_pane?;
@@ -851,6 +857,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                                 if border_drag.is_some() {
                                     border_drag = None;
+                                    // Ratio was updated live during drag but
+                                    // PTY resizes were deferred — fire one now.
+                                    needs_resize = true;
                                 } else if layout.active_tab().is_some_and(|t| t.dragging_pane.is_some()) {
                                     let source_id = layout.active_tab().and_then(|t| t.dragging_pane);
                                     let target_id = layout.active_tab().and_then(|t| t.drag_target);

@@ -528,8 +528,9 @@ pub fn render_rename(frame: &mut Frame, input: &str) {
         ));
     let inner = block.inner(ra);
     frame.render_widget(block, ra);
+    // Use the real terminal cursor; don't print a literal '_'.
     frame.render_widget(
-        Paragraph::new(format!("{input}_")).style(Style::default().fg(Color::White)),
+        Paragraph::new(input.to_string()).style(Style::default().fg(Color::White)),
         inner,
     );
     let cursor_x = inner.x + input.width() as u16;
@@ -624,7 +625,8 @@ pub fn render_help(frame: &mut Frame) {
         "    Ctrl+B %       Split vertical",
         "    Ctrl+B o       Cycle pane focus",
         "    Ctrl+B arrows  Directional focus",
-        "    Ctrl+B A-arrow Resize pane",
+        "    Ctrl+B A-arrow Resize pane (Alt-arrow)",
+        "    Ctrl+B H/J/K/L Resize pane (portable)",
         "    Drag border    Resize pane",
         "    Drag title     Swap pane position",
         "    Ctrl+B x       Close pane",
@@ -739,8 +741,10 @@ pub fn render_command_palette(frame: &mut Frame, input: &str) {
         ));
     let inner = block.inner(ra);
     frame.render_widget(block, ra);
+    // Use the real terminal cursor for insertion point; don't print a literal
+    // '_' after the input or it shows as a phantom character next to the cursor.
     frame.render_widget(
-        Paragraph::new(format!(":{input}_")).style(Style::default().fg(Color::White)),
+        Paragraph::new(format!(":{input}")).style(Style::default().fg(Color::White)),
         inner,
     );
     let cursor_x = inner.x + 1 + input.width() as u16;

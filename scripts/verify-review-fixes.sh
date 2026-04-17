@@ -176,6 +176,45 @@ fi
 green "  ok ($(echo $CMDS | wc -w | tr -d ' ') commands, all documented)"
 
 # ---------------------------------------------------------------------------
+# Round E: interactive polish from real-run feedback
+#   (1) drag smoothness (defer PTY resize to mouse-up)
+#   (2) no phantom '_' in input overlays
+#   (3) portable H/J/K/L resize keys
+# ---------------------------------------------------------------------------
+info "Round E — border drag defers PTY resize until mouse-up"
+# The Drag branch for border_drag must NOT set needs_resize = true; the Up
+# branch for border_drag must set it. Verify both structurally.
+DRAG_BLOCK=$(awk '/if let Some\(\(ref hit, ref pa\)\) = border_drag \{/,/\}[[:space:]]*else if layout\.active_tab/' src/app.rs | head -40)
+if echo "$DRAG_BLOCK" | grep -q "needs_resize = true"; then
+    fail "border_drag Drag branch must not set needs_resize (causes PTY thrash)"
+fi
+# Up branch: first clause after border_drag.is_some() should set needs_resize.
+UP_BLOCK=$(awk '/if border_drag\.is_some\(\) \{/,/\} else if layout\.active_tab\(\)\.is_some_and\(\|t\| t\.dragging_pane/' src/app.rs)
+if ! echo "$UP_BLOCK" | grep -q "needs_resize = true"; then
+    fail "border_drag Up branch must set needs_resize = true (deferred resize)"
+fi
+green "  ok"
+
+info "Round E — no phantom '_' in Command / Rename overlays"
+# The literal format!("...{input}_") pattern was leaking as a visual character
+# alongside the real terminal cursor.
+if grep -nE 'format!\("[^"]*\{input\}_"' src/render.rs; then
+    fail "render.rs still has format!(\"...{input}_\") that prints a phantom underscore"
+fi
+green "  ok"
+
+info "Round E — portable H/J/K/L resize fallback present"
+for k in "KeyCode::Char('H') => Action::ResizeLeft" \
+         "KeyCode::Char('J') => Action::ResizeDown" \
+         "KeyCode::Char('K') => Action::ResizeUp" \
+         "KeyCode::Char('L') => Action::ResizeRight"; do
+    if ! grep -qF "$k" src/keybinds.rs; then
+        fail "missing portable resize binding: $k"
+    fi
+done
+green "  ok"
+
+# ---------------------------------------------------------------------------
 # Build + tests
 # ---------------------------------------------------------------------------
 info "cargo build"
