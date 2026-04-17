@@ -1260,4 +1260,144 @@ mod tests {
         // Mixed
         assert_eq!(UnicodeWidthStr::width("a代") as u16, 3);
     }
+
+    // --- Tab / Layout mutation tests ---
+    //
+    // The helper below builds a minimal Pane that is cheap to construct and
+    // does not drive any PTY. Callers that need the pane to count as an agent
+    // (e.g. agent_count) should override `backend` via `leaf_agent`.
+
+    fn leaf(id: usize, name: &str) -> Pane {
+        Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam::channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            selection: None,
+        }
+    }
+
+    fn leaf_agent(id: usize, name: &str) -> Pane {
+        let mut p = leaf(id, name);
+        p.backend = Some(Backend::ClaudeCode);
+        p
+    }
+
+    #[test]
+    fn pane_count_and_agent_count_across_split() {
+        // Tab with one agent + one shell, split-right. pane_count counts all
+        // leaves; agent_count counts only panes whose backend is Some.
+        let mut tab = Tab::new("mixed".to_string(), leaf_agent(1, "alice"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "shell")));
+        assert_eq!(tab.root().pane_count(), 2);
+        assert_eq!(tab.root().agent_count(), 1);
+    }
+
+    #[test]
+    fn close_focused_updates_focus_to_sibling() {
+        // Closing the focused pane must move focus_id to the remaining pane
+        // so subsequent actions target a real pane (not a stale id).
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        // After split_focused, focus_id still points at pane 1.
+        assert_eq!(tab.focus_id, 1);
+        let removed = tab.close_focused();
+        assert_eq!(removed.as_deref(), Some("a"));
+        assert_eq!(tab.root().pane_count(), 1);
+        assert_eq!(tab.focus_id, 2, "focus must move to surviving pane");
+    }
+
+    #[test]
+    fn close_pane_by_id_returns_none_when_last() {
+        // A tab with a single pane cannot close its last pane — the caller
+        // should close the tab instead.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "only"));
+        assert!(tab.close_pane_by_id(1).is_none());
+        assert_eq!(tab.root().pane_count(), 1);
+    }
+
+    #[test]
+    fn cycle_focus_wraps_around_three_panes() {
+        // With 3 panes, three cycles return focus to the origin.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(3, "c")));
+        let start = tab.focus_id;
+        tab.cycle_focus();
+        tab.cycle_focus();
+        tab.cycle_focus();
+        assert_eq!(tab.focus_id, start);
+    }
+
+    #[test]
+    fn apply_layout_even_horizontal_preserves_pane_count() {
+        // Rebuilding a tree from a preset must not lose panes, and must reset
+        // pane_rects (cached hit-test data is stale after re-tile).
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert!(tab.split_focused(SplitDir::Horizontal, leaf(3, "c")));
+        tab.pane_rects.insert(1, (0, 0, 10, 10));
+        tab.apply_layout(LayoutPreset::EvenHorizontal);
+        assert_eq!(tab.root().pane_count(), 3);
+        assert_eq!(tab.last_layout, Some(LayoutPreset::EvenHorizontal));
+        assert!(tab.pane_rects.is_empty(), "pane_rects must be cleared");
+    }
+
+    #[test]
+    fn next_layout_cycles_from_none_to_even_horizontal() {
+        // First next_layout call (with last_layout = None) must land on
+        // EvenHorizontal — the start of the cycle.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert!(tab.last_layout.is_none());
+        tab.next_layout();
+        assert_eq!(tab.last_layout, Some(LayoutPreset::EvenHorizontal));
+    }
+
+    #[test]
+    fn layout_next_tab_wraps_at_boundary() {
+        // next_tab from the last tab wraps to the first.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t1".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("t2".to_string(), leaf(2, "b")));
+        layout.add_tab(Tab::new("t3".to_string(), leaf(3, "c")));
+        assert_eq!(layout.active, 2, "add_tab switches to new tab");
+        layout.next_tab();
+        assert_eq!(layout.active, 0, "wrap from last to first");
+    }
+
+    #[test]
+    fn swap_panes_across_nested_split() {
+        // Build a tree where the two panes to swap live under different
+        // sub-splits, forcing find_two_panes to recurse into (true, true) /
+        // (false, false) branches. swap_panes uses mem::swap so the whole
+        // Pane (id included) travels: post-swap, the two physical positions
+        // hold each other's ids.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        tab.focus_id = 1;
+        assert!(tab.split_focused(SplitDir::Horizontal, leaf(3, "c")));
+        tab.focus_id = 2;
+        assert!(tab.split_focused(SplitDir::Horizontal, leaf(4, "d")));
+
+        let pre = tab.root().pane_ids();
+        let first_id = pre[0];
+        let last_id = *pre.last().expect("non-empty");
+        assert!(swap_panes(tab.root_mut(), first_id, last_id));
+
+        let post = tab.root().pane_ids();
+        assert_eq!(post.len(), pre.len(), "no panes lost");
+        assert_eq!(post[0], last_id, "first slot now holds the last pane");
+        assert_eq!(
+            *post.last().expect("non-empty"),
+            first_id,
+            "last slot now holds the first pane"
+        );
+    }
 }
