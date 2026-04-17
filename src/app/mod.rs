@@ -4,6 +4,7 @@
 //! same PTY lifecycle as the daemon: auto-dismiss, state tracking, broadcast.
 
 mod session;
+mod telegram_hooks;
 
 use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
@@ -269,7 +270,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 .collect();
             match crate::telegram::init_from_config(config, &home, submit_keys) {
                 Some(state) => (Some(state), render::TelegramStatus::Connected),
-                None => (None, telegram_status_from_config(config)),
+                None => (None, telegram_hooks::telegram_status_from_config(config)),
             }
         } else {
             (None, render::TelegramStatus::NotConfigured)
@@ -371,7 +372,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                         item, &fleet_path, &mut layout, &registry, &home,
                                                         pc, pr, &wakeup_tx, &mut name_counter,
                                                     ) {
-                                                        maybe_create_telegram_topic(&telegram_state, &registry, &home, &pane);
+                                                        telegram_hooks::maybe_create_telegram_topic(&telegram_state, &registry, &home, &pane);
                                                         let tab_name = pane.agent_name.clone();
                                                         layout.add_tab(Tab::new(tab_name, pane));
                                                         needs_resize = true;
@@ -402,7 +403,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                         pc, pr, &wakeup_tx, &mut name_counter,
                                                     ) {
                                                         Ok(p) => {
-                                                            maybe_create_telegram_topic(&telegram_state, &registry, &home, &p);
+                                                            telegram_hooks::maybe_create_telegram_topic(&telegram_state, &registry, &home, &p);
                                                             if let Some(tab) = layout.active_tab_mut() {
                                                                 tab.split_focused(split_dir, p);
                                                             }
@@ -472,7 +473,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                                 .and_then(|p| p.fleet_instance_name.clone())))
                                                         .collect();
                                                     for fname in &fleet_names {
-                                                        maybe_delete_telegram_topic(&telegram_state, &home, fname);
+                                                        telegram_hooks::maybe_delete_telegram_topic(&telegram_state, &home, fname);
                                                     }
                                                     if !fleet_names.is_empty() {
                                                         let _ = crate::fleet::remove_instances_from_yaml(&home, &fleet_names);
@@ -489,7 +490,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                                 let fid = tab.focus_id;
                                                 if let Some(pane) = tab.root().find_pane(fid) {
                                                     if let Some(ref fleet_name) = pane.fleet_instance_name {
-                                                        maybe_delete_telegram_topic(&telegram_state, &home, fleet_name);
+                                                        telegram_hooks::maybe_delete_telegram_topic(&telegram_state, &home, fleet_name);
                                                         let _ = crate::fleet::remove_instance_from_yaml(&home, fleet_name);
                                                     }
                                                 }
@@ -1351,87 +1352,6 @@ fn create_pane_from_resolved(
     Ok(pane)
 }
 
-/// Derive Telegram status from an already-loaded FleetConfig (no disk I/O).
-fn telegram_status_from_config(config: &crate::fleet::FleetConfig) -> render::TelegramStatus {
-    match config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram {
-            ref bot_token_env, ..
-        }) => {
-            if std::env::var(bot_token_env).is_ok() {
-                render::TelegramStatus::Connected
-            } else {
-                render::TelegramStatus::NoToken
-            }
-        }
-        None => render::TelegramStatus::NotConfigured,
-    }
-}
-
-/// Create a Telegram topic for a newly spawned fleet instance (non-blocking).
-/// Spawns a background thread for the Telegram API call to avoid freezing the TUI.
-fn maybe_create_telegram_topic(
-    tg: &Option<Arc<Mutex<crate::telegram::TelegramState>>>,
-    registry: &AgentRegistry,
-    home: &Path,
-    pane: &Pane,
-) {
-    let Some(tg) = tg else { return };
-    let Some(fleet_name) = &pane.fleet_instance_name else {
-        return;
-    };
-    {
-        let s = crate::telegram::lock_state(tg);
-        if s.instance_to_topic.contains_key(fleet_name) {
-            return;
-        }
-    }
-    let submit_key = {
-        let reg = agent::lock_registry(registry);
-        reg.get(&pane.agent_name)
-            .map(|h| h.submit_key.clone())
-            .unwrap_or_else(|| "\r".to_string())
-    };
-    let tg = Arc::clone(tg);
-    let home = home.to_path_buf();
-    let fleet_name = fleet_name.clone();
-    std::thread::spawn(move || {
-        match crate::telegram::create_topic_for_instance(&home, &fleet_name) {
-            Some(tid) => {
-                let mut s = crate::telegram::lock_state(&tg);
-                s.instance_to_topic.insert(fleet_name.clone(), tid);
-                s.topic_to_instance.insert(tid, fleet_name.clone());
-                s.submit_keys.insert(fleet_name, submit_key);
-            }
-            None => tracing::warn!(%fleet_name, "failed to create Telegram topic"),
-        }
-    });
-}
-
-/// Delete Telegram topic for a fleet instance (non-blocking).
-/// State is updated immediately; the Telegram API call runs on a background thread.
-fn maybe_delete_telegram_topic(
-    tg: &Option<Arc<Mutex<crate::telegram::TelegramState>>>,
-    home: &Path,
-    fleet_name: &str,
-) {
-    let Some(tg) = tg else { return };
-    let tid = {
-        let mut s = crate::telegram::lock_state(tg);
-        match s.instance_to_topic.remove(fleet_name) {
-            Some(tid) => {
-                s.topic_to_instance.remove(&tid);
-                s.submit_keys.remove(fleet_name);
-                tid
-            }
-            None => return,
-        }
-    };
-    let home = home.to_path_buf();
-    std::thread::spawn(move || {
-        crate::telegram::delete_topic(&home, tid);
-    });
-}
-
 /// Resolve a backend command string into (command, args, submit_key).
 /// If `fresh` is true, uses fresh_args (no resume) when available.
 fn resolve_backend(backend_name: &str, fresh: bool) -> (String, Vec<String>, String) {
@@ -1523,7 +1443,12 @@ fn execute_command(
             };
             match pane_result {
                 Ok(pane) => {
-                    maybe_create_telegram_topic(telegram_state, registry, home, &pane);
+                    telegram_hooks::maybe_create_telegram_topic(
+                        telegram_state,
+                        registry,
+                        home,
+                        &pane,
+                    );
                     match parts[0] {
                         "vsplit" => {
                             if let Some(tab) = layout.active_tab_mut() {
@@ -1550,7 +1475,7 @@ fn execute_command(
         "kill" => {
             if let Some(name) = parts.get(1) {
                 if let Some(fleet_name) = lookup_fleet_name(layout, name) {
-                    maybe_delete_telegram_topic(telegram_state, home, &fleet_name);
+                    telegram_hooks::maybe_delete_telegram_topic(telegram_state, home, &fleet_name);
                     let _ = crate::fleet::remove_instance_from_yaml(home, &fleet_name);
                 }
                 kill_agent(registry, name);
