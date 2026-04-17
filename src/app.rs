@@ -760,36 +760,41 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                         None => {}
                                     }
                                 } else {
-                                    // Check for border hit before starting text selection
+                                    // Title-bar hit is checked before split-border so that
+                                    // horizontally-stacked panes (whose top border coincides
+                                    // with the split line) can be grabbed for drag-to-swap.
+                                    // Horizontal-split borders must be resized via keyboard.
                                     let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
                                     let pa = Rect::new(0, 1, c, r.saturating_sub(2));
-                                    let hit = layout.active_tab().and_then(|tab| {
-                                        crate::layout::find_split_border(
-                                            tab.root(),
-                                            (pa.x, pa.y, pa.width, pa.height),
-                                            mouse.column,
-                                            mouse.row,
-                                        )
-                                    });
-                                    if let Some(h) = hit {
-                                        border_drag = Some((h, pa));
-                                    } else if !layout.active_tab().is_some_and(|t| t.zoomed) {
-                                        let title_hit = layout
-                                            .active_tab()
-                                            .and_then(|tab| tab.title_bar_at(mouse.column, mouse.row));
-                                        if let Some(pane_id) = title_hit {
-                                            if let Some(tab) = layout.active_tab_mut() {
-                                                tab.focus_id = pane_id;
-                                                tab.dragging_pane = Some(pane_id);
-                                                tab.drag_target = None;
-                                            }
+                                    let zoomed = layout.active_tab().is_some_and(|t| t.zoomed);
+                                    let title_hit = (!zoomed)
+                                        .then(|| {
+                                            layout
+                                                .active_tab()
+                                                .and_then(|tab| tab.title_bar_at(mouse.column, mouse.row))
+                                        })
+                                        .flatten();
+                                    if let Some(pane_id) = title_hit {
+                                        if let Some(tab) = layout.active_tab_mut() {
+                                            tab.focus_id = pane_id;
+                                            tab.dragging_pane = Some(pane_id);
+                                            tab.drag_target = None;
+                                        }
+                                    } else {
+                                        let hit = layout.active_tab().and_then(|tab| {
+                                            crate::layout::find_split_border(
+                                                tab.root(),
+                                                (pa.x, pa.y, pa.width, pa.height),
+                                                mouse.column,
+                                                mouse.row,
+                                            )
+                                        });
+                                        if let Some(h) = hit {
+                                            border_drag = Some((h, pa));
                                         } else {
                                             handle_mouse_selection(&mut layout, &mouse);
                                             clear_selection_cache(&mut layout);
                                         }
-                                    } else {
-                                        handle_mouse_selection(&mut layout, &mouse);
-                                        clear_selection_cache(&mut layout);
                                     }
                                 }
                             }

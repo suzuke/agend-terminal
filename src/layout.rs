@@ -531,11 +531,12 @@ pub fn resize_focused(
                     | (SplitDir::Horizontal, Direction::Up | Direction::Down)
             );
             if dir_matches {
+                // Absolute direction: Right/Down pushes the split boundary
+                // right/down regardless of which side is focused (tmux-style).
                 let delta = match dir {
                     Direction::Right | Direction::Down => step,
                     Direction::Left | Direction::Up => -step,
                 };
-                let delta = if second_has { -delta } else { delta };
                 *ratio = (*ratio + delta).clamp(MIN_RATIO, MAX_RATIO);
                 return true;
             }
@@ -830,12 +831,26 @@ impl Tab {
             .map(|(&id, _)| id)
     }
 
-    /// Pane ID whose top border row contains (col, row), if any.
+    /// Pane ID whose title-text region contains (col, row), if any.
+    /// Title occupies columns [px+1, px+1+label_len+2) — matches the ` {label} `
+    /// rendering in render_pane. Agent state suffix (` [state] `) is excluded so
+    /// that clicks on it fall through to split-border resize.
     pub fn title_bar_at(&self, col: u16, row: u16) -> Option<usize> {
-        self.pane_rects
-            .iter()
-            .find(|(_, &(px, py, pw, _ph))| row == py && col >= px && col < px + pw)
-            .map(|(&id, _)| id)
+        for (&id, &(px, py, pw, _ph)) in &self.pane_rects {
+            if row != py {
+                continue;
+            }
+            let Some(pane) = self.root().find_pane(id) else {
+                continue;
+            };
+            let title_width = pane.label().chars().count() as u16 + 2;
+            let start = px + 1;
+            let end = (start + title_width).min(px + pw);
+            if col >= start && col < end {
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Reset both drag fields after a title-bar drag completes or aborts.
