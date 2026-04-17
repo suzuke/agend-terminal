@@ -732,7 +732,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 };
                                 if let Some(tab) = layout.active_tab_mut() {
                                     let focus = tab.focus_id;
-                                    crate::layout::resize_focused(tab.root_mut(), focus, dir, 0.05);
+                                    // Pane tree occupies terminal height minus
+                                    // the tab bar row and status bar row (see
+                                    // render::render_app chrome layout).
+                                    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+                                    let area = (0, 1, cols, rows.saturating_sub(2));
+                                    crate::layout::resize_focused(tab.root_mut(), area, focus, dir, 0.05);
                                 }
                                 needs_resize = true;
                             }

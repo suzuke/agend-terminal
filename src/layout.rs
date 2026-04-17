@@ -3,6 +3,7 @@
 use crate::backend::Backend;
 use crate::vterm::VTerm;
 use std::path::PathBuf;
+use unicode_width::UnicodeWidthStr;
 
 /// A single pane displaying one agent's terminal output.
 /// PTY ownership is in AgentRegistry — pane only has subscriber channel + local VTerm.
@@ -85,8 +86,24 @@ pub enum PaneNode {
 }
 
 const DEFAULT_RATIO: f32 = 0.5;
-const MIN_RATIO: f32 = 0.1;
-const MAX_RATIO: f32 = 0.9;
+
+/// Minimum cells (columns or rows) required per pane child to remain usable.
+/// All ratio clamps derive from this so the bounds scale with terminal size —
+/// a 400-cell area allows near-full drag range, while a 10-cell area still
+/// guarantees both sides are visible.
+const MIN_PANE_CELLS: u16 = 3;
+
+/// Valid ratio bounds for a split of `total` cells. Returns `(min, max)` such
+/// that both children end up with ≥ MIN_PANE_CELLS. When `total` is too small
+/// to honor both minimums, returns `(0.5, 0.5)` — callers should avoid
+/// splitting such tiny areas in the first place.
+fn ratio_bounds(total: u16) -> (f32, f32) {
+    if total < 2 * MIN_PANE_CELLS {
+        return (0.5, 0.5);
+    }
+    let min = MIN_PANE_CELLS as f32 / total as f32;
+    (min, 1.0 - min)
+}
 
 impl PaneNode {
     pub fn pane_ids(&self) -> Vec<usize> {
@@ -407,12 +424,18 @@ fn build_preset(panes: Vec<Pane>, preset: LayoutPreset) -> PaneNode {
 
 // --- Split border hit-test and resize ---
 
-/// Convert a ratio to a pixel size, clamped to [1, total-1] so both children
-/// always have at least 1 cell.
+/// Convert a stored ratio to a cell size. Self-corrects when `total` changed
+/// since the ratio was set (e.g. terminal resize) by re-clamping to the bounds
+/// valid for the current `total`. For `total < 2`, returns `total / 2`; the
+/// caller shouldn't be splitting such an area, but we degrade gracefully
+/// instead of panicking.
 pub fn ratio_to_size(ratio: f32, total: u16) -> u16 {
-    ((ratio * total as f32).round() as u16)
-        .max(1)
-        .min(total.saturating_sub(1))
+    if total < 2 {
+        return total / 2;
+    }
+    let (lo, hi) = ratio_bounds(total);
+    let clamped = ratio.clamp(lo, hi);
+    ((clamped * total as f32).round() as u16).clamp(1, total - 1)
 }
 
 /// Compute the (first, second) child areas of a split.
@@ -496,7 +519,8 @@ pub fn adjust_split_ratio(
                 };
                 if total > 1 {
                     let new_ratio = (mouse_pos.saturating_sub(start) as f32) / (total as f32);
-                    *ratio = new_ratio.clamp(MIN_RATIO, MAX_RATIO);
+                    let (lo, hi) = ratio_bounds(total);
+                    *ratio = new_ratio.clamp(lo, hi);
                 }
                 return true;
             }
@@ -510,9 +534,12 @@ pub fn adjust_split_ratio(
 }
 
 /// Adjust the split ratio containing the focused pane in a given direction.
-/// `step` is the ratio delta (positive = grow first child).
+/// `step` is the ratio delta (positive = grow first child). `area` is the
+/// rect enclosing `node`; it's tracked through recursion so the final clamp
+/// uses bounds derived from the target split's actual cell count.
 pub fn resize_focused(
     node: &mut PaneNode,
+    area: (u16, u16, u16, u16),
     focus_id: usize,
     dir: Direction,
     step: f32,
@@ -526,7 +553,7 @@ pub fn resize_focused(
                 return false;
             }
             let dir_matches = matches!(
-                (split_dir, dir),
+                (*split_dir, dir),
                 (SplitDir::Vertical, Direction::Left | Direction::Right)
                     | (SplitDir::Horizontal, Direction::Up | Direction::Down)
             );
@@ -537,14 +564,20 @@ pub fn resize_focused(
                     Direction::Right | Direction::Down => step,
                     Direction::Left | Direction::Up => -step,
                 };
-                *ratio = (*ratio + delta).clamp(MIN_RATIO, MAX_RATIO);
+                let total = match *split_dir {
+                    SplitDir::Horizontal => area.3,
+                    SplitDir::Vertical => area.2,
+                };
+                let (lo, hi) = ratio_bounds(total);
+                *ratio = (*ratio + delta).clamp(lo, hi);
                 return true;
             }
-            // Recurse into the child containing focus
+            // Recurse into the child containing focus, tracking its area.
+            let (first_area, second_area) = split_child_areas(area, *split_dir, *ratio);
             if first_has {
-                resize_focused(first, focus_id, dir, step)
+                resize_focused(first, first_area, focus_id, dir, step)
             } else {
-                resize_focused(second, focus_id, dir, step)
+                resize_focused(second, second_area, focus_id, dir, step)
             }
         }
     }
@@ -843,7 +876,9 @@ impl Tab {
             let Some(pane) = self.root().find_pane(id) else {
                 continue;
             };
-            let title_width = pane.label().chars().count() as u16 + 2;
+            // Rendered title is ` {label} ` — measure with terminal cell
+            // width (not char count) so CJK / emoji labels hit correctly.
+            let title_width = UnicodeWidthStr::width(pane.label()) as u16 + 2;
             let start = px + 1;
             let end = (start + title_width).min(px + pw);
             if col >= start && col < end {
@@ -949,5 +984,87 @@ impl Layout {
             self.active = self.tabs.len() - 1;
         }
         Some(tab)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- ratio_bounds invariants (covers Round A #3 + #6) ---
+
+    #[test]
+    fn ratio_bounds_symmetric_when_room() {
+        let (lo, hi) = ratio_bounds(100);
+        assert!((lo + hi - 1.0).abs() < f32::EPSILON, "bounds should be symmetric");
+    }
+
+    #[test]
+    fn ratio_bounds_degenerate_when_tiny() {
+        // total < 2 * MIN_PANE_CELLS — no valid split honoring both minimums
+        assert_eq!(ratio_bounds(5), (0.5, 0.5));
+        assert_eq!(ratio_bounds(0), (0.5, 0.5));
+    }
+
+    #[test]
+    fn ratio_bounds_min_cells_enforced() {
+        let (lo, _) = ratio_bounds(30);
+        // first child at lo ratio ≈ 3 cells (MIN_PANE_CELLS)
+        let first = (lo * 30.0).round() as u16;
+        assert_eq!(first, MIN_PANE_CELLS);
+    }
+
+    // --- ratio_to_size guarantees (covers #3) ---
+
+    #[test]
+    fn ratio_to_size_no_zero_when_room() {
+        // For any ratio in [0.0, 1.0] and total ≥ 2 * MIN_PANE_CELLS,
+        // both sides get ≥ MIN_PANE_CELLS.
+        for total in [6u16, 10, 40, 100, 500] {
+            for ratio_int in 0..=100 {
+                let r = ratio_int as f32 / 100.0;
+                let first = ratio_to_size(r, total);
+                let second = total - first;
+                assert!(
+                    first >= MIN_PANE_CELLS && second >= MIN_PANE_CELLS,
+                    "total={total} ratio={r} -> first={first} second={second}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ratio_to_size_degenerate_does_not_panic() {
+        // total < 2: degrade gracefully instead of panicking
+        assert_eq!(ratio_to_size(0.5, 0), 0);
+        assert_eq!(ratio_to_size(0.5, 1), 0);
+    }
+
+    #[test]
+    fn ratio_to_size_sum_matches_total() {
+        // split_child_areas relies on second = total - first; verify no drift.
+        for total in [2u16, 3, 10, 100, 1000] {
+            for ratio_int in [0, 25, 50, 75, 100] {
+                let r = ratio_int as f32 / 100.0;
+                let first = ratio_to_size(r, total);
+                assert!(first <= total, "first={first} > total={total}");
+            }
+        }
+    }
+
+    // --- Unicode title hit-test (covers #4) ---
+    //
+    // title_bar_at uses UnicodeWidthStr::width for the label, matching the
+    // rendered ` {label} ` width. We test the width calc directly since
+    // building a full Tab with Pane requires a VTerm + agent registry.
+
+    #[test]
+    fn unicode_width_for_title_matches_terminal_cells() {
+        // ASCII: 1 cell per char
+        assert_eq!(UnicodeWidthStr::width("alice") as u16, 5);
+        // CJK: 2 cells per char
+        assert_eq!(UnicodeWidthStr::width("代理") as u16, 4);
+        // Mixed
+        assert_eq!(UnicodeWidthStr::width("a代") as u16, 3);
     }
 }
