@@ -234,6 +234,12 @@ impl StatePatterns {
                 // [measured] Full ready prompt + YOLO mode
                 (AgentState::Ready, r"Type your message|YOLO"),
             ],
+            // Non-preset backends have no state-detection heuristics — pane
+            // stays in whatever state the generic output pipeline sets. These
+            // variants should never reach here in normal flow (state machine
+            // is gated on preset variants today), but keep the match
+            // exhaustive so we fail loudly if a caller does route them here.
+            Backend::Shell | Backend::Raw(_) => vec![],
         };
 
         let compiled: Vec<_> = patterns

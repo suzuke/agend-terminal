@@ -307,7 +307,10 @@ pub fn configure(working_dir: &Path, command: &str) {
         Some(crate::backend::Backend::Gemini) => configure_gemini(working_dir),
         Some(crate::backend::Backend::OpenCode) => configure_opencode(working_dir),
         Some(crate::backend::Backend::Codex) => configure_codex(working_dir),
-        None => return,
+        // Non-preset backends (Shell, Raw) have no MCP wiring.
+        Some(crate::backend::Backend::Shell) | Some(crate::backend::Backend::Raw(_)) | None => {
+            return
+        }
     };
 
     if let Err(e) = result {

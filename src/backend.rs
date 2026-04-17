@@ -1,20 +1,88 @@
 //! Backend presets for CLI agent tools.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Known backend presets. Serde names match the actual CLI command.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Everything that can run in a pane. Serialized as a bare YAML/JSON string:
+/// known presets by their canonical name (`claude`, `kiro-cli`, ...), generic
+/// shells as `shell`, and anything else round-trips as the literal command
+/// string.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Backend {
-    #[serde(rename = "claude", alias = "claude-code")]
     ClaudeCode,
-    #[serde(rename = "kiro-cli", alias = "kiro")]
     KiroCli,
-    #[serde(rename = "codex", alias = "codex-cli")]
     Codex,
-    #[serde(rename = "opencode", alias = "opencode-cli")]
     OpenCode,
-    #[serde(rename = "gemini", alias = "gemini-cli")]
     Gemini,
+    /// Generic shell (bash/zsh/sh). No preset wiring — inject/ready/resume are
+    /// all no-ops. Command defaults to `$SHELL` or `/bin/sh`.
+    Shell,
+    /// Arbitrary executable path. No preset behavior; the stored string is the
+    /// command to spawn verbatim.
+    Raw(String),
+}
+
+impl Backend {
+    /// Parse a bare string form (yaml scalar or MCP tool argument).
+    /// Known names → preset variants; shell aliases → [`Backend::Shell`];
+    /// anything else becomes [`Backend::Raw`].
+    pub fn parse_str(s: &str) -> Backend {
+        let trimmed = s.trim();
+        let lower = trimmed.to_lowercase();
+        match lower.as_str() {
+            "claude" | "claude-code" => Backend::ClaudeCode,
+            "kiro-cli" | "kiro" => Backend::KiroCli,
+            "codex" | "codex-cli" => Backend::Codex,
+            "opencode" | "opencode-cli" => Backend::OpenCode,
+            "gemini" | "gemini-cli" => Backend::Gemini,
+            "shell" | "bash" | "zsh" | "sh" => Backend::Shell,
+            _ => Backend::Raw(trimmed.to_string()),
+        }
+    }
+
+    /// Canonical string form (inverse of [`parse_str`]). For [`Backend::Raw`]
+    /// returns the stored command verbatim.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Backend::ClaudeCode => "claude",
+            Backend::KiroCli => "kiro-cli",
+            Backend::Codex => "codex",
+            Backend::OpenCode => "opencode",
+            Backend::Gemini => "gemini",
+            Backend::Shell => "shell",
+            Backend::Raw(s) => s.as_str(),
+        }
+    }
+
+    /// Actual command path to spawn. For [`Backend::Shell`] resolves to
+    /// `$SHELL` (with `/bin/sh` as fallback). For [`Backend::Raw`] returns the
+    /// literal stored path. For presets returns the static preset command.
+    #[allow(dead_code)] // Call sites migrate in follow-up commits.
+    pub fn command_string(&self) -> String {
+        match self {
+            Backend::ClaudeCode
+            | Backend::KiroCli
+            | Backend::Codex
+            | Backend::OpenCode
+            | Backend::Gemini => self.preset().command.to_string(),
+            Backend::Shell => {
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+            }
+            Backend::Raw(path) => path.clone(),
+        }
+    }
+}
+
+impl Serialize for Backend {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Backend {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        Ok(Backend::parse_str(&s))
+    }
 }
 
 /// How to resume a previous session.
@@ -227,6 +295,26 @@ impl Backend {
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
             },
+            // Shell and Raw have no preset behavior. `command` is `""` as a
+            // sentinel — callers that need the actual spawn path should use
+            // [`Backend::command_string`], which resolves Shell to `$SHELL`
+            // and Raw to its stored path.
+            Backend::Shell | Backend::Raw(_) => BackendPreset {
+                command: "",
+                args: &[],
+                ready_pattern: "",
+                submit_key: "\r",
+                inject_prefix: "",
+                typed_inject: false,
+                resume_mode: ResumeMode::NotSupported,
+                quit_command: "exit",
+                instructions_path: "",
+                instructions_shared: false,
+                inject_instructions_on_ready: false,
+                ready_timeout_secs: 10,
+                dismiss_patterns: &[],
+                fresh_args: None,
+            },
         }
     }
 
@@ -274,15 +362,10 @@ impl Backend {
         }
     }
 
-    /// Display name matching the CLI command.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Backend::ClaudeCode => "claude",
-            Backend::KiroCli => "kiro-cli",
-            Backend::Codex => "codex",
-            Backend::OpenCode => "opencode",
-            Backend::Gemini => "gemini",
-        }
+    /// Display name matching the CLI command. For [`Backend::Raw`] returns the
+    /// stored path verbatim (borrow tied to self).
+    pub fn name(&self) -> &str {
+        self.as_str()
     }
 
     /// Extra CLI flags to pass on spawn, derived from files that
@@ -356,7 +439,8 @@ impl Backend {
         Some(version)
     }
 
-    /// Version used when patterns were last calibrated.
+    /// Version used when patterns were last calibrated. Non-preset variants
+    /// return `"n/a"` (no pattern calibration).
     pub fn calibrated_version(&self) -> &'static str {
         match self {
             Backend::ClaudeCode => "2.1.89",
@@ -364,6 +448,7 @@ impl Backend {
             Backend::Codex => "0.118.0",
             Backend::OpenCode => "1.4.0",
             Backend::Gemini => "0.37.1",
+            Backend::Shell | Backend::Raw(_) => "n/a",
         }
     }
 }
@@ -445,6 +530,125 @@ mod tests {
     #[test]
     fn all_backends_returns_five() {
         assert_eq!(Backend::all().len(), 5);
+    }
+
+    #[test]
+    fn parse_str_known_presets() {
+        assert_eq!(Backend::parse_str("claude"), Backend::ClaudeCode);
+        assert_eq!(Backend::parse_str("claude-code"), Backend::ClaudeCode);
+        assert_eq!(Backend::parse_str("kiro-cli"), Backend::KiroCli);
+        assert_eq!(Backend::parse_str("kiro"), Backend::KiroCli);
+        assert_eq!(Backend::parse_str("codex"), Backend::Codex);
+        assert_eq!(Backend::parse_str("opencode"), Backend::OpenCode);
+        assert_eq!(Backend::parse_str("gemini"), Backend::Gemini);
+        // Case insensitive
+        assert_eq!(Backend::parse_str("Claude"), Backend::ClaudeCode);
+        // Whitespace trim
+        assert_eq!(Backend::parse_str("  claude  "), Backend::ClaudeCode);
+    }
+
+    #[test]
+    fn parse_str_shell_aliases() {
+        assert_eq!(Backend::parse_str("shell"), Backend::Shell);
+        assert_eq!(Backend::parse_str("bash"), Backend::Shell);
+        assert_eq!(Backend::parse_str("zsh"), Backend::Shell);
+        assert_eq!(Backend::parse_str("sh"), Backend::Shell);
+        assert_eq!(Backend::parse_str("SHELL"), Backend::Shell);
+    }
+
+    #[test]
+    fn parse_str_unknown_becomes_raw() {
+        assert_eq!(
+            Backend::parse_str("/opt/custom/tool"),
+            Backend::Raw("/opt/custom/tool".to_string())
+        );
+        assert_eq!(
+            Backend::parse_str("vim"),
+            Backend::Raw("vim".to_string())
+        );
+        assert_eq!(
+            Backend::parse_str("/usr/bin/my-agent"),
+            Backend::Raw("/usr/bin/my-agent".to_string())
+        );
+    }
+
+    #[test]
+    fn as_str_roundtrip_preserves_raw_path() {
+        let raw = Backend::Raw("/opt/foo/bar".to_string());
+        assert_eq!(raw.as_str(), "/opt/foo/bar");
+        assert_eq!(Backend::Shell.as_str(), "shell");
+        assert_eq!(Backend::ClaudeCode.as_str(), "claude");
+    }
+
+    #[test]
+    fn serde_roundtrip_bare_string() {
+        // Preset variant serializes as bare name.
+        let yaml = serde_yaml::to_string(&Backend::ClaudeCode).unwrap();
+        assert_eq!(yaml.trim(), "claude");
+
+        // Shell → "shell"
+        let yaml = serde_yaml::to_string(&Backend::Shell).unwrap();
+        assert_eq!(yaml.trim(), "shell");
+
+        // Raw → literal path (no enum tagging like `!Raw`).
+        let yaml = serde_yaml::to_string(&Backend::Raw("/opt/x".to_string())).unwrap();
+        assert_eq!(yaml.trim(), "/opt/x");
+
+        // Deserialize back to the same value.
+        assert_eq!(
+            serde_yaml::from_str::<Backend>("claude").unwrap(),
+            Backend::ClaudeCode
+        );
+        assert_eq!(
+            serde_yaml::from_str::<Backend>("shell").unwrap(),
+            Backend::Shell
+        );
+        assert_eq!(
+            serde_yaml::from_str::<Backend>("/opt/x").unwrap(),
+            Backend::Raw("/opt/x".to_string())
+        );
+    }
+
+    #[test]
+    fn preset_shell_and_raw_are_empty() {
+        for b in [Backend::Shell, Backend::Raw("/opt/x".to_string())] {
+            let p = b.preset();
+            assert!(p.args.is_empty(), "{b:?} should have empty args");
+            assert!(p.ready_pattern.is_empty(), "{b:?} should have no ready pattern");
+            assert!(p.dismiss_patterns.is_empty(), "{b:?} should have no dismiss patterns");
+            assert!(matches!(p.resume_mode, ResumeMode::NotSupported));
+        }
+    }
+
+    #[test]
+    fn command_string_shell_uses_env_or_fallback() {
+        // Whatever $SHELL is in test env, result must be non-empty.
+        let cmd = Backend::Shell.command_string();
+        assert!(!cmd.is_empty());
+        assert!(cmd.starts_with('/') || cmd == "/bin/sh");
+    }
+
+    #[test]
+    fn command_string_raw_returns_literal() {
+        assert_eq!(
+            Backend::Raw("/opt/x/my-tool".to_string()).command_string(),
+            "/opt/x/my-tool"
+        );
+    }
+
+    #[test]
+    fn command_string_preset_returns_static_command() {
+        assert_eq!(Backend::ClaudeCode.command_string(), "claude");
+        assert_eq!(Backend::KiroCli.command_string(), "kiro-cli");
+    }
+
+    #[test]
+    fn calibrated_version_na_for_non_preset() {
+        assert_eq!(Backend::Shell.calibrated_version(), "n/a");
+        assert_eq!(
+            Backend::Raw("/opt/x".to_string()).calibrated_version(),
+            "n/a"
+        );
     }
 
     #[test]
