@@ -21,7 +21,7 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
             fleet::InstanceConfig {
                 role: Some("Fleet coordinator — routes tasks between agents".to_string()),
                 backend: Some(default_backend),
-                working_directory: None, // resolve_instance will default to $AGEND_HOME/workspaces/general
+                working_directory: None, // resolve_instance will default to $AGEND_HOME/workspace/general
                 topic_id: Some(1),       // Telegram General topic
                 ..Default::default()
             },
