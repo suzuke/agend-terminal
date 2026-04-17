@@ -436,12 +436,21 @@ mod tests {
     fn kiro_creates_wrapper_script() {
         let dir = tmp_dir("kiro_wrapper");
         configure_kiro(&dir).expect("configure");
-        let wrapper = dir.join(".kiro/settings/agend-mcp-wrapper.sh");
-        assert!(wrapper.exists(), "wrapper script must exist");
+        let ext = if cfg!(windows) { "cmd" } else { "sh" };
+        let wrapper = dir.join(format!(".kiro/settings/agend-mcp-wrapper.{ext}"));
+        assert!(
+            wrapper.exists(),
+            "wrapper script must exist at {}",
+            wrapper.display()
+        );
         let content = std::fs::read_to_string(&wrapper).expect("read");
-        assert!(content.starts_with("#!/bin/bash"));
         assert!(content.contains("AGEND_HOME"));
-        assert!(content.contains("exec"));
+        if cfg!(windows) {
+            assert!(content.starts_with("@echo off"));
+        } else {
+            assert!(content.starts_with("#!/bin/bash"));
+            assert!(content.contains("exec"));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -454,7 +463,9 @@ mod tests {
         let cmd = config["mcpServers"]["agend-terminal"]["command"]
             .as_str()
             .expect("command str");
-        assert!(cmd.contains("agend-mcp-wrapper.sh"));
+        let ext = if cfg!(windows) { "cmd" } else { "sh" };
+        let needle = format!("agend-mcp-wrapper.{ext}");
+        assert!(cmd.contains(&needle), "expected {needle} in {cmd}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -499,7 +510,8 @@ mod tests {
         assert!(dir.join("mcp-config.json").exists());
         assert!(dir.join(".claude/settings.local.json").exists());
         assert!(dir.join("claude-settings.json").exists());
-        assert!(dir.join("statusline.sh").exists());
+        let ext = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(dir.join(format!("statusline.{ext}")).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -512,12 +524,21 @@ mod tests {
             .output()
             .ok();
         configure_claude(&dir).expect("configure");
-        let script = std::fs::read_to_string(dir.join("statusline.sh")).expect("read");
-        // Path should be single-quoted
-        assert!(
-            script.contains("cat > '"),
-            "statusline path must be quoted: {script}"
-        );
+        let ext = if cfg!(windows) { "cmd" } else { "sh" };
+        let script = std::fs::read_to_string(dir.join(format!("statusline.{ext}"))).expect("read");
+        // Path should be quoted — single quotes on Unix (bash), double quotes
+        // on Windows (cmd.exe doesn't do single-quote quoting).
+        if cfg!(windows) {
+            assert!(
+                script.contains("findstr \"^\" > \""),
+                "statusline path must be double-quoted: {script}"
+            );
+        } else {
+            assert!(
+                script.contains("cat > '"),
+                "statusline path must be single-quoted: {script}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

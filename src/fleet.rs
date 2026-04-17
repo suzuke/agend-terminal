@@ -699,10 +699,11 @@ instances:
             "tilde should be expanded, got: {}",
             wd.display()
         );
-        // Should end with /project
+        // Should end with the `project` component — compare via Path so the
+        // separator flip on Windows (`\`) doesn't trip a plain string match.
         assert!(
-            wd.to_string_lossy().ends_with("/project"),
-            "should end with /project, got: {}",
+            wd.ends_with("project"),
+            "should end with project, got: {}",
             wd.display()
         );
 
@@ -943,8 +944,9 @@ instances:
         // alice: no working_directory → defaults to $AGEND_HOME/workspace/alice
         let alice = config.resolve_instance("alice").expect("alice");
         let wd = alice.working_directory.expect("wd");
+        // Compare components (not strings) so `\` on Windows doesn't fail.
         assert!(
-            wd.display().to_string().ends_with("workspace/alice"),
+            wd.ends_with("workspace/alice"),
             "expected default workspace path, got: {}",
             wd.display()
         );

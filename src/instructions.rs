@@ -293,7 +293,9 @@ mod tests {
     fn generate_claude_creates_statusline() {
         let dir = tmp_dir("gen_claude");
         generate(&dir, "claude");
-        assert!(dir.join("statusline.sh").exists(), "missing statusline.sh");
+        let ext = if cfg!(windows) { "cmd" } else { "sh" };
+        let script = dir.join(format!("statusline.{ext}"));
+        assert!(script.exists(), "missing {}", script.display());
         assert!(
             dir.join("claude-settings.json").exists(),
             "missing claude-settings.json"
