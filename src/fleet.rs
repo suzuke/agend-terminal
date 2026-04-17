@@ -89,9 +89,34 @@ impl FleetConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read fleet config: {}", path.display()))?;
-        let config: FleetConfig = serde_yaml::from_str(&content)
+        let mut config: FleetConfig = serde_yaml::from_str(&content)
             .with_context(|| format!("Failed to parse fleet config: {}", path.display()))?;
+        config.normalize();
         Ok(config)
+    }
+
+    /// Normalize legacy configs so that `backend:` is the single source of
+    /// truth for "what runs in the pane". When only the legacy `command:`
+    /// field is set, derive a [`Backend`] from it (presets like `claude` land
+    /// on the matching variant; `/bin/bash` or similar land on
+    /// [`Backend::Shell`]; arbitrary paths land on [`Backend::Raw`]).
+    ///
+    /// The `command:` field itself is left intact for backward compatibility
+    /// with call sites that still read it directly — follow-up commits
+    /// collapse those paths and eventually remove the field.
+    fn normalize(&mut self) {
+        if self.defaults.backend.is_none() {
+            if let Some(cmd) = &self.defaults.command {
+                self.defaults.backend = Some(Backend::parse_str(cmd));
+            }
+        }
+        for inst in self.instances.values_mut() {
+            if inst.backend.is_none() {
+                if let Some(cmd) = &inst.command {
+                    inst.backend = Some(Backend::parse_str(cmd));
+                }
+            }
+        }
     }
 
     /// Resolve an instance config by merging with defaults + backend preset.
@@ -981,6 +1006,128 @@ instances:
             resolved.working_directory.is_some(),
             "working_directory must always be Some after resolve"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Normalize: backend is derived from legacy `command:` at load ─────
+
+    #[test]
+    fn normalize_legacy_command_only_becomes_backend() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-norm1-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+defaults:
+  command: /bin/bash
+instances:
+  worker:
+    command: /opt/custom/tool
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        // Absolute paths preserve the literal — a later spawn uses them
+        // verbatim. Only the bare names `shell|bash|zsh|sh` fold into Shell.
+        assert_eq!(
+            config.defaults.backend,
+            Some(Backend::Raw("/bin/bash".to_string()))
+        );
+        assert_eq!(
+            config.instances.get("worker").and_then(|i| i.backend.clone()),
+            Some(Backend::Raw("/opt/custom/tool".to_string()))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_legacy_command_with_known_preset_name() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-norm2-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+defaults:
+  command: claude
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        assert_eq!(config.defaults.backend, Some(Backend::ClaudeCode));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_explicit_backend_takes_precedence_over_command() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-norm3-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  worker:
+    backend: claude
+    command: /custom/claude-v2
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        // Explicit backend wins — command remains for resolve_instance to use as override.
+        let inst = config.instances.get("worker").expect("worker");
+        assert_eq!(inst.backend, Some(Backend::ClaudeCode));
+        assert_eq!(inst.command.as_deref(), Some("/custom/claude-v2"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_new_shell_variant() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-norm4-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  bash_pane:
+    backend: shell
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        assert_eq!(
+            config.instances.get("bash_pane").and_then(|i| i.backend.clone()),
+            Some(Backend::Shell)
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_new_raw_variant_as_bare_path() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-norm5-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  custom:
+    backend: /opt/foo/bar
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        assert_eq!(
+            config.instances.get("custom").and_then(|i| i.backend.clone()),
+            Some(Backend::Raw("/opt/foo/bar".to_string()))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-norm6-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+defaults:
+  command: zsh
+"#,
+        );
+        let mut config = FleetConfig::load(&path).expect("load");
+        let before = config.defaults.backend.clone();
+        config.normalize();
+        // Running it again produces the same result.
+        assert_eq!(config.defaults.backend, before);
+        // Bare "zsh" (no leading slash) is the shell alias.
+        assert_eq!(config.defaults.backend, Some(Backend::Shell));
         fs::remove_dir_all(&dir).ok();
     }
 }
