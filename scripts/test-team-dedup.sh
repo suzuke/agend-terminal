@@ -50,23 +50,26 @@ info "starting app in tmux (AGEND_HOME=$AGEND_HOME)"
 tmux new-session -d -s "$SESSION" -x 120 -y 40 \
     "env AGEND_HOME='$AGEND_HOME' '$BIN' app"
 
-# Wait for api.sock
-SOCK=""
+# Wait for api.port
+API_PORT=""
 for _ in $(seq 1 50); do
-    SOCK="$(find "$AGEND_HOME/run" -name api.sock 2>/dev/null | head -1 || true)"
-    [[ -n "$SOCK" && -S "$SOCK" ]] && break
+    PORT_FILE="$(find "$AGEND_HOME/run" -name api.port 2>/dev/null | head -1 || true)"
+    if [[ -n "$PORT_FILE" && -f "$PORT_FILE" ]]; then
+        API_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
+        [[ -n "$API_PORT" ]] && break
+    fi
     sleep 0.2
 done
-[[ -z "$SOCK" ]] && fail "api.sock never appeared"
+[[ -z "$API_PORT" ]] && fail "api.port never appeared"
 sleep 1
 
 api_call() {
-    python3 - "$SOCK" "$1" <<'PY'
-import json, socket, sys
-sock_path, payload = sys.argv[1], sys.argv[2]
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    python3 - "$API_PORT" "$1" <<'PY'
+import socket, sys
+port, payload = int(sys.argv[1]), sys.argv[2]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(10)
-s.connect(sock_path)
+s.connect(("127.0.0.1", port))
 s.sendall((payload + "\n").encode())
 print(s.makefile().readline().strip())
 PY

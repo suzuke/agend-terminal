@@ -730,14 +730,18 @@ pub fn send_to(home: &Path, from: &str, target: &str, text: &str, kind: &str) ->
     }
 }
 
-/// List agent sockets in home directory.
+/// List agents published in the active daemon's run directory.
 pub fn list_agents() -> Vec<String> {
     let home = crate::home_dir();
+    let run = match crate::daemon::find_active_run_dir(&home) {
+        Some(r) => r,
+        None => return Vec::new(),
+    };
     let mut agents = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&home) {
+    if let Ok(entries) = std::fs::read_dir(&run) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".sock") && name != "api.sock" {
+            if name.ends_with(".port") && name != "api.port" {
                 agents.push(name[..name.len() - 5].to_string());
             }
         }

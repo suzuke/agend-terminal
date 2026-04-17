@@ -1,13 +1,14 @@
-//! Daemon JSON control API over Unix socket.
+//! Daemon JSON control API over TCP loopback.
 //!
 //! Protocol: NDJSON (one JSON request per line, one JSON response per line).
-//! Socket: {home}/api.sock
+//! Port is published to `{run_dir}/api.port`; see `ipc.rs` for the port
+//! registry and loopback-binding rules.
 
 use crate::agent::{self, AgentRegistry, ExternalRegistry};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -42,19 +43,23 @@ pub fn serve(
     externals: ExternalRegistry,
     tui_tx: Option<crate::app::TuiEventSender>,
 ) {
-    let sock = api_socket_path(home);
-    let _ = std::fs::remove_file(&sock);
-
-    let listener = match UnixListener::bind(&sock) {
+    let listener: TcpListener = match crate::ipc::bind_loopback() {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(path = %sock, error = %e, "failed to bind API socket");
+            tracing::warn!(error = %e, "failed to bind API socket");
             return;
         }
     };
-    tracing::info!(path = %sock, "API listening");
+    let port = crate::ipc::local_port(&listener);
+    let run_dir = crate::daemon::run_dir(home);
+    if let Err(e) = crate::ipc::write_port(&run_dir, crate::ipc::API_NAME, port) {
+        tracing::warn!(error = %e, "failed to publish API port");
+        return;
+    }
+    tracing::info!(port, "API listening");
 
     for stream in listener.incoming().flatten() {
+        let _ = stream.set_nodelay(true);
         let reg = Arc::clone(&registry);
         let home = home.to_path_buf();
         let shutdown = Arc::clone(&shutdown);
@@ -70,26 +75,8 @@ pub fn serve(
     }
 }
 
-pub fn api_socket_path(home: &Path) -> String {
-    crate::daemon::run_dir(home)
-        .join("api.sock")
-        .display()
-        .to_string()
-}
-
-/// Find API socket from any active daemon.
-pub fn find_api_socket(home: &Path) -> Option<String> {
-    let run = crate::daemon::find_active_run_dir(home)?;
-    let sock = run.join("api.sock");
-    if sock.exists() {
-        Some(sock.display().to_string())
-    } else {
-        None
-    }
-}
-
 fn handle_session(
-    stream: UnixStream,
+    stream: TcpStream,
     registry: &AgentRegistry,
     home: &Path,
     shutdown: &Arc<AtomicBool>,
@@ -261,9 +248,8 @@ fn handle_session(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(name);
-                // Cleanup socket
-                let sock = crate::daemon::agent_socket_path(home, name);
-                let _ = std::fs::remove_file(&sock);
+                // Cleanup the agent's published port file
+                crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
                 crate::event_log::log(home, "delete", name, "deleted via API");
                 // Notify TUI to close the corresponding pane
                 if let Some(tx) = tui_tx {
@@ -654,20 +640,19 @@ fn spawn_one(
         },
         registry,
     )?;
-    let sock = crate::daemon::agent_socket_path(home, name);
+    let rdir = crate::daemon::run_dir(home);
     let reg = Arc::clone(registry);
     let n = name.to_string();
     std::thread::Builder::new()
         .name(format!("{n}_tui"))
-        .spawn(move || crate::daemon::serve_agent_tui(&n, &sock, &reg))
+        .spawn(move || crate::daemon::serve_agent_tui(&n, &rdir, &reg))
         .ok();
     Ok(())
 }
 
-/// Send a request to the API socket and get response.
+/// Send a request to the daemon API and read one NDJSON response.
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
-    let sock = find_api_socket(home).unwrap_or_else(|| api_socket_path(home));
-    let mut stream = UnixStream::connect(&sock)?;
+    let mut stream = crate::ipc::connect_api(home)?;
     writeln!(stream, "{}", request)?;
     stream.flush()?;
 
@@ -697,65 +682,16 @@ mod tests {
     }
 
     #[test]
-    fn api_socket_path_ends_with_api_sock() {
-        let home = tmp_home("sock_path");
-        let path = api_socket_path(&home);
-        assert!(path.ends_with("api.sock"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn api_socket_path_under_run_dir() {
-        let home = tmp_home("sock_path_run");
-        let path = api_socket_path(&home);
-        assert!(path.contains("run"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn find_api_socket_no_daemon() {
-        let home = tmp_home("no_daemon");
-        assert!(find_api_socket(&home).is_none());
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn find_api_socket_with_sock_file() {
-        let home = tmp_home("with_sock");
-        let pid = std::process::id();
-        let run = home.join("run").join(pid.to_string());
-        std::fs::create_dir_all(&run).ok();
-        // Write daemon ID so find_active_run_dir finds it
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        std::fs::write(run.join(".daemon"), format!("{pid}:{now}")).ok();
-        // Create fake api.sock
-        std::fs::write(run.join("api.sock"), "").ok();
-        let found = find_api_socket(&home);
-        assert!(found.is_some());
-        assert!(found
-            .as_ref()
-            .map(|s| s.ends_with("api.sock"))
-            .unwrap_or(false));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn find_api_socket_run_dir_without_sock() {
-        let home = tmp_home("no_sock");
-        let pid = std::process::id();
-        let run = home.join("run").join(pid.to_string());
-        std::fs::create_dir_all(&run).ok();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        std::fs::write(run.join(".daemon"), format!("{pid}:{now}")).ok();
-        // No api.sock file
-        let found = find_api_socket(&home);
-        assert!(found.is_none());
+    fn call_fails_without_daemon() {
+        let home = tmp_home("call_no_daemon");
+        let err = call(&home, &json!({"method": "list"})).unwrap_err();
+        // No active daemon → either "no active daemon" or a TCP ConnectionRefused
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_ascii_lowercase().contains("no active daemon")
+                || msg.to_ascii_lowercase().contains("refused"),
+            "unexpected error: {msg}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

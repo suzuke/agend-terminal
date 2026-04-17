@@ -61,7 +61,7 @@ fn write_message(stdout: &mut io::Stdout, json: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(agent_socket: &str) -> anyhow::Result<()> {
+pub fn run() -> anyhow::Result<()> {
     let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
     tracing::info!(%instance_name, "server starting");
 
@@ -104,7 +104,7 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
                 let args = &req.params["arguments"];
 
                 // Try daemon proxy first — avoids per-process overhead
-                let result = proxy_or_local(tool, args, &instance_name, agent_socket);
+                let result = proxy_or_local(tool, args, &instance_name);
 
                 json!({
                     "jsonrpc": "2.0", "id": id,
@@ -132,9 +132,9 @@ pub fn run(agent_socket: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Try to proxy a tool call through the daemon API socket.
+/// Try to proxy a tool call through the daemon API port.
 /// Falls back to local handling if the daemon is unavailable.
-fn proxy_or_local(tool: &str, args: &Value, instance_name: &str, agent_socket: &str) -> Value {
+fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
     let home = crate::home_dir();
 
     if let Ok(resp) = crate::api::call(
@@ -154,5 +154,5 @@ fn proxy_or_local(tool: &str, args: &Value, instance_name: &str, agent_socket: &
     }
 
     // Daemon unavailable or returned error — handle locally
-    handlers::handle_tool(tool, args, agent_socket, instance_name)
+    handlers::handle_tool(tool, args, instance_name)
 }
