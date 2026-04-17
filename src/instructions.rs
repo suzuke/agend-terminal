@@ -272,6 +272,7 @@ pub fn generate_with_context(working_dir: &Path, command: &str, ctx: Option<&Age
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

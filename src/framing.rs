@@ -64,6 +64,7 @@ pub fn write_resize(w: &mut impl Write, cols: u16, rows: u16) -> std::io::Result
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::Cursor;
@@ -209,6 +210,7 @@ mod tests {
         assert_eq!(TAG_DATA, 0);
         assert_eq!(TAG_RESIZE, 1);
         assert_eq!(PROTOCOL_VERSION, 1);
-        assert!(DEFAULT_FRAME_LIMIT > 0);
+        // DEFAULT_FRAME_LIMIT is a positive const — checked at compile time.
+        const _: () = assert!(DEFAULT_FRAME_LIMIT > 0);
     }
 }

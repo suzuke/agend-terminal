@@ -321,6 +321,7 @@ fn shell_escape(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -579,7 +580,7 @@ mod tests {
         std::fs::create_dir_all(dir.join(".codex")).ok();
 
         // Override HOME for test
-        let work_dir = std::path::PathBuf::from("/tmp/test-project");
+        let _work_dir = std::path::PathBuf::from("/tmp/test-project");
         // Write directly to test path
         {
             use std::io::Write;
@@ -617,7 +618,7 @@ mod tests {
         let content_before = std::fs::read_to_string(&config_path).expect("read");
         codex_trust_directory(work_dir);
         // Since we can't override HOME in codex_trust_directory, test the check logic directly
-        let content = std::fs::read_to_string(&config_path).expect("read");
+        let _content = std::fs::read_to_string(&config_path).expect("read");
         // The function writes to ~/.codex/config.toml, not our test path,
         // so just verify the check logic: content already has the key
         assert!(content_before.contains("[projects.\"/tmp/already\"]"));

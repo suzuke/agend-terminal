@@ -176,6 +176,22 @@ pub fn record_run(home: &Path, schedule_id: &str, status: &str) {
     });
 }
 
+pub fn delete(home: &Path, args: &Value) -> Value {
+    let id = match args["id"].as_str() {
+        Some(i) => i.to_string(),
+        None => return serde_json::json!({"error": "missing 'id'"}),
+    };
+    match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+        let before = store.schedules.len();
+        store.schedules.retain(|s| s.id != id);
+        Ok(store.schedules.len() < before)
+    }) {
+        Ok(true) => serde_json::json!({"id": id, "status": "deleted"}),
+        Ok(false) => serde_json::json!({"error": format!("schedule '{id}' not found")}),
+        Err(e) => serde_json::json!({"error": format!("{e}")}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,21 +283,5 @@ mod tests {
         assert_eq!(listed["schedules"].as_array().expect("arr").len(), 1);
 
         std::fs::remove_dir_all(&home).ok();
-    }
-}
-
-pub fn delete(home: &Path, args: &Value) -> Value {
-    let id = match args["id"].as_str() {
-        Some(i) => i.to_string(),
-        None => return serde_json::json!({"error": "missing 'id'"}),
-    };
-    match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
-        let before = store.schedules.len();
-        store.schedules.retain(|s| s.id != id);
-        Ok(store.schedules.len() < before)
-    }) {
-        Ok(true) => serde_json::json!({"id": id, "status": "deleted"}),
-        Ok(false) => serde_json::json!({"error": format!("schedule '{id}' not found")}),
-        Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }

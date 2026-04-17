@@ -209,11 +209,9 @@ fn test_content_length_framing() {
 
     let reader = BufReader::new(stdout);
     let mut responses = Vec::new();
-    for line in reader.lines() {
-        if let Ok(l) = line {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
-                responses.push(v);
-            }
+    for l in reader.lines().map_while(Result::ok) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+            responses.push(v);
         }
     }
 

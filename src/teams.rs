@@ -118,6 +118,17 @@ pub fn update(home: &Path, args: &Value) -> Value {
     }
 }
 
+/// Get members of a team.
+pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
+    let store = load(home);
+    store
+        .teams
+        .iter()
+        .find(|t| t.name == team_name)
+        .map(|t| t.members.clone())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,15 +202,4 @@ mod tests {
         assert!(r["error"].as_str().is_some());
         std::fs::remove_dir_all(&home).ok();
     }
-}
-
-/// Get members of a team.
-pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
-    let store = load(home);
-    store
-        .teams
-        .iter()
-        .find(|t| t.name == team_name)
-        .map(|t| t.members.clone())
-        .unwrap_or_default()
 }

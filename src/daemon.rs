@@ -1134,7 +1134,7 @@ mod tests {
         write_daemon_id(&run);
         let found = find_active_run_dir(&home);
         assert!(found.is_some());
-        assert_eq!(found.as_ref().map(|p| p.as_path()), Some(run.as_path()));
+        assert_eq!(found.as_deref(), Some(run.as_path()));
         std::fs::remove_dir_all(&home).ok();
     }
 

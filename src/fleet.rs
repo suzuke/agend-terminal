@@ -360,6 +360,7 @@ pub fn update_instance_field(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs;
@@ -915,7 +916,7 @@ instances:
         .ok();
         remove_instance_from_yaml(&dir, "alice").expect("remove");
         let config = FleetConfig::load(&path).expect("load");
-        assert!(config.instances.get("alice").is_none());
+        assert!(!config.instances.contains_key("alice"));
         assert_eq!(
             config.instances.get("bob").and_then(|i| i.topic_id),
             Some(300)
