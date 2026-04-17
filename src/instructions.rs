@@ -1,6 +1,18 @@
 use anyhow::Result;
 use std::path::Path;
 
+/// Migrate any Claude instructions file left by older agend versions at the
+/// former path `.claude/rules/agend.md`. We now pass instructions explicitly
+/// via `--append-system-prompt-file .claude/agend.md`, so keeping the old file
+/// around would cause Claude to auto-load stale content as a rule on top of
+/// the flag-provided version.
+fn migrate_claude_old_rules_file(working_dir: &Path) {
+    let old = working_dir.join(".claude").join("rules").join("agend.md");
+    if old.exists() {
+        let _ = std::fs::remove_file(&old);
+    }
+}
+
 /// Claude Code: statusline for session ID capture
 fn generate_claude(working_dir: &Path) -> Result<()> {
     let statusline_path = working_dir.join("statusline.json");
@@ -195,7 +207,7 @@ pub(crate) fn merge_agend_block(existing: &str, body: &str) -> String {
 
 /// Write agent instructions file to the backend-specific path.
 /// Shared files (AGENTS.md, GEMINI.md) use marker-merge; agend-owned files
-/// (.claude/rules/agend.md, .kiro/steering/agend.md) are rewritten in full.
+/// (.claude/agend.md, .kiro/steering/agend.md) are rewritten in full.
 fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&AgentContext>) {
     let backend = match crate::backend::Backend::from_command(command) {
         Some(b) => b,
@@ -238,7 +250,10 @@ pub fn generate_with_context(working_dir: &Path, command: &str, ctx: Option<&Age
 
     // Backend-specific setup (non-MCP)
     let result = match backend {
-        Some(crate::backend::Backend::ClaudeCode) => generate_claude(working_dir),
+        Some(crate::backend::Backend::ClaudeCode) => {
+            migrate_claude_old_rules_file(working_dir);
+            generate_claude(working_dir)
+        }
         Some(crate::backend::Backend::Codex) => {
             codex_trust_directory(working_dir);
             Ok(())
@@ -324,8 +339,8 @@ mod tests {
             fleet_peers: &peers,
         };
         generate_with_context(&dir, "claude", Some(&ctx));
-        let path = dir.join(".claude").join("rules").join("agend.md");
-        assert!(path.exists(), "missing agend.md");
+        let path = dir.join(".claude").join("agend.md");
+        assert!(path.exists(), "missing agend.md at {}", path.display());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("v3-mcp"), "missing v3-mcp");
         assert!(content.contains("reply"), "missing reply reference");
@@ -337,6 +352,38 @@ mod tests {
         assert!(content.contains("dev"), "missing agent name");
         assert!(content.contains("developer"), "missing role");
         assert!(content.contains("reviewer"), "missing peer");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_migration_removes_stale_rules_file() {
+        let dir = tmp_dir("claude_migrate_stale");
+        let stale = dir.join(".claude").join("rules").join("agend.md");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, "# old content from pre-migration agend").unwrap();
+        generate(&dir, "claude");
+        assert!(
+            !stale.exists(),
+            "stale .claude/rules/agend.md was not removed"
+        );
+        assert!(
+            dir.join(".claude").join("agend.md").exists(),
+            "new .claude/agend.md was not written"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn claude_migration_preserves_user_rules_dir_contents() {
+        let dir = tmp_dir("claude_migrate_other_rules");
+        let user_rule = dir.join(".claude").join("rules").join("my-rule.md");
+        std::fs::create_dir_all(user_rule.parent().unwrap()).unwrap();
+        std::fs::write(&user_rule, "user-owned rule").unwrap();
+        generate(&dir, "claude");
+        assert!(
+            user_rule.exists(),
+            "migration must not touch user's other .claude/rules/*.md files"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
