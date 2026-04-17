@@ -3,6 +3,7 @@
 use crate::backend::Backend;
 use crate::vterm::VTerm;
 use std::path::PathBuf;
+use unicode_width::UnicodeWidthStr;
 
 /// A single pane displaying one agent's terminal output.
 /// PTY ownership is in AgentRegistry — pane only has subscriber channel + local VTerm.
@@ -85,8 +86,24 @@ pub enum PaneNode {
 }
 
 const DEFAULT_RATIO: f32 = 0.5;
-const MIN_RATIO: f32 = 0.1;
-const MAX_RATIO: f32 = 0.9;
+
+/// Minimum cells (columns or rows) required per pane child to remain usable.
+/// All ratio clamps derive from this so the bounds scale with terminal size —
+/// a 400-cell area allows near-full drag range, while a 10-cell area still
+/// guarantees both sides are visible.
+const MIN_PANE_CELLS: u16 = 3;
+
+/// Valid ratio bounds for a split of `total` cells. Returns `(min, max)` such
+/// that both children end up with ≥ MIN_PANE_CELLS. When `total` is too small
+/// to honor both minimums, returns `(0.5, 0.5)` — callers should avoid
+/// splitting such tiny areas in the first place.
+fn ratio_bounds(total: u16) -> (f32, f32) {
+    if total < 2 * MIN_PANE_CELLS {
+        return (0.5, 0.5);
+    }
+    let min = MIN_PANE_CELLS as f32 / total as f32;
+    (min, 1.0 - min)
+}
 
 impl PaneNode {
     pub fn pane_ids(&self) -> Vec<usize> {
@@ -407,15 +424,29 @@ fn build_preset(panes: Vec<Pane>, preset: LayoutPreset) -> PaneNode {
 
 // --- Split border hit-test and resize ---
 
-/// Convert a ratio to a pixel size, clamped to [1, total-1] so both children
-/// always have at least 1 cell.
+/// Convert a stored ratio to a cell size. Self-corrects when `total` changed
+/// since the ratio was set (e.g. terminal resize) by re-clamping to the bounds
+/// valid for the current `total`. For `total < 2`, returns `total / 2`; the
+/// caller shouldn't be splitting such an area, but we degrade gracefully
+/// instead of panicking.
 pub fn ratio_to_size(ratio: f32, total: u16) -> u16 {
-    ((ratio * total as f32).round() as u16)
-        .max(1)
-        .min(total.saturating_sub(1))
+    if total < 2 {
+        return total / 2;
+    }
+    let (lo, hi) = ratio_bounds(total);
+    let clamped = ratio.clamp(lo, hi);
+    ((clamped * total as f32).round() as u16).clamp(1, total - 1)
 }
 
 /// Compute the (first, second) child areas of a split.
+///
+/// Siblings overlap by 1 cell on the split axis so they share a single border
+/// column/row. This lets the render-time border grid merge adjacent pane borders
+/// into joined box-drawing chars (`├┤┬┴┼`) across all terminals — macOS Terminal
+/// in particular doesn't auto-join `┘┌` pairs into `┬` when drawn side-by-side.
+///
+/// Invariant (for non-degenerate sizes): `second_start = first_start + first_size - 1`
+/// and `second_size = total - first_size + 1`. Total painted cells = `first_size + second_size - 1`.
 #[allow(clippy::type_complexity)]
 fn split_child_areas(
     area: (u16, u16, u16, u16),
@@ -426,11 +457,17 @@ fn split_child_areas(
     match dir {
         SplitDir::Horizontal => {
             let first_h = ratio_to_size(ratio, ah);
-            ((ax, ay, aw, first_h), (ax, ay + first_h, aw, ah - first_h))
+            let overlap = if first_h >= 1 && ah > first_h { 1 } else { 0 };
+            let second_y = ay + first_h.saturating_sub(overlap);
+            let second_h = ah + overlap - first_h;
+            ((ax, ay, aw, first_h), (ax, second_y, aw, second_h))
         }
         SplitDir::Vertical => {
             let first_w = ratio_to_size(ratio, aw);
-            ((ax, ay, first_w, ah), (ax + first_w, ay, aw - first_w, ah))
+            let overlap = if first_w >= 1 && aw > first_w { 1 } else { 0 };
+            let second_x = ax + first_w.saturating_sub(overlap);
+            let second_w = aw + overlap - first_w;
+            ((ax, ay, first_w, ah), (second_x, ay, second_w, ah))
         }
     }
 }
@@ -456,13 +493,17 @@ pub fn find_split_border(
         PaneNode::Split { dir, ratio, first, second } => {
             let (first_area, second_area) = split_child_areas(area, *dir, *ratio);
             let (ax, ay, aw, ah) = area;
+            // Shared-border convention: with 1-cell overlap between siblings,
+            // the border column/row is the last cell of `first` == first cell
+            // of `second`. `split_child_areas` computes `second_{x,y}` as
+            // `first_size - 1`, so we reuse that directly.
             let on_border = match dir {
                 SplitDir::Horizontal => {
-                    let border_row = ay + first_area.3;
+                    let border_row = second_area.1;
                     row == border_row && col >= ax && col < ax + aw
                 }
                 SplitDir::Vertical => {
-                    let border_col = ax + first_area.2;
+                    let border_col = second_area.0;
                     col == border_col && row >= ay && row < ay + ah
                 }
             };
@@ -495,8 +536,14 @@ pub fn adjust_split_ratio(
                     SplitDir::Vertical => (area.0, area.2),
                 };
                 if total > 1 {
-                    let new_ratio = (mouse_pos.saturating_sub(start) as f32) / (total as f32);
-                    *ratio = new_ratio.clamp(MIN_RATIO, MAX_RATIO);
+                    // With 1-cell overlap between siblings, the border sits at
+                    // `first_size - 1` cells from `start`. So when the user
+                    // drags the border to `mouse_pos`, the desired first_size
+                    // is `(mouse_pos - start) + 1`.
+                    let desired_first =
+                        (mouse_pos.saturating_sub(start) as f32 + 1.0) / (total as f32);
+                    let (lo, hi) = ratio_bounds(total);
+                    *ratio = desired_first.clamp(lo, hi);
                 }
                 return true;
             }
@@ -510,9 +557,12 @@ pub fn adjust_split_ratio(
 }
 
 /// Adjust the split ratio containing the focused pane in a given direction.
-/// `step` is the ratio delta (positive = grow first child).
+/// `step` is the ratio delta (positive = grow first child). `area` is the
+/// rect enclosing `node`; it's tracked through recursion so the final clamp
+/// uses bounds derived from the target split's actual cell count.
 pub fn resize_focused(
     node: &mut PaneNode,
+    area: (u16, u16, u16, u16),
     focus_id: usize,
     dir: Direction,
     step: f32,
@@ -526,7 +576,7 @@ pub fn resize_focused(
                 return false;
             }
             let dir_matches = matches!(
-                (split_dir, dir),
+                (*split_dir, dir),
                 (SplitDir::Vertical, Direction::Left | Direction::Right)
                     | (SplitDir::Horizontal, Direction::Up | Direction::Down)
             );
@@ -537,14 +587,20 @@ pub fn resize_focused(
                     Direction::Right | Direction::Down => step,
                     Direction::Left | Direction::Up => -step,
                 };
-                *ratio = (*ratio + delta).clamp(MIN_RATIO, MAX_RATIO);
+                let total = match *split_dir {
+                    SplitDir::Horizontal => area.3,
+                    SplitDir::Vertical => area.2,
+                };
+                let (lo, hi) = ratio_bounds(total);
+                *ratio = (*ratio + delta).clamp(lo, hi);
                 return true;
             }
-            // Recurse into the child containing focus
+            // Recurse into the child containing focus, tracking its area.
+            let (first_area, second_area) = split_child_areas(area, *split_dir, *ratio);
             if first_has {
-                resize_focused(first, focus_id, dir, step)
+                resize_focused(first, first_area, focus_id, dir, step)
             } else {
-                resize_focused(second, focus_id, dir, step)
+                resize_focused(second, second_area, focus_id, dir, step)
             }
         }
     }
@@ -843,7 +899,9 @@ impl Tab {
             let Some(pane) = self.root().find_pane(id) else {
                 continue;
             };
-            let title_width = pane.label().chars().count() as u16 + 2;
+            // Rendered title is ` {label} ` — measure with terminal cell
+            // width (not char count) so CJK / emoji labels hit correctly.
+            let title_width = UnicodeWidthStr::width(pane.label()) as u16 + 2;
             let start = px + 1;
             let end = (start + title_width).min(px + pw);
             if col >= start && col < end {
@@ -855,6 +913,15 @@ impl Tab {
 
     /// Reset both drag fields after a title-bar drag completes or aborts.
     pub fn clear_drag(&mut self) {
+        self.dragging_pane = None;
+        self.drag_target = None;
+    }
+
+    /// Clear all in-progress UI state (selection tracking + drag tracking).
+    /// Called when the user leaves this tab so a half-finished mouse
+    /// interaction doesn't resume if they return to the tab later.
+    pub fn clear_transient_input(&mut self) {
+        self.selecting_pane = None;
         self.dragging_pane = None;
         self.drag_target = None;
     }
@@ -910,8 +977,8 @@ impl Layout {
     }
 
     pub fn add_tab(&mut self, tab: Tab) {
+        self.switch_active(self.tabs.len());
         self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {
@@ -922,21 +989,31 @@ impl Layout {
         self.tabs.get_mut(self.active)
     }
 
+    /// Change the active tab index, clearing the outgoing tab's in-progress
+    /// mouse state (selection / drag tracking) so it doesn't resume if the
+    /// user returns. Centralizing here keeps the invariant in one place.
+    fn switch_active(&mut self, new_idx: usize) {
+        if let Some(old) = self.tabs.get_mut(self.active) {
+            old.clear_transient_input();
+        }
+        self.active = new_idx;
+    }
+
     pub fn next_tab(&mut self) {
         if !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
+            self.switch_active((self.active + 1) % self.tabs.len());
         }
     }
 
     pub fn prev_tab(&mut self) {
         if !self.tabs.is_empty() {
-            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+            self.switch_active((self.active + self.tabs.len() - 1) % self.tabs.len());
         }
     }
 
     pub fn goto_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
-            self.active = idx;
+            self.switch_active(idx);
         }
     }
 
@@ -946,8 +1023,217 @@ impl Layout {
         }
         let tab = self.tabs.remove(idx);
         if self.active >= self.tabs.len() && !self.tabs.is_empty() {
-            self.active = self.tabs.len() - 1;
+            self.switch_active(self.tabs.len() - 1);
         }
         Some(tab)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- ratio_bounds invariants (covers Round A #3 + #6) ---
+
+    #[test]
+    fn ratio_bounds_symmetric_when_room() {
+        let (lo, hi) = ratio_bounds(100);
+        assert!((lo + hi - 1.0).abs() < f32::EPSILON, "bounds should be symmetric");
+    }
+
+    #[test]
+    fn ratio_bounds_degenerate_when_tiny() {
+        // total < 2 * MIN_PANE_CELLS — no valid split honoring both minimums
+        assert_eq!(ratio_bounds(5), (0.5, 0.5));
+        assert_eq!(ratio_bounds(0), (0.5, 0.5));
+    }
+
+    #[test]
+    fn ratio_bounds_min_cells_enforced() {
+        let (lo, _) = ratio_bounds(30);
+        // first child at lo ratio ≈ 3 cells (MIN_PANE_CELLS)
+        let first = (lo * 30.0).round() as u16;
+        assert_eq!(first, MIN_PANE_CELLS);
+    }
+
+    // --- ratio_to_size guarantees (covers #3) ---
+
+    #[test]
+    fn ratio_to_size_no_zero_when_room() {
+        // For any ratio in [0.0, 1.0] and total ≥ 2 * MIN_PANE_CELLS,
+        // both sides get ≥ MIN_PANE_CELLS.
+        for total in [6u16, 10, 40, 100, 500] {
+            for ratio_int in 0..=100 {
+                let r = ratio_int as f32 / 100.0;
+                let first = ratio_to_size(r, total);
+                let second = total - first;
+                assert!(
+                    first >= MIN_PANE_CELLS && second >= MIN_PANE_CELLS,
+                    "total={total} ratio={r} -> first={first} second={second}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ratio_to_size_degenerate_does_not_panic() {
+        // total < 2: degrade gracefully instead of panicking
+        assert_eq!(ratio_to_size(0.5, 0), 0);
+        assert_eq!(ratio_to_size(0.5, 1), 0);
+    }
+
+    #[test]
+    fn ratio_to_size_sum_matches_total() {
+        // split_child_areas relies on `first <= total` for safe overlap math
+        // (second_size = total - first + overlap); verify no drift.
+        for total in [2u16, 3, 10, 100, 1000] {
+            for ratio_int in [0, 25, 50, 75, 100] {
+                let r = ratio_int as f32 / 100.0;
+                let first = ratio_to_size(r, total);
+                assert!(first <= total, "first={first} > total={total}");
+            }
+        }
+    }
+
+    // --- split_child_areas overlap invariant (covers #1 joined borders) ---
+
+    #[test]
+    fn split_child_areas_vertical_siblings_share_one_cell() {
+        // Siblings must overlap by exactly 1 cell on the split axis so the
+        // border grid can merge their shared edge into a single glyph.
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Vertical, 0.5);
+        assert_eq!(first.0, 0, "first.x");
+        assert!(first.2 > 0, "first.w must be > 0");
+        assert_eq!(second.0, first.0 + first.2 - 1, "shared column");
+        // Total painted width = first + second - 1 (the shared column is
+        // counted once).
+        assert_eq!(first.2 + second.2 - 1, area.2, "cells account for overlap");
+    }
+
+    #[test]
+    fn split_child_areas_horizontal_siblings_share_one_cell() {
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Horizontal, 0.5);
+        assert_eq!(second.1, first.1 + first.3 - 1, "shared row");
+        assert_eq!(first.3 + second.3 - 1, area.3, "cells account for overlap");
+    }
+
+    #[test]
+    fn find_split_border_matches_shared_column() {
+        // A vertical split's border should be detectable at exactly the
+        // shared column (first.x + first.w - 1), and NOT at the old
+        // pre-overlap position (first.x + first.w).
+        let root = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "a".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 1,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                selection: None,
+            }))),
+            second: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "b".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 2,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                selection: None,
+            }))),
+        };
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Vertical, 0.5);
+        let shared_col = first.0 + first.2 - 1;
+        assert_eq!(shared_col, second.0);
+        assert!(find_split_border(&root, area, shared_col, 5).is_some());
+        // After overlap, the old border column (first.x + first.w) is now
+        // inside `second`; no longer a border cell.
+        assert!(find_split_border(&root, area, first.0 + first.2, 5).is_none());
+    }
+
+    #[test]
+    fn adjust_split_ratio_border_lands_where_user_clicked() {
+        // When the user drags the border to col X, adjust_split_ratio must
+        // produce a ratio such that the new border sits at col X (modulo
+        // ratio_to_size rounding within 1 cell).
+        let mut root = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "a".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 1,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                selection: None,
+            }))),
+            second: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "b".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 2,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                selection: None,
+            }))),
+        };
+        let area = (0u16, 0u16, 100u16, 20u16);
+        // User drags border to col 60. Must settle at col 60 (± 0 cells
+        // since 100-cell total gives exact pixel mapping).
+        assert!(adjust_split_ratio(
+            &mut root,
+            area,
+            area,
+            60,
+            SplitDir::Vertical,
+        ));
+        if let PaneNode::Split { ratio, .. } = &root {
+            let (first, _second) = split_child_areas(area, SplitDir::Vertical, *ratio);
+            let new_border_col = first.0 + first.2 - 1;
+            assert!(
+                (new_border_col as i32 - 60).abs() <= 1,
+                "border at col {new_border_col}, expected ~60"
+            );
+        } else {
+            panic!("root should still be a Split");
+        }
+    }
+
+    // --- Unicode title hit-test (covers #4) ---
+    //
+    // title_bar_at uses UnicodeWidthStr::width for the label, matching the
+    // rendered ` {label} ` width. We test the width calc directly since
+    // building a full Tab with Pane requires a VTerm + agent registry.
+
+    #[test]
+    fn unicode_width_for_title_matches_terminal_cells() {
+        // ASCII: 1 cell per char
+        assert_eq!(UnicodeWidthStr::width("alice") as u16, 5);
+        // CJK: 2 cells per char
+        assert_eq!(UnicodeWidthStr::width("代理") as u16, 4);
+        // Mixed
+        assert_eq!(UnicodeWidthStr::width("a代") as u16, 3);
     }
 }

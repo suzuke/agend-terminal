@@ -148,11 +148,18 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char(' ') => Action::NextLayout,
         KeyCode::Char('.') => Action::RenamePane,
 
-        // Directional pane focus (plain arrows) / resize (Alt+arrows)
+        // Directional pane focus (plain arrows) / resize (Alt+arrows).
+        // Alt+Arrow encoding depends on the terminal (macOS Terminal, Ghostty,
+        // iTerm2 all disagree on whether Option is Meta), so we also accept
+        // uppercase H/J/K/L as a portable tmux-style resize fallback.
         KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeUp,
         KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeDown,
         KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeLeft,
         KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeRight,
+        KeyCode::Char('K') => Action::ResizeUp,
+        KeyCode::Char('J') => Action::ResizeDown,
+        KeyCode::Char('H') => Action::ResizeLeft,
+        KeyCode::Char('L') => Action::ResizeRight,
         KeyCode::Up => Action::FocusUp,
         KeyCode::Down => Action::FocusDown,
         KeyCode::Left => Action::FocusLeft,

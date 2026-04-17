@@ -732,13 +732,23 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 };
                                 if let Some(tab) = layout.active_tab_mut() {
                                     let focus = tab.focus_id;
-                                    crate::layout::resize_focused(tab.root_mut(), focus, dir, 0.05);
+                                    // Pane tree occupies terminal height minus
+                                    // the tab bar row and status bar row (see
+                                    // render::render_app chrome layout).
+                                    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+                                    let area = (0, 1, cols, rows.saturating_sub(2));
+                                    crate::layout::resize_focused(tab.root_mut(), area, focus, dir, 0.05);
                                 }
                                 needs_resize = true;
                             }
                             Action::None => {}
                         }
                     }
+                    // #11: Overlays (Help, Tasks, Decisions, Command palette, rename,
+                    // etc.) are modal — mouse events must not reach hidden panes,
+                    // otherwise drag/selection state accumulates on panes the user
+                    // can't see. Swallow mouse events while any overlay is active.
+                    Event::Mouse(_) if !matches!(overlay, Overlay::None) => {}
                     Event::Mouse(mouse) => {
                         match mouse.kind {
                             MouseEventKind::ScrollUp => scroll_focused(&mut layout, 3),
@@ -766,6 +776,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     // Horizontal-split borders must be resized via keyboard.
                                     let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
                                     let pa = Rect::new(0, 1, c, r.saturating_sub(2));
+                                    // #12: When a tab is zoomed, only the focused pane is
+                                    // visible; the split tree still exists but its borders
+                                    // aren't rendered. Disable title-bar AND border hit-tests
+                                    // so users can't drag invisible borders.
                                     let zoomed = layout.active_tab().is_some_and(|t| t.zoomed);
                                     let title_hit = (!zoomed)
                                         .then(|| {
@@ -777,10 +791,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     if let Some(pane_id) = title_hit {
                                         if let Some(tab) = layout.active_tab_mut() {
                                             tab.focus_id = pane_id;
-                                            tab.dragging_pane = Some(pane_id);
-                                            tab.drag_target = None;
+                                            // #2: Only start a drag when there's a possible
+                                            // swap target. Otherwise the source pane briefly
+                                            // flashes magenta for a no-op.
+                                            if tab.root().pane_count() > 1 {
+                                                tab.dragging_pane = Some(pane_id);
+                                                tab.drag_target = None;
+                                            }
                                         }
-                                    } else {
+                                    } else if !zoomed {
                                         let hit = layout.active_tab().and_then(|tab| {
                                             crate::layout::find_split_border(
                                                 tab.root(),
@@ -793,8 +812,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                             border_drag = Some((h, pa));
                                         } else {
                                             handle_mouse_selection(&mut layout, &mouse);
-                                            clear_selection_cache(&mut layout);
                                         }
+                                    } else {
+                                        // Zoomed: only selection inside the one visible pane.
+                                        handle_mouse_selection(&mut layout, &mouse);
                                     }
                                 }
                             }
@@ -813,7 +834,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                             hit.dir,
                                         );
                                     }
-                                    needs_resize = true;
+                                    // Don't fire PTY resize per-tick: the render
+                                    // loop recomputes pane_rects from the updated
+                                    // ratio so the drag is visually smooth, but
+                                    // resizing the PTY every mouse cell triggers
+                                    // the backend (Claude/etc.) to reflow its
+                                    // entire UI and floods us with redraw data.
+                                    // Defer the single PTY resize to mouse-up.
                                 } else if layout.active_tab().is_some_and(|t| t.dragging_pane.is_some()) {
                                     let target = layout.active_tab().and_then(|tab| {
                                         let source = tab.dragging_pane?;
@@ -825,12 +852,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     }
                                 } else {
                                     handle_mouse_selection(&mut layout, &mouse);
-                                    clear_selection_cache(&mut layout);
                                 }
                             }
                             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                                 if border_drag.is_some() {
                                     border_drag = None;
+                                    // Ratio was updated live during drag but
+                                    // PTY resizes were deferred — fire one now.
+                                    needs_resize = true;
                                 } else if layout.active_tab().is_some_and(|t| t.dragging_pane.is_some()) {
                                     let source_id = layout.active_tab().and_then(|t| t.dragging_pane);
                                     let target_id = layout.active_tab().and_then(|t| t.drag_target);
@@ -845,7 +874,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     }
                                 } else {
                                     handle_mouse_selection(&mut layout, &mouse);
-                                    clear_selection_cache(&mut layout);
                                 }
                             }
                             _ => {}
@@ -2435,10 +2463,6 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
     }
 
     let rect = tab.pane_rects.get(&target_id).copied();
-    let pane = match tab.root_mut().find_pane_mut(target_id) {
-        Some(p) => p,
-        None => return,
-    };
     let (px, py, pw, ph) = match rect {
         Some(r) => r,
         None => return,
@@ -2451,57 +2475,54 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
         return;
     }
 
-    match mouse.kind {
-        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            if mouse.column >= inner_x
-                && mouse.column < inner_x + inner_w
-                && mouse.row >= inner_y
-                && mouse.row < inner_y + inner_h
-            {
-                let col = mouse.column - inner_x;
-                let row = mouse.row - inner_y;
-                pane.selection = Some(crate::layout::Selection {
-                    start: (row, col),
-                    end: (row, col),
-                });
-            }
-        }
-        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-            let col = mouse.column.max(inner_x).min(inner_x + inner_w - 1) - inner_x;
-            let row = mouse.row.max(inner_y).min(inner_y + inner_h - 1) - inner_y;
-            if let Some(ref mut sel) = pane.selection {
-                sel.end = (row, col);
-            }
-        }
-        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-            if let Some(ref sel) = pane.selection {
-                let text = pane
-                    .vterm
-                    .extract_text(sel.start, sel.end, pane.scroll_offset);
-                if !text.is_empty() {
-                    copy_to_clipboard(&text);
+    // Scope the pane borrow so we can touch tab.selecting_pane afterwards.
+    let finished = {
+        let pane = match tab.root_mut().find_pane_mut(target_id) {
+            Some(p) => p,
+            None => return,
+        };
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if mouse.column >= inner_x
+                    && mouse.column < inner_x + inner_w
+                    && mouse.row >= inner_y
+                    && mouse.row < inner_y + inner_h
+                {
+                    let col = mouse.column - inner_x;
+                    let row = mouse.row - inner_y;
+                    pane.selection = Some(crate::layout::Selection {
+                        start: (row, col),
+                        end: (row, col),
+                    });
                 }
+                false
             }
-            pane.selection = None;
-            // Can't access tab here (already borrowed), so set a flag
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                let col = mouse.column.max(inner_x).min(inner_x + inner_w - 1) - inner_x;
+                let row = mouse.row.max(inner_y).min(inner_y + inner_h - 1) - inner_y;
+                if let Some(ref mut sel) = pane.selection {
+                    sel.end = (row, col);
+                }
+                false
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                if let Some(ref sel) = pane.selection {
+                    let text = pane
+                        .vterm
+                        .extract_text(sel.start, sel.end, pane.scroll_offset);
+                    if !text.is_empty() {
+                        copy_to_clipboard(&text);
+                    }
+                }
+                pane.selection = None;
+                true
+            }
+            _ => false,
         }
-        _ => {}
-    }
-}
+    };
 
-/// Clear selecting_pane cache after mouse up. Called after handle_mouse_selection.
-fn clear_selection_cache(layout: &mut Layout) {
-    if let Some(tab) = layout.active_tab_mut() {
-        if tab.selecting_pane.is_some() {
-            // Check if selection was cleared (mouse up happened)
-            let still_selecting = tab
-                .selecting_pane
-                .and_then(|id| tab.root().find_pane(id))
-                .is_some_and(|p| p.selection.is_some());
-            if !still_selecting {
-                tab.selecting_pane = None;
-            }
-        }
+    if finished {
+        tab.selecting_pane = None;
     }
 }
 

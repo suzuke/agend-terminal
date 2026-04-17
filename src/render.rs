@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Telegram connection status for status bar display.
 #[derive(Clone, Copy)]
@@ -130,24 +130,34 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
     frame.render_widget(tabs, area);
 }
 
+/// Split an area into two child rects that overlap by 1 cell on the split axis
+/// so siblings share a border column/row. Mirrors `layout::split_child_areas`
+/// — keep the two in sync (both produce overlap-by-1 results).
 fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] {
     let total = match dir {
         SplitDir::Horizontal => area.height,
         SplitDir::Vertical => area.width,
     };
     let first_size = crate::layout::ratio_to_size(ratio, total);
-    let direction = match dir {
-        SplitDir::Horizontal => Direction::Vertical,
-        SplitDir::Vertical => Direction::Horizontal,
-    };
-    let chunks = ratatui::layout::Layout::default()
-        .direction(direction)
-        .constraints([
-            Constraint::Length(first_size),
-            Constraint::Min(1),
-        ])
-        .split(area);
-    [chunks[0], chunks[1]]
+    let overlap: u16 = if first_size >= 1 && total > first_size { 1 } else { 0 };
+    match dir {
+        SplitDir::Horizontal => {
+            let second_y = area.y + first_size.saturating_sub(overlap);
+            let second_h = area.height + overlap - first_size;
+            [
+                Rect::new(area.x, area.y, area.width, first_size),
+                Rect::new(area.x, second_y, area.width, second_h),
+            ]
+        }
+        SplitDir::Vertical => {
+            let second_x = area.x + first_size.saturating_sub(overlap);
+            let second_w = area.width + overlap - first_size;
+            [
+                Rect::new(area.x, area.y, first_size, area.height),
+                Rect::new(second_x, area.y, second_w, area.height),
+            ]
+        }
+    }
 }
 
 /// Resize pass — sync VTerm + PTY sizes to match render layout.
@@ -243,7 +253,12 @@ fn render_pane_tree(
 
     if tab.zoomed {
         if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
-            render_pane(frame, area, pane, true, false, registry, false, false);
+            let info = render_pane(frame, area, pane, true, false, registry, false, false);
+            // Single-pane zoom: just draw its own 4 edges, no neighbors to merge with.
+            let infos = vec![info];
+            render_border_grid(frame, &infos);
+            // Titles paint on top of borders so they read as text, not `─`.
+            render_pane_titles(frame, &infos);
         }
         tab.pane_rects.clear();
         tab.pane_rects
@@ -254,18 +269,25 @@ fn render_pane_tree(
     let drag_source = tab.dragging_pane;
     let drag_target = tab.drag_target;
     let mut rects = std::collections::HashMap::new();
+    let mut border_infos: Vec<PaneBorderInfo> = Vec::new();
     render_node(
         frame,
         area,
         tab.root_mut(),
         focus_id,
         &mut rects,
+        &mut border_infos,
         repeat_mode,
         registry,
         drag_source,
         drag_target,
     );
     tab.pane_rects = rects;
+    // Two-pass border rendering: first merge every pane's 4 edges into a single
+    // grid (shared cells OR'd together → ┬/┴/├/┤/┼), then overlay each pane's
+    // title on its top border row.
+    render_border_grid(frame, &border_infos);
+    render_pane_titles(frame, &border_infos);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -275,6 +297,7 @@ fn render_node(
     node: &mut PaneNode,
     focus_id: usize,
     rects: &mut std::collections::HashMap<usize, (u16, u16, u16, u16)>,
+    border_infos: &mut Vec<PaneBorderInfo>,
     repeat_mode: bool,
     registry: &AgentRegistry,
     drag_source: Option<usize>,
@@ -286,7 +309,7 @@ fn render_node(
             let focused = pane.id == focus_id;
             let is_drag_source = drag_source == Some(pane.id);
             let is_drag_target = drag_target == Some(pane.id);
-            render_pane(
+            let info = render_pane(
                 frame,
                 area,
                 pane,
@@ -296,13 +319,33 @@ fn render_node(
                 is_drag_source,
                 is_drag_target,
             );
+            border_infos.push(info);
         }
         PaneNode::Split { dir, ratio, first, second } => {
             let [c0, c1] = split_chunks(area, dir, *ratio);
-            render_node(frame, c0, first, focus_id, rects, repeat_mode, registry, drag_source, drag_target);
-            render_node(frame, c1, second, focus_id, rects, repeat_mode, registry, drag_source, drag_target);
+            render_node(
+                frame, c0, first, focus_id, rects, border_infos,
+                repeat_mode, registry, drag_source, drag_target,
+            );
+            render_node(
+                frame, c1, second, focus_id, rects, border_infos,
+                repeat_mode, registry, drag_source, drag_target,
+            );
         }
     }
+}
+
+/// One leaf pane's contribution to the border grid: its rect + resolved
+/// border/title styles + a merge priority (drag_source, then drag_target,
+/// then focused+repeat, then focused, then default). Two adjacent panes'
+/// shared border cells pick the higher priority's style so drag highlights
+/// always win over neighbor focus.
+struct PaneBorderInfo {
+    area: Rect,
+    border_style: Style,
+    title: String,
+    title_style: Style,
+    priority: u8,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -315,7 +358,7 @@ fn render_pane(
     registry: &AgentRegistry,
     is_drag_source: bool,
     is_drag_target: bool,
-) {
+) -> PaneBorderInfo {
     pane.drain_output();
 
     if focused {
@@ -329,20 +372,34 @@ fn render_pane(
     };
     let sc = state_color(state);
 
-    // Drag state overrides normal border colors
-    let border_color = if is_drag_source {
-        Color::Magenta
+    // Drag source/target use REVERSED modifier so the highlight is unambiguous
+    // even when the agent's state color happens to match (Magenta =
+    // PermissionPrompt, Green = Ready). Reversed swaps fg/bg on the border
+    // cells, which no state-color path uses — so drag is always visually
+    // distinct from any agent state.
+    let (border_style, title_style, priority) = if is_drag_source {
+        let s = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::REVERSED);
+        (s, s.add_modifier(Modifier::BOLD), 5u8)
     } else if is_drag_target {
-        Color::Green
+        let s = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::REVERSED);
+        (s, s.add_modifier(Modifier::BOLD), 4u8)
     } else if focused && repeat_mode {
-        Color::Yellow
+        let s = Style::default().fg(Color::Yellow);
+        (s, s.add_modifier(Modifier::BOLD), 3u8)
     } else if focused {
-        match sc {
+        let c = match sc {
             Color::DarkGray | Color::White => Color::Cyan,
             _ => sc,
-        }
+        };
+        let s = Style::default().fg(c);
+        (s, s.add_modifier(Modifier::BOLD), 2u8)
     } else {
-        Color::DarkGray
+        let s = Style::default().fg(Color::DarkGray);
+        (s, s, 1u8)
     };
 
     let title = if pane.backend.is_some() {
@@ -351,33 +408,26 @@ fn render_pane(
         format!(" {} ", pane.label())
     };
 
-    let title_style = if is_drag_source {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else if is_drag_target {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if focused && repeat_mode {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if focused {
-        Style::default()
-            .fg(border_color)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(title, title_style));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    // Inner (content) area = outer shrunk 1 cell on every side, matching the
+    // former Block::ALL inner. Borders are drawn later in `render_border_grid`
+    // from every pane's collected rect — neighboring panes' shared edges merge
+    // into joined box-drawing chars. Titles paint on top of the top border in
+    // `render_pane_titles`.
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    if inner.width == 0 || inner.height == 0 {
+        return PaneBorderInfo {
+            area,
+            border_style,
+            title,
+            title_style,
+            priority,
+        };
+    }
     pane.vterm
         .render_to_buffer(frame.buffer_mut(), inner, pane.scroll_offset, !focused);
 
@@ -413,6 +463,181 @@ fn render_pane(
         let cy = inner.y + cursor_line;
         if cx < inner.x + inner.width && cy < inner.y + inner.height {
             frame.set_cursor_position(ratatui::layout::Position::new(cx, cy));
+        }
+    }
+
+    PaneBorderInfo {
+        area,
+        border_style,
+        title,
+        title_style,
+        priority,
+    }
+}
+
+// --- Pane border grid (joined box-drawing across shared edges) ---
+//
+// A single BorderCell encodes which of the four neighbor directions have a
+// line continuing from this cell. Merging the per-pane edge contributions
+// into one grid is what makes adjacent corners resolve into ├┤┬┴┼ on
+// terminals that don't auto-join `┘┌` glyphs (e.g. macOS Terminal.app).
+
+const DIR_N: u8 = 0b0001;
+const DIR_E: u8 = 0b0010;
+const DIR_S: u8 = 0b0100;
+const DIR_W: u8 = 0b1000;
+
+#[derive(Clone, Copy, Default)]
+struct BorderCell {
+    mask: u8,
+    style: Style,
+    priority: u8,
+}
+
+fn border_char(mask: u8) -> Option<char> {
+    let c = match mask {
+        0 => return None,
+        m if m == DIR_N => '│',
+        m if m == DIR_S => '│',
+        m if m == DIR_E => '─',
+        m if m == DIR_W => '─',
+        m if m == DIR_N | DIR_S => '│',
+        m if m == DIR_E | DIR_W => '─',
+        m if m == DIR_N | DIR_E => '└',
+        m if m == DIR_N | DIR_W => '┘',
+        m if m == DIR_S | DIR_E => '┌',
+        m if m == DIR_S | DIR_W => '┐',
+        m if m == DIR_N | DIR_S | DIR_E => '├',
+        m if m == DIR_N | DIR_S | DIR_W => '┤',
+        m if m == DIR_N | DIR_E | DIR_W => '┴',
+        m if m == DIR_S | DIR_E | DIR_W => '┬',
+        m if m == DIR_N | DIR_E | DIR_S | DIR_W => '┼',
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// Add a pane's 4 edges to the grid. Corners carry bits from two perpendicular
+/// edges so the merged mask naturally yields the right glyph. Interior edge
+/// cells get only `N|S` or `E|W`; when a sibling pane adds its own edge at the
+/// same cell (they overlap by 1 on the split axis), the OR is idempotent.
+fn add_pane_borders(
+    cells: &mut std::collections::HashMap<(u16, u16), BorderCell>,
+    info: &PaneBorderInfo,
+) {
+    let area = info.area;
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let x0 = area.x;
+    let y0 = area.y;
+    let x1 = area.x + area.width - 1;
+    let y1 = area.y + area.height - 1;
+
+    let merge = |cells: &mut std::collections::HashMap<(u16, u16), BorderCell>,
+                 x: u16,
+                 y: u16,
+                 mask: u8| {
+        let slot = cells.entry((x, y)).or_default();
+        slot.mask |= mask;
+        if info.priority > slot.priority {
+            slot.style = info.border_style;
+            slot.priority = info.priority;
+        }
+    };
+
+    // Top + bottom edges (corners carry vertical bits pointing inward).
+    for x in x0..=x1 {
+        let mut top = 0u8;
+        let mut bot = 0u8;
+        if x > x0 {
+            top |= DIR_W;
+            bot |= DIR_W;
+        }
+        if x < x1 {
+            top |= DIR_E;
+            bot |= DIR_E;
+        }
+        if x == x0 || x == x1 {
+            top |= DIR_S;
+            bot |= DIR_N;
+        }
+        merge(cells, x, y0, top);
+        merge(cells, x, y1, bot);
+    }
+    // Left + right edge interiors (corners already handled above).
+    if y1 > y0 + 1 {
+        for y in (y0 + 1)..y1 {
+            merge(cells, x0, y, DIR_N | DIR_S);
+            merge(cells, x1, y, DIR_N | DIR_S);
+        }
+    }
+}
+
+fn render_border_grid(frame: &mut Frame, infos: &[PaneBorderInfo]) {
+    let mut cells: std::collections::HashMap<(u16, u16), BorderCell> =
+        std::collections::HashMap::new();
+    for info in infos {
+        add_pane_borders(&mut cells, info);
+    }
+    let buf = frame.buffer_mut();
+    let buf_area = buf.area;
+    for ((x, y), cell) in cells {
+        if x < buf_area.x
+            || x >= buf_area.x + buf_area.width
+            || y < buf_area.y
+            || y >= buf_area.y + buf_area.height
+        {
+            continue;
+        }
+        if let Some(ch) = border_char(cell.mask) {
+            let b = &mut buf[(x, y)];
+            b.set_char(ch);
+            b.set_style(cell.style);
+        }
+    }
+}
+
+/// Overlay each pane's title on its top border row, starting at `area.x + 1`.
+/// `title_bar_at` (in layout.rs) mirrors this position for mouse hit-testing
+/// — any change here must stay in sync.
+fn render_pane_titles(frame: &mut Frame, infos: &[PaneBorderInfo]) {
+    let buf = frame.buffer_mut();
+    let buf_area = buf.area;
+    for info in infos {
+        let area = info.area;
+        if area.width < 3 || area.height == 0 {
+            continue;
+        }
+        let y = area.y;
+        // Reserve the right-most cell for the top-right corner glyph.
+        let last_usable_x = area.x + area.width - 1;
+        let mut x = area.x + 1;
+        for g in info.title.chars() {
+            let w = UnicodeWidthChar::width(g).unwrap_or(0) as u16;
+            if w == 0 {
+                continue;
+            }
+            if x + w > last_usable_x {
+                break;
+            }
+            if x >= buf_area.x + buf_area.width || y >= buf_area.y + buf_area.height {
+                break;
+            }
+            let cell = &mut buf[(x, y)];
+            cell.set_char(g);
+            cell.set_style(info.title_style);
+            // For wide chars, blank out the trailing cells so residual border
+            // glyphs don't peek through.
+            for off in 1..w {
+                if x + off >= buf_area.x + buf_area.width {
+                    break;
+                }
+                let trail = &mut buf[(x + off, y)];
+                trail.set_char(' ');
+                trail.set_style(info.title_style);
+            }
+            x += w;
         }
     }
 }
@@ -534,8 +759,9 @@ pub fn render_rename(frame: &mut Frame, input: &str) {
         ));
     let inner = block.inner(ra);
     frame.render_widget(block, ra);
+    // Use the real terminal cursor; don't print a literal '_'.
     frame.render_widget(
-        Paragraph::new(format!("{input}_")).style(Style::default().fg(Color::White)),
+        Paragraph::new(input.to_string()).style(Style::default().fg(Color::White)),
         inner,
     );
     let cursor_x = inner.x + input.width() as u16;
@@ -630,7 +856,8 @@ pub fn render_help(frame: &mut Frame) {
         "    Ctrl+B %       Split vertical",
         "    Ctrl+B o       Cycle pane focus",
         "    Ctrl+B arrows  Directional focus",
-        "    Ctrl+B A-arrow Resize pane",
+        "    Ctrl+B A-arrow Resize pane (Alt-arrow)",
+        "    Ctrl+B H/J/K/L Resize pane (portable)",
         "    Drag border    Resize pane",
         "    Drag title     Swap pane position",
         "    Ctrl+B x       Close pane",
@@ -653,6 +880,7 @@ pub fn render_help(frame: &mut Frame) {
         "      :restart [name]       Restart agent",
         "      :send <to> <msg>      Send message",
         "      :broadcast <msg>      Broadcast",
+        "      :status               Log agent states",
         "    Ctrl+B D       Decisions panel",
         "    Ctrl+B T       Task board",
         "",
@@ -744,8 +972,10 @@ pub fn render_command_palette(frame: &mut Frame, input: &str) {
         ));
     let inner = block.inner(ra);
     frame.render_widget(block, ra);
+    // Use the real terminal cursor for insertion point; don't print a literal
+    // '_' after the input or it shows as a phantom character next to the cursor.
     frame.render_widget(
-        Paragraph::new(format!(":{input}_")).style(Style::default().fg(Color::White)),
+        Paragraph::new(format!(":{input}")).style(Style::default().fg(Color::White)),
         inner,
     );
     let cursor_x = inner.x + 1 + input.width() as u16;
@@ -891,4 +1121,114 @@ pub fn render_tasks(frame: &mut Frame, items: &[crate::tasks::Task], scroll: usi
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn info(x: u16, y: u16, w: u16, h: u16) -> PaneBorderInfo {
+        PaneBorderInfo {
+            area: Rect::new(x, y, w, h),
+            border_style: Style::default(),
+            title: String::new(),
+            title_style: Style::default(),
+            priority: 1,
+        }
+    }
+
+    #[test]
+    fn border_char_corner_and_junction_masks() {
+        assert_eq!(border_char(0), None);
+        assert_eq!(border_char(DIR_S | DIR_E), Some('┌'));
+        assert_eq!(border_char(DIR_S | DIR_W), Some('┐'));
+        assert_eq!(border_char(DIR_N | DIR_E), Some('└'));
+        assert_eq!(border_char(DIR_N | DIR_W), Some('┘'));
+        assert_eq!(border_char(DIR_E | DIR_W), Some('─'));
+        assert_eq!(border_char(DIR_N | DIR_S), Some('│'));
+        assert_eq!(border_char(DIR_N | DIR_S | DIR_E), Some('├'));
+        assert_eq!(border_char(DIR_N | DIR_S | DIR_W), Some('┤'));
+        assert_eq!(border_char(DIR_S | DIR_E | DIR_W), Some('┬'));
+        assert_eq!(border_char(DIR_N | DIR_E | DIR_W), Some('┴'));
+        assert_eq!(border_char(DIR_N | DIR_S | DIR_E | DIR_W), Some('┼'));
+    }
+
+    #[test]
+    fn single_pane_renders_outer_frame() {
+        // One pane at (0,0,10,5) → corners are ┌┐└┘, top/bottom are ─, sides │.
+        let mut cells: HashMap<(u16, u16), BorderCell> = HashMap::new();
+        add_pane_borders(&mut cells, &info(0, 0, 10, 5));
+        assert_eq!(border_char(cells[&(0, 0)].mask), Some('┌'));
+        assert_eq!(border_char(cells[&(9, 0)].mask), Some('┐'));
+        assert_eq!(border_char(cells[&(0, 4)].mask), Some('└'));
+        assert_eq!(border_char(cells[&(9, 4)].mask), Some('┘'));
+        assert_eq!(border_char(cells[&(5, 0)].mask), Some('─'));
+        assert_eq!(border_char(cells[&(5, 4)].mask), Some('─'));
+        assert_eq!(border_char(cells[&(0, 2)].mask), Some('│'));
+        assert_eq!(border_char(cells[&(9, 2)].mask), Some('│'));
+    }
+
+    #[test]
+    fn adjacent_vertical_panes_produce_t_junctions() {
+        // Two panes sharing col 9 (overlap-by-1 model):
+        //   A = (0, 0, 10, 5),  B = (9, 0, 11, 5)
+        // Shared-column corners merge to ┬ (top) and ┴ (bottom); middle is │.
+        let mut cells: HashMap<(u16, u16), BorderCell> = HashMap::new();
+        add_pane_borders(&mut cells, &info(0, 0, 10, 5));
+        add_pane_borders(&mut cells, &info(9, 0, 11, 5));
+        assert_eq!(
+            border_char(cells[&(9, 0)].mask),
+            Some('┬'),
+            "top of shared column must be ┬, not two stacked ┐┌"
+        );
+        assert_eq!(border_char(cells[&(9, 4)].mask), Some('┴'));
+        assert_eq!(border_char(cells[&(9, 2)].mask), Some('│'));
+        // Outer corners preserved.
+        assert_eq!(border_char(cells[&(0, 0)].mask), Some('┌'));
+        assert_eq!(border_char(cells[&(19, 0)].mask), Some('┐'));
+    }
+
+    #[test]
+    fn four_way_grid_produces_cross_junction() {
+        // 2x2 grid (horizontal split above+below a vertical split):
+        //   A=(0,0,10,5) B=(9,0,11,5) C=(0,4,10,6) D=(9,4,11,6)
+        // The center cell (9, 4) is the 4-way junction — must render ┼.
+        let mut cells: HashMap<(u16, u16), BorderCell> = HashMap::new();
+        add_pane_borders(&mut cells, &info(0, 0, 10, 5));
+        add_pane_borders(&mut cells, &info(9, 0, 11, 5));
+        add_pane_borders(&mut cells, &info(0, 4, 10, 6));
+        add_pane_borders(&mut cells, &info(9, 4, 11, 6));
+        assert_eq!(
+            border_char(cells[&(9, 4)].mask),
+            Some('┼'),
+            "4-way junction must be ┼"
+        );
+        assert_eq!(
+            border_char(cells[&(0, 4)].mask),
+            Some('├'),
+            "left-edge T must be ├"
+        );
+        assert_eq!(
+            border_char(cells[&(19, 4)].mask),
+            Some('┤'),
+            "right-edge T must be ┤"
+        );
+    }
+
+    #[test]
+    fn higher_priority_wins_shared_cell_style() {
+        // When a drag_source pane (priority 5) and a default pane (priority 1)
+        // share a border cell, the drag style must win regardless of insertion order.
+        let mut a = info(0, 0, 10, 5);
+        a.priority = 5;
+        a.border_style = Style::default().fg(Color::Magenta);
+        let b = info(9, 0, 11, 5);
+        let mut cells: HashMap<(u16, u16), BorderCell> = HashMap::new();
+        add_pane_borders(&mut cells, &b);
+        add_pane_borders(&mut cells, &a);
+        let shared = cells[&(9, 2)];
+        assert_eq!(shared.priority, 5);
+        assert_eq!(shared.style.fg, Some(Color::Magenta));
+    }
 }
