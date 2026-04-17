@@ -288,6 +288,19 @@ fn handle_session(
                     let _ = writeln!(writer, "{}", json!({"ok": false, "error": e}));
                     continue;
                 }
+                // Dedup: reject spawn for an already-registered name. spawn_agent
+                // silently overwrites the registry entry, which would orphan the
+                // previous agent's PTY and leave panes reading from a stale
+                // subscription. The respawn-after-crash path in daemon.rs goes
+                // through a different code path and is not affected.
+                if agent::lock_registry(registry).contains_key(name) {
+                    let _ = writeln!(
+                        writer,
+                        "{}",
+                        json!({"ok": false, "error": format!("agent '{name}' already exists")})
+                    );
+                    continue;
+                }
                 let command = params["backend"]
                     .as_str()
                     .map(String::from)
@@ -320,12 +333,19 @@ fn handle_session(
                                 .as_str()
                                 .filter(|s| !s.is_empty())
                                 .map(String::from);
+                            tracing::info!(
+                                agent = name,
+                                layout = ?layout_hint,
+                                spawner = ?spawner,
+                                channel_len = tx.len(),
+                                "SPAWN emitting InstanceCreated"
+                            );
                             if let Err(e) = tx.try_send(crate::app::TuiEvent::InstanceCreated {
                                 name: name.to_string(),
                                 layout: layout_hint,
                                 spawner,
                             }) {
-                                tracing::warn!("TUI event send failed (spawn {}): {e}", name);
+                                tracing::warn!(agent = name, error = %e, "InstanceCreated try_send failed");
                             }
                         }
                         json!({"ok": true, "result": {"name": name}})
@@ -481,21 +501,34 @@ fn handle_session(
                 };
                 let count = params["count"].as_u64().unwrap_or(0) as usize;
                 let backend = params["backend"].as_str().unwrap_or("claude");
+                tracing::info!(team = team_name, count, backend, "CREATE_TEAM begin");
 
                 let mut spawned: Vec<String> = Vec::new();
                 let mut failed: Vec<String> = Vec::new();
                 let size = crossterm::terminal::size().unwrap_or((120, 40));
                 for i in 1..=count {
                     let inst_name = format!("{team_name}-{i}");
+                    // Dedup: see SPAWN handler note. Re-creating a team with an
+                    // existing name would otherwise overwrite the registry entry
+                    // and orphan the previous tab's PTY subscription.
+                    if agent::lock_registry(registry).contains_key(&inst_name) {
+                        tracing::warn!(team = team_name, member = %inst_name, "CREATE_TEAM skip: name already exists");
+                        failed.push(format!("{inst_name}: agent already exists"));
+                        continue;
+                    }
                     let work_dir = home.join("workspace").join(&inst_name);
                     match spawn_one(home, registry, &inst_name, backend, &[], &work_dir, size) {
-                        Ok(()) => spawned.push(inst_name),
+                        Ok(()) => {
+                            tracing::info!(team = team_name, member = %inst_name, "CREATE_TEAM spawn ok");
+                            spawned.push(inst_name);
+                        }
                         Err(e) => {
-                            tracing::warn!("failed to spawn team member {}: {e}", inst_name);
+                            tracing::warn!(team = team_name, member = %inst_name, error = %e, "CREATE_TEAM spawn failed");
                             failed.push(format!("{inst_name}: {e}"));
                         }
                     }
                 }
+                tracing::info!(team = team_name, spawned = spawned.len(), failed = failed.len(), "CREATE_TEAM spawn phase done");
                 if count > 0 && spawned.is_empty() {
                     let _ = writeln!(
                         writer,
@@ -546,13 +579,25 @@ fn handle_session(
 
                 if let Some(tx) = tui_tx {
                     if !spawned.is_empty() {
+                        let members_for_event = spawned.clone();
+                        tracing::info!(
+                            team = team_name,
+                            members = ?members_for_event,
+                            channel_len = tx.len(),
+                            channel_cap = ?tx.capacity(),
+                            "CREATE_TEAM emitting TeamCreated"
+                        );
                         if let Err(e) = tx.try_send(crate::app::TuiEvent::TeamCreated {
                             name: team_name.to_string(),
-                            members: spawned.clone(),
+                            members: members_for_event,
                         }) {
-                            tracing::warn!("TUI event send failed (team {}): {e}", team_name);
+                            tracing::warn!(team = team_name, error = %e, "TeamCreated try_send failed");
                         }
+                    } else {
+                        tracing::warn!(team = team_name, "CREATE_TEAM not emitting (spawned empty)");
                     }
+                } else {
+                    tracing::warn!(team = team_name, "CREATE_TEAM no tui_tx, event dropped");
                 }
                 let mut resp = json!({"ok": true, "result": result, "spawned": &spawned});
                 if !failed.is_empty() {

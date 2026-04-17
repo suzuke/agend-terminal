@@ -2090,7 +2090,9 @@ fn handle_instance_created(
     registry: &AgentRegistry,
     wakeup_tx: &crossbeam::channel::Sender<usize>,
 ) {
+    tracing::info!(agent = name, hint = ?hint, spawner = ?spawner, tabs_before = layout.tabs.len(), "handle_instance_created begin");
     if layout.tabs.iter().any(|tab| tab.root().has_agent(name)) {
+        tracing::info!(agent = name, "handle_instance_created: agent already in layout, deduped");
         return;
     }
 
@@ -2154,39 +2156,80 @@ fn handle_team_created(
     registry: &AgentRegistry,
     wakeup_tx: &crossbeam::channel::Sender<usize>,
 ) {
+    tracing::info!(team = team_name, members = ?members, tabs_before = layout.tabs.len(), "handle_team_created begin");
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let pane_rows = rows.saturating_sub(4);
 
-    let running: Vec<&str> = {
+    // Filter members in two passes:
+    //   1. must exist in registry (spawn_agent completed)
+    //   2. must NOT already be displayed in any tab — defensive guard against
+    //      re-entry. Mirrors `handle_instance_created`'s dedup check. With
+    //      per-member dedup in CREATE_TEAM this should never skip anyone, but
+    //      the check keeps behavior safe if the API path changes.
+    let (running, missing): (Vec<&str>, Vec<&str>) = {
         let reg = agent::lock_registry(registry);
-        members
+        let (r, m): (Vec<_>, Vec<_>) = members
             .iter()
-            .filter(|m| reg.contains_key(m.as_str()))
             .map(|m| m.as_str())
-            .collect()
+            .partition(|m| reg.contains_key(*m));
+        (r, m)
     };
+    if !missing.is_empty() {
+        tracing::warn!(team = team_name, missing = ?missing, "handle_team_created: members not in registry, skipped");
+    }
+    let running: Vec<&str> = running
+        .into_iter()
+        .filter(|m| {
+            let already = layout.tabs.iter().any(|tab| tab.root().has_agent(m));
+            if already {
+                tracing::warn!(team = team_name, member = m, "handle_team_created: member already in a tab, skipped");
+            }
+            !already
+        })
+        .collect();
+    tracing::info!(team = team_name, running = ?running, "handle_team_created: filter complete");
 
     if running.is_empty() {
+        tracing::warn!(team = team_name, "handle_team_created: no running members, no tab created");
         return;
     }
 
     let first_pane = match attach_pane(running[0], registry, cols, pane_rows, wakeup_tx, layout) {
-        Ok(p) => p,
+        Ok(p) => {
+            tracing::info!(team = team_name, first = running[0], "handle_team_created: first pane attached");
+            p
+        }
         Err(e) => {
-            tracing::warn!(team = team_name, error = %e, "failed to create team tab");
+            tracing::warn!(team = team_name, first = running[0], error = %e, "handle_team_created: first attach_pane failed, no tab created");
             return;
         }
     };
 
     let mut tab = Tab::new(team_name.to_string(), first_pane);
+    let mut attached = 1usize;
 
     for member in &running[1..] {
-        if let Ok(pane) = attach_pane(member, registry, cols, pane_rows, wakeup_tx, layout) {
-            tab.split_focused(SplitDir::Horizontal, pane);
+        match attach_pane(member, registry, cols, pane_rows, wakeup_tx, layout) {
+            Ok(pane) => {
+                tab.split_focused(SplitDir::Horizontal, pane);
+                attached += 1;
+            }
+            Err(e) => {
+                tracing::warn!(team = team_name, member = member, error = %e, "handle_team_created: split attach_pane failed");
+            }
         }
     }
 
+    let panes_in_tab = tab.root().pane_count();
     layout.add_tab(tab);
+    tracing::info!(
+        team = team_name,
+        expected = running.len(),
+        attached,
+        panes_in_tab,
+        tabs_after = layout.tabs.len(),
+        "handle_team_created end"
+    );
 }
 
 /// Remove ALL panes for the given agent from every tab. Cleans up empty tabs.
