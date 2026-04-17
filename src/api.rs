@@ -326,7 +326,7 @@ fn handle_session(
                 match spawn_one(home, registry, name, command, &args, &work_dir, size) {
                     Ok(()) => {
                         if let Some(tx) = tui_tx {
-                            let layout_hint = crate::app::LayoutHint::from_str(
+                            let layout_hint = crate::app::LayoutHint::parse_hint(
                                 params["layout"].as_str().unwrap_or("tab"),
                             );
                             let spawner = params["spawner"]
