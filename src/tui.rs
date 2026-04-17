@@ -1,4 +1,4 @@
-//! TUI client: connects to daemon's agent socket, raw terminal passthrough.
+//! TUI client: connects to daemon's agent TCP port, raw terminal passthrough.
 //!
 //! Ctrl+B d to detach. Agent keeps running.
 
@@ -6,7 +6,7 @@ use crate::framing::{self, PROTOCOL_VERSION, TAG_DATA};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 /// RAII guard for crossterm raw mode.
 struct RawModeGuard;
@@ -16,10 +16,10 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Connect to agent socket, enter raw mode, bridge terminal.
-pub fn attach(socket_path: &str) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket_path)
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {socket_path}: {e}"))?;
+/// Resolve the agent's TCP port, connect, enter raw mode, bridge terminal.
+pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
+    let mut stream = crate::ipc::connect_agent(home, name)
+        .map_err(|e| anyhow::anyhow!("Failed to connect to agent '{name}': {e}"))?;
 
     // Read protocol version byte from server
     let mut version_buf = [0u8; 1];

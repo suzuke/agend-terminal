@@ -9,7 +9,6 @@ use teloxide::prelude::Requester;
 use portable_pty::PtySize;
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -27,22 +26,30 @@ pub struct AgentConfig {
 }
 
 /// Start the TUI socket server for an agent (blocks the calling thread).
-pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) {
-    let _ = std::fs::remove_file(socket_path);
-    let listener = match UnixListener::bind(socket_path) {
+///
+/// Binds a TCP loopback port, publishes it to `{run_dir}/{name}.port`, then
+/// accepts connections. Removes the port file when the listener exits.
+pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
+    let listener = match crate::ipc::bind_loopback() {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(agent = name, path = socket_path, error = %e, "failed to bind TUI socket");
+            tracing::warn!(agent = name, error = %e, "failed to bind TUI socket");
             return;
         }
     };
-    tracing::info!(agent = name, path = socket_path, "TUI socket ready");
+    let port = crate::ipc::local_port(&listener);
+    if let Err(e) = crate::ipc::write_port(run_dir, name, port) {
+        tracing::warn!(agent = name, error = %e, "failed to publish TUI port");
+        return;
+    }
+    tracing::info!(agent = name, port, "TUI socket ready");
 
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
             Err(_) => continue,
         };
+        let _ = stream.set_nodelay(true);
         tracing::info!(agent = name, "TUI client connected");
 
         // Protocol version handshake: send version byte before any framed data
@@ -137,11 +144,6 @@ pub fn serve_agent_tui(name: &str, socket_path: &str, registry: &AgentRegistry) 
 /// Get the PID-isolated run directory for the current daemon.
 pub fn run_dir(home: &Path) -> PathBuf {
     home.join("run").join(std::process::id().to_string())
-}
-
-pub fn agent_socket_path(home: &Path, name: &str) -> String {
-    let dir = find_active_run_dir(home).unwrap_or_else(|| run_dir(home));
-    dir.join(format!("{name}.sock")).display().to_string()
 }
 
 /// Find any active run directory (for CLI commands connecting to daemon).
@@ -290,12 +292,12 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             &registry,
         )?;
 
-        let sock = agent_socket_path(home, name);
+        let rdir = run_dir(home);
         let reg = Arc::clone(&registry);
         let n = name.clone();
         std::thread::Builder::new()
             .name(format!("{n}_tui_server"))
-            .spawn(move || serve_agent_tui(&n, &sock, &reg))?;
+            .spawn(move || serve_agent_tui(&n, &rdir, &reg))?;
         if agents.len() > 1 {
             let stagger_ms: u64 = std::env::var("AGEND_SPAWN_STAGGER_MS")
                 .ok()
@@ -621,13 +623,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                     }
 
                                     // Start TUI socket for respawned agent
-                                    let sock = agent_socket_path(&home, &config.name);
+                                    let rdir = run_dir(&home);
                                     let n = config.name.clone();
                                     let n_err = n.clone();
                                     let reg2 = Arc::clone(&reg);
                                     if let Err(e) = std::thread::Builder::new()
                                         .name(format!("{n}_tui_server"))
-                                        .spawn(move || serve_agent_tui(&n, &sock, &reg2))
+                                        .spawn(move || serve_agent_tui(&n, &rdir, &reg2))
                                     {
                                         tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI server");
                                     }
@@ -688,7 +690,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         let _ = c.kill();
         tracing::info!(agent = %name, "killed");
     }
-    // Remove entire run dir (sockets + PID isolation)
+    // Remove entire run dir (port files + .daemon identity + PID isolation)
     let _ = std::fs::remove_dir_all(run_dir(home));
 
     // Give threads time to flush logs and close connections
@@ -1149,19 +1151,6 @@ mod tests {
         // Timestamp should be a positive number
         let ts: u64 = parts[1].parse().expect("parse timestamp");
         assert!(ts > 0);
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn agent_socket_path_format() {
-        let home = tmp_home("sock_path");
-        // Create run dir for current PID so find_active_run_dir works
-        let run = run_dir(&home);
-        std::fs::create_dir_all(&run).ok();
-        write_daemon_id(&run);
-        let path = agent_socket_path(&home, "myagent");
-        assert!(path.ends_with("myagent.sock"));
-        assert!(path.contains("run"));
         std::fs::remove_dir_all(&home).ok();
     }
 

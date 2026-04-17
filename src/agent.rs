@@ -467,8 +467,7 @@ fn handle_pty_close(
             reg.remove(name);
         }
         if let Some(ref home) = home {
-            let sock = crate::daemon::agent_socket_path(home, name);
-            let _ = std::fs::remove_file(&sock);
+            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
         }
         return;
     }
