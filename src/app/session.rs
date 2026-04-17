@@ -202,7 +202,7 @@ pub(super) fn restore_with_reconciliation(
             unplaced.sort();
             for name in &unplaced {
                 if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(name)) {
-                    if let Ok(pane) = super::create_pane_from_resolved(
+                    if let Ok(pane) = super::pane_factory::create_pane_from_resolved(
                         name,
                         &resolved,
                         layout,
@@ -277,7 +277,7 @@ fn restore_node_reconciled(
                             .extend(backend.preset().resume_mode.args_for(home, fleet_name));
                     }
                     placed.insert(fleet_name.clone());
-                    let mut pane = super::create_pane_from_resolved(
+                    let mut pane = super::pane_factory::create_pane_from_resolved(
                         fleet_name,
                         &resolved,
                         layout,
@@ -295,7 +295,7 @@ fn restore_node_reconciled(
                 None => {
                     // Shell pane — recreate fresh
                     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-                    let mut pane = super::create_pane(
+                    let mut pane = super::pane_factory::create_pane(
                         layout,
                         registry,
                         home,

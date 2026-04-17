@@ -4,6 +4,7 @@
 //! same PTY lifecycle as the daemon: auto-dismiss, state tracking, broadcast.
 
 mod api_server;
+mod pane_factory;
 mod session;
 mod telegram_hooks;
 
@@ -12,7 +13,6 @@ use crate::backend::Backend;
 use crate::keybinds::{Action, KeyHandler};
 use crate::layout::{Layout, Pane, SplitDir, Tab};
 use crate::render;
-use crate::vterm::VTerm;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, MouseEventKind};
@@ -233,7 +233,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     );
     if !started {
         // Rule 4: nothing to restore → open shell tab
-        spawn_pane_tab(
+        pane_factory::spawn_pane_tab(
             &mut layout,
             &registry,
             &home,
@@ -970,7 +970,7 @@ fn pane_from_menu_item(
     match item.kind {
         MenuItemKind::Shell => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-            create_pane(
+            pane_factory::create_pane(
                 layout,
                 registry,
                 home,
@@ -988,7 +988,7 @@ fn pane_from_menu_item(
         }
         MenuItemKind::Backend(backend) => {
             let preset = backend.preset();
-            let inst_name = unique_fleet_name(home, preset.command);
+            let inst_name = pane_factory::unique_fleet_name(home, preset.command);
             if let Err(e) = crate::fleet::add_instance_to_yaml(
                 home,
                 &inst_name,
@@ -1003,7 +1003,7 @@ fn pane_from_menu_item(
             // Resolve from fleet to get defaults merged
             let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
             if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
-                create_pane_from_resolved(
+                pane_factory::create_pane_from_resolved(
                     &inst_name,
                     &resolved,
                     layout,
@@ -1016,7 +1016,7 @@ fn pane_from_menu_item(
                 )
             } else {
                 let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-                create_pane(
+                pane_factory::create_pane(
                     layout,
                     registry,
                     home,
@@ -1038,7 +1038,7 @@ fn pane_from_menu_item(
             let resolved = fleet
                 .resolve_instance(&inst_name)
                 .ok_or_else(|| anyhow::anyhow!("fleet instance '{inst_name}' not found"))?;
-            create_pane_from_resolved(
+            pane_factory::create_pane_from_resolved(
                 &inst_name,
                 &resolved,
                 layout,
@@ -1050,279 +1050,6 @@ fn pane_from_menu_item(
                 name_counter,
             )
         }
-    }
-}
-
-/// Spawn an agent/shell via spawn_agent and add as a new tab.
-#[allow(clippy::too_many_arguments)]
-fn spawn_pane_tab(
-    layout: &mut Layout,
-    registry: &AgentRegistry,
-    home: &Path,
-    base_name: &str,
-    command: &str,
-    args: &[String],
-    working_dir: Option<&Path>,
-    env: &HashMap<String, String>,
-    submit_key: &str,
-    cols: u16,
-    rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
-    name_counter: &mut HashMap<String, usize>,
-) -> Result<()> {
-    let pane = create_pane(
-        layout,
-        registry,
-        home,
-        base_name,
-        command,
-        args,
-        working_dir,
-        env,
-        submit_key,
-        cols,
-        rows,
-        wakeup_tx,
-        name_counter,
-    )?;
-    let tab_name = pane.agent_name.clone();
-    layout.add_tab(Tab::new(tab_name, pane));
-    Ok(())
-}
-
-/// Create a pane backed by spawn_agent.
-#[allow(clippy::too_many_arguments)]
-fn create_pane(
-    layout: &mut Layout,
-    registry: &AgentRegistry,
-    home: &Path,
-    base_name: &str,
-    command: &str,
-    args: &[String],
-    working_dir: Option<&Path>,
-    env: &HashMap<String, String>,
-    submit_key: &str,
-    cols: u16,
-    rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
-    name_counter: &mut HashMap<String, usize>,
-) -> Result<Pane> {
-    // Auto-dedup name
-    let count = name_counter.entry(base_name.to_string()).or_insert(0);
-    let name = if *count == 0 {
-        base_name.to_string()
-    } else {
-        format!("{base_name}-{count}")
-    };
-    *count += 1;
-
-    // Resolve working directory
-    let work_dir = working_dir
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| home.join("workspace").join(&name));
-
-    // Generate MCP config for agent backends
-    if Backend::from_command(command).is_some() {
-        crate::instructions::generate(&work_dir, command);
-    }
-
-    // Backend-specific flags (Claude's --append-system-prompt-file / --mcp-config /
-    // --settings) are now injected centrally by agent::spawn_agent, so callers pass
-    // raw args and spawn_agent enriches them from files under work_dir.
-    agent::spawn_agent(
-        &agent::SpawnConfig {
-            name: &name,
-            backend_command: command,
-            args,
-            cols,
-            rows,
-            env: Some(env),
-            working_dir: Some(&work_dir),
-            submit_key,
-            home: Some(home),
-            crash_tx: None,
-            shutdown: None,
-        },
-        registry,
-    )?;
-
-    // Subscribe to the agent's output
-    let (rx, dump) = {
-        let reg = agent::lock_registry(registry);
-        let handle = reg
-            .get(&name)
-            .ok_or_else(|| anyhow::anyhow!("agent not found after spawn"))?;
-        agent::subscribe_with_dump(handle)
-    };
-
-    // Create local VTerm and feed the screen dump
-    let mut vterm = VTerm::new(cols, rows);
-    vterm.process(&dump);
-
-    // Forward subscriber output to wakeup channel
-    let pane_id = layout.next_pane_id();
-    let tx = wakeup_tx.clone();
-    let pane_rx = {
-        let (fwd_tx, fwd_rx) = crossbeam::channel::unbounded::<Vec<u8>>();
-        std::thread::Builder::new()
-            .name(format!("{name}_fwd"))
-            .spawn(move || {
-                while let Ok(data) = rx.recv() {
-                    if fwd_tx.send(data).is_err() {
-                        break;
-                    }
-                    let _ = tx.send(pane_id);
-                }
-            })
-            .ok();
-        fwd_rx
-    };
-
-    let backend = Backend::from_command(command);
-
-    Ok(Pane {
-        agent_name: name,
-        vterm,
-        rx: pane_rx,
-        id: pane_id,
-        backend,
-        working_dir: Some(work_dir),
-        display_name: None,
-        scroll_offset: 0,
-        has_notification: false,
-        fleet_instance_name: None,
-        selection: None,
-    })
-}
-
-/// Attach a pane to an already-running agent (no spawn — subscribe only).
-/// Used when the API server creates an agent via MCP and the TUI needs to show it.
-fn attach_pane(
-    name: &str,
-    registry: &AgentRegistry,
-    cols: u16,
-    rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
-    layout: &mut Layout,
-) -> Result<Pane> {
-    let (rx, dump, backend_command) = {
-        let reg = agent::lock_registry(registry);
-        let handle = reg
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found in registry"))?;
-        let (rx, dump) = agent::subscribe_with_dump(handle);
-        (rx, dump, handle.backend_command.clone())
-    };
-
-    let mut vterm = VTerm::new(cols, rows);
-    vterm.process(&dump);
-
-    let pane_id = layout.next_pane_id();
-    let tx = wakeup_tx.clone();
-    let pane_rx = {
-        let n = name.to_string();
-        let (fwd_tx, fwd_rx) = crossbeam::channel::unbounded::<Vec<u8>>();
-        std::thread::Builder::new()
-            .name(format!("{n}_fwd"))
-            .spawn(move || {
-                while let Ok(data) = rx.recv() {
-                    if fwd_tx.send(data).is_err() {
-                        break;
-                    }
-                    let _ = tx.send(pane_id);
-                }
-            })
-            .ok();
-        fwd_rx
-    };
-
-    let backend = Backend::from_command(&backend_command);
-
-    Ok(Pane {
-        agent_name: name.to_string(),
-        vterm,
-        rx: pane_rx,
-        id: pane_id,
-        backend,
-        working_dir: None,
-        display_name: None,
-        scroll_offset: 0,
-        has_notification: false,
-        fleet_instance_name: Some(name.to_string()),
-        selection: None,
-    })
-}
-
-/// Create a pane from a fleet ResolvedInstance (full config: env, args, model, etc.).
-#[allow(clippy::too_many_arguments)]
-fn create_pane_from_resolved(
-    fleet_name: &str,
-    resolved: &crate::fleet::ResolvedInstance,
-    layout: &mut Layout,
-    registry: &AgentRegistry,
-    home: &Path,
-    cols: u16,
-    rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
-    name_counter: &mut HashMap<String, usize>,
-) -> Result<Pane> {
-    // Build fleet peer list for agent instructions
-    let fleet_path = home.join("fleet.yaml");
-    let peers: Vec<(String, Option<String>)> = crate::fleet::FleetConfig::load(&fleet_path)
-        .map(|f| {
-            f.instances
-                .iter()
-                .map(|(n, c)| (n.clone(), c.role.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let ctx = crate::instructions::AgentContext {
-        name: fleet_name,
-        role: resolved.role.as_deref(),
-        fleet_peers: &peers,
-    };
-
-    let mut pane = create_pane(
-        layout,
-        registry,
-        home,
-        fleet_name,
-        &resolved.backend_command,
-        &resolved.args,
-        resolved.working_directory.as_deref(),
-        &resolved.env,
-        &resolved.submit_key,
-        cols,
-        rows,
-        wakeup_tx,
-        name_counter,
-    )?;
-
-    // Overwrite basic instructions with fleet-aware version
-    if let Some(ref wd) = pane.working_dir {
-        crate::instructions::generate_with_context(wd, &resolved.backend_command, Some(&ctx));
-    }
-    pane.fleet_instance_name = Some(fleet_name.to_string());
-    Ok(pane)
-}
-
-/// Resolve a backend command string into (command, args, submit_key).
-/// If `fresh` is true, uses fresh_args (no resume) when available.
-fn resolve_backend(backend_name: &str, fresh: bool) -> (String, Vec<String>, String) {
-    if let Some(b) = Backend::from_command(backend_name) {
-        let p = b.preset();
-        let args = if fresh {
-            p.fresh_args.unwrap_or(p.args)
-        } else {
-            p.args
-        };
-        (
-            p.command.to_string(),
-            args.iter().map(|s| s.to_string()).collect(),
-            p.submit_key.to_string(),
-        )
-    } else {
-        (backend_name.to_string(), vec![], "\r".to_string())
     }
 }
 
@@ -1350,7 +1077,7 @@ fn execute_command(
             let pr = rows.saturating_sub(4);
 
             // unique_fleet_name guarantees inst_name is not yet in fleet.yaml
-            let inst_name = unique_fleet_name(home, base_name);
+            let inst_name = pane_factory::unique_fleet_name(home, base_name);
             if let Err(e) = crate::fleet::add_instance_to_yaml(
                 home,
                 &inst_name,
@@ -1366,7 +1093,7 @@ fn execute_command(
             let pane_result = if let Some(resolved) =
                 fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name))
             {
-                create_pane_from_resolved(
+                pane_factory::create_pane_from_resolved(
                     &inst_name,
                     &resolved,
                     layout,
@@ -1378,8 +1105,9 @@ fn execute_command(
                     name_counter,
                 )
             } else {
-                let (command, args, submit_key) = resolve_backend(backend_name, false);
-                create_pane(
+                let (command, args, submit_key) =
+                    pane_factory::resolve_backend(backend_name, false);
+                pane_factory::create_pane(
                     layout,
                     registry,
                     home,
@@ -1494,7 +1222,7 @@ fn execute_command(
                         if let Some(resolved) =
                             fleet.as_ref().and_then(|f| f.resolve_instance(fname))
                         {
-                            create_pane_from_resolved(
+                            pane_factory::create_pane_from_resolved(
                                 fname,
                                 &resolved,
                                 layout,
@@ -1506,8 +1234,9 @@ fn execute_command(
                                 name_counter,
                             )
                         } else {
-                            let (command, args, submit_key) = resolve_backend(&backend_cmd, true);
-                            create_pane(
+                            let (command, args, submit_key) =
+                                pane_factory::resolve_backend(&backend_cmd, true);
+                            pane_factory::create_pane(
                                 layout,
                                 registry,
                                 home,
@@ -1525,8 +1254,9 @@ fn execute_command(
                         }
                     } else {
                         // Non-fleet pane — use backend preset directly
-                        let (command, args, submit_key) = resolve_backend(&backend_cmd, true);
-                        create_pane(
+                        let (command, args, submit_key) =
+                            pane_factory::resolve_backend(&backend_cmd, true);
+                        pane_factory::create_pane(
                             layout,
                             registry,
                             home,
@@ -1679,7 +1409,7 @@ fn handle_instance_created(
         LayoutHint::Tab => None,
     };
 
-    let pane = match attach_pane(
+    let pane = match pane_factory::attach_pane(
         name,
         registry,
         cols,
@@ -1767,7 +1497,9 @@ fn handle_team_created(
         return;
     }
 
-    let first_pane = match attach_pane(running[0], registry, cols, pane_rows, wakeup_tx, layout) {
+    let first_pane = match pane_factory::attach_pane(
+        running[0], registry, cols, pane_rows, wakeup_tx, layout,
+    ) {
         Ok(p) => {
             tracing::info!(
                 team = team_name,
@@ -1786,7 +1518,7 @@ fn handle_team_created(
     let mut attached = 1usize;
 
     for member in &running[1..] {
-        match attach_pane(member, registry, cols, pane_rows, wakeup_tx, layout) {
+        match pane_factory::attach_pane(member, registry, cols, pane_rows, wakeup_tx, layout) {
             Ok(pane) => {
                 tab.split_focused(SplitDir::Horizontal, pane);
                 attached += 1;
@@ -1855,20 +1587,6 @@ fn kill_agent(registry: &AgentRegistry, name: &str) {
 }
 
 /// Generate a unique fleet instance name by checking fleet.yaml for collisions.
-fn unique_fleet_name(home: &Path, base: &str) -> String {
-    let Some(fleet) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok() else {
-        return base.to_string();
-    };
-    if !fleet.instances.contains_key(base) {
-        return base.to_string();
-    }
-    // Infinite iterator over 2.. always finds a unique name
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|c| !fleet.instances.contains_key(c))
-        .expect("infinite iterator")
-}
-
 /// Look up the fleet_instance_name for an agent by scanning the layout.
 fn lookup_fleet_name(layout: &Layout, agent_name: &str) -> Option<String> {
     for tab in &layout.tabs {

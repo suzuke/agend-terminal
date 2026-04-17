@@ -95,7 +95,7 @@ pub(super) fn auto_start_fleet(
     let mut spawned = false;
     for name in &names {
         if let Some(resolved) = fleet.resolve_instance(name) {
-            match super::create_pane_from_resolved(
+            match super::pane_factory::create_pane_from_resolved(
                 name,
                 &resolved,
                 layout,
