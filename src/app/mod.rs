@@ -15,7 +15,7 @@ use crate::layout::{Layout, Pane, SplitDir, Tab};
 use crate::render;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use std::collections::HashMap;
@@ -354,6 +354,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     Err(_) => break,
                 };
                 match ev {
+                    // Windows crossterm emits both Press and Release events for every key;
+                    // Unix only emits Press. Ignoring non-Press avoids every keystroke
+                    // firing the handler twice (breaks Ctrl+B prefix state, etc.).
+                    Event::Key(key) if key.kind != KeyEventKind::Press => {}
                     Event::Key(key) => {
                         // Overlay input handling
                         if !matches!(overlay, Overlay::None) {
