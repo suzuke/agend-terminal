@@ -395,8 +395,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             match &mut overlay {
                                 Overlay::NewTabMenu { ref items, ref mut selected } => {
                                     match key.code {
-                                        KeyCode::Up | KeyCode::Char('k') => { if *selected > 0 { *selected -= 1; } }
-                                        KeyCode::Down | KeyCode::Char('j') => { if *selected + 1 < items.len() { *selected += 1; } }
+                                        KeyCode::Up | KeyCode::Char('k') if *selected > 0 => { *selected -= 1; }
+                                        KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => { *selected += 1; }
                                         KeyCode::Enter => {
                                             let sel = *selected;
                                             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
@@ -423,8 +423,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 Overlay::SplitMenu { ref items, ref mut selected, dir } => {
                                     let split_dir = *dir;
                                     match key.code {
-                                        KeyCode::Up | KeyCode::Char('k') => { if *selected > 0 { *selected -= 1; } }
-                                        KeyCode::Down | KeyCode::Char('j') => { if *selected + 1 < items.len() { *selected += 1; } }
+                                        KeyCode::Up | KeyCode::Char('k') if *selected > 0 => { *selected -= 1; }
+                                        KeyCode::Down | KeyCode::Char('j') if *selected + 1 < items.len() => { *selected += 1; }
                                         KeyCode::Enter => {
                                             let sel = *selected;
                                             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
@@ -541,11 +541,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 }
                                 Overlay::TabList { ref mut selected } => {
                                     match key.code {
-                                        KeyCode::Up | KeyCode::Char('k') => {
-                                            if *selected > 0 { *selected -= 1; }
+                                        KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
+                                            *selected -= 1;
                                         }
-                                        KeyCode::Down | KeyCode::Char('j') => {
-                                            if *selected + 1 < layout.tabs.len() { *selected += 1; }
+                                        KeyCode::Down | KeyCode::Char('j') if *selected + 1 < layout.tabs.len() => {
+                                            *selected += 1;
                                         }
                                         KeyCode::Enter => {
                                             layout.goto_tab(*selected);
