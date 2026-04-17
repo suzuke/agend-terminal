@@ -85,9 +85,15 @@ fn configure_claude(working_dir: &Path) -> Result<()> {
 
     // Write statusline capture script (captures session_id from Claude)
     let statusline_path = working_dir.join("statusline.json");
-    let script_path = working_dir.join("statusline.sh");
-    let escaped_path = statusline_path.display().to_string().replace('\'', "'\\''");
-    let script = format!("#!/bin/bash\ncat > '{}'\necho ok\n", escaped_path);
+    let script_ext = if cfg!(windows) { "cmd" } else { "sh" };
+    let script_path = working_dir.join(format!("statusline.{script_ext}"));
+    let script = if cfg!(windows) {
+        let escaped = statusline_path.display().to_string().replace('"', "\"\"");
+        format!("@echo off\r\nfindstr \"^\" > \"{escaped}\"\r\necho ok\r\n")
+    } else {
+        let escaped = statusline_path.display().to_string().replace('\'', "'\\''");
+        format!("#!/bin/bash\ncat > '{escaped}'\necho ok\n")
+    };
     std::fs::write(&script_path, &script)?;
     #[cfg(unix)]
     {
@@ -129,12 +135,21 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
     // Generate wrapper script (Kiro ignores "env" in mcp.json)
     let wrapper_dir = working_dir.join(".kiro").join("settings");
     std::fs::create_dir_all(&wrapper_dir)?;
-    let wrapper_path = wrapper_dir.join("agend-mcp-wrapper.sh");
-    let wrapper = format!(
-        "#!/bin/bash\nexport AGEND_HOME={home}\nexec {bin} mcp\n",
-        home = shell_escape(&home_path()),
-        bin = shell_escape(&binary_path()),
-    );
+    let wrapper_ext = if cfg!(windows) { "cmd" } else { "sh" };
+    let wrapper_path = wrapper_dir.join(format!("agend-mcp-wrapper.{wrapper_ext}"));
+    let wrapper = if cfg!(windows) {
+        format!(
+            "@echo off\r\nset \"AGEND_HOME={home}\"\r\n\"{bin}\" mcp\r\n",
+            home = home_path(),
+            bin = binary_path(),
+        )
+    } else {
+        format!(
+            "#!/bin/bash\nexport AGEND_HOME={home}\nexec {bin} mcp\n",
+            home = shell_escape(&home_path()),
+            bin = shell_escape(&binary_path()),
+        )
+    };
     std::fs::write(&wrapper_path, &wrapper)?;
     #[cfg(unix)]
     {
@@ -280,7 +295,7 @@ fn codex_trust_directory(dir: &Path) {
 }
 
 fn dirs_home() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+    crate::user_home_dir()
 }
 
 /// Detect backend from command name and configure MCP.

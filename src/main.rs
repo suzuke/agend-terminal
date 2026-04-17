@@ -21,6 +21,7 @@ mod layout;
 mod mcp;
 mod mcp_config;
 mod ops;
+mod process;
 mod quickstart;
 mod render;
 mod schedules;
@@ -38,12 +39,16 @@ mod worktree;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Cross-platform user home directory with temp_dir fallback.
+pub fn user_home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(std::env::temp_dir)
+}
+
 pub fn home_dir() -> PathBuf {
     if let Ok(home) = std::env::var("AGEND_HOME") {
         return PathBuf::from(home);
     }
-    let base = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let base = PathBuf::from(base);
+    let base = user_home_dir();
     // Prefer ~/.agend, fallback to ~/.agend-terminal for backwards compat
     let new_path = base.join(".agend");
     let legacy_path = base.join(".agend-terminal");
