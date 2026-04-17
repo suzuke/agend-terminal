@@ -244,6 +244,18 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                     .or_else(|| args["command"].as_str())
                     .unwrap_or("claude");
                 let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
+                // Pre-generate instructions/mcp_config for all predicted team member
+                // names before the API call. Team names are deterministic
+                // ({team_name}-{i}) and the PTY starts immediately on spawn; generating
+                // after the API call creates a race where the agent can read configs
+                // before they exist. Matches the single-instance ordering above.
+                for i in 1..=count {
+                    let inst_name = format!("{team_name}-{i}");
+                    let wd = home.join("workspace").join(&inst_name);
+                    std::fs::create_dir_all(&wd).ok();
+                    crate::instructions::generate(&wd, backend);
+                    crate::mcp_config::configure(&wd, backend);
+                }
                 match crate::api::call(
                     &home,
                     &json!({"method": crate::api::method::CREATE_TEAM, "params": {
@@ -260,11 +272,6 @@ pub fn handle_tool(tool: &str, args: &Value, _agent_socket: &str, instance_name:
                                     .collect()
                             })
                             .unwrap_or_default();
-                        for inst_name in &spawned {
-                            let wd = home.join("workspace").join(inst_name);
-                            crate::instructions::generate(&wd, backend);
-                            crate::mcp_config::configure(&wd, backend);
-                        }
 
                         std::thread::scope(|s| {
                             for inst_name in &spawned {
