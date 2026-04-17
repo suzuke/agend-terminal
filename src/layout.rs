@@ -78,10 +78,15 @@ pub enum PaneNode {
     Leaf(Box<Pane>),
     Split {
         dir: SplitDir,
+        ratio: f32,
         first: Box<PaneNode>,
         second: Box<PaneNode>,
     },
 }
+
+const DEFAULT_RATIO: f32 = 0.5;
+const MIN_RATIO: f32 = 0.1;
+const MAX_RATIO: f32 = 0.9;
 
 impl PaneNode {
     pub fn pane_ids(&self) -> Vec<usize> {
@@ -192,6 +197,7 @@ fn split_in_tree(
         PaneNode::Leaf(p) if p.id == target_id => (
             PaneNode::Split {
                 dir,
+                ratio: DEFAULT_RATIO,
                 first: Box::new(PaneNode::Leaf(p)),
                 second: Box::new(PaneNode::Leaf(Box::new(new_pane))),
             },
@@ -200,6 +206,7 @@ fn split_in_tree(
         PaneNode::Leaf(p) => (PaneNode::Leaf(p), Some(new_pane)),
         PaneNode::Split {
             dir: d,
+            ratio,
             first,
             second,
         } => {
@@ -209,6 +216,7 @@ fn split_in_tree(
                 (
                     PaneNode::Split {
                         dir: d,
+                        ratio,
                         first: Box::new(new_first),
                         second: Box::new(new_second),
                     },
@@ -218,6 +226,7 @@ fn split_in_tree(
                 (
                     PaneNode::Split {
                         dir: d,
+                        ratio,
                         first: Box::new(new_first),
                         second,
                     },
@@ -231,7 +240,7 @@ fn split_in_tree(
 fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, Option<Pane>) {
     match node {
         PaneNode::Leaf(p) => (PaneNode::Leaf(p), None),
-        PaneNode::Split { dir, first, second } => {
+        PaneNode::Split { dir, ratio, first, second } => {
             if let PaneNode::Leaf(ref p) = *first {
                 if p.id == target_id {
                     let PaneNode::Leaf(removed) = *first else {
@@ -253,6 +262,7 @@ fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, Option<Pane>
                 return (
                     PaneNode::Split {
                         dir,
+                        ratio,
                         first: Box::new(new_first),
                         second,
                     },
@@ -263,6 +273,7 @@ fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, Option<Pane>
             (
                 PaneNode::Split {
                     dir,
+                    ratio,
                     first: Box::new(new_first),
                     second: Box::new(new_second),
                 },
@@ -351,6 +362,7 @@ fn build_tree(panes: Vec<Pane>, dir: SplitDir, alternate: bool) -> PaneNode {
     let child_dir = if alternate { dir.opposite() } else { dir };
     PaneNode::Split {
         dir,
+        ratio: DEFAULT_RATIO,
         first: Box::new(build_tree(left, child_dir, alternate)),
         second: Box::new(build_tree(right, child_dir, alternate)),
     }
@@ -370,6 +382,7 @@ fn build_preset(panes: Vec<Pane>, preset: LayoutPreset) -> PaneNode {
             let rest = main.split_off(1);
             PaneNode::Split {
                 dir: SplitDir::Vertical,
+                ratio: DEFAULT_RATIO,
                 first: Box::new(PaneNode::Leaf(Box::new(
                     main.into_iter().next().expect("split_off(1)"),
                 ))),
@@ -381,6 +394,7 @@ fn build_preset(panes: Vec<Pane>, preset: LayoutPreset) -> PaneNode {
             let rest = main.split_off(1);
             PaneNode::Split {
                 dir: SplitDir::Horizontal,
+                ratio: DEFAULT_RATIO,
                 first: Box::new(PaneNode::Leaf(Box::new(
                     main.into_iter().next().expect("split_off(1)"),
                 ))),
@@ -388,6 +402,210 @@ fn build_preset(panes: Vec<Pane>, preset: LayoutPreset) -> PaneNode {
             }
         }
         LayoutPreset::Tiled => build_tree(panes, SplitDir::Horizontal, true),
+    }
+}
+
+// --- Split border hit-test and resize ---
+
+/// Convert a ratio to a pixel size, clamped to [1, total-1] so both children
+/// always have at least 1 cell.
+pub fn ratio_to_size(ratio: f32, total: u16) -> u16 {
+    ((ratio * total as f32).round() as u16)
+        .max(1)
+        .min(total.saturating_sub(1))
+}
+
+/// Compute the (first, second) child areas of a split.
+#[allow(clippy::type_complexity)]
+fn split_child_areas(
+    area: (u16, u16, u16, u16),
+    dir: SplitDir,
+    ratio: f32,
+) -> ((u16, u16, u16, u16), (u16, u16, u16, u16)) {
+    let (ax, ay, aw, ah) = area;
+    match dir {
+        SplitDir::Horizontal => {
+            let first_h = ratio_to_size(ratio, ah);
+            ((ax, ay, aw, first_h), (ax, ay + first_h, aw, ah - first_h))
+        }
+        SplitDir::Vertical => {
+            let first_w = ratio_to_size(ratio, aw);
+            ((ax, ay, first_w, ah), (ax + first_w, ay, aw - first_w, ah))
+        }
+    }
+}
+
+/// Info about a split border detected at a mouse position.
+#[derive(Clone, Copy)]
+pub struct SplitBorderHit {
+    /// The area of the split node that owns this border.
+    pub split_area: (u16, u16, u16, u16),
+    pub dir: SplitDir,
+}
+
+/// Walk the pane tree with area info to find a split border at (col, row).
+/// A border is the 1-cell boundary between the two children of a split.
+pub fn find_split_border(
+    node: &PaneNode,
+    area: (u16, u16, u16, u16),
+    col: u16,
+    row: u16,
+) -> Option<SplitBorderHit> {
+    match node {
+        PaneNode::Leaf(_) => None,
+        PaneNode::Split { dir, ratio, first, second } => {
+            let (first_area, second_area) = split_child_areas(area, *dir, *ratio);
+            let (ax, ay, aw, ah) = area;
+            let on_border = match dir {
+                SplitDir::Horizontal => {
+                    let border_row = ay + first_area.3;
+                    row == border_row && col >= ax && col < ax + aw
+                }
+                SplitDir::Vertical => {
+                    let border_col = ax + first_area.2;
+                    col == border_col && row >= ay && row < ay + ah
+                }
+            };
+            if on_border {
+                return Some(SplitBorderHit { split_area: area, dir: *dir });
+            }
+            if let Some(hit) = find_split_border(first, first_area, col, row) {
+                return Some(hit);
+            }
+            find_split_border(second, second_area, col, row)
+        }
+    }
+}
+
+/// Adjust the ratio of the split whose area matches `split_area`,
+/// setting a new ratio based on mouse position.
+pub fn adjust_split_ratio(
+    node: &mut PaneNode,
+    area: (u16, u16, u16, u16),
+    split_area: (u16, u16, u16, u16),
+    mouse_pos: u16,
+    dir: SplitDir,
+) -> bool {
+    match node {
+        PaneNode::Leaf(_) => false,
+        PaneNode::Split { dir: d, ratio, first, second } => {
+            if area == split_area && *d == dir {
+                let (start, total) = match dir {
+                    SplitDir::Horizontal => (area.1, area.3),
+                    SplitDir::Vertical => (area.0, area.2),
+                };
+                if total > 1 {
+                    let new_ratio = (mouse_pos.saturating_sub(start) as f32) / (total as f32);
+                    *ratio = new_ratio.clamp(MIN_RATIO, MAX_RATIO);
+                }
+                return true;
+            }
+            let (first_area, second_area) = split_child_areas(area, *d, *ratio);
+            if adjust_split_ratio(first, first_area, split_area, mouse_pos, dir) {
+                return true;
+            }
+            adjust_split_ratio(second, second_area, split_area, mouse_pos, dir)
+        }
+    }
+}
+
+/// Adjust the split ratio containing the focused pane in a given direction.
+/// `step` is the ratio delta (positive = grow first child).
+pub fn resize_focused(
+    node: &mut PaneNode,
+    focus_id: usize,
+    dir: Direction,
+    step: f32,
+) -> bool {
+    match node {
+        PaneNode::Leaf(_) => false,
+        PaneNode::Split { dir: split_dir, ratio, first, second } => {
+            let first_has = first.find_pane(focus_id).is_some();
+            let second_has = second.find_pane(focus_id).is_some();
+            if !first_has && !second_has {
+                return false;
+            }
+            let dir_matches = matches!(
+                (split_dir, dir),
+                (SplitDir::Vertical, Direction::Left | Direction::Right)
+                    | (SplitDir::Horizontal, Direction::Up | Direction::Down)
+            );
+            if dir_matches {
+                let delta = match dir {
+                    Direction::Right | Direction::Down => step,
+                    Direction::Left | Direction::Up => -step,
+                };
+                let delta = if second_has { -delta } else { delta };
+                *ratio = (*ratio + delta).clamp(MIN_RATIO, MAX_RATIO);
+                return true;
+            }
+            // Recurse into the child containing focus
+            if first_has {
+                resize_focused(first, focus_id, dir, step)
+            } else {
+                resize_focused(second, focus_id, dir, step)
+            }
+        }
+    }
+}
+
+// --- Pane swap ---
+
+/// Swap two panes in the tree by ID. Returns true if both were found and swapped.
+pub fn swap_panes(root: &mut PaneNode, id_a: usize, id_b: usize) -> bool {
+    if id_a == id_b {
+        return false;
+    }
+    match root {
+        PaneNode::Leaf(_) => false,
+        PaneNode::Split { first, second, .. } => {
+            if let Some((pa, pb)) = find_two_panes(first, second, id_a, id_b) {
+                std::mem::swap(pa, pb);
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Find mutable references to two panes across sibling subtrees for swapping.
+fn find_two_panes<'a>(
+    first: &'a mut PaneNode,
+    second: &'a mut PaneNode,
+    id_a: usize,
+    id_b: usize,
+) -> Option<(&'a mut Pane, &'a mut Pane)> {
+    let a_in_first = first.find_pane(id_a).is_some();
+    let b_in_first = first.find_pane(id_b).is_some();
+
+    match (a_in_first, b_in_first) {
+        (true, false) => {
+            let pa = first.find_pane_mut(id_a)?;
+            let pb = second.find_pane_mut(id_b)?;
+            Some((pa, pb))
+        }
+        (false, true) => {
+            let pa = second.find_pane_mut(id_a)?;
+            let pb = first.find_pane_mut(id_b)?;
+            Some((pa, pb))
+        }
+        (true, true) => match first {
+            PaneNode::Split {
+                first: c1,
+                second: c2,
+                ..
+            } => find_two_panes(c1, c2, id_a, id_b),
+            _ => None,
+        },
+        (false, false) => match second {
+            PaneNode::Split {
+                first: c1,
+                second: c2,
+                ..
+            } => find_two_panes(c1, c2, id_a, id_b),
+            _ => None,
+        },
     }
 }
 
@@ -433,6 +651,10 @@ pub struct Tab {
     pub selecting_pane: Option<usize>,
     /// Last applied layout preset (for cycling with next_layout).
     pub last_layout: Option<LayoutPreset>,
+    /// Pane currently being dragged by title bar (drag-to-swap).
+    pub dragging_pane: Option<usize>,
+    /// Drop target pane during title bar drag.
+    pub drag_target: Option<usize>,
 }
 
 impl Tab {
@@ -446,6 +668,8 @@ impl Tab {
             pane_rects: std::collections::HashMap::new(),
             selecting_pane: None,
             last_layout: None,
+            dragging_pane: None,
+            drag_target: None,
         }
     }
 
@@ -460,6 +684,8 @@ impl Tab {
             pane_rects: std::collections::HashMap::new(),
             selecting_pane: None,
             last_layout: None,
+            dragging_pane: None,
+            drag_target: None,
         }
     }
 
@@ -592,6 +818,30 @@ impl Tab {
         let (new_root, remaining) = split_in_tree(root, self.focus_id, dir, new_pane);
         self.root = Some(new_root);
         remaining.is_none()
+    }
+
+    /// Pane ID whose rect contains (col, row), if any.
+    pub fn pane_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.pane_rects
+            .iter()
+            .find(|(_, &(px, py, pw, ph))| {
+                col >= px && col < px + pw && row >= py && row < py + ph
+            })
+            .map(|(&id, _)| id)
+    }
+
+    /// Pane ID whose top border row contains (col, row), if any.
+    pub fn title_bar_at(&self, col: u16, row: u16) -> Option<usize> {
+        self.pane_rects
+            .iter()
+            .find(|(_, &(px, py, pw, _ph))| row == py && col >= px && col < px + pw)
+            .map(|(&id, _)| id)
+    }
+
+    /// Reset both drag fields after a title-bar drag completes or aborts.
+    pub fn clear_drag(&mut self) {
+        self.dragging_pane = None;
+        self.drag_target = None;
     }
 
     /// Close the focused pane. Returns the removed pane's agent_name.

@@ -130,14 +130,22 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
     frame.render_widget(tabs, area);
 }
 
-fn split_chunks(area: Rect, dir: &SplitDir) -> [Rect; 2] {
+fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] {
+    let total = match dir {
+        SplitDir::Horizontal => area.height,
+        SplitDir::Vertical => area.width,
+    };
+    let first_size = crate::layout::ratio_to_size(ratio, total);
     let direction = match dir {
         SplitDir::Horizontal => Direction::Vertical,
         SplitDir::Vertical => Direction::Horizontal,
     };
     let chunks = ratatui::layout::Layout::default()
         .direction(direction)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Length(first_size),
+            Constraint::Min(1),
+        ])
         .split(area);
     [chunks[0], chunks[1]]
 }
@@ -186,8 +194,8 @@ fn collect_resize_needs(
                 resizes.push((pane.agent_name.clone(), w, h));
             }
         }
-        PaneNode::Split { dir, first, second } => {
-            let [c0, c1] = split_chunks(area, dir);
+        PaneNode::Split { dir, ratio, first, second } => {
+            let [c0, c1] = split_chunks(area, dir, *ratio);
             collect_resize_needs(c0, first, rects, resizes);
             collect_resize_needs(c1, second, rects, resizes);
         }
@@ -235,7 +243,7 @@ fn render_pane_tree(
 
     if tab.zoomed {
         if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
-            render_pane(frame, area, pane, true, false, registry);
+            render_pane(frame, area, pane, true, false, registry, false, false);
         }
         tab.pane_rects.clear();
         tab.pane_rects
@@ -243,6 +251,8 @@ fn render_pane_tree(
         return;
     }
 
+    let drag_source = tab.dragging_pane;
+    let drag_target = tab.drag_target;
     let mut rects = std::collections::HashMap::new();
     render_node(
         frame,
@@ -252,10 +262,13 @@ fn render_pane_tree(
         &mut rects,
         repeat_mode,
         registry,
+        drag_source,
+        drag_target,
     );
     tab.pane_rects = rects;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_node(
     frame: &mut Frame,
     area: Rect,
@@ -264,21 +277,35 @@ fn render_node(
     rects: &mut std::collections::HashMap<usize, (u16, u16, u16, u16)>,
     repeat_mode: bool,
     registry: &AgentRegistry,
+    drag_source: Option<usize>,
+    drag_target: Option<usize>,
 ) {
     match node {
         PaneNode::Leaf(pane) => {
             rects.insert(pane.id, (area.x, area.y, area.width, area.height));
             let focused = pane.id == focus_id;
-            render_pane(frame, area, pane, focused, repeat_mode, registry);
+            let is_drag_source = drag_source == Some(pane.id);
+            let is_drag_target = drag_target == Some(pane.id);
+            render_pane(
+                frame,
+                area,
+                pane,
+                focused,
+                repeat_mode,
+                registry,
+                is_drag_source,
+                is_drag_target,
+            );
         }
-        PaneNode::Split { dir, first, second } => {
-            let [c0, c1] = split_chunks(area, dir);
-            render_node(frame, c0, first, focus_id, rects, repeat_mode, registry);
-            render_node(frame, c1, second, focus_id, rects, repeat_mode, registry);
+        PaneNode::Split { dir, ratio, first, second } => {
+            let [c0, c1] = split_chunks(area, dir, *ratio);
+            render_node(frame, c0, first, focus_id, rects, repeat_mode, registry, drag_source, drag_target);
+            render_node(frame, c1, second, focus_id, rects, repeat_mode, registry, drag_source, drag_target);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pane(
     frame: &mut Frame,
     area: Rect,
@@ -286,6 +313,8 @@ fn render_pane(
     focused: bool,
     repeat_mode: bool,
     registry: &AgentRegistry,
+    is_drag_source: bool,
+    is_drag_target: bool,
 ) {
     pane.drain_output();
 
@@ -300,14 +329,17 @@ fn render_pane(
     };
     let sc = state_color(state);
 
-    // Focused pane: always use a bright border so it's clearly visible.
-    // Yellow for repeat mode, Green for active agents, Cyan for idle/shell.
-    let border_color = if focused && repeat_mode {
+    // Drag state overrides normal border colors
+    let border_color = if is_drag_source {
+        Color::Magenta
+    } else if is_drag_target {
+        Color::Green
+    } else if focused && repeat_mode {
         Color::Yellow
     } else if focused {
         match sc {
-            Color::DarkGray | Color::White => Color::Cyan, // idle, starting, shell
-            _ => sc, // thinking=yellow, tooluse=blue, error=red, etc.
+            Color::DarkGray | Color::White => Color::Cyan,
+            _ => sc,
         }
     } else {
         Color::DarkGray
@@ -319,7 +351,15 @@ fn render_pane(
         format!(" {} ", pane.label())
     };
 
-    let title_style = if focused && repeat_mode {
+    let title_style = if is_drag_source {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else if is_drag_target {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if focused && repeat_mode {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
@@ -590,6 +630,9 @@ pub fn render_help(frame: &mut Frame) {
         "    Ctrl+B %       Split vertical",
         "    Ctrl+B o       Cycle pane focus",
         "    Ctrl+B arrows  Directional focus",
+        "    Ctrl+B A-arrow Resize pane",
+        "    Drag border    Resize pane",
+        "    Drag title     Swap pane position",
         "    Ctrl+B x       Close pane",
         "    Ctrl+B z       Toggle zoom",
         "    Ctrl+B Space   Next layout preset",

@@ -12,6 +12,7 @@ use crate::vterm::VTerm;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -75,9 +76,15 @@ enum SessionNode {
     Leaf(SessionPane),
     Split {
         dir: SplitDir,
+        #[serde(default = "default_ratio")]
+        ratio: f32,
         first: Box<SessionNode>,
         second: Box<SessionNode>,
     },
+}
+
+fn default_ratio() -> f32 {
+    0.5
 }
 
 /// Layout-only pane info. Agent config comes from fleet.yaml on restore.
@@ -231,6 +238,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let mut key_handler = KeyHandler::new();
     let mut overlay = Overlay::None;
     let mut last_tab: usize = 0;
+    // Active border drag state for mouse resize
+    let mut border_drag: Option<(crate::layout::SplitBorderHit, Rect)> = None;
     // Counter for auto-dedup agent names
     let mut name_counter: HashMap<String, usize> = HashMap::new();
 
@@ -713,6 +722,20 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 }
                                 needs_resize = true;
                             }
+                            Action::ResizeUp | Action::ResizeDown
+                            | Action::ResizeLeft | Action::ResizeRight => {
+                                let dir = match action {
+                                    Action::ResizeUp => crate::layout::Direction::Up,
+                                    Action::ResizeDown => crate::layout::Direction::Down,
+                                    Action::ResizeLeft => crate::layout::Direction::Left,
+                                    _ => crate::layout::Direction::Right,
+                                };
+                                if let Some(tab) = layout.active_tab_mut() {
+                                    let focus = tab.focus_id;
+                                    crate::layout::resize_focused(tab.root_mut(), focus, dir, 0.05);
+                                }
+                                needs_resize = true;
+                            }
                             Action::None => {}
                         }
                     }
@@ -737,16 +760,88 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                         None => {}
                                     }
                                 } else {
+                                    // Check for border hit before starting text selection
+                                    let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
+                                    let pa = Rect::new(0, 1, c, r.saturating_sub(2));
+                                    let hit = layout.active_tab().and_then(|tab| {
+                                        crate::layout::find_split_border(
+                                            tab.root(),
+                                            (pa.x, pa.y, pa.width, pa.height),
+                                            mouse.column,
+                                            mouse.row,
+                                        )
+                                    });
+                                    if let Some(h) = hit {
+                                        border_drag = Some((h, pa));
+                                    } else if !layout.active_tab().is_some_and(|t| t.zoomed) {
+                                        let title_hit = layout
+                                            .active_tab()
+                                            .and_then(|tab| tab.title_bar_at(mouse.column, mouse.row));
+                                        if let Some(pane_id) = title_hit {
+                                            if let Some(tab) = layout.active_tab_mut() {
+                                                tab.focus_id = pane_id;
+                                                tab.dragging_pane = Some(pane_id);
+                                                tab.drag_target = None;
+                                            }
+                                        } else {
+                                            handle_mouse_selection(&mut layout, &mouse);
+                                            clear_selection_cache(&mut layout);
+                                        }
+                                    } else {
+                                        handle_mouse_selection(&mut layout, &mouse);
+                                        clear_selection_cache(&mut layout);
+                                    }
+                                }
+                            }
+                            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                                if let Some((ref hit, ref pa)) = border_drag {
+                                    let mouse_pos = match hit.dir {
+                                        SplitDir::Horizontal => mouse.row,
+                                        SplitDir::Vertical => mouse.column,
+                                    };
+                                    if let Some(tab) = layout.active_tab_mut() {
+                                        crate::layout::adjust_split_ratio(
+                                            tab.root_mut(),
+                                            (pa.x, pa.y, pa.width, pa.height),
+                                            hit.split_area,
+                                            mouse_pos,
+                                            hit.dir,
+                                        );
+                                    }
+                                    needs_resize = true;
+                                } else if layout.active_tab().is_some_and(|t| t.dragging_pane.is_some()) {
+                                    let target = layout.active_tab().and_then(|tab| {
+                                        let source = tab.dragging_pane?;
+                                        tab.pane_at(mouse.column, mouse.row)
+                                            .filter(|&id| id != source)
+                                    });
+                                    if let Some(tab) = layout.active_tab_mut() {
+                                        tab.drag_target = target;
+                                    }
+                                } else {
                                     handle_mouse_selection(&mut layout, &mouse);
                                     clear_selection_cache(&mut layout);
                                 }
                             }
-                            MouseEventKind::Drag(crossterm::event::MouseButton::Left)
-                            | MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                                handle_mouse_selection(&mut layout, &mouse);
-                                // Separate call: can't clear selecting_pane inside handle_mouse_selection
-                                // because tab is mutably borrowed via root_mut().find_pane_mut()
-                                clear_selection_cache(&mut layout);
+                            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                                if border_drag.is_some() {
+                                    border_drag = None;
+                                } else if layout.active_tab().is_some_and(|t| t.dragging_pane.is_some()) {
+                                    let source_id = layout.active_tab().and_then(|t| t.dragging_pane);
+                                    let target_id = layout.active_tab().and_then(|t| t.drag_target);
+                                    if let (Some(src), Some(tgt)) = (source_id, target_id) {
+                                        if let Some(tab) = layout.active_tab_mut() {
+                                            crate::layout::swap_panes(tab.root_mut(), src, tgt);
+                                        }
+                                        needs_resize = true;
+                                    }
+                                    if let Some(tab) = layout.active_tab_mut() {
+                                        tab.clear_drag();
+                                    }
+                                } else {
+                                    handle_mouse_selection(&mut layout, &mouse);
+                                    clear_selection_cache(&mut layout);
+                                }
                             }
                             _ => {}
                         }
@@ -1729,8 +1824,9 @@ fn save_node(node: &crate::layout::PaneNode) -> SessionNode {
             fleet_instance_name: pane.fleet_instance_name.clone(),
             display_name: pane.display_name.clone(),
         }),
-        crate::layout::PaneNode::Split { dir, first, second } => SessionNode::Split {
+        crate::layout::PaneNode::Split { dir, ratio, first, second } => SessionNode::Split {
             dir: *dir,
+            ratio: *ratio,
             first: Box::new(save_node(first)),
             second: Box::new(save_node(second)),
         },
@@ -1903,7 +1999,7 @@ fn restore_node_reconciled(
                 }
             }
         }
-        SessionNode::Split { dir, first, second } => {
+        SessionNode::Split { dir, ratio, first, second } => {
             let f = restore_node_reconciled(
                 first,
                 fleet,
@@ -1931,6 +2027,7 @@ fn restore_node_reconciled(
             match (f, s) {
                 (Some(f), Some(s)) => Some(crate::layout::PaneNode::Split {
                     dir: *dir,
+                    ratio: *ratio,
                     first: Box::new(f),
                     second: Box::new(s),
                 }),

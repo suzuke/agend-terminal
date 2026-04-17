@@ -25,6 +25,10 @@ pub enum Action {
     FocusDown,
     FocusLeft,
     FocusRight,
+    ResizeUp,
+    ResizeDown,
+    ResizeLeft,
+    ResizeRight,
     ClosePane,
     CloseTab,
     ToggleZoom,
@@ -144,7 +148,11 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char(' ') => Action::NextLayout,
         KeyCode::Char('.') => Action::RenamePane,
 
-        // Directional pane focus
+        // Directional pane focus (plain arrows) / resize (Alt+arrows)
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeUp,
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeDown,
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeLeft,
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeRight,
         KeyCode::Up => Action::FocusUp,
         KeyCode::Down => Action::FocusDown,
         KeyCode::Left => Action::FocusLeft,
@@ -171,6 +179,10 @@ fn is_repeatable(action: &Action) -> bool {
             | Action::FocusDown
             | Action::FocusLeft
             | Action::FocusRight
+            | Action::ResizeUp
+            | Action::ResizeDown
+            | Action::ResizeLeft
+            | Action::ResizeRight
             | Action::NextTab
             | Action::PrevTab
             | Action::NextLayout
