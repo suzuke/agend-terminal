@@ -6,6 +6,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
+/// Shell binary used as the dummy long-running process for each agent.
+/// Both `/bin/bash` (Unix) and `cmd.exe` (Windows) sit in the default PATH
+/// and block on stdin when spawned under a PTY, which is all these tests
+/// need from the agent — they exercise daemon lifecycle, not shell syntax.
+#[cfg(windows)]
+const SHELL_BIN: &str = "cmd.exe";
+#[cfg(not(windows))]
+const SHELL_BIN: &str = "/bin/bash";
+
 fn binary() -> PathBuf {
     // Use debug build
     let mut path = std::env::current_exe().expect("current_exe");
@@ -22,7 +31,8 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start(name: &str) -> Self {
-        Self::start_with_agents(name, vec!["shell:/bin/bash"])
+        let agent = format!("shell:{SHELL_BIN}");
+        Self::start_with_agents(name, vec![agent.as_str()])
     }
 
     fn start_with_agents(name: &str, agents: Vec<&str>) -> Self {
@@ -236,8 +246,9 @@ fn test_event_log_written() {
 #[test]
 fn test_fleet_multi_agent_lifecycle() {
     // Start daemon with two agents
-    let mut daemon =
-        TestDaemon::start_with_agents("fleet", vec!["shell1:/bin/bash", "shell2:/bin/bash"]);
+    let a1 = format!("shell1:{SHELL_BIN}");
+    let a2 = format!("shell2:{SHELL_BIN}");
+    let mut daemon = TestDaemon::start_with_agents("fleet", vec![a1.as_str(), a2.as_str()]);
 
     // Verify both appear in API list
     let resp = daemon.api_call(&serde_json::json!({"method": "list"}));

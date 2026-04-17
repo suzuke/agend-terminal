@@ -38,7 +38,6 @@ jobs:
 
       - name: Integration tests
         run: cargo test --test integration
-        if: runner.os != 'Windows'
 
       - name: Upload binary (Unix)
         if: runner.os != 'Windows'
