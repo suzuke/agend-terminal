@@ -21,7 +21,7 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
             fleet::InstanceConfig {
                 role: Some("Fleet coordinator — routes tasks between agents".to_string()),
                 backend: Some(default_backend),
-                working_directory: None, // resolve_instance will default to $AGEND_HOME/workspaces/general
+                working_directory: None, // resolve_instance will default to $AGEND_HOME/workspace/general
                 topic_id: Some(1),       // Telegram General topic
                 ..Default::default()
             },
@@ -180,10 +180,10 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 
     let stripped = {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         match reg.get(&name) {
             Some(handle) => {
-                let raw = handle.core.lock().unwrap().vterm.dump_screen();
+                let raw = handle.core.lock().unwrap_or_else(|e| e.into_inner()).vterm.dump_screen();
                 agent::strip_ansi_pub(&String::from_utf8_lossy(&raw))
             }
             None => {
@@ -194,9 +194,9 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     };
 
     {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(h) = reg.get(&name) {
-            let _ = h.child.lock().unwrap().kill();
+            let _ = h.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
         }
     }
 
@@ -258,7 +258,7 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
 
     tracing::info!("test:attach — injecting test command");
     {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let handle = reg.get("test-attach").unwrap();
         agent::write_to_agent(handle, b"echo AGEND_TEST_OK\r")?;
     }
@@ -266,9 +266,9 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let output = {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let handle = reg.get("test-attach").unwrap();
-        let core = handle.core.lock().unwrap();
+        let core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
         let dump = core.vterm.dump_screen();
         String::from_utf8_lossy(&dump).to_string()
     };
@@ -281,9 +281,9 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     }
 
     {
-        let reg = registry.lock().unwrap();
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         let handle = reg.get("test-attach").unwrap();
-        let mut child = handle.child.lock().unwrap();
+        let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
         let _ = child.kill();
     }
 

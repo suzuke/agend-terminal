@@ -464,19 +464,6 @@ pub fn try_dismiss_dialog(
     }
     let clean = strip_ansi(&String::from_utf8_lossy(detect_buf));
 
-    // DEBUG: log what dismiss sees (remove after fixing kiro TUI issue)
-    if clean.len() > 50 {
-        let tail: String = clean
-            .chars()
-            .rev()
-            .take(200)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        tracing::debug!(agent = name, patterns = dismiss_patterns.len(), clean_tail = %tail, "dismiss_check");
-    }
-
     for (pattern, key_seq) in dismiss_patterns {
         if clean.contains(pattern.as_str()) {
             tracing::info!(agent = name, pattern, "auto-dismissing dialog");
