@@ -13,8 +13,11 @@
 | 問題 | 狀態 |
 |------|------|
 | 🔴 TUI 事件後沒設 `needs_resize` | ✅ 已修復（app.rs:779） |
-| 🟡 split fallback 時重複訂閱 | ⚠️ 仍存在 |
-| 🟡 `LayoutHint::from_str` 遮蔽標準 trait | ⚠️ 仍存在 |
+| 🟡 P1: Team 路徑 instructions 競態 | ✅ 已修復（0f33156，pre-generate 在 API spawn 前） |
+| 🟡 P2: `create_instance` team 模式下 `name` required | ✅ 已修復（description 已說明 team 模式下 name 被當作 base name，忽略） |
+| 🟡 P3: split fallback 重複訂閱 | ✅ 已修復（25337ee，placement 在 attach_pane 前解析） |
+| 🟡 P4: 註解殘留 `workspaces` | ✅ 已修復（0c563c5） |
+| 🟢 P5: `LayoutHint::from_str` 遮蔽標準 trait | ✅ 已修復（重新命名為 `parse_hint`） |
 | 🟢 Team handler 沒有對已存在的 pane 去重 | 未改動（可接受） |
 
 ## 好的部分

@@ -47,7 +47,9 @@ pub(crate) enum LayoutHint {
 }
 
 impl LayoutHint {
-    pub(crate) fn from_str(s: &str) -> Self {
+    /// Parse a layout-hint string into the enum.
+    /// Named `parse_hint` (not `from_str`) to avoid shadowing `std::str::FromStr::from_str`.
+    pub(crate) fn parse_hint(s: &str) -> Self {
         match s {
             "split-right" => Self::SplitRight,
             "split-below" => Self::SplitBelow,
