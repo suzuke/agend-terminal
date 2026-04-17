@@ -120,47 +120,42 @@ impl FleetConfig {
     }
 
     /// Resolve an instance config by merging with defaults + backend preset.
+    ///
+    /// `backend` is the single source of truth for preset behavior: its variant
+    /// determines args / ready_pattern / submit_key (Shell / Raw variants have
+    /// empty presets). An explicit `command:` field, if present, still overrides
+    /// the binary path to spawn — useful for users pointing a preset at a
+    /// custom-built binary (`backend: claude` + `command: /opt/claude-v2/claude`).
     pub fn resolve_instance(&self, name: &str) -> Option<ResolvedInstance> {
         let inst = self.instances.get(name)?;
         let defaults = &self.defaults;
 
-        // Backend preset: instance > defaults
-        let backend = inst.backend.as_ref().or(defaults.backend.as_ref());
-        let preset = backend.map(|b| b.preset());
+        // Backend: instance > defaults > ClaudeCode fallback when the yaml
+        // specifies neither backend nor command.
+        let backend = inst
+            .backend
+            .clone()
+            .or_else(|| defaults.backend.clone())
+            .unwrap_or(Backend::ClaudeCode);
+        let preset = backend.preset();
 
-        // Command: instance > defaults > preset > "claude"
+        // Command path: explicit `command:` override > backend's own path.
+        // Shell resolves to $SHELL at spawn time; Raw carries a literal path.
         let backend_cmd = inst
             .command
             .clone()
             .or_else(|| defaults.command.clone())
-            .or_else(|| preset.as_ref().map(|p| p.command.to_string()))
-            .unwrap_or_else(|| "claude".to_string());
+            .unwrap_or_else(|| backend.command_string());
 
-        // Args: instance > defaults > preset (only if command basename matches preset)
-        let command_basename = std::path::Path::new(&backend_cmd)
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or(&backend_cmd)
-            .to_lowercase();
-        let command_matches_preset = preset
-            .as_ref()
-            .map(|p| {
-                command_basename == p.command
-                    || command_basename.starts_with(&format!("{}-", p.command))
-            })
-            .unwrap_or(false);
+        // Args: instance > defaults > preset. No basename guessing —
+        // Shell/Raw variants return empty preset args, preset variants return
+        // their bundled args unconditionally.
         let args = if !inst.args.is_empty() {
             inst.args.clone()
         } else if !defaults.args.is_empty() {
             defaults.args.clone()
-        } else if let Some(ref p) = preset {
-            if command_matches_preset {
-                p.args.iter().map(|s| s.to_string()).collect()
-            } else {
-                Vec::new()
-            }
         } else {
-            Vec::new()
+            preset.args.iter().map(|s| s.to_string()).collect()
         };
 
         // Merge env: defaults first, then instance overrides
@@ -168,22 +163,23 @@ impl FleetConfig {
         env.extend(inst.env.clone());
         env.insert("AGEND_INSTANCE_NAME".to_string(), name.to_string());
 
-        // Ready pattern: instance > defaults > preset
+        // Ready pattern: instance > defaults > preset (empty string for
+        // Shell/Raw, which means "no ready detection").
         let ready_pattern = inst
             .ready_pattern
             .clone()
             .or_else(|| defaults.ready_pattern.clone())
-            .or_else(|| preset.as_ref().map(|p| p.ready_pattern.to_string()));
+            .or_else(|| {
+                if preset.ready_pattern.is_empty() {
+                    None
+                } else {
+                    Some(preset.ready_pattern.to_string())
+                }
+            });
 
-        // Submit key: from preset (only if command matches) or default \r
-        let submit_key = if command_matches_preset {
-            preset
-                .as_ref()
-                .map(|p| p.submit_key.to_string())
-                .unwrap_or_else(|| "\r".to_string())
-        } else {
-            "\r".to_string()
-        };
+        // Submit key comes straight from the backend's preset. Shell/Raw
+        // default to `\r`.
+        let submit_key = preset.submit_key.to_string();
 
         let working_directory = Some(if let Some(d) = inst.working_directory.as_ref() {
             // Expand ~ to home directory
@@ -1107,6 +1103,35 @@ instances:
         assert_eq!(
             config.instances.get("custom").and_then(|i| i.backend.clone()),
             Some(Backend::Raw("/opt/foo/bar".to_string()))
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_backend_plus_command_override_keeps_preset_args() {
+        // Previously `command_matches_preset` basename-matched to decide
+        // whether preset args applied — a bug when the user pointed a preset
+        // at a custom-built binary (e.g. /opt/claude-v2/claude). After
+        // refactor, `backend:` is the contract; `command:` is purely the
+        // spawn path.
+        let dir = std::env::temp_dir().join(format!("agend-fleet-override-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  test:
+    backend: claude
+    command: /opt/claude-v2/my-claude
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("test").expect("resolve");
+        assert_eq!(resolved.backend_command, "/opt/claude-v2/my-claude");
+        // Preset args ARE applied because backend is explicitly claude.
+        assert!(
+            resolved.args.contains(&"--dangerously-skip-permissions".to_string()),
+            "expected claude preset args, got {:?}",
+            resolved.args
         );
         fs::remove_dir_all(&dir).ok();
     }
