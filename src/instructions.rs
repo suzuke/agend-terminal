@@ -46,31 +46,6 @@ fn generate_claude(working_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Codex: auto-trust working directory
-fn codex_trust_directory(dir: &Path) {
-    let home = crate::user_home_dir();
-    let config_path = home.join(".codex").join("config.toml");
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let dir_str = dir.display().to_string();
-    let toml_key = format!("[projects.\"{dir_str}\"]");
-    if content.contains(&toml_key) {
-        return;
-    }
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config_path)
-    {
-        let prefix = if content.is_empty() || content.ends_with('\n') {
-            ""
-        } else {
-            "\n"
-        };
-        let _ = writeln!(f, "{prefix}{toml_key}\ntrust_level = \"trusted\"");
-    }
-}
-
 /// Context for generating agent instructions.
 pub struct AgentContext<'a> {
     pub name: &'a str,
@@ -248,15 +223,13 @@ pub fn generate_with_context(working_dir: &Path, command: &str, ctx: Option<&Age
         ensure_project_root(working_dir);
     }
 
-    // Backend-specific setup (non-MCP)
+    // Backend-specific setup (non-MCP).
+    // Codex trust is handled inside mcp_config::configure below — do not
+    // duplicate it here or concurrent spawns race on ~/.codex/config.toml.
     let result = match backend {
         Some(crate::backend::Backend::ClaudeCode) => {
             migrate_claude_old_rules_file(working_dir);
             generate_claude(working_dir)
-        }
-        Some(crate::backend::Backend::Codex) => {
-            codex_trust_directory(working_dir);
-            Ok(())
         }
         _ => Ok(()),
     };

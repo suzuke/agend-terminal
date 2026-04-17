@@ -266,32 +266,70 @@ AGEND_HOME = "{home}""#
 }
 
 /// Add a directory to Codex's trusted projects in ~/.codex/config.toml.
+///
+/// Serialized across concurrent spawns via a sibling `.lock` file. Without the
+/// flock, parallel `create_instance` calls race: two writers interleave their
+/// `writeln!` syscalls and produce `[projects."a"][projects."b"]` on one line,
+/// which breaks `codex` config parsing. The lock scope also re-reads the file
+/// *after* acquisition, so a racing writer's entry is visible and we don't
+/// append a duplicate.
 fn codex_trust_directory(dir: &Path) {
-    let config_path = dirs_home().join(".codex").join("config.toml");
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let codex_dir = dirs_home().join(".codex");
+    // If ~/.codex doesn't exist, codex isn't installed — silently skip,
+    // matching pre-lock behavior where OpenOptions::create would fail.
+    if !codex_dir.exists() {
+        return;
+    }
+    let config_path = codex_dir.join("config.toml");
+    let lock_path = codex_dir.join(".config.toml.lock");
     let dir_str = dir.display().to_string();
-
-    // Check if already trusted
     let toml_key = format!("[projects.\"{dir_str}\"]");
+
+    let lock_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "codex trust: failed to open lock file");
+            return;
+        }
+    };
+    if let Err(e) = fs2::FileExt::lock_exclusive(&lock_file) {
+        tracing::warn!(error = %e, "codex trust: flock failed");
+        return;
+    }
+    // Lock held for the remainder of this function (released on drop).
+
+    // Re-read under the lock so a racing writer's entry is visible.
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
     if content.contains(&toml_key) {
         return;
     }
 
-    // Append trust entry
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&config_path)
-    {
-        let prefix = if content.is_empty() || content.ends_with('\n') {
-            ""
-        } else {
-            "\n"
-        };
-        let _ = writeln!(f, "{prefix}{toml_key}\ntrust_level = \"trusted\"");
-        tracing::debug!(dir = %dir_str, "Codex directory trusted");
+    else {
+        return;
+    };
+    let prefix = if content.is_empty() || content.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    // Single write_all of a pre-formatted buffer so a would-be interleave
+    // across multiple write() syscalls is impossible.
+    let entry = format!("{prefix}{toml_key}\ntrust_level = \"trusted\"\n");
+    if let Err(e) = f.write_all(entry.as_bytes()) {
+        tracing::warn!(error = %e, "codex trust: write failed");
+        return;
     }
+    tracing::debug!(dir = %dir_str, "Codex directory trusted");
 }
 
 fn dirs_home() -> std::path::PathBuf {
