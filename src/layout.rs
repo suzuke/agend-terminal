@@ -894,6 +894,15 @@ impl Tab {
         self.drag_target = None;
     }
 
+    /// Clear all in-progress UI state (selection tracking + drag tracking).
+    /// Called when the user leaves this tab so a half-finished mouse
+    /// interaction doesn't resume if they return to the tab later.
+    pub fn clear_transient_input(&mut self) {
+        self.selecting_pane = None;
+        self.dragging_pane = None;
+        self.drag_target = None;
+    }
+
     /// Close the focused pane. Returns the removed pane's agent_name.
     pub fn close_focused(&mut self) -> Option<String> {
         self.close_pane_by_id(self.focus_id)
@@ -945,8 +954,8 @@ impl Layout {
     }
 
     pub fn add_tab(&mut self, tab: Tab) {
+        self.switch_active(self.tabs.len());
         self.tabs.push(tab);
-        self.active = self.tabs.len() - 1;
     }
 
     pub fn active_tab(&self) -> Option<&Tab> {
@@ -957,21 +966,31 @@ impl Layout {
         self.tabs.get_mut(self.active)
     }
 
+    /// Change the active tab index, clearing the outgoing tab's in-progress
+    /// mouse state (selection / drag tracking) so it doesn't resume if the
+    /// user returns. Centralizing here keeps the invariant in one place.
+    fn switch_active(&mut self, new_idx: usize) {
+        if let Some(old) = self.tabs.get_mut(self.active) {
+            old.clear_transient_input();
+        }
+        self.active = new_idx;
+    }
+
     pub fn next_tab(&mut self) {
         if !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
+            self.switch_active((self.active + 1) % self.tabs.len());
         }
     }
 
     pub fn prev_tab(&mut self) {
         if !self.tabs.is_empty() {
-            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+            self.switch_active((self.active + self.tabs.len() - 1) % self.tabs.len());
         }
     }
 
     pub fn goto_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() {
-            self.active = idx;
+            self.switch_active(idx);
         }
     }
 
@@ -981,7 +1000,7 @@ impl Layout {
         }
         let tab = self.tabs.remove(idx);
         if self.active >= self.tabs.len() && !self.tabs.is_empty() {
-            self.active = self.tabs.len() - 1;
+            self.switch_active(self.tabs.len() - 1);
         }
         Some(tab)
     }

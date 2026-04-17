@@ -798,7 +798,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                             border_drag = Some((h, pa));
                                         } else {
                                             handle_mouse_selection(&mut layout, &mouse);
-                                            clear_selection_cache(&mut layout);
                                         }
                                     }
                                 }
@@ -830,7 +829,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     }
                                 } else {
                                     handle_mouse_selection(&mut layout, &mouse);
-                                    clear_selection_cache(&mut layout);
                                 }
                             }
                             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
@@ -850,7 +848,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     }
                                 } else {
                                     handle_mouse_selection(&mut layout, &mouse);
-                                    clear_selection_cache(&mut layout);
                                 }
                             }
                             _ => {}
@@ -2397,10 +2394,6 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
     }
 
     let rect = tab.pane_rects.get(&target_id).copied();
-    let pane = match tab.root_mut().find_pane_mut(target_id) {
-        Some(p) => p,
-        None => return,
-    };
     let (px, py, pw, ph) = match rect {
         Some(r) => r,
         None => return,
@@ -2413,57 +2406,54 @@ fn handle_mouse_selection(layout: &mut Layout, mouse: &crossterm::event::MouseEv
         return;
     }
 
-    match mouse.kind {
-        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            if mouse.column >= inner_x
-                && mouse.column < inner_x + inner_w
-                && mouse.row >= inner_y
-                && mouse.row < inner_y + inner_h
-            {
-                let col = mouse.column - inner_x;
-                let row = mouse.row - inner_y;
-                pane.selection = Some(crate::layout::Selection {
-                    start: (row, col),
-                    end: (row, col),
-                });
-            }
-        }
-        MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-            let col = mouse.column.max(inner_x).min(inner_x + inner_w - 1) - inner_x;
-            let row = mouse.row.max(inner_y).min(inner_y + inner_h - 1) - inner_y;
-            if let Some(ref mut sel) = pane.selection {
-                sel.end = (row, col);
-            }
-        }
-        MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-            if let Some(ref sel) = pane.selection {
-                let text = pane
-                    .vterm
-                    .extract_text(sel.start, sel.end, pane.scroll_offset);
-                if !text.is_empty() {
-                    copy_to_clipboard(&text);
+    // Scope the pane borrow so we can touch tab.selecting_pane afterwards.
+    let finished = {
+        let pane = match tab.root_mut().find_pane_mut(target_id) {
+            Some(p) => p,
+            None => return,
+        };
+        match mouse.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                if mouse.column >= inner_x
+                    && mouse.column < inner_x + inner_w
+                    && mouse.row >= inner_y
+                    && mouse.row < inner_y + inner_h
+                {
+                    let col = mouse.column - inner_x;
+                    let row = mouse.row - inner_y;
+                    pane.selection = Some(crate::layout::Selection {
+                        start: (row, col),
+                        end: (row, col),
+                    });
                 }
+                false
             }
-            pane.selection = None;
-            // Can't access tab here (already borrowed), so set a flag
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                let col = mouse.column.max(inner_x).min(inner_x + inner_w - 1) - inner_x;
+                let row = mouse.row.max(inner_y).min(inner_y + inner_h - 1) - inner_y;
+                if let Some(ref mut sel) = pane.selection {
+                    sel.end = (row, col);
+                }
+                false
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                if let Some(ref sel) = pane.selection {
+                    let text = pane
+                        .vterm
+                        .extract_text(sel.start, sel.end, pane.scroll_offset);
+                    if !text.is_empty() {
+                        copy_to_clipboard(&text);
+                    }
+                }
+                pane.selection = None;
+                true
+            }
+            _ => false,
         }
-        _ => {}
-    }
-}
+    };
 
-/// Clear selecting_pane cache after mouse up. Called after handle_mouse_selection.
-fn clear_selection_cache(layout: &mut Layout) {
-    if let Some(tab) = layout.active_tab_mut() {
-        if tab.selecting_pane.is_some() {
-            // Check if selection was cleared (mouse up happened)
-            let still_selecting = tab
-                .selecting_pane
-                .and_then(|id| tab.root().find_pane(id))
-                .is_some_and(|p| p.selection.is_some());
-            if !still_selecting {
-                tab.selecting_pane = None;
-            }
-        }
+    if finished {
+        tab.selecting_pane = None;
     }
 }
 

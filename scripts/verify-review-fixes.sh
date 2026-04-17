@@ -63,6 +63,58 @@ fi
 green "  ok (1 attach_pane call)"
 
 # ---------------------------------------------------------------------------
+# Round A: layout bounds + unicode width
+# ---------------------------------------------------------------------------
+info "Round A — MIN_PANE_CELLS + ratio_bounds present in layout.rs"
+if ! grep -q "const MIN_PANE_CELLS" src/layout.rs; then
+    fail "MIN_PANE_CELLS constant missing from src/layout.rs"
+fi
+if ! grep -q "fn ratio_bounds" src/layout.rs; then
+    fail "ratio_bounds helper missing from src/layout.rs"
+fi
+if ! grep -q "UnicodeWidthStr::width" src/layout.rs; then
+    fail "title bar sizing must use UnicodeWidthStr::width (CJK/emoji width)"
+fi
+green "  ok"
+
+info "Round A — tests cover ratio_bounds + unicode title width"
+for t in ratio_bounds_symmetric_when_room \
+         ratio_bounds_degenerate_when_tiny \
+         ratio_to_size_no_zero_when_room \
+         unicode_width_for_title_matches_terminal_cells; do
+    if ! grep -q "fn $t" src/layout.rs; then
+        fail "missing regression test: $t"
+    fi
+done
+green "  ok"
+
+# ---------------------------------------------------------------------------
+# Round B: selection cache merged + tab switch clears transient state
+# ---------------------------------------------------------------------------
+info "Round B — clear_selection_cache merged into handle_mouse_selection"
+if grep -qn "fn clear_selection_cache" src/app.rs; then
+    fail "clear_selection_cache should have been merged into handle_mouse_selection"
+fi
+if grep -qn "clear_selection_cache(" src/app.rs; then
+    fail "clear_selection_cache is still being called (should be merged)"
+fi
+green "  ok"
+
+info "Round B — Layout::switch_active centralizes tab-switch state clearing"
+if ! grep -q "fn switch_active" src/layout.rs; then
+    fail "Layout::switch_active helper missing"
+fi
+if ! grep -q "fn clear_transient_input" src/layout.rs; then
+    fail "Tab::clear_transient_input helper missing"
+fi
+# Only one `self.active =` assignment should remain (inside switch_active itself).
+ACTIVE_ASSIGNS=$(grep -c "self\.active = " src/layout.rs || true)
+if (( ACTIVE_ASSIGNS != 1 )); then
+    fail "expected exactly 1 'self.active =' assignment in layout.rs (inside switch_active); found $ACTIVE_ASSIGNS"
+fi
+green "  ok (1 self.active assignment, inside switch_active)"
+
+# ---------------------------------------------------------------------------
 # Build + tests
 # ---------------------------------------------------------------------------
 info "cargo build"
