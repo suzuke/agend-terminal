@@ -10,6 +10,7 @@ use crate::vterm::VTerm;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -204,11 +205,16 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         }
     }
 
-    // Add agend-terminal binary to PATH
+    // Add agend-terminal binary to PATH (use platform PATH separator)
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", format!("{}:{current_path}", bin_dir.display()));
+            let mut paths: Vec<PathBuf> = vec![bin_dir.to_path_buf()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                cmd.env("PATH", joined);
+            }
         }
     }
 
