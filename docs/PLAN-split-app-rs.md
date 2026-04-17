@@ -224,7 +224,7 @@ Without agent-spawn plumbing, use a `create_pane_stub` helper gated `#[cfg(test)
 
 ### Defensive checks per extraction PR
 - `cargo clippy --all-targets -- -D warnings`
-- Manual smoke: `cargo run -- quickstart` → create tab → split → zoom → rename → close. Document in PR body.
+- Manual smoke: `cargo run -- app` → create tab → split → zoom → rename → close. Document in PR body.
 
 ### Why not a TUI E2E test?
 Feasible but expensive: a pseudo-terminal driver (`vt100`/`expectrl`) around the binary would validate the event loop, but the crossterm thread + crossbeam select make deterministic E2E hard. Defer. Inline unit tests on extracted modules give 80% safety at 20% cost.
