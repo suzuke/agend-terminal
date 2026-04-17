@@ -326,10 +326,15 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             )
         })?;
 
+    // Shutdown wake channel — ctrlc handler sends on this so the main loop's
+    // select! wakes immediately instead of waiting up to 10s for the next tick.
+    let (shutdown_tx, shutdown_rx) = crossbeam::channel::bounded::<()>(1);
     let shutdown2 = Arc::clone(&shutdown);
     match ctrlc::set_handler(move || {
         tracing::info!("shutting down...");
         shutdown2.store(true, std::sync::atomic::Ordering::Relaxed);
+        // try_send: if already signaled, the flag is enough.
+        let _ = shutdown_tx.try_send(());
     }) {
         Ok(()) => {}
         Err(e) => tracing::warn!(error = %e, "Ctrl+C handler failed, use `stop`"),
@@ -366,7 +371,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             break;
         }
 
-        // Block until either a crash event or periodic tick
+        // Block until a crash event, periodic tick, or shutdown signal.
         let crashed_name: Option<String>;
         crossbeam::select! {
             recv(crash_rx) -> msg => {
@@ -374,6 +379,10 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             }
             recv(tick_rx) -> _ => {
                 crashed_name = None;
+            }
+            recv(shutdown_rx) -> _ => {
+                // Re-check flag at top of loop and break.
+                continue;
             }
         }
 
