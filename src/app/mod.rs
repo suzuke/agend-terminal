@@ -544,4 +544,3 @@ fn kill_agent(registry: &AgentRegistry, name: &str) {
     }
     reg.remove(name);
 }
-

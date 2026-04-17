@@ -158,7 +158,10 @@ fn handle_drag(mouse: MouseEvent, layout: &mut Layout, state: &mut MouseState) {
         // but resizing the PTY every mouse cell triggers the backend
         // (Claude/etc.) to reflow its entire UI and floods us with redraw
         // data. Defer the single PTY resize to mouse-up.
-    } else if layout.active_tab().is_some_and(|t| t.dragging_pane.is_some()) {
+    } else if layout
+        .active_tab()
+        .is_some_and(|t| t.dragging_pane.is_some())
+    {
         let target = layout.active_tab().and_then(|tab| {
             let source = tab.dragging_pane?;
             tab.pane_at(mouse.column, mouse.row)
@@ -183,7 +186,10 @@ fn handle_up(
         // Ratio was updated live during drag but PTY resizes were deferred
         // — fire one now.
         out.needs_resize = true;
-    } else if layout.active_tab().is_some_and(|t| t.dragging_pane.is_some()) {
+    } else if layout
+        .active_tab()
+        .is_some_and(|t| t.dragging_pane.is_some())
+    {
         let source_id = layout.active_tab().and_then(|t| t.dragging_pane);
         let target_id = layout.active_tab().and_then(|t| t.drag_target);
         if let (Some(src), Some(tgt)) = (source_id, target_id) {

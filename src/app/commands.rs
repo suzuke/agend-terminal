@@ -174,7 +174,8 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
 
                 if let Some((backend_cmd, work_dir, display_name, fleet_name)) = pane_info {
                     super::kill_agent(ctx.registry, &name);
-                    let _ = std::fs::remove_file(ctx.home.join("sessions").join(format!("{name}.sid")));
+                    let _ =
+                        std::fs::remove_file(ctx.home.join("sessions").join(format!("{name}.sid")));
 
                     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
                     let pc = cols.saturating_sub(2);
