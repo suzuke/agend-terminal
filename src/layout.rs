@@ -257,7 +257,12 @@ fn split_in_tree(
 fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, Option<Pane>) {
     match node {
         PaneNode::Leaf(p) => (PaneNode::Leaf(p), None),
-        PaneNode::Split { dir, ratio, first, second } => {
+        PaneNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
             if let PaneNode::Leaf(ref p) = *first {
                 if p.id == target_id {
                     let PaneNode::Leaf(removed) = *first else {
@@ -490,7 +495,12 @@ pub fn find_split_border(
 ) -> Option<SplitBorderHit> {
     match node {
         PaneNode::Leaf(_) => None,
-        PaneNode::Split { dir, ratio, first, second } => {
+        PaneNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
             let (first_area, second_area) = split_child_areas(area, *dir, *ratio);
             let (ax, ay, aw, ah) = area;
             // Shared-border convention: with 1-cell overlap between siblings,
@@ -508,7 +518,10 @@ pub fn find_split_border(
                 }
             };
             if on_border {
-                return Some(SplitBorderHit { split_area: area, dir: *dir });
+                return Some(SplitBorderHit {
+                    split_area: area,
+                    dir: *dir,
+                });
             }
             if let Some(hit) = find_split_border(first, first_area, col, row) {
                 return Some(hit);
@@ -529,7 +542,12 @@ pub fn adjust_split_ratio(
 ) -> bool {
     match node {
         PaneNode::Leaf(_) => false,
-        PaneNode::Split { dir: d, ratio, first, second } => {
+        PaneNode::Split {
+            dir: d,
+            ratio,
+            first,
+            second,
+        } => {
             if area == split_area && *d == dir {
                 let (start, total) = match dir {
                     SplitDir::Horizontal => (area.1, area.3),
@@ -569,7 +587,12 @@ pub fn resize_focused(
 ) -> bool {
     match node {
         PaneNode::Leaf(_) => false,
-        PaneNode::Split { dir: split_dir, ratio, first, second } => {
+        PaneNode::Split {
+            dir: split_dir,
+            ratio,
+            first,
+            second,
+        } => {
             let first_has = first.find_pane(focus_id).is_some();
             let second_has = second.find_pane(focus_id).is_some();
             if !first_has && !second_has {
@@ -881,9 +904,7 @@ impl Tab {
     pub fn pane_at(&self, col: u16, row: u16) -> Option<usize> {
         self.pane_rects
             .iter()
-            .find(|(_, &(px, py, pw, ph))| {
-                col >= px && col < px + pw && row >= py && row < py + ph
-            })
+            .find(|(_, &(px, py, pw, ph))| col >= px && col < px + pw && row >= py && row < py + ph)
             .map(|(&id, _)| id)
     }
 
@@ -1038,7 +1059,10 @@ mod tests {
     #[test]
     fn ratio_bounds_symmetric_when_room() {
         let (lo, hi) = ratio_bounds(100);
-        assert!((lo + hi - 1.0).abs() < f32::EPSILON, "bounds should be symmetric");
+        assert!(
+            (lo + hi - 1.0).abs() < f32::EPSILON,
+            "bounds should be symmetric"
+        );
     }
 
     #[test]

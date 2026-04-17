@@ -1743,7 +1743,11 @@ fn execute_command(
                 return true;
             };
             let Some(preset) = crate::layout::LayoutPreset::from_name(name) else {
-                tracing::warn!(name = *name, valid = crate::layout::LayoutPreset::all_names(), "unknown layout preset");
+                tracing::warn!(
+                    name = *name,
+                    valid = crate::layout::LayoutPreset::all_names(),
+                    "unknown layout preset"
+                );
                 return false;
             };
             tab.apply_layout(preset);
@@ -1859,7 +1863,12 @@ fn save_node(node: &crate::layout::PaneNode) -> SessionNode {
             fleet_instance_name: pane.fleet_instance_name.clone(),
             display_name: pane.display_name.clone(),
         }),
-        crate::layout::PaneNode::Split { dir, ratio, first, second } => SessionNode::Split {
+        crate::layout::PaneNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => SessionNode::Split {
             dir: *dir,
             ratio: *ratio,
             first: Box::new(save_node(first)),
@@ -2034,7 +2043,12 @@ fn restore_node_reconciled(
                 }
             }
         }
-        SessionNode::Split { dir, ratio, first, second } => {
+        SessionNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
             let f = restore_node_reconciled(
                 first,
                 fleet,
@@ -2122,7 +2136,10 @@ fn handle_instance_created(
 ) {
     tracing::info!(agent = name, hint = ?hint, spawner = ?spawner, tabs_before = layout.tabs.len(), "handle_instance_created begin");
     if layout.tabs.iter().any(|tab| tab.root().has_agent(name)) {
-        tracing::info!(agent = name, "handle_instance_created: agent already in layout, deduped");
+        tracing::info!(
+            agent = name,
+            "handle_instance_created: agent already in layout, deduped"
+        );
         return;
     }
 
@@ -2212,7 +2229,11 @@ fn handle_team_created(
         .filter(|m| {
             let already = layout.tabs.iter().any(|tab| tab.root().has_agent(m));
             if already {
-                tracing::warn!(team = team_name, member = m, "handle_team_created: member already in a tab, skipped");
+                tracing::warn!(
+                    team = team_name,
+                    member = m,
+                    "handle_team_created: member already in a tab, skipped"
+                );
             }
             !already
         })
@@ -2220,13 +2241,20 @@ fn handle_team_created(
     tracing::info!(team = team_name, running = ?running, "handle_team_created: filter complete");
 
     if running.is_empty() {
-        tracing::warn!(team = team_name, "handle_team_created: no running members, no tab created");
+        tracing::warn!(
+            team = team_name,
+            "handle_team_created: no running members, no tab created"
+        );
         return;
     }
 
     let first_pane = match attach_pane(running[0], registry, cols, pane_rows, wakeup_tx, layout) {
         Ok(p) => {
-            tracing::info!(team = team_name, first = running[0], "handle_team_created: first pane attached");
+            tracing::info!(
+                team = team_name,
+                first = running[0],
+                "handle_team_created: first pane attached"
+            );
             p
         }
         Err(e) => {

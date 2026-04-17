@@ -183,7 +183,12 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         match reg.get(&name) {
             Some(handle) => {
-                let raw = handle.core.lock().unwrap_or_else(|e| e.into_inner()).vterm.dump_screen();
+                let raw = handle
+                    .core
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .vterm
+                    .dump_screen();
                 agent::strip_ansi_pub(&String::from_utf8_lossy(&raw))
             }
             None => {

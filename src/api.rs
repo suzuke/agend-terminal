@@ -528,7 +528,12 @@ fn handle_session(
                         }
                     }
                 }
-                tracing::info!(team = team_name, spawned = spawned.len(), failed = failed.len(), "CREATE_TEAM spawn phase done");
+                tracing::info!(
+                    team = team_name,
+                    spawned = spawned.len(),
+                    failed = failed.len(),
+                    "CREATE_TEAM spawn phase done"
+                );
                 if count > 0 && spawned.is_empty() {
                     let _ = writeln!(
                         writer,
@@ -594,7 +599,10 @@ fn handle_session(
                             tracing::warn!(team = team_name, error = %e, "TeamCreated try_send failed");
                         }
                     } else {
-                        tracing::warn!(team = team_name, "CREATE_TEAM not emitting (spawned empty)");
+                        tracing::warn!(
+                            team = team_name,
+                            "CREATE_TEAM not emitting (spawned empty)"
+                        );
                     }
                 } else {
                     tracing::warn!(team = team_name, "CREATE_TEAM no tui_tx, event dropped");

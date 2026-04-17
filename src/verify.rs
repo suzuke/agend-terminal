@@ -234,7 +234,12 @@ fn test_attach(_home: &Path) -> TestResult {
 
     let output = {
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
-        let core = reg.get("verify-attach").unwrap().core.lock().unwrap_or_else(|e| e.into_inner());
+        let core = reg
+            .get("verify-attach")
+            .unwrap()
+            .core
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         String::from_utf8_lossy(&core.vterm.dump_screen()).to_string()
     };
     let ok = output.contains("VERIFY_OK");
@@ -477,7 +482,12 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             if !ready {
                 let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(handle) = reg.get(&agent_name) {
-                    let dump = handle.core.lock().unwrap_or_else(|e| e.into_inner()).vterm.dump_screen();
+                    let dump = handle
+                        .core
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .vterm
+                        .dump_screen();
                     let stripped = crate::agent::strip_ansi_pub(&String::from_utf8_lossy(&dump));
                     tracing::debug!(%name, "VTerm at timeout:");
                     for (i, line) in stripped.lines().enumerate() {
@@ -534,7 +544,12 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
                 }
             }
 
-            let is_gone = || !registry.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&agent_name);
+            let is_gone = || {
+                !registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&agent_name)
+            };
             let mut quit_ok = poll_until(
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
                 &is_gone,

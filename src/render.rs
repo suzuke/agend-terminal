@@ -139,7 +139,11 @@ fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] {
         SplitDir::Vertical => area.width,
     };
     let first_size = crate::layout::ratio_to_size(ratio, total);
-    let overlap: u16 = if first_size >= 1 && total > first_size { 1 } else { 0 };
+    let overlap: u16 = if first_size >= 1 && total > first_size {
+        1
+    } else {
+        0
+    };
     match dir {
         SplitDir::Horizontal => {
             let second_y = area.y + first_size.saturating_sub(overlap);
@@ -204,7 +208,12 @@ fn collect_resize_needs(
                 resizes.push((pane.agent_name.clone(), w, h));
             }
         }
-        PaneNode::Split { dir, ratio, first, second } => {
+        PaneNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
             let [c0, c1] = split_chunks(area, dir, *ratio);
             collect_resize_needs(c0, first, rects, resizes);
             collect_resize_needs(c1, second, rects, resizes);
@@ -321,15 +330,36 @@ fn render_node(
             );
             border_infos.push(info);
         }
-        PaneNode::Split { dir, ratio, first, second } => {
+        PaneNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
             let [c0, c1] = split_chunks(area, dir, *ratio);
             render_node(
-                frame, c0, first, focus_id, rects, border_infos,
-                repeat_mode, registry, drag_source, drag_target,
+                frame,
+                c0,
+                first,
+                focus_id,
+                rects,
+                border_infos,
+                repeat_mode,
+                registry,
+                drag_source,
+                drag_target,
             );
             render_node(
-                frame, c1, second, focus_id, rects, border_infos,
-                repeat_mode, registry, drag_source, drag_target,
+                frame,
+                c1,
+                second,
+                focus_id,
+                rects,
+                border_infos,
+                repeat_mode,
+                registry,
+                drag_source,
+                drag_target,
             );
         }
     }
