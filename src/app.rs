@@ -1208,27 +1208,14 @@ fn create_pane(
         crate::instructions::generate(&work_dir, command);
     }
 
-    // Build args with MCP config flags for Claude
-    let mut final_args = args.to_vec();
-    if let Some(Backend::ClaudeCode) = Backend::from_command(command) {
-        let mcp_config = work_dir.join("mcp-config.json");
-        if mcp_config.exists() {
-            final_args.push("--mcp-config".to_string());
-            final_args.push(mcp_config.display().to_string());
-        }
-        let settings = work_dir.join("claude-settings.json");
-        if settings.exists() {
-            final_args.push("--settings".to_string());
-            final_args.push(settings.display().to_string());
-        }
-    }
-
-    // Use the daemon's spawn_agent — gets auto-dismiss, state tracking, broadcast
+    // Backend-specific flags (Claude's --append-system-prompt-file / --mcp-config /
+    // --settings) are now injected centrally by agent::spawn_agent, so callers pass
+    // raw args and spawn_agent enriches them from files under work_dir.
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: &name,
             backend_command: command,
-            args: &final_args,
+            args,
             cols,
             rows,
             env: Some(env),
