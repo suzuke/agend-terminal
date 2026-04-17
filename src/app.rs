@@ -273,7 +273,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             &registry,
             &home,
             "shell",
-            &std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string()),
+            &std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string()),
             &[],
             None,
             &HashMap::new(),
@@ -1051,7 +1051,8 @@ fn pane_from_menu_item(
 ) -> Result<Pane> {
     match item.kind {
         MenuItemKind::Shell => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let shell =
+                std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string());
             create_pane(
                 layout,
                 registry,
@@ -1208,27 +1209,14 @@ fn create_pane(
         crate::instructions::generate(&work_dir, command);
     }
 
-    // Build args with MCP config flags for Claude
-    let mut final_args = args.to_vec();
-    if let Some(Backend::ClaudeCode) = Backend::from_command(command) {
-        let mcp_config = work_dir.join("mcp-config.json");
-        if mcp_config.exists() {
-            final_args.push("--mcp-config".to_string());
-            final_args.push(mcp_config.display().to_string());
-        }
-        let settings = work_dir.join("claude-settings.json");
-        if settings.exists() {
-            final_args.push("--settings".to_string());
-            final_args.push(settings.display().to_string());
-        }
-    }
-
-    // Use the daemon's spawn_agent — gets auto-dismiss, state tracking, broadcast
+    // Backend-specific flags (Claude's --append-system-prompt-file / --mcp-config /
+    // --settings) are now injected centrally by agent::spawn_agent, so callers pass
+    // raw args and spawn_agent enriches them from files under work_dir.
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: &name,
             backend_command: command,
-            args: &final_args,
+            args,
             cols,
             rows,
             env: Some(env),
@@ -2021,7 +2009,8 @@ fn restore_node_reconciled(
                 }
                 None => {
                     // Shell pane — recreate fresh
-                    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+                    let shell = std::env::var("SHELL")
+                        .unwrap_or_else(|_| crate::default_shell().to_string());
                     let mut pane = create_pane(
                         layout,
                         registry,

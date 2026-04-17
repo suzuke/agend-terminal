@@ -397,15 +397,15 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     if let Some(run) = crate::daemon::find_active_run_dir(home) {
         for entry in std::fs::read_dir(&run)?.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(".sock") && name != "api.sock" {
+            if name.ends_with(".port") && name != "api.port" {
                 let agent = &name[..name.len() - 5];
-                let ok = std::os::unix::net::UnixStream::connect(entry.path()).is_ok();
+                let ok = crate::ipc::probe_agent(&run, agent);
                 println!(
                     "    {agent} {}",
                     if ok {
-                        "✓ (socket responsive)"
+                        "✓ (port responsive)"
                     } else {
-                        "✗ (socket stale)"
+                        "✗ (port stale)"
                     }
                 );
                 count += 1;

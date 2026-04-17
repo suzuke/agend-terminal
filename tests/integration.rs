@@ -1,10 +1,19 @@
-//! Integration tests — spawn daemon as subprocess, test via API socket.
+//! Integration tests — spawn daemon as subprocess, test via TCP API port.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
+
+/// Shell binary used as the dummy long-running process for each agent.
+/// Both `/bin/bash` (Unix) and `cmd.exe` (Windows) sit in the default PATH
+/// and block on stdin when spawned under a PTY, which is all these tests
+/// need from the agent — they exercise daemon lifecycle, not shell syntax.
+#[cfg(windows)]
+const SHELL_BIN: &str = "cmd.exe";
+#[cfg(not(windows))]
+const SHELL_BIN: &str = "/bin/bash";
 
 fn binary() -> PathBuf {
     // Use debug build
@@ -22,7 +31,8 @@ struct TestDaemon {
 
 impl TestDaemon {
     fn start(name: &str) -> Self {
-        Self::start_with_agents(name, vec!["shell:/bin/bash"])
+        let agent = format!("shell:{SHELL_BIN}");
+        Self::start_with_agents(name, vec![agent.as_str()])
     }
 
     fn start_with_agents(name: &str, agents: Vec<&str>) -> Self {
@@ -42,37 +52,41 @@ impl TestDaemon {
             .spawn()
             .expect("spawn daemon");
 
-        // Wait for API socket
+        // Wait for API port file
         let mut found = false;
         for _ in 0..30 {
             std::thread::sleep(Duration::from_millis(200));
-            if Self::find_api_sock(&home).is_some() {
+            if Self::find_api_port(&home).is_some() {
                 found = true;
                 break;
             }
         }
-        assert!(found, "daemon API socket not found after 6s");
+        assert!(found, "daemon API port not published after 6s");
 
         TestDaemon { child, home }
     }
 
-    fn find_api_sock(home: &Path) -> Option<PathBuf> {
+    fn find_api_port(home: &Path) -> Option<u16> {
         let run = home.join("run");
         if !run.exists() {
             return None;
         }
         for entry in std::fs::read_dir(&run).ok()?.flatten() {
-            let api = entry.path().join("api.sock");
-            if api.exists() {
-                return Some(api);
+            let port_path = entry.path().join("api.port");
+            if let Ok(contents) = std::fs::read_to_string(&port_path) {
+                if let Ok(port) = contents.trim().parse::<u16>() {
+                    return Some(port);
+                }
             }
         }
         None
     }
 
     fn api_call(&self, request: &serde_json::Value) -> serde_json::Value {
-        let sock = Self::find_api_sock(&self.home).expect("api socket");
-        let mut stream = UnixStream::connect(&sock).expect("connect");
+        let port = Self::find_api_port(&self.home).expect("api port");
+        let mut stream =
+            TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
+        stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         writeln!(stream, "{}", request).expect("write");
         stream.flush().expect("flush");
@@ -232,8 +246,9 @@ fn test_event_log_written() {
 #[test]
 fn test_fleet_multi_agent_lifecycle() {
     // Start daemon with two agents
-    let mut daemon =
-        TestDaemon::start_with_agents("fleet", vec!["shell1:/bin/bash", "shell2:/bin/bash"]);
+    let a1 = format!("shell1:{SHELL_BIN}");
+    let a2 = format!("shell2:{SHELL_BIN}");
+    let mut daemon = TestDaemon::start_with_agents("fleet", vec![a1.as_str(), a2.as_str()]);
 
     // Verify both appear in API list
     let resp = daemon.api_call(&serde_json::json!({"method": "list"}));

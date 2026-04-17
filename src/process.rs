@@ -18,7 +18,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
                 pid,
             )
         };
-        if handle == 0 {
+        if handle.is_null() {
             return false;
         }
         unsafe {
@@ -45,7 +45,7 @@ pub fn terminate(pid: u32) {
                 pid,
             )
         };
-        if handle != 0 {
+        if !handle.is_null() {
             unsafe {
                 windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
                 windows_sys::Win32::Foundation::CloseHandle(handle);

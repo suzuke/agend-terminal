@@ -171,8 +171,23 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         })
         .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
 
+    let detected_backend = Backend::from_command(backend_command);
+
+    // Enrich args with backend-specific flags (e.g. Claude's
+    // --append-system-prompt-file / --mcp-config / --settings) derived from
+    // files already written by instructions::generate. Flags are only emitted
+    // when the files exist, so callers that skip generate() get raw args.
+    let enriched_args: Vec<String> = {
+        let extra = detected_backend
+            .as_ref()
+            .zip(*working_dir)
+            .map(|(b, wd)| b.spawn_flags(wd))
+            .unwrap_or_default();
+        args.iter().cloned().chain(extra).collect()
+    };
+
     let mut cmd = CommandBuilder::new(backend_command);
-    cmd.args(*args);
+    cmd.args(&enriched_args);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("FORCE_COLOR", "1");
@@ -219,7 +234,6 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         .map_err(|e| anyhow::anyhow!("clone_reader: {e}"))?;
     let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
-    let detected_backend = Backend::from_command(backend_command);
     let core = Arc::new(Mutex::new(AgentCore {
         vterm: VTerm::new(*cols, *rows),
         subscribers: Vec::new(),
@@ -467,8 +481,7 @@ fn handle_pty_close(
             reg.remove(name);
         }
         if let Some(ref home) = home {
-            let sock = crate::daemon::agent_socket_path(home, name);
-            let _ = std::fs::remove_file(&sock);
+            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
         }
         return;
     }

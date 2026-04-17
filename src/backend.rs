@@ -121,7 +121,9 @@ impl Backend {
                 typed_inject: false,
                 resume_mode: ResumeMode::SavedSession { flag: "--resume" },
                 quit_command: "/exit",
-                instructions_path: ".claude/rules/agend.md",
+                // Not under `.claude/rules/` to avoid double-loading: we pass this
+                // file explicitly via `--append-system-prompt-file` (see spawn_flags).
+                instructions_path: ".claude/agend.md",
                 instructions_shared: false,
                 inject_instructions_on_ready: false,
                 ready_timeout_secs: 30,
@@ -281,6 +283,36 @@ impl Backend {
             Backend::OpenCode => "opencode",
             Backend::Gemini => "gemini",
         }
+    }
+
+    /// Extra CLI flags to pass on spawn, derived from files that
+    /// `instructions::generate` has written to `working_dir`. Only emits a flag
+    /// when the corresponding file is present, so this is safe to call
+    /// unconditionally from every spawn path.
+    ///
+    /// Claude Code gets `--append-system-prompt-file` (instructions) plus
+    /// `--mcp-config` / `--settings` (MCP wiring). Other backends rely on
+    /// their own auto-discovery mechanisms and return an empty vec.
+    pub fn spawn_flags(&self, working_dir: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if matches!(self, Backend::ClaudeCode) {
+            let instr = working_dir.join(self.preset().instructions_path);
+            if instr.exists() {
+                out.push("--append-system-prompt-file".to_string());
+                out.push(instr.display().to_string());
+            }
+            let mcp = working_dir.join("mcp-config.json");
+            if mcp.exists() {
+                out.push("--mcp-config".to_string());
+                out.push(mcp.display().to_string());
+            }
+            let settings = working_dir.join("claude-settings.json");
+            if settings.exists() {
+                out.push("--settings".to_string());
+                out.push(settings.display().to_string());
+            }
+        }
+        out
     }
 
     /// Check if the backend binary is in PATH.
@@ -484,5 +516,84 @@ mod tests {
             "gemini-2.5-pro"
         );
         assert_eq!(Backend::Codex.format_model_arg("o3"), "o3");
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!(
+            "agend-backend-test-{}-{tag}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&d).ok();
+        d
+    }
+
+    #[test]
+    fn spawn_flags_claude_emits_only_for_existing_files() {
+        let dir = tmp_dir("spawn_flags_claude_partial");
+        // Nothing on disk yet — no flags.
+        assert!(
+            Backend::ClaudeCode.spawn_flags(&dir).is_empty(),
+            "expected empty when files missing"
+        );
+        // Drop just the instructions file.
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/agend.md"), "x").unwrap();
+        let flags = Backend::ClaudeCode.spawn_flags(&dir);
+        assert!(flags.contains(&"--append-system-prompt-file".to_string()));
+        assert!(!flags.contains(&"--mcp-config".to_string()));
+        assert!(!flags.contains(&"--settings".to_string()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_flags_claude_full_set_when_all_files_present() {
+        let dir = tmp_dir("spawn_flags_claude_full");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/agend.md"), "x").unwrap();
+        std::fs::write(dir.join("mcp-config.json"), "{}").unwrap();
+        std::fs::write(dir.join("claude-settings.json"), "{}").unwrap();
+        let flags = Backend::ClaudeCode.spawn_flags(&dir);
+        // Each flag appears exactly once, followed by its path arg.
+        assert_eq!(
+            flags
+                .iter()
+                .filter(|s| s.starts_with("--"))
+                .collect::<Vec<_>>()
+                .len(),
+            3
+        );
+        assert!(flags
+            .windows(2)
+            .any(|w| w[0] == "--append-system-prompt-file" && w[1].ends_with(".claude/agend.md")));
+        assert!(flags
+            .windows(2)
+            .any(|w| w[0] == "--mcp-config" && w[1].ends_with("mcp-config.json")));
+        assert!(flags
+            .windows(2)
+            .any(|w| w[0] == "--settings" && w[1].ends_with("claude-settings.json")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_flags_non_claude_backends_are_empty() {
+        let dir = tmp_dir("spawn_flags_non_claude");
+        // Even if random files exist they must not produce flags for these.
+        std::fs::write(dir.join("AGENTS.md"), "x").unwrap();
+        std::fs::write(dir.join("GEMINI.md"), "x").unwrap();
+        for b in [
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Gemini,
+        ] {
+            assert!(
+                b.spawn_flags(&dir).is_empty(),
+                "{b:?} must not emit spawn flags"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

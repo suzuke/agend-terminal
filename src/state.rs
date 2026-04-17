@@ -474,8 +474,14 @@ mod tests {
     #[test]
     fn idle_never_hangs() {
         let mut h = HealthTracker::new();
-        // Even with 10000s of silence, Idle should never be considered hung
-        let ancient = Instant::now() - Duration::from_secs(10_000);
+        // Even with 10000s of silence, Idle should never be considered hung.
+        // On Windows `Instant` is anchored to boot time, so plain subtraction
+        // overflows when the runner has been up for less than the offset.
+        // Fall back to `now` (elapsed ≈ 0) on that path — still exercises
+        // the "Idle never hangs" branch, just at a shorter elapsed time.
+        let ancient = Instant::now()
+            .checked_sub(Duration::from_secs(10_000))
+            .unwrap_or_else(Instant::now);
         assert!(!h.check_hang(AgentState::Idle, ancient));
     }
 

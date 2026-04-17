@@ -16,6 +16,7 @@ mod framing;
 mod health;
 mod inbox;
 mod instructions;
+mod ipc;
 mod keybinds;
 mod layout;
 mod mcp;
@@ -42,6 +43,19 @@ use std::path::PathBuf;
 /// Cross-platform user home directory with temp_dir fallback.
 pub fn user_home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// Default shell command used whenever no explicit agent command is given.
+/// Both `/bin/bash` (Unix) and `cmd.exe` (Windows) sit in the default PATH.
+pub fn default_shell() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cmd.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "/bin/bash"
+    }
 }
 
 pub fn home_dir() -> PathBuf {
@@ -293,7 +307,7 @@ fn main() -> anyhow::Result<()> {
                     &home,
                     vec![(
                         "shell".to_string(),
-                        "/bin/bash".to_string(),
+                        default_shell().to_string(),
                         Vec::new(),
                         None,
                         None,
@@ -306,7 +320,7 @@ fn main() -> anyhow::Result<()> {
             let agents: Vec<_> = if agents.is_empty() {
                 vec![(
                     "shell".into(),
-                    "/bin/bash".into(),
+                    default_shell().into(),
                     Vec::new(),
                     None,
                     None,
@@ -344,16 +358,17 @@ fn main() -> anyhow::Result<()> {
             connect::run(&home, &name, &backend, working_dir.as_deref(), &extra_args)?;
         }
         Some(Commands::Attach { name }) => {
-            let sock = daemon::agent_socket_path(&home, &name);
-            if let Err(e) = tui::attach(&sock) {
-                let err = format!("{e}");
-                if err.contains("No such file") || err.contains("Connection refused") {
-                    if daemon::find_active_run_dir(&home).is_none() {
-                        daemon_not_running_hint();
-                    } else {
-                        eprintln!("Agent '{name}' not found.");
-                        list_running_agents(&home);
-                    }
+            if let Err(e) = tui::attach(&home, &name) {
+                let err = format!("{e:#}").to_ascii_lowercase();
+                if err.contains("no active daemon") {
+                    daemon_not_running_hint();
+                } else if err.contains("port file missing")
+                    || err.contains("refused")
+                    || err.contains("connectionreset")
+                    || err.contains("connection reset")
+                {
+                    eprintln!("Agent '{name}' not found.");
+                    list_running_agents(&home);
                 } else {
                     return Err(e);
                 }
@@ -391,7 +406,7 @@ fn main() -> anyhow::Result<()> {
                     .flatten()
                     .filter_map(|e| {
                         let n = e.file_name().to_string_lossy().to_string();
-                        n.ends_with(".sock").then(|| n[..n.len() - 5].to_string())
+                        n.ends_with(".port").then(|| n[..n.len() - 5].to_string())
                     })
                     .filter(|n| n != "api")
                     .collect();
@@ -479,7 +494,7 @@ fn main() -> anyhow::Result<()> {
             if instance_name.is_empty() {
                 tracing::warn!("AGEND_INSTANCE_NAME not set, running in standalone mode");
             }
-            mcp::run(&daemon::agent_socket_path(&home, &instance_name))?;
+            mcp::run()?;
         }
         Some(Commands::Capture { backend, seconds }) => {
             let b: backend::Backend = serde_json::from_str(&format!("\"{backend}\""))

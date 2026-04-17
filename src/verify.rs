@@ -96,14 +96,24 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
         && agent::spawn_agent(&test_spawn_config("test-b", Some(&daemon_home)), &registry).is_ok();
 
     if spawn_ok {
-        // Start TUI sockets
+        // Ensure run dir + .daemon identity exists so clients can discover us
+        let rdir = daemon::run_dir(&daemon_home);
+        std::fs::create_dir_all(&rdir).ok();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = std::fs::write(
+            rdir.join(".daemon"),
+            format!("{}:{now}", std::process::id()),
+        );
         for name in ["test-a", "test-b"] {
-            let sock = daemon::agent_socket_path(&daemon_home, name);
+            let rdir = rdir.clone();
             let reg = Arc::clone(&registry);
             let n = name.to_string();
             std::thread::Builder::new()
                 .name(format!("{n}_tui"))
-                .spawn(move || daemon::serve_agent_tui(&n, &sock, &reg))
+                .spawn(move || daemon::serve_agent_tui(&n, &rdir, &reg))
                 .ok();
         }
 

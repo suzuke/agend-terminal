@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, worktree-windows-support-phase-a]
+    branches: [main, worktree-windows-port-phase-c]
   pull_request:
     branches: [main]
 
@@ -14,8 +14,9 @@ jobs:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,11 +38,80 @@ jobs:
 
       - name: Integration tests
         run: cargo test --test integration
-        if: runner.os != 'Windows'
 
-      - name: Upload binary
+      - name: CLI smoke (Phase C.5)
+        shell: bash
+        env:
+          AGEND_HOME: ${{ runner.temp }}/agend-smoke
+        run: |
+          set -eu
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN="./target/release/agend-terminal.exe"
+            SHELL_CMD="cmd.exe"
+          else
+            BIN="./target/release/agend-terminal"
+            SHELL_CMD="/bin/bash"
+          fi
+
+          rm -rf "$AGEND_HOME"
+          mkdir -p "$AGEND_HOME"
+
+          # Binary invokes at all
+          "$BIN" --version
+
+          # Spawn daemon in background with one shell agent
+          "$BIN" daemon "shell:$SHELL_CMD" > daemon.log 2>&1 &
+          DAEMON_PID=$!
+
+          # Wait up to 30s for api.port to appear
+          for i in $(seq 1 60); do
+            if find "$AGEND_HOME/run" -name api.port 2>/dev/null | grep -q .; then
+              echo "daemon ready (iter $i)"
+              break
+            fi
+            if ! kill -0 $DAEMON_PID 2>/dev/null; then
+              echo "daemon died during startup"
+              cat daemon.log
+              exit 1
+            fi
+            sleep 0.5
+          done
+
+          # List — must include the shell agent
+          "$BIN" list --json | tee list.out
+          grep -q '"shell"' list.out || { echo "shell agent missing from list"; exit 1; }
+
+          # Inject
+          "$BIN" inject shell 'echo hi'
+
+          # Clean shutdown
+          "$BIN" stop
+
+          # Wait up to 20s for daemon to exit (saw ~10s on a local macOS run;
+          # Windows runners are slower, leave headroom).
+          for i in $(seq 1 40); do
+            if ! kill -0 $DAEMON_PID 2>/dev/null; then
+              echo "daemon exited cleanly"
+              break
+            fi
+            sleep 0.5
+          done
+
+          echo "=== daemon log ==="
+          cat daemon.log || true
+
+      - name: Upload binary (Unix)
+        if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: agend-terminal-${{ runner.os }}-${{ runner.arch }}
           path: target/release/agend-terminal
+          retention-days: 14
+
+      - name: Upload binary (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: agend-terminal-${{ runner.os }}-${{ runner.arch }}
+          path: target/release/agend-terminal.exe
           retention-days: 14
