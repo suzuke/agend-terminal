@@ -1,5 +1,8 @@
 # AgEnD Terminal — Terminal Emulator 實作計劃
 
+> Status: **DONE** — all phases shipped to `main`. Kept as historical / design reference.
+> For the post-merge review and follow-up punch list, see `docs/REVIEW-auto-pane.md`.
+>
 > 目標：把 agend-terminal 從 CLI 工具升級成一個內建 agent 管理功能的 terminal application。
 > 使用者打開它就是一個 terminal，每個 tab/pane 就是一個 agent，自動接入 daemon，自動有 MCP tools。
 
