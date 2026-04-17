@@ -384,12 +384,12 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                 if let Ok(mut core) = handle.core.lock() {
                     core.health.maybe_decay();
                     let agent_state = core.state.current;
-                    let last_output = core.state.last_output;
-                    if core.health.check_hang(agent_state, last_output) {
+                    let silent = core.state.last_output.elapsed();
+                    if core.health.check_hang(agent_state, silent) {
                         tracing::warn!(
                             agent = %name,
                             state = agent_state.display_name(),
-                            silent = ?last_output.elapsed(),
+                            silent = ?silent,
                             "hang detected"
                         );
                     }
