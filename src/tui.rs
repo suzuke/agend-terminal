@@ -3,7 +3,7 @@
 //! Ctrl+B d to detach. Agent keeps running.
 
 use crate::framing::{self, PROTOCOL_VERSION, TAG_DATA};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -70,6 +70,9 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
             continue;
         }
         match event::read() {
+            // Windows emits both Press and Release; ignore Release to keep
+            // prefix state (ctrl_b_pressed) from toggling off immediately.
+            Ok(Event::Key(key)) if key.kind != KeyEventKind::Press => {}
             Ok(Event::Key(KeyEvent {
                 code, modifiers, ..
             })) => {
