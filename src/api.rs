@@ -27,6 +27,7 @@ pub mod method {
     pub const REGISTER_EXTERNAL: &str = "register_external";
     pub const DEREGISTER_EXTERNAL: &str = "deregister_external";
     pub const CREATE_TEAM: &str = "create_team";
+    pub const UPDATE_TEAM: &str = "update_team";
     pub const SHUTDOWN: &str = "shutdown";
 }
 
@@ -485,15 +486,31 @@ fn handle_session(
                         continue;
                     }
                 };
-                let count = params["count"].as_u64().unwrap_or(0) as usize;
-                let backend = params["backend"].as_str().unwrap_or("claude");
-                tracing::info!(team = team_name, count, backend, "CREATE_TEAM begin");
+                // `backends: [..]` — per-member backend (heterogeneous team).
+                // Falls back to repeating `backend` `count` times when absent.
+                let per_member_backends: Vec<String> =
+                    if let Some(arr) = params["backends"].as_array() {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    } else {
+                        let count = params["count"].as_u64().unwrap_or(0) as usize;
+                        let backend = params["backend"].as_str().unwrap_or("claude").to_string();
+                        vec![backend; count]
+                    };
+                let count = per_member_backends.len();
+                tracing::info!(
+                    team = team_name,
+                    count,
+                    backends = ?per_member_backends,
+                    "CREATE_TEAM begin"
+                );
 
-                let mut spawned: Vec<String> = Vec::new();
+                let mut spawned: Vec<(String, String)> = Vec::new(); // (name, backend)
                 let mut failed: Vec<String> = Vec::new();
                 let size = crossterm::terminal::size().unwrap_or((120, 40));
-                for i in 1..=count {
-                    let inst_name = format!("{team_name}-{i}");
+                for (i, backend) in per_member_backends.iter().enumerate() {
+                    let inst_name = format!("{team_name}-{}", i + 1);
                     // Dedup: see SPAWN handler note. Re-creating a team with an
                     // existing name would otherwise overwrite the registry entry
                     // and orphan the previous tab's PTY subscription.
@@ -505,11 +522,11 @@ fn handle_session(
                     let work_dir = home.join("workspace").join(&inst_name);
                     match spawn_one(home, registry, &inst_name, backend, &[], &work_dir, size) {
                         Ok(()) => {
-                            tracing::info!(team = team_name, member = %inst_name, "CREATE_TEAM spawn ok");
-                            spawned.push(inst_name);
+                            tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");
+                            spawned.push((inst_name, backend.clone()));
                         }
                         Err(e) => {
-                            tracing::warn!(team = team_name, member = %inst_name, error = %e, "CREATE_TEAM spawn failed");
+                            tracing::warn!(team = team_name, member = %inst_name, backend = %backend, error = %e, "CREATE_TEAM spawn failed");
                             failed.push(format!("{inst_name}: {e}"));
                         }
                     }
@@ -537,19 +554,20 @@ fn handle_session(
                             .collect()
                     })
                     .unwrap_or_default();
+                let spawned_names: Vec<String> = spawned.iter().map(|(n, _)| n.clone()).collect();
                 let all_members: Vec<String> = existing
                     .into_iter()
-                    .chain(spawned.iter().cloned())
+                    .chain(spawned_names.iter().cloned())
                     .collect();
 
                 if !spawned.is_empty() {
                     let entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = spawned
                         .iter()
-                        .map(|name| {
+                        .map(|(name, be)| {
                             (
                                 name.clone(),
                                 crate::fleet::InstanceYamlEntry {
-                                    backend: Some(backend.to_string()),
+                                    backend: Some(be.clone()),
                                     working_directory: Some(
                                         home.join("workspace").join(name).display().to_string(),
                                     ),
@@ -570,7 +588,7 @@ fn handle_session(
 
                 if let Some(tx) = tui_tx {
                     if !spawned.is_empty() {
-                        let members_for_event = spawned.clone();
+                        let members_for_event = spawned_names.clone();
                         tracing::info!(
                             team = team_name,
                             members = ?members_for_event,
@@ -593,11 +611,57 @@ fn handle_session(
                 } else {
                     tracing::warn!(team = team_name, "CREATE_TEAM no tui_tx, event dropped");
                 }
-                let mut resp = json!({"ok": true, "result": result, "spawned": &spawned});
+                let mut resp = json!({"ok": true, "result": result, "spawned": &spawned_names});
                 if !failed.is_empty() {
                     resp["failed"] = json!(failed);
                 }
                 resp
+            }
+            method::UPDATE_TEAM => {
+                let team_name = match params["name"].as_str() {
+                    Some(n) => n.to_string(),
+                    None => {
+                        let _ =
+                            writeln!(writer, "{}", json!({"ok": false, "error": "missing name"}));
+                        continue;
+                    }
+                };
+                // Snapshot the pre-mutation roster so the TUI event carries the
+                // *effective* diff (noop adds like re-adding an existing member
+                // must not trigger a pane move).
+                let before = crate::teams::get_members(home, &team_name);
+                let result = crate::teams::update(home, params);
+                let after = crate::teams::get_members(home, &team_name);
+                let before_set: std::collections::HashSet<&String> = before.iter().collect();
+                let after_set: std::collections::HashSet<&String> = after.iter().collect();
+                let added: Vec<String> = after
+                    .iter()
+                    .filter(|m| !before_set.contains(m))
+                    .cloned()
+                    .collect();
+                let removed: Vec<String> = before
+                    .iter()
+                    .filter(|m| !after_set.contains(m))
+                    .cloned()
+                    .collect();
+                if let Some(tx) = tui_tx {
+                    if !added.is_empty() || !removed.is_empty() {
+                        tracing::info!(
+                            team = %team_name,
+                            added = ?added,
+                            removed = ?removed,
+                            "UPDATE_TEAM emitting TeamMembersChanged"
+                        );
+                        if let Err(e) = tx.try_send(crate::app::TuiEvent::TeamMembersChanged {
+                            name: team_name.clone(),
+                            added,
+                            removed,
+                        }) {
+                            tracing::warn!(team = %team_name, error = %e, "TeamMembersChanged try_send failed");
+                        }
+                    }
+                }
+                json!({"ok": true, "result": result})
             }
             method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");

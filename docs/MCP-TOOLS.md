@@ -90,7 +90,9 @@ Create one or more agent instances.
 - `branch` (string) — if set, a git worktree is created.
 - `task` (string) — initial task injected after spawn.
 - `layout` (string enum: `tab` | `split-right` | `split-below`) — TUI placement relative to caller.
-- `count` (integer) + `team` (string) — spawn `<team>-1`, `<team>-2`, … and group them as a team.
+- `team` (string) + one of:
+  - `count` (integer) — homogeneous team: spawn `<team>-1`..`<team>-N` all on `backend`.
+  - `backends` (array<string>) — heterogeneous team: member *i* uses `backends[i]` (e.g. `backends: ["codex", "kiro-cli", "gemini"]`). Length dictates member count; `count` is ignored when `backends` is set.
 - `command` (string) — **deprecated**, use `backend`.
 
 ### `delete_instance`
@@ -157,7 +159,7 @@ Teams are created via `create_instance` with `team` + `count`. Maintenance tools
 No parameters.
 
 ### `update_team`
-Add or remove members.
+Add or remove members. When running inside the TUI, added members migrate into the team tab (created on demand) and removed members are dropped from the team tab — panes in other tabs are left untouched.
 - **`name`** (string), `add` (array<string>), `remove` (array<string>)
 
 ### `delete_team`

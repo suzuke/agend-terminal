@@ -69,7 +69,7 @@ fn instance_tools() -> Vec<Value> {
     vec![
         json!({"name": "list_instances", "description": "List all active agent instances.",
             "inputSchema": {"type": "object", "properties": {}}}),
-        json!({"name": "create_instance", "description": "Create agent instance(s). Use count+team to spawn a team in one call (e.g. count:3, backend:\"claude\", team:\"dev\" → spawns dev-1, dev-2, dev-3 grouped as team \"dev\").",
+        json!({"name": "create_instance", "description": "Create agent instance(s). Team modes: (a) homogeneous — count:3, backend:\"claude\", team:\"dev\" → dev-1..dev-3 all claude; (b) heterogeneous — backends:[\"codex\",\"kiro-cli\",\"gemini\"], team:\"mixed\" → mixed-1=codex, mixed-2=kiro-cli, mixed-3=gemini, all grouped in one tab.",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Instance name (single instance) or base name (ignored when team is set — team name is used as prefix)"},
                 "backend": {"type": "string", "description": "Backend CLI name: claude, gemini, kiro-cli, codex, opencode"},
@@ -79,8 +79,9 @@ fn instance_tools() -> Vec<Value> {
                 "branch": {"type": "string", "description": "Git branch — creates worktree if specified"},
                 "task": {"type": "string", "description": "Initial task to inject after spawn"},
                 "layout": {"type": "string", "enum": ["tab", "split-right", "split-below"], "description": "TUI layout: tab (default), split-right, or split-below relative to caller"},
-                "count": {"type": "integer", "description": "Number of instances to spawn (requires team)"},
-                "team": {"type": "string", "description": "Team name — spawns count instances as <team>-1, <team>-2, ... and groups them"},
+                "count": {"type": "integer", "description": "Number of instances to spawn (requires team; ignored when `backends` is set)"},
+                "team": {"type": "string", "description": "Team name — members become <team>-1, <team>-2, ... grouped in one tab"},
+                "backends": {"type": "array", "items": {"type": "string"}, "description": "Per-member backend list for a mixed-backend team (requires team). Length dictates member count."},
                 "command": {"type": "string", "description": "Deprecated: use 'backend' instead"}
             }, "required": ["name"]}}),
         json!({"name": "delete_instance", "description": "Stop and remove an instance.",

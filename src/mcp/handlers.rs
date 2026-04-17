@@ -235,31 +235,47 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "create_instance" => {
             // Team mode: spawn count instances and group them
             if let Some(team_name) = args.get("team").and_then(|v| v.as_str()) {
-                let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                if count == 0 {
-                    return json!({"error": "count must be >= 1"});
-                }
-                let backend = args["backend"]
+                let default_backend = args["backend"]
                     .as_str()
                     .or_else(|| args["command"].as_str())
                     .unwrap_or("claude");
+                // `backends: [..]` lets a team mix different CLIs (e.g.
+                // ["codex","kiro-cli","opencode","gemini"]). When present, it
+                // dictates both membership count and per-member backend.
+                // Otherwise fall back to `count` copies of the scalar backend.
+                let per_member_backends: Vec<String> =
+                    match args.get("backends").and_then(|v| v.as_array()) {
+                        Some(arr) => arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect(),
+                        None => {
+                            let count =
+                                args.get("count").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                            vec![default_backend.to_string(); count]
+                        }
+                    };
+                if per_member_backends.is_empty() {
+                    return json!({"error": "count must be >= 1 (or backends must be non-empty)"});
+                }
                 let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
                 // Pre-generate instructions/mcp_config for all predicted team member
                 // names before the API call. Team names are deterministic
                 // ({team_name}-{i}) and the PTY starts immediately on spawn; generating
                 // after the API call creates a race where the agent can read configs
                 // before they exist. Matches the single-instance ordering above.
-                for i in 1..=count {
-                    let inst_name = format!("{team_name}-{i}");
+                for (i, be) in per_member_backends.iter().enumerate() {
+                    let inst_name = format!("{team_name}-{}", i + 1);
                     let wd = home.join("workspace").join(&inst_name);
                     std::fs::create_dir_all(&wd).ok();
-                    crate::instructions::generate(&wd, backend);
-                    crate::mcp_config::configure(&wd, backend);
+                    crate::instructions::generate(&wd, be);
+                    crate::mcp_config::configure(&wd, be);
                 }
                 match crate::api::call(
                     &home,
                     &json!({"method": crate::api::method::CREATE_TEAM, "params": {
-                        "name": team_name, "count": count, "backend": backend,
+                        "name": team_name,
+                        "backends": per_member_backends,
                         "description": args.get("description"),
                     }}),
                 ) {
@@ -299,8 +315,11 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                                 })
                                 .ok();
                         }
-                        let mut result =
-                            json!({"team": team_name, "spawned": spawned, "backend": backend});
+                        let mut result = json!({
+                            "team": team_name,
+                            "spawned": spawned,
+                            "backends": per_member_backends,
+                        });
                         if let Some(failed) = resp.get("failed") {
                             result["failed"] = failed.clone();
                         }
@@ -480,7 +499,23 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // --- Teams ---
         "delete_team" => crate::teams::delete(&home, args),
         "list_teams" => crate::teams::list(&home),
-        "update_team" => crate::teams::update(&home, args),
+        "update_team" => {
+            // Route through the API so the server side can emit a
+            // TeamMembersChanged TUI event (migrates panes into / out of the
+            // team tab). Falling back to the direct call keeps behavior when
+            // the daemon isn't reachable — no TUI running means nothing to
+            // migrate anyway.
+            match crate::api::call(
+                &home,
+                &json!({"method": crate::api::method::UPDATE_TEAM, "params": args}),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => resp["result"].clone(),
+                Ok(resp) => {
+                    json!({"error": resp["error"].as_str().unwrap_or("update_team failed")})
+                }
+                Err(_) => crate::teams::update(&home, args),
+            }
+        }
 
         // --- Scheduling ---
         "create_schedule" => crate::schedules::create(&home, &instance_name, args),
