@@ -439,6 +439,14 @@ pub fn ratio_to_size(ratio: f32, total: u16) -> u16 {
 }
 
 /// Compute the (first, second) child areas of a split.
+///
+/// Siblings overlap by 1 cell on the split axis so they share a single border
+/// column/row. This lets the render-time border grid merge adjacent pane borders
+/// into joined box-drawing chars (`├┤┬┴┼`) across all terminals — macOS Terminal
+/// in particular doesn't auto-join `┘┌` pairs into `┬` when drawn side-by-side.
+///
+/// Invariant (for non-degenerate sizes): `second_start = first_start + first_size - 1`
+/// and `second_size = total - first_size + 1`. Total painted cells = `first_size + second_size - 1`.
 #[allow(clippy::type_complexity)]
 fn split_child_areas(
     area: (u16, u16, u16, u16),
@@ -449,11 +457,17 @@ fn split_child_areas(
     match dir {
         SplitDir::Horizontal => {
             let first_h = ratio_to_size(ratio, ah);
-            ((ax, ay, aw, first_h), (ax, ay + first_h, aw, ah - first_h))
+            let overlap = if first_h >= 1 && ah > first_h { 1 } else { 0 };
+            let second_y = ay + first_h.saturating_sub(overlap);
+            let second_h = ah + overlap - first_h;
+            ((ax, ay, aw, first_h), (ax, second_y, aw, second_h))
         }
         SplitDir::Vertical => {
             let first_w = ratio_to_size(ratio, aw);
-            ((ax, ay, first_w, ah), (ax + first_w, ay, aw - first_w, ah))
+            let overlap = if first_w >= 1 && aw > first_w { 1 } else { 0 };
+            let second_x = ax + first_w.saturating_sub(overlap);
+            let second_w = aw + overlap - first_w;
+            ((ax, ay, first_w, ah), (second_x, ay, second_w, ah))
         }
     }
 }
@@ -479,13 +493,17 @@ pub fn find_split_border(
         PaneNode::Split { dir, ratio, first, second } => {
             let (first_area, second_area) = split_child_areas(area, *dir, *ratio);
             let (ax, ay, aw, ah) = area;
+            // Shared-border convention: with 1-cell overlap between siblings,
+            // the border column/row is the last cell of `first` == first cell
+            // of `second`. `split_child_areas` computes `second_{x,y}` as
+            // `first_size - 1`, so we reuse that directly.
             let on_border = match dir {
                 SplitDir::Horizontal => {
-                    let border_row = ay + first_area.3;
+                    let border_row = second_area.1;
                     row == border_row && col >= ax && col < ax + aw
                 }
                 SplitDir::Vertical => {
-                    let border_col = ax + first_area.2;
+                    let border_col = second_area.0;
                     col == border_col && row >= ay && row < ay + ah
                 }
             };
@@ -518,9 +536,14 @@ pub fn adjust_split_ratio(
                     SplitDir::Vertical => (area.0, area.2),
                 };
                 if total > 1 {
-                    let new_ratio = (mouse_pos.saturating_sub(start) as f32) / (total as f32);
+                    // With 1-cell overlap between siblings, the border sits at
+                    // `first_size - 1` cells from `start`. So when the user
+                    // drags the border to `mouse_pos`, the desired first_size
+                    // is `(mouse_pos - start) + 1`.
+                    let desired_first =
+                        (mouse_pos.saturating_sub(start) as f32 + 1.0) / (total as f32);
                     let (lo, hi) = ratio_bounds(total);
-                    *ratio = new_ratio.clamp(lo, hi);
+                    *ratio = desired_first.clamp(lo, hi);
                 }
                 return true;
             }
@@ -1061,13 +1084,140 @@ mod tests {
 
     #[test]
     fn ratio_to_size_sum_matches_total() {
-        // split_child_areas relies on second = total - first; verify no drift.
+        // split_child_areas relies on `first <= total` for safe overlap math
+        // (second_size = total - first + overlap); verify no drift.
         for total in [2u16, 3, 10, 100, 1000] {
             for ratio_int in [0, 25, 50, 75, 100] {
                 let r = ratio_int as f32 / 100.0;
                 let first = ratio_to_size(r, total);
                 assert!(first <= total, "first={first} > total={total}");
             }
+        }
+    }
+
+    // --- split_child_areas overlap invariant (covers #1 joined borders) ---
+
+    #[test]
+    fn split_child_areas_vertical_siblings_share_one_cell() {
+        // Siblings must overlap by exactly 1 cell on the split axis so the
+        // border grid can merge their shared edge into a single glyph.
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Vertical, 0.5);
+        assert_eq!(first.0, 0, "first.x");
+        assert!(first.2 > 0, "first.w must be > 0");
+        assert_eq!(second.0, first.0 + first.2 - 1, "shared column");
+        // Total painted width = first + second - 1 (the shared column is
+        // counted once).
+        assert_eq!(first.2 + second.2 - 1, area.2, "cells account for overlap");
+    }
+
+    #[test]
+    fn split_child_areas_horizontal_siblings_share_one_cell() {
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Horizontal, 0.5);
+        assert_eq!(second.1, first.1 + first.3 - 1, "shared row");
+        assert_eq!(first.3 + second.3 - 1, area.3, "cells account for overlap");
+    }
+
+    #[test]
+    fn find_split_border_matches_shared_column() {
+        // A vertical split's border should be detectable at exactly the
+        // shared column (first.x + first.w - 1), and NOT at the old
+        // pre-overlap position (first.x + first.w).
+        let root = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "a".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 1,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                selection: None,
+            }))),
+            second: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "b".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 2,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                selection: None,
+            }))),
+        };
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Vertical, 0.5);
+        let shared_col = first.0 + first.2 - 1;
+        assert_eq!(shared_col, second.0);
+        assert!(find_split_border(&root, area, shared_col, 5).is_some());
+        // After overlap, the old border column (first.x + first.w) is now
+        // inside `second`; no longer a border cell.
+        assert!(find_split_border(&root, area, first.0 + first.2, 5).is_none());
+    }
+
+    #[test]
+    fn adjust_split_ratio_border_lands_where_user_clicked() {
+        // When the user drags the border to col X, adjust_split_ratio must
+        // produce a ratio such that the new border sits at col X (modulo
+        // ratio_to_size rounding within 1 cell).
+        let mut root = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "a".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 1,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                selection: None,
+            }))),
+            second: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "b".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 2,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                selection: None,
+            }))),
+        };
+        let area = (0u16, 0u16, 100u16, 20u16);
+        // User drags border to col 60. Must settle at col 60 (± 0 cells
+        // since 100-cell total gives exact pixel mapping).
+        assert!(adjust_split_ratio(
+            &mut root,
+            area,
+            area,
+            60,
+            SplitDir::Vertical,
+        ));
+        if let PaneNode::Split { ratio, .. } = &root {
+            let (first, _second) = split_child_areas(area, SplitDir::Vertical, *ratio);
+            let new_border_col = first.0 + first.2 - 1;
+            assert!(
+                (new_border_col as i32 - 60).abs() <= 1,
+                "border at col {new_border_col}, expected ~60"
+            );
+        } else {
+            panic!("root should still be a Split");
         }
     }
 
