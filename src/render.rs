@@ -125,7 +125,9 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         spans.push(Span::styled(label, style));
     }
 
-    spans.push(Span::styled(" [+] ", Style::default().fg(Color::DarkGray)));
+    // fg must differ from the tab bar's bg (also DarkGray) — use Gray to match
+    // the unselected-tab label color.
+    spans.push(Span::styled(" [+] ", Style::default().fg(Color::Gray)));
     let tabs = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(tabs, area);
 }
