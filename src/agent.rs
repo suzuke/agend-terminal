@@ -286,8 +286,103 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             pty_read_loop(&mut pty_reader, &ctx);
         })?;
 
+    // Backends whose CLI does not auto-load the instructions file (e.g. Kiro)
+    // need the file contents injected as the first user message on Ready.
+    if let Some(b) = detected_backend.as_ref() {
+        let preset = b.preset();
+        if preset.inject_instructions_on_ready {
+            if let Some(dir) = working_dir {
+                spawn_instructions_bootstrap(
+                    Arc::clone(registry),
+                    name.to_string(),
+                    dir.join(preset.instructions_path),
+                    std::time::Duration::from_secs(preset.ready_timeout_secs + 15),
+                    shutdown.clone(),
+                );
+            }
+        }
+    }
+
     tracing::info!(agent = name, backend = backend_command, args = %args.join(" "), "spawned");
     Ok(())
+}
+
+/// Poll until the agent reaches Ready, then inject the instructions file
+/// contents as a first user message. Used by backends (Kiro) whose CLI does
+/// not auto-load the steering file.
+fn spawn_instructions_bootstrap(
+    registry: AgentRegistry,
+    name: String,
+    instructions_path: std::path::PathBuf,
+    timeout: std::time::Duration,
+    shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+) {
+    let thread_name = format!("{name}_instr_boot");
+    let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
+        let deadline = std::time::Instant::now() + timeout;
+        let poll_interval = std::time::Duration::from_millis(200);
+
+        loop {
+            if let Some(ref s) = shutdown {
+                if s.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    agent = %name,
+                    "instructions bootstrap timed out waiting for Ready"
+                );
+                return;
+            }
+
+            let ready = {
+                let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                match reg.get(&name) {
+                    Some(h) => {
+                        let core = h.core.lock().unwrap_or_else(|e| e.into_inner());
+                        core.state.get_state() == crate::state::AgentState::Ready
+                    }
+                    None => return, // agent gone
+                }
+            };
+            if ready {
+                break;
+            }
+            std::thread::sleep(poll_interval);
+        }
+
+        // Small settle delay so the prompt is fully painted before we type.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let content = match std::fs::read_to_string(&instructions_path) {
+            Ok(c) if !c.trim().is_empty() => c,
+            _ => {
+                tracing::warn!(
+                    agent = %name,
+                    path = %instructions_path.display(),
+                    "instructions file missing or empty, skipping bootstrap inject"
+                );
+                return;
+            }
+        };
+
+        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = reg.get(&name) {
+            if let Err(e) = inject_to_agent(handle, content.as_bytes()) {
+                tracing::warn!(agent = %name, error = %e, "instructions bootstrap inject failed");
+            } else {
+                tracing::info!(
+                    agent = %name,
+                    bytes = content.len(),
+                    "instructions bootstrap injected"
+                );
+            }
+        }
+    });
+    if let Err(e) = spawn_result {
+        tracing::warn!(error = %e, "failed to spawn instructions bootstrap thread");
+    }
 }
 
 /// Context for PTY read loop reaper (reduces argument count).

@@ -94,6 +94,13 @@ pub struct BackendPreset {
     pub dismiss_patterns: &'static [(&'static str, &'static [u8])],
     /// Relative path for instructions file from working dir.
     pub instructions_path: &'static str,
+    /// Whether `instructions_path` is a file shared with the user (e.g. AGENTS.md,
+    /// GEMINI.md). When true, writes use marker-merge to preserve user content;
+    /// when false the whole file is agend-owned and rewritten in full.
+    pub instructions_shared: bool,
+    /// Inject instructions as the first message once the agent reaches Ready.
+    /// Needed for backends (Kiro) whose CLI does not auto-load the instructions file.
+    pub inject_instructions_on_ready: bool,
     /// Relative path for MCP config file from working dir.
     /// Timeout in seconds for ready detection.
     pub ready_timeout_secs: u64,
@@ -115,6 +122,8 @@ impl Backend {
                 resume_mode: ResumeMode::SavedSession { flag: "--resume" },
                 quit_command: "/exit",
                 instructions_path: ".claude/rules/agend.md",
+                instructions_shared: false,
+                inject_instructions_on_ready: false,
                 ready_timeout_secs: 30,
                 dismiss_patterns: &[
                     ("Yes, I trust", b"\x1b[A\x1b[A\r"),
@@ -133,6 +142,10 @@ impl Backend {
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--resume" },
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
+                instructions_shared: false,
+                // Kiro CLI does not auto-load .kiro/steering/*.md (IDE-only feature).
+                // Inject the file contents as the first user message once ready.
+                inject_instructions_on_ready: true,
                 ready_timeout_secs: 30,
                 dismiss_patterns: &[
                     // Trust-all-tools confirmation: cursor defaults to "No, exit"
@@ -156,6 +169,8 @@ impl Backend {
                 resume_mode: ResumeMode::NotSupported,
                 quit_command: "exit",
                 instructions_path: "AGENTS.md",
+                instructions_shared: true,
+                inject_instructions_on_ready: false,
                 ready_timeout_secs: 20,
                 dismiss_patterns: &[
                     // Trust directory prompt: "Yes, continue" is pre-selected → Enter
@@ -176,6 +191,8 @@ impl Backend {
                 resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
                 instructions_path: "AGENTS.md",
+                instructions_shared: true,
+                inject_instructions_on_ready: false,
                 ready_timeout_secs: 45,
                 dismiss_patterns: &[
                     ("Update Available", b"\r"),
@@ -197,6 +214,8 @@ impl Backend {
                 },
                 quit_command: "/exit",
                 instructions_path: "GEMINI.md",
+                instructions_shared: true,
+                inject_instructions_on_ready: false,
                 ready_timeout_secs: 20,
                 // Auto-approve: MCP tools ("3" = all server tools for session),
                 // shell commands ("2" = allow for session)
