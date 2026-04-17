@@ -141,8 +141,7 @@ pub(super) fn handle_key(
             KeyCode::Enter => {
                 let sel = *selected;
                 let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
-                if let Overlay::NewTabMenu { items, .. } =
-                    std::mem::replace(overlay, Overlay::None)
+                if let Overlay::NewTabMenu { items, .. } = std::mem::replace(overlay, Overlay::None)
                 {
                     if let Some(item) = items.into_iter().nth(sel) {
                         let pc = c.saturating_sub(2);

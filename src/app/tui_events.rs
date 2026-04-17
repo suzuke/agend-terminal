@@ -215,7 +215,8 @@ fn handle_team_created(
     let mut attached = 1usize;
 
     for member in &running[1..] {
-        match super::pane_factory::attach_pane(member, registry, cols, pane_rows, wakeup_tx, layout) {
+        match super::pane_factory::attach_pane(member, registry, cols, pane_rows, wakeup_tx, layout)
+        {
             Ok(pane) => {
                 tab.split_focused(SplitDir::Horizontal, pane);
                 attached += 1;

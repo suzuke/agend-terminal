@@ -1028,7 +1028,10 @@ instances:
             Some(Backend::Raw("/bin/bash".to_string()))
         );
         assert_eq!(
-            config.instances.get("worker").and_then(|i| i.backend.clone()),
+            config
+                .instances
+                .get("worker")
+                .and_then(|i| i.backend.clone()),
             Some(Backend::Raw("/opt/custom/tool".to_string()))
         );
         fs::remove_dir_all(&dir).ok();
@@ -1082,7 +1085,10 @@ instances:
         );
         let config = FleetConfig::load(&path).expect("load");
         assert_eq!(
-            config.instances.get("bash_pane").and_then(|i| i.backend.clone()),
+            config
+                .instances
+                .get("bash_pane")
+                .and_then(|i| i.backend.clone()),
             Some(Backend::Shell)
         );
         fs::remove_dir_all(&dir).ok();
@@ -1101,7 +1107,10 @@ instances:
         );
         let config = FleetConfig::load(&path).expect("load");
         assert_eq!(
-            config.instances.get("custom").and_then(|i| i.backend.clone()),
+            config
+                .instances
+                .get("custom")
+                .and_then(|i| i.backend.clone()),
             Some(Backend::Raw("/opt/foo/bar".to_string()))
         );
         fs::remove_dir_all(&dir).ok();
@@ -1129,7 +1138,9 @@ instances:
         assert_eq!(resolved.backend_command, "/opt/claude-v2/my-claude");
         // Preset args ARE applied because backend is explicitly claude.
         assert!(
-            resolved.args.contains(&"--dangerously-skip-permissions".to_string()),
+            resolved
+                .args
+                .contains(&"--dangerously-skip-permissions".to_string()),
             "expected claude preset args, got {:?}",
             resolved.args
         );

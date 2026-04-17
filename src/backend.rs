@@ -64,9 +64,7 @@ impl Backend {
             | Backend::Codex
             | Backend::OpenCode
             | Backend::Gemini => self.preset().command.to_string(),
-            Backend::Shell => {
-                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
-            }
+            Backend::Shell => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
             Backend::Raw(path) => path.clone(),
         }
     }
@@ -562,10 +560,7 @@ mod tests {
             Backend::parse_str("/opt/custom/tool"),
             Backend::Raw("/opt/custom/tool".to_string())
         );
-        assert_eq!(
-            Backend::parse_str("vim"),
-            Backend::Raw("vim".to_string())
-        );
+        assert_eq!(Backend::parse_str("vim"), Backend::Raw("vim".to_string()));
         assert_eq!(
             Backend::parse_str("/usr/bin/my-agent"),
             Backend::Raw("/usr/bin/my-agent".to_string())
@@ -614,8 +609,14 @@ mod tests {
         for b in [Backend::Shell, Backend::Raw("/opt/x".to_string())] {
             let p = b.preset();
             assert!(p.args.is_empty(), "{b:?} should have empty args");
-            assert!(p.ready_pattern.is_empty(), "{b:?} should have no ready pattern");
-            assert!(p.dismiss_patterns.is_empty(), "{b:?} should have no dismiss patterns");
+            assert!(
+                p.ready_pattern.is_empty(),
+                "{b:?} should have no ready pattern"
+            );
+            assert!(
+                p.dismiss_patterns.is_empty(),
+                "{b:?} should have no dismiss patterns"
+            );
             assert!(matches!(p.resume_mode, ResumeMode::NotSupported));
         }
     }
