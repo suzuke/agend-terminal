@@ -115,6 +115,29 @@ fi
 green "  ok (1 self.active assignment, inside switch_active)"
 
 # ---------------------------------------------------------------------------
+# Round C: overlay modal + drag guard + zoom blocks border hit-test
+# ---------------------------------------------------------------------------
+info "Round C — overlay swallows mouse events"
+if ! grep -q "Event::Mouse(_) if !matches!(overlay, Overlay::None)" src/app.rs; then
+    fail "overlay-modal guard for Event::Mouse missing in src/app.rs"
+fi
+green "  ok"
+
+info "Round C — drag-to-swap requires pane_count > 1"
+# The guard and the assignment must both appear. Use a window grep.
+if ! grep -A 3 "tab.root().pane_count() > 1" src/app.rs | grep -q "dragging_pane = Some"; then
+    fail "drag-to-swap must be gated by pane_count() > 1 in src/app.rs"
+fi
+green "  ok"
+
+info "Round C — zoomed mode skips find_split_border"
+# In the mouse-Down non-title branch, border detection must be guarded by !zoomed.
+if ! grep -q "else if !zoomed" src/app.rs; then
+    fail "find_split_border branch should be gated by !zoomed in src/app.rs"
+fi
+green "  ok"
+
+# ---------------------------------------------------------------------------
 # Build + tests
 # ---------------------------------------------------------------------------
 info "cargo build"

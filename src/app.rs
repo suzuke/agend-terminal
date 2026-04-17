@@ -744,6 +744,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             Action::None => {}
                         }
                     }
+                    // #11: Overlays (Help, Tasks, Decisions, Command palette, rename,
+                    // etc.) are modal — mouse events must not reach hidden panes,
+                    // otherwise drag/selection state accumulates on panes the user
+                    // can't see. Swallow mouse events while any overlay is active.
+                    Event::Mouse(_) if !matches!(overlay, Overlay::None) => {}
                     Event::Mouse(mouse) => {
                         match mouse.kind {
                             MouseEventKind::ScrollUp => scroll_focused(&mut layout, 3),
@@ -771,6 +776,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     // Horizontal-split borders must be resized via keyboard.
                                     let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
                                     let pa = Rect::new(0, 1, c, r.saturating_sub(2));
+                                    // #12: When a tab is zoomed, only the focused pane is
+                                    // visible; the split tree still exists but its borders
+                                    // aren't rendered. Disable title-bar AND border hit-tests
+                                    // so users can't drag invisible borders.
                                     let zoomed = layout.active_tab().is_some_and(|t| t.zoomed);
                                     let title_hit = (!zoomed)
                                         .then(|| {
@@ -782,10 +791,15 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                     if let Some(pane_id) = title_hit {
                                         if let Some(tab) = layout.active_tab_mut() {
                                             tab.focus_id = pane_id;
-                                            tab.dragging_pane = Some(pane_id);
-                                            tab.drag_target = None;
+                                            // #2: Only start a drag when there's a possible
+                                            // swap target. Otherwise the source pane briefly
+                                            // flashes magenta for a no-op.
+                                            if tab.root().pane_count() > 1 {
+                                                tab.dragging_pane = Some(pane_id);
+                                                tab.drag_target = None;
+                                            }
                                         }
-                                    } else {
+                                    } else if !zoomed {
                                         let hit = layout.active_tab().and_then(|tab| {
                                             crate::layout::find_split_border(
                                                 tab.root(),
@@ -799,6 +813,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                         } else {
                                             handle_mouse_selection(&mut layout, &mouse);
                                         }
+                                    } else {
+                                        // Zoomed: only selection inside the one visible pane.
+                                        handle_mouse_selection(&mut layout, &mouse);
                                     }
                                 }
                             }
