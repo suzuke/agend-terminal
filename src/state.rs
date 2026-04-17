@@ -461,41 +461,22 @@ mod tests {
     #[test]
     fn starting_hang_120s() {
         let mut h = HealthTracker::new();
-
-        // 119s — no hang
-        let recent = Instant::now() - Duration::from_secs(119);
-        assert!(!h.check_hang(AgentState::Starting, recent));
-
-        // 121s — hang
-        let old = Instant::now() - Duration::from_secs(121);
-        assert!(h.check_hang(AgentState::Starting, old));
+        assert!(!h.check_hang(AgentState::Starting, Duration::from_secs(119)));
+        assert!(h.check_hang(AgentState::Starting, Duration::from_secs(121)));
     }
 
     #[test]
     fn idle_never_hangs() {
         let mut h = HealthTracker::new();
         // Even with 10000s of silence, Idle should never be considered hung.
-        // On Windows `Instant` is anchored to boot time, so plain subtraction
-        // overflows when the runner has been up for less than the offset.
-        // Fall back to `now` (elapsed ≈ 0) on that path — still exercises
-        // the "Idle never hangs" branch, just at a shorter elapsed time.
-        let ancient = Instant::now()
-            .checked_sub(Duration::from_secs(10_000))
-            .unwrap_or_else(Instant::now);
-        assert!(!h.check_hang(AgentState::Idle, ancient));
+        assert!(!h.check_hang(AgentState::Idle, Duration::from_secs(10_000)));
     }
 
     #[test]
     fn thinking_hang_600s() {
         let mut h = HealthTracker::new();
-
-        // 599s — no hang
-        let recent = Instant::now() - Duration::from_secs(599);
-        assert!(!h.check_hang(AgentState::Thinking, recent));
-
-        // 601s — hang
-        let old = Instant::now() - Duration::from_secs(601);
-        assert!(h.check_hang(AgentState::Thinking, old));
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(599)));
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(601)));
     }
 
     // ── P2: Pattern matching ────────────────────────────────────────────

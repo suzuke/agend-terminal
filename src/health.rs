@@ -133,8 +133,11 @@ impl HealthTracker {
     }
 
     /// Check for hang based on agent state and output timeout.
-    pub fn check_hang(&mut self, agent_state: AgentState, last_output: Instant) -> bool {
-        let silent = last_output.elapsed();
+    ///
+    /// Takes `silent` as a plain `Duration` (rather than `Instant::elapsed()`
+    /// internally) so tests can construct arbitrary durations without
+    /// overflowing on platforms where `Instant` is boot-anchored (Windows).
+    pub fn check_hang(&mut self, agent_state: AgentState, silent: Duration) -> bool {
         let is_hang = match agent_state {
             AgentState::Idle => false, // Waiting for input
             AgentState::Starting => silent > Duration::from_secs(120),
@@ -294,18 +297,14 @@ mod tests {
     #[test]
     fn test_hang_idle_exempt() {
         let mut h = HealthTracker::new();
-        let old = Instant::now() - Duration::from_secs(300);
-        assert!(!h.check_hang(AgentState::Idle, old)); // Idle never hangs
+        assert!(!h.check_hang(AgentState::Idle, Duration::from_secs(300))); // Idle never hangs
     }
 
     #[test]
     fn test_hang_thinking_long_timeout() {
         let mut h = HealthTracker::new();
-        let recent = Instant::now() - Duration::from_secs(100);
-        assert!(!h.check_hang(AgentState::Thinking, recent)); // 100s < 600s
-
-        let old = Instant::now() - Duration::from_secs(700);
-        assert!(h.check_hang(AgentState::Thinking, old)); // 700s > 600s
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(100))); // 100s < 600s
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700))); // 700s > 600s
     }
 
     #[test]
