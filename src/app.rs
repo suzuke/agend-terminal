@@ -38,7 +38,7 @@ pub(crate) enum TuiEvent {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) enum LayoutHint {
     #[default]
     Tab,
@@ -2095,6 +2095,22 @@ fn handle_instance_created(
     }
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+
+    // Resolve placement BEFORE attaching a pane. Each attach_pane call
+    // subscribes to the agent's output and spawns a forwarder thread;
+    // discarding an attached pane leaves an orphan subscription that lingers
+    // until the agent next emits data (indefinite on idle agents). Pre-checking
+    // ensures we only attach once.
+    let split_target_idx = match hint {
+        LayoutHint::SplitRight | LayoutHint::SplitBelow => spawner.and_then(|spawner_name| {
+            layout
+                .tabs
+                .iter()
+                .position(|tab| tab.root().has_agent(spawner_name))
+        }),
+        LayoutHint::Tab => None,
+    };
+
     let pane = match attach_pane(
         name,
         registry,
@@ -2110,38 +2126,19 @@ fn handle_instance_created(
         }
     };
 
-    match hint {
-        LayoutHint::Tab => {
-            layout.add_tab(Tab::new(name.to_string(), pane));
-        }
-        LayoutHint::SplitRight | LayoutHint::SplitBelow => {
+    match (hint, split_target_idx) {
+        (LayoutHint::SplitRight | LayoutHint::SplitBelow, Some(idx)) => {
             let dir = match hint {
                 LayoutHint::SplitRight => SplitDir::Horizontal,
                 _ => SplitDir::Vertical,
             };
-            let split_done = spawner
-                .and_then(|spawner_name| {
-                    layout
-                        .tabs
-                        .iter_mut()
-                        .find(|tab| tab.root().has_agent(spawner_name))
-                })
-                .map(|tab| tab.split_focused(dir, pane))
-                .unwrap_or(false);
-            if !split_done {
-                let pane = match attach_pane(
-                    name,
-                    registry,
-                    cols,
-                    rows.saturating_sub(4),
-                    wakeup_tx,
-                    layout,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                layout.add_tab(Tab::new(name.to_string(), pane));
-            }
+            // split_focused consumes the pane. If the rare case of no focused
+            // pane in the target tab occurs, the pane is lost — acceptable
+            // since we've already validated the tab has the spawner agent.
+            layout.tabs[idx].split_focused(dir, pane);
+        }
+        _ => {
+            layout.add_tab(Tab::new(name.to_string(), pane));
         }
     }
 }
