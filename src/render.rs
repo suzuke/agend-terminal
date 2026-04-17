@@ -418,15 +418,26 @@ fn render_pane(
             .add_modifier(Modifier::REVERSED);
         (s, s.add_modifier(Modifier::BOLD), 4u8)
     } else if focused && repeat_mode {
-        let s = Style::default().fg(Color::Yellow);
-        (s, s.add_modifier(Modifier::BOLD), 3u8)
+        let border = Style::default().fg(Color::Yellow);
+        let title = Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        (border, title, 3u8)
     } else if focused {
         let c = match sc {
             Color::DarkGray | Color::White => Color::Cyan,
             _ => sc,
         };
-        let s = Style::default().fg(c);
-        (s, s.add_modifier(Modifier::BOLD), 2u8)
+        let border = Style::default().fg(c);
+        // Focused title gets a filled band (bg = state color, fg = black) so the
+        // input focus is unambiguous at a glance in multi-pane layouts. Border
+        // keeps fg-only so joined borders between panes stay visually clean.
+        let title = Style::default()
+            .bg(c)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        (border, title, 2u8)
     } else {
         let s = Style::default().fg(Color::DarkGray);
         (s, s, 1u8)
