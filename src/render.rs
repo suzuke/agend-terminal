@@ -329,20 +329,34 @@ fn render_pane(
     };
     let sc = state_color(state);
 
-    // Drag state overrides normal border colors
-    let border_color = if is_drag_source {
-        Color::Magenta
+    // Drag source/target use REVERSED modifier so the highlight is unambiguous
+    // even when the agent's state color happens to match (Magenta =
+    // PermissionPrompt, Green = Ready). Reversed swaps fg/bg on the border
+    // cells, which no state-color path uses — so drag is always visually
+    // distinct from any agent state.
+    let (border_style, title_style) = if is_drag_source {
+        let s = Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::REVERSED);
+        (s, s.add_modifier(Modifier::BOLD))
     } else if is_drag_target {
-        Color::Green
+        let s = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::REVERSED);
+        (s, s.add_modifier(Modifier::BOLD))
     } else if focused && repeat_mode {
-        Color::Yellow
+        let s = Style::default().fg(Color::Yellow);
+        (s, s.add_modifier(Modifier::BOLD))
     } else if focused {
-        match sc {
+        let c = match sc {
             Color::DarkGray | Color::White => Color::Cyan,
             _ => sc,
-        }
+        };
+        let s = Style::default().fg(c);
+        (s, s.add_modifier(Modifier::BOLD))
     } else {
-        Color::DarkGray
+        let s = Style::default().fg(Color::DarkGray);
+        (s, s)
     };
 
     let title = if pane.backend.is_some() {
@@ -351,29 +365,9 @@ fn render_pane(
         format!(" {} ", pane.label())
     };
 
-    let title_style = if is_drag_source {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else if is_drag_target {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if focused && repeat_mode {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if focused {
-        Style::default()
-            .fg(border_color)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color))
+        .border_style(border_style)
         .title(Span::styled(title, title_style));
 
     let inner = block.inner(area);
@@ -653,6 +647,7 @@ pub fn render_help(frame: &mut Frame) {
         "      :restart [name]       Restart agent",
         "      :send <to> <msg>      Send message",
         "      :broadcast <msg>      Broadcast",
+        "      :status               Log agent states",
         "    Ctrl+B D       Decisions panel",
         "    Ctrl+B T       Task board",
         "",

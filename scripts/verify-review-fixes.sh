@@ -138,6 +138,44 @@ fi
 green "  ok"
 
 # ---------------------------------------------------------------------------
+# Round D: drag border distinct from state colors + help lists every command
+# ---------------------------------------------------------------------------
+info "Round D — drag borders use REVERSED modifier (distinct from state colors)"
+# The drag branch must apply Modifier::REVERSED so Magenta-drag-source and
+# Green-drag-target aren't confused with Magenta=PermissionPrompt / Green=Ready.
+if ! grep -A 4 "is_drag_source" src/render.rs | grep -q "Modifier::REVERSED"; then
+    fail "drag source border must use Modifier::REVERSED"
+fi
+if ! grep -A 4 "is_drag_target" src/render.rs | grep -q "Modifier::REVERSED"; then
+    fail "drag target border must use Modifier::REVERSED"
+fi
+green "  ok"
+
+info "Round D — help text lists every palette command implemented in execute_command"
+# Extract command names from match arms inside fn execute_command.
+# Only match lines that look like pattern arms: `"<name>"[ | "<name>"]* => {`
+# (excludes quoted strings used inside arm bodies, e.g. "claude", "\r").
+BODY=$(awk '/^fn execute_command\(/,/^}$/' src/app.rs)
+CMDS=$(echo "$BODY" \
+    | grep -E '^[[:space:]]*"[a-z]+"([[:space:]]*\|[[:space:]]*"[a-z]+")*[[:space:]]*=>' \
+    | grep -oE '"[a-z]+"' \
+    | tr -d '"' \
+    | sort -u)
+if [[ -z "$CMDS" ]]; then
+    fail "could not extract palette commands from execute_command"
+fi
+MISSING=""
+for cmd in $CMDS; do
+    if ! grep -q ":$cmd" src/render.rs; then
+        MISSING="$MISSING $cmd"
+    fi
+done
+if [[ -n "$MISSING" ]]; then
+    fail "help text is missing these palette commands:$MISSING"
+fi
+green "  ok ($(echo $CMDS | wc -w | tr -d ' ') commands, all documented)"
+
+# ---------------------------------------------------------------------------
 # Build + tests
 # ---------------------------------------------------------------------------
 info "cargo build"
