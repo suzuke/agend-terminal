@@ -15,6 +15,65 @@ use std::sync::{Arc, Mutex};
 
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
+/// Validate a caller-supplied `working_directory` against the AGEND_HOME and
+/// (optionally) `AGEND_ALLOWED_WORK_ROOTS` (colon-separated list).
+///
+/// Rules:
+/// - Path must not contain `..` components (blocks relative escape regardless
+///   of whether the target exists).
+/// - After canonicalising the deepest existing ancestor, the resolved path
+///   must start with one of the allowed roots. This catches symlink escape
+///   inside an otherwise-legal prefix.
+///
+/// Returns the resolved `PathBuf` on success. The caller is responsible for
+/// creating the directory.
+pub fn validate_working_directory(
+    path: &std::path::Path,
+    home: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        anyhow::bail!("working_directory must not contain '..'");
+    }
+    // Walk up to the deepest existing ancestor for canonicalisation. A path
+    // pointing into a not-yet-created subdirectory is legal as long as its
+    // existing prefix is inside an allowed root.
+    let mut existing = path.to_path_buf();
+    while !existing.as_os_str().is_empty() && !existing.exists() {
+        if !existing.pop() {
+            break;
+        }
+    }
+    let anchor = if existing.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else {
+        std::fs::canonicalize(&existing).unwrap_or(existing.clone())
+    };
+    let tail = path.strip_prefix(&existing).unwrap_or(path);
+    let resolved = anchor.join(tail);
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.push(std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
+    if let Ok(extra) = std::env::var("AGEND_ALLOWED_WORK_ROOTS") {
+        for p in extra.split(':').filter(|s| !s.is_empty()) {
+            let pb = PathBuf::from(p);
+            roots.push(std::fs::canonicalize(&pb).unwrap_or(pb));
+        }
+    }
+    for root in &roots {
+        if resolved.starts_with(root) {
+            return Ok(resolved);
+        }
+    }
+    anyhow::bail!(
+        "working_directory '{}' escapes allowed roots (set AGEND_ALLOWED_WORK_ROOTS to widen)",
+        resolved.display()
+    )
+}
+
 /// API method name constants — single source of truth for the NDJSON protocol.
 pub mod method {
     pub const LIST: &str = "list";
@@ -61,6 +120,11 @@ pub fn serve(
 
     for stream in listener.incoming().flatten() {
         let _ = stream.set_nodelay(true);
+        // Slow-client hardening: set read/write deadlines so a stalled peer
+        // cannot pin a session thread indefinitely. 30s is generous for a
+        // JSON request line; control-plane calls are never slow on purpose.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         let reg = Arc::clone(&registry);
         let home = home.to_path_buf();
         let shutdown = Arc::clone(&shutdown);
@@ -304,10 +368,21 @@ fn handle_session(
                     .as_str()
                     .map(|s| s.split_whitespace().map(String::from).collect())
                     .unwrap_or_default();
-                let work_dir = params["working_directory"]
+                let requested_work_dir = params["working_directory"]
                     .as_str()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| home.join("workspace").join(name));
+                let work_dir = match validate_working_directory(&requested_work_dir, home) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = writeln!(
+                            writer,
+                            "{}",
+                            json!({"ok": false, "error": format!("{e}")})
+                        );
+                        continue;
+                    }
+                };
                 let size = crossterm::terminal::size().unwrap_or((120, 40));
 
                 match spawn_one(home, registry, name, command, &args, &work_dir, size) {
@@ -732,6 +807,16 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate `AGEND_ALLOWED_WORK_ROOTS` — env mutation
+    /// from parallel tests races otherwise.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -744,6 +829,74 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn validate_work_dir_rejects_parent_dir() {
+        let home = tmp_home("validate_parent");
+        let bad = home.join("..").join("escape");
+        let err = validate_working_directory(&bad, &home).unwrap_err();
+        assert!(
+            format!("{err}").contains(".."),
+            "expected parent-dir rejection, got: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn validate_work_dir_allows_under_home() {
+        let home = tmp_home("validate_home");
+        let ok = home.join("workspace").join("agent");
+        let resolved =
+            validate_working_directory(&ok, &home).expect("path under home must validate");
+        assert!(resolved.starts_with(std::fs::canonicalize(&home).unwrap()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn validate_work_dir_rejects_outside_home() {
+        let _g = env_guard();
+        let home = tmp_home("validate_outside");
+        // Pick a path that definitely exists and is not under home.
+        let outside = std::path::PathBuf::from("/tmp");
+        // Ensure AGEND_ALLOWED_WORK_ROOTS isn't accidentally opening this up.
+        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
+        std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS");
+        let err = validate_working_directory(&outside, &home).unwrap_err();
+        if let Some(v) = prev {
+            std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v);
+        }
+        assert!(
+            format!("{err}").contains("escapes"),
+            "expected escape rejection, got: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn validate_work_dir_honors_allowed_roots_env() {
+        let _g = env_guard();
+        let home = tmp_home("validate_env_root");
+        let root = std::env::temp_dir().join(format!(
+            "agend-extra-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).expect("mkdir extra root");
+        let inside = root.join("agent");
+        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
+        std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", root.display().to_string());
+        let result = validate_working_directory(&inside, &home);
+        match prev {
+            Some(v) => std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v),
+            None => std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS"),
+        }
+        result.expect("path under AGEND_ALLOWED_WORK_ROOTS must validate");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

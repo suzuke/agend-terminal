@@ -31,6 +31,17 @@ pub enum ChannelConfig {
         /// Mode: "topic" for forum topics.
         #[serde(default = "default_mode")]
         mode: String,
+        /// Optional allowlist of Telegram user IDs (`user.id`, not username)
+        /// permitted to command the fleet via messages.
+        ///
+        /// - `None` (field omitted): **legacy open mode** — any group member
+        ///   is accepted; a deprecation warning is logged on startup.
+        /// - `Some([])` (explicit empty list): reject all — useful to lock
+        ///   down an environment without removing the channel config.
+        /// - `Some([...])`: only those user IDs are accepted; others are
+        ///   dropped with a warn log.
+        #[serde(default)]
+        user_allowlist: Option<Vec<i64>>,
     },
 }
 
@@ -597,6 +608,7 @@ instances:
                 ref bot_token_env,
                 group_id,
                 ref mode,
+                ..
             }) => {
                 assert_eq!(bot_token_env, "MY_BOT_TOKEN");
                 assert_eq!(group_id, -100123456);
