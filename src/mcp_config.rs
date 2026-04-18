@@ -204,7 +204,10 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
     }
     config["mcpServers"]["agend-terminal"] = json!({
         "command": wrapper_path.display().to_string(),
-        "args": []
+        "args": [],
+        // Auto-approve every tool from this server. `--trust-all-tools` only
+        // covers Kiro's built-in tools; per-MCP-server trust is set here.
+        "autoApprove": ["*"]
     });
     std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
     tracing::debug!(path = %path.display(), "configured MCP");
@@ -212,13 +215,42 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Gemini: .gemini/settings.json — uses { "mcpServers": { ... } } format
+/// Gemini: .gemini/settings.json — uses { "mcpServers": { ... } } format.
+///
+/// Adds `"trust": true` to the agend-terminal entry. `--yolo` / `--approval-mode
+/// yolo` only auto-approve built-in tools and shell; MCP tool calls still
+/// prompt unless the server is marked trusted in settings.json.
 fn configure_gemini(working_dir: &Path) -> Result<()> {
     let path = working_dir.join(".gemini").join("settings.json");
-    upsert_mcp_servers(&path)
+    let mut config: serde_json::Value = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&content).unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+    if config.get("mcpServers").is_none() {
+        config["mcpServers"] = json!({});
+    }
+    config["mcpServers"]["agend-terminal"] = json!({
+        "command": binary_path(),
+        "args": ["mcp"],
+        "env": { "AGEND_HOME": home_path() },
+        "trust": true
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
+    tracing::debug!(path = %path.display(), "configured MCP");
+    Ok(())
 }
 
 /// OpenCode: opencode.json — uses { "mcp": { ... } } with command as array.
+///
+/// Also sets the `permission` block to "allow" for the actions an autonomous
+/// agent will hit (edit / bash / webfetch / external_directory). Each instance
+/// has its own working_dir/opencode.json so this does not bleed into the
+/// user's manual opencode usage.
 fn configure_opencode(working_dir: &Path) -> Result<()> {
     let path = working_dir.join("opencode.json");
     let mut config: serde_json::Value = if path.exists() {
@@ -244,6 +276,19 @@ fn configure_opencode(working_dir: &Path) -> Result<()> {
             "AGEND_HOME": home_path()
         }
     });
+
+    // Force `permission` to an object so we can insert keys; replaces any
+    // pre-existing scalar form (e.g. "ask") since autonomous agents must
+    // not block on prompts.
+    if !config.get("permission").map(|v| v.is_object()).unwrap_or(false) {
+        config["permission"] = json!({});
+    }
+    let perm = config["permission"]
+        .as_object_mut()
+        .expect("permission set to object above");
+    for key in ["edit", "bash", "webfetch", "external_directory"] {
+        perm.insert(key.to_string(), json!("allow"));
+    }
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -472,6 +517,94 @@ mod tests {
     }
 
     #[test]
+    fn opencode_sets_permission_allow_for_autonomous_actions() {
+        let dir = tmp_dir("oc_perm");
+        configure_opencode(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        let perm = &config["permission"];
+        for key in ["edit", "bash", "webfetch", "external_directory"] {
+            assert_eq!(
+                perm[key], "allow",
+                "permission.{key} must be \"allow\" so autonomous agents don't block"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_permission_replaces_scalar_form() {
+        let dir = tmp_dir("oc_perm_scalar");
+        // Pre-existing scalar form must be coerced to object — otherwise our
+        // insert would silently fail and external_directory keeps prompting.
+        let pre = json!({"permission": "ask"});
+        std::fs::write(
+            dir.join("opencode.json"),
+            serde_json::to_string(&pre).expect("s"),
+        )
+        .ok();
+        configure_opencode(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert!(
+            config["permission"].is_object(),
+            "scalar permission must be replaced with object"
+        );
+        assert_eq!(config["permission"]["external_directory"], "allow");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_permission_preserves_unrelated_keys() {
+        let dir = tmp_dir("oc_perm_preserve");
+        let pre = json!({"permission": {"read": "deny", "edit": "deny"}});
+        std::fs::write(
+            dir.join("opencode.json"),
+            serde_json::to_string(&pre).expect("s"),
+        )
+        .ok();
+        configure_opencode(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        // Our managed keys overwrite (autonomous context demands "allow").
+        assert_eq!(config["permission"]["edit"], "allow");
+        // Keys we don't manage stay untouched.
+        assert_eq!(config["permission"]["read"], "deny");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kiro_mcp_server_has_autoapprove_wildcard() {
+        let dir = tmp_dir("kiro_autoapprove");
+        configure_kiro(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        let entry = &config["mcpServers"]["agend-terminal"];
+        let auto = entry["autoApprove"]
+            .as_array()
+            .expect("autoApprove must be array");
+        assert!(
+            auto.iter().any(|v| v == "*"),
+            "autoApprove must contain \"*\" wildcard so MCP tool calls don't prompt"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kiro_autoapprove_idempotent_across_runs() {
+        let dir = tmp_dir("kiro_autoapprove_idem");
+        configure_kiro(&dir).expect("first configure");
+        configure_kiro(&dir).expect("second configure");
+        let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        let auto = config["mcpServers"]["agend-terminal"]["autoApprove"]
+            .as_array()
+            .expect("autoApprove must be array");
+        assert_eq!(auto.len(), 1, "autoApprove must not duplicate on re-run");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn opencode_uses_environment_not_env() {
         let dir = tmp_dir("oc_env");
         configure_opencode(&dir).expect("configure");
@@ -569,6 +702,19 @@ mod tests {
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         assert!(config.get("mcpServers").is_some());
         assert!(config["mcpServers"]["agend-terminal"]["command"].is_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gemini_mcp_server_marked_trusted() {
+        let dir = tmp_dir("gemini_trust");
+        configure_gemini(&dir).expect("configure");
+        let content = std::fs::read_to_string(dir.join(".gemini/settings.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(
+            config["mcpServers"]["agend-terminal"]["trust"], true,
+            "Gemini --yolo doesn't cover MCP — settings.json must mark server trusted"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
