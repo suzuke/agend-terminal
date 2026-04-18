@@ -280,9 +280,7 @@ mod tests {
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::sync::lock_poisoned(LOCK.get_or_init(|| Mutex::new(())), "mcp_env_guard")
     }
 
     fn save_env() -> (Option<String>, Option<String>) {

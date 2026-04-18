@@ -51,7 +51,7 @@ pub type ExternalRegistry = Arc<Mutex<HashMap<String, ExternalAgentHandle>>>;
 pub fn lock_external(
     reg: &ExternalRegistry,
 ) -> std::sync::MutexGuard<'_, HashMap<String, ExternalAgentHandle>> {
-    reg.lock().unwrap_or_else(|e| e.into_inner())
+    crate::sync::lock_poisoned(reg, "agent_registry")
 }
 
 /// Environment variable names that fleet.yaml-supplied `env:` maps are NOT
@@ -125,7 +125,7 @@ pub fn validate_name(name: &str) -> Result<&str, String> {
 pub fn lock_registry(
     reg: &AgentRegistry,
 ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
-    reg.lock().unwrap_or_else(|e| e.into_inner())
+    crate::sync::lock_poisoned(reg, "agent_registry")
 }
 
 /// ANSI escape sequence stripper for dialog detection.
@@ -339,7 +339,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
 
     // Register in registry
     {
-        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = crate::sync::lock_poisoned(registry, "agent_registry");
         reg.insert(
             name.to_string(),
             AgentHandle {
@@ -476,10 +476,10 @@ fn spawn_instructions_bootstrap(
             }
 
             let ready = {
-                let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                let reg = crate::sync::lock_poisoned(&registry, "agent_registry");
                 match reg.get(&name) {
                     Some(h) => {
-                        let core = h.core.lock().unwrap_or_else(|e| e.into_inner());
+                        let core = crate::sync::lock_poisoned(&h.core, "agent_core");
                         core.state.get_state() == crate::state::AgentState::Ready
                     }
                     None => return, // agent gone
@@ -497,7 +497,7 @@ fn spawn_instructions_bootstrap(
         // longer widens an external-mutation window.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let reg = crate::sync::lock_poisoned(&registry, "agent_registry");
         if let Some(handle) = reg.get(&name) {
             if let Err(e) = inject_to_agent(handle, content.as_bytes()) {
                 tracing::warn!(agent = %name, error = %e, "instructions bootstrap inject failed");
@@ -565,7 +565,7 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic)
                 {
-                    let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut c = crate::sync::lock_poisoned(core, "agent_core");
                     c.vterm.process(data);
                     let stripped = strip_ansi(&String::from_utf8_lossy(data));
                     c.state.feed(&stripped);
@@ -607,7 +607,7 @@ fn handle_pty_close(
     // Wait up to 2s for process to fully exit
     let mut exit_code: Option<i32> = None;
     for _ in 0..20 {
-        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let reg = crate::sync::lock_poisoned(registry, "agent_registry");
         // Agent removed from registry → shutdown or explicit delete. Not a crash.
         if reg.get(name).is_none() {
             tracing::debug!(agent = name, "not in registry, skipping crash handling");
@@ -707,7 +707,7 @@ pub fn try_dismiss_dialog(
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 // Send keys in chunks split on \r/\n boundaries with delay between,
                 // so TUI frameworks process navigation before confirmation.
-                let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                let mut w = crate::sync::lock_poisoned(&writer, "pty_writer");
                 let mut start = 0;
                 for (i, &b) in keys.iter().enumerate() {
                     if b == b'\r' || b == b'\n' {
@@ -717,7 +717,7 @@ pub fn try_dismiss_dialog(
                             let _ = w.flush();
                             drop(w);
                             std::thread::sleep(std::time::Duration::from_millis(200));
-                            w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                            w = crate::sync::lock_poisoned(&writer, "pty_writer");
                         }
                         // Send the Enter
                         let _ = w.write_all(&keys[i..=i]);
@@ -741,7 +741,7 @@ pub fn try_dismiss_dialog(
 
 /// Write data to an agent's PTY (atomic write — for attach path).
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
     w.write_all(data)
         .map_err(crate::error::AgendError::PtyWrite)?;
     w.flush().map_err(crate::error::AgendError::PtyWrite)?;
@@ -751,7 +751,7 @@ pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<
 /// Write data to an agent's PTY byte-by-byte with small delays.
 #[allow(dead_code)]
 pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
     for byte in data {
         w.write_all(&[*byte])
             .map_err(crate::error::AgendError::PtyWrite)?;
@@ -768,7 +768,7 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
 pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result<()> {
     let prefix = agent.inject_prefix.as_bytes();
     let submit = agent.submit_key.as_bytes();
-    let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
 
     // Write prefix + text
     if agent.typed_inject {
@@ -838,7 +838,7 @@ pub fn broadcast_registry(
 pub fn subscribe_with_dump(
     agent: &AgentHandle,
 ) -> (crossbeam::channel::Receiver<Vec<u8>>, Vec<u8>) {
-    let mut core = agent.core.lock().unwrap_or_else(|e| e.into_inner());
+    let mut core = crate::sync::lock_poisoned(&agent.core, "agent_core");
     let dump = core.vterm.dump_screen();
     let (tx, rx) = crossbeam::channel::unbounded();
     core.subscribers.push(tx);
