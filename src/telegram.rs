@@ -284,6 +284,35 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
     tracing::info!(from = username, to = %instance_name, %text, "inbound message");
 
+    // Route based on agent state: when blocked on an unexpected startup
+    // prompt (AwaitingOperator), the operator's reply must reach the PTY
+    // as raw keystrokes — any inbox prefix ("[telegram:@user] …") would
+    // confuse the CLI's prompt parser. In every other state, preserve the
+    // existing inbox semantics so agent-authored message handling keeps
+    // working.
+    if agent_is_awaiting_operator(&home, &instance_name) {
+        let payload = format!("{text}\n");
+        match crate::api::call(
+            &home,
+            &serde_json::json!({
+                "method": crate::api::method::INJECT,
+                "params": {"name": instance_name, "data": payload, "raw": true}
+            }),
+        ) {
+            Ok(_) => tracing::info!(
+                to = %instance_name,
+                bytes = payload.len(),
+                "routed raw keystrokes (awaiting_operator)"
+            ),
+            Err(e) => tracing::warn!(
+                to = %instance_name,
+                error = %e,
+                "raw injection failed"
+            ),
+        }
+        return;
+    }
+
     // Enqueue in inbox
     let msg_obj = InboxMessage {
         from: format!("user:{username}"),
@@ -301,6 +330,35 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         text,
         &submit_key,
     );
+}
+
+/// Query the daemon for the current `agent_state` of one instance.
+/// Returns true only when the daemon reports `"awaiting_operator"`.
+/// Any error (daemon down, agent missing, parse failure) returns false so
+/// we fall through to normal inbox routing rather than silently dropping
+/// messages.
+fn agent_is_awaiting_operator(home: &Path, instance_name: &str) -> bool {
+    let resp = match crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::LIST}),
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    list_response_is_awaiting(&resp, instance_name)
+}
+
+/// Pure JSON-inspection half of [`agent_is_awaiting_operator`]. Separated
+/// out so the routing logic can be unit-tested without a running daemon.
+fn list_response_is_awaiting(resp: &serde_json::Value, instance_name: &str) -> bool {
+    resp["result"]["agents"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter().find(|a| a["name"].as_str() == Some(instance_name))
+        })
+        .and_then(|a| a["agent_state"].as_str())
+        .map(|s| s == crate::state::AgentState::AwaitingOperator.display_name())
+        .unwrap_or(false)
 }
 
 /// Send a reply from an agent to Telegram (called from MCP reply tool).
@@ -968,5 +1026,37 @@ instances:
         let home = PathBuf::from("/tmp/agend-test-nonexistent-dir-12345");
         let reg = load_topic_registry(&home);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn list_response_is_awaiting_detects_target_state() {
+        let resp = serde_json::json!({
+            "ok": true,
+            "result": {
+                "agents": [
+                    {"name": "alice", "agent_state": "ready"},
+                    {"name": "bob",   "agent_state": "awaiting_operator"},
+                    {"name": "carol", "agent_state": "starting"},
+                ]
+            }
+        });
+        assert!(!list_response_is_awaiting(&resp, "alice"));
+        assert!(list_response_is_awaiting(&resp, "bob"));
+        assert!(!list_response_is_awaiting(&resp, "carol"));
+        // Missing agent returns false (fall through to inbox path)
+        assert!(!list_response_is_awaiting(&resp, "eve"));
+    }
+
+    #[test]
+    fn list_response_is_awaiting_tolerates_malformed() {
+        // Missing result.agents → false
+        let r1 = serde_json::json!({"ok": false, "error": "daemon down"});
+        assert!(!list_response_is_awaiting(&r1, "any"));
+        // agents not an array → false
+        let r2 = serde_json::json!({"result": {"agents": "nope"}});
+        assert!(!list_response_is_awaiting(&r2, "any"));
+        // agent without agent_state field → false
+        let r3 = serde_json::json!({"result": {"agents": [{"name": "x"}]}});
+        assert!(!list_response_is_awaiting(&r3, "x"));
     }
 }
