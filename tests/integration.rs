@@ -96,6 +96,22 @@ impl TestDaemon {
         serde_json::from_str(line.trim()).expect("parse response")
     }
 
+    /// Send a raw line (not pre-serialised JSON) and read one NDJSON response.
+    /// Used to probe the parse-error path — `api_call` can only send valid JSON.
+    fn api_call_raw(&self, raw_line: &str) -> serde_json::Value {
+        let port = Self::find_api_port(&self.home).expect("api port");
+        let mut stream =
+            TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
+        stream.set_nodelay(true).ok();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        writeln!(stream, "{}", raw_line).expect("write");
+        stream.flush().expect("flush");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        serde_json::from_str(line.trim()).expect("parse response")
+    }
+
     fn stop(&mut self) {
         let _ = self.api_call(&serde_json::json!({"method": "shutdown"}));
         // Wait for daemon to exit
@@ -126,6 +142,83 @@ fn test_daemon_list_and_status() {
     let agents = resp["result"]["agents"].as_array().expect("agents");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["name"], "shell");
+    daemon.stop();
+}
+
+#[test]
+fn test_api_error_paths() {
+    // Consolidated happy-path + error-path coverage for the JSON API so we
+    // don't pay one daemon-startup-cost per assertion.
+    let mut daemon = TestDaemon::start("api_errors");
+
+    // Malformed JSON → parse-error response, socket stays live.
+    let resp = daemon.api_call_raw("{this-is-not-json");
+    assert_eq!(resp["ok"], false, "parse error should set ok=false");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("parse"),
+        "expected parse error, got: {resp}"
+    );
+
+    // Unknown method → the dispatch falls through to the default branch.
+    // The test doesn't pin the exact error text (that can evolve); it only
+    // asserts ok=false.
+    let resp = daemon.api_call(&serde_json::json!({"method": "definitely_not_a_method"}));
+    assert_eq!(resp["ok"], false, "unknown method should set ok=false");
+
+    // INJECT with an invalid name (contains "/") — validate_name rejects.
+    let resp = daemon.api_call(&serde_json::json!({
+        "method": "inject",
+        "params": {"name": "bad/name", "data": "x"}
+    }));
+    assert_eq!(resp["ok"], false);
+    assert!(
+        resp["error"].as_str().is_some(),
+        "expected validation error text, got: {resp}"
+    );
+
+    // DELETE an unknown agent — the delete dispatcher removes from external
+    // first (no-op), then from managed (no-op). The current implementation
+    // returns ok:true even when nothing was there, which matches the
+    // intentionally-idempotent semantics documented at the call site. Lock
+    // that behaviour in as a test so a future change to strict-mode delete
+    // is forced to revisit callers.
+    let resp =
+        daemon.api_call(&serde_json::json!({"method": "delete", "params": {"name": "ghost"}}));
+    assert_eq!(
+        resp["ok"], true,
+        "delete of unknown name is idempotent; got: {resp}"
+    );
+
+    // SEND with from == target — self-send is rejected.
+    let resp = daemon.api_call(&serde_json::json!({
+        "method": "send",
+        "params": {"from": "shell", "target": "shell", "text": "hi"}
+    }));
+    assert_eq!(resp["ok"], false, "self-send must be rejected");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("self"),
+        "expected self-send error, got: {resp}"
+    );
+
+    // SPAWN for an already-registered name → dedup rejection.
+    let resp = daemon.api_call(&serde_json::json!({
+        "method": "spawn",
+        "params": {"name": "shell", "backend": "shell:/bin/sh"}
+    }));
+    assert_eq!(resp["ok"], false, "duplicate spawn must be rejected");
+    assert!(
+        resp["error"].as_str().unwrap_or("").contains("exists"),
+        "expected 'already exists' error, got: {resp}"
+    );
+
     daemon.stop();
 }
 
