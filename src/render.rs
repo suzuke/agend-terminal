@@ -659,10 +659,7 @@ fn render_pane_titles(frame: &mut Frame, infos: &[PaneBorderInfo]) {
         // area abutting u16::MAX) — wraparound would then silently bypass
         // the `if x + w > last_usable_x` bound check and corrupt memory
         // outside our Rect (P2-architecture sweep).
-        let last_usable_x = area
-            .x
-            .saturating_add(area.width)
-            .saturating_sub(1);
+        let last_usable_x = area.x.saturating_add(area.width).saturating_sub(1);
         let buf_right = buf_area.x.saturating_add(buf_area.width);
         let buf_bottom = buf_area.y.saturating_add(buf_area.height);
         let mut x = area.x.saturating_add(1);

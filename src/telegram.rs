@@ -345,7 +345,9 @@ pub fn init_from_config(
              Set `user_allowlist: [123, 456]` in fleet.yaml to lock this down."
         ),
         Some(list) if list.is_empty() => {
-            tracing::info!("telegram channel.user_allowlist is empty — all inbound messages will be rejected")
+            tracing::info!(
+                "telegram channel.user_allowlist is empty — all inbound messages will be rejected"
+            )
         }
         Some(list) => tracing::info!(count = list.len(), "telegram user_allowlist active"),
     }

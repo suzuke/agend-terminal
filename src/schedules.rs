@@ -152,32 +152,34 @@ pub fn update(home: &Path, args: &Value) -> Value {
     let new_label = args["label"].as_str().map(String::from);
     let new_tz = args["timezone"].as_str().map(String::from);
     let new_enabled = args["enabled"].as_bool();
-    match crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
-        match store.schedules.iter_mut().find(|s| s.id == id) {
-            Some(schedule) => {
-                if let Some(ref c) = new_cron {
-                    schedule.cron.clone_from(c);
-                }
-                if let Some(ref m) = new_message {
-                    schedule.message.clone_from(m);
-                }
-                if let Some(ref t) = new_target {
-                    schedule.target.clone_from(t);
-                }
-                if let Some(ref l) = new_label {
-                    schedule.label = Some(l.clone());
-                }
-                if let Some(ref tz) = new_tz {
-                    schedule.timezone.clone_from(tz);
-                }
-                if let Some(e) = new_enabled {
-                    schedule.enabled = e;
-                }
-                schedule.updated_at = chrono::Utc::now().to_rfc3339();
-                Ok(true)
+    match crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| match store
+        .schedules
+        .iter_mut()
+        .find(|s| s.id == id)
+    {
+        Some(schedule) => {
+            if let Some(ref c) = new_cron {
+                schedule.cron.clone_from(c);
             }
-            None => Ok(false),
+            if let Some(ref m) = new_message {
+                schedule.message.clone_from(m);
+            }
+            if let Some(ref t) = new_target {
+                schedule.target.clone_from(t);
+            }
+            if let Some(ref l) = new_label {
+                schedule.label = Some(l.clone());
+            }
+            if let Some(ref tz) = new_tz {
+                schedule.timezone.clone_from(tz);
+            }
+            if let Some(e) = new_enabled {
+                schedule.enabled = e;
+            }
+            schedule.updated_at = chrono::Utc::now().to_rfc3339();
+            Ok(true)
         }
+        None => Ok(false),
     }) {
         Ok(true) => serde_json::json!({"id": id, "status": "updated"}),
         Ok(false) => serde_json::json!({"error": format!("schedule '{id}' not found")}),

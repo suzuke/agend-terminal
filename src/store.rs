@@ -340,11 +340,7 @@ mod tests {
         let dir = tmp_dir("versioned_ok");
         let path = dir.join("v.json");
         // Version == CURRENT: accepted.
-        fs::write(
-            &path,
-            r#"{"schema_version": 2, "payload": ["keep"]}"#,
-        )
-        .expect("w");
+        fs::write(&path, r#"{"schema_version": 2, "payload": ["keep"]}"#).expect("w");
         let got: VersionedTestStore = load_versioned(&path, VersionedTestStore::CURRENT);
         assert_eq!(got.payload, vec!["keep".to_string()]);
         assert_eq!(got.schema_version, 2);
@@ -361,11 +357,7 @@ mod tests {
         let dir = tmp_dir("versioned_future");
         let path = dir.join("v.json");
         // schema_version > CURRENT: refused, default returned.
-        fs::write(
-            &path,
-            r#"{"schema_version": 99, "payload": ["alien"]}"#,
-        )
-        .expect("w");
+        fs::write(&path, r#"{"schema_version": 99, "payload": ["alien"]}"#).expect("w");
         let got: VersionedTestStore = load_versioned(&path, VersionedTestStore::CURRENT);
         assert_eq!(got, VersionedTestStore::default());
         fs::remove_dir_all(&dir).ok();

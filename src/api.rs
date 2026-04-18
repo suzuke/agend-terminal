@@ -32,10 +32,7 @@ pub fn validate_working_directory(
     home: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
-    if path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
         anyhow::bail!("working_directory must not contain '..'");
     }
     // Walk up to the deepest existing ancestor for canonicalisation. A path
@@ -372,11 +369,8 @@ fn handle_session(
                 let work_dir = match validate_working_directory(&requested_work_dir, home) {
                     Ok(p) => p,
                     Err(e) => {
-                        let _ = writeln!(
-                            writer,
-                            "{}",
-                            json!({"ok": false, "error": format!("{e}")})
-                        );
+                        let _ =
+                            writeln!(writer, "{}", json!({"ok": false, "error": format!("{e}")}));
                         continue;
                     }
                 };
@@ -891,6 +885,40 @@ mod tests {
         }
         result.expect("path under AGEND_ALLOWED_WORK_ROOTS must validate");
         std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_work_dir_rejects_symlink_escape() {
+        // Stage 4 P1-8 regression guard: a symlink inside an allowed root
+        // pointing OUT of all allowed roots must be rejected after canonicalisation.
+        let _g = env_guard();
+        let home = tmp_home("validate_symlink_escape");
+        // Create a symlink at `{home}/escape` → /tmp (outside any allowed root).
+        let target = std::path::PathBuf::from("/tmp");
+        let link = home.join("escape");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
+        std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS");
+        // Request a path *under* the symlink. After canonicalisation it should
+        // resolve outside `home` and be rejected.
+        let requested = link.join("agent");
+        let result = validate_working_directory(&requested, &home);
+        if let Some(v) = prev {
+            std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v);
+        }
+        match result {
+            Ok(resolved) => panic!(
+                "expected symlink escape rejection, but validated as {}",
+                resolved.display()
+            ),
+            Err(e) => assert!(
+                format!("{e}").contains("escapes"),
+                "expected escape rejection, got: {e}"
+            ),
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 
