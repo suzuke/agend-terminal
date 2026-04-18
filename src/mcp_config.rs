@@ -4,7 +4,42 @@
 
 use anyhow::Result;
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::cell::RefCell;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for `~/.codex`. When set, [`codex_home`] returns this
+    /// path instead of the real user home. Prevents test runs from polluting
+    /// the developer's real `~/.codex/config.toml`.
+    static CODEX_HOME_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Resolve the effective `~/.codex` directory. In tests, a thread-local
+/// override takes precedence so integration-style tests can redirect writes
+/// to a scratch directory.
+fn codex_home() -> PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(p) = CODEX_HOME_OVERRIDE.with(|c| c.borrow().clone()) {
+            return p;
+        }
+    }
+    dirs_home().join(".codex")
+}
+
+/// Run `f` with the codex-home path overridden to `path` on the current thread.
+/// Test-only helper so tests that invoke `generate`/`codex_trust_directory`
+/// don't write into the real `$HOME/.codex`.
+#[cfg(test)]
+pub(crate) fn with_codex_home_override<R>(path: &Path, f: impl FnOnce() -> R) -> R {
+    let prev = CODEX_HOME_OVERRIDE.with(|c| c.replace(Some(path.to_path_buf())));
+    let result = f();
+    CODEX_HOME_OVERRIDE.with(|c| *c.borrow_mut() = prev);
+    result
+}
 
 /// Get the agend-terminal binary path for MCP server config.
 fn binary_path() -> String {
@@ -274,7 +309,7 @@ AGEND_HOME = "{home}""#
 /// *after* acquisition, so a racing writer's entry is visible and we don't
 /// append a duplicate.
 fn codex_trust_directory(dir: &Path) {
-    let codex_dir = dirs_home().join(".codex");
+    let codex_dir = codex_home();
     // If ~/.codex doesn't exist, codex isn't installed — silently skip,
     // matching pre-lock behavior where OpenOptions::create would fail.
     if !codex_dir.exists() {
@@ -617,28 +652,20 @@ mod tests {
     #[test]
     fn codex_trust_writes_toml() {
         let dir = tmp_dir("codex_trust");
-        let config_path = dir.join(".codex").join("config.toml");
-        std::fs::create_dir_all(dir.join(".codex")).ok();
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create .codex");
+        let config_path = codex_dir.join("config.toml");
 
-        // Override HOME for test
-        let _work_dir = std::path::PathBuf::from("/tmp/test-project");
-        // Write directly to test path
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&config_path)
-                .expect("open");
-            writeln!(
-                f,
-                "[projects.\"/tmp/test-project\"]\ntrust_level = \"trusted\""
-            )
-            .ok();
-        }
+        let work_dir = dir.join("project");
+        std::fs::create_dir_all(&work_dir).expect("create project");
+
+        with_codex_home_override(&codex_dir, || {
+            codex_trust_directory(&work_dir);
+        });
 
         let content = std::fs::read_to_string(&config_path).expect("read");
-        assert!(content.contains("[projects.\"/tmp/test-project\"]"));
+        let key = format!("[projects.\"{}\"]", work_dir.display());
+        assert!(content.contains(&key), "missing {key} in {content}");
         assert!(content.contains("trust_level = \"trusted\""));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -646,23 +673,44 @@ mod tests {
     #[test]
     fn codex_trust_idempotent() {
         let dir = tmp_dir("codex_trust_idem");
-        let config_path = dir.join(".codex").join("config.toml");
-        std::fs::create_dir_all(dir.join(".codex")).ok();
-        std::fs::write(
-            &config_path,
-            "[projects.\"/tmp/already\"]\ntrust_level = \"trusted\"\n",
-        )
-        .ok();
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create .codex");
+        let config_path = codex_dir.join("config.toml");
 
-        // Call trust with same path — should not duplicate
-        let work_dir = std::path::Path::new("/tmp/already");
-        let content_before = std::fs::read_to_string(&config_path).expect("read");
-        codex_trust_directory(work_dir);
-        // Since we can't override HOME in codex_trust_directory, test the check logic directly
-        let _content = std::fs::read_to_string(&config_path).expect("read");
-        // The function writes to ~/.codex/config.toml, not our test path,
-        // so just verify the check logic: content already has the key
-        assert!(content_before.contains("[projects.\"/tmp/already\"]"));
+        let work_dir = dir.join("project");
+        std::fs::create_dir_all(&work_dir).expect("create project");
+
+        with_codex_home_override(&codex_dir, || {
+            codex_trust_directory(&work_dir);
+            codex_trust_directory(&work_dir);
+        });
+
+        let content = std::fs::read_to_string(&config_path).expect("read");
+        let key = format!("[projects.\"{}\"]", work_dir.display());
+        assert_eq!(
+            content.matches(&key).count(),
+            1,
+            "entry must not duplicate on second call"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_trust_skips_when_codex_dir_missing() {
+        let dir = tmp_dir("codex_trust_absent");
+        // Point override at a non-existent codex home — function should no-op.
+        let fake_codex = dir.join("no-such-codex");
+        let work_dir = dir.join("project");
+        std::fs::create_dir_all(&work_dir).ok();
+
+        with_codex_home_override(&fake_codex, || {
+            codex_trust_directory(&work_dir);
+        });
+
+        assert!(
+            !fake_codex.exists(),
+            "function must not create the codex dir when it's absent"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
