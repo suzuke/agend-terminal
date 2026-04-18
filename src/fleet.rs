@@ -253,28 +253,28 @@ pub struct InstanceYamlEntry {
     pub role: Option<String>,
 }
 
-/// Atomically write a serde_yaml::Value back to fleet.yaml using temp file + rename.
+/// Atomically write a serde_yaml::Value back to fleet.yaml using temp + fsync + rename.
 /// Caller must hold the file lock.
 fn atomic_write_yaml(home: &Path, doc: &serde_yaml::Value) -> Result<()> {
     let yaml = serde_yaml::to_string(doc).context("Failed to serialize fleet.yaml")?;
     let fleet_path = home.join("fleet.yaml");
-    let tmp_path = home.join(".fleet.yaml.tmp");
-    std::fs::write(&tmp_path, &yaml).context("Failed to write temp fleet.yaml")?;
-    std::fs::rename(&tmp_path, &fleet_path).context("Failed to rename temp fleet.yaml")?;
-    Ok(())
+    // Use the shared helper so fsync-before-rename is uniform across the
+    // codebase. The previous write→rename (no fsync) left a crash window
+    // where the renamed-over fleet.yaml could be truncated on power loss.
+    crate::store::atomic_write(&fleet_path, yaml.as_bytes())
+        .context("Failed to atomic-write fleet.yaml")
 }
 
 /// Acquire the fleet.yaml file lock via flock (auto-released on crash/drop).
+///
+/// Delegates to the shared helper which deliberately does NOT use
+/// `truncate(true)` when opening the lock file. Truncating on every
+/// acquire is never required for correctness — flock is tied to the
+/// inode, not the file contents — and the project-wide review flagged it
+/// as a source of confusion across call sites (fleet.rs, mcp_config.rs).
 fn acquire_lock(home: &Path) -> Result<std::fs::File> {
     let lock_path = home.join(".fleet.yaml.lock");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&lock_path)
-        .context("failed to open lock file")?;
-    fs2::FileExt::lock_exclusive(&f).map_err(|e| anyhow::anyhow!("flock failed: {e}"))?;
-    Ok(f) // Lock released when File is dropped
+    crate::store::acquire_file_lock(&lock_path).context("failed to acquire fleet lock")
 }
 
 /// Lock fleet.yaml, parse it, apply a mutation, and atomically write back.

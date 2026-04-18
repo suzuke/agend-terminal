@@ -229,6 +229,110 @@ fn test_content_length_framing() {
 }
 
 #[test]
+fn test_content_length_zero_skips_frame_without_desync() {
+    // Content-Length: 0 is valid (empty body) — it must consume the
+    // separator and continue. If the server mishandled it by `continue`ing
+    // without eating the empty line, the following NDJSON request would
+    // be read at an offset and lost, hanging the caller.
+    let home = std::env::temp_dir().join(format!("agend-mcp-cl0-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+
+    let mut child = Command::new(binary())
+        .args(["mcp"])
+        .env("AGEND_HOME", &home)
+        .env("AGEND_INSTANCE_NAME", "test-cl0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    // Send an empty-body CL=0 frame, then a real NDJSON ping. If framing
+    // is right we get exactly one response (ping); if not, the server
+    // mis-parses the ping bytes as headers and we get none.
+    write!(stdin, "Content-Length: 0\r\n\r\n").expect("write cl0");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"ping","params":{{}}}}"#
+    )
+    .expect("write ping");
+    stdin.flush().expect("flush");
+    drop(stdin);
+
+    let reader = BufReader::new(stdout);
+    let mut responses = Vec::new();
+    for l in reader.lines().map_while(Result::ok) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+            responses.push(v);
+        }
+    }
+    child.wait().ok();
+    let _ = std::fs::remove_dir_all(&home);
+
+    assert_eq!(
+        responses.len(),
+        1,
+        "CL=0 frame must not desync stream; expected 1 ping response, got {}",
+        responses.len()
+    );
+    assert_eq!(responses[0]["id"], 1);
+    assert!(responses[0]["result"].is_object());
+}
+
+#[test]
+fn test_invalid_content_length_resyncs_to_next_frame() {
+    // A garbage Content-Length previously fell through to len=0 via
+    // unwrap_or(0) and then `continue`d without consuming the separator,
+    // scrambling the stream. With the fix, the malformed frame is
+    // discarded and a following NDJSON request is still served.
+    let home = std::env::temp_dir().join(format!("agend-mcp-clbad-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+
+    let mut child = Command::new(binary())
+        .args(["mcp"])
+        .env("AGEND_HOME", &home)
+        .env("AGEND_INSTANCE_NAME", "test-clbad")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    // Malformed header, followed by an empty separator, followed by a
+    // real NDJSON request. The server must skip the bad frame cleanly
+    // and respond to the ping.
+    write!(stdin, "Content-Length: not-a-number\r\n\r\n").expect("write bad");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":7,"method":"ping","params":{{}}}}"#
+    )
+    .expect("write ping");
+    stdin.flush().expect("flush");
+    drop(stdin);
+
+    let reader = BufReader::new(stdout);
+    let mut responses = Vec::new();
+    for l in reader.lines().map_while(Result::ok) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+            responses.push(v);
+        }
+    }
+    child.wait().ok();
+    let _ = std::fs::remove_dir_all(&home);
+
+    assert!(
+        responses.iter().any(|r| r["id"] == 7),
+        "server must resync and serve the following ping, got {responses:?}"
+    );
+}
+
+#[test]
 fn test_unknown_method() {
     let responses = mcp_session(&[
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,

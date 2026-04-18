@@ -64,8 +64,31 @@ fn mcp_server_entry() -> serde_json::Value {
     })
 }
 
+/// Per-config flock path for a given config file. Two concurrent `configure`
+/// calls targeting the same working_directory would otherwise interleave
+/// their read→mutate→write cycles (one reads stale content, applies its
+/// edit, overwrites the other's edit). We use a sibling `.lock` file so
+/// the lock is local to the project dir and auto-released on drop.
+fn config_lock_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_string());
+    parent.join(format!(".{name}.lock"))
+}
+
 /// Upsert mcpServers.agend-terminal in a JSON file (Claude, Gemini, Kiro format).
+///
+/// Flock-serialised + atomic write. Prior implementation `fs::write`'d
+/// directly with no lock, so two concurrent `create_instance` calls
+/// targeting the same working_directory could drop one of their edits.
 fn upsert_mcp_servers(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(path))?;
+
     let mut config: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(path)?;
         serde_json::from_str(&content).unwrap_or(json!({}))
@@ -78,10 +101,8 @@ fn upsert_mcp_servers(path: &Path) -> Result<()> {
     }
     config["mcpServers"]["agend-terminal"] = mcp_server_entry();
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(path, body.as_bytes())?;
     tracing::debug!(path = %path.display(), "configured MCP");
     Ok(())
 }
@@ -118,7 +139,9 @@ fn configure_claude(working_dir: &Path) -> Result<()> {
     let standalone = working_dir.join("mcp-config.json");
     upsert_mcp_servers(&standalone)?;
 
-    // Write statusline capture script (captures session_id from Claude)
+    // Write statusline capture script (captures session_id from Claude).
+    // Atomic write so a racing spawn never observes a half-written script
+    // that fails to execute or appears executable with bad contents.
     let statusline_path = working_dir.join("statusline.json");
     let script_ext = if cfg!(windows) { "cmd" } else { "sh" };
     let script_path = working_dir.join(format!("statusline.{script_ext}"));
@@ -129,45 +152,39 @@ fn configure_claude(working_dir: &Path) -> Result<()> {
         let escaped = statusline_path.display().to_string().replace('\'', "'\\''");
         format!("#!/bin/bash\ncat > '{escaped}'\necho ok\n")
     };
-    std::fs::write(&script_path, &script)?;
+    crate::store::atomic_write(&script_path, script.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    // Write claude-settings.json with statusLine config (for --settings flag)
+    // Write claude-settings.json with statusLine config (for --settings flag).
     let settings_path = working_dir.join("claude-settings.json");
+    let _settings_lock = crate::store::acquire_file_lock(&config_lock_path(&settings_path))?;
     let settings = json!({
         "statusLine": {
             "type": "command",
             "command": script_path.display().to_string()
         }
     });
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    let settings_body = serde_json::to_string_pretty(&settings)?;
+    crate::store::atomic_write(&settings_path, settings_body.as_bytes())?;
     tracing::debug!(path = %settings_path.display(), "Claude settings written");
 
     Ok(())
 }
 
 /// Kiro: .kiro/settings/mcp.json — uses wrapper script because Kiro ignores env block.
+///
+/// All edits run under a per-path flock + atomic write so two concurrent
+/// `create_instance` calls sharing a working_directory can't interleave
+/// their read→mutate→write cycles into a corrupt mcp.json.
 fn configure_kiro(working_dir: &Path) -> Result<()> {
     let path = working_dir.join(".kiro").join("settings").join("mcp.json");
 
-    // Clean up old format: remove top-level "agend-terminal" key
-    if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(obj) = config.as_object_mut() {
-                    if obj.remove("agend-terminal").is_some() {
-                        let _ = std::fs::write(&path, serde_json::to_string_pretty(&config)?);
-                    }
-                }
-            }
-        }
-    }
-
-    // Generate wrapper script (Kiro ignores "env" in mcp.json)
+    // Generate wrapper script (Kiro ignores "env" in mcp.json). Atomic so
+    // a racing read never sees a partially-written script.
     let wrapper_dir = working_dir.join(".kiro").join("settings");
     std::fs::create_dir_all(&wrapper_dir)?;
     let wrapper_ext = if cfg!(windows) { "cmd" } else { "sh" };
@@ -185,20 +202,33 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
             bin = shell_escape(&binary_path()),
         )
     };
-    std::fs::write(&wrapper_path, &wrapper)?;
+    crate::store::atomic_write(&wrapper_path, wrapper.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))?;
     }
 
-    // Write mcp.json pointing to wrapper
+    // Hold the mcp.json flock across the cleanup+rewrite so legacy-key
+    // removal and mcpServers upsert can't race a sibling caller.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(&path))?;
+
     let mut config: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(&path)?;
         serde_json::from_str(&content).unwrap_or(json!({}))
     } else {
         json!({})
     };
+
+    // Clean up old format: remove top-level "agend-terminal" key (pre-dates
+    // the mcpServers schema). Done under the same lock as the upsert below.
+    if let Some(obj) = config.as_object_mut() {
+        obj.remove("agend-terminal");
+    }
+
     if config.get("mcpServers").is_none() {
         config["mcpServers"] = json!({});
     }
@@ -209,7 +239,8 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
         // covers Kiro's built-in tools; per-MCP-server trust is set here.
         "autoApprove": ["*"]
     });
-    std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(&path, body.as_bytes())?;
     tracing::debug!(path = %path.display(), "configured MCP");
 
     Ok(())
@@ -222,6 +253,13 @@ fn configure_kiro(working_dir: &Path) -> Result<()> {
 /// prompt unless the server is marked trusted in settings.json.
 fn configure_gemini(working_dir: &Path) -> Result<()> {
     let path = working_dir.join(".gemini").join("settings.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Flock + atomic write so concurrent spawn calls can't lose each
+    // other's edits to the shared settings.json.
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(&path))?;
+
     let mut config: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(&path)?;
         serde_json::from_str(&content).unwrap_or(json!({}))
@@ -237,10 +275,8 @@ fn configure_gemini(working_dir: &Path) -> Result<()> {
         "env": { "AGEND_HOME": home_path() },
         "trust": true
     });
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(&path, body.as_bytes())?;
     tracing::debug!(path = %path.display(), "configured MCP");
     Ok(())
 }
@@ -253,6 +289,13 @@ fn configure_gemini(working_dir: &Path) -> Result<()> {
 /// user's manual opencode usage.
 fn configure_opencode(working_dir: &Path) -> Result<()> {
     let path = working_dir.join("opencode.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Flock + atomic write so concurrent spawns can't interleave their
+    // load-modify-save cycles on opencode.json.
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(&path))?;
+
     let mut config: serde_json::Value = if path.exists() {
         let content = std::fs::read_to_string(&path)?;
         serde_json::from_str(&content).unwrap_or(json!({}))
@@ -290,10 +333,8 @@ fn configure_opencode(working_dir: &Path) -> Result<()> {
         perm.insert(key.to_string(), json!("allow"));
     }
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
+    let body = serde_json::to_string_pretty(&config)?;
+    crate::store::atomic_write(&path, body.as_bytes())?;
     tracing::debug!(path = %path.display(), "configured MCP");
     Ok(())
 }
@@ -365,23 +406,16 @@ fn codex_trust_directory(dir: &Path) {
     let dir_str = dir.display().to_string();
     let toml_key = format!("[projects.\"{dir_str}\"]");
 
-    let lock_file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&lock_path)
-    {
+    // Shared helper — deliberately no truncate(true) (flock is on the
+    // inode, file contents don't matter). Held for the rest of this
+    // function and auto-released on drop.
+    let _lock_file = match crate::store::acquire_file_lock(&lock_path) {
         Ok(f) => f,
         Err(e) => {
-            tracing::warn!(error = %e, "codex trust: failed to open lock file");
+            tracing::warn!(error = %e, "codex trust: lock acquisition failed");
             return;
         }
     };
-    if let Err(e) = fs2::FileExt::lock_exclusive(&lock_file) {
-        tracing::warn!(error = %e, "codex trust: flock failed");
-        return;
-    }
-    // Lock held for the remainder of this function (released on drop).
 
     // Re-read under the lock so a racing writer's entry is visible.
     let content = std::fs::read_to_string(&config_path).unwrap_or_default();
