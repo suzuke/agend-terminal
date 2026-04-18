@@ -93,11 +93,19 @@ impl VTerm {
         let grid = self.term.grid();
         let rows = self.rows.min(area.height);
         let cols = self.cols.min(area.width);
-        let offset = scroll_offset as i32;
+        // `scroll_offset` is usize; `as i32` wraps on 64-bit hosts when the
+        // caller somehow passes > i32::MAX. Clamp instead so an unreasonable
+        // offset degrades to "deepest scrollback" rather than flipping sign
+        // and pulling a positive-huge line index that panics alacritty on
+        // index.
+        let offset: i32 = scroll_offset.min(i32::MAX as usize) as i32;
 
         for row in 0..rows {
-            // With scroll_offset, shift grid line index into scrollback
-            let grid_line = Line(row as i32 - offset);
+            // With scroll_offset, shift grid line index into scrollback.
+            // `row` is u16 (≤ self.rows, ≤ u16::MAX) so `row as i32` can't
+            // overflow; `saturating_sub` keeps the result in i32 range even
+            // if offset is near i32::MAX.
+            let grid_line = Line((row as i32).saturating_sub(offset));
             let mut col = 0u16;
             while col < cols {
                 let cell = &grid[Point::new(grid_line, Column(col as usize))];
@@ -156,7 +164,9 @@ impl VTerm {
     /// Extract text from a selection range (grid coordinates), accounting for scroll offset.
     pub fn extract_text(&self, start: (u16, u16), end: (u16, u16), scroll_offset: usize) -> String {
         let grid = self.term.grid();
-        let offset = scroll_offset as i32;
+        // Same clamp rationale as `render_to_buffer`: `scroll_offset as i32`
+        // wraps negative for pathological values.
+        let offset: i32 = scroll_offset.min(i32::MAX as usize) as i32;
 
         // Normalize start/end so start is before end
         let (s, e) = if start <= end {
@@ -169,7 +179,7 @@ impl VTerm {
 
         let mut text = String::new();
         for row in s_row..=e_row {
-            let grid_line = Line(row as i32 - offset);
+            let grid_line = Line((row as i32).saturating_sub(offset));
             let col_start = if row == s_row { s_col } else { 0 };
             let col_end = if row == e_row {
                 e_col

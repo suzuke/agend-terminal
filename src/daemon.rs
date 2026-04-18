@@ -106,9 +106,7 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
                 loop {
                     match framing::read_tagged_frame(&mut reader) {
                         Ok((TAG_DATA, data)) => {
-                            if pty_writer
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
+                            if crate::sync::lock_poisoned(&pty_writer, "pty_writer")
                                 .write_all(&data)
                                 .is_err()
                             {
@@ -118,7 +116,7 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
                         Ok((TAG_RESIZE, data)) if data.len() == 4 => {
                             let cols = u16::from_be_bytes([data[0], data[1]]);
                             let rows = u16::from_be_bytes([data[2], data[3]]);
-                            let _ = pty_master.lock().unwrap_or_else(|e| e.into_inner()).resize(
+                            let _ = crate::sync::lock_poisoned(&pty_master, "pty_master").resize(
                                 PtySize {
                                     rows,
                                     cols,
@@ -662,7 +660,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
     // Shutdown: print residual worktrees
     {
-        let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
+        let cfgs = crate::sync::lock_poisoned(&configs, "configs");
         let mut seen = std::collections::HashSet::new();
         for config in cfgs.values() {
             // Use worktree_source (original repo) if available, otherwise working_dir
@@ -691,7 +689,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // registry — if the agent is gone, they return silently instead of
     // sending crash events. This eliminates all shutdown race conditions.
     let agents_to_kill: Vec<_> = {
-        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = crate::sync::lock_poisoned(&registry, "registry");
         let agents: Vec<_> = reg
             .drain()
             .map(|(name, handle)| (name, handle.child))
@@ -699,7 +697,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         agents
     };
     for (name, child) in &agents_to_kill {
-        let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = crate::sync::lock_poisoned(child, "child_proc");
         let _ = c.kill();
         tracing::info!(agent = %name, "killed");
     }
