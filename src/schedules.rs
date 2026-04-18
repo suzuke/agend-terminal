@@ -3,24 +3,41 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
-
-/// Detect system timezone from /etc/localtime or TZ env var. Falls back to UTC.
-fn detect_timezone() -> &'static str {
-    // Check TZ env var first
-    if let Ok(tz) = std::env::var("TZ") {
-        // Leak the string to get a 'static lifetime (called rarely)
-        return Box::leak(tz.into_boxed_str());
-    }
-    // macOS/Linux: read /etc/localtime symlink
-    if let Ok(link) = std::fs::read_link("/etc/localtime") {
-        let path = link.display().to_string();
-        if let Some(tz) = path.split("/zoneinfo/").nth(1) {
-            return Box::leak(tz.to_string().into_boxed_str());
-        }
-    }
-    "UTC"
-}
 use std::str::FromStr;
+use std::sync::OnceLock;
+
+/// Cache for the detected system timezone string. Originally each call leaked
+/// a `Box<str>`, so repeated `detect_timezone()` invocations (e.g. `create` /
+/// `update` in quick succession, or a daemon that rereads env) grew the heap
+/// unboundedly. `OnceLock` caches the first successful detection for process
+/// lifetime and keeps `&'static str` without leaking on every call.
+static DETECTED_TZ: OnceLock<String> = OnceLock::new();
+
+/// Return the detected system timezone as a stable `&'static str`.
+///
+/// Precedence: `TZ` env at first call → `/etc/localtime` symlink → `"UTC"`.
+/// The detection runs once; later mutations of `$TZ` are intentionally
+/// ignored, because (a) schedules carry their own per-row `timezone` field
+/// that is the real source of truth for cron evaluation, and (b) leaking a
+/// new string on every env toggle was the original P2-6 bug.
+pub fn detect_timezone() -> &'static str {
+    DETECTED_TZ
+        .get_or_init(|| {
+            if let Ok(tz) = std::env::var("TZ") {
+                if !tz.is_empty() {
+                    return tz;
+                }
+            }
+            if let Ok(link) = std::fs::read_link("/etc/localtime") {
+                let path = link.display().to_string();
+                if let Some(tz) = path.split("/zoneinfo/").nth(1) {
+                    return tz.to_string();
+                }
+            }
+            "UTC".to_string()
+        })
+        .as_str()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schedule {
@@ -46,7 +63,16 @@ pub struct ScheduleRun {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ScheduleStore {
+    #[serde(default)]
+    schema_version: u32,
     schedules: Vec<Schedule>,
+}
+
+impl crate::store::SchemaVersioned for ScheduleStore {
+    const CURRENT: u32 = 1;
+    fn version_mut(&mut self) -> &mut u32 {
+        &mut self.schema_version
+    }
 }
 
 fn store_path(home: &Path) -> std::path::PathBuf {
@@ -54,7 +80,10 @@ fn store_path(home: &Path) -> std::path::PathBuf {
 }
 
 fn load(home: &Path) -> ScheduleStore {
-    crate::store::load(&store_path(home))
+    crate::store::load_versioned(
+        &store_path(home),
+        <ScheduleStore as crate::store::SchemaVersioned>::CURRENT,
+    )
 }
 
 pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
@@ -92,7 +121,7 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         updated_at: now,
         run_history: Vec::new(),
     };
-    match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+    match crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
         store.schedules.push(schedule);
         Ok(())
     }) {
@@ -123,7 +152,7 @@ pub fn update(home: &Path, args: &Value) -> Value {
     let new_label = args["label"].as_str().map(String::from);
     let new_tz = args["timezone"].as_str().map(String::from);
     let new_enabled = args["enabled"].as_bool();
-    match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+    match crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
         match store.schedules.iter_mut().find(|s| s.id == id) {
             Some(schedule) => {
                 if let Some(ref c) = new_cron {
@@ -160,7 +189,7 @@ pub fn update(home: &Path, args: &Value) -> Value {
 pub fn record_run(home: &Path, schedule_id: &str, status: &str) {
     let sid = schedule_id.to_string();
     let st = status.to_string();
-    let _ = crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
         if let Some(sched) = store.schedules.iter_mut().find(|s| s.id == sid) {
             sched.run_history.push(ScheduleRun {
                 triggered_at: chrono::Utc::now().to_rfc3339(),
@@ -181,7 +210,7 @@ pub fn delete(home: &Path, args: &Value) -> Value {
         Some(i) => i.to_string(),
         None => return serde_json::json!({"error": "missing 'id'"}),
     };
-    match crate::store::mutate(&store_path(home), |store: &mut ScheduleStore| {
+    match crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
         let before = store.schedules.len();
         store.schedules.retain(|s| s.id != id);
         Ok(store.schedules.len() < before)

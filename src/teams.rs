@@ -14,7 +14,16 @@ pub struct Team {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TeamStore {
+    #[serde(default)]
+    schema_version: u32,
     teams: Vec<Team>,
+}
+
+impl crate::store::SchemaVersioned for TeamStore {
+    const CURRENT: u32 = 1;
+    fn version_mut(&mut self) -> &mut u32 {
+        &mut self.schema_version
+    }
 }
 
 fn store_path(home: &Path) -> std::path::PathBuf {
@@ -22,7 +31,10 @@ fn store_path(home: &Path) -> std::path::PathBuf {
 }
 
 fn load(home: &Path) -> TeamStore {
-    crate::store::load(&store_path(home))
+    crate::store::load_versioned(
+        &store_path(home),
+        <TeamStore as crate::store::SchemaVersioned>::CURRENT,
+    )
 }
 
 pub fn create(home: &Path, args: &Value) -> Value {
@@ -38,7 +50,7 @@ pub fn create(home: &Path, args: &Value) -> Value {
         None => return serde_json::json!({"error": "missing 'members'"}),
     };
     let description = args["description"].as_str().map(String::from);
-    match crate::store::mutate(&store_path(home), |store: &mut TeamStore| {
+    match crate::store::mutate_versioned(&store_path(home), |store: &mut TeamStore| {
         if store.teams.iter().any(|t| t.name == name) {
             return Ok(false);
         }
@@ -61,7 +73,7 @@ pub fn delete(home: &Path, args: &Value) -> Value {
         Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
-    match crate::store::mutate(&store_path(home), |store: &mut TeamStore| {
+    match crate::store::mutate_versioned(&store_path(home), |store: &mut TeamStore| {
         let before = store.teams.len();
         store.teams.retain(|t| t.name != name);
         Ok(store.teams.len() < before)
@@ -98,7 +110,7 @@ pub fn update(home: &Path, args: &Value) -> Value {
                 .collect()
         })
         .unwrap_or_default();
-    match crate::store::mutate(&store_path(home), |store: &mut TeamStore| {
+    match crate::store::mutate_versioned(&store_path(home), |store: &mut TeamStore| {
         match store.teams.iter_mut().find(|t| t.name == name) {
             Some(team) => {
                 for m in &to_add {

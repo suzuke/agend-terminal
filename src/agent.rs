@@ -389,13 +389,38 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         let preset = b.preset();
         if preset.inject_instructions_on_ready {
             if let Some(dir) = working_dir {
-                spawn_instructions_bootstrap(
-                    Arc::clone(registry),
-                    name.to_string(),
-                    dir.join(preset.instructions_path),
-                    std::time::Duration::from_secs(preset.ready_timeout_secs + 15),
-                    shutdown.clone(),
-                );
+                // Read the instructions body here — while we hold the spawn
+                // context and before the `Ready` poll window starts — so an
+                // external process mutating the file between write and
+                // bootstrap cannot inject a different prompt. Skip the
+                // bootstrap entirely if the file is missing/empty.
+                let path = dir.join(preset.instructions_path);
+                match std::fs::read_to_string(&path) {
+                    Ok(content) if !content.trim().is_empty() => {
+                        spawn_instructions_bootstrap(
+                            Arc::clone(registry),
+                            name.to_string(),
+                            content,
+                            std::time::Duration::from_secs(preset.ready_timeout_secs + 15),
+                            shutdown.clone(),
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            agent = %name,
+                            path = %path.display(),
+                            "instructions file empty, skipping bootstrap inject"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %name,
+                            path = %path.display(),
+                            error = %e,
+                            "instructions file unreadable, skipping bootstrap inject"
+                        );
+                    }
+                }
             }
         }
     }
@@ -404,13 +429,17 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     Ok(())
 }
 
-/// Poll until the agent reaches Ready, then inject the instructions file
-/// contents as a first user message. Used by backends (Kiro) whose CLI does
+/// Poll until the agent reaches Ready, then inject the pre-read instructions
+/// content as a first user message. Used by backends (Kiro) whose CLI does
 /// not auto-load the steering file.
+///
+/// The `content` is captured at spawn time (see call site) rather than
+/// re-read after Ready: this closes the mutation window where an external
+/// process could swap the instructions file between write and inject.
 fn spawn_instructions_bootstrap(
     registry: AgentRegistry,
     name: String,
-    instructions_path: std::path::PathBuf,
+    content: String,
     timeout: std::time::Duration,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
@@ -450,19 +479,10 @@ fn spawn_instructions_bootstrap(
         }
 
         // Small settle delay so the prompt is fully painted before we type.
+        // This is a UI-layer concern (avoiding a torn prompt paint) — the
+        // content itself was already snapshotted at spawn, so the delay no
+        // longer widens an external-mutation window.
         std::thread::sleep(std::time::Duration::from_millis(500));
-
-        let content = match std::fs::read_to_string(&instructions_path) {
-            Ok(c) if !c.trim().is_empty() => c,
-            _ => {
-                tracing::warn!(
-                    agent = %name,
-                    path = %instructions_path.display(),
-                    "instructions file missing or empty, skipping bootstrap inject"
-                );
-                return;
-            }
-        };
 
         let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(handle) = reg.get(&name) {
@@ -633,7 +653,13 @@ fn handle_pty_close(
         }
     }
     if let Some(ref tx) = crash_tx {
-        let _ = tx.send(name.to_string());
+        // Non-blocking send: the channel is bounded (see daemon::run), so a
+        // stalled reaper must not wedge this PTY close handler. Dropping a
+        // crash event means one agent skips auto-respawn — the next health
+        // probe will still catch a persistent failure.
+        if let Err(e) = tx.try_send(name.to_string()) {
+            tracing::warn!(agent = %name, error = %e, "crash channel full — respawn event dropped");
+        }
     }
 }
 

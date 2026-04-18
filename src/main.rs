@@ -29,6 +29,7 @@ mod schedules;
 mod snapshot;
 mod state;
 mod store;
+mod sync;
 mod tasks;
 mod teams;
 mod telegram;
