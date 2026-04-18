@@ -17,6 +17,10 @@ const STATE_BUF_MAX: usize = 2048;
 pub enum AgentState {
     Starting,
     Hang,
+    /// Startup stalled on unexpected interactive prompt (e.g. codex update menu).
+    /// Entered when Starting + stdout silent > threshold. Operator reply is
+    /// routed as raw PTY keystrokes (not inbox-wrapped) via INJECT_RAW.
+    AwaitingOperator,
     Ready,
     Idle,
     ToolUse,
@@ -37,18 +41,19 @@ impl AgentState {
         match self {
             Self::Starting => 0,
             Self::Hang => 1,
-            Self::Ready => 2,
-            Self::Idle => 3,
-            Self::ToolUse => 4,
-            Self::Thinking => 5,
-            Self::PermissionPrompt => 6,
-            Self::ContextFull => 7,
-            Self::RateLimit => 8,
-            Self::UsageLimit => 9,
-            Self::AuthError => 10,
-            Self::ApiError => 11,
-            Self::Crashed => 12,
-            Self::Restarting => 13,
+            Self::AwaitingOperator => 2,
+            Self::Ready => 3,
+            Self::Idle => 4,
+            Self::ToolUse => 5,
+            Self::Thinking => 6,
+            Self::PermissionPrompt => 7,
+            Self::ContextFull => 8,
+            Self::RateLimit => 9,
+            Self::UsageLimit => 10,
+            Self::AuthError => 11,
+            Self::ApiError => 12,
+            Self::Crashed => 13,
+            Self::Restarting => 14,
         }
     }
 
@@ -66,6 +71,7 @@ impl AgentState {
         match self {
             Self::Starting => "starting",
             Self::Hang => "hang",
+            Self::AwaitingOperator => "awaiting_operator",
             Self::Ready => "ready",
             Self::Idle => "idle",
             Self::ToolUse => "tool_use",
@@ -583,5 +589,25 @@ mod tests {
         assert!(!AgentState::Thinking.is_error());
         assert!(!AgentState::Idle.is_error());
         assert!(!AgentState::Starting.is_error());
+    }
+
+    #[test]
+    fn awaiting_operator_not_error() {
+        // AwaitingOperator means "needs human keystrokes", not a failure mode.
+        assert!(!AgentState::AwaitingOperator.is_error());
+        assert!(!AgentState::AwaitingOperator.is_unavailable());
+    }
+
+    #[test]
+    fn awaiting_operator_priority_between_hang_and_ready() {
+        // Hang < AwaitingOperator < Ready so it preempts Starting/Hang in
+        // tab-bar highest-priority display but doesn't outrank real activity.
+        assert!(AgentState::Hang.priority() < AgentState::AwaitingOperator.priority());
+        assert!(AgentState::AwaitingOperator.priority() < AgentState::Ready.priority());
+    }
+
+    #[test]
+    fn awaiting_operator_display_name() {
+        assert_eq!(AgentState::AwaitingOperator.display_name(), "awaiting_operator");
     }
 }
