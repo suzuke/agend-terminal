@@ -261,7 +261,7 @@ fn handle_session(
                         if let Ok(mut core) = handle.core.lock() {
                             core.state.set_restarting();
                         }
-                        let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut child = crate::sync::lock_poisoned(&handle.child, "api_child");
                         let _ = child.kill();
                         drop(child);
                         drop(reg);
@@ -302,17 +302,14 @@ fn handle_session(
                 // handler from sending a crash event (agent not in registry = no crash).
                 let mut reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(name) {
-                    let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut child = crate::sync::lock_poisoned(&handle.child, "api_child");
                     let _ = child.kill();
                     drop(child);
                 }
                 reg.remove(name);
                 drop(reg);
                 // Then remove config (no race: agent already gone from registry)
-                configs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(name);
+                crate::sync::lock_poisoned(configs, "api_configs").remove(name);
                 // Cleanup the agent's published port file
                 crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
                 crate::event_log::log(home, "delete", name, "deleted via API");
@@ -812,9 +809,7 @@ mod tests {
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::sync::lock_poisoned(LOCK.get_or_init(|| Mutex::new(())), "api_env_guard")
     }
 
     fn tmp_home(name: &str) -> std::path::PathBuf {

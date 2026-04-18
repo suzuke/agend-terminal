@@ -539,7 +539,7 @@ fn scroll_focused(layout: &mut Layout, delta: i32) {
 fn kill_agent(registry: &AgentRegistry, name: &str) {
     let mut reg = agent::lock_registry(registry);
     if let Some(handle) = reg.get(name) {
-        let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = crate::sync::lock_poisoned(&handle.child, "app_child");
         let _ = child.kill();
     }
     reg.remove(name);
