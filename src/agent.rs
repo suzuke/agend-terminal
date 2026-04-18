@@ -54,6 +54,53 @@ pub fn lock_external(
     reg.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Environment variable names that fleet.yaml-supplied `env:` maps are NOT
+/// allowed to override when spawning an agent. These either (a) carry
+/// credentials that only the host user should control, (b) govern dynamic
+/// linking and would let a hostile fleet.yaml load attacker-supplied code
+/// into the spawned process, or (c) are agend's own runtime plumbing.
+///
+/// Matching is case-insensitive for cross-platform safety: Windows env is
+/// case-insensitive, so `anthropic_api_key` and `ANTHROPIC_API_KEY` map to the
+/// same variable there, and a pure case-sensitive deny-list would miss it.
+const SENSITIVE_ENV_KEYS: &[&str] = &[
+    // API credentials for backends we drive
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    // Cloud credentials commonly present in dev environments
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    // Git forge tokens
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    // Dynamic-linker injection vectors (Linux / macOS)
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    // agend's own runtime wiring — overriding these lets a template redirect
+    // the spawned agent to a different home / break MCP config discovery
+    "AGEND_HOME",
+    "AGEND_INSTANCE_NAME",
+    "AGEND_ALLOWED_WORK_ROOTS",
+    "AGEND_MCP_TOOLS_ALLOW",
+    "AGEND_MCP_TOOLS_DENY",
+];
+
+/// Returns true if the env-var name is on the spawn-time deny-list.
+pub fn is_sensitive_env_key(key: &str) -> bool {
+    SENSITIVE_ENV_KEYS
+        .iter()
+        .any(|denied| denied.eq_ignore_ascii_case(key))
+}
+
 /// Validate and sanitize an instance name. Only allows [a-zA-Z0-9_-].
 pub fn validate_name(name: &str) -> Result<&str, String> {
     if name.is_empty() {
@@ -198,9 +245,20 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         cmd.env("LANG", "en_US.UTF-8");
     }
 
-    // User env
+    // User env from fleet.yaml. Drop entries on the sensitive-env deny-list
+    // so a hostile template cannot override ANTHROPIC_API_KEY, LD_PRELOAD,
+    // AGEND_HOME, etc. with attacker-controlled values inherited by the
+    // spawned agent process.
     if let Some(env_map) = *env {
         for (k, v) in env_map {
+            if is_sensitive_env_key(k) {
+                tracing::warn!(
+                    instance = %name,
+                    key = %k,
+                    "dropping fleet.yaml env override for sensitive key"
+                );
+                continue;
+            }
             cmd.env(k, v);
         }
     }
@@ -219,8 +277,27 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     }
 
     if let Some(dir) = working_dir {
-        std::fs::create_dir_all(dir).ok();
-        cmd.cwd(dir);
+        // Defense-in-depth: the API spawn handler already calls
+        // validate_working_directory at admission, but a symlink could have
+        // been swapped in between admission and spawn. Revalidate here both
+        // before and after create_dir_all so the final cwd we hand to the PTY
+        // provably resolves inside AGEND_HOME / AGEND_ALLOWED_WORK_ROOTS.
+        // If no home is available (ad-hoc test spawn), skip the recheck.
+        if let Some(home_path) = *home {
+            if let Err(e) = crate::api::validate_working_directory(dir, home_path) {
+                anyhow::bail!("working_directory validation failed at spawn: {e}");
+            }
+            std::fs::create_dir_all(dir).ok();
+            // Second pass: now that the leaf exists, canonicalisation walks
+            // through any symlink and the starts_with check inside the
+            // validator catches escape-via-symlink.
+            let resolved = crate::api::validate_working_directory(dir, home_path)
+                .map_err(|e| anyhow::anyhow!("working_directory escapes via symlink: {e}"))?;
+            cmd.cwd(&resolved);
+        } else {
+            std::fs::create_dir_all(dir).ok();
+            cmd.cwd(dir);
+        }
     }
 
     let child = pair
@@ -767,5 +844,32 @@ mod tests {
     #[test]
     fn strip_ansi_osc() {
         assert_eq!(strip_ansi("\x1b]0;title\x07rest"), "rest");
+    }
+
+    #[test]
+    fn sensitive_env_keys_covers_known_dangerous() {
+        assert!(is_sensitive_env_key("ANTHROPIC_API_KEY"));
+        assert!(is_sensitive_env_key("OPENAI_API_KEY"));
+        assert!(is_sensitive_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(is_sensitive_env_key("LD_PRELOAD"));
+        assert!(is_sensitive_env_key("DYLD_INSERT_LIBRARIES"));
+        assert!(is_sensitive_env_key("AGEND_HOME"));
+        assert!(is_sensitive_env_key("AGEND_MCP_TOOLS_DENY"));
+    }
+
+    #[test]
+    fn sensitive_env_keys_is_case_insensitive() {
+        // Windows env is case-insensitive; ensure lower-cased fleet.yaml keys
+        // still hit the deny-list.
+        assert!(is_sensitive_env_key("anthropic_api_key"));
+        assert!(is_sensitive_env_key("Ld_Preload"));
+    }
+
+    #[test]
+    fn sensitive_env_keys_allows_benign() {
+        assert!(!is_sensitive_env_key("MY_APP_DEBUG"));
+        assert!(!is_sensitive_env_key("LANG"));
+        assert!(!is_sensitive_env_key("TERM"));
+        assert!(!is_sensitive_env_key("PROMPT_OVERRIDE"));
     }
 }
