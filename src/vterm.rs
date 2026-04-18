@@ -199,6 +199,53 @@ impl VTerm {
         text
     }
 
+    /// Return the last `n` visible rows of the screen as plain text,
+    /// stripped of ANSI attributes and trailing spaces. Leading blank
+    /// rows are omitted so short output doesn't look padded.
+    ///
+    /// Used by AwaitingOperator to snapshot "what the CLI printed before
+    /// it started waiting for stdin" for forwarding to Telegram.
+    #[allow(dead_code)] // wired in daemon tick loop / telegram push (later commit)
+    pub fn tail_lines(&self, n: usize) -> String {
+        let grid = self.term.grid();
+        let cols = self.cols as usize;
+        let rows = self.rows as usize;
+
+        let mut lines: Vec<String> = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let mut line = String::with_capacity(cols);
+            let mut col = 0;
+            while col < cols {
+                let cell = &grid[Point::new(Line(row as i32), Column(col))];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    col += 1;
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                line.push(ch);
+                col += 1;
+            }
+            lines.push(line.trim_end().to_string());
+        }
+
+        // Trim blank lines at both ends so terse output doesn't look padded
+        // and tail-N doesn't return the scroll buffer's trailing whitespace.
+        let first = lines.iter().position(|l| !l.is_empty()).unwrap_or(lines.len());
+        let last = lines
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map(|i| i + 1)
+            .unwrap_or(first);
+        let visible = &lines[first..last];
+
+        let tail = if visible.len() > n {
+            &visible[visible.len() - n..]
+        } else {
+            visible
+        };
+        tail.join("\n")
+    }
+
     /// Dump current screen as ANSI escape sequences for full redraw.
     pub fn dump_screen(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.cols as usize * self.rows as usize * 4);
@@ -569,5 +616,43 @@ mod tests {
         let screen = vt.dump_screen();
         let screen_str = String::from_utf8_lossy(&screen);
         assert!(screen_str.contains("日本語"));
+    }
+
+    #[test]
+    fn tail_lines_strips_leading_blanks_and_trailing_spaces() {
+        let mut vt = VTerm::new(40, 10);
+        vt.process(b"\r\n\r\nhello  \r\nworld");
+        let tail = vt.tail_lines(5);
+        // Leading/trailing blank lines gone; trailing spaces on "hello" stripped
+        assert_eq!(tail, "hello\nworld");
+    }
+
+    #[test]
+    fn tail_lines_caps_at_n() {
+        let mut vt = VTerm::new(20, 10);
+        for i in 0..6 {
+            vt.process(format!("line{i}\r\n").as_bytes());
+        }
+        let tail = vt.tail_lines(3);
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "line3");
+        assert_eq!(lines[1], "line4");
+        assert_eq!(lines[2], "line5");
+    }
+
+    #[test]
+    fn tail_lines_empty_screen() {
+        let vt = VTerm::new(80, 24);
+        assert_eq!(vt.tail_lines(40), "");
+    }
+
+    #[test]
+    fn tail_lines_wide_char_preserved() {
+        let mut vt = VTerm::new(40, 5);
+        vt.process("日本語 prompt>".as_bytes());
+        let tail = vt.tail_lines(3);
+        assert!(tail.contains("日本語"));
+        assert!(tail.contains("prompt>"));
     }
 }
