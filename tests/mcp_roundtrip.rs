@@ -243,6 +243,34 @@ fn test_unknown_method() {
 }
 
 #[test]
+fn test_parse_error_returns_response() {
+    // JSON-RPC 2.0 mandates that a parse error yields an error response.
+    // Prior behaviour silently dropped malformed requests, hanging clients.
+    let responses = mcp_session(&[
+        r#"{not valid json"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#,
+    ]);
+    assert!(
+        responses.len() >= 2,
+        "parse error must produce a response, got {}",
+        responses.len()
+    );
+    assert_eq!(responses[0]["error"]["code"], -32700);
+    assert_eq!(responses[0]["id"], serde_json::Value::Null);
+    // Subsequent valid request still served.
+    assert!(responses[1]["result"].is_object());
+}
+
+#[test]
+fn test_parse_error_salvages_id_when_possible() {
+    // Valid JSON but missing required fields — we can still recover id.
+    let responses = mcp_session(&[r#"{"id":42,"garbage":true}"#]);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["error"]["code"], -32700);
+    assert_eq!(responses[0]["id"], 42);
+}
+
+#[test]
 fn test_ping() {
     let responses = mcp_session(&[
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
