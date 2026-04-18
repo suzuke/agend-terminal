@@ -880,6 +880,115 @@ mod tests {
     }
 
     #[test]
+    fn codex_trust_concurrent_writes_stay_valid() {
+        // P0-5 regression guard: codex was the only backend with a flock in the
+        // original code; Stage 2 extended the pattern to the others. This test
+        // exercises codex_trust_directory from 8 threads racing on the same
+        // config.toml and asserts:
+        //   1. The file is syntactically valid TOML at the end.
+        //   2. The trusted-project entry appears exactly once (idempotent under race).
+        let dir = tmp_dir("codex_trust_concurrent");
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create .codex");
+        let config_path = codex_dir.join("config.toml");
+        let work_dir = dir.join("project");
+        std::fs::create_dir_all(&work_dir).expect("create project");
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let codex_dir = codex_dir.clone();
+                let work_dir = work_dir.clone();
+                std::thread::spawn(move || {
+                    with_codex_home_override(&codex_dir, || {
+                        codex_trust_directory(&work_dir);
+                    });
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let content = std::fs::read_to_string(&config_path).expect("read");
+        let key = format!("[projects.\"{}\"]", work_dir.display());
+        assert_eq!(
+            content.matches(&key).count(),
+            1,
+            "8 concurrent calls must still produce exactly one entry, got:\n{content}"
+        );
+        assert!(
+            content.contains("trust_level = \"trusted\""),
+            "trust_level must be present after concurrent writes:\n{content}"
+        );
+        // Sanity: every non-empty line is either a section header or key=val.
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            assert!(
+                trimmed.starts_with('[') || trimmed.contains('='),
+                "malformed toml line detected (likely interleaved writes): {line:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gemini_concurrent_configure_keeps_json_valid_and_trusted() {
+        // Stage 2 extended the per-path flock to Gemini/Kiro/Claude/OpenCode.
+        // Race configure_gemini from 8 threads on the same working_dir and
+        // assert the settings.json is still parseable and retains the trust flag.
+        let dir = tmp_dir("gemini_concurrent");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    configure_gemini(&dir).expect("configure_gemini");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let content = std::fs::read_to_string(dir.join(".gemini/settings.json")).expect("read");
+        let config: serde_json::Value =
+            serde_json::from_str(&content).expect("concurrent writes must leave valid JSON");
+        assert_eq!(
+            config["mcpServers"]["agend-terminal"]["trust"], true,
+            "trust must still be true after concurrent configures"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opencode_concurrent_configure_keeps_json_valid() {
+        // Same race test against configure_opencode — opencode.json is
+        // read→mutate→atomic_write under a flock.
+        let dir = tmp_dir("opencode_concurrent");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    configure_opencode(&dir).expect("configure_opencode");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let content = std::fs::read_to_string(dir.join("opencode.json")).expect("read");
+        let config: serde_json::Value =
+            serde_json::from_str(&content).expect("concurrent writes must leave valid JSON");
+        // The agend-terminal entry must still be present and well-formed.
+        assert!(config["mcp"]["agend-terminal"]["command"].is_array());
+        assert_eq!(config["mcp"]["agend-terminal"]["type"], "local");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn codex_trust_skips_when_codex_dir_missing() {
         let dir = tmp_dir("codex_trust_absent");
         // Point override at a non-existent codex home — function should no-op.
