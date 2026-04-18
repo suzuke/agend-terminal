@@ -244,10 +244,8 @@ fn test_attach(_home: &Path) -> TestResult {
 
     let output = {
         let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
-        let core = crate::sync::lock_poisoned(
-            &reg.get("verify-attach").unwrap().core,
-            "verify_core",
-        );
+        let core =
+            crate::sync::lock_poisoned(&reg.get("verify-attach").unwrap().core, "verify_core");
         String::from_utf8_lossy(&core.vterm.dump_screen()).to_string()
     };
     let ok = output.contains("VERIFY_OK");
@@ -550,8 +548,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             }
 
             let is_gone = || {
-                !crate::sync::lock_poisoned(&registry, "verify_registry")
-                    .contains_key(&agent_name)
+                !crate::sync::lock_poisoned(&registry, "verify_registry").contains_key(&agent_name)
             };
             let mut quit_ok = poll_until(
                 std::time::Instant::now() + std::time::Duration::from_secs(5),

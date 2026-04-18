@@ -66,7 +66,11 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
         let tz: chrono_tz::Tz = match tz_name.parse() {
             Ok(t) => t,
             Err(_) => {
-                tracing::warn!(cron = cron_expr, timezone = tz_name, "unknown timezone, falling back to UTC");
+                tracing::warn!(
+                    cron = cron_expr,
+                    timezone = tz_name,
+                    "unknown timezone, falling back to UTC"
+                );
                 chrono_tz::UTC
             }
         };

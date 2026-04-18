@@ -32,10 +32,7 @@ pub fn validate_working_directory(
     home: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
-    if path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
         anyhow::bail!("working_directory must not contain '..'");
     }
     // Walk up to the deepest existing ancestor for canonicalisation. A path
@@ -372,11 +369,8 @@ fn handle_session(
                 let work_dir = match validate_working_directory(&requested_work_dir, home) {
                     Ok(p) => p,
                     Err(e) => {
-                        let _ = writeln!(
-                            writer,
-                            "{}",
-                            json!({"ok": false, "error": format!("{e}")})
-                        );
+                        let _ =
+                            writeln!(writer, "{}", json!({"ok": false, "error": format!("{e}")}));
                         continue;
                     }
                 };

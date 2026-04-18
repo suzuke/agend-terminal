@@ -130,10 +130,7 @@ pub(crate) fn sanitize_identifier(s: &str) -> String {
 /// closing the enclosing code span / opening a new fenced block, and control
 /// chars (including newlines) would let an attacker append arbitrary sections.
 pub(crate) fn sanitize_role_text(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| *c != '`' && !c.is_control())
-        .collect();
+    let cleaned: String = s.chars().filter(|c| *c != '`' && !c.is_control()).collect();
     cleaned.chars().take(256).collect()
 }
 
@@ -158,8 +155,7 @@ pub(crate) fn build_instructions_body(ctx: Option<&AgentContext>) -> String {
             for (name, role) in ctx.fleet_peers {
                 if *name != ctx.name {
                     let safe_peer = sanitize_identifier(name);
-                    let safe_peer_role =
-                        sanitize_role_text(role.as_deref().unwrap_or("(no role)"));
+                    let safe_peer_role = sanitize_role_text(role.as_deref().unwrap_or("(no role)"));
                     content.push_str(&format!("- `{safe_peer}` — {safe_peer_role}\n"));
                 }
             }
@@ -572,7 +568,10 @@ mod tests {
 
     #[test]
     fn sanitize_role_text_removes_backticks_and_control() {
-        assert_eq!(sanitize_role_text("A helpful reviewer"), "A helpful reviewer");
+        assert_eq!(
+            sanitize_role_text("A helpful reviewer"),
+            "A helpful reviewer"
+        );
         assert_eq!(
             sanitize_role_text("role`with`backticks"),
             "rolewithbackticks"

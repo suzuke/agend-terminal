@@ -200,7 +200,9 @@ pub fn update(home: &Path, args: &Value) -> Value {
         };
         let mut decision: Decision = match serde_json::from_str(&content) {
             Ok(d) => d,
-            Err(e) => return serde_json::json!({"error": format!("decision '{id}' corrupted: {e}")}),
+            Err(e) => {
+                return serde_json::json!({"error": format!("decision '{id}' corrupted: {e}")})
+            }
         };
 
         if let Some(content) = args["content"].as_str() {

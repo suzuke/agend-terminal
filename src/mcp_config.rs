@@ -323,7 +323,11 @@ fn configure_opencode(working_dir: &Path) -> Result<()> {
     // Force `permission` to an object so we can insert keys; replaces any
     // pre-existing scalar form (e.g. "ask") since autonomous agents must
     // not block on prompts.
-    if !config.get("permission").map(|v| v.is_object()).unwrap_or(false) {
+    if !config
+        .get("permission")
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+    {
         config["permission"] = json!({});
     }
     let perm = config["permission"]
