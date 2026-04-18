@@ -242,8 +242,14 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // External agents registry (connected via `agend-terminal connect`)
     let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-    // Crash channel for auto-respawn
-    let (crash_tx, crash_rx) = crossbeam::channel::unbounded::<String>();
+    // Crash channel for auto-respawn.
+    //
+    // Bounded to prevent the reaper from accumulating unbounded crash events
+    // if the main loop stalls (P2-2, review 2026-04-18). 64 is comfortably
+    // more than a plausible burst — every fleet member crashing at once —
+    // and senders use `try_send` so a full channel drops the event with a
+    // warning rather than blocking the PTY close handler.
+    let (crash_tx, crash_rx) = crossbeam::channel::bounded::<String>(64);
 
     // Store configs for respawn
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -261,7 +267,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     .map(|p| p.to_path_buf())
             })?
         });
-        configs.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        crate::sync::lock_poisoned(&configs, "configs").insert(
             name.clone(),
             AgentConfig {
                 name: name.clone(),
@@ -422,7 +428,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         // Periodic snapshot: save fleet state (only if changed)
         {
             let reg = agent::lock_registry(&registry);
-            let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
+            let cfgs = crate::sync::lock_poisoned(&configs, "configs");
             let snapshots: Vec<_> = reg
                 .iter()
                 .map(|(name, handle)| {
@@ -464,7 +470,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         check_ci_watches(home, &registry);
 
         {
-            let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
+            let cfgs = crate::sync::lock_poisoned(&configs, "configs");
             for (name, config) in cfgs.iter() {
                 if let Some(ref dir) = config.working_dir {
                     if let Some(sid) = crate::backend::read_session_id(dir) {
@@ -500,9 +506,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
 
         // Get config for respawn
-        let config = configs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let config = crate::sync::lock_poisoned(&configs, "configs")
             .get(&crashed_name)
             .cloned();
         let config = match config {
@@ -518,7 +522,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             let reg = agent::lock_registry(&registry);
             match reg.get(&crashed_name) {
                 Some(handle) => {
-                    let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut core = crate::sync::lock_poisoned(&handle.core, "agent_core");
                     core.health.record_crash()
                 }
                 None => {
@@ -549,7 +553,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
             // Save health tracker from old handle before respawn replaces it
             let saved_health = {
-                let r = registry.lock().unwrap_or_else(|e| e.into_inner());
+                let r = crate::sync::lock_poisoned(&registry, "registry");
                 r.get(&crashed_name)
                     .and_then(|h| h.core.lock().ok().map(|c| c.health.clone()))
             };
@@ -606,9 +610,9 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
                                     // Restore health tracker from old handle + mark respawn OK
                                     {
-                                        let r = reg.lock().unwrap_or_else(|e| e.into_inner());
+                                        let r = crate::sync::lock_poisoned(&reg, "registry");
                                         if let Some(handle) = r.get(&config.name) {
-                                            let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+                                            let mut core = crate::sync::lock_poisoned(&handle.core, "agent_core");
                                             if let Some(ref old_health) = saved_health {
                                                 core.health = old_health.clone();
                                             }
@@ -619,7 +623,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                     // Inject system message
                                     std::thread::sleep(std::time::Duration::from_secs(2));
                                     {
-                                        let r = reg.lock().unwrap_or_else(|e| e.into_inner());
+                                        let r = crate::sync::lock_poisoned(&reg, "registry");
                                         if let Some(handle) = r.get(&config.name) {
                                             let reason = handle.core.lock().ok()
                                                 .map(|c| c.health.crash_reason().to_string())
@@ -780,13 +784,13 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
         None => return,
     };
 
-    let now = chrono::Utc::now();
+    let now_utc = chrono::Utc::now();
     let last_check_path = home.join(".schedule_last_check");
-    let last_check = std::fs::read_to_string(&last_check_path)
+    let last_check_utc = std::fs::read_to_string(&last_check_path)
         .ok()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
         .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|| now - chrono::Duration::seconds(10));
+        .unwrap_or_else(|| now_utc - chrono::Duration::seconds(10));
 
     let mut any_triggered = false;
     for sched in schedules {
@@ -810,7 +814,35 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
                 continue;
             }
         };
-        if !schedule.after(&last_check).take(1).any(|next| next <= now) {
+
+        // Evaluate the cron expression in the schedule's declared timezone
+        // (falls back to detected local TZ, then UTC). Previously we always
+        // compared against UTC, so "0 9 * * *" fired at 9 AM UTC regardless
+        // of the user's intent, and a DST transition in the user's region
+        // silently shifted the trigger by 1h. A tz-aware DateTime lets
+        // chrono resolve the wall-clock → instant conversion correctly.
+        // Explicit `match` rather than `unwrap_or_else(detect_timezone)` so
+        // the &str borrowed from `store` (JSON Value) doesn't need to unify
+        // with detect_timezone's &'static str — Rust would otherwise infer
+        // `'static` for the Value borrow and blow up lifetimes.
+        let tz_name: &str = match sched["timezone"].as_str().filter(|s| !s.is_empty()) {
+            Some(s) => s,
+            None => crate::schedules::detect_timezone(),
+        };
+        let tz: chrono_tz::Tz = match tz_name.parse() {
+            Ok(t) => t,
+            Err(_) => {
+                tracing::warn!(cron = cron_expr, timezone = tz_name, "unknown timezone, falling back to UTC");
+                chrono_tz::UTC
+            }
+        };
+        let now_local = now_utc.with_timezone(&tz);
+        let last_check_local = last_check_utc.with_timezone(&tz);
+        if !schedule
+            .after(&last_check_local)
+            .take(1)
+            .any(|next| next <= now_local)
+        {
             continue;
         }
 
@@ -848,7 +880,7 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     from: "system:schedule".to_string(),
                     text: message.to_string(),
                     kind: Some("schedule".to_string()),
-                    timestamp: now.to_rfc3339(),
+                    timestamp: now_utc.to_rfc3339(),
                 },
             );
             "ok_inbox"
@@ -860,8 +892,8 @@ fn check_schedules(home: &Path, registry: &AgentRegistry) {
         any_triggered = true;
     }
 
-    if any_triggered || now.signed_duration_since(last_check).num_seconds() >= 10 {
-        let _ = std::fs::write(&last_check_path, now.to_rfc3339());
+    if any_triggered || now_utc.signed_duration_since(last_check_utc).num_seconds() >= 10 {
+        let _ = std::fs::write(&last_check_path, now_utc.to_rfc3339());
     }
 }
 

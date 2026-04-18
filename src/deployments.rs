@@ -16,7 +16,16 @@ pub struct Deployment {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct DeploymentStore {
+    #[serde(default)]
+    schema_version: u32,
     deployments: Vec<Deployment>,
+}
+
+impl crate::store::SchemaVersioned for DeploymentStore {
+    const CURRENT: u32 = 1;
+    fn version_mut(&mut self) -> &mut u32 {
+        &mut self.schema_version
+    }
 }
 
 fn store_path(home: &Path) -> std::path::PathBuf {
@@ -24,10 +33,15 @@ fn store_path(home: &Path) -> std::path::PathBuf {
 }
 
 fn load(home: &Path) -> DeploymentStore {
-    crate::store::load(&store_path(home))
+    crate::store::load_versioned(
+        &store_path(home),
+        <DeploymentStore as crate::store::SchemaVersioned>::CURRENT,
+    )
 }
 
-fn save(home: &Path, store: &DeploymentStore) -> anyhow::Result<()> {
+fn save(home: &Path, store: &mut DeploymentStore) -> anyhow::Result<()> {
+    use crate::store::SchemaVersioned;
+    *store.version_mut() = DeploymentStore::CURRENT;
     crate::store::save(&store_path(home), store)
 }
 
@@ -191,7 +205,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     };
     let mut store = load(home);
     store.deployments.push(deployment);
-    let _ = save(home, &store);
+    let _ = save(home, &mut store);
 
     let _ = instance_name; // suppress unused
     serde_json::json!({"status": "deployed", "name": deploy_name, "instances": created})
@@ -224,7 +238,7 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
 
     // Remove from store
     store.deployments.retain(|d| d.name != name);
-    let _ = save(home, &store);
+    let _ = save(home, &mut store);
 
     serde_json::json!({"status": "torn_down", "name": name, "instances": deployment.instances})
 }
