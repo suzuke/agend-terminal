@@ -295,6 +295,19 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                 .map_err(|e| anyhow::anyhow!("working_directory escapes via symlink: {e}"))?;
             cmd.cwd(&resolved);
         } else {
+            // No `home` means no allow-list to validate against. All
+            // production spawn paths thread `home` through `SpawnConfig`; the
+            // only call sites that legitimately pass `None` are ad-hoc test
+            // spawns (tests/integration.rs). Emit a warn so that if a future
+            // code path regresses and spawns without home, the lost
+            // symlink-escape guard shows up in logs instead of silently
+            // degrading. Tests suppress tracing output so this stays quiet
+            // under `cargo test` while still being visible in a live daemon.
+            tracing::warn!(
+                instance = %name,
+                dir = %dir.display(),
+                "spawn without AGEND_HOME — working_directory symlink recheck skipped"
+            );
             std::fs::create_dir_all(dir).ok();
             cmd.cwd(dir);
         }
