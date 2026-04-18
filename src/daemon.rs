@@ -394,6 +394,39 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     core.health.maybe_decay();
                     let agent_state = core.state.current;
                     let silent = core.state.last_output.elapsed();
+
+                    // AwaitingOperator takes precedence over Hang during
+                    // Starting: an unexpected interactive prompt (codex
+                    // update menu, trust dialog, ...) should route to the
+                    // operator in seconds rather than wait 120s for Hang.
+                    // The predicate only fires while current == Starting,
+                    // so set_awaiting_operator() transitions once; next
+                    // tick sees AwaitingOperator and this branch is skipped.
+                    if core.health.check_awaiting_operator(agent_state, silent) {
+                        core.state.set_awaiting_operator();
+                        let tail = core.vterm.tail_lines(40);
+                        // Release the per-agent lock before Telegram IO;
+                        // notify_telegram itself spawns a thread but the
+                        // fleet-config load inside it shouldn't hold agent
+                        // core locks either.
+                        drop(core);
+                        tracing::info!(
+                            agent = %name,
+                            silent_secs = silent.as_secs(),
+                            "awaiting operator (startup stalled on interactive prompt)"
+                        );
+                        let msg = format!(
+                            "⚠️ {name} 啟動後靜默 {silent_secs}s，可能卡在互動 prompt\n\
+                             ────────\n\
+                             {tail}\n\
+                             ────────\n\
+                             💬 回覆將以原始鍵盤輸入寫入 agent stdin",
+                            silent_secs = silent.as_secs(),
+                        );
+                        notify_telegram(home, name, &msg);
+                        continue;
+                    }
+
                     if core.health.check_hang(agent_state, silent) {
                         tracing::warn!(
                             agent = %name,

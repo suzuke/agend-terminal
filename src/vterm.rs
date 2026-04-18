@@ -205,7 +205,6 @@ impl VTerm {
     ///
     /// Used by AwaitingOperator to snapshot "what the CLI printed before
     /// it started waiting for stdin" for forwarding to Telegram.
-    #[allow(dead_code)] // wired in daemon tick loop / telegram push (later commit)
     pub fn tail_lines(&self, n: usize) -> String {
         let grid = self.term.grid();
         let cols = self.cols as usize;

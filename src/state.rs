@@ -328,6 +328,21 @@ impl StateTracker {
         self.state_buf.clear();
     }
 
+    /// Force state to AwaitingOperator when startup stalls on an unexpected
+    /// interactive prompt (codex update menu, claude trust prompt, etc.).
+    /// Only takes effect from `Starting`; once the operator replies and the
+    /// ready pattern matches, the usual `transition()` path lifts the
+    /// state out (AwaitingOperator prio < Ready prio → higher always wins).
+    pub fn set_awaiting_operator(&mut self) {
+        if self.current == AgentState::Starting {
+            self.current = AgentState::AwaitingOperator;
+            self.since = Instant::now();
+            // Fresh buffer: post-stall output (after the operator types)
+            // must feed pattern detection without stale banner text.
+            self.state_buf.clear();
+        }
+    }
+
     fn transition(&mut self, new_state: AgentState) {
         if new_state == self.current {
             return;
@@ -609,5 +624,40 @@ mod tests {
     #[test]
     fn awaiting_operator_display_name() {
         assert_eq!(AgentState::AwaitingOperator.display_name(), "awaiting_operator");
+    }
+
+    #[test]
+    fn set_awaiting_operator_from_starting() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 5);
+        t.set_awaiting_operator();
+        assert_eq!(t.current, AgentState::AwaitingOperator);
+    }
+
+    #[test]
+    fn set_awaiting_operator_noop_from_other_states() {
+        // Only Starting should transition; from any other state it's a no-op
+        // so late-firing tick-loop detections can't corrupt a healthy agent.
+        for s in [
+            AgentState::Ready,
+            AgentState::Idle,
+            AgentState::Thinking,
+            AgentState::AwaitingOperator,
+            AgentState::Crashed,
+        ] {
+            let mut t = tracker_at(&Backend::ClaudeCode, s, 10);
+            t.set_awaiting_operator();
+            assert_eq!(t.current, s, "state {:?} should be unchanged", s);
+        }
+    }
+
+    #[test]
+    fn ready_pattern_lifts_awaiting_operator() {
+        // Once operator unblocks the stall and the ready banner fires,
+        // transition() takes the usual higher-priority-wins path.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 5);
+        t.set_awaiting_operator();
+        assert_eq!(t.current, AgentState::AwaitingOperator);
+        t.feed("bypass permissions");
+        assert_eq!(t.current, AgentState::Ready);
     }
 }

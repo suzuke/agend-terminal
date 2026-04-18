@@ -18,7 +18,6 @@ const STABILITY_WINDOW: Duration = Duration::from_secs(1800); // 30 min stable â
 /// Silence threshold for AwaitingOperator detection. Agent in `Starting`
 /// with no stdout for this long is likely blocked on an interactive prompt
 /// (codex update menu, claude trust prompt, etc.).
-#[allow(dead_code)] // wired in daemon tick loop (later commit)
 const AWAITING_OP_SILENCE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -142,7 +141,6 @@ impl HealthTracker {
     /// in `Starting` AND has been silent past the threshold. Other states
     /// return false regardless of silence (post-Ready waits are covered by
     /// PermissionPrompt / check_hang).
-    #[allow(dead_code)] // wired in daemon tick loop (later commit)
     pub fn check_awaiting_operator(&self, agent_state: AgentState, silent: Duration) -> bool {
         matches!(agent_state, AgentState::Starting) && silent > AWAITING_OP_SILENCE
     }
