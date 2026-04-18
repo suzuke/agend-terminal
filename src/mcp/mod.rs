@@ -79,6 +79,20 @@ pub fn run() -> anyhow::Result<()> {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "invalid JSON-RPC");
+                // Per JSON-RPC 2.0: parse errors MUST produce a response
+                // so the caller does not hang. id is Null because the
+                // malformed request may not expose a valid one; best-effort
+                // salvage if the body was valid JSON but failed our shape.
+                let id = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .unwrap_or(Value::Null);
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32700, "message": format!("Parse error: {e}") }
+                });
+                write_message(&mut stdout, &err_resp.to_string())?;
                 continue;
             }
         };
