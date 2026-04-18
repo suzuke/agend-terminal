@@ -39,13 +39,33 @@ fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<
         }
         // Content-Length framing
         if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-            let len: usize = val.trim().parse().unwrap_or(0);
+            // Prior behaviour `val.parse().unwrap_or(0)` silently collapsed
+            // garbage headers to len=0 and then `continue`d without
+            // consuming the empty separator line, leaving the stream
+            // desynced against the next frame. Handle the parse error
+            // explicitly: log it, skip the separator to resync on the
+            // following header, and drop this frame.
+            let len: usize = match val.trim().parse() {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        value = %val.trim(),
+                        error = %e,
+                        "invalid Content-Length; frame discarded"
+                    );
+                    let mut empty = String::new();
+                    let _ = reader.read_line(&mut empty);
+                    continue;
+                }
+            };
+            // Empty separator line is part of the frame — consume it
+            // unconditionally so len==0 doesn't leave the stream pointing
+            // at the separator on the next iteration.
+            let mut empty = String::new();
+            reader.read_line(&mut empty)?;
             if len == 0 {
                 continue;
             }
-            // Read empty line after headers
-            let mut empty = String::new();
-            reader.read_line(&mut empty)?;
             // Read body
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body)?;
