@@ -82,15 +82,48 @@ impl TestDaemon {
         None
     }
 
-    fn api_call(&self, request: &serde_json::Value) -> serde_json::Value {
+    /// Read the 32-byte cookie the daemon published in its run dir. Tests
+    /// speak raw TCP so they must present it manually (unlike production
+    /// clients which go through `ipc::connect_api`/`auth_cookie`).
+    fn find_api_cookie(home: &Path) -> Option<Vec<u8>> {
+        let run = home.join("run");
+        for entry in std::fs::read_dir(&run).ok()?.flatten() {
+            let p = entry.path().join("api.cookie");
+            if let Ok(bytes) = std::fs::read(&p) {
+                if bytes.len() == 32 {
+                    return Some(bytes);
+                }
+            }
+        }
+        None
+    }
+
+    /// Open a TCP connection to the API port and complete the NDJSON cookie
+    /// handshake. Returns the reader/writer pair primed for the first real
+    /// request.
+    fn connect_authed(&self) -> (BufReader<TcpStream>, TcpStream) {
         let port = Self::find_api_port(&self.home).expect("api port");
-        let mut stream =
+        let cookie = Self::find_api_cookie(&self.home).expect("api.cookie");
+        let stream =
             TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        writeln!(stream, "{}", request).expect("write");
-        stream.flush().expect("flush");
+        let mut writer = stream.try_clone().expect("clone");
         let mut reader = BufReader::new(stream);
+        let hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
+        writeln!(writer, "{{\"auth\":\"{}\"}}", hex).expect("write auth");
+        writer.flush().expect("flush auth");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read auth reply");
+        let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse auth reply");
+        assert_eq!(resp["ok"], true, "auth handshake failed: {resp}");
+        (reader, writer)
+    }
+
+    fn api_call(&self, request: &serde_json::Value) -> serde_json::Value {
+        let (mut reader, mut writer) = self.connect_authed();
+        writeln!(writer, "{}", request).expect("write");
+        writer.flush().expect("flush");
         let mut line = String::new();
         reader.read_line(&mut line).expect("read");
         serde_json::from_str(line.trim()).expect("parse response")
@@ -99,14 +132,9 @@ impl TestDaemon {
     /// Send a raw line (not pre-serialised JSON) and read one NDJSON response.
     /// Used to probe the parse-error path — `api_call` can only send valid JSON.
     fn api_call_raw(&self, raw_line: &str) -> serde_json::Value {
-        let port = Self::find_api_port(&self.home).expect("api port");
-        let mut stream =
-            TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
-        stream.set_nodelay(true).ok();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        writeln!(stream, "{}", raw_line).expect("write");
-        stream.flush().expect("flush");
-        let mut reader = BufReader::new(stream);
+        let (mut reader, mut writer) = self.connect_authed();
+        writeln!(writer, "{}", raw_line).expect("write");
+        writer.flush().expect("flush");
         let mut line = String::new();
         reader.read_line(&mut line).expect("read");
         serde_json::from_str(line.trim()).expect("parse response")
@@ -219,6 +247,65 @@ fn test_api_error_paths() {
         "expected 'already exists' error, got: {resp}"
     );
 
+    daemon.stop();
+}
+
+/// P1-10: verify the daemon rejects a TCP peer that cannot present the
+/// cookie (no auth / bad auth). Complements the unit tests in
+/// `src/auth_cookie.rs` — this exercises the full end-to-end path including
+/// the TCP listener and the `handle_session` gate.
+#[test]
+fn test_api_rejects_connection_without_cookie() {
+    let mut daemon = TestDaemon::start("auth_missing");
+    let port = TestDaemon::find_api_port(&daemon.home).expect("api port");
+    let mut stream =
+        TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
+    stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    // Send a command line directly — no {"auth":...} first. Server's first-line
+    // handshake must treat this as malformed/missing auth and close.
+    writeln!(stream, r#"{{"method":"list"}}"#).expect("write");
+    stream.flush().expect("flush");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read reply");
+    let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse");
+    assert_eq!(
+        resp["ok"], false,
+        "server must reject unauthenticated request, got: {resp}"
+    );
+    // Second read should see EOF — server closed after the auth failure.
+    let mut tail = String::new();
+    let n = reader.read_line(&mut tail).expect("second read");
+    assert_eq!(n, 0, "server should close after auth failure; got: {tail}");
+    daemon.stop();
+}
+
+#[test]
+fn test_api_rejects_connection_with_wrong_cookie() {
+    let mut daemon = TestDaemon::start("auth_wrong");
+    let port = TestDaemon::find_api_port(&daemon.home).expect("api port");
+    let mut stream =
+        TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
+    stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    // 64 hex chars of a cookie the daemon never issued.
+    let fake_hex = "a".repeat(64);
+    writeln!(stream, r#"{{"auth":"{}"}}"#, fake_hex).expect("write");
+    stream.flush().expect("flush");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read reply");
+    let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse");
+    assert_eq!(resp["ok"], false, "wrong cookie must be rejected");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("auth"),
+        "expected auth error, got: {resp}"
+    );
     daemon.stop();
 }
 

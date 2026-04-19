@@ -107,6 +107,16 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
             rdir.join(".daemon"),
             format!("{}:{now}", std::process::id()),
         );
+        // P1-10: issue the API auth cookie before spawning the TUI / API
+        // threads so their `read_cookie` calls succeed.
+        let cookie_ok = crate::auth_cookie::issue(&rdir).is_ok();
+        if !cookie_ok {
+            results.push(TestResult {
+                name: "daemon_setup".into(),
+                passed: false,
+                detail: "Failed to issue API cookie".into(),
+            });
+        }
         for name in ["test-a", "test-b"] {
             let rdir = rdir.clone();
             let reg = Arc::clone(&registry);

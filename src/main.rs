@@ -1,6 +1,7 @@
 mod agent;
 mod api;
 mod app;
+mod auth_cookie;
 mod backend;
 mod bugreport;
 mod channel;
