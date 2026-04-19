@@ -330,11 +330,19 @@ impl StateTracker {
 
     /// Force state to AwaitingOperator when startup stalls on an unexpected
     /// interactive prompt (codex update menu, claude trust prompt, etc.).
-    /// Only takes effect from `Starting`; once the operator replies and the
-    /// ready pattern matches, the usual `transition()` path lifts the
-    /// state out (AwaitingOperator prio < Ready prio → higher always wins).
+    ///
+    /// Takes effect from `Starting` OR `Ready`. The Ready case covers backends
+    /// whose ready_pattern matches the startup banner that also contains the
+    /// interactive prompt (codex: `ready_pattern: "OpenAI Codex|›"` matches
+    /// the `› 1. Update now` menu). The supervisor's predicate gates Ready
+    /// transitions with a grace window so long-running idle agents aren't
+    /// mis-flagged.
+    ///
+    /// Once the operator replies and the ready pattern matches against
+    /// post-stall output, the usual `transition()` path lifts the state out
+    /// (AwaitingOperator prio < Ready prio → higher always wins).
     pub fn set_awaiting_operator(&mut self) {
-        if self.current == AgentState::Starting {
+        if matches!(self.current, AgentState::Starting | AgentState::Ready) {
             self.current = AgentState::AwaitingOperator;
             self.since = Instant::now();
             // Fresh buffer: post-stall output (after the operator types)
@@ -634,13 +642,26 @@ mod tests {
     }
 
     #[test]
+    fn set_awaiting_operator_from_ready() {
+        // Ready must also transition: codex's ready_pattern matches the
+        // startup banner that contains the update menu, so the agent reports
+        // Ready while still blocked on keystrokes. The supervisor's predicate
+        // gates Ready with a grace window to avoid flagging idle agents.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Ready, 5);
+        t.set_awaiting_operator();
+        assert_eq!(t.current, AgentState::AwaitingOperator);
+    }
+
+    #[test]
     fn set_awaiting_operator_noop_from_other_states() {
-        // Only Starting should transition; from any other state it's a no-op
-        // so late-firing tick-loop detections can't corrupt a healthy agent.
+        // Only Starting/Ready should transition; from any other state it's a
+        // no-op so late-firing tick-loop detections can't corrupt a healthy
+        // mid-task agent.
         for s in [
-            AgentState::Ready,
             AgentState::Idle,
             AgentState::Thinking,
+            AgentState::ToolUse,
+            AgentState::PermissionPrompt,
             AgentState::AwaitingOperator,
             AgentState::Crashed,
         ] {
