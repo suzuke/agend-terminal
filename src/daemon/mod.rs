@@ -112,6 +112,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     let run = run_dir(home);
     std::fs::create_dir_all(&run)?;
     write_daemon_id(&run);
+    // P1-10: issue the connection cookie *before* spawning any TUI / API
+    // server thread, since `serve_agent_tui` and `api::serve` both expect
+    // `api.cookie` to already exist. Failure here aborts startup —
+    // running the control plane without auth would be a silent security
+    // regression.
+    crate::auth_cookie::issue(&run)
+        .map_err(|e| anyhow::anyhow!("failed to issue API auth cookie: {e}"))?;
     tracing::info!(path = %run.display(), "run dir");
 
     // Check for previous snapshot if fleet.yaml doesn't exist

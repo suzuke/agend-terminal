@@ -113,6 +113,17 @@ pub fn serve(
         tracing::warn!(error = %e, "failed to publish API port");
         return;
     }
+    // P1-10: Load the per-daemon auth cookie (already issued by
+    // `daemon::run` / `verify::run` before any server thread spawned). If
+    // it's missing we fail closed — running without auth would be worse
+    // than not serving.
+    let cookie = match crate::auth_cookie::read_cookie(&run_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "api.cookie missing; aborting serve");
+            return;
+        }
+    };
     tracing::info!(port, "API listening");
 
     for stream in listener.incoming().flatten() {
@@ -128,15 +139,28 @@ pub fn serve(
         let cfgs = Arc::clone(&configs);
         let ext = Arc::clone(&externals);
         let tui = tui_tx.clone();
+        // Cookie is `[u8; 32]` (Copy), each session gets its own copy so the
+        // spawned closure satisfies `'static`.
+        let session_cookie = cookie;
         std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
-                handle_session(stream, &reg, &home, &shutdown, &cfgs, &ext, tui.as_ref())
+                handle_session(
+                    stream,
+                    &reg,
+                    &home,
+                    &shutdown,
+                    &cfgs,
+                    &ext,
+                    tui.as_ref(),
+                    session_cookie,
+                )
             })
             .ok();
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_session(
     stream: TcpStream,
     registry: &AgentRegistry,
@@ -145,6 +169,7 @@ fn handle_session(
     configs: &ConfigRegistry,
     externals: &ExternalRegistry,
     tui_tx: Option<&crate::app::TuiEventSender>,
+    cookie: crate::auth_cookie::Cookie,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -155,6 +180,14 @@ fn handle_session(
     };
     let mut reader = BufReader::new(cloned);
     let mut writer = stream;
+
+    // P1-10 gate: first NDJSON line must be `{"auth":"<hex>"}`. Read deadline
+    // on the stream (set in `serve`) ensures a silent peer closes out in 30s
+    // rather than pinning this worker thread.
+    if let Err(e) = crate::auth_cookie::server_handshake_ndjson(&mut reader, &mut writer, &cookie) {
+        tracing::warn!(error = %e, "API auth rejected");
+        return;
+    }
 
     loop {
         let mut line = String::new();
@@ -781,12 +814,25 @@ fn spawn_one(
 }
 
 /// Send a request to the daemon API and read one NDJSON response.
+///
+/// Performs the P1-10 cookie handshake first: reads `api.cookie` from the
+/// active daemon's run dir, sends `{"auth":"<hex>"}`, and rejects the call
+/// if the server does not reply `{"ok":true}`. The cookie file has mode
+/// 0600 so only the daemon's user can read it — this is the peer-UID
+/// substitute for TCP loopback (see `auth_cookie.rs`).
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
-    let mut stream = crate::ipc::connect_api(home)?;
-    writeln!(stream, "{}", request)?;
-    stream.flush()?;
+    let stream = crate::ipc::connect_api(home)?;
+    let run = crate::daemon::find_active_run_dir(home)
+        .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;
+    let cookie = crate::auth_cookie::read_cookie(&run)?;
 
+    let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
+    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &cookie)?;
+
+    writeln!(writer, "{}", request)?;
+    writer.flush()?;
+
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let resp: Value = serde_json::from_str(line.trim())?;

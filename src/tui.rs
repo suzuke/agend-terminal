@@ -21,6 +21,15 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
     let mut stream = crate::ipc::connect_agent(home, name)
         .map_err(|e| anyhow::anyhow!("Failed to connect to agent '{name}': {e}"))?;
 
+    // P1-10: send the 32-byte per-daemon cookie before anything else. The
+    // daemon's TUI server reads and verifies it before replying with the
+    // protocol version byte. Missing / wrong cookie → connection dropped.
+    let run = crate::daemon::find_active_run_dir(home)
+        .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;
+    let cookie = crate::auth_cookie::read_cookie(&run)?;
+    crate::auth_cookie::write_tui_auth(&mut stream, &cookie)
+        .map_err(|e| anyhow::anyhow!("Failed to send TUI auth: {e}"))?;
+
     // Read protocol version byte from server
     let mut version_buf = [0u8; 1];
     stream

@@ -10,6 +10,18 @@ use std::sync::Arc;
 /// Binds a TCP loopback port, publishes it to `{run_dir}/{name}.port`, then
 /// accepts connections. Removes the port file when the listener exits.
 pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
+    // P1-10: load the per-daemon cookie once; every incoming TUI client must
+    // present it as the first 32 bytes on the wire. If the cookie file isn't
+    // there yet, the caller (daemon::run / verify::run) skipped its issuance
+    // step — fail closed rather than serve an unauthenticated TUI.
+    let cookie = match crate::auth_cookie::read_cookie(run_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(agent = name, error = %e, "api.cookie missing; TUI server aborted");
+            return;
+        }
+    };
+
     let listener = match crate::ipc::bind_loopback() {
         Ok(l) => l,
         Err(e) => {
@@ -30,6 +42,15 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
             Err(_) => continue,
         };
         let _ = stream.set_nodelay(true);
+        // Bound the auth read so a silent peer cannot pin this accept loop.
+        // Framing read/write stays unbounded afterwards — the deadline is
+        // reset once the cookie check passes.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        if let Err(e) = crate::auth_cookie::read_and_verify_tui(&mut stream, &cookie) {
+            tracing::warn!(agent = name, error = %e, "TUI client rejected (auth)");
+            continue;
+        }
+        let _ = stream.set_read_timeout(None);
         tracing::info!(agent = name, "TUI client connected");
 
         // Protocol version handshake: send version byte before any framed data
