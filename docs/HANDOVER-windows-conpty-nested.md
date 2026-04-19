@@ -163,8 +163,55 @@ Binaries tested (all under the same Win11 Insider Dev 26200 build):
 
 Ship the manifest fix (this PR), stop trying to work around it in our code. Users on 26200 should either (a) switch to Windows stable channel or (b) install and use WezTerm as their terminal until Microsoft fixes it. Users on 22H2/23H2/24H2 GA builds are unaffected (CI `windows-latest` ≈ Server 2022 + Win11 22H2 stays green).
 
+### External corroboration (added 2026-04-19)
+
+Confirmed independently via public bug trackers — this is not an agend-specific or portable-pty-specific issue. Multiple unrelated projects hit different ConPTY/node-pty failures on the same 26200 build:
+
+| Project | PTY backend | Symptom on build 26200 |
+|---|---|---|
+| [pinokiocomputer/pinokio#1017](https://github.com/pinokiocomputer/pinokio/issues/1017) | node-pty (ConPTY → winpty fallback) | `conpty.dll` missing from `System32\` entirely on some boxes; winpty fallback fails with `connect ENOENT \\.\pipe\winpty-conout-...` |
+| [openai/codex#13973](https://github.com/openai/codex/issues/13973) | node-pty ConPTY | MSVC runtime assertion `remove_pty_baton(baton->id)` at `conpty.cc:106`; Abort/Retry dialog appears on first PTY spawn |
+| [google-gemini/gemini-cli#12019](https://github.com/google-gemini/gemini-cli/issues/12019) / [#12060](https://github.com/google-gemini/gemini-cli/issues/12060) | node-pty | "Cannot resize a pty that has already exited" — PTY exits prematurely between commands (build 26200.6901) |
+| **this repo** (`pty_smoke_minimal`) | portable-pty 0.9 ConPTY | 20 bytes of banner then indefinite read-block (build 26200.8246) |
+
+Common factor: all on Windows 11 25H2 build 26200.x. No downstream fixes are known — the issues are all open/unresolved. Microsoft's [official 25H2 known-issues page](https://learn.microsoft.com/en-us/windows/release-health/status-windows-11-25h2) (as of 2026-04-17) lists only a Microsoft-account sign-in bug and a WUSA path bug — **no ConPTY/pseudoconsole regression is officially acknowledged yet**.
+
+Rollback path (tested 2026-04-19): user's box had `C:\Windows.old` within the 10-day rollback window → Settings → System → Recovery → **Go back** rolls 25H2 → 24H2 (build 26100) while preserving files and apps. After rollback, `pty_smoke_minimal.exe` should produce the full cmd.exe banner (~100+ bytes) instead of blocking at 20.
+
+## Session 4 correction (2026-04-19) — the *real* root causes were ours
+
+After the user rolled back from 25H2 → 23H2 (build 22631.4602), `agend-terminal app` still showed an empty pane and Ctrl+C still hung the daemon. That forced the diagnosis to continue past the Session-3 "it's Microsoft's bug" verdict, and two separate agend-side bugs surfaced:
+
+### Bug 1: `\x1b[6n` DSR-CPR query silently dropped — pane stays black
+
+Windows ConPTY's `conhost.exe --headless` emits a cursor-position query (`ESC [ 6 n`) to the master at startup and **blocks the child process until it gets a reply**. `alacritty_terminal` (our vterm) detects the query and emits `Event::PtyWrite("\x1b[1;1R")`, but the previous `NoopListener` dropped every event. No reply ever reached the PTY writer → cmd.exe / PowerShell / any shell never got past the pre-banner handshake → the pane stayed empty forever.
+
+Fix: replace `NoopListener` with `PtyWriteListener` (`src/vterm.rs`) that holds an `Arc<Mutex<Box<dyn Write + Send>>>` clone of the agent's PTY writer and forwards every `Event::PtyWrite` back to the pty. macOS/Linux kernel PTY never sends CPR on startup, so the bug was Windows-only.
+
+Diagnostic left in the tree: `AGEND_DEBUG_PTY_READ=1` env var in `pty_read_loop` dumps every read (byte count + first 64 bytes, printable+hex). That's how the 4-byte `\x1b[6n` was isolated — without it the reader just looked silent.
+
+### Bug 2: Daemon inherits Windows "ignore CTRL+C" flag — Ctrl+C doesn't fire handler
+
+`SetConsoleCtrlHandler(NULL, TRUE)` is a **per-process, inheritable** flag that skips the entire handler chain for CTRL_C_EVENT while leaving CTRL_BREAK_EVENT unaffected. Something in the daemon's init (either inherited from the parent shell or set by a dependency) had that flag on, so `ctrlc::set_handler` installed its routine but Windows never called it when CTRL_C arrived. Users saw "no response" from Ctrl+C; `agend-terminal stop` (API-based, not signal-based) still worked — which is why this wasn't caught earlier.
+
+How the bug was isolated: `scripts/test_ctrlc.py` sends CTRL_BREAK_EVENT via `CREATE_NEW_PROCESS_GROUP` + `os.kill(pid, CTRL_BREAK_EVENT)` → clean 1.14s shutdown. `scripts/test_ctrlc_v2.py` sends real CTRL_C_EVENT via `CREATE_NEW_CONSOLE` + `AttachConsole` + `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` → handler never fires, daemon hangs until force-killed. Both signals go through the same `ctrlc` handler routine, so only the flag explains the asymmetry.
+
+Fix: `src/daemon.rs` explicitly calls `SetConsoleCtrlHandler(None, 0)` (Add=FALSE with null handler re-enables Ctrl+C) before `ctrlc::set_handler`. Requires the `Win32_System_Console` feature on `windows-sys`.
+
+Diagnostic left in the tree: `AGEND_CTRLC_SENTINEL=<path>` env var writes a timestamp file the moment the ctrlc handler fires. Lets future diagnostics prove handler delivery without needing to capture a hidden-console stdout stream.
+
+### What this means for the 25H2/26200 story
+
+The Session-3 verdict ("everything that touches ConPTY on 26200 is broken") was overstated. The CPR-never-replied bug was the dominant symptom on 26200 *and* 23H2 — rolling the OS back didn't fix it, fixing vterm's event listener did. There may still be a genuine 26200 regression (the external corroboration list is real), but for this repo specifically the CPR and Ctrl+C fixes are what mattered.
+
+### Diagnostic scripts committed under `scripts/`
+
+- `tui_dump.py` — connect to an agent's TUI socket, print handshake version + every framed read. Use to observe whether the PTY reader is actually getting bytes (as opposed to vterm faking an empty screen in its dump).
+- `tui_send.py` — same protocol in the write direction; useful for injecting raw bytes (e.g., `\x03` ETX) into an agent without going through `inject_to_agent`'s prefix/submit-key wrapping.
+- `test_ctrlc_v2.py` — the AttachConsole/GenerateConsoleCtrlEvent harness that isolated Bug 2.
+
 ## Open questions for next session
 
-1. Is the 26200 regression filed on Microsoft Feedback Hub / `microsoft/terminal` issues? File one if not — link attaches this repro log.
-2. If next Insider build (26300+) fixes it, retest with the same `pty_smoke_minimal.exe` — if 20 bytes becomes 100 bytes, the bug is fixed upstream and no work needed here.
-3. **Not worth doing unless a user asks**: build `conpty.dll` from `microsoft/terminal` source and sideload the matched pair; it's days of work for an Insider-only workaround whose value evaporates when Microsoft ships their fix.
+1. Is there *still* a separate 26200-only regression hiding under the CPR fix? Retest `pty_smoke_minimal.exe` on 26200 with a build that includes the CPR auto-reply in `pty_smoke` (or just run the full daemon now that it's fixed) — if it still shows short reads on 26200 but works on 23H2, file the 26200-specific bug.
+2. `agend-terminal app` default shell is still `cmd.exe`; consider changing Windows default to PowerShell for a less spartan first-run experience.
+3. `AGEND_DEBUG_PTY_READ` and `AGEND_CTRLC_SENTINEL` env vars are kept for future Windows diagnostics. Strip them only if the diagnostic noise bothers a reviewer — they cost nothing when unset.
