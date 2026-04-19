@@ -15,16 +15,17 @@ const DEFAULT_MAX_RETRIES: u32 = 5;
 const BACKOFF_BASE: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const STABILITY_WINDOW: Duration = Duration::from_secs(1800); // 30 min stable → decay
-/// Silence threshold for AwaitingOperator detection. Agent in `Starting` (or
-/// recently-entered `Ready`) with no stdout for this long is likely blocked
-/// on an interactive prompt (codex update menu, claude trust prompt, etc.).
+/// Silence threshold for AwaitingOperator detection. Agent in `Starting`
+/// with no stdout for this long is likely blocked on an interactive startup
+/// prompt (trust dialog, codex update menu before banner, auth confirmation).
+///
+/// Only `Starting` is considered: once the agent transitions to `Ready` we
+/// trust the detection and any further silence is either legitimate idle or
+/// a real hang — the latter is handled by `check_hang` with much higher
+/// thresholds (120s+). Flagging Ready-with-short-silence produced false
+/// positives for agents in the middle of tool execution that simply had a
+/// few seconds of quiet between bursts of output.
 const AWAITING_OP_SILENCE: Duration = Duration::from_secs(3);
-/// Grace window after entering `Ready` during which stdout silence is still
-/// treated as a stuck-on-prompt signal. Some backends (e.g. codex) match their
-/// ready pattern against the startup banner that precedes the update menu,
-/// so the agent reports Ready while actually still waiting on keystrokes.
-/// After this window a silent Ready agent is considered legitimately idle.
-const READY_GRACE_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,30 +146,13 @@ impl HealthTracker {
     /// Check whether agent is stalled on an interactive startup prompt.
     /// Pure predicate — no state mutation.
     ///
-    /// Fires when the agent has been silent past the threshold AND is either:
-    /// - in `Starting` (not yet ready), or
-    /// - in `Ready` within the grace window (some backends match ready_pattern
-    ///   against the startup banner that also contains the update prompt —
-    ///   codex is the canonical case: `ready_pattern: "OpenAI Codex|›"` matches
-    ///   the `› 1. Update now` menu line, so the agent reports Ready while
-    ///   actually blocked on keystrokes).
-    ///
-    /// Long-running idle Ready agents (past the grace window) are exempt: a
-    /// task-less but alive agent is not a pre-ready stall.
-    pub fn check_awaiting_operator(
-        &self,
-        agent_state: AgentState,
-        silent: Duration,
-        time_in_state: Duration,
-    ) -> bool {
-        if silent <= AWAITING_OP_SILENCE {
-            return false;
-        }
-        match agent_state {
-            AgentState::Starting => true,
-            AgentState::Ready => time_in_state < READY_GRACE_WINDOW,
-            _ => false,
-        }
+    /// Fires only when the agent is in `Starting` AND has been silent past
+    /// the threshold. Once the agent reaches `Ready` we trust the backend
+    /// and any further quiet period is handled by `check_hang` with a much
+    /// higher threshold — flagging short Ready silences produced false
+    /// positives for agents in the middle of legitimate tool execution.
+    pub fn check_awaiting_operator(&self, agent_state: AgentState, silent: Duration) -> bool {
+        silent > AWAITING_OP_SILENCE && matches!(agent_state, AgentState::Starting)
     }
 
     /// Check for hang based on agent state and output timeout.
@@ -349,52 +333,21 @@ mod tests {
     #[test]
     fn test_awaiting_operator_starting_silence() {
         let h = HealthTracker::new();
-        // Starting + 2s silence → not yet (time_in_state irrelevant for Starting)
-        assert!(!h.check_awaiting_operator(
-            AgentState::Starting,
-            Duration::from_secs(2),
-            Duration::from_secs(2)
-        ));
+        // Starting + 2s silence → under threshold
+        assert!(!h.check_awaiting_operator(AgentState::Starting, Duration::from_secs(2)));
         // Starting + 4s silence → flagged
-        assert!(h.check_awaiting_operator(
-            AgentState::Starting,
-            Duration::from_secs(4),
-            Duration::from_secs(4)
-        ));
+        assert!(h.check_awaiting_operator(AgentState::Starting, Duration::from_secs(4)));
     }
 
     #[test]
-    fn test_awaiting_operator_ready_within_grace_window() {
-        // codex-style case: ready_pattern matches the startup banner that also
-        // contains the update menu, so state flips to Ready within a few
-        // seconds but the agent is still waiting on keystrokes.
+    fn test_awaiting_operator_non_starting_exempt() {
+        // Only Starting triggers. Ready and all other states are exempt
+        // regardless of silence — Ready silence is handled by `check_hang`
+        // with much higher thresholds so legitimate pauses between tool
+        // bursts don't produce false positives.
         let h = HealthTracker::new();
-        // Ready + 4s silent, entered Ready 5s ago → within grace → flagged
-        assert!(h.check_awaiting_operator(
-            AgentState::Ready,
-            Duration::from_secs(4),
-            Duration::from_secs(5)
-        ));
-        // Ready + 4s silent, entered Ready 60s ago → past grace → exempt
-        assert!(!h.check_awaiting_operator(
-            AgentState::Ready,
-            Duration::from_secs(4),
-            Duration::from_secs(60)
-        ));
-        // Ready + 2s silent (under threshold) → not flagged regardless of grace
-        assert!(!h.check_awaiting_operator(
-            AgentState::Ready,
-            Duration::from_secs(2),
-            Duration::from_secs(5)
-        ));
-    }
-
-    #[test]
-    fn test_awaiting_operator_other_states_exempt() {
-        let h = HealthTracker::new();
-        // No matter how long silent, states other than Starting/Ready never
-        // trigger (Thinking/ToolUse silence is handled by check_hang).
         for s in [
+            AgentState::Ready,
             AgentState::Idle,
             AgentState::Thinking,
             AgentState::ToolUse,
@@ -404,7 +357,7 @@ mod tests {
             AgentState::Crashed,
         ] {
             assert!(
-                !h.check_awaiting_operator(s, Duration::from_secs(60), Duration::from_secs(1)),
+                !h.check_awaiting_operator(s, Duration::from_secs(60)),
                 "state {:?} should not trigger awaiting_operator",
                 s
             );
