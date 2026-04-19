@@ -330,7 +330,27 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // select! wakes immediately instead of waiting up to 10s for the next tick.
     let (shutdown_tx, shutdown_rx) = crossbeam::channel::bounded::<()>(1);
     let shutdown2 = Arc::clone(&shutdown);
+    // Windows: re-enable CTRL+C delivery in case something (inherited
+    // parent state, a dependency's init) has set the per-process "ignore
+    // CTRL+C" flag. Without this, `SetConsoleCtrlHandler` routines are
+    // skipped entirely for CTRL_C_EVENT and the daemon appears unresponsive
+    // to Ctrl+C (while `agend-terminal stop` still works). CTRL_BREAK_EVENT
+    // is unaffected by the flag — that's how the bug was isolated.
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        SetConsoleCtrlHandler(None, 0);
+    }
     match ctrlc::set_handler(move || {
+        // Sentinel: confirms the handler fired (observable even when the
+        // daemon's stdout console is invisible or has already been torn
+        // down). Used for Windows Ctrl+C diagnostics.
+        if let Ok(path) = std::env::var("AGEND_CTRLC_SENTINEL") {
+            let _ = std::fs::write(
+                &path,
+                format!("fired at {:?}\n", std::time::SystemTime::now()),
+            );
+        }
         tracing::info!("shutting down...");
         shutdown2.store(true, std::sync::atomic::Ordering::Relaxed);
         // try_send: if already signaled, the flag is enough.
