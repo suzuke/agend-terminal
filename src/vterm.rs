@@ -7,11 +7,41 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{self, Config};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
+/// Alacritty emits `Event::PtyWrite` for terminal queries like DSR CPR
+/// (`\x1b[6n`), DA, and mode reports. On ConPTY (Windows), `conhost.exe`
+/// fires these during startup and **blocks the child process until a reply
+/// arrives** — without auto-reply the child never prints its prompt. This
+/// listener forwards `PtyWrite` bytes back to the agent's PTY writer; a
+/// `None` writer (tests, layout stubs) behaves like a silent sink.
 #[derive(Clone)]
-struct NoopListener;
-impl EventListener for NoopListener {
-    fn send_event(&self, _event: Event) {}
+pub struct PtyWriteListener {
+    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+}
+
+impl PtyWriteListener {
+    fn noop() -> Self {
+        Self { writer: None }
+    }
+
+    pub fn new(writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
+        Self {
+            writer: Some(writer),
+        }
+    }
+}
+
+impl EventListener for PtyWriteListener {
+    fn send_event(&self, event: Event) {
+        let Event::PtyWrite(text) = event else { return };
+        let Some(writer) = &self.writer else { return };
+        if let Ok(mut w) = writer.lock() {
+            let _ = w.write_all(text.as_bytes());
+            let _ = w.flush();
+        }
+    }
 }
 
 /// Cached once: whether terminal supports true color (avoids env var lookup per cell).
@@ -40,7 +70,7 @@ impl Dimensions for VTermSize {
 }
 
 pub struct VTerm {
-    term: term::Term<NoopListener>,
+    term: term::Term<PtyWriteListener>,
     processor: Processor,
     cols: u16,
     rows: u16,
@@ -48,12 +78,28 @@ pub struct VTerm {
 
 impl VTerm {
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::with_listener(cols, rows, PtyWriteListener::noop())
+    }
+
+    /// Construct a VTerm that auto-replies to terminal status queries by
+    /// writing responses back through `pty_writer`. Required on Windows
+    /// ConPTY where `conhost.exe` waits for a cursor-position reply before
+    /// letting the child print its banner.
+    pub fn with_pty_writer(
+        cols: u16,
+        rows: u16,
+        pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    ) -> Self {
+        Self::with_listener(cols, rows, PtyWriteListener::new(pty_writer))
+    }
+
+    fn with_listener(cols: u16, rows: u16, listener: PtyWriteListener) -> Self {
         let size = VTermSize { cols, rows };
         let config = Config {
             scrolling_history: 10000,
             ..Default::default()
         };
-        let term = term::Term::new(config, &size, NoopListener);
+        let term = term::Term::new(config, &size, listener);
         Self {
             term,
             processor: Processor::new(),

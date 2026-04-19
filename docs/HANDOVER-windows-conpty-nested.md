@@ -84,9 +84,134 @@ WezTerm source: `https://github.com/wez/wezterm/tree/main/pty/src/win`.
   - `[System.Environment]::OSVersion.Version` — report build.
 - **Log**: `agend-terminal start` runs in foreground and prints tracing to stderr — capture by redirecting: `.\agend-terminal.exe start 2>&1 | Tee-Object daemon-log.txt`.
 
+## Session 2 update (2026-04-19) — directions A and B refuted, manifest fix landed, real cause narrowed to daemon glue
+
+### What we ruled out
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| **A. Console inheritance** (nested ConPTY from PowerShell's conhost) | Branch `fix/windows-freeconsole`: `FreeConsole()` after ctrlc registration | Silent hang unchanged, `ctrlc` handler dead after `FreeConsole`. Branch deleted. |
+| **Subsystem** (console vs GUI) | Launched daemon with true `DETACHED_PROCESS` (P/Invoke, 0 console attached, same state as GUI subsystem) | Silent hang unchanged at +91s → `health_state=hung`. |
+| **Missing Windows app manifest** (compat shims on unmanifested apps) | Added `build.rs` + `assets/windows/agend-terminal.manifest` declaring Win10/11 supportedOS + UTF-8 codepage (matches WezTerm's `console.manifest`). Rebuilt + retested with DETACHED_PROCESS. | Silent hang unchanged at +125s. Manifest is still a correctness improvement — it's landed (this PR). |
+| **Sideload version** (v1.14.2281 too old for 26200) | Removed sideload → kernel32 in-box ConPTY / conhost.exe. Retested. | Silent hang unchanged at +125s. |
+| **portable-pty itself broken** | Built `examples/pty_smoke.rs` (minimal, 70 LOC, spawns cmd.exe + reads). Ran from mintty parent. | Got **20 bytes** of cmd.exe banner at +0.04s, then `reader.read` blocked. portable-pty is NOT broken — it can receive some output. |
+| **Launch context matters** | Launched `agend-terminal start` from bash (mintty parent, not PowerShell/DETACHED). | Same 0-byte silent hang. Parent env is not the variable. |
+
+### What we confirmed
+
+**WezTerm still works on this 26200 box today.** Downloaded `WezTerm-windows-20240203-110809-5046fc22.zip`, extracted, launched `wezterm-gui.exe` — cmd.exe child stays alive, OpenConsole.exe host stays alive. The bundled `conpty.dll` + `OpenConsole.exe` inside that zip are **SHA256-identical** to the sideload next to `agend-terminal.exe`:
+
+- `conpty.dll` SHA256 `2F09EAA55C60E11241CA21FFF19336529470D9B76A77BCB45DE78CFABDB50308`
+- `OpenConsole.exe` SHA256 `6B0E73145462116B2ED3D422AC71E25C8554B1A52295D8CF55CF6025775276EE`
+
+Same `portable-pty` 0.9.0 code (verified `pty/src/win/*.rs` byte-identical between WezTerm main and crates.io 0.9.0 — portable-pty is published from WezTerm's mono-repo so they're the same crate), same sideload, yet different outcome. **The bug is in agend-terminal glue**, not Microsoft / Windows / portable-pty / sideload version.
+
+### Partial breakthrough: OpenConsole swap fixes the read path
+
+Replacing `OpenConsole.exe` with Terminal stable 1.24.10921 or preview 1.25.923 (keeping the v1.14 `conpty.dll`) → daemon transitions out of `starting` in **under a second**, `agent_state=restarting` + `health_state=recovering` immediately. Output flows.
+
+But cmd.exe exits within ~110ms of spawn, triggering auto-respawn loop. `conpty.dll` v1.14 + newer OpenConsole.exe is a protocol mismatch (Microsoft stopped shipping a sideloadable `conpty.dll` after ~2021). The matched newer pair is not publicly distributed.
+
+**Not a shippable fix.** Does prove the reader-hang side is OpenConsole-side. But also proves WezTerm's v1.14 OpenConsole IS capable of delivering output on 26200 — since WezTerm itself works with that exact file — so something in our spawn path is poking OpenConsole wrong.
+
+### Direction for next session — bisect `pty_smoke` → `agent::spawn_agent`
+
+`examples/pty_smoke.rs` gets bytes out of cmd.exe on 26200. `src/agent.rs::spawn_agent` doesn't. The structural differences:
+
+1. `spawn_agent` calls `take_writer()` on the master after `spawn_command` returns. `pty_smoke` doesn't.
+2. `spawn_agent` moves `pair.master` into `Arc<Mutex<Box<dyn MasterPty + Send>>>` after cloning reader.
+3. `spawn_agent`'s `CommandBuilder` may inherit/add env vars from the daemon context.
+4. The reader runs in a spawned thread (`pty_read_loop`), not on the thread that called openpty.
+5. The daemon holds the `.daemon.lock` file and other handles when spawn happens.
+6. Other threads (API server, TUI server) are spawned — though AFTER the agent spawn, so they shouldn't race.
+
+**Concrete next step**: extend `pty_smoke` incrementally — add `take_writer()`, move to Arc<Mutex<>>, move read into a spawned thread, inherit env, etc. — one change at a time until it breaks. The change that flips 20 bytes → 0 bytes is the bug.
+
+### Manifest fix landed (this PR `fix/windows-manifest`)
+
+`build.rs` embeds `assets/windows/agend-terminal.manifest` via `embed-resource`. Manifest declares Win10/11 `supportedOS` GUID and UTF-8 `activeCodePage`. It's correct cross-platform hygiene and matches what Windows Terminal / WezTerm do. It is **necessary but not sufficient** for fixing 26200 — keeps it in for when the next session nails the real cause.
+
+### Diagnostic artifacts preserved in repo
+
+- `examples/pty_smoke.rs` — run via `cargo build --release --example pty_smoke` then launch the `.exe` via PowerShell P/Invoke `DETACHED_PROCESS` to reproduce the 26200 environment.
+- Launcher helper referenced in previous session: `%TEMP%\launch-detached.ps1` — standalone P/Invoke wrapper for `CreateProcessW` with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`. Recreate from session log if lost.
+
+## Session 3 update (2026-04-19) — partial results are environment-dependent, not glue-dependent
+
+Attempted to bisect `examples/pty_smoke.rs` variants v1→v8 (each adds one structural piece of `spawn_agent`). Got inconsistent results that inverted the earlier session-2 conclusion: the problem isn't only in daemon glue.
+
+Binaries tested (all under the same Win11 Insider Dev 26200 build):
+
+| Binary | Launch context | Bytes read (cmd.exe banner is ~100 B) |
+|---|---|---|
+| `examples/pty_smoke_minimal.rs` | Bash (mintty parent) | 20 bytes then reader blocks |
+| `examples/pty_smoke_minimal.rs` | PowerShell interactive | 20 bytes then reader blocks |
+| `examples/pty_smoke_minimal.rs` | `DETACHED_PROCESS` | **0 bytes, process exits before it can even write a log file** |
+| `pty_smoke v1_isolated` (inline-coded equivalent of minimal) | Bash | 20 bytes then blocks |
+| `examples/pty_smoke.rs` `AGEND_SMOKE_MODE=v1` (variant-gated but v1 takes exact same code path) | Bash | **0 bytes, hard-timeout** |
+| `examples/pty_smoke.rs` v2–v8 | Bash | 0 bytes for all |
+| `agend-terminal start` (full daemon) | Bash / PowerShell / DETACHED | 0 bytes in every context |
+
+### What this means
+
+1. **26200's ConPTY is broken for every consumer**. Not just our daemon. Even a 50-line minimal `openpty → spawn cmd → read` reliably gets only ~20 bytes of banner then blocks forever. The first write from OpenConsole gets through; subsequent writes don't. WezTerm masks this because its async I/O tolerates slow/stuck reads and its GUI rendering doesn't panic at "only partial banner".
+2. **`DETACHED_PROCESS` launch context makes it strictly worse.** The same minimal binary that gets 20 bytes from Bash/PowerShell gets zero bytes under `DETACHED_PROCESS`. So launch context IS a factor — just not the only one.
+3. **Structurally-equivalent Rust binaries behave differently.** `pty_smoke_minimal.rs` (works, 20 bytes) and `pty_smoke.rs` with `AGEND_SMOKE_MODE=v1` (fails, 0 bytes) are supposed to execute the exact same code at runtime for v1. They don't. Likely explanations: `embed-resource`-pulled compile artifacts, Windows Defender real-time scanning with different code paths, or memory layout dependence in conpty.dll/OpenConsole's initial-handshake timing.
+4. **The daemon is not uniquely broken.** Everything that touches ConPTY on 26200 is broken. That invalidates the session-2 "find the bad line in `agent::spawn_agent`" plan — there isn't a single bad line to find.
+
+### New verdict: it's a Microsoft bug in 26200
+
+Ship the manifest fix (this PR), stop trying to work around it in our code. Users on 26200 should either (a) switch to Windows stable channel or (b) install and use WezTerm as their terminal until Microsoft fixes it. Users on 22H2/23H2/24H2 GA builds are unaffected (CI `windows-latest` ≈ Server 2022 + Win11 22H2 stays green).
+
+### External corroboration (added 2026-04-19)
+
+Confirmed independently via public bug trackers — this is not an agend-specific or portable-pty-specific issue. Multiple unrelated projects hit different ConPTY/node-pty failures on the same 26200 build:
+
+| Project | PTY backend | Symptom on build 26200 |
+|---|---|---|
+| [pinokiocomputer/pinokio#1017](https://github.com/pinokiocomputer/pinokio/issues/1017) | node-pty (ConPTY → winpty fallback) | `conpty.dll` missing from `System32\` entirely on some boxes; winpty fallback fails with `connect ENOENT \\.\pipe\winpty-conout-...` |
+| [openai/codex#13973](https://github.com/openai/codex/issues/13973) | node-pty ConPTY | MSVC runtime assertion `remove_pty_baton(baton->id)` at `conpty.cc:106`; Abort/Retry dialog appears on first PTY spawn |
+| [google-gemini/gemini-cli#12019](https://github.com/google-gemini/gemini-cli/issues/12019) / [#12060](https://github.com/google-gemini/gemini-cli/issues/12060) | node-pty | "Cannot resize a pty that has already exited" — PTY exits prematurely between commands (build 26200.6901) |
+| **this repo** (`pty_smoke_minimal`) | portable-pty 0.9 ConPTY | 20 bytes of banner then indefinite read-block (build 26200.8246) |
+
+Common factor: all on Windows 11 25H2 build 26200.x. No downstream fixes are known — the issues are all open/unresolved. Microsoft's [official 25H2 known-issues page](https://learn.microsoft.com/en-us/windows/release-health/status-windows-11-25h2) (as of 2026-04-17) lists only a Microsoft-account sign-in bug and a WUSA path bug — **no ConPTY/pseudoconsole regression is officially acknowledged yet**.
+
+Rollback path (tested 2026-04-19): user's box had `C:\Windows.old` within the 10-day rollback window → Settings → System → Recovery → **Go back** rolls 25H2 → 24H2 (build 26100) while preserving files and apps. After rollback, `pty_smoke_minimal.exe` should produce the full cmd.exe banner (~100+ bytes) instead of blocking at 20.
+
+## Session 4 correction (2026-04-19) — the *real* root causes were ours
+
+After the user rolled back from 25H2 → 23H2 (build 22631.4602), `agend-terminal app` still showed an empty pane and Ctrl+C still hung the daemon. That forced the diagnosis to continue past the Session-3 "it's Microsoft's bug" verdict, and two separate agend-side bugs surfaced:
+
+### Bug 1: `\x1b[6n` DSR-CPR query silently dropped — pane stays black
+
+Windows ConPTY's `conhost.exe --headless` emits a cursor-position query (`ESC [ 6 n`) to the master at startup and **blocks the child process until it gets a reply**. `alacritty_terminal` (our vterm) detects the query and emits `Event::PtyWrite("\x1b[1;1R")`, but the previous `NoopListener` dropped every event. No reply ever reached the PTY writer → cmd.exe / PowerShell / any shell never got past the pre-banner handshake → the pane stayed empty forever.
+
+Fix: replace `NoopListener` with `PtyWriteListener` (`src/vterm.rs`) that holds an `Arc<Mutex<Box<dyn Write + Send>>>` clone of the agent's PTY writer and forwards every `Event::PtyWrite` back to the pty. macOS/Linux kernel PTY never sends CPR on startup, so the bug was Windows-only.
+
+Diagnostic left in the tree: `AGEND_DEBUG_PTY_READ=1` env var in `pty_read_loop` dumps every read (byte count + first 64 bytes, printable+hex). That's how the 4-byte `\x1b[6n` was isolated — without it the reader just looked silent.
+
+### Bug 2: Daemon inherits Windows "ignore CTRL+C" flag — Ctrl+C doesn't fire handler
+
+`SetConsoleCtrlHandler(NULL, TRUE)` is a **per-process, inheritable** flag that skips the entire handler chain for CTRL_C_EVENT while leaving CTRL_BREAK_EVENT unaffected. Something in the daemon's init (either inherited from the parent shell or set by a dependency) had that flag on, so `ctrlc::set_handler` installed its routine but Windows never called it when CTRL_C arrived. Users saw "no response" from Ctrl+C; `agend-terminal stop` (API-based, not signal-based) still worked — which is why this wasn't caught earlier.
+
+How the bug was isolated: `scripts/test_ctrlc.py` sends CTRL_BREAK_EVENT via `CREATE_NEW_PROCESS_GROUP` + `os.kill(pid, CTRL_BREAK_EVENT)` → clean 1.14s shutdown. `scripts/test_ctrlc_v2.py` sends real CTRL_C_EVENT via `CREATE_NEW_CONSOLE` + `AttachConsole` + `GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)` → handler never fires, daemon hangs until force-killed. Both signals go through the same `ctrlc` handler routine, so only the flag explains the asymmetry.
+
+Fix: `src/daemon.rs` explicitly calls `SetConsoleCtrlHandler(None, 0)` (Add=FALSE with null handler re-enables Ctrl+C) before `ctrlc::set_handler`. Requires the `Win32_System_Console` feature on `windows-sys`.
+
+Diagnostic left in the tree: `AGEND_CTRLC_SENTINEL=<path>` env var writes a timestamp file the moment the ctrlc handler fires. Lets future diagnostics prove handler delivery without needing to capture a hidden-console stdout stream.
+
+### What this means for the 25H2/26200 story
+
+The Session-3 verdict ("everything that touches ConPTY on 26200 is broken") was overstated. The CPR-never-replied bug was the dominant symptom on 26200 *and* 23H2 — rolling the OS back didn't fix it, fixing vterm's event listener did. There may still be a genuine 26200 regression (the external corroboration list is real), but for this repo specifically the CPR and Ctrl+C fixes are what mattered.
+
+### Diagnostic scripts committed under `scripts/`
+
+- `tui_dump.py` — connect to an agent's TUI socket, print handshake version + every framed read. Use to observe whether the PTY reader is actually getting bytes (as opposed to vterm faking an empty screen in its dump).
+- `tui_send.py` — same protocol in the write direction; useful for injecting raw bytes (e.g., `\x03` ETX) into an agent without going through `inject_to_agent`'s prefix/submit-key wrapping.
+- `test_ctrlc_v2.py` — the AttachConsole/GenerateConsoleCtrlEvent harness that isolated Bug 2.
+
 ## Open questions for next session
 
-1. Does `FreeConsole()` before spawn make the child's output flow? (direction A verification)
-2. If yes, does `ctrlc` handler survive `FreeConsole`? If not, how does `SetConsoleCtrlHandler` registered pre-FreeConsole behave?
-3. Is there a Windows version-specific code path in WezTerm's vendored portable-pty that upstream `portable-pty` 0.9 is missing?
-4. Should agend-terminal ship `conpty.dll` + `OpenConsole.exe` in release artifacts even though sideload didn't help 26200? (It may still help future builds with different regressions.)
+1. Is there *still* a separate 26200-only regression hiding under the CPR fix? Retest `pty_smoke_minimal.exe` on 26200 with a build that includes the CPR auto-reply in `pty_smoke` (or just run the full daemon now that it's fixed) — if it still shows short reads on 26200 but works on 23H2, file the 26200-specific bug.
+2. `agend-terminal app` default shell is still `cmd.exe`; consider changing Windows default to PowerShell for a less spartan first-run experience.
+3. `AGEND_DEBUG_PTY_READ` and `AGEND_CTRLC_SENTINEL` env vars are kept for future Windows diagnostics. Strip them only if the diagnostic noise bothers a reviewer — they cost nothing when unset.
