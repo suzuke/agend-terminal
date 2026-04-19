@@ -1,14 +1,24 @@
 //! Agent state detection via PTY output pattern matching.
 //!
-//! Dual buffer: ready_buf (8KB, one-time) + state_buf (2KB, rolling).
+//! Detection runs against the current **vterm screen text** (caller supplies
+//! it via `feed()`), not an accumulated byte buffer. Pattern hits therefore
+//! reflect what the user would currently see on screen, so dismissing an
+//! interactive prompt (e.g. codex update menu) drops the matching text from
+//! the grid and the next `feed()` re-evaluates to the underlying Ready state
+//! without stale-buffer lag.
+//!
 //! Hysteresis: error states instant, active 2s, passive 5s.
+//!
+//! Hash-based dedup in `feed()`: if the screen text is identical to the
+//! previous snapshot, we skip both the silence-timer bump and pattern
+//! detection. This keeps invisible terminal chatter (cursor blinks, etc.)
+//! from resetting timers used by hang/awaiting detection.
 
 use crate::backend::Backend;
 use regex::Regex;
 use serde::Serialize;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
-
-const STATE_BUF_MAX: usize = 2048;
 
 /// Agent runtime state, ordered by priority (highest last).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -279,8 +289,17 @@ pub struct StateTracker {
     pub current: AgentState,
     pub(crate) since: Instant,
     pub last_output: Instant,
-    pub(crate) state_buf: String,
+    /// Hash of the last screen text fed to `feed()`. `None` before the first
+    /// call. Used to skip re-detection when the screen hasn't changed —
+    /// crucial for not resetting `last_output` on cursor-blink noise.
+    last_screen_hash: Option<u64>,
     patterns: Option<StatePatterns>,
+}
+
+fn hash_screen(text: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl StateTracker {
@@ -289,37 +308,33 @@ impl StateTracker {
             current: AgentState::Starting,
             since: Instant::now(),
             last_output: Instant::now(),
-            state_buf: String::with_capacity(STATE_BUF_MAX),
+            last_screen_hash: None,
             patterns: backend.map(StatePatterns::for_backend),
         }
     }
 
-    /// Feed new output data (already ANSI-stripped).
+    /// Feed the current vterm screen text (ANSI already resolved by the
+    /// terminal emulator — caller passes plain text rows).
     ///
-    /// Empty input (pure ANSI control sequences such as cursor-blink toggles)
-    /// is ignored: such bytes are not user-visible output and must not reset
-    /// the silence timer, otherwise agents that idle on a blinking prompt
-    /// (e.g. codex's update menu) never accumulate enough silence to trigger
-    /// the `AwaitingOperator` predicate.
-    pub fn feed(&mut self, stripped_text: &str) {
-        if stripped_text.is_empty() {
+    /// If the screen is identical to the previous snapshot (same hash) we
+    /// skip: no silence-timer bump, no re-detection. This lets invisible
+    /// terminal chatter (cursor blinks, bell, etc.) pass through without
+    /// masking hang/awaiting detection.
+    ///
+    /// When the screen does change, `last_output` is bumped and pattern
+    /// detection runs against the full screen text. Because we always feed
+    /// the current grid (not an accumulation), dismissed prompts drop out of
+    /// detection on the next call — no stale-buffer lag.
+    pub fn feed(&mut self, screen_text: &str) {
+        let hash = hash_screen(screen_text);
+        if self.last_screen_hash == Some(hash) {
             return;
         }
+        self.last_screen_hash = Some(hash);
         self.last_output = Instant::now();
-        self.state_buf.push_str(stripped_text);
 
-        // Truncate to last STATE_BUF_MAX chars
-        if self.state_buf.len() > STATE_BUF_MAX {
-            let mut start = self.state_buf.len() - STATE_BUF_MAX;
-            while !self.state_buf.is_char_boundary(start) {
-                start += 1;
-            }
-            self.state_buf = self.state_buf[start..].to_string();
-        }
-
-        // Detect new state
         if let Some(ref patterns) = self.patterns {
-            if let Some(detected) = patterns.detect(&self.state_buf) {
+            if let Some(detected) = patterns.detect(screen_text) {
                 self.transition(detected);
             }
         }
@@ -334,29 +349,21 @@ impl StateTracker {
     pub fn set_restarting(&mut self) {
         self.current = AgentState::Restarting;
         self.since = Instant::now();
-        self.state_buf.clear();
     }
 
     /// Force state to AwaitingOperator when startup stalls on an unexpected
-    /// interactive prompt (codex update menu, claude trust prompt, etc.).
+    /// interactive prompt. Only fires from `Starting` — Ready-state stalls
+    /// are caught by pattern-based detection (see `InteractivePrompt` once
+    /// added; until then they're missed, which is acceptable for the
+    /// time-based fallback role).
     ///
-    /// Takes effect from `Starting` OR `Ready`. The Ready case covers backends
-    /// whose ready_pattern matches the startup banner that also contains the
-    /// interactive prompt (codex: `ready_pattern: "OpenAI Codex|›"` matches
-    /// the `› 1. Update now` menu). The supervisor's predicate gates Ready
-    /// transitions with a grace window so long-running idle agents aren't
-    /// mis-flagged.
-    ///
-    /// Once the operator replies and the ready pattern matches against
-    /// post-stall output, the usual `transition()` path lifts the state out
-    /// (AwaitingOperator prio < Ready prio → higher always wins).
+    /// Once the operator unblocks the stall and the ready pattern matches
+    /// fresh screen content, `transition()` lifts the state (Ready prio >
+    /// AwaitingOperator prio → higher always wins).
     pub fn set_awaiting_operator(&mut self) {
-        if matches!(self.current, AgentState::Starting | AgentState::Ready) {
+        if matches!(self.current, AgentState::Starting) {
             self.current = AgentState::AwaitingOperator;
             self.since = Instant::now();
-            // Fresh buffer: post-stall output (after the operator types)
-            // must feed pattern detection without stale banner text.
-            self.state_buf.clear();
         }
     }
 
@@ -364,8 +371,6 @@ impl StateTracker {
         if new_state == self.current {
             return;
         }
-
-        let old_state = self.current;
 
         // Error states: instant transition (no hysteresis)
         if new_state.is_error() {
@@ -389,11 +394,6 @@ impl StateTracker {
                 self.current = new_state;
                 self.since = Instant::now();
             }
-        }
-
-        // Clear state_buf on actual transition to avoid stale pattern matches
-        if self.current != old_state {
-            self.state_buf.clear();
         }
     }
 }
@@ -483,13 +483,28 @@ mod tests {
     // ── P1: Edge cases ──────────────────────────────────────────────────
 
     #[test]
-    fn state_buf_clears_on_transition() {
-        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-        // Feed thinking pattern — Thinking > Idle so instant transition
-        t.feed("Thinking");
-        assert_eq!(t.get_state(), AgentState::Thinking);
-        // state_buf should be cleared after transition
-        assert!(t.state_buf.is_empty());
+    fn dismissed_prompt_clears_on_next_feed() {
+        // Screen-based detection: once the prompt text leaves the current
+        // screen, the next feed re-evaluates without lag — the replacement
+        // for the old state_buf-clearing behavior.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+        // Simulate the update-menu screen
+        t.feed("Update available! 0.120.0 -> 0.121.0\n1. Update now\n2. Skip");
+        // Then the banner re-renders after dismissal
+        t.feed("bypass permissions");
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn unchanged_screen_does_not_reset_last_output() {
+        // Hash dedup: feeding the same screen twice must not bump
+        // last_output (used by hang/awaiting-operator predicates).
+        let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+        t.feed("hello world");
+        let first = t.last_output;
+        std::thread::sleep(Duration::from_millis(20));
+        t.feed("hello world");
+        assert_eq!(t.last_output, first, "identical screen must not bump last_output");
     }
 
     #[test]
@@ -547,19 +562,6 @@ mod tests {
         assert_eq!(t.get_state(), AgentState::Starting);
     }
 
-    /// Regression: pure-ANSI bytes (cursor blinks etc.) arrive as empty
-    /// strings after strip_ansi. These must NOT reset `last_output`, or
-    /// agents idling on a blinking prompt never accumulate silence for
-    /// the AwaitingOperator predicate.
-    #[test]
-    fn empty_feed_does_not_reset_silence() {
-        let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
-        t.feed("hello");
-        let first = t.last_output;
-        std::thread::sleep(Duration::from_millis(20));
-        t.feed("");
-        assert_eq!(t.last_output, first, "empty feed must not update last_output");
-    }
 
     #[test]
     fn ready_detection() {
@@ -606,21 +608,10 @@ mod tests {
     }
 
     #[test]
-    fn set_restarting_clears_buf() {
+    fn set_restarting_transitions_state() {
         let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 5);
-        t.state_buf.push_str("some old data");
         t.set_restarting();
         assert_eq!(t.get_state(), AgentState::Restarting);
-        assert!(t.state_buf.is_empty());
-    }
-
-    #[test]
-    fn state_buf_truncates_to_max() {
-        let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
-        // Feed more than STATE_BUF_MAX bytes
-        let big_input = "x".repeat(STATE_BUF_MAX + 500);
-        t.feed(&big_input);
-        assert!(t.state_buf.len() <= STATE_BUF_MAX);
     }
 
     #[test]
@@ -668,22 +659,13 @@ mod tests {
     }
 
     #[test]
-    fn set_awaiting_operator_from_ready() {
-        // Ready must also transition: codex's ready_pattern matches the
-        // startup banner that contains the update menu, so the agent reports
-        // Ready while still blocked on keystrokes. The supervisor's predicate
-        // gates Ready with a grace window to avoid flagging idle agents.
-        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Ready, 5);
-        t.set_awaiting_operator();
-        assert_eq!(t.current, AgentState::AwaitingOperator);
-    }
-
-    #[test]
-    fn set_awaiting_operator_noop_from_other_states() {
-        // Only Starting/Ready should transition; from any other state it's a
-        // no-op so late-firing tick-loop detections can't corrupt a healthy
-        // mid-task agent.
+    fn set_awaiting_operator_noop_from_non_starting() {
+        // Only Starting transitions. All other states (including Ready) are
+        // no-ops so late-firing tick-loop detections can't corrupt a healthy
+        // mid-task agent. Known interactive prompts from Ready are caught
+        // by pattern-based detection, not this time-based fallback.
         for s in [
+            AgentState::Ready,
             AgentState::Idle,
             AgentState::Thinking,
             AgentState::ToolUse,

@@ -567,8 +567,13 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
                 {
                     let mut c = crate::sync::lock_poisoned(core, "agent_core");
                     c.vterm.process(data);
-                    let stripped = strip_ansi(&String::from_utf8_lossy(data));
-                    c.state.feed(&stripped);
+                    // Detection runs against the current vterm screen. The
+                    // grid already has ANSI resolved, so state.feed() gets
+                    // plain user-visible text. Hash-dedup inside feed()
+                    // skips cycles where the screen didn't change.
+                    let rows = c.vterm.rows() as usize;
+                    let screen = c.vterm.tail_lines(rows);
+                    c.state.feed(&screen);
                     c.subscribers.retain(|tx| tx.send(data.to_vec()).is_ok());
                 }
             }
