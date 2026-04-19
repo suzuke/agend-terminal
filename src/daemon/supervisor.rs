@@ -61,11 +61,7 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
             };
             let agent_state = core.state.current;
             let silent = core.state.last_output.elapsed();
-            let time_in_state = core.state.since.elapsed();
-            if core
-                .health
-                .check_awaiting_operator(agent_state, silent, time_in_state)
-            {
+            if core.health.check_awaiting_operator(agent_state, silent) {
                 core.state.set_awaiting_operator();
                 let tail = core.vterm.tail_lines(TAIL_LINES);
                 tracing::info!(
