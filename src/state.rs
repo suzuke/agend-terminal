@@ -689,4 +689,129 @@ mod tests {
         t.feed("bypass permissions");
         assert_eq!(t.current, AgentState::Ready);
     }
+
+    // ── Full pipeline: PTY bytes → VTerm → screen → StateTracker ────────
+    //
+    // Exercises the production path `agent::pty_read_loop` takes: push
+    // raw bytes (with ANSI escapes) through the vterm, pull tail_lines of
+    // the screen, feed to state. Without these, unit tests can drift from
+    // how detection actually behaves once vterm rendering is involved —
+    // wrapped lines, cleared screens, scroll-off, etc.
+
+    use crate::vterm::VTerm;
+
+    /// Drive one full PTY cycle: process bytes, snapshot screen, feed state.
+    fn drive(vterm: &mut VTerm, state: &mut StateTracker, bytes: &[u8]) {
+        vterm.process(bytes);
+        let rows = vterm.rows() as usize;
+        let screen = vterm.tail_lines(rows);
+        state.feed(&screen);
+    }
+
+    #[test]
+    fn pipeline_claude_ready_via_vterm() {
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+        // Bytes include ANSI colors — vterm must resolve them so screen
+        // text is plain and pattern can match.
+        drive(
+            &mut vt,
+            &mut st,
+            b"\x1b[1;32mClaude Code\x1b[0m ready (bypass permissions mode)\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn pipeline_codex_ready_via_vterm() {
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        drive(&mut vt, &mut st, b"\x1b[1mOpenAI Codex\x1b[0m v0.120.0\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn pipeline_dismiss_drops_stale_pattern() {
+        // Regression for the bug this whole refactor exists to fix: an
+        // interactive prompt shows up, pattern matches; operator dismisses;
+        // screen re-renders without the prompt text; state must re-evaluate
+        // and fall back — NOT stay wedged on the stale buffered text.
+        //
+        // Uses codex-style flow: usage-limit banner (high priority) appears,
+        // then a clear-screen + ready banner re-renders.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+
+        // Step 1: screen shows usage limit
+        drive(
+            &mut vt,
+            &mut st,
+            b"You've hit your usage limit. Try again at 10:00 AM.\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::UsageLimit);
+
+        // Step 2: clear screen + fresh banner (simulates user re-auth / reset)
+        // \x1b[2J clears screen, \x1b[H moves cursor home.
+        // Advance `since` so the lower-priority Ready transition clears the
+        // active-hold gate (UsageLimit is an error state; leaving requires
+        // active hold 2s).
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
+        assert_eq!(
+            st.get_state(),
+            AgentState::Ready,
+            "after screen clear + ready banner, stale UsageLimit must release"
+        );
+    }
+
+    #[test]
+    fn pipeline_screen_unchanged_preserves_silence_timer() {
+        // Cursor-blink-like bytes (show/hide cursor) must not bump
+        // last_output since they leave the rendered grid unchanged.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        drive(&mut vt, &mut st, b"OpenAI Codex v0.120.0\r\n");
+        let before = st.last_output;
+        std::thread::sleep(Duration::from_millis(20));
+        // Cursor hide/show — visible grid unchanged.
+        drive(&mut vt, &mut st, b"\x1b[?25l\x1b[?25h");
+        assert_eq!(
+            st.last_output, before,
+            "cursor-visibility toggles must not reset silence timer"
+        );
+    }
+
+    #[test]
+    fn pipeline_usage_limit_instant_from_idle() {
+        // Claude flow: agent sitting at idle prompt, then rate-limit burst
+        // arrives. Error state must win immediately (no hysteresis).
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+        drive(&mut vt, &mut st, b"bypass permissions\r\n> ready\r\n\xe2\x9d\xaf");
+        assert!(matches!(
+            st.get_state(),
+            AgentState::Ready | AgentState::Idle
+        ));
+        drive(&mut vt, &mut st, b"\r\n\x1b[31m429 rate limit exceeded\x1b[0m\r\n");
+        assert_eq!(st.get_state(), AgentState::RateLimit);
+    }
+
+    #[test]
+    fn pipeline_opencode_ready_prompt_resolves_to_idle() {
+        // OpenCode's input prompt "Ask anything" matches BOTH the Idle
+        // pattern (listed first) and the Ready pattern, so first-match
+        // returns Idle. This reflects the backend's pattern table as
+        // currently configured — noted here so future tweaks don't
+        // accidentally flip to Ready without intent. Semantically OK:
+        // Idle is "waiting for input at an alive prompt", and that's
+        // what the user sees when opencode is ready.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::OpenCode));
+        drive(
+            &mut vt,
+            &mut st,
+            b"Ask anything   \xe2\x8c\x85 tab agents\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::Idle);
+    }
 }
