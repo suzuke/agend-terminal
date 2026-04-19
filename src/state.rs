@@ -295,7 +295,16 @@ impl StateTracker {
     }
 
     /// Feed new output data (already ANSI-stripped).
+    ///
+    /// Empty input (pure ANSI control sequences such as cursor-blink toggles)
+    /// is ignored: such bytes are not user-visible output and must not reset
+    /// the silence timer, otherwise agents that idle on a blinking prompt
+    /// (e.g. codex's update menu) never accumulate enough silence to trigger
+    /// the `AwaitingOperator` predicate.
     pub fn feed(&mut self, stripped_text: &str) {
+        if stripped_text.is_empty() {
+            return;
+        }
         self.last_output = Instant::now();
         self.state_buf.push_str(stripped_text);
 
@@ -536,6 +545,20 @@ mod tests {
         let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
         t.feed("");
         assert_eq!(t.get_state(), AgentState::Starting);
+    }
+
+    /// Regression: pure-ANSI bytes (cursor blinks etc.) arrive as empty
+    /// strings after strip_ansi. These must NOT reset `last_output`, or
+    /// agents idling on a blinking prompt never accumulate silence for
+    /// the AwaitingOperator predicate.
+    #[test]
+    fn empty_feed_does_not_reset_silence() {
+        let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
+        t.feed("hello");
+        let first = t.last_output;
+        std::thread::sleep(Duration::from_millis(20));
+        t.feed("");
+        assert_eq!(t.last_output, first, "empty feed must not update last_output");
     }
 
     #[test]
