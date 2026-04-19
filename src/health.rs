@@ -15,6 +15,10 @@ const DEFAULT_MAX_RETRIES: u32 = 5;
 const BACKOFF_BASE: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const STABILITY_WINDOW: Duration = Duration::from_secs(1800); // 30 min stable → decay
+/// Silence threshold for AwaitingOperator detection. Agent in `Starting`
+/// with no stdout for this long is likely blocked on an interactive prompt
+/// (codex update menu, claude trust prompt, etc.).
+const AWAITING_OP_SILENCE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -130,6 +134,15 @@ impl HealthTracker {
             Some(last) => last.elapsed() >= NOTIFY_COOLDOWN,
             None => true,
         }
+    }
+
+    /// Check whether agent is stalled on an interactive startup prompt.
+    /// Pure predicate — no state mutation. Returns true iff agent is still
+    /// in `Starting` AND has been silent past the threshold. Other states
+    /// return false regardless of silence (post-Ready waits are covered by
+    /// PermissionPrompt / check_hang).
+    pub fn check_awaiting_operator(&self, agent_state: AgentState, silent: Duration) -> bool {
+        matches!(agent_state, AgentState::Starting) && silent > AWAITING_OP_SILENCE
     }
 
     /// Check for hang based on agent state and output timeout.
@@ -305,6 +318,38 @@ mod tests {
         let mut h = HealthTracker::new();
         assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(100))); // 100s < 600s
         assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700))); // 700s > 600s
+    }
+
+    #[test]
+    fn test_awaiting_operator_starting_silence() {
+        let h = HealthTracker::new();
+        // Starting + 2s silence → not yet
+        assert!(!h.check_awaiting_operator(AgentState::Starting, Duration::from_secs(2)));
+        // Starting + 4s silence → flagged
+        assert!(h.check_awaiting_operator(AgentState::Starting, Duration::from_secs(4)));
+    }
+
+    #[test]
+    fn test_awaiting_operator_non_starting_states_exempt() {
+        let h = HealthTracker::new();
+        // No matter how long silent, non-Starting states never trigger
+        // (Ready waits are normal; Thinking silence is handled by check_hang)
+        for s in [
+            AgentState::Ready,
+            AgentState::Idle,
+            AgentState::Thinking,
+            AgentState::ToolUse,
+            AgentState::PermissionPrompt,
+            AgentState::Hang,
+            AgentState::AwaitingOperator,
+            AgentState::Crashed,
+        ] {
+            assert!(
+                !h.check_awaiting_operator(s, Duration::from_secs(60)),
+                "state {:?} should not trigger awaiting_operator",
+                s
+            );
+        }
     }
 
     #[test]

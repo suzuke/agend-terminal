@@ -25,6 +25,7 @@ pub enum TelegramStatus {
 fn state_color(state: AgentState) -> Color {
     match state {
         AgentState::Starting => Color::White,
+        AgentState::AwaitingOperator => Color::Indexed(214), // orange — needs human attention
         AgentState::Ready => Color::Green,
         AgentState::Idle => Color::DarkGray,
         AgentState::Thinking => Color::Yellow,
@@ -106,7 +107,10 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
 
         let blink = matches!(
             state,
-            AgentState::PermissionPrompt | AgentState::Hang | AgentState::Restarting
+            AgentState::PermissionPrompt
+                | AgentState::Hang
+                | AgentState::Restarting
+                | AgentState::AwaitingOperator
         );
         let dot = if blink {
             Span::styled(

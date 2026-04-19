@@ -17,6 +17,10 @@ const STATE_BUF_MAX: usize = 2048;
 pub enum AgentState {
     Starting,
     Hang,
+    /// Startup stalled on unexpected interactive prompt (e.g. codex update menu).
+    /// Entered when Starting + stdout silent > threshold. Operator reply is
+    /// routed as raw PTY keystrokes (not inbox-wrapped) via INJECT_RAW.
+    AwaitingOperator,
     Ready,
     Idle,
     ToolUse,
@@ -37,18 +41,19 @@ impl AgentState {
         match self {
             Self::Starting => 0,
             Self::Hang => 1,
-            Self::Ready => 2,
-            Self::Idle => 3,
-            Self::ToolUse => 4,
-            Self::Thinking => 5,
-            Self::PermissionPrompt => 6,
-            Self::ContextFull => 7,
-            Self::RateLimit => 8,
-            Self::UsageLimit => 9,
-            Self::AuthError => 10,
-            Self::ApiError => 11,
-            Self::Crashed => 12,
-            Self::Restarting => 13,
+            Self::AwaitingOperator => 2,
+            Self::Ready => 3,
+            Self::Idle => 4,
+            Self::ToolUse => 5,
+            Self::Thinking => 6,
+            Self::PermissionPrompt => 7,
+            Self::ContextFull => 8,
+            Self::RateLimit => 9,
+            Self::UsageLimit => 10,
+            Self::AuthError => 11,
+            Self::ApiError => 12,
+            Self::Crashed => 13,
+            Self::Restarting => 14,
         }
     }
 
@@ -66,6 +71,7 @@ impl AgentState {
         match self {
             Self::Starting => "starting",
             Self::Hang => "hang",
+            Self::AwaitingOperator => "awaiting_operator",
             Self::Ready => "ready",
             Self::Idle => "idle",
             Self::ToolUse => "tool_use",
@@ -320,6 +326,21 @@ impl StateTracker {
         self.current = AgentState::Restarting;
         self.since = Instant::now();
         self.state_buf.clear();
+    }
+
+    /// Force state to AwaitingOperator when startup stalls on an unexpected
+    /// interactive prompt (codex update menu, claude trust prompt, etc.).
+    /// Only takes effect from `Starting`; once the operator replies and the
+    /// ready pattern matches, the usual `transition()` path lifts the
+    /// state out (AwaitingOperator prio < Ready prio → higher always wins).
+    pub fn set_awaiting_operator(&mut self) {
+        if self.current == AgentState::Starting {
+            self.current = AgentState::AwaitingOperator;
+            self.since = Instant::now();
+            // Fresh buffer: post-stall output (after the operator types)
+            // must feed pattern detection without stale banner text.
+            self.state_buf.clear();
+        }
     }
 
     fn transition(&mut self, new_state: AgentState) {
@@ -583,5 +604,60 @@ mod tests {
         assert!(!AgentState::Thinking.is_error());
         assert!(!AgentState::Idle.is_error());
         assert!(!AgentState::Starting.is_error());
+    }
+
+    #[test]
+    fn awaiting_operator_not_error() {
+        // AwaitingOperator means "needs human keystrokes", not a failure mode.
+        assert!(!AgentState::AwaitingOperator.is_error());
+        assert!(!AgentState::AwaitingOperator.is_unavailable());
+    }
+
+    #[test]
+    fn awaiting_operator_priority_between_hang_and_ready() {
+        // Hang < AwaitingOperator < Ready so it preempts Starting/Hang in
+        // tab-bar highest-priority display but doesn't outrank real activity.
+        assert!(AgentState::Hang.priority() < AgentState::AwaitingOperator.priority());
+        assert!(AgentState::AwaitingOperator.priority() < AgentState::Ready.priority());
+    }
+
+    #[test]
+    fn awaiting_operator_display_name() {
+        assert_eq!(AgentState::AwaitingOperator.display_name(), "awaiting_operator");
+    }
+
+    #[test]
+    fn set_awaiting_operator_from_starting() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 5);
+        t.set_awaiting_operator();
+        assert_eq!(t.current, AgentState::AwaitingOperator);
+    }
+
+    #[test]
+    fn set_awaiting_operator_noop_from_other_states() {
+        // Only Starting should transition; from any other state it's a no-op
+        // so late-firing tick-loop detections can't corrupt a healthy agent.
+        for s in [
+            AgentState::Ready,
+            AgentState::Idle,
+            AgentState::Thinking,
+            AgentState::AwaitingOperator,
+            AgentState::Crashed,
+        ] {
+            let mut t = tracker_at(&Backend::ClaudeCode, s, 10);
+            t.set_awaiting_operator();
+            assert_eq!(t.current, s, "state {:?} should be unchanged", s);
+        }
+    }
+
+    #[test]
+    fn ready_pattern_lifts_awaiting_operator() {
+        // Once operator unblocks the stall and the ready banner fires,
+        // transition() takes the usual higher-priority-wins path.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 5);
+        t.set_awaiting_operator();
+        assert_eq!(t.current, AgentState::AwaitingOperator);
+        t.feed("bypass permissions");
+        assert_eq!(t.current, AgentState::Ready);
     }
 }
