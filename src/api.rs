@@ -16,7 +16,8 @@ use std::sync::{Arc, Mutex};
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
 /// Validate a caller-supplied `working_directory` against the AGEND_HOME and
-/// (optionally) `AGEND_ALLOWED_WORK_ROOTS` (colon-separated list).
+/// (optionally) `AGEND_ALLOWED_WORK_ROOTS` — a platform-native path list
+/// (`:`-separated on Unix, `;`-separated on Windows, same rules as `PATH`).
 ///
 /// Rules:
 /// - Path must not contain `..` components (blocks relative escape regardless
@@ -54,9 +55,11 @@ pub fn validate_working_directory(
 
     let mut roots: Vec<PathBuf> = Vec::new();
     roots.push(std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
-    if let Ok(extra) = std::env::var("AGEND_ALLOWED_WORK_ROOTS") {
-        for p in extra.split(':').filter(|s| !s.is_empty()) {
-            let pb = PathBuf::from(p);
+    if let Some(extra) = std::env::var_os("AGEND_ALLOWED_WORK_ROOTS") {
+        // `split_paths` uses the OS-native separator — `:` on Unix, `;` on
+        // Windows. Raw `split(':')` broke Windows because `C:\...` paths
+        // already contain a colon after the drive letter.
+        for pb in std::env::split_paths(&extra).filter(|p| !p.as_os_str().is_empty()) {
             roots.push(std::fs::canonicalize(&pb).unwrap_or(pb));
         }
     }
