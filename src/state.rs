@@ -504,7 +504,10 @@ mod tests {
         let first = t.last_output;
         std::thread::sleep(Duration::from_millis(20));
         t.feed("hello world");
-        assert_eq!(t.last_output, first, "identical screen must not bump last_output");
+        assert_eq!(
+            t.last_output, first,
+            "identical screen must not bump last_output"
+        );
     }
 
     #[test]
@@ -561,7 +564,6 @@ mod tests {
         t.feed("");
         assert_eq!(t.get_state(), AgentState::Starting);
     }
-
 
     #[test]
     fn ready_detection() {
@@ -787,12 +789,20 @@ mod tests {
         // arrives. Error state must win immediately (no hysteresis).
         let mut vt = VTerm::new(80, 24);
         let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
-        drive(&mut vt, &mut st, b"bypass permissions\r\n> ready\r\n\xe2\x9d\xaf");
+        drive(
+            &mut vt,
+            &mut st,
+            b"bypass permissions\r\n> ready\r\n\xe2\x9d\xaf",
+        );
         assert!(matches!(
             st.get_state(),
             AgentState::Ready | AgentState::Idle
         ));
-        drive(&mut vt, &mut st, b"\r\n\x1b[31m429 rate limit exceeded\x1b[0m\r\n");
+        drive(
+            &mut vt,
+            &mut st,
+            b"\r\n\x1b[31m429 rate limit exceeded\x1b[0m\r\n",
+        );
         assert_eq!(st.get_state(), AgentState::RateLimit);
     }
 
@@ -813,5 +823,91 @@ mod tests {
             b"Ask anything   \xe2\x8c\x85 tab agents\r\n",
         );
         assert_eq!(st.get_state(), AgentState::Idle);
+    }
+
+    // ── Replay harness (empirical A/B test vs pre-Phase-1a) ─────────────
+    // Driven by env vars so it works without cargo arg plumbing:
+    //   REPLAY_FILE=/tmp/session.raw REPLAY_BACKEND=gemini \
+    //     cargo test --release -- --ignored --nocapture replay_session
+    #[test]
+    #[ignore]
+    #[allow(clippy::unwrap_used)]
+    fn replay_session() {
+        let path = std::env::var("REPLAY_FILE").expect("REPLAY_FILE env var required");
+        let backend_name = std::env::var("REPLAY_BACKEND").unwrap_or_else(|_| "gemini".to_string());
+        let chunk_size: usize = std::env::var("REPLAY_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let backend = match backend_name.as_str() {
+            "gemini" => Backend::Gemini,
+            "codex" => Backend::Codex,
+            "claude" | "claude-code" => Backend::ClaudeCode,
+            "kiro" | "kiro-cli" => Backend::KiroCli,
+            "opencode" => Backend::OpenCode,
+            other => panic!("unknown backend: {other}"),
+        };
+
+        let bytes = std::fs::read(&path).unwrap();
+        let mut vt = VTerm::new(120, 40);
+        let mut st = StateTracker::new(Some(&backend));
+        let mut transitions: Vec<(usize, AgentState)> = vec![(0, st.current)];
+
+        let mut total = 0usize;
+        for chunk in bytes.chunks(chunk_size) {
+            total += chunk.len();
+            vt.process(chunk);
+            let rows = vt.rows() as usize;
+            let screen = vt.tail_lines(rows);
+            st.feed(&screen);
+            let last = transitions.last().map(|x| x.1);
+            if last != Some(st.current) {
+                transitions.push((total, st.current));
+            }
+        }
+
+        eprintln!(
+            "[POST-Phase-1a] file={} backend={} bytes={} chunk={}",
+            path,
+            backend_name,
+            bytes.len(),
+            chunk_size
+        );
+        eprintln!("Transitions (byte_offset → state):");
+        for (off, s) in &transitions {
+            eprintln!("  {:>8} → {:?}", off, s);
+        }
+        eprintln!("Final state: {:?}", st.current);
+
+        // Probe: what does pattern.detect return on the final screen?
+        // This bypasses hysteresis — tells us the "if time had passed, would
+        // we transition?" answer, which is what matters in production.
+        let patterns = StatePatterns::for_backend(&backend);
+        let final_screen = vt.tail_lines(vt.rows() as usize);
+        eprintln!(
+            "Final detect() on screen: {:?}",
+            patterns.detect(&final_screen)
+        );
+
+        // Simulated production pacing: backdate `since` by 10s so any
+        // pending downward transition can fire, then re-feed.
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        // Force re-detection by bumping the screen hash (clear it).
+        // We can't easily clear the private field here; just feed a tiny
+        // visible diff and then the real screen to force two detects.
+        vt.process(b"\n");
+        st.feed(&vt.tail_lines(vt.rows() as usize));
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        st.feed(&vt.tail_lines(vt.rows() as usize));
+        eprintln!("After simulated +10s pacing: {:?}", st.current);
+
+        eprintln!("--- final tail_lines(40) ---");
+        let screen = vt.tail_lines(40);
+        for (i, line) in screen.lines().enumerate() {
+            let t = line.trim_end();
+            if !t.is_empty() {
+                eprintln!("  {:>2}| {}", i + 1, t);
+            }
+        }
     }
 }
