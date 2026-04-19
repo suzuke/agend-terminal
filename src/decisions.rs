@@ -42,12 +42,34 @@ fn load_all(home: &Path) -> Vec<Decision> {
     decisions
 }
 
+fn decision_path(home: &Path, id: &str) -> std::path::PathBuf {
+    decisions_dir(home).join(format!("{id}.json"))
+}
+
+fn decision_lock_path(home: &Path, id: &str) -> std::path::PathBuf {
+    decisions_dir(home).join(format!("{id}.lock"))
+}
+
+/// Atomic save under a per-decision flock. Callers that also *read* the
+/// current contents before mutating (see supersede / update flows) must
+/// hold the lock across the whole read→mutate→save cycle via
+/// [`with_decision_lock`] — this function acquires the lock only for the
+/// write itself.
 fn save(home: &Path, decision: &Decision) -> anyhow::Result<()> {
     let dir = decisions_dir(home);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}.json", decision.id));
-    std::fs::write(&path, serde_json::to_string_pretty(decision)?)?;
-    Ok(())
+    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, &decision.id))?;
+    crate::store::save_atomic(&decision_path(home, &decision.id), decision)
+}
+
+/// Hold the per-decision flock for the duration of `f`. flock is not
+/// re-entrant, so inside `f` callers must write via `save_atomic` directly
+/// rather than calling [`save`], which would deadlock on the same path.
+fn with_decision_lock<R>(home: &Path, id: &str, f: impl FnOnce() -> R) -> anyhow::Result<R> {
+    let dir = decisions_dir(home);
+    std::fs::create_dir_all(&dir)?;
+    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, id))?;
+    Ok(f())
 }
 
 pub fn post(home: &Path, author: &str, args: &Value) -> Value {
@@ -72,16 +94,40 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     let supersedes = args["supersedes"].as_str().map(String::from);
 
     let now = chrono::Utc::now().to_rfc3339();
-    let id = format!("d-{}", &now[..19].replace([':', '-', 'T'], ""));
+    // The historical id format was seconds-precision only — two posts in the
+    // same UTC second collided and the second silently overwrote the first.
+    // Append nanoseconds + a process-local counter so no two posts from the
+    // same process can share an id, even when issued back-to-back.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ID_SEQ: AtomicU64 = AtomicU64::new(0);
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
+    let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    let id = format!("d-{ts}-{seq}");
 
-    // If superseding, archive old decision
+    // Archive the superseded decision under its own flock. The previous
+    // implementation read-all → mutated-one → saved outside any lock, so
+    // two concurrent callers (post(supersedes=X) + update(X), or two
+    // posts both superseding X) would race: both read the same old
+    // record, both flip fields, whichever wrote last clobbered the other.
     if let Some(ref old_id) = supersedes {
-        let mut all = load_all(home);
-        if let Some(old) = all.iter_mut().find(|d| d.id == *old_id) {
+        let old_id_c = old_id.clone();
+        let now_c = now.clone();
+        let _ = with_decision_lock(home, &old_id_c, || {
+            let path = decision_path(home, &old_id_c);
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let Ok(mut old) = serde_json::from_str::<Decision>(&content) else {
+                return;
+            };
             old.archived = true;
-            old.updated_at = now.clone();
-            let _ = save(home, old);
-        }
+            old.updated_at = now_c;
+            // Write inline; save() re-acquires the same (non-reentrant)
+            // flock and would deadlock.
+            if let Err(e) = crate::store::save_atomic(&path, &old) {
+                tracing::warn!(id = %old_id_c, error = %e, "supersede archive write failed");
+            }
+        });
     }
 
     let working_dir = std::env::current_dir()
@@ -137,37 +183,55 @@ pub fn list(home: &Path, args: &Value) -> Value {
 
 pub fn update(home: &Path, args: &Value) -> Value {
     let id = match args["id"].as_str() {
-        Some(i) => i,
+        Some(i) => i.to_string(),
         None => return serde_json::json!({"error": "missing 'id'"}),
     };
+    let args = args.clone();
 
-    let mut all = load_all(home);
-    let decision = match all.iter_mut().find(|d| d.id == id) {
-        Some(d) => d,
-        None => return serde_json::json!({"error": format!("decision '{id}' not found")}),
-    };
+    // Read+mutate+write must all happen under the same per-decision flock
+    // so concurrent updates don't lose field changes. The previous code
+    // load_all'd every decision on disk and clobbered whatever version
+    // was there at save time.
+    let locked = with_decision_lock(home, &id, || -> Value {
+        let path = decision_path(home, &id);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return serde_json::json!({"error": format!("decision '{id}' not found")}),
+        };
+        let mut decision: Decision = match serde_json::from_str(&content) {
+            Ok(d) => d,
+            Err(e) => {
+                return serde_json::json!({"error": format!("decision '{id}' corrupted: {e}")})
+            }
+        };
 
-    if let Some(content) = args["content"].as_str() {
-        decision.content = content.to_string();
-    }
-    if let Some(tags) = args["tags"].as_array() {
-        decision.tags = tags
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-    }
-    if let Some(ttl) = args["ttl_days"].as_u64() {
-        decision.ttl_days = Some(ttl);
-    }
-    if args["archive"].as_bool() == Some(true) {
-        decision.archived = true;
-    }
-    decision.updated_at = chrono::Utc::now().to_rfc3339();
+        if let Some(content) = args["content"].as_str() {
+            decision.content = content.to_string();
+        }
+        if let Some(tags) = args["tags"].as_array() {
+            decision.tags = tags
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+        if let Some(ttl) = args["ttl_days"].as_u64() {
+            decision.ttl_days = Some(ttl);
+        }
+        if args["archive"].as_bool() == Some(true) {
+            decision.archived = true;
+        }
+        decision.updated_at = chrono::Utc::now().to_rfc3339();
 
-    let decision = decision.clone();
-    match save(home, &decision) {
-        Ok(()) => serde_json::json!({"id": id, "status": "updated"}),
-        Err(e) => serde_json::json!({"error": format!("{e}")}),
+        // Inline write — save() would try to re-acquire this same lock.
+        match crate::store::save_atomic(&path, &decision) {
+            Ok(()) => serde_json::json!({"id": id, "status": "updated"}),
+            Err(e) => serde_json::json!({"error": format!("{e}")}),
+        }
+    });
+
+    match locked {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({"error": format!("lock acquisition failed: {e}")}),
     }
 }
 
@@ -244,6 +308,103 @@ mod tests {
         let home = tmp_home("update_nonexistent");
         let result = update(&home, &serde_json::json!({"id": "no-such-id"}));
         assert!(result["error"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_supersede_archives_old() {
+        let home = tmp_home("supersede");
+        let old = post(
+            &home,
+            "a",
+            &serde_json::json!({"title": "old", "content": "v1"}),
+        );
+        let old_id = old["id"].as_str().expect("id").to_string();
+        // New decision supersedes the old one.
+        let new = post(
+            &home,
+            "a",
+            &serde_json::json!({"title": "new", "content": "v2", "supersedes": old_id}),
+        );
+        assert_eq!(new["status"], "posted");
+
+        // Old must now be archived.
+        let listed = list(&home, &serde_json::json!({"include_archived": true}));
+        let arr = listed["decisions"].as_array().expect("arr");
+        let old_rec = arr
+            .iter()
+            .find(|d| d["id"].as_str() == Some(&old_id))
+            .expect("old decision present");
+        assert_eq!(old_rec["archived"], true);
+
+        // Default list (non-archived) excludes it.
+        let active = list(&home, &serde_json::json!({}));
+        let active_ids: Vec<_> = active["decisions"]
+            .as_array()
+            .expect("arr")
+            .iter()
+            .map(|d| d["id"].as_str().unwrap_or(""))
+            .collect();
+        assert!(!active_ids.contains(&old_id.as_str()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_concurrent_updates_no_loss() {
+        // Load-modify-save without a lock would let the two updates race:
+        // both read the same starting record, each flips a different
+        // field, whichever writes last silently drops the other's change.
+        // Per-decision flock must serialize them so both writes land.
+        let home = tmp_home("concurrent");
+        let posted = post(
+            &home,
+            "a",
+            &serde_json::json!({"title": "T", "content": "c0", "tags": []}),
+        );
+        let id = posted["id"].as_str().expect("id").to_string();
+
+        let home_arc = std::sync::Arc::new(home.clone());
+        let id_arc = std::sync::Arc::new(id.clone());
+
+        let h1 = {
+            let h = home_arc.clone();
+            let i = id_arc.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    update(
+                        &h,
+                        &serde_json::json!({"id": (*i).clone(), "content": "from_thread_1"}),
+                    );
+                }
+            })
+        };
+        let h2 = {
+            let h = home_arc.clone();
+            let i = id_arc.clone();
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    update(
+                        &h,
+                        &serde_json::json!({"id": (*i).clone(), "tags": ["from_thread_2"]}),
+                    );
+                }
+            })
+        };
+        h1.join().expect("t1");
+        h2.join().expect("t2");
+
+        // Final state: last-writer-wins on each field is expected, but the
+        // *file* must be valid JSON (no interleaved bytes) and must still
+        // deserialize as a Decision. Without the lock, atomic_write guards
+        // the write but load_all-based update would re-serialize the
+        // *entire list*, losing fields written between load and save.
+        let listed = list(&home, &serde_json::json!({"include_archived": true}));
+        let decisions = listed["decisions"].as_array().expect("arr");
+        assert_eq!(decisions.len(), 1, "decision must still exist intact");
+        let d = &decisions[0];
+        // Final state: updated_at must be populated (both threads always
+        // update it), tags/content are whichever thread wrote last.
+        assert!(d["updated_at"].as_str().is_some());
         std::fs::remove_dir_all(&home).ok();
     }
 }

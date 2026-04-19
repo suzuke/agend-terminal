@@ -81,6 +81,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let (tui_event_tx, tui_event_rx) = crossbeam::channel::bounded::<TuiEvent>(256);
     let _api_guard = api_server::start_api_server(&home, &registry, tui_event_tx);
 
+    // Per-agent AwaitingOperator supervisor: watches for stdout silence during
+    // Starting (or recently-entered Ready — some backends like codex match
+    // ready_pattern against the startup banner that precedes the update menu)
+    // and pushes a vterm tail to the agent's Telegram topic. Same thread runs
+    // in daemon mode; lifting it out of the daemon tick lets app mode get the
+    // behavior without pulling in daemon's crash-respawn machinery.
+    crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
+
     let mut layout = Layout::new();
     let mut key_handler = KeyHandler::new();
     let mut overlay = Overlay::None;
@@ -539,7 +547,7 @@ fn scroll_focused(layout: &mut Layout, delta: i32) {
 fn kill_agent(registry: &AgentRegistry, name: &str) {
     let mut reg = agent::lock_registry(registry);
     if let Some(handle) = reg.get(name) {
-        let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = crate::sync::lock_poisoned(&handle.child, "app_child");
         let _ = child.kill();
     }
     reg.remove(name);

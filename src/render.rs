@@ -25,6 +25,7 @@ pub enum TelegramStatus {
 fn state_color(state: AgentState) -> Color {
     match state {
         AgentState::Starting => Color::White,
+        AgentState::AwaitingOperator => Color::Indexed(214), // orange — needs human attention
         AgentState::Ready => Color::Green,
         AgentState::Idle => Color::DarkGray,
         AgentState::Thinking => Color::Yellow,
@@ -106,7 +107,10 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
 
         let blink = matches!(
             state,
-            AgentState::PermissionPrompt | AgentState::Hang | AgentState::Restarting
+            AgentState::PermissionPrompt
+                | AgentState::Hang
+                | AgentState::Restarting
+                | AgentState::AwaitingOperator
         );
         let dot = if blink {
             Span::styled(
@@ -653,18 +657,27 @@ fn render_pane_titles(frame: &mut Frame, infos: &[PaneBorderInfo]) {
             continue;
         }
         let y = area.y;
-        // Reserve the right-most cell for the top-right corner glyph.
-        let last_usable_x = area.x + area.width - 1;
-        let mut x = area.x + 1;
+        // Reserve the right-most cell for the top-right corner glyph. All
+        // bounds arithmetic here uses `saturating_*` because u16 addition of
+        // two real Rect fields can overflow on pathological sizes (e.g. an
+        // area abutting u16::MAX) — wraparound would then silently bypass
+        // the `if x + w > last_usable_x` bound check and corrupt memory
+        // outside our Rect (P2-architecture sweep).
+        let last_usable_x = area.x.saturating_add(area.width).saturating_sub(1);
+        let buf_right = buf_area.x.saturating_add(buf_area.width);
+        let buf_bottom = buf_area.y.saturating_add(buf_area.height);
+        let mut x = area.x.saturating_add(1);
         for g in info.title.chars() {
-            let w = UnicodeWidthChar::width(g).unwrap_or(0) as u16;
+            // Unicode width fits in a `u8` in practice; clamp to u16 so a
+            // future width > 65535 would still terminate the loop safely.
+            let w = u16::try_from(UnicodeWidthChar::width(g).unwrap_or(0)).unwrap_or(u16::MAX);
             if w == 0 {
                 continue;
             }
-            if x + w > last_usable_x {
+            if x.saturating_add(w) > last_usable_x {
                 break;
             }
-            if x >= buf_area.x + buf_area.width || y >= buf_area.y + buf_area.height {
+            if x >= buf_right || y >= buf_bottom {
                 break;
             }
             let cell = &mut buf[(x, y)];
@@ -673,14 +686,15 @@ fn render_pane_titles(frame: &mut Frame, infos: &[PaneBorderInfo]) {
             // For wide chars, blank out the trailing cells so residual border
             // glyphs don't peek through.
             for off in 1..w {
-                if x + off >= buf_area.x + buf_area.width {
+                let tx = x.saturating_add(off);
+                if tx >= buf_right {
                     break;
                 }
-                let trail = &mut buf[(x + off, y)];
+                let trail = &mut buf[(tx, y)];
                 trail.set_char(' ');
                 trail.set_style(info.title_style);
             }
-            x += w;
+            x = x.saturating_add(w);
         }
     }
 }
@@ -748,8 +762,14 @@ fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout, telegram: T
 
 pub fn render_menu(frame: &mut Frame, items: &[MenuItem], selected: usize) {
     let area = frame.area();
-    let menu_height = (items.len() as u16 + 4).min(area.height - 2);
-    let menu_width = 50u16.min(area.width - 4);
+    // `items.len() as u16` can silently truncate; `area.height - 2` panics
+    // if height < 2. Use saturating arithmetic throughout so a tiny
+    // terminal renders a (clipped) menu instead of underflow-panicking.
+    let item_count = u16::try_from(items.len()).unwrap_or(u16::MAX);
+    let menu_height = item_count
+        .saturating_add(4)
+        .min(area.height.saturating_sub(2));
+    let menu_width = 50u16.min(area.width.saturating_sub(4));
     let x = (area.width.saturating_sub(menu_width)) / 2;
     let y = (area.height.saturating_sub(menu_height)) / 2;
     let menu_area = Rect::new(x, y, menu_width, menu_height);

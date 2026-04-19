@@ -1,14 +1,19 @@
 //! Daemon: manages agent registry, TUI sockets, auto-respawn, fleet lifecycle,
 //! schedule checking, health monitoring, Telegram notifications.
 
-use crate::agent::{self, AgentRegistry};
-use crate::framing::{self, TAG_DATA, TAG_RESIZE};
-use teloxide::payloads::SendMessageSetters;
-use teloxide::prelude::Requester;
+mod ci_watch;
+mod cron_tick;
+pub(crate) mod supervisor;
+mod telegram;
+mod tui_bridge;
 
-use portable_pty::PtySize;
+use crate::agent::{self, AgentRegistry};
+use ci_watch::check_ci_watches;
+use cron_tick::check_schedules;
+use telegram::notify_telegram;
+pub use tui_bridge::serve_agent_tui;
+
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -23,122 +28,6 @@ pub struct AgentConfig {
     /// Original repo root (before worktree redirect).
     pub worktree_source: Option<PathBuf>,
     pub submit_key: String,
-}
-
-/// Start the TUI socket server for an agent (blocks the calling thread).
-///
-/// Binds a TCP loopback port, publishes it to `{run_dir}/{name}.port`, then
-/// accepts connections. Removes the port file when the listener exits.
-pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
-    let listener = match crate::ipc::bind_loopback() {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(agent = name, error = %e, "failed to bind TUI socket");
-            return;
-        }
-    };
-    let port = crate::ipc::local_port(&listener);
-    if let Err(e) = crate::ipc::write_port(run_dir, name, port) {
-        tracing::warn!(agent = name, error = %e, "failed to publish TUI port");
-        return;
-    }
-    tracing::info!(agent = name, port, "TUI socket ready");
-
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let _ = stream.set_nodelay(true);
-        tracing::info!(agent = name, "TUI client connected");
-
-        // Protocol version handshake: send version byte before any framed data
-        if stream.write_all(&[framing::PROTOCOL_VERSION]).is_err() {
-            continue;
-        }
-        if stream.flush().is_err() {
-            continue;
-        }
-
-        let (rx, pty_writer, pty_master, core) = {
-            let reg = agent::lock_registry(registry);
-            let agent = match reg.get(name) {
-                Some(a) => a,
-                None => continue,
-            };
-            let (rx, dump) = agent::subscribe_with_dump(agent);
-            if framing::write_frame(&mut stream, &dump).is_err() {
-                continue;
-            }
-            (
-                rx,
-                Arc::clone(&agent.pty_writer),
-                Arc::clone(&agent.pty_master),
-                Arc::clone(&agent.core),
-            )
-        };
-
-        let mut write_stream = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let n = name.to_string();
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("{n}_tui_out"))
-            .spawn(move || {
-                while let Ok(data) = rx.recv() {
-                    if framing::write_frame(&mut write_stream, &data).is_err() {
-                        break;
-                    }
-                }
-            })
-        {
-            tracing::warn!(agent = %n, error = %e, "failed to spawn TUI output thread");
-        }
-
-        let read_stream = stream;
-        let n = name.to_string();
-        let n_err = n.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("{n}_tui_in"))
-            .spawn(move || {
-                let mut reader = read_stream;
-                loop {
-                    match framing::read_tagged_frame(&mut reader) {
-                        Ok((TAG_DATA, data)) => {
-                            if pty_writer
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .write_all(&data)
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Ok((TAG_RESIZE, data)) if data.len() == 4 => {
-                            let cols = u16::from_be_bytes([data[0], data[1]]);
-                            let rows = u16::from_be_bytes([data[2], data[3]]);
-                            let _ = pty_master.lock().unwrap_or_else(|e| e.into_inner()).resize(
-                                PtySize {
-                                    rows,
-                                    cols,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                },
-                            );
-                            if let Ok(mut c) = core.lock() {
-                                c.vterm.resize(cols, rows);
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-                tracing::info!(agent = %n, "TUI client disconnected");
-            })
-        {
-            tracing::warn!(agent = %n_err, error = %e, "failed to spawn TUI input thread");
-        }
-    }
 }
 
 /// Get the PID-isolated run directory for the current daemon.
@@ -224,6 +113,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     let run = run_dir(home);
     std::fs::create_dir_all(&run)?;
     write_daemon_id(&run);
+    // P1-10: issue the connection cookie *before* spawning any TUI / API
+    // server thread, since `serve_agent_tui` and `api::serve` both expect
+    // `api.cookie` to already exist. Failure here aborts startup —
+    // running the control plane without auth would be a silent security
+    // regression.
+    crate::auth_cookie::issue(&run)
+        .map_err(|e| anyhow::anyhow!("failed to issue API auth cookie: {e}"))?;
     tracing::info!(path = %run.display(), "run dir");
 
     // Check for previous snapshot if fleet.yaml doesn't exist
@@ -242,8 +138,14 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // External agents registry (connected via `agend-terminal connect`)
     let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-    // Crash channel for auto-respawn
-    let (crash_tx, crash_rx) = crossbeam::channel::unbounded::<String>();
+    // Crash channel for auto-respawn.
+    //
+    // Bounded to prevent the reaper from accumulating unbounded crash events
+    // if the main loop stalls (P2-2, review 2026-04-18). 64 is comfortably
+    // more than a plausible burst — every fleet member crashing at once —
+    // and senders use `try_send` so a full channel drops the event with a
+    // warning rather than blocking the PTY close handler.
+    let (crash_tx, crash_rx) = crossbeam::channel::bounded::<String>(64);
 
     // Store configs for respawn
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -261,7 +163,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                     .map(|p| p.to_path_buf())
             })?
         });
-        configs.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        crate::sync::lock_poisoned(&configs, "configs").insert(
             name.clone(),
             AgentConfig {
                 name: name.clone(),
@@ -368,6 +270,8 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     );
     tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
 
+    supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
+
     let mut last_snapshot_json = String::new();
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
@@ -406,7 +310,11 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             }
         }
 
-        // Periodic maintenance (runs on every wake, whether crash or tick)
+        // Periodic maintenance (runs on every wake, whether crash or tick).
+        // AwaitingOperator detection lives in the dedicated supervisor thread
+        // (spawned earlier) so app mode gets the same behavior as daemon mode.
+        // Hang detection and health decay stay here — they're daemon-only
+        // concerns (hang notifications tie into crash respawn accounting).
         {
             let reg = agent::lock_registry(&registry);
             for (name, handle) in reg.iter() {
@@ -442,7 +350,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         // Periodic snapshot: save fleet state (only if changed)
         {
             let reg = agent::lock_registry(&registry);
-            let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
+            let cfgs = crate::sync::lock_poisoned(&configs, "configs");
             let snapshots: Vec<_> = reg
                 .iter()
                 .map(|(name, handle)| {
@@ -484,7 +392,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         check_ci_watches(home, &registry);
 
         {
-            let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
+            let cfgs = crate::sync::lock_poisoned(&configs, "configs");
             for (name, config) in cfgs.iter() {
                 if let Some(ref dir) = config.working_dir {
                     if let Some(sid) = crate::backend::read_session_id(dir) {
@@ -520,9 +428,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
 
         // Get config for respawn
-        let config = configs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let config = crate::sync::lock_poisoned(&configs, "configs")
             .get(&crashed_name)
             .cloned();
         let config = match config {
@@ -538,7 +444,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
             let reg = agent::lock_registry(&registry);
             match reg.get(&crashed_name) {
                 Some(handle) => {
-                    let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut core = crate::sync::lock_poisoned(&handle.core, "agent_core");
                     core.health.record_crash()
                 }
                 None => {
@@ -569,7 +475,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
             // Save health tracker from old handle before respawn replaces it
             let saved_health = {
-                let r = registry.lock().unwrap_or_else(|e| e.into_inner());
+                let r = crate::sync::lock_poisoned(&registry, "registry");
                 r.get(&crashed_name)
                     .and_then(|h| h.core.lock().ok().map(|c| c.health.clone()))
             };
@@ -626,9 +532,9 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
                                     // Restore health tracker from old handle + mark respawn OK
                                     {
-                                        let r = reg.lock().unwrap_or_else(|e| e.into_inner());
+                                        let r = crate::sync::lock_poisoned(&reg, "registry");
                                         if let Some(handle) = r.get(&config.name) {
-                                            let mut core = handle.core.lock().unwrap_or_else(|e| e.into_inner());
+                                            let mut core = crate::sync::lock_poisoned(&handle.core, "agent_core");
                                             if let Some(ref old_health) = saved_health {
                                                 core.health = old_health.clone();
                                             }
@@ -639,7 +545,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
                                     // Inject system message
                                     std::thread::sleep(std::time::Duration::from_secs(2));
                                     {
-                                        let r = reg.lock().unwrap_or_else(|e| e.into_inner());
+                                        let r = crate::sync::lock_poisoned(&reg, "registry");
                                         if let Some(handle) = r.get(&config.name) {
                                             let reason = handle.core.lock().ok()
                                                 .map(|c| c.health.crash_reason().to_string())
@@ -678,7 +584,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
     // Shutdown: print residual worktrees
     {
-        let cfgs = configs.lock().unwrap_or_else(|e| e.into_inner());
+        let cfgs = crate::sync::lock_poisoned(&configs, "configs");
         let mut seen = std::collections::HashSet::new();
         for config in cfgs.values() {
             // Use worktree_source (original repo) if available, otherwise working_dir
@@ -707,7 +613,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // registry — if the agent is gone, they return silently instead of
     // sending crash events. This eliminates all shutdown race conditions.
     let agents_to_kill: Vec<_> = {
-        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = crate::sync::lock_poisoned(&registry, "registry");
         let agents: Vec<_> = reg
             .drain()
             .map(|(name, handle)| (name, handle.child))
@@ -715,7 +621,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         agents
     };
     for (name, child) in &agents_to_kill {
-        let mut c = child.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = crate::sync::lock_poisoned(child, "child_proc");
         let _ = c.kill();
         tracing::info!(agent = %name, "killed");
     }
@@ -725,328 +631,6 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // Give threads time to flush logs and close connections
     std::thread::sleep(std::time::Duration::from_secs(1));
     tracing::info!("exiting");
-    Ok(())
-}
-
-/// Send a notification to Telegram (instance topic or general).
-fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
-    let config = match crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let (token, group_id, topic_id) = match &config.channel {
-        Some(crate::fleet::ChannelConfig::Telegram {
-            bot_token_env,
-            group_id,
-            ..
-        }) => match std::env::var(bot_token_env) {
-            Ok(t) => (
-                t,
-                *group_id,
-                config.instances.get(instance_name).and_then(|i| i.topic_id),
-            ),
-            Err(_) => return,
-        },
-        None => return,
-    };
-
-    let text = text.to_string();
-    std::thread::Builder::new()
-        .name("tg_notify".into())
-        .spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            if let Err(_e) = rt.block_on(async {
-                let bot = teloxide::Bot::new(&token);
-                let chat_id = teloxide::types::ChatId(group_id);
-                match topic_id {
-                    Some(tid) if tid != 1 => {
-                        bot.send_message(chat_id, &text)
-                            .message_thread_id(teloxide::types::ThreadId(
-                                teloxide::types::MessageId(tid),
-                            ))
-                            .await?;
-                    }
-                    _ => {
-                        bot.send_message(chat_id, &text).await?;
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            }) {
-                tracing::warn!(error = %_e, "telegram notify failed");
-            }
-        })
-        .ok();
-}
-
-/// Check cron schedules and inject messages for due ones.
-fn check_schedules(home: &Path, registry: &AgentRegistry) {
-    use cron::Schedule;
-    use std::str::FromStr;
-
-    let store: serde_json::Value = match std::fs::read_to_string(home.join("schedules.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-    {
-        Some(v) => v,
-        None => return,
-    };
-    let schedules = match store["schedules"].as_array() {
-        Some(s) => s,
-        None => return,
-    };
-
-    let now = chrono::Utc::now();
-    let last_check_path = home.join(".schedule_last_check");
-    let last_check = std::fs::read_to_string(&last_check_path)
-        .ok()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(|| now - chrono::Duration::seconds(10));
-
-    let mut any_triggered = false;
-    for sched in schedules {
-        if !sched["enabled"].as_bool().unwrap_or(true) {
-            continue;
-        }
-        let cron_expr = match sched["cron"].as_str() {
-            Some(c) => c,
-            None => continue,
-        };
-        let full_expr = if cron_expr.split_whitespace().count() == 5 {
-            format!("0 {cron_expr}")
-        } else {
-            cron_expr.to_string()
-        };
-
-        let schedule = match Schedule::from_str(&full_expr) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(cron = cron_expr, error = %e, "invalid cron");
-                continue;
-            }
-        };
-        if !schedule.after(&last_check).take(1).any(|next| next <= now) {
-            continue;
-        }
-
-        let (sched_id, target) = (
-            sched["id"].as_str().unwrap_or(""),
-            sched["target"].as_str().unwrap_or(""),
-        );
-        let (message, label) = (
-            sched["message"].as_str().unwrap_or(""),
-            sched["label"].as_str().unwrap_or("(unnamed)"),
-        );
-
-        tracing::info!(label, target, message, "schedule triggered");
-        crate::event_log::log(
-            home,
-            "schedule_trigger",
-            target,
-            &format!("{label}: {message}"),
-        );
-
-        let reg = agent::lock_registry(registry);
-        let status = if let Some(handle) = reg.get(target) {
-            match agent::inject_to_agent(handle, message.as_bytes()) {
-                Ok(()) => "ok",
-                Err(e) => {
-                    tracing::warn!(error = %e, "schedule inject failed");
-                    "inject_failed"
-                }
-            }
-        } else {
-            let _ = crate::inbox::enqueue(
-                home,
-                target,
-                crate::inbox::InboxMessage {
-                    from: "system:schedule".to_string(),
-                    text: message.to_string(),
-                    kind: Some("schedule".to_string()),
-                    timestamp: now.to_rfc3339(),
-                },
-            );
-            "ok_inbox"
-        };
-        drop(reg);
-        if !sched_id.is_empty() {
-            crate::schedules::record_run(home, sched_id, status);
-        }
-        any_triggered = true;
-    }
-
-    if any_triggered || now.signed_duration_since(last_check).num_seconds() >= 10 {
-        let _ = std::fs::write(&last_check_path, now.to_rfc3339());
-    }
-}
-
-/// Check CI watch configs and inject failure logs to agents when CI fails.
-fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
-    let entries = match std::fs::read_dir(home.join("ci-watches")) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let watch: serde_json::Value = match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())
-        {
-            Some(v) => v,
-            None => continue,
-        };
-        let (repo, instance) = match (watch["repo"].as_str(), watch["instance"].as_str()) {
-            (Some(r), Some(i)) => (r.to_string(), i.to_string()),
-            _ => continue,
-        };
-        let branch = watch["branch"].as_str().unwrap_or("main").to_string();
-        let interval = watch["interval_secs"].as_u64().unwrap_or(60);
-        let last_run_id = watch["last_run_id"].as_u64();
-
-        // Throttle via mtime
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta
-                .modified()
-                .ok()
-                .and_then(|m| m.elapsed().ok())
-                .map(|age| age.as_secs() < interval)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-        }
-        let _ = std::fs::write(
-            &path,
-            serde_json::to_string_pretty(&watch).unwrap_or_default(),
-        );
-
-        let home = home.to_path_buf();
-        let watch_path = path.clone();
-        let registry = Arc::clone(registry);
-        std::thread::Builder::new()
-            .name("ci_check".into())
-            .spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                if let Err(e) = rt.block_on(ci_check_repo(
-                    &home,
-                    &watch_path,
-                    &repo,
-                    &branch,
-                    &instance,
-                    last_run_id,
-                    &registry,
-                )) {
-                    tracing::debug!(repo = %repo, error = %e, "CI check failed");
-                }
-            })
-            .ok();
-    }
-}
-
-/// Fetch latest GitHub Actions run and inject failure info if new failure detected.
-async fn ci_check_repo(
-    home: &Path,
-    watch_path: &Path,
-    repo: &str,
-    branch: &str,
-    instance: &str,
-    last_run_id: Option<u64>,
-    registry: &AgentRegistry,
-) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let gh_get = |url: &str| {
-        let mut req = client
-            .get(url)
-            .header("User-Agent", "agend-terminal")
-            .header("Accept", "application/vnd.github+json");
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
-        req
-    };
-
-    let resp: serde_json::Value = gh_get(&format!(
-        "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=1"
-    ))
-    .send()
-    .await?
-    .json()
-    .await?;
-    let run = match resp["workflow_runs"].as_array().and_then(|a| a.first()) {
-        Some(r) => r,
-        None => return Ok(()),
-    };
-    let run_id = run["id"].as_u64().unwrap_or(0);
-    if run["conclusion"].as_str() != Some("failure") || Some(run_id) == last_run_id {
-        return Ok(());
-    }
-
-    let jobs_resp: serde_json::Value = gh_get(&format!(
-        "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
-    ))
-    .send()
-    .await?
-    .json()
-    .await?;
-    let failure_summary = jobs_resp["jobs"]
-        .as_array()
-        .and_then(|jobs| {
-            jobs.iter().find_map(|job| {
-                job["steps"].as_array().and_then(|steps| {
-                    steps.iter().find_map(|step| {
-                        (step["conclusion"].as_str() == Some("failure")).then(|| {
-                            format!(
-                                "{} / {}",
-                                job["name"].as_str().unwrap_or("?"),
-                                step["name"].as_str().unwrap_or("?")
-                            )
-                        })
-                    })
-                })
-            })
-        })
-        .unwrap_or_else(|| "unknown step".to_string());
-
-    let msg = format!("[ci-fail] {repo} branch {branch}: {failure_summary}\r");
-    let reg = agent::lock_registry(registry);
-    if let Some(handle) = reg.get(instance) {
-        let _ = agent::inject_to_agent(handle, msg.as_bytes());
-    } else {
-        drop(reg);
-        let _ = crate::inbox::enqueue(
-            home,
-            instance,
-            crate::inbox::InboxMessage {
-                from: "system:ci".to_string(),
-                text: msg,
-                kind: Some("ci-fail".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            },
-        );
-    }
-
-    // Update last_run_id
-    if let Ok(content) = std::fs::read_to_string(watch_path) {
-        if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
-            watch["last_run_id"] = serde_json::json!(run_id);
-            let _ = std::fs::write(
-                watch_path,
-                serde_json::to_string_pretty(&watch).unwrap_or_default(),
-            );
-        }
-    }
     Ok(())
 }
 

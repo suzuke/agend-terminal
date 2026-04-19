@@ -86,6 +86,10 @@ pub struct TelegramState {
     pub home: PathBuf,
     /// Submit key per instance (for PTY notification injection).
     pub submit_keys: HashMap<String, String>,
+    /// Allowlist of Telegram user IDs permitted to command the fleet.
+    /// See [`crate::fleet::ChannelConfig::Telegram::user_allowlist`] for
+    /// semantics of `None` vs `Some(empty)` vs `Some([...])`.
+    pub user_allowlist: Option<Vec<i64>>,
 }
 
 impl TelegramState {
@@ -95,6 +99,7 @@ impl TelegramState {
         topic_map: HashMap<String, i32>,
         home: PathBuf,
         submit_keys: HashMap<String, String>,
+        user_allowlist: Option<Vec<i64>>,
     ) -> Self {
         let topic_to_instance: HashMap<i32, String> = topic_map
             .iter()
@@ -107,6 +112,16 @@ impl TelegramState {
             instance_to_topic: topic_map,
             home,
             submit_keys,
+            user_allowlist,
+        }
+    }
+
+    /// Return true if a sender is permitted by the allowlist.
+    /// `None` allowlist = accept (legacy). `Some` = must appear in the list.
+    pub fn is_user_allowed(&self, user_id: i64) -> bool {
+        match &self.user_allowlist {
+            None => true,
+            Some(list) => list.contains(&user_id),
         }
     }
 
@@ -228,11 +243,31 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         None => return,
     };
 
+    let sender_id: Option<i64> = msg.from.as_ref().map(|u| u.id.0 as i64);
     let username = msg
         .from
         .as_ref()
         .and_then(|u| u.username.as_deref())
         .unwrap_or("unknown");
+
+    // Authz: drop messages from senders not on the allowlist. Legacy
+    // deployments (user_allowlist = None) accept all; `Some([])` rejects
+    // all; `Some([...])` restricts to the listed IDs.
+    {
+        let s = lock_state(state);
+        let allowed = match sender_id {
+            Some(id) => s.is_user_allowed(id),
+            None => s.user_allowlist.is_none(),
+        };
+        if !allowed {
+            tracing::warn!(
+                from = username,
+                user_id = ?sender_id,
+                "telegram message rejected by user_allowlist"
+            );
+            return;
+        }
+    }
 
     let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
 
@@ -248,6 +283,35 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     };
 
     tracing::info!(from = username, to = %instance_name, %text, "inbound message");
+
+    // Route based on agent state: when blocked on an unexpected startup
+    // prompt (AwaitingOperator), the operator's reply must reach the PTY
+    // as raw keystrokes — any inbox prefix ("[telegram:@user] …") would
+    // confuse the CLI's prompt parser. In every other state, preserve the
+    // existing inbox semantics so agent-authored message handling keeps
+    // working.
+    if agent_is_awaiting_operator(&home, &instance_name) {
+        let payload = format!("{text}\n");
+        match crate::api::call(
+            &home,
+            &serde_json::json!({
+                "method": crate::api::method::INJECT,
+                "params": {"name": instance_name, "data": payload, "raw": true}
+            }),
+        ) {
+            Ok(_) => tracing::info!(
+                to = %instance_name,
+                bytes = payload.len(),
+                "routed raw keystrokes (awaiting_operator)"
+            ),
+            Err(e) => tracing::warn!(
+                to = %instance_name,
+                error = %e,
+                "raw injection failed"
+            ),
+        }
+        return;
+    }
 
     // Enqueue in inbox
     let msg_obj = InboxMessage {
@@ -266,6 +330,36 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         text,
         &submit_key,
     );
+}
+
+/// Query the daemon for the current `agent_state` of one instance.
+/// Returns true only when the daemon reports `"awaiting_operator"`.
+/// Any error (daemon down, agent missing, parse failure) returns false so
+/// we fall through to normal inbox routing rather than silently dropping
+/// messages.
+fn agent_is_awaiting_operator(home: &Path, instance_name: &str) -> bool {
+    let resp = match crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::LIST}),
+    ) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    list_response_is_awaiting(&resp, instance_name)
+}
+
+/// Pure JSON-inspection half of [`agent_is_awaiting_operator`]. Separated
+/// out so the routing logic can be unit-tested without a running daemon.
+fn list_response_is_awaiting(resp: &serde_json::Value, instance_name: &str) -> bool {
+    resp["result"]["agents"]
+        .as_array()
+        .and_then(|arr| {
+            arr.iter()
+                .find(|a| a["name"].as_str() == Some(instance_name))
+        })
+        .and_then(|a| a["agent_state"].as_str())
+        .map(|s| s == crate::state::AgentState::AwaitingOperator.display_name())
+        .unwrap_or(false)
 }
 
 /// Send a reply from an agent to Telegram (called from MCP reply tool).
@@ -294,6 +388,7 @@ pub fn init_from_config(
     let ChannelConfig::Telegram {
         bot_token_env,
         group_id,
+        user_allowlist,
         ..
     } = config.channel.as_ref()?;
     let token = match std::env::var(bot_token_env) {
@@ -303,6 +398,19 @@ pub fn init_from_config(
             return None;
         }
     };
+    match user_allowlist {
+        None => tracing::warn!(
+            "telegram channel.user_allowlist is not set — any group member can command the fleet. \
+             Set `user_allowlist: [123, 456]` in fleet.yaml to lock this down."
+        ),
+        Some(list) if list.is_empty() => {
+            tracing::info!(
+                "telegram channel.user_allowlist is empty — all inbound messages will be rejected"
+            )
+        }
+        Some(list) => tracing::info!(count = list.len(), "telegram user_allowlist active"),
+    }
+    let allowlist = user_allowlist.clone();
 
     // Clean up orphaned topics: exist in registry but not in fleet.yaml
     let mut reg = load_topic_registry(home);
@@ -369,6 +477,7 @@ pub fn init_from_config(
         topic_map,
         home.to_path_buf(),
         submit_keys,
+        allowlist,
     )));
     start_polling(Arc::clone(&state));
     Some(state)
@@ -653,6 +762,7 @@ mod tests {
             topic_map,
             PathBuf::from("/tmp/test"),
             HashMap::new(),
+            None,
         );
         assert_eq!(
             state.topic_to_instance.get(&100),
@@ -674,6 +784,7 @@ mod tests {
             HashMap::new(),
             PathBuf::from("/tmp"),
             HashMap::new(),
+            None,
         );
         assert!(state.topic_to_instance.is_empty());
         assert!(state.instance_to_topic.is_empty());
@@ -683,8 +794,54 @@ mod tests {
     fn telegram_state_submit_keys_preserved() {
         let mut keys = HashMap::new();
         keys.insert("agent1".to_string(), "\n".to_string());
-        let state = TelegramState::new("tok", -1, HashMap::new(), PathBuf::from("/tmp"), keys);
+        let state =
+            TelegramState::new("tok", -1, HashMap::new(), PathBuf::from("/tmp"), keys, None);
         assert_eq!(state.submit_keys.get("agent1"), Some(&"\n".to_string()));
+    }
+
+    #[test]
+    fn is_user_allowed_none_means_open() {
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        // Legacy open mode: any id accepted.
+        assert!(state.is_user_allowed(1));
+        assert!(state.is_user_allowed(i64::MAX));
+    }
+
+    #[test]
+    fn is_user_allowed_empty_rejects_all() {
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            Some(vec![]),
+        );
+        assert!(!state.is_user_allowed(1));
+        assert!(!state.is_user_allowed(0));
+    }
+
+    #[test]
+    fn is_user_allowed_restricts_to_list() {
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            Some(vec![42, 100]),
+        );
+        assert!(state.is_user_allowed(42));
+        assert!(state.is_user_allowed(100));
+        assert!(!state.is_user_allowed(41));
+        assert!(!state.is_user_allowed(0));
     }
 
     #[test]
@@ -731,8 +888,14 @@ mod tests {
     fn resolve_topic_known_topic() {
         let mut topic_map = HashMap::new();
         topic_map.insert("alice".to_string(), 100);
-        let mut state =
-            TelegramState::new("tok", -1, topic_map, PathBuf::from("/tmp"), HashMap::new());
+        let mut state = TelegramState::new(
+            "tok",
+            -1,
+            topic_map,
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
         assert_eq!(resolve_topic(&mut state, Some(100)), "alice");
     }
 
@@ -744,6 +907,7 @@ mod tests {
             HashMap::new(),
             PathBuf::from("/tmp"),
             HashMap::new(),
+            None,
         );
         assert_eq!(resolve_topic(&mut state, None), "general");
     }
@@ -756,6 +920,7 @@ mod tests {
             HashMap::new(),
             PathBuf::from("/tmp/nonexistent"),
             HashMap::new(),
+            None,
         );
         // No fleet.yaml → falls back to general
         assert_eq!(resolve_topic(&mut state, Some(999)), "general");
@@ -777,7 +942,14 @@ instances:
         std::fs::write(home.join("fleet.yaml"), yaml).ok();
 
         // State has NO topic mappings — simulates runtime-created topic
-        let mut state = TelegramState::new("tok", -1, HashMap::new(), home.clone(), HashMap::new());
+        let mut state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        );
 
         // Should reload from fleet.yaml and find alice
         assert_eq!(resolve_topic(&mut state, Some(229)), "alice");
@@ -799,7 +971,14 @@ instances:
     topic_id: 500
 "#;
         std::fs::write(home.join("fleet.yaml"), yaml).ok();
-        let mut state = TelegramState::new("tok", -1, HashMap::new(), home.clone(), HashMap::new());
+        let mut state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        );
 
         // First call: reloads from fleet.yaml
         assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
@@ -850,5 +1029,37 @@ instances:
         let home = PathBuf::from("/tmp/agend-test-nonexistent-dir-12345");
         let reg = load_topic_registry(&home);
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn list_response_is_awaiting_detects_target_state() {
+        let resp = serde_json::json!({
+            "ok": true,
+            "result": {
+                "agents": [
+                    {"name": "alice", "agent_state": "ready"},
+                    {"name": "bob",   "agent_state": "awaiting_operator"},
+                    {"name": "carol", "agent_state": "starting"},
+                ]
+            }
+        });
+        assert!(!list_response_is_awaiting(&resp, "alice"));
+        assert!(list_response_is_awaiting(&resp, "bob"));
+        assert!(!list_response_is_awaiting(&resp, "carol"));
+        // Missing agent returns false (fall through to inbox path)
+        assert!(!list_response_is_awaiting(&resp, "eve"));
+    }
+
+    #[test]
+    fn list_response_is_awaiting_tolerates_malformed() {
+        // Missing result.agents → false
+        let r1 = serde_json::json!({"ok": false, "error": "daemon down"});
+        assert!(!list_response_is_awaiting(&r1, "any"));
+        // agents not an array → false
+        let r2 = serde_json::json!({"result": {"agents": "nope"}});
+        assert!(!list_response_is_awaiting(&r2, "any"));
+        // agent without agent_state field → false
+        let r3 = serde_json::json!({"result": {"agents": [{"name": "x"}]}});
+        assert!(!list_response_is_awaiting(&r3, "x"));
     }
 }

@@ -69,25 +69,58 @@ pub fn enqueue(home: &Path, name: &str, msg: InboxMessage) -> anyhow::Result<()>
 }
 
 /// Drain all messages atomically (rename + read to avoid race with concurrent append).
+///
+/// Recovery: if a previous drain crashed between `rename()` and `remove_file()`
+/// (or the read_to_string failed), the messages would live on in
+/// `{name}.draining` forever, AND would be silently lost the next time drain
+/// renamed over it. We now treat a leftover `.draining` as the authoritative
+/// pending batch: read and consume it first. New arrivals in `{name}.jsonl`
+/// are picked up on the next drain call — delaying them by one cycle is
+/// acceptable; dropping them is not.
 pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     let path = inbox_path(home, name);
+    let tmp = path.with_extension("draining");
+
+    // Leftover from a crashed predecessor — consume it first, leave the
+    // live file untouched so no pending batch is overwritten.
+    if tmp.exists() {
+        return read_drain_file(&tmp);
+    }
+
     if !path.exists() {
         return Vec::new();
     }
-    // Atomic: rename file, then read the renamed copy
-    let tmp = path.with_extension("draining");
     if std::fs::rename(&path, &tmp).is_err() {
         return Vec::new(); // File may have been drained by another caller
     }
-    let content = match std::fs::read_to_string(&tmp) {
+    read_drain_file(&tmp)
+}
+
+fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
+    let content = match std::fs::read_to_string(tmp) {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        // Leave `.draining` in place so the next drain call retries; the
+        // previous implementation early-returned without removing, but also
+        // returned empty even on success when read_to_string returned Err
+        // after the earlier remove had run — which was impossible to recover.
+        Err(e) => {
+            tracing::warn!(
+                path = %tmp.display(),
+                error = %e,
+                "inbox drain read failed; .draining retained for retry"
+            );
+            return Vec::new();
+        }
     };
-    let _ = std::fs::remove_file(&tmp);
     let messages: Vec<InboxMessage> = content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
+    // Remove only AFTER a successful read+parse so crashes between read and
+    // remove still leave the data on disk for the next drain to recover.
+    if let Err(e) = std::fs::remove_file(tmp) {
+        tracing::warn!(path = %tmp.display(), error = %e, "inbox drain cleanup failed");
+    }
     messages
 }
 
@@ -374,5 +407,82 @@ mod tests {
         let s = NotifySource::System("ci");
         assert_eq!(s.to_string(), "system:ci");
         assert!(s.reply_hint().is_empty());
+    }
+
+    #[test]
+    fn drain_recovers_leftover_draining_file() {
+        // Simulates a crash between rename() and read: pending messages
+        // sit in `{name}.draining`. A second drain() must surface them,
+        // not drop them.
+        let home = tmp_home("recover");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+        let draining = inbox_dir.join("agent1.draining");
+        let msg = serde_json::to_string(&make_msg("crashed", "pending")).expect("ser");
+        fs::write(&draining, format!("{msg}\n")).expect("write leftover");
+
+        let msgs = drain(&home, "agent1");
+        assert_eq!(msgs.len(), 1, "crashed batch must be recovered");
+        assert_eq!(msgs[0].from, "crashed");
+        assert_eq!(msgs[0].text, "pending");
+        // After successful read, leftover is cleared.
+        assert!(
+            !draining.exists(),
+            ".draining must be removed after successful drain"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn drain_does_not_overwrite_leftover_draining() {
+        // If a .draining file exists from a prior crash AND a new live
+        // inbox has arrived, the live file must be preserved — the new
+        // messages are picked up on the next drain cycle, not lost by a
+        // rename that overwrites the pending batch.
+        let home = tmp_home("no_overwrite");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+
+        let draining = inbox_dir.join("agent1.draining");
+        let old_msg = serde_json::to_string(&make_msg("old", "from_crashed_batch")).expect("ser");
+        fs::write(&draining, format!("{old_msg}\n")).expect("write leftover");
+
+        enqueue(&home, "agent1", make_msg("new", "fresh")).ok();
+
+        // First drain: returns the crashed batch only.
+        let first = drain(&home, "agent1");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].from, "old");
+
+        // Second drain: picks up the new message now that .draining is gone.
+        let second = drain(&home, "agent1");
+        assert_eq!(second.len(), 1, "fresh message must survive recovery");
+        assert_eq!(second[0].from, "new");
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn drain_read_failure_leaves_file_for_retry() {
+        // If read_to_string fails, .draining must remain on disk so a
+        // subsequent drain has another chance. (Simulating an unreadable
+        // file is awkward cross-platform; we instead assert the
+        // "retain-on-error" invariant by verifying successful drains
+        // DO remove, which is the inverse assertion our prior bug
+        // violated. See drain_recovers_leftover_draining_file.)
+        let home = tmp_home("retain");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+        let draining = inbox_dir.join("agent1.draining");
+        // Non-UTF8 bytes → read_to_string returns Err.
+        fs::write(&draining, [0xFF, 0xFE, 0xFD]).expect("write");
+
+        let msgs = drain(&home, "agent1");
+        assert!(msgs.is_empty(), "unreadable batch yields no messages");
+        assert!(
+            draining.exists(),
+            ".draining must be retained after read failure for next retry"
+        );
+        fs::remove_dir_all(&home).ok();
     }
 }

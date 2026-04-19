@@ -1,6 +1,7 @@
 mod agent;
 mod api;
 mod app;
+mod auth_cookie;
 mod backend;
 mod bugreport;
 mod channel;
@@ -29,6 +30,7 @@ mod schedules;
 mod snapshot;
 mod state;
 mod store;
+mod sync;
 mod tasks;
 mod teams;
 mod telegram;

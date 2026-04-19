@@ -8,7 +8,69 @@ pub mod tools;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Read, Write};
+
+/// Tool authz: returns `(allow, deny)` sets parsed from
+/// `AGEND_MCP_TOOLS_ALLOW` / `AGEND_MCP_TOOLS_DENY` (comma-separated,
+/// whitespace-tolerant). An empty allow-set means "allow all" (legacy
+/// behaviour). A tool on the deny-set is always rejected; if the allow-set
+/// is non-empty, only tools on the allow-set (minus any deny-set entries)
+/// are exposed / callable.
+fn tool_acl() -> (HashSet<String>, HashSet<String>) {
+    fn parse_csv(v: &str) -> HashSet<String> {
+        v.split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+    let allow = std::env::var("AGEND_MCP_TOOLS_ALLOW")
+        .ok()
+        .map(|v| parse_csv(&v))
+        .unwrap_or_default();
+    let deny = std::env::var("AGEND_MCP_TOOLS_DENY")
+        .ok()
+        .map(|v| parse_csv(&v))
+        .unwrap_or_default();
+    (allow, deny)
+}
+
+/// Returns true if `tool` is callable under the configured ACL.
+pub(crate) fn tool_is_allowed(tool: &str) -> bool {
+    let (allow, deny) = tool_acl();
+    if deny.contains(tool) {
+        return false;
+    }
+    if allow.is_empty() {
+        return true;
+    }
+    allow.contains(tool)
+}
+
+/// Filter a `tool_definitions()` value in place to drop tools blocked by the
+/// ACL. Takes the `{"tools": [..]}` object and returns a filtered clone.
+pub(crate) fn filter_tools(defs: Value) -> Value {
+    let (allow, deny) = tool_acl();
+    let tools = match defs.get("tools").and_then(|v| v.as_array()) {
+        Some(a) => a.clone(),
+        None => return defs,
+    };
+    let filtered: Vec<Value> = tools
+        .into_iter()
+        .filter(|t| {
+            let n = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if deny.contains(n) {
+                return false;
+            }
+            if allow.is_empty() {
+                return true;
+            }
+            allow.contains(n)
+        })
+        .collect();
+    json!({ "tools": filtered })
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -39,13 +101,33 @@ fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<
         }
         // Content-Length framing
         if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-            let len: usize = val.trim().parse().unwrap_or(0);
+            // Prior behaviour `val.parse().unwrap_or(0)` silently collapsed
+            // garbage headers to len=0 and then `continue`d without
+            // consuming the empty separator line, leaving the stream
+            // desynced against the next frame. Handle the parse error
+            // explicitly: log it, skip the separator to resync on the
+            // following header, and drop this frame.
+            let len: usize = match val.trim().parse() {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        value = %val.trim(),
+                        error = %e,
+                        "invalid Content-Length; frame discarded"
+                    );
+                    let mut empty = String::new();
+                    let _ = reader.read_line(&mut empty);
+                    continue;
+                }
+            };
+            // Empty separator line is part of the frame — consume it
+            // unconditionally so len==0 doesn't leave the stream pointing
+            // at the separator on the next iteration.
+            let mut empty = String::new();
+            reader.read_line(&mut empty)?;
             if len == 0 {
                 continue;
             }
-            // Read empty line after headers
-            let mut empty = String::new();
-            reader.read_line(&mut empty)?;
             // Read body
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body)?;
@@ -79,6 +161,20 @@ pub fn run() -> anyhow::Result<()> {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "invalid JSON-RPC");
+                // Per JSON-RPC 2.0: parse errors MUST produce a response
+                // so the caller does not hang. id is Null because the
+                // malformed request may not expose a valid one; best-effort
+                // salvage if the body was valid JSON but failed our shape.
+                let id = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("id").cloned())
+                    .unwrap_or(Value::Null);
+                let err_resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32700, "message": format!("Parse error: {e}") }
+                });
+                write_message(&mut stdout, &err_resp.to_string())?;
                 continue;
             }
         };
@@ -97,11 +193,30 @@ pub fn run() -> anyhow::Result<()> {
             "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
             "notifications/initialized" | "notifications/cancelled" => continue,
             "tools/list" => {
-                json!({ "jsonrpc": "2.0", "id": id, "result": tools::tool_definitions() })
+                json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": filter_tools(tools::tool_definitions())
+                })
             }
             "tools/call" => {
                 let tool = req.params["name"].as_str().unwrap_or("");
                 let args = &req.params["arguments"];
+
+                if !tool_is_allowed(tool) {
+                    tracing::warn!(tool = %tool, "blocked by AGEND_MCP_TOOLS_ALLOW/DENY");
+                    write_message(
+                        &mut stdout,
+                        &json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {
+                                "code": -32601,
+                                "message": format!("Tool '{tool}' not available (blocked by policy)")
+                            }
+                        })
+                        .to_string(),
+                    )?;
+                    continue;
+                }
 
                 // Try daemon proxy first — avoids per-process overhead
                 let result = proxy_or_local(tool, args, &instance_name);
@@ -155,4 +270,102 @@ fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
 
     // Daemon unavailable or returned error — handle locally
     handlers::handle_tool(tool, args, instance_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serialises tests that mutate the AGEND_MCP_TOOLS_* env vars.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        crate::sync::lock_poisoned(LOCK.get_or_init(|| Mutex::new(())), "mcp_env_guard")
+    }
+
+    fn save_env() -> (Option<String>, Option<String>) {
+        (
+            std::env::var("AGEND_MCP_TOOLS_ALLOW").ok(),
+            std::env::var("AGEND_MCP_TOOLS_DENY").ok(),
+        )
+    }
+    fn restore_env(prev: (Option<String>, Option<String>)) {
+        match prev.0 {
+            Some(v) => std::env::set_var("AGEND_MCP_TOOLS_ALLOW", v),
+            None => std::env::remove_var("AGEND_MCP_TOOLS_ALLOW"),
+        }
+        match prev.1 {
+            Some(v) => std::env::set_var("AGEND_MCP_TOOLS_DENY", v),
+            None => std::env::remove_var("AGEND_MCP_TOOLS_DENY"),
+        }
+    }
+
+    #[test]
+    fn tool_acl_default_allows_everything() {
+        let _g = env_guard();
+        let prev = save_env();
+        std::env::remove_var("AGEND_MCP_TOOLS_ALLOW");
+        std::env::remove_var("AGEND_MCP_TOOLS_DENY");
+        assert!(tool_is_allowed("delete_instance"));
+        assert!(tool_is_allowed("send_to_instance"));
+        restore_env(prev);
+    }
+
+    #[test]
+    fn tool_acl_deny_blocks_tool() {
+        let _g = env_guard();
+        let prev = save_env();
+        std::env::set_var("AGEND_MCP_TOOLS_DENY", "delete_instance, shutdown");
+        std::env::remove_var("AGEND_MCP_TOOLS_ALLOW");
+        assert!(!tool_is_allowed("delete_instance"));
+        assert!(!tool_is_allowed("shutdown"));
+        assert!(tool_is_allowed("inbox")); // not on deny list
+        restore_env(prev);
+    }
+
+    #[test]
+    fn tool_acl_allow_restricts_to_list() {
+        let _g = env_guard();
+        let prev = save_env();
+        std::env::set_var("AGEND_MCP_TOOLS_ALLOW", "inbox,send_to_instance");
+        std::env::remove_var("AGEND_MCP_TOOLS_DENY");
+        assert!(tool_is_allowed("inbox"));
+        assert!(tool_is_allowed("send_to_instance"));
+        assert!(!tool_is_allowed("delete_instance"));
+        restore_env(prev);
+    }
+
+    #[test]
+    fn tool_acl_deny_overrides_allow() {
+        let _g = env_guard();
+        let prev = save_env();
+        std::env::set_var("AGEND_MCP_TOOLS_ALLOW", "inbox,delete_instance");
+        std::env::set_var("AGEND_MCP_TOOLS_DENY", "delete_instance");
+        assert!(tool_is_allowed("inbox"));
+        assert!(!tool_is_allowed("delete_instance"));
+        restore_env(prev);
+    }
+
+    #[test]
+    fn filter_tools_removes_blocked_tools_from_list() {
+        let _g = env_guard();
+        let prev = save_env();
+        std::env::set_var("AGEND_MCP_TOOLS_DENY", "delete_instance");
+        std::env::remove_var("AGEND_MCP_TOOLS_ALLOW");
+
+        let defs = json!({
+            "tools": [
+                {"name": "inbox"},
+                {"name": "delete_instance"},
+                {"name": "send_to_instance"}
+            ]
+        });
+        let filtered = filter_tools(defs);
+        let arr = filtered["tools"].as_array().expect("tools array");
+        let names: Vec<&str> = arr.iter().filter_map(|v| v["name"].as_str()).collect();
+        assert!(names.contains(&"inbox"));
+        assert!(names.contains(&"send_to_instance"));
+        assert!(!names.contains(&"delete_instance"));
+        restore_env(prev);
+    }
 }

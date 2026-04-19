@@ -26,10 +26,28 @@ pub fn save(home: &Path, agents: &[AgentSnapshot]) {
         agents: agents.to_vec(),
     };
     let path = home.join("snapshot.json");
-    let _ = std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
-    );
+    if let Err(e) = save_atomic(&path, &snapshot) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to persist snapshot");
+    }
+}
+
+// Write-to-temp + fsync + rename. Guarantees snapshot.json is never
+// observed as a half-written file even if the process crashes mid-write.
+fn save_atomic(final_path: &Path, snapshot: &FleetSnapshot) -> std::io::Result<()> {
+    use std::io::Write;
+    let body = serde_json::to_string_pretty(snapshot)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp_path = final_path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, final_path)
 }
 
 pub fn load(home: &Path) -> Option<FleetSnapshot> {
@@ -151,6 +169,39 @@ mod tests {
         let parsed: AgentSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.name, "test");
         assert_eq!(parsed.agent_state, "running");
+    }
+
+    #[test]
+    fn save_leaves_no_tmp_file() {
+        let home = tmp_home("atomic");
+        save(&home, &[make_agent("a", "idle")]);
+        let tmp = home.join("snapshot.json.tmp");
+        assert!(
+            !tmp.exists(),
+            "temporary file must be renamed, not left behind"
+        );
+        assert!(home.join("snapshot.json").exists());
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn save_overwrites_atomically_without_truncating_to_zero() {
+        // If a reader observes snapshot.json between truncate and write, it
+        // would see an empty file. Atomic rename must prevent that window.
+        let home = tmp_home("atomic-size");
+        save(&home, &[make_agent("first", "idle")]);
+        let first_size = fs::metadata(home.join("snapshot.json"))
+            .expect("first meta")
+            .len();
+        save(
+            &home,
+            &[make_agent("second", "busy"), make_agent("third", "idle")],
+        );
+        let second_size = fs::metadata(home.join("snapshot.json"))
+            .expect("second meta")
+            .len();
+        assert!(first_size > 0 && second_size > 0);
+        fs::remove_dir_all(&home).ok();
     }
 
     #[test]

@@ -51,7 +51,54 @@ pub type ExternalRegistry = Arc<Mutex<HashMap<String, ExternalAgentHandle>>>;
 pub fn lock_external(
     reg: &ExternalRegistry,
 ) -> std::sync::MutexGuard<'_, HashMap<String, ExternalAgentHandle>> {
-    reg.lock().unwrap_or_else(|e| e.into_inner())
+    crate::sync::lock_poisoned(reg, "agent_registry")
+}
+
+/// Environment variable names that fleet.yaml-supplied `env:` maps are NOT
+/// allowed to override when spawning an agent. These either (a) carry
+/// credentials that only the host user should control, (b) govern dynamic
+/// linking and would let a hostile fleet.yaml load attacker-supplied code
+/// into the spawned process, or (c) are agend's own runtime plumbing.
+///
+/// Matching is case-insensitive for cross-platform safety: Windows env is
+/// case-insensitive, so `anthropic_api_key` and `ANTHROPIC_API_KEY` map to the
+/// same variable there, and a pure case-sensitive deny-list would miss it.
+const SENSITIVE_ENV_KEYS: &[&str] = &[
+    // API credentials for backends we drive
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    // Cloud credentials commonly present in dev environments
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    // Git forge tokens
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "NPM_TOKEN",
+    // Dynamic-linker injection vectors (Linux / macOS)
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    // agend's own runtime wiring — overriding these lets a template redirect
+    // the spawned agent to a different home / break MCP config discovery
+    "AGEND_HOME",
+    "AGEND_INSTANCE_NAME",
+    "AGEND_ALLOWED_WORK_ROOTS",
+    "AGEND_MCP_TOOLS_ALLOW",
+    "AGEND_MCP_TOOLS_DENY",
+];
+
+/// Returns true if the env-var name is on the spawn-time deny-list.
+pub fn is_sensitive_env_key(key: &str) -> bool {
+    SENSITIVE_ENV_KEYS
+        .iter()
+        .any(|denied| denied.eq_ignore_ascii_case(key))
 }
 
 /// Validate and sanitize an instance name. Only allows [a-zA-Z0-9_-].
@@ -78,7 +125,7 @@ pub fn validate_name(name: &str) -> Result<&str, String> {
 pub fn lock_registry(
     reg: &AgentRegistry,
 ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
-    reg.lock().unwrap_or_else(|e| e.into_inner())
+    crate::sync::lock_poisoned(reg, "agent_registry")
 }
 
 /// ANSI escape sequence stripper for dialog detection.
@@ -198,9 +245,20 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         cmd.env("LANG", "en_US.UTF-8");
     }
 
-    // User env
+    // User env from fleet.yaml. Drop entries on the sensitive-env deny-list
+    // so a hostile template cannot override ANTHROPIC_API_KEY, LD_PRELOAD,
+    // AGEND_HOME, etc. with attacker-controlled values inherited by the
+    // spawned agent process.
     if let Some(env_map) = *env {
         for (k, v) in env_map {
+            if is_sensitive_env_key(k) {
+                tracing::warn!(
+                    instance = %name,
+                    key = %k,
+                    "dropping fleet.yaml env override for sensitive key"
+                );
+                continue;
+            }
             cmd.env(k, v);
         }
     }
@@ -219,8 +277,40 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     }
 
     if let Some(dir) = working_dir {
-        std::fs::create_dir_all(dir).ok();
-        cmd.cwd(dir);
+        // Defense-in-depth: the API spawn handler already calls
+        // validate_working_directory at admission, but a symlink could have
+        // been swapped in between admission and spawn. Revalidate here both
+        // before and after create_dir_all so the final cwd we hand to the PTY
+        // provably resolves inside AGEND_HOME / AGEND_ALLOWED_WORK_ROOTS.
+        // If no home is available (ad-hoc test spawn), skip the recheck.
+        if let Some(home_path) = *home {
+            if let Err(e) = crate::api::validate_working_directory(dir, home_path) {
+                anyhow::bail!("working_directory validation failed at spawn: {e}");
+            }
+            std::fs::create_dir_all(dir).ok();
+            // Second pass: now that the leaf exists, canonicalisation walks
+            // through any symlink and the starts_with check inside the
+            // validator catches escape-via-symlink.
+            let resolved = crate::api::validate_working_directory(dir, home_path)
+                .map_err(|e| anyhow::anyhow!("working_directory escapes via symlink: {e}"))?;
+            cmd.cwd(&resolved);
+        } else {
+            // No `home` means no allow-list to validate against. All
+            // production spawn paths thread `home` through `SpawnConfig`; the
+            // only call sites that legitimately pass `None` are ad-hoc test
+            // spawns (tests/integration.rs). Emit a warn so that if a future
+            // code path regresses and spawns without home, the lost
+            // symlink-escape guard shows up in logs instead of silently
+            // degrading. Tests suppress tracing output so this stays quiet
+            // under `cargo test` while still being visible in a live daemon.
+            tracing::warn!(
+                instance = %name,
+                dir = %dir.display(),
+                "spawn without AGEND_HOME — working_directory symlink recheck skipped"
+            );
+            std::fs::create_dir_all(dir).ok();
+            cmd.cwd(dir);
+        }
     }
 
     let child = pair
@@ -249,7 +339,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
 
     // Register in registry
     {
-        let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reg = crate::sync::lock_poisoned(registry, "agent_registry");
         reg.insert(
             name.to_string(),
             AgentHandle {
@@ -312,13 +402,38 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         let preset = b.preset();
         if preset.inject_instructions_on_ready {
             if let Some(dir) = working_dir {
-                spawn_instructions_bootstrap(
-                    Arc::clone(registry),
-                    name.to_string(),
-                    dir.join(preset.instructions_path),
-                    std::time::Duration::from_secs(preset.ready_timeout_secs + 15),
-                    shutdown.clone(),
-                );
+                // Read the instructions body here — while we hold the spawn
+                // context and before the `Ready` poll window starts — so an
+                // external process mutating the file between write and
+                // bootstrap cannot inject a different prompt. Skip the
+                // bootstrap entirely if the file is missing/empty.
+                let path = dir.join(preset.instructions_path);
+                match std::fs::read_to_string(&path) {
+                    Ok(content) if !content.trim().is_empty() => {
+                        spawn_instructions_bootstrap(
+                            Arc::clone(registry),
+                            name.to_string(),
+                            content,
+                            std::time::Duration::from_secs(preset.ready_timeout_secs + 15),
+                            shutdown.clone(),
+                        );
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            agent = %name,
+                            path = %path.display(),
+                            "instructions file empty, skipping bootstrap inject"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            agent = %name,
+                            path = %path.display(),
+                            error = %e,
+                            "instructions file unreadable, skipping bootstrap inject"
+                        );
+                    }
+                }
             }
         }
     }
@@ -327,13 +442,17 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     Ok(())
 }
 
-/// Poll until the agent reaches Ready, then inject the instructions file
-/// contents as a first user message. Used by backends (Kiro) whose CLI does
+/// Poll until the agent reaches Ready, then inject the pre-read instructions
+/// content as a first user message. Used by backends (Kiro) whose CLI does
 /// not auto-load the steering file.
+///
+/// The `content` is captured at spawn time (see call site) rather than
+/// re-read after Ready: this closes the mutation window where an external
+/// process could swap the instructions file between write and inject.
 fn spawn_instructions_bootstrap(
     registry: AgentRegistry,
     name: String,
-    instructions_path: std::path::PathBuf,
+    content: String,
     timeout: std::time::Duration,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
@@ -357,10 +476,10 @@ fn spawn_instructions_bootstrap(
             }
 
             let ready = {
-                let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                let reg = crate::sync::lock_poisoned(&registry, "agent_registry");
                 match reg.get(&name) {
                     Some(h) => {
-                        let core = h.core.lock().unwrap_or_else(|e| e.into_inner());
+                        let core = crate::sync::lock_poisoned(&h.core, "agent_core");
                         core.state.get_state() == crate::state::AgentState::Ready
                     }
                     None => return, // agent gone
@@ -373,21 +492,12 @@ fn spawn_instructions_bootstrap(
         }
 
         // Small settle delay so the prompt is fully painted before we type.
+        // This is a UI-layer concern (avoiding a torn prompt paint) — the
+        // content itself was already snapshotted at spawn, so the delay no
+        // longer widens an external-mutation window.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        let content = match std::fs::read_to_string(&instructions_path) {
-            Ok(c) if !c.trim().is_empty() => c,
-            _ => {
-                tracing::warn!(
-                    agent = %name,
-                    path = %instructions_path.display(),
-                    "instructions file missing or empty, skipping bootstrap inject"
-                );
-                return;
-            }
-        };
-
-        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let reg = crate::sync::lock_poisoned(&registry, "agent_registry");
         if let Some(handle) = reg.get(&name) {
             if let Err(e) = inject_to_agent(handle, content.as_bytes()) {
                 tracing::warn!(agent = %name, error = %e, "instructions bootstrap inject failed");
@@ -480,7 +590,7 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic)
                 {
-                    let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut c = crate::sync::lock_poisoned(core, "agent_core");
                     c.vterm.process(data);
                     let stripped = strip_ansi(&String::from_utf8_lossy(data));
                     c.state.feed(&stripped);
@@ -529,7 +639,7 @@ fn handle_pty_close(
     // Wait up to 2s for process to fully exit
     let mut exit_code: Option<i32> = None;
     for _ in 0..20 {
-        let reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let reg = crate::sync::lock_poisoned(registry, "agent_registry");
         // Agent removed from registry → shutdown or explicit delete. Not a crash.
         if reg.get(name).is_none() {
             tracing::debug!(agent = name, "not in registry, skipping crash handling");
@@ -588,7 +698,13 @@ fn handle_pty_close(
         }
     }
     if let Some(ref tx) = crash_tx {
-        let _ = tx.send(name.to_string());
+        // Non-blocking send: the channel is bounded (see daemon::run), so a
+        // stalled reaper must not wedge this PTY close handler. Dropping a
+        // crash event means one agent skips auto-respawn — the next health
+        // probe will still catch a persistent failure.
+        if let Err(e) = tx.try_send(name.to_string()) {
+            tracing::warn!(agent = %name, error = %e, "crash channel full — respawn event dropped");
+        }
     }
 }
 
@@ -623,7 +739,7 @@ pub fn try_dismiss_dialog(
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 // Send keys in chunks split on \r/\n boundaries with delay between,
                 // so TUI frameworks process navigation before confirmation.
-                let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                let mut w = crate::sync::lock_poisoned(&writer, "pty_writer");
                 let mut start = 0;
                 for (i, &b) in keys.iter().enumerate() {
                     if b == b'\r' || b == b'\n' {
@@ -633,7 +749,7 @@ pub fn try_dismiss_dialog(
                             let _ = w.flush();
                             drop(w);
                             std::thread::sleep(std::time::Duration::from_millis(200));
-                            w = writer.lock().unwrap_or_else(|e| e.into_inner());
+                            w = crate::sync::lock_poisoned(&writer, "pty_writer");
                         }
                         // Send the Enter
                         let _ = w.write_all(&keys[i..=i]);
@@ -657,7 +773,7 @@ pub fn try_dismiss_dialog(
 
 /// Write data to an agent's PTY (atomic write — for attach path).
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
     w.write_all(data)
         .map_err(crate::error::AgendError::PtyWrite)?;
     w.flush().map_err(crate::error::AgendError::PtyWrite)?;
@@ -667,7 +783,7 @@ pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<
 /// Write data to an agent's PTY byte-by-byte with small delays.
 #[allow(dead_code)]
 pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
     for byte in data {
         w.write_all(&[*byte])
             .map_err(crate::error::AgendError::PtyWrite)?;
@@ -684,7 +800,7 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
 pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result<()> {
     let prefix = agent.inject_prefix.as_bytes();
     let submit = agent.submit_key.as_bytes();
-    let mut w = agent.pty_writer.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
 
     // Write prefix + text
     if agent.typed_inject {
@@ -754,7 +870,7 @@ pub fn broadcast_registry(
 pub fn subscribe_with_dump(
     agent: &AgentHandle,
 ) -> (crossbeam::channel::Receiver<Vec<u8>>, Vec<u8>) {
-    let mut core = agent.core.lock().unwrap_or_else(|e| e.into_inner());
+    let mut core = crate::sync::lock_poisoned(&agent.core, "agent_core");
     let dump = core.vterm.dump_screen();
     let (tx, rx) = crossbeam::channel::unbounded();
     core.subscribers.push(tx);
@@ -799,5 +915,32 @@ mod tests {
     #[test]
     fn strip_ansi_osc() {
         assert_eq!(strip_ansi("\x1b]0;title\x07rest"), "rest");
+    }
+
+    #[test]
+    fn sensitive_env_keys_covers_known_dangerous() {
+        assert!(is_sensitive_env_key("ANTHROPIC_API_KEY"));
+        assert!(is_sensitive_env_key("OPENAI_API_KEY"));
+        assert!(is_sensitive_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(is_sensitive_env_key("LD_PRELOAD"));
+        assert!(is_sensitive_env_key("DYLD_INSERT_LIBRARIES"));
+        assert!(is_sensitive_env_key("AGEND_HOME"));
+        assert!(is_sensitive_env_key("AGEND_MCP_TOOLS_DENY"));
+    }
+
+    #[test]
+    fn sensitive_env_keys_is_case_insensitive() {
+        // Windows env is case-insensitive; ensure lower-cased fleet.yaml keys
+        // still hit the deny-list.
+        assert!(is_sensitive_env_key("anthropic_api_key"));
+        assert!(is_sensitive_env_key("Ld_Preload"));
+    }
+
+    #[test]
+    fn sensitive_env_keys_allows_benign() {
+        assert!(!is_sensitive_env_key("MY_APP_DEBUG"));
+        assert!(!is_sensitive_env_key("LANG"));
+        assert!(!is_sensitive_env_key("TERM"));
+        assert!(!is_sensitive_env_key("PROMPT_OVERRIDE"));
     }
 }

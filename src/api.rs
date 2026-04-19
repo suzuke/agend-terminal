@@ -15,6 +15,65 @@ use std::sync::{Arc, Mutex};
 
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
+/// Validate a caller-supplied `working_directory` against the AGEND_HOME and
+/// (optionally) `AGEND_ALLOWED_WORK_ROOTS` — a platform-native path list
+/// (`:`-separated on Unix, `;`-separated on Windows, same rules as `PATH`).
+///
+/// Rules:
+/// - Path must not contain `..` components (blocks relative escape regardless
+///   of whether the target exists).
+/// - After canonicalising the deepest existing ancestor, the resolved path
+///   must start with one of the allowed roots. This catches symlink escape
+///   inside an otherwise-legal prefix.
+///
+/// Returns the resolved `PathBuf` on success. The caller is responsible for
+/// creating the directory.
+pub fn validate_working_directory(
+    path: &std::path::Path,
+    home: &std::path::Path,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        anyhow::bail!("working_directory must not contain '..'");
+    }
+    // Walk up to the deepest existing ancestor for canonicalisation. A path
+    // pointing into a not-yet-created subdirectory is legal as long as its
+    // existing prefix is inside an allowed root.
+    let mut existing = path.to_path_buf();
+    while !existing.as_os_str().is_empty() && !existing.exists() {
+        if !existing.pop() {
+            break;
+        }
+    }
+    let anchor = if existing.as_os_str().is_empty() {
+        PathBuf::from("/")
+    } else {
+        std::fs::canonicalize(&existing).unwrap_or(existing.clone())
+    };
+    let tail = path.strip_prefix(&existing).unwrap_or(path);
+    let resolved = anchor.join(tail);
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.push(std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
+    if let Some(extra) = std::env::var_os("AGEND_ALLOWED_WORK_ROOTS") {
+        // `split_paths` uses the OS-native separator — `:` on Unix, `;` on
+        // Windows. Raw `split(':')` broke Windows because `C:\...` paths
+        // already contain a colon after the drive letter.
+        for pb in std::env::split_paths(&extra).filter(|p| !p.as_os_str().is_empty()) {
+            roots.push(std::fs::canonicalize(&pb).unwrap_or(pb));
+        }
+    }
+    for root in &roots {
+        if resolved.starts_with(root) {
+            return Ok(resolved);
+        }
+    }
+    anyhow::bail!(
+        "working_directory '{}' escapes allowed roots (set AGEND_ALLOWED_WORK_ROOTS to widen)",
+        resolved.display()
+    )
+}
+
 /// API method name constants — single source of truth for the NDJSON protocol.
 pub mod method {
     pub const LIST: &str = "list";
@@ -57,25 +116,54 @@ pub fn serve(
         tracing::warn!(error = %e, "failed to publish API port");
         return;
     }
+    // P1-10: Load the per-daemon auth cookie (already issued by
+    // `daemon::run` / `verify::run` before any server thread spawned). If
+    // it's missing we fail closed — running without auth would be worse
+    // than not serving.
+    let cookie = match crate::auth_cookie::read_cookie(&run_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "api.cookie missing; aborting serve");
+            return;
+        }
+    };
     tracing::info!(port, "API listening");
 
     for stream in listener.incoming().flatten() {
         let _ = stream.set_nodelay(true);
+        // Slow-client hardening: set read/write deadlines so a stalled peer
+        // cannot pin a session thread indefinitely. 30s is generous for a
+        // JSON request line; control-plane calls are never slow on purpose.
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         let reg = Arc::clone(&registry);
         let home = home.to_path_buf();
         let shutdown = Arc::clone(&shutdown);
         let cfgs = Arc::clone(&configs);
         let ext = Arc::clone(&externals);
         let tui = tui_tx.clone();
+        // Cookie is `[u8; 32]` (Copy), each session gets its own copy so the
+        // spawned closure satisfies `'static`.
+        let session_cookie = cookie;
         std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
-                handle_session(stream, &reg, &home, &shutdown, &cfgs, &ext, tui.as_ref())
+                handle_session(
+                    stream,
+                    &reg,
+                    &home,
+                    &shutdown,
+                    &cfgs,
+                    &ext,
+                    tui.as_ref(),
+                    session_cookie,
+                )
             })
             .ok();
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_session(
     stream: TcpStream,
     registry: &AgentRegistry,
@@ -84,6 +172,7 @@ fn handle_session(
     configs: &ConfigRegistry,
     externals: &ExternalRegistry,
     tui_tx: Option<&crate::app::TuiEventSender>,
+    cookie: crate::auth_cookie::Cookie,
 ) {
     let cloned = match stream.try_clone() {
         Ok(c) => c,
@@ -94,6 +183,14 @@ fn handle_session(
     };
     let mut reader = BufReader::new(cloned);
     let mut writer = stream;
+
+    // P1-10 gate: first NDJSON line must be `{"auth":"<hex>"}`. Read deadline
+    // on the stream (set in `serve`) ensures a silent peer closes out in 30s
+    // rather than pinning this worker thread.
+    if let Err(e) = crate::auth_cookie::server_handshake_ndjson(&mut reader, &mut writer, &cookie) {
+        tracing::warn!(error = %e, "API auth rejected");
+        return;
+    }
 
     loop {
         let mut line = String::new();
@@ -197,7 +294,7 @@ fn handle_session(
                         if let Ok(mut core) = handle.core.lock() {
                             core.state.set_restarting();
                         }
-                        let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut child = crate::sync::lock_poisoned(&handle.child, "api_child");
                         let _ = child.kill();
                         drop(child);
                         drop(reg);
@@ -238,17 +335,14 @@ fn handle_session(
                 // handler from sending a crash event (agent not in registry = no crash).
                 let mut reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(name) {
-                    let mut child = handle.child.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut child = crate::sync::lock_poisoned(&handle.child, "api_child");
                     let _ = child.kill();
                     drop(child);
                 }
                 reg.remove(name);
                 drop(reg);
                 // Then remove config (no race: agent already gone from registry)
-                configs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(name);
+                crate::sync::lock_poisoned(configs, "api_configs").remove(name);
                 // Cleanup the agent's published port file
                 crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
                 crate::event_log::log(home, "delete", name, "deleted via API");
@@ -304,10 +398,18 @@ fn handle_session(
                     .as_str()
                     .map(|s| s.split_whitespace().map(String::from).collect())
                     .unwrap_or_default();
-                let work_dir = params["working_directory"]
+                let requested_work_dir = params["working_directory"]
                     .as_str()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| home.join("workspace").join(name));
+                let work_dir = match validate_working_directory(&requested_work_dir, home) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ =
+                            writeln!(writer, "{}", json!({"ok": false, "error": format!("{e}")}));
+                        continue;
+                    }
+                };
                 let size = crossterm::terminal::size().unwrap_or((120, 40));
 
                 match spawn_one(home, registry, name, command, &args, &work_dir, size) {
@@ -715,12 +817,25 @@ fn spawn_one(
 }
 
 /// Send a request to the daemon API and read one NDJSON response.
+///
+/// Performs the P1-10 cookie handshake first: reads `api.cookie` from the
+/// active daemon's run dir, sends `{"auth":"<hex>"}`, and rejects the call
+/// if the server does not reply `{"ok":true}`. The cookie file has mode
+/// 0600 so only the daemon's user can read it — this is the peer-UID
+/// substitute for TCP loopback (see `auth_cookie.rs`).
 pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
-    let mut stream = crate::ipc::connect_api(home)?;
-    writeln!(stream, "{}", request)?;
-    stream.flush()?;
+    let stream = crate::ipc::connect_api(home)?;
+    let run = crate::daemon::find_active_run_dir(home)
+        .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;
+    let cookie = crate::auth_cookie::read_cookie(&run)?;
 
+    let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
+    crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &cookie)?;
+
+    writeln!(writer, "{}", request)?;
+    writer.flush()?;
+
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let resp: Value = serde_json::from_str(line.trim())?;
@@ -731,6 +846,14 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that mutate `AGEND_ALLOWED_WORK_ROOTS` — env mutation
+    /// from parallel tests races otherwise.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        crate::sync::lock_poisoned(LOCK.get_or_init(|| Mutex::new(())), "api_env_guard")
+    }
 
     fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -744,6 +867,108 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    #[test]
+    fn validate_work_dir_rejects_parent_dir() {
+        let home = tmp_home("validate_parent");
+        let bad = home.join("..").join("escape");
+        let err = validate_working_directory(&bad, &home).unwrap_err();
+        assert!(
+            format!("{err}").contains(".."),
+            "expected parent-dir rejection, got: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn validate_work_dir_allows_under_home() {
+        let home = tmp_home("validate_home");
+        let ok = home.join("workspace").join("agent");
+        let resolved =
+            validate_working_directory(&ok, &home).expect("path under home must validate");
+        assert!(resolved.starts_with(std::fs::canonicalize(&home).unwrap()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn validate_work_dir_rejects_outside_home() {
+        let _g = env_guard();
+        let home = tmp_home("validate_outside");
+        // Pick a path that definitely exists and is not under home.
+        let outside = std::path::PathBuf::from("/tmp");
+        // Ensure AGEND_ALLOWED_WORK_ROOTS isn't accidentally opening this up.
+        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
+        std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS");
+        let err = validate_working_directory(&outside, &home).unwrap_err();
+        if let Some(v) = prev {
+            std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v);
+        }
+        assert!(
+            format!("{err}").contains("escapes"),
+            "expected escape rejection, got: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn validate_work_dir_honors_allowed_roots_env() {
+        let _g = env_guard();
+        let home = tmp_home("validate_env_root");
+        let root = std::env::temp_dir().join(format!(
+            "agend-extra-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).expect("mkdir extra root");
+        let inside = root.join("agent");
+        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
+        std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", root.display().to_string());
+        let result = validate_working_directory(&inside, &home);
+        match prev {
+            Some(v) => std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v),
+            None => std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS"),
+        }
+        result.expect("path under AGEND_ALLOWED_WORK_ROOTS must validate");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_work_dir_rejects_symlink_escape() {
+        // Stage 4 P1-8 regression guard: a symlink inside an allowed root
+        // pointing OUT of all allowed roots must be rejected after canonicalisation.
+        let _g = env_guard();
+        let home = tmp_home("validate_symlink_escape");
+        // Create a symlink at `{home}/escape` → /tmp (outside any allowed root).
+        let target = std::path::PathBuf::from("/tmp");
+        let link = home.join("escape");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
+        std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS");
+        // Request a path *under* the symlink. After canonicalisation it should
+        // resolve outside `home` and be rejected.
+        let requested = link.join("agent");
+        let result = validate_working_directory(&requested, &home);
+        if let Some(v) = prev {
+            std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v);
+        }
+        match result {
+            Ok(resolved) => panic!(
+                "expected symlink escape rejection, but validated as {}",
+                resolved.display()
+            ),
+            Err(e) => assert!(
+                format!("{e}").contains("escapes"),
+                "expected escape rejection, got: {e}"
+            ),
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

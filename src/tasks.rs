@@ -21,7 +21,16 @@ pub struct Task {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TaskStore {
+    #[serde(default)]
+    schema_version: u32,
     tasks: Vec<Task>,
+}
+
+impl crate::store::SchemaVersioned for TaskStore {
+    const CURRENT: u32 = 1;
+    fn version_mut(&mut self) -> &mut u32 {
+        &mut self.schema_version
+    }
 }
 
 fn store_path(home: &Path) -> std::path::PathBuf {
@@ -29,7 +38,10 @@ fn store_path(home: &Path) -> std::path::PathBuf {
 }
 
 fn load(home: &Path) -> TaskStore {
-    crate::store::load(&store_path(home))
+    crate::store::load_versioned(
+        &store_path(home),
+        <TaskStore as crate::store::SchemaVersioned>::CURRENT,
+    )
 }
 
 /// Return all tasks as typed structs (no JSON round-trip).
@@ -71,7 +83,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 created_at: now.clone(),
                 updated_at: now,
             };
-            match crate::store::mutate(&store_path(home), |store: &mut TaskStore| {
+            match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 store.tasks.push(task);
                 Ok(())
             }) {
@@ -97,7 +109,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 None => return serde_json::json!({"error": "missing 'id'"}),
             };
             let iname = instance_name.to_string();
-            match crate::store::mutate(&store_path(home), |store: &mut TaskStore| {
+            match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
                         task.status = "claimed".to_string();
@@ -121,7 +133,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 None => return serde_json::json!({"error": "missing 'id'"}),
             };
             let result_text = args["result"].as_str().map(String::from);
-            match crate::store::mutate(&store_path(home), |store: &mut TaskStore| {
+            match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
                         task.status = "done".to_string();
@@ -145,7 +157,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let new_status = args["status"].as_str().map(String::from);
             let new_priority = args["priority"].as_str().map(String::from);
             let new_assignee = args["assignee"].as_str().map(String::from);
-            match crate::store::mutate(&store_path(home), |store: &mut TaskStore| {
+            match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
                         if let Some(ref s) = new_status {

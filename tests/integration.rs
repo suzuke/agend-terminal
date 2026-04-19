@@ -82,15 +82,59 @@ impl TestDaemon {
         None
     }
 
-    fn api_call(&self, request: &serde_json::Value) -> serde_json::Value {
+    /// Read the 32-byte cookie the daemon published in its run dir. Tests
+    /// speak raw TCP so they must present it manually (unlike production
+    /// clients which go through `ipc::connect_api`/`auth_cookie`).
+    fn find_api_cookie(home: &Path) -> Option<Vec<u8>> {
+        let run = home.join("run");
+        for entry in std::fs::read_dir(&run).ok()?.flatten() {
+            let p = entry.path().join("api.cookie");
+            if let Ok(bytes) = std::fs::read(&p) {
+                if bytes.len() == 32 {
+                    return Some(bytes);
+                }
+            }
+        }
+        None
+    }
+
+    /// Open a TCP connection to the API port and complete the NDJSON cookie
+    /// handshake. Returns the reader/writer pair primed for the first real
+    /// request.
+    fn connect_authed(&self) -> (BufReader<TcpStream>, TcpStream) {
         let port = Self::find_api_port(&self.home).expect("api port");
-        let mut stream =
+        let cookie = Self::find_api_cookie(&self.home).expect("api.cookie");
+        let stream =
             TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        writeln!(stream, "{}", request).expect("write");
-        stream.flush().expect("flush");
+        let mut writer = stream.try_clone().expect("clone");
         let mut reader = BufReader::new(stream);
+        let hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
+        writeln!(writer, "{{\"auth\":\"{}\"}}", hex).expect("write auth");
+        writer.flush().expect("flush auth");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read auth reply");
+        let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse auth reply");
+        assert_eq!(resp["ok"], true, "auth handshake failed: {resp}");
+        (reader, writer)
+    }
+
+    fn api_call(&self, request: &serde_json::Value) -> serde_json::Value {
+        let (mut reader, mut writer) = self.connect_authed();
+        writeln!(writer, "{}", request).expect("write");
+        writer.flush().expect("flush");
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read");
+        serde_json::from_str(line.trim()).expect("parse response")
+    }
+
+    /// Send a raw line (not pre-serialised JSON) and read one NDJSON response.
+    /// Used to probe the parse-error path — `api_call` can only send valid JSON.
+    fn api_call_raw(&self, raw_line: &str) -> serde_json::Value {
+        let (mut reader, mut writer) = self.connect_authed();
+        writeln!(writer, "{}", raw_line).expect("write");
+        writer.flush().expect("flush");
         let mut line = String::new();
         reader.read_line(&mut line).expect("read");
         serde_json::from_str(line.trim()).expect("parse response")
@@ -126,6 +170,142 @@ fn test_daemon_list_and_status() {
     let agents = resp["result"]["agents"].as_array().expect("agents");
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["name"], "shell");
+    daemon.stop();
+}
+
+#[test]
+fn test_api_error_paths() {
+    // Consolidated happy-path + error-path coverage for the JSON API so we
+    // don't pay one daemon-startup-cost per assertion.
+    let mut daemon = TestDaemon::start("api_errors");
+
+    // Malformed JSON → parse-error response, socket stays live.
+    let resp = daemon.api_call_raw("{this-is-not-json");
+    assert_eq!(resp["ok"], false, "parse error should set ok=false");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("parse"),
+        "expected parse error, got: {resp}"
+    );
+
+    // Unknown method → the dispatch falls through to the default branch.
+    // The test doesn't pin the exact error text (that can evolve); it only
+    // asserts ok=false.
+    let resp = daemon.api_call(&serde_json::json!({"method": "definitely_not_a_method"}));
+    assert_eq!(resp["ok"], false, "unknown method should set ok=false");
+
+    // INJECT with an invalid name (contains "/") — validate_name rejects.
+    let resp = daemon.api_call(&serde_json::json!({
+        "method": "inject",
+        "params": {"name": "bad/name", "data": "x"}
+    }));
+    assert_eq!(resp["ok"], false);
+    assert!(
+        resp["error"].as_str().is_some(),
+        "expected validation error text, got: {resp}"
+    );
+
+    // DELETE an unknown agent — the delete dispatcher removes from external
+    // first (no-op), then from managed (no-op). The current implementation
+    // returns ok:true even when nothing was there, which matches the
+    // intentionally-idempotent semantics documented at the call site. Lock
+    // that behaviour in as a test so a future change to strict-mode delete
+    // is forced to revisit callers.
+    let resp =
+        daemon.api_call(&serde_json::json!({"method": "delete", "params": {"name": "ghost"}}));
+    assert_eq!(
+        resp["ok"], true,
+        "delete of unknown name is idempotent; got: {resp}"
+    );
+
+    // SEND with from == target — self-send is rejected.
+    let resp = daemon.api_call(&serde_json::json!({
+        "method": "send",
+        "params": {"from": "shell", "target": "shell", "text": "hi"}
+    }));
+    assert_eq!(resp["ok"], false, "self-send must be rejected");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("self"),
+        "expected self-send error, got: {resp}"
+    );
+
+    // SPAWN for an already-registered name → dedup rejection.
+    let resp = daemon.api_call(&serde_json::json!({
+        "method": "spawn",
+        "params": {"name": "shell", "backend": "shell:/bin/sh"}
+    }));
+    assert_eq!(resp["ok"], false, "duplicate spawn must be rejected");
+    assert!(
+        resp["error"].as_str().unwrap_or("").contains("exists"),
+        "expected 'already exists' error, got: {resp}"
+    );
+
+    daemon.stop();
+}
+
+/// P1-10: verify the daemon rejects a TCP peer that cannot present the
+/// cookie (no auth / bad auth). Complements the unit tests in
+/// `src/auth_cookie.rs` — this exercises the full end-to-end path including
+/// the TCP listener and the `handle_session` gate.
+#[test]
+fn test_api_rejects_connection_without_cookie() {
+    let mut daemon = TestDaemon::start("auth_missing");
+    let port = TestDaemon::find_api_port(&daemon.home).expect("api port");
+    let mut stream =
+        TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
+    stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    // Send a command line directly — no {"auth":...} first. Server's first-line
+    // handshake must treat this as malformed/missing auth and close.
+    writeln!(stream, r#"{{"method":"list"}}"#).expect("write");
+    stream.flush().expect("flush");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read reply");
+    let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse");
+    assert_eq!(
+        resp["ok"], false,
+        "server must reject unauthenticated request, got: {resp}"
+    );
+    // Second read should see EOF — server closed after the auth failure.
+    let mut tail = String::new();
+    let n = reader.read_line(&mut tail).expect("second read");
+    assert_eq!(n, 0, "server should close after auth failure; got: {tail}");
+    daemon.stop();
+}
+
+#[test]
+fn test_api_rejects_connection_with_wrong_cookie() {
+    let mut daemon = TestDaemon::start("auth_wrong");
+    let port = TestDaemon::find_api_port(&daemon.home).expect("api port");
+    let mut stream =
+        TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
+    stream.set_nodelay(true).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    // 64 hex chars of a cookie the daemon never issued.
+    let fake_hex = "a".repeat(64);
+    writeln!(stream, r#"{{"auth":"{}"}}"#, fake_hex).expect("write");
+    stream.flush().expect("flush");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read reply");
+    let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse");
+    assert_eq!(resp["ok"], false, "wrong cookie must be rejected");
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains("auth"),
+        "expected auth error, got: {resp}"
+    );
     daemon.stop();
 }
 
