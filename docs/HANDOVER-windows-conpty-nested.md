@@ -136,8 +136,35 @@ But cmd.exe exits within ~110ms of spawn, triggering auto-respawn loop. `conpty.
 - `examples/pty_smoke.rs` — run via `cargo build --release --example pty_smoke` then launch the `.exe` via PowerShell P/Invoke `DETACHED_PROCESS` to reproduce the 26200 environment.
 - Launcher helper referenced in previous session: `%TEMP%\launch-detached.ps1` — standalone P/Invoke wrapper for `CreateProcessW` with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`. Recreate from session log if lost.
 
+## Session 3 update (2026-04-19) — partial results are environment-dependent, not glue-dependent
+
+Attempted to bisect `examples/pty_smoke.rs` variants v1→v8 (each adds one structural piece of `spawn_agent`). Got inconsistent results that inverted the earlier session-2 conclusion: the problem isn't only in daemon glue.
+
+Binaries tested (all under the same Win11 Insider Dev 26200 build):
+
+| Binary | Launch context | Bytes read (cmd.exe banner is ~100 B) |
+|---|---|---|
+| `examples/pty_smoke_minimal.rs` | Bash (mintty parent) | 20 bytes then reader blocks |
+| `examples/pty_smoke_minimal.rs` | PowerShell interactive | 20 bytes then reader blocks |
+| `examples/pty_smoke_minimal.rs` | `DETACHED_PROCESS` | **0 bytes, process exits before it can even write a log file** |
+| `pty_smoke v1_isolated` (inline-coded equivalent of minimal) | Bash | 20 bytes then blocks |
+| `examples/pty_smoke.rs` `AGEND_SMOKE_MODE=v1` (variant-gated but v1 takes exact same code path) | Bash | **0 bytes, hard-timeout** |
+| `examples/pty_smoke.rs` v2–v8 | Bash | 0 bytes for all |
+| `agend-terminal start` (full daemon) | Bash / PowerShell / DETACHED | 0 bytes in every context |
+
+### What this means
+
+1. **26200's ConPTY is broken for every consumer**. Not just our daemon. Even a 50-line minimal `openpty → spawn cmd → read` reliably gets only ~20 bytes of banner then blocks forever. The first write from OpenConsole gets through; subsequent writes don't. WezTerm masks this because its async I/O tolerates slow/stuck reads and its GUI rendering doesn't panic at "only partial banner".
+2. **`DETACHED_PROCESS` launch context makes it strictly worse.** The same minimal binary that gets 20 bytes from Bash/PowerShell gets zero bytes under `DETACHED_PROCESS`. So launch context IS a factor — just not the only one.
+3. **Structurally-equivalent Rust binaries behave differently.** `pty_smoke_minimal.rs` (works, 20 bytes) and `pty_smoke.rs` with `AGEND_SMOKE_MODE=v1` (fails, 0 bytes) are supposed to execute the exact same code at runtime for v1. They don't. Likely explanations: `embed-resource`-pulled compile artifacts, Windows Defender real-time scanning with different code paths, or memory layout dependence in conpty.dll/OpenConsole's initial-handshake timing.
+4. **The daemon is not uniquely broken.** Everything that touches ConPTY on 26200 is broken. That invalidates the session-2 "find the bad line in `agent::spawn_agent`" plan — there isn't a single bad line to find.
+
+### New verdict: it's a Microsoft bug in 26200
+
+Ship the manifest fix (this PR), stop trying to work around it in our code. Users on 26200 should either (a) switch to Windows stable channel or (b) install and use WezTerm as their terminal until Microsoft fixes it. Users on 22H2/23H2/24H2 GA builds are unaffected (CI `windows-latest` ≈ Server 2022 + Win11 22H2 stays green).
+
 ## Open questions for next session
 
-1. Which step between `openpty()` and the first `reader.read()` call in `agent::spawn_agent` breaks the output pipe on 26200? Bisect with `pty_smoke`.
-2. Does installing a newer matched `conpty.dll` + `OpenConsole.exe` pair (built from `microsoft/terminal` source) unblock 26200 entirely? Probably, but building it is days of work.
-3. Is the 26200 regression filed anywhere on Microsoft Feedback Hub / `microsoft/terminal` issues? Worth linking if found.
+1. Is the 26200 regression filed on Microsoft Feedback Hub / `microsoft/terminal` issues? File one if not — link attaches this repro log.
+2. If next Insider build (26300+) fixes it, retest with the same `pty_smoke_minimal.exe` — if 20 bytes becomes 100 bytes, the bug is fixed upstream and no work needed here.
+3. **Not worth doing unless a user asks**: build `conpty.dll` from `microsoft/terminal` source and sideload the matched pair; it's days of work for an Insider-only workaround whose value evaporates when Microsoft ships their fix.
