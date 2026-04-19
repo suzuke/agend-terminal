@@ -404,11 +404,7 @@ mod tests {
             AgentState::Crashed,
         ] {
             assert!(
-                !h.check_awaiting_operator(
-                    s,
-                    Duration::from_secs(60),
-                    Duration::from_secs(1)
-                ),
+                !h.check_awaiting_operator(s, Duration::from_secs(60), Duration::from_secs(1)),
                 "state {:?} should not trigger awaiting_operator",
                 s
             );

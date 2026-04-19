@@ -387,10 +387,16 @@ mod tests {
     fn test_acquire_file_lock_no_truncate_preserves_lock_contents() {
         // Write a sentinel into the lock file, then re-acquire. The new
         // opener must NOT wipe the contents (we removed truncate(true)).
+        // Release the lock before reading: on Windows, `LockFileEx` is a
+        // byte-range lock that blocks reads from *any* handle, so the
+        // assertion-time read would otherwise fail there with ERROR_LOCK_VIOLATION.
+        // The semantic we care about — "open-with-truncate=false did not wipe
+        // content" — is decided during acquisition and survives the drop.
         let dir = tmp_dir("flock_no_trunc");
         let lock_path = dir.join("my.lock");
         fs::write(&lock_path, "sentinel").expect("pre-write");
-        let _guard = acquire_file_lock(&lock_path).expect("lock");
+        let guard = acquire_file_lock(&lock_path).expect("lock");
+        drop(guard);
         let after = fs::read_to_string(&lock_path).expect("read");
         assert_eq!(after, "sentinel", "lock acquisition must not truncate");
         fs::remove_dir_all(&dir).ok();
