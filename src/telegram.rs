@@ -354,7 +354,8 @@ fn list_response_is_awaiting(resp: &serde_json::Value, instance_name: &str) -> b
     resp["result"]["agents"]
         .as_array()
         .and_then(|arr| {
-            arr.iter().find(|a| a["name"].as_str() == Some(instance_name))
+            arr.iter()
+                .find(|a| a["name"].as_str() == Some(instance_name))
         })
         .and_then(|a| a["agent_state"].as_str())
         .map(|s| s == crate::state::AgentState::AwaitingOperator.display_name())

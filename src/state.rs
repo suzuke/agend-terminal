@@ -623,7 +623,10 @@ mod tests {
 
     #[test]
     fn awaiting_operator_display_name() {
-        assert_eq!(AgentState::AwaitingOperator.display_name(), "awaiting_operator");
+        assert_eq!(
+            AgentState::AwaitingOperator.display_name(),
+            "awaiting_operator"
+        );
     }
 
     #[test]

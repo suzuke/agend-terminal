@@ -239,7 +239,10 @@ impl VTerm {
 
         // Trim blank lines at both ends so terse output doesn't look padded
         // and tail-N doesn't return the scroll buffer's trailing whitespace.
-        let first = lines.iter().position(|l| !l.is_empty()).unwrap_or(lines.len());
+        let first = lines
+            .iter()
+            .position(|l| !l.is_empty())
+            .unwrap_or(lines.len());
         let last = lines
             .iter()
             .rposition(|l| !l.is_empty())
