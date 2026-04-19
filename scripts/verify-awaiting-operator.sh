@@ -59,27 +59,42 @@ for _ in 1 2 3 4 5 6; do
 done
 [[ -n "$API_PORT_FILE" ]] || fail "api.port never appeared (daemon crashed? see $TEST_HOME/daemon.log)"
 API_PORT="$(cat "$API_PORT_FILE")"
+API_COOKIE_FILE="$(dirname "$API_PORT_FILE")/api.cookie"
+[[ -f "$API_COOKIE_FILE" ]] || fail "api.cookie missing at $API_COOKIE_FILE (Stage 8 auth regression?)"
 green "  ok (api port $API_PORT)"
 
-# Helper: send a single NDJSON request, read one NDJSON reply line.
+# Helper: send a single NDJSON request after the Stage 8 cookie handshake.
 # Usage: rpc '{"method":"list"}'
 rpc() {
-    python3 - "$API_PORT" "$1" <<'PY'
+    python3 - "$API_PORT" "$API_COOKIE_FILE" "$1" <<'PY'
 import json, socket, sys
 port = int(sys.argv[1])
-req = sys.argv[2]
+cookie_path = sys.argv[2]
+req = sys.argv[3]
+with open(cookie_path, "rb") as f:
+    cookie_bytes = f.read()
+cookie_hex = cookie_bytes.hex()
 s = socket.create_connection(("127.0.0.1", port), timeout=3.0)
-s.sendall((req + "\n").encode())
-buf = b""
 s.settimeout(3.0)
-while b"\n" not in buf:
-    chunk = s.recv(4096)
-    if not chunk:
-        break
-    buf += chunk
+def send_line(payload):
+    s.sendall((payload + "\n").encode())
+def recv_line():
+    buf = b""
+    while b"\n" not in buf:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    return buf.decode().splitlines()[0] if buf else ""
+# Stage 8 handshake: first line auths the whole session.
+send_line(json.dumps({"auth": cookie_hex}))
+auth_resp = recv_line()
+if json.loads(auth_resp).get("ok") is not True:
+    print(auth_resp)
+    sys.exit(0)
+send_line(req)
+print(recv_line())
 s.close()
-line = buf.decode().splitlines()[0]
-print(line)
 PY
 }
 
@@ -109,10 +124,14 @@ info "verify cat echoed the raw bytes back through its PTY"
 AGENT_PORT_FILE="$(find "$TEST_HOME/run" -name silent.port -type f 2>/dev/null | head -1 || true)"
 [[ -n "$AGENT_PORT_FILE" ]] || fail "agent TUI port file not found"
 AGENT_PORT="$(cat "$AGENT_PORT_FILE")"
-PTY_DUMP="$(python3 - "$AGENT_PORT" <<'PY'
+PTY_DUMP="$(python3 - "$AGENT_PORT" "$API_COOKIE_FILE" <<'PY'
 import socket, sys
 port = int(sys.argv[1])
+with open(sys.argv[2], "rb") as f:
+    cookie = f.read()
 s = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+# TUI socket auth: 32 raw cookie bytes before any stream reads.
+s.sendall(cookie)
 s.settimeout(1.5)
 buf = b""
 try:
