@@ -805,11 +805,46 @@ fn accept_loop(
 }
 
 fn wait_for_child(pid: u32, ev_tx: Sender<Event>) {
+    // Two ways a child can become unwatchable:
+    //
+    //   a) It was reaped elsewhere (e.g. `stop_child`'s `Child::try_wait`)
+    //      — the PID is fully gone, `kill(pid, 0)` returns ESRCH.
+    //   b) It exited but we (the parent) haven't reaped yet — a zombie. In
+    //      this state `kill(pid, 0)` still returns success because the PID
+    //      entry lingers until waitpid. Polling `kill(0)` alone misses
+    //      this case and the stability/ready windows stay blind to
+    //      crashes.
+    //
+    // We therefore try `waitpid(pid, WNOHANG)` first. When it returns a
+    // positive value the child has just exited *and we reaped it*; when
+    // it returns -1/ECHILD another call site already reaped (harmless
+    // race with `Child::try_wait`). Only if neither happened do we fall
+    // back to `kill(0)` for belt-and-braces defence.
     loop {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            let _ = ev_tx.send(Event::Exited {
+                pid,
+                detail: format!("exited (waitpid status {status:#x})"),
+            });
+            return;
+        }
+        if r < 0 {
+            let last = std::io::Error::last_os_error();
+            if last.raw_os_error() == Some(libc::ECHILD) {
+                let _ = ev_tx.send(Event::Exited {
+                    pid,
+                    detail: "already reaped elsewhere".into(),
+                });
+                return;
+            }
+            // Other errors (EINTR) — retry after a tick.
+        }
         if !is_alive(pid) {
             let _ = ev_tx.send(Event::Exited {
                 pid,
-                detail: "process exited".into(),
+                detail: "process gone (kill=ESRCH)".into(),
             });
             return;
         }
