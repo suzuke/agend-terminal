@@ -331,7 +331,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
 
     let core = Arc::new(Mutex::new(AgentCore {
-        vterm: VTerm::new(*cols, *rows),
+        vterm: VTerm::with_pty_writer(*cols, *rows, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),
         state: StateTracker::new(detected_backend.as_ref()),
         health: HealthTracker::new(),
@@ -542,14 +542,39 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
     let mut buf = [0u8; 8192];
     let mut detect_buf = Vec::with_capacity(4096);
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
+    let debug_reads = std::env::var("AGEND_DEBUG_PTY_READ").is_ok();
+    let mut read_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
 
     loop {
         match pty_reader.read(&mut buf) {
             Ok(0) => {
+                if debug_reads {
+                    eprintln!(
+                        "[pty_read {name}] EOF after {read_count} reads, {total_bytes} bytes"
+                    );
+                }
                 handle_pty_close(name, registry, home, crash_tx, shutdown);
                 break;
             }
             Ok(n_bytes) => {
+                if debug_reads {
+                    read_count += 1;
+                    total_bytes += n_bytes as u64;
+                    let snip: String = buf[..n_bytes.min(64)]
+                        .iter()
+                        .map(|b| {
+                            if b.is_ascii_graphic() || *b == b' ' {
+                                (*b as char).to_string()
+                            } else {
+                                format!("\\x{:02x}", b)
+                            }
+                        })
+                        .collect();
+                    eprintln!(
+                        "[pty_read {name}] read#{read_count} {n_bytes}B total={total_bytes} first64={snip}"
+                    );
+                }
                 let data = &buf[..n_bytes];
 
                 // Auto-dismiss trust/update dialogs (cooldown: 10s after last dismiss)
@@ -577,7 +602,14 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
                     c.subscribers.retain(|tx| tx.send(data.to_vec()).is_ok());
                 }
             }
-            Err(_) => break,
+            Err(e) => {
+                if debug_reads {
+                    eprintln!(
+                        "[pty_read {name}] ERR after {read_count} reads, {total_bytes} bytes: {e}"
+                    );
+                }
+                break;
+            }
         }
     }
 }

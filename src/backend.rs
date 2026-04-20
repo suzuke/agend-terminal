@@ -397,13 +397,16 @@ impl Backend {
     }
 
     /// Check if the backend binary is in PATH.
+    ///
+    /// Uses the `which` crate so Windows honors `PATHEXT` (npm-installed
+    /// backends live at `claude.cmd`, `codex.ps1`, etc., not bare
+    /// `claude`). The previous implementation shelled out to a `which`
+    /// binary that isn't in the default Windows PATH, so this always
+    /// reported "not installed" on Windows even when the backend was
+    /// working fine.
     pub fn is_installed(&self) -> bool {
         let preset = self.preset();
-        std::process::Command::new("which")
-            .arg(preset.command)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        which::which(preset.command).is_ok()
     }
 
     /// Get installed version via --version. Returns None if not installed.
@@ -626,7 +629,18 @@ mod tests {
         // Whatever $SHELL is in test env, result must be non-empty.
         let cmd = Backend::Shell.command_string();
         assert!(!cmd.is_empty());
-        assert!(cmd.starts_with('/') || cmd == "/bin/sh");
+        // Unix: `/bin/bash`, `/bin/zsh`, etc.; fallback `/bin/sh`. Windows
+        // under Git Bash translates POSIX SHELL into a Win32 path like
+        // `C:\Program Files\Git\bin\bash.exe` before the child sees it, so
+        // accept drive-letter paths too. CI's plain PowerShell doesn't do
+        // the translation, which is why this test was green on windows-latest
+        // but failed when run locally through Git Bash.
+        let unixish = cmd.starts_with('/');
+        let winish = cmd.chars().nth(1) == Some(':') && cmd.chars().nth(2) == Some('\\');
+        assert!(
+            unixish || winish,
+            "unexpected shell path shape: {cmd:?}"
+        );
     }
 
     #[test]
