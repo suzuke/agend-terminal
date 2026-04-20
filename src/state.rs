@@ -340,10 +340,8 @@ fn is_generic_startup_prompt(text: &str) -> bool {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         // Case-insensitive so `(Y/n)` etc. hit the same token set.
-        Regex::new(
-            r"(?i)\(y/n\)|\(yes/no\)|\[y/n\]|press\s+(enter|return|any\s+key)",
-        )
-        .expect("generic startup prompt regex compiles")
+        Regex::new(r"(?i)\(y/n\)|\(yes/no\)|\[y/n\]|press\s+(enter|return|any\s+key)")
+            .expect("generic startup prompt regex compiles")
     });
     re.is_match(text)
 }
@@ -710,7 +708,9 @@ mod tests {
     fn generic_startup_prompt_rejects_ordinary_prose() {
         // Question marks and colons alone must not trigger — AI model
         // output is full of these.
-        assert!(!is_generic_startup_prompt("Should I continue with the refactor?"));
+        assert!(!is_generic_startup_prompt(
+            "Should I continue with the refactor?"
+        ));
         assert!(!is_generic_startup_prompt("Next steps:"));
         assert!(!is_generic_startup_prompt("Select: option A vs option B"));
         assert!(!is_generic_startup_prompt("Type your message"));
@@ -1361,13 +1361,13 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn replay_manifest_regression() {
-        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/state-replay");
+        let fixtures_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-replay");
         let manifest_path = fixtures_dir.join("MANIFEST.yaml");
         let raw = std::fs::read_to_string(&manifest_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
-        let manifest: ReplayManifest = serde_yaml::from_str(&raw)
-            .unwrap_or_else(|e| panic!("parse MANIFEST.yaml: {e}"));
+        let manifest: ReplayManifest =
+            serde_yaml::from_str(&raw).unwrap_or_else(|e| panic!("parse MANIFEST.yaml: {e}"));
 
         assert!(
             !manifest.fixtures.is_empty(),
@@ -1395,8 +1395,11 @@ mod tests {
                 }
             }
 
-            let expected: Vec<AgentState> =
-                f.expected_transitions.iter().map(|s| parse_state(s)).collect();
+            let expected: Vec<AgentState> = f
+                .expected_transitions
+                .iter()
+                .map(|s| parse_state(s))
+                .collect();
             assert_eq!(
                 observed, expected,
                 "[{ctx}] transition mismatch — pattern change or upstream CLI UI drift? \
