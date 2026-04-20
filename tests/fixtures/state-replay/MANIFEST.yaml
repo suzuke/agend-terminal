@@ -89,3 +89,84 @@ fixtures:
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: null
+
+  # ── Stage 2a ToolUse recordings (2026-04-20) ────────────────────────
+  # Every recording below DID exercise a real tool call (verified by
+  # final-screen tool banners / session summaries), yet none of the
+  # observed transition sequences contain AgentState::ToolUse. Each
+  # fixture therefore documents a *pattern coverage gap*, tracked in
+  # docs/FOLLOWUP-tooluse-pattern-gaps.md. Treat these as regression
+  # anchors: if a future pattern change starts firing ToolUse on one
+  # of these fixtures the transitions array will diverge and this
+  # test will flag it for manual review.
+
+  - file: claude-tooluse.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-04-20"
+    scenario: "prompt 'list files in current directory' -> claude runs a tool and prints a directory listing under the ⏺ banner -> /exit"
+    # Tool DID execute (banner `⏺ <files>` visible on final screen) but
+    # the ClaudeCode ToolUse pattern requires a literal tool name
+    # (Read|Bash|Edit|Write|Grep|Glob) after the spinner/dot glyph,
+    # which this CLI version does not print on the banner line. See
+    # FOLLOWUP-tooluse-pattern-gaps.md.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+
+  - file: codex-tooluse.raw
+    backend: codex
+    cli_version: "0.120.0"
+    recorded_on: "2026-04-20"
+    scenario: "prompt 'read the README.md file' -> codex reads + summarizes -> /exit (recording tail shows the `/exit` slash-command autocomplete menu)"
+    # Codex ToolUse pattern is `apply_patch` only, which does not match
+    # read-file tool calls. InteractivePrompt fires once during the
+    # recording (same root cause as codex-update.raw — either an
+    # `Update available!` banner during startup or the slash-command
+    # menu at the end). Final detect() returns None because the menu
+    # frame covers the idle `›` glyph.
+    expected_transitions: [starting, interactive_prompt]
+    expected_final_state: interactive_prompt
+    expected_final_detect: null
+
+  - file: gemini-tooluse.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-04-20"
+    scenario: "--yolo mode; prompt 'read package.json' -> gemini reads + replies -> /quit (session summary shows `Tool Calls: 1 ✓ 1`)"
+    # Gemini ToolUse pattern `tool.*call|MCP.*tool` only matches the
+    # end-of-session summary line "Tool Calls:" — by which point the
+    # agent is already exiting. No in-flight tool banner pattern is
+    # defined for the Gemini spinner. Final detect is None because the
+    # goodbye frame replaces the prompt line.
+    expected_transitions: [starting, ready, idle, thinking]
+    expected_final_state: thinking
+    expected_final_detect: null
+
+  - file: kiro-tooluse.raw
+    backend: kiro-cli
+    cli_version: "2.0.1"
+    recorded_on: "2026-04-20"
+    scenario: "--trust-all-tools mode; prompt 'list files in current directory' -> kiro runs tool + prints directory listing -> /quit"
+    # Kiro ToolUse pattern is `execute_bash|fs_read|fs_write` — kiro
+    # 2.0.1 renders the tool call under a different banner so the
+    # pattern never matches on this recording. Detect() returns Ready
+    # at the end because the final screen still shows the "Trust All
+    # Tools active · /quit to exit" status line.
+    expected_transitions: [starting, idle, thinking]
+    expected_final_state: thinking
+    expected_final_detect: ready
+
+  - file: opencode-tooluse.raw
+    backend: opencode
+    cli_version: "1.4.0"
+    recorded_on: "2026-04-20"
+    scenario: "prompt 'read README.md' -> opencode reads + replies -> /exit (recording ends on the opencode session-exit ASCII banner)"
+    # OpenCode has NO ToolUse pattern defined at all (see src/state.rs
+    # Backend::OpenCode patterns). This fixture is the real-PTY anchor
+    # for that gap; adding a ToolUse entry in the pattern table in a
+    # future change will shift this transition sequence and be caught
+    # by replay_manifest_regression.
+    expected_transitions: [starting, idle, thinking]
+    expected_final_state: thinking
+    expected_final_detect: null
