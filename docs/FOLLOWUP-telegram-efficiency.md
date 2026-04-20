@@ -22,18 +22,25 @@ JSON-parsed, then one field extracted.
 - O(N) scan inside daemon for each incoming Telegram reply
 - Scales poorly once a fleet has many agents / chatty Telegram groups
 
-**Proposed fix:**
-- Pass `Arc<AgentRegistry>` (or a `Fn(&str) -> Option<AgentState>` closure)
-  into `TelegramState` at init
-- Replace the RPC with `registry.get(name).map(|c| c.lock().state.current)`
-- Keep `list_response_wants_raw_keystrokes` as a pure JSON helper for the
-  "external client" code path if we ever add one — otherwise delete it
+**Call graph (verified 2026-04-20):** Telegram is only initialized on the
+`OwnedFleet` bootstrap path (`src/bootstrap/mod.rs:160-164` →
+`telegram::init_from_config`). Both daemon mode and app mode go through this
+path when they own the registry; the `Attached` path skips Telegram init
+entirely. So Telegram always lives in-process with `AgentRegistry` — the RPC
+here is effectively the process talking to itself over UDS. No pluggable
+source needed; just pipe the registry through.
 
-**Complication:** daemon mode vs app mode both bring up Telegram, but only app
-mode has the registry in-process. Daemon mode's telegram worker talks to
-the daemon across the UDS boundary. Either (a) make the state lookup take a
-pluggable source so each mode supplies its own, or (b) drop the daemon-mode
-telegram worker path entirely if it's unused — check first.
+**Proposed fix:**
+- Add `Arc<AgentRegistry>` parameter to `telegram::init_from_config`
+  (callers already have one — see `bootstrap::OwnedFleet.agents` / the
+  registry used by `daemon::supervisor::spawn`)
+- Store it on `TelegramState` alongside `bot`, `group_id`, etc.
+- Replace `agent_wants_raw_keystrokes` with
+  `registry.get(name).map(|c| c.lock().state.current).map(AgentState::wants_raw_keystrokes)`
+  (assumes §3 fix applied; otherwise inline the matches!)
+- Keep `list_response_wants_raw_keystrokes` as a pure JSON helper **only if**
+  we still need it for an external-client code path — otherwise delete it
+  along with its tests
 
 **Severity:** must-fix when fleet sizes grow; nice-to-have today.
 
