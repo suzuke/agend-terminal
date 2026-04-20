@@ -431,6 +431,12 @@ pub struct StateTracker {
     /// crucial for not resetting `last_output` on cursor-blink noise.
     last_screen_hash: Option<u64>,
     patterns: Option<StatePatterns>,
+    /// Set to true the moment we enter `InteractivePrompt`; cleared by
+    /// `take_interactive_prompt_notice()` once the supervisor has forwarded a
+    /// Telegram notice. This deduplicates per-entry: re-entry (e.g. dismissed
+    /// then triggered again) re-arms it, but repeated supervisor ticks while
+    /// still in the same InteractivePrompt won't re-spam.
+    interactive_prompt_pending_notice: bool,
 }
 
 fn hash_screen(text: &str) -> u64 {
@@ -452,6 +458,20 @@ impl StateTracker {
             last_output: Instant::now(),
             last_screen_hash: None,
             patterns: backend.map(StatePatterns::for_backend),
+            interactive_prompt_pending_notice: false,
+        }
+    }
+
+    /// Returns true at most once per entry into `InteractivePrompt`. The
+    /// supervisor calls this each tick; it returns true only on the first
+    /// tick after a fresh transition into the state so Telegram only gets
+    /// one notice per prompt, not one per tick.
+    pub fn take_interactive_prompt_notice(&mut self) -> bool {
+        if self.interactive_prompt_pending_notice {
+            self.interactive_prompt_pending_notice = false;
+            true
+        } else {
+            false
         }
     }
 
@@ -558,6 +578,8 @@ impl StateTracker {
             return;
         }
 
+        let prev = self.current;
+
         // Error states: instant transition (no hysteresis)
         if new_state.is_error() {
             self.current = new_state;
@@ -580,6 +602,13 @@ impl StateTracker {
                 self.current = new_state;
                 self.since = Instant::now();
             }
+        }
+
+        // Arm a one-shot Telegram notice whenever we actually entered
+        // InteractivePrompt on this call. Gated by `prev != current` so the
+        // no-op path (rejected by hysteresis) doesn't arm.
+        if self.current == AgentState::InteractivePrompt && prev != AgentState::InteractivePrompt {
+            self.interactive_prompt_pending_notice = true;
         }
     }
 }
@@ -1210,6 +1239,62 @@ mod tests {
             b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
         );
         assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+    }
+
+    #[test]
+    fn interactive_prompt_notice_armed_on_entry_and_dedupes() {
+        // Fresh tracker (state = Starting) must not claim a pending notice —
+        // we only arm after a real transition INTO InteractivePrompt.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        assert!(!st.take_interactive_prompt_notice());
+
+        // Codex update menu → InteractivePrompt. First take fires, second
+        // is debounced so supervisor ticks don't spam Telegram.
+        drive(
+            &mut vt,
+            &mut st,
+            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+        assert!(st.take_interactive_prompt_notice(), "first entry must arm");
+        assert!(
+            !st.take_interactive_prompt_notice(),
+            "subsequent ticks within the same InteractivePrompt must not re-arm"
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_notice_rearms_on_reentry() {
+        // Dismiss → Ready → re-enter InteractivePrompt should re-arm the
+        // notice so the operator is told again on the second modal.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        drive(
+            &mut vt,
+            &mut st,
+            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+        assert!(st.take_interactive_prompt_notice());
+
+        // Simulate passive-hold window so InteractivePrompt can drop back.
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+        assert!(!st.take_interactive_prompt_notice(), "no notice while Ready");
+
+        // Second modal appears.
+        drive(
+            &mut vt,
+            &mut st,
+            b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+        assert!(
+            st.take_interactive_prompt_notice(),
+            "re-entry after a leave must re-arm the notice"
+        );
     }
 
     #[test]

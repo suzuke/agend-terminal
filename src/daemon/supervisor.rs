@@ -78,6 +78,22 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
                      💬 回覆將以原始鍵盤輸入寫入 agent stdin",
                     silent_secs = silent.as_secs(),
                 ))
+            } else if core.state.take_interactive_prompt_notice() {
+                // Pattern-based InteractivePrompt fires immediately on state
+                // entry (no silence window), so the notice also goes out on
+                // the first tick after entry rather than waiting for quiet.
+                let tail = core.vterm.tail_lines(TAIL_LINES);
+                tracing::info!(
+                    agent = %name,
+                    "interactive prompt detected — forwarding to telegram"
+                );
+                Some(format!(
+                    "⚠️ {name} 卡在互動 prompt\n\
+                     ────────\n\
+                     {tail}\n\
+                     ────────\n\
+                     💬 回覆將以原始鍵盤輸入寫入 agent stdin",
+                ))
             } else {
                 None
             }

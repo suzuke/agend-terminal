@@ -284,13 +284,13 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
     tracing::info!(from = username, to = %instance_name, %text, "inbound message");
 
-    // Route based on agent state: when blocked on an unexpected startup
-    // prompt (AwaitingOperator), the operator's reply must reach the PTY
-    // as raw keystrokes — any inbox prefix ("[telegram:@user] …") would
-    // confuse the CLI's prompt parser. In every other state, preserve the
-    // existing inbox semantics so agent-authored message handling keeps
-    // working.
-    if agent_is_awaiting_operator(&home, &instance_name) {
+    // Route based on agent state: when blocked on an interactive prompt
+    // (AwaitingOperator startup stall, or a pattern-matched InteractivePrompt
+    // like codex's update menu), the operator's reply must reach the PTY as
+    // raw keystrokes — any inbox prefix ("[telegram:@user] …") would confuse
+    // the CLI's prompt parser. In every other state, preserve the existing
+    // inbox semantics so agent-authored message handling keeps working.
+    if agent_wants_raw_keystrokes(&home, &instance_name) {
         let payload = format!("{text}\n");
         match crate::api::call(
             &home,
@@ -302,7 +302,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             Ok(_) => tracing::info!(
                 to = %instance_name,
                 bytes = payload.len(),
-                "routed raw keystrokes (awaiting_operator)"
+                "routed raw keystrokes (interactive prompt)"
             ),
             Err(e) => tracing::warn!(
                 to = %instance_name,
@@ -333,11 +333,13 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 }
 
 /// Query the daemon for the current `agent_state` of one instance.
-/// Returns true only when the daemon reports `"awaiting_operator"`.
+/// Returns true when the daemon reports a state that expects raw keyboard
+/// input rather than inbox-wrapped prose: `awaiting_operator` (startup stall)
+/// or `interactive_prompt` (pattern-matched modal like codex's update menu).
 /// Any error (daemon down, agent missing, parse failure) returns false so
 /// we fall through to normal inbox routing rather than silently dropping
 /// messages.
-fn agent_is_awaiting_operator(home: &Path, instance_name: &str) -> bool {
+fn agent_wants_raw_keystrokes(home: &Path, instance_name: &str) -> bool {
     let resp = match crate::api::call(
         home,
         &serde_json::json!({"method": crate::api::method::LIST}),
@@ -345,12 +347,12 @@ fn agent_is_awaiting_operator(home: &Path, instance_name: &str) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    list_response_is_awaiting(&resp, instance_name)
+    list_response_wants_raw_keystrokes(&resp, instance_name)
 }
 
-/// Pure JSON-inspection half of [`agent_is_awaiting_operator`]. Separated
+/// Pure JSON-inspection half of [`agent_wants_raw_keystrokes`]. Separated
 /// out so the routing logic can be unit-tested without a running daemon.
-fn list_response_is_awaiting(resp: &serde_json::Value, instance_name: &str) -> bool {
+fn list_response_wants_raw_keystrokes(resp: &serde_json::Value, instance_name: &str) -> bool {
     resp["result"]["agents"]
         .as_array()
         .and_then(|arr| {
@@ -358,7 +360,10 @@ fn list_response_is_awaiting(resp: &serde_json::Value, instance_name: &str) -> b
                 .find(|a| a["name"].as_str() == Some(instance_name))
         })
         .and_then(|a| a["agent_state"].as_str())
-        .map(|s| s == crate::state::AgentState::AwaitingOperator.display_name())
+        .map(|s| {
+            s == crate::state::AgentState::AwaitingOperator.display_name()
+                || s == crate::state::AgentState::InteractivePrompt.display_name()
+        })
         .unwrap_or(false)
 }
 
@@ -1032,7 +1037,7 @@ instances:
     }
 
     #[test]
-    fn list_response_is_awaiting_detects_target_state() {
+    fn list_response_wants_raw_keystrokes_detects_target_states() {
         let resp = serde_json::json!({
             "ok": true,
             "result": {
@@ -1040,26 +1045,32 @@ instances:
                     {"name": "alice", "agent_state": "ready"},
                     {"name": "bob",   "agent_state": "awaiting_operator"},
                     {"name": "carol", "agent_state": "starting"},
+                    {"name": "dave",  "agent_state": "interactive_prompt"},
+                    {"name": "frank", "agent_state": "permission"},
                 ]
             }
         });
-        assert!(!list_response_is_awaiting(&resp, "alice"));
-        assert!(list_response_is_awaiting(&resp, "bob"));
-        assert!(!list_response_is_awaiting(&resp, "carol"));
+        assert!(!list_response_wants_raw_keystrokes(&resp, "alice"));
+        assert!(list_response_wants_raw_keystrokes(&resp, "bob"));
+        assert!(!list_response_wants_raw_keystrokes(&resp, "carol"));
+        assert!(list_response_wants_raw_keystrokes(&resp, "dave"));
+        // permission prompt is NOT in the raw-keystroke set: its reply flow
+        // is handled separately (approve/deny UI), not free-form keystrokes.
+        assert!(!list_response_wants_raw_keystrokes(&resp, "frank"));
         // Missing agent returns false (fall through to inbox path)
-        assert!(!list_response_is_awaiting(&resp, "eve"));
+        assert!(!list_response_wants_raw_keystrokes(&resp, "eve"));
     }
 
     #[test]
-    fn list_response_is_awaiting_tolerates_malformed() {
+    fn list_response_wants_raw_keystrokes_tolerates_malformed() {
         // Missing result.agents → false
         let r1 = serde_json::json!({"ok": false, "error": "daemon down"});
-        assert!(!list_response_is_awaiting(&r1, "any"));
+        assert!(!list_response_wants_raw_keystrokes(&r1, "any"));
         // agents not an array → false
         let r2 = serde_json::json!({"result": {"agents": "nope"}});
-        assert!(!list_response_is_awaiting(&r2, "any"));
+        assert!(!list_response_wants_raw_keystrokes(&r2, "any"));
         // agent without agent_state field → false
         let r3 = serde_json::json!({"result": {"agents": [{"name": "x"}]}});
-        assert!(!list_response_is_awaiting(&r3, "x"));
+        assert!(!list_response_wants_raw_keystrokes(&r3, "x"));
     }
 }
