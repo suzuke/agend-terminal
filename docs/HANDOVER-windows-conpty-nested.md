@@ -1,7 +1,12 @@
 # Handover — Windows ConPTY nested spawn silent hang
 
-**Status**: unresolved, blocks Windows usability on Insider Dev builds.
-**Environment reproducing**: Windows 11 Insider Dev, build **10.0.26200**.
+**Status**: **resolved (Session 4, 2026-04-19)**. The symptom was real, but the root causes were agend-side, not an OS/ConPTY regression. Two fixes landed on `main`:
+- `src/vterm.rs` — replace `NoopListener` with `PtyWriteListener` so the DSR-CPR `\x1b[6n` reply that ConPTY blocks on actually reaches the child.
+- `src/daemon.rs` — call `SetConsoleCtrlHandler(None, 0)` before `ctrlc::set_handler` so the daemon doesn't inherit an ignore-CTRL+C flag.
+
+**If a future session opens this file, skip straight to "Session 4 correction" (line ~180).** Sessions 1–3 above it document the diagnostic journey (including a wrong "it's Microsoft's bug" verdict at the end of Session 3) and are preserved only so past mistakes aren't repeated — **do not act on their `unresolved` framing**.
+
+**Environment where it reproduced before the fixes**: Windows 11 Insider Dev, build **10.0.26200** (and, per Session 4, also 23H2 after rollback — CPR was the dominant cause on both).
 **Environment known-good**: GitHub Actions `windows-latest` (Windows Server 2022 ≈ Windows 11 22H2). CI is green.
 
 ## Symptom

@@ -1,21 +1,21 @@
 # Windows Support — Implementation Plan
 
-> Date: 2026-04-17 (rev. 2026-04-20 — Phase A / B / C.1 / C.2 all folded into `main`; Phase C.3 mostly fixed, one unresolved Windows 11 Insider Dev regression)
+> Date: 2026-04-17 (rev. 2026-04-20 — all phases folded into `main`; the 26200 "ConPTY regression" was re-diagnosed as agend-side and fixed in Session 4).
 > Prereq: Read `docs/EVAL-cross-platform.md` for the state-of-play.
-> Remaining effort: One outstanding bug (C.3 nested-ConPTY hang on Win 11 Insider build 26200, tracked in `docs/HANDOVER-windows-conpty-nested.md`). Everything else that was once Phase B/C is on `main`.
+> Remaining effort: **none** — Phase A/B/C are all on `main`. The 26200 nested-ConPTY symptom turned out to be the CPR-reply + ignore-Ctrl+C bugs documented in `docs/HANDOVER-windows-conpty-nested.md` (see "Session 4 correction" section). Both fixes landed.
 
 ---
 
 ## Overview
 
-The Unix-only blockers are all down. IPC moved to TCP loopback, CI runs on `windows-latest`, and shell wrappers emit `.cmd` on Windows. What remains is a single OS-specific runtime regression.
+The Unix-only blockers are all down. IPC moved to TCP loopback, CI runs on `windows-latest`, shell wrappers emit `.cmd` on Windows, and the Windows-only runtime gaps (CPR auto-reply, Ctrl+C delivery, manifest, `which` resolution) have all landed.
 
 Phases:
 - **Phase A — DONE**. Platform-agnostic fixes (paths, file locking, PID helpers, chmod guards).
 - **Phase B — DONE** (2026-04-17). IPC migration (UDS → TCP loopback + port-file registry in `src/ipc.rs`).
 - **Phase C.1 — DONE**. `windows-latest` in the CI matrix (`.github/workflows/ci.yml`).
 - **Phase C.2 — DONE**. `.cmd` wrappers emitted alongside `.sh` in `src/instructions.rs` / `src/mcp_config.rs`.
-- **Phase C.3 — MOSTLY DONE**. Windows-specific ConPTY fixes landed (DSR CPR auto-reply, Ctrl+C delivery, embed-resource manifest declaring Win10/11 + UTF-8, backend resolution via `which`). **One unresolved case**: nested-ConPTY silent hang on Windows 11 Insider Dev build 26200 — see `docs/HANDOVER-windows-conpty-nested.md` (`Status: unresolved`). GitHub Actions `windows-latest` (Server 2022) is green.
+- **Phase C.3 — DONE**. Windows-specific ConPTY fixes landed: DSR CPR auto-reply (`src/vterm.rs` `PtyWriteListener`), Ctrl+C delivery via `SetConsoleCtrlHandler(None, 0)` reset in `src/daemon.rs`, embed-resource manifest declaring Win10/11 + UTF-8, backend resolution via `which`. The 26200 "nested-ConPTY hang" was re-diagnosed in Session 4 as the same CPR bug, not an OS regression — see `docs/HANDOVER-windows-conpty-nested.md` (Status: resolved). GitHub Actions `windows-latest` (Server 2022) is green.
 - **Phase C.4 — DONE (de facto)**. Backend PATH resolution fixed in commit `7fa064a`; `doctor` covers availability.
 - **Phase C.5 — DONE (de facto)**. Real-PTY start/attach/app/stop have been exercised repeatedly (every HANDOVER-windows-* document was produced by running the E2E smoke flow).
 
@@ -107,7 +107,7 @@ pub fn connect_agent(home: &Path, name: &str) -> Result<TcpStream>;
 
 ---
 
-## Phase C — Validation (DONE except C.3 nested-ConPTY on build 26200)
+## Phase C — Validation (DONE)
 
 ### C.1 Windows CI
 
@@ -189,8 +189,9 @@ Phase B — IPC migration (DONE 2026-04-17)
 Phase C — Validation
   [x] C.1 Windows in CI matrix (.github/workflows/ci.yml)
   [x] C.2 .cmd wrappers on Windows (instructions.rs, mcp_config.rs)
-  [~] C.3 ConPTY behavior — most fixes landed; nested-ConPTY hang on
-          Win 11 Insider Dev 26200 unresolved (HANDOVER-windows-conpty-nested.md)
+  [x] C.3 ConPTY behavior — CPR auto-reply, Ctrl+C reset, manifest, which
+          resolution. The 26200 "nested-ConPTY hang" was re-diagnosed as
+          the same CPR bug (HANDOVER-windows-conpty-nested.md, Session 4).
   [x] C.4 Backend availability — which-based PATH resolution (commit 7fa064a)
   [x] C.5 End-to-end smoke — run repeatedly during C.3 debugging
 ```
@@ -199,4 +200,4 @@ Phase C — Validation
 
 ## Remaining work
 
-Only **C.3 nested-ConPTY on Windows 11 Insider Dev build 26200** is open. The symptom, ruled-out causes, and proposed investigation direction are in `docs/HANDOVER-windows-conpty-nested.md`. GitHub Actions `windows-latest` (Server 2022 ≈ Win 11 22H2) is green, so the bug is specific to the 26000+ Insider branch.
+None. If a new Windows-only symptom appears, start by setting `AGEND_DEBUG_PTY_READ=1` and reading the actual PTY byte stream before assuming any OS-side regression — that's the Session 4 lesson from `docs/HANDOVER-windows-conpty-nested.md`.
