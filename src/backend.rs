@@ -629,7 +629,18 @@ mod tests {
         // Whatever $SHELL is in test env, result must be non-empty.
         let cmd = Backend::Shell.command_string();
         assert!(!cmd.is_empty());
-        assert!(cmd.starts_with('/') || cmd == "/bin/sh");
+        // Unix: `/bin/bash`, `/bin/zsh`, etc.; fallback `/bin/sh`. Windows
+        // under Git Bash translates POSIX SHELL into a Win32 path like
+        // `C:\Program Files\Git\bin\bash.exe` before the child sees it, so
+        // accept drive-letter paths too. CI's plain PowerShell doesn't do
+        // the translation, which is why this test was green on windows-latest
+        // but failed when run locally through Git Bash.
+        let unixish = cmd.starts_with('/');
+        let winish = cmd.chars().nth(1) == Some(':') && cmd.chars().nth(2) == Some('\\');
+        assert!(
+            unixish || winish,
+            "unexpected shell path shape: {cmd:?}"
+        );
     }
 
     #[test]
