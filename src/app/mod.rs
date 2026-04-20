@@ -95,47 +95,44 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         ..Default::default()
     };
     let mut attached_run_dir: Option<PathBuf> = None;
-    let (_api_guard, telegram_state, telegram_status) = match crate::bootstrap::prepare(
-        &home,
-        &fleet_path,
-        opts,
-    ) {
-        Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
-            let telegram = prepared.telegram.clone();
-            let status = if telegram.is_some() {
-                render::TelegramStatus::Connected
-            } else {
-                telegram_hooks::telegram_status_from_config(&prepared.config)
-            };
-            let guard = api_server::start_api_server(prepared, &registry, tui_event_tx);
-            // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
-            // the owned app. SIGINT stays with crossterm so Ctrl+C still
-            // reaches the focused pane's PTY as 0x03.
-            crate::bootstrap::signals::install_term_only();
-            (guard, telegram, status)
-        }
-        Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
-            tracing::info!(
-                pid = attached.daemon_pid,
-                path = %attached.run_dir.display(),
-                "attached to existing daemon, connecting as remote client"
-            );
-            attached_run_dir = Some(attached.run_dir.clone());
-            (
-                api_server::noop_guard(),
-                None,
-                render::TelegramStatus::NotConfigured,
-            )
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
-            (
-                api_server::noop_guard(),
-                None,
-                render::TelegramStatus::NotConfigured,
-            )
-        }
-    };
+    let (_api_guard, telegram_state, telegram_status) =
+        match crate::bootstrap::prepare(&home, &fleet_path, opts) {
+            Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
+                let telegram = prepared.telegram.clone();
+                let status = if telegram.is_some() {
+                    render::TelegramStatus::Connected
+                } else {
+                    telegram_hooks::telegram_status_from_config(&prepared.config)
+                };
+                let guard = api_server::start_api_server(prepared, &registry, tui_event_tx);
+                // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
+                // the owned app. SIGINT stays with crossterm so Ctrl+C still
+                // reaches the focused pane's PTY as 0x03.
+                crate::bootstrap::signals::install_term_only();
+                (guard, telegram, status)
+            }
+            Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
+                tracing::info!(
+                    pid = attached.daemon_pid,
+                    path = %attached.run_dir.display(),
+                    "attached to existing daemon, connecting as remote client"
+                );
+                attached_run_dir = Some(attached.run_dir.clone());
+                (
+                    api_server::noop_guard(),
+                    None,
+                    render::TelegramStatus::NotConfigured,
+                )
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
+                (
+                    api_server::noop_guard(),
+                    None,
+                    render::TelegramStatus::NotConfigured,
+                )
+            }
+        };
     let attached_mode = attached_run_dir.is_some();
 
     // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the

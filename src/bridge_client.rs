@@ -47,8 +47,7 @@ impl BridgeClient {
         let run = crate::daemon::find_active_run_dir(home)
             .context("no active daemon (run dir not found)")?;
         let cookie = crate::auth_cookie::read_cookie(&run).context("read api.cookie")?;
-        crate::auth_cookie::write_tui_auth(&mut stream, &cookie)
-            .context("send TUI auth cookie")?;
+        crate::auth_cookie::write_tui_auth(&mut stream, &cookie).context("send TUI auth cookie")?;
 
         let mut version_buf = [0u8; 1];
         use std::io::Read;
@@ -63,7 +62,9 @@ impl BridgeClient {
             );
         }
 
-        let reader = stream.try_clone().context("clone bridge stream for read side")?;
+        let reader = stream
+            .try_clone()
+            .context("clone bridge stream for read side")?;
         let mut writer = stream;
         framing::write_resize(&mut writer, cols, rows).context("send initial resize")?;
 

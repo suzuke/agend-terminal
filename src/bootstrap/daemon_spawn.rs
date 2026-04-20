@@ -35,8 +35,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHandle> {
     let exe = std::env::current_exe().context("resolve current_exe for detach spawn")?;
 
-    std::fs::create_dir_all(home)
-        .with_context(|| format!("create home {}", home.display()))?;
+    std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
     let log_path = home.join("daemon.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -70,9 +69,9 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
         cmd.creation_flags(0x00000008 | 0x00000200);
     }
 
-    let child = cmd.spawn().with_context(|| {
-        format!("spawn detached daemon: {} start", exe.display())
-    })?;
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("spawn detached daemon: {} start", exe.display()))?;
     let spawn_pid = child.id();
     // Forget the handle so the parent does not wait / reap the child at drop.
     // The daemon is now a long-lived background process unrelated to us.

@@ -42,25 +42,41 @@ pub enum BootstrapOutcome {
 /// Owned state: this process is the daemon. Run dir + cookie + lock belong to
 /// us. Fleet is normalized and every instance is resolved into a spawn-ready
 /// [`AgentDef`].
+///
+/// Some fields are scaffolding for follow-on work (e.g. hot-reload of
+/// fleet.yaml needs `fleet_path`, `cookie` is read by tests + may be read by
+/// callers that want to avoid re-reading the cookie file per connection).
+/// `#[allow(dead_code)]` is applied per-field so genuinely new unused fields
+/// still trip `-D warnings` in CI.
 pub struct OwnedFleet {
     pub home: PathBuf,
+    #[allow(dead_code)]
     pub fleet_path: PathBuf,
     pub config: crate::fleet::FleetConfig,
     pub agents: Vec<AgentDef>,
     pub run_dir: PathBuf,
+    #[allow(dead_code)]
     pub cookie: crate::auth_cookie::Cookie,
     pub telegram: Option<Arc<Mutex<crate::telegram::TelegramState>>>,
     /// Flock guard — drop releases `.daemon.lock`. Kept last so the lock is
     /// released only after every other resource has been dropped.
+    #[allow(dead_code)]
     pub lock: DaemonLock,
 }
 
 /// Attached state: an existing daemon owns the run dir. We read its cookie so
 /// we can speak the TUI/API protocols but never touch the run dir itself.
+///
+/// `home` / `fleet_path` / `cookie` are scaffolding — today `BridgeClient`
+/// re-derives them per connection, but a future per-pane cache would read
+/// these. See OwnedFleet note about why `#[allow(dead_code)]` is per-field.
 pub struct AttachedFleet {
+    #[allow(dead_code)]
     pub home: PathBuf,
+    #[allow(dead_code)]
     pub fleet_path: PathBuf,
     pub run_dir: PathBuf,
+    #[allow(dead_code)]
     pub cookie: crate::auth_cookie::Cookie,
     /// PID of the running daemon, parsed from `.daemon`. 0 if unparseable.
     pub daemon_pid: u32,
@@ -107,11 +123,7 @@ impl Default for PrepareOptions {
 /// 6. Resolve every fleet instance into an [`AgentDef`] (working dir, worktree
 ///    creation, instructions, resume/model/claude flags).
 /// 7. Initialize Telegram if requested and configured.
-pub fn prepare(
-    home: &Path,
-    fleet_path: &Path,
-    opts: PrepareOptions,
-) -> Result<BootstrapOutcome> {
+pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<BootstrapOutcome> {
     std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
 
     if let Some(attached) = try_attach(home, fleet_path)? {
@@ -168,12 +180,8 @@ fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
     let Some(run_dir) = crate::daemon::find_active_run_dir(home) else {
         return Ok(None);
     };
-    let cookie = crate::auth_cookie::read_cookie(&run_dir).with_context(|| {
-        format!(
-            "existing daemon at {} has no api.cookie",
-            run_dir.display()
-        )
-    })?;
+    let cookie = crate::auth_cookie::read_cookie(&run_dir)
+        .with_context(|| format!("existing daemon at {} has no api.cookie", run_dir.display()))?;
     let daemon_pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(0);
     Ok(Some(AttachedFleet {
         home: home.to_path_buf(),
@@ -187,10 +195,10 @@ fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
 fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
     use fs2::FileExt;
     let path = home.join(".daemon.lock");
-    let file = std::fs::File::create(&path)
-        .with_context(|| format!("open {}", path.display()))?;
-    file.try_lock_exclusive()
-        .map_err(|e| anyhow!("another agend-terminal daemon is already running (lock held): {e}"))?;
+    let file = std::fs::File::create(&path).with_context(|| format!("open {}", path.display()))?;
+    file.try_lock_exclusive().map_err(|e| {
+        anyhow!("another agend-terminal daemon is already running (lock held): {e}")
+    })?;
     Ok(DaemonLock { _file: file })
 }
 

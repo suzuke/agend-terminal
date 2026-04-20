@@ -137,6 +137,9 @@ mod tests {
             },
         );
         normalize(&mut c, Path::new("/tmp/agend-normalize-test"), false);
-        assert_eq!(c.instances.get("general").and_then(|i| i.topic_id), Some(42));
+        assert_eq!(
+            c.instances.get("general").and_then(|i| i.topic_id),
+            Some(42)
+        );
     }
 }
