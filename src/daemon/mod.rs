@@ -241,6 +241,23 @@ fn run_core(
     );
     tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
 
+    // Ready ping → agend-supervisor (if we were started under one, i.e.
+    // `AGEND_SUPERVISOR_SOCK` env is set). Must come after agents are up
+    // and API is bound — supervisor treats this as "upgrade succeeded".
+    // Fire-and-forget: supervisor crashes shouldn't stop the daemon.
+    let pid = std::process::id();
+    let version = env!("CARGO_PKG_VERSION");
+    if let Err(e) = agend_terminal::supervisor::client::notify_ready(pid, version) {
+        tracing::warn!(error = %e, "supervisor ready ping failed (continuing)");
+    }
+
+    // If the supervisor just upgraded us, it dropped an upgrade-marker with
+    // from/to versions. Consume it asynchronously: wait for agent prompts to
+    // settle, inject a single "daemon upgraded" notice into each, then delete
+    // the marker. Spawned so we don't delay the main loop; errors are logged
+    // and otherwise ignored (agents missing the message is a cosmetic loss).
+    consume_upgrade_marker(home.to_path_buf(), Arc::clone(&registry));
+
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
 
     let mut last_snapshot_json = String::new();
@@ -831,6 +848,64 @@ fn strip_resume_args(args: &[String]) -> Vec<String> {
         result.push(arg.clone());
     }
     result
+}
+
+/// If `$AGEND_HOME/run/upgrade-marker` exists, we were just (re)launched by
+/// the supervisor as part of a hot-upgrade. Wait briefly for agents to be
+/// ready to accept input, inject a single "daemon upgraded" notice into each
+/// PTY, then delete the marker so a subsequent crash-respawn won't repeat it.
+///
+/// The marker format is the JSON blob supervisor writes in `write_upgrade_marker`:
+/// `{ "from_version": "...", "to_version": "...", "new_hash": "...", "prev_hash": "...", "at": "..." }`.
+///
+/// Failures are logged but never propagated — this is a cosmetic notice;
+/// missing it must not abort daemon startup.
+fn consume_upgrade_marker(home: PathBuf, registry: AgentRegistry) {
+    let marker_path = agend_terminal::supervisor::paths::upgrade_marker(&home);
+    if !marker_path.exists() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("upgrade_marker".into())
+        .spawn(move || {
+            let raw = match std::fs::read_to_string(&marker_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(path = %marker_path.display(), error = %e, "read upgrade-marker failed");
+                    let _ = std::fs::remove_file(&marker_path);
+                    return;
+                }
+            };
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            let from = parsed
+                .get("from_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let to = parsed
+                .get("to_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let msg = format!(
+                "[system] Daemon upgraded from {from} to {to}. All agents restarted.\r"
+            );
+
+            // Give agents a moment to paint their prompts; matches the delay
+            // used by the crash-respawn system message injection above.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let r = crate::sync::lock_poisoned(&registry, "registry");
+            for handle in r.values() {
+                let _ = agent::write_to_agent(handle, msg.as_bytes());
+            }
+            drop(r);
+            if let Err(e) = std::fs::remove_file(&marker_path) {
+                tracing::warn!(
+                    path = %marker_path.display(),
+                    error = %e,
+                    "remove upgrade-marker failed (daemon will keep running)"
+                );
+            }
+            tracing::info!(from, to, "upgrade-marker consumed, agents notified");
+        });
 }
 
 #[cfg(test)]

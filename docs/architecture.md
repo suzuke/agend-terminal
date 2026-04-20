@@ -644,6 +644,156 @@ enum Cli {
 
 ---
 
+## Module 8: Self-Healing — Supervised Hot Upgrade
+
+Zero-downtime daemon upgrades with automatic rollback on failure. Unix-only
+(the socket-swap + symlink-rename trick doesn't map cleanly to Windows;
+`agend-terminal upgrade` returns an error there).
+
+### Layering
+
+```text
+agend-supervisor             ← frozen, tiny, upgraded rarely
+  └── agend-terminal daemon  ← hot-swappable binary (PTY master owner)
+        └── agent PTYs       ← spawned fresh by the new daemon after upgrade
+```
+
+The supervisor's job is narrow on purpose: own the daemon child, orchestrate
+binary swaps, and roll back on failure. It does not own PTYs, Telegram state,
+or the MCP server — if it did, every supervisor change would force agents to
+restart. Keeping its surface small is the whole point: it can stay frozen for
+months while the daemon iterates daily.
+
+### Filesystem Layout
+
+```text
+$AGEND_HOME/
+  bin/
+    current          → symlink to the active daemon binary
+    prev             → symlink to the previous binary (rollback target)
+    store/
+      <sha256>       ← content-addressed binaries staged by `upgrade`
+    supervisor       ← symlink to the installed supervisor binary
+  run/
+    <pid>/           ← per-daemon run dir (unchanged from Module 1)
+    supervisor.sock  ← supervisor IPC socket (0600)
+    supervisor.pid   ← supervisor's PID
+    upgrade-marker   ← JSON blob written pre-upgrade, consumed by new daemon
+```
+
+Content-addressed store means swapping a binary is just a `rename(2)` over a
+symlink — atomic, no half-written state. Rolling back is the same operation
+in reverse.
+
+### Protocol: `supervisor.sock`
+
+NDJSON over UDS. One request, streaming progress frames, terminal response.
+
+| Request                    | Sent by                      | Purpose                                    |
+|----------------------------|------------------------------|--------------------------------------------|
+| `Ping`                     | CLI pre-upgrade probe        | Detect a live supervisor + fetch its PID  |
+| `Status`                   | CLI                          | Query current daemon version               |
+| `Upgrade { new_hash, … }`  | CLI                          | Run the upgrade workflow                   |
+| `Ready { pid, version }`   | Daemon post-boot             | "I'm up" ping consumed by `wait_for_ready` |
+| `ShuttingDown { reason }`  | Daemon pre-exit (optional)   | Distinguishes clean stop from crash        |
+
+Wire version is pinned at `1`; CLI refuses servers with a newer version and
+tells the user to upgrade the client. The protocol is deliberately not
+backwards-compatible in the degrade-gracefully sense — the supervisor is the
+oldest moving piece and will outlive its peers.
+
+### Upgrade Flow
+
+```text
+CLI                             Supervisor                      Daemon (old)   Daemon (new)
+ │                                  │                                │              │
+ │ 1. stage new binary in store/   │                                │              │
+ │ 2. stage current  → prev/       │                                │              │
+ │ 3. swap bin/current symlink     │                                │              │
+ │ 4. Upgrade{ new_hash, … } ───► │                                │              │
+ │                                  │ 5. self-test (AGEND_SELF_TEST) │              │
+ │                                  │    spawn new binary, wait exit │              │
+ │                                  │ 6. write upgrade-marker        │              │
+ │                                  │ 7. SIGTERM old ──────────────► │ exit         │
+ │                                  │ 8. spawn new ────────────────────────────────►│
+ │                                  │ 9. wait for Ready ping ◄──────────────────────│
+ │                                  │ 10. stability window (60s)     │              │
+ │                                  │     — watch for crashes —      │              │
+ │ 11. ◄────── Ok { final: true }  │                                │              │
+```
+
+If any step after 5 fails — self-test exits non-zero, ready ping doesn't
+arrive within the timeout, or the new daemon crashes ≥ 2 times inside the
+stability window — the supervisor rolls back:
+
+```text
+Supervisor: stop new daemon → swap bin/current → store/<prev_hash>
+            → delete upgrade-marker → respawn old daemon → report rollback
+```
+
+The CLI surfaces this as a hard failure (`Err`) even though the system is back
+in a good state. "Rollback succeeded" is still a failed upgrade from the
+user's perspective.
+
+### Why Agents Restart
+
+The daemon owns every agent's PTY master fd. When it exits, those fds close
+and the child processes see EOF / SIGHUP. CRIU-style fd handoff was considered
+and rejected: platform-fragile, complicates the supervisor's freeze surface,
+and the existing crash-respawn code path already handles "daemon went away,
+agents came back" correctly. The MVP trades a few seconds of agent
+interruption for a much simpler supervisor.
+
+After the new daemon boots, it reads `run/upgrade-marker` and — if present —
+injects `[system] Daemon upgraded from vX to vY. All agents restarted.` into
+every agent's PTY instead of the normal crash-respawn notice. The marker is
+then deleted so a subsequent unrelated crash respawn gets its real reason.
+
+### Rollback Triggers
+
+- **Self-test failure**: new binary exits non-zero under `AGEND_SELF_TEST=1`
+  before we kill the old daemon. Cheapest failure mode — zero disruption.
+- **Ready-ping timeout**: new daemon exec'd but never pinged within
+  `--ready-timeout-secs` (default 60). Catches hangs, missing deps, busted
+  config.
+- **Stability-window crash**: new daemon pings Ready but then crashes ≥ 2
+  times within `--stability-secs` (default 60). Catches "boots fine, dies
+  under first real request" regressions.
+
+### Bootstrap Migration
+
+Fresh installs with no supervisor: the first `agend-terminal upgrade
+--install-supervisor --yes` lays down `bin/current`, `bin/supervisor`, and
+`bin/store/`, then tells the user to start `agend-supervisor`. It does **not**
+auto-start the supervisor — how to daemonize (nohup, systemd, launchd) is a
+policy decision the installer's shell owns.
+
+### Testable Surface
+
+- `supervisor::client` — pure (sha256, symlink swap, UDS send/recv).
+- `supervisor::ipc` — serde roundtrip tests on every Request/Response variant.
+- `supervisor::self_test` — passes with valid `fleet.yaml`, fails on corrupt.
+- `supervisor::server` — end-to-end integration tests in
+  `tests/self_healing_supervisor.rs` drive the real `agend-supervisor` binary
+  against a temp `$AGEND_HOME`, using `src/bin/agend-mock-daemon.rs` as the
+  daemon child. Two cases covered:
+  - **Success path**: v1 booted → stage v2 → `Upgrade` → terminal `Ok` →
+    `current` repointed at v2 → v2 sentinel observed.
+  - **Rollback path**: crash counter armed at 2 so the new daemon crashes
+    post-ready twice inside the stability window → supervisor repoints
+    `current` back at v1, deletes the upgrade marker, and responds `Err`.
+    This path also exercises the watcher's `waitpid(WNOHANG)` zombie reap —
+    pure `kill(pid, 0)` liveness probing would leave crashed children as
+    zombies and silently report the upgrade as stable.
+
+  The v2 binary is fabricated by appending padding bytes to the v1
+  mock-daemon so the sha256 differs while behaviour stays identical
+  (ELF/Mach-O loaders ignore trailing bytes). The mock daemon is
+  Unix-only and never shipped — it lives under `src/bin/` purely so
+  `cargo test` builds it into `target/debug/` alongside the supervisor.
+
+---
+
 ## Cross-Cutting: UDS API Design
 
 All communication goes through a single Unix domain socket.
