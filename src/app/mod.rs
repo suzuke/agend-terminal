@@ -53,6 +53,33 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 
     let fleet_path = fleet_path_override.map(PathBuf::from);
 
+    // Pre-TUI check: if another daemon is running, we can't safely own the
+    // fleet (our pane_factory would spawn local PTYs that compete with the
+    // daemon's agents). Fail before ratatui grabs the terminal so the error
+    // message is visible. Users who want to interact with a running daemon's
+    // agent should use `agend-terminal attach <name>`.
+    //
+    // This is the Stage 3.4 compromise: without a Pane::Remote source, the
+    // app TUI can only be meaningful as the Owned daemon. Full attach-mode
+    // with remote panes requires the bridge_client extraction tracked in
+    // docs/PLAN-daemon-resident.md (Stage 3.1/3.2/3.6).
+    if let Some(run_dir) = crate::daemon::find_active_run_dir(&home) {
+        let pid = std::fs::read_to_string(run_dir.join(".daemon"))
+            .ok()
+            .and_then(|s| {
+                s.trim()
+                    .split_once(':')
+                    .and_then(|(p, _)| p.parse::<u32>().ok())
+            })
+            .unwrap_or(0);
+        anyhow::bail!(
+            "another agend-terminal daemon is already running (pid {pid}, run_dir {})\n\
+             use `agend-terminal attach <agent>` to connect to one of its agents,\n\
+             or `agend-terminal stop` to free the fleet.",
+            run_dir.display()
+        );
+    }
+
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,

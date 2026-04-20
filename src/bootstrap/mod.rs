@@ -14,6 +14,7 @@
 //!   The current process is a client and should not touch run dir ownership.
 
 mod agent_resolve;
+pub mod daemon_spawn;
 mod fleet_normalize;
 pub mod signals;
 mod telegram_init;

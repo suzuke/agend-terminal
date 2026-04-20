@@ -153,7 +153,16 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start daemon with fleet.yaml
-    Start,
+    Start {
+        /// Run the daemon in the background (detaches from this shell,
+        /// stdio → $AGEND_HOME/daemon.log). Parent process exits immediately
+        /// once the daemon has published its run dir.
+        #[arg(long)]
+        detached: bool,
+        /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml).
+        #[arg(long)]
+        fleet: Option<String>,
+    },
     /// Start daemon with explicit agent specs (name:cmd ...)
     Daemon {
         /// Agent specs in name:command format
@@ -301,9 +310,25 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::App { fleet }) => {
             app::run(fleet.as_deref())?;
         }
-        Some(Commands::Start) => {
-            let fleet_path = home.join("fleet.yaml");
-            if fleet_path.exists() {
+        Some(Commands::Start { detached, fleet }) => {
+            let fleet_path = fleet
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("fleet.yaml"));
+            if detached {
+                // Spawn self as a background process and exit. Child inherits
+                // a clean environment from the parent shell but runs in its
+                // own process group so this shell's Ctrl+C doesn't reach it.
+                let handle = bootstrap::daemon_spawn::spawn_detached(
+                    &home,
+                    fleet_path.exists().then_some(fleet_path.as_path()),
+                )?;
+                println!(
+                    "daemon started: pid={} run_dir={} log={}",
+                    handle.pid,
+                    handle.run_dir.display(),
+                    handle.log_path.display()
+                );
+            } else if fleet_path.exists() {
                 cli::start_with_fleet(&home, &fleet_path)?;
             } else {
                 daemon::run(
