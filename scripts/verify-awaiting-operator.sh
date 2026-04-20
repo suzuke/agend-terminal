@@ -3,7 +3,7 @@
 #
 # Reproduces the codex-style "stuck on interactive prompt" scenario with a
 # silent backend (`cat`), verifies the state machine flips to
-# `awaiting_operator` after ~3s of stdout silence, and confirms that an
+# `awaiting_operator` after ~30s of stdout silence, and confirms that an
 # API `inject` with `raw: true` writes bytes straight to the agent's stdin
 # without inbox wrapping.
 #
@@ -103,14 +103,14 @@ INITIAL="$(rpc '{"method":"list"}' | python3 -c 'import json,sys; print(json.loa
 [[ "$INITIAL" == "starting" ]] || fail "expected 'starting', got '$INITIAL'"
 green "  ok"
 
-info "wait for silence detection (tick period is 10s, silence threshold 3s)"
+info "wait for silence detection (tick period is 10s, silence threshold 30s)"
 AFTER=""
-for i in $(seq 1 15); do
+for i in $(seq 1 50); do
     sleep 1
     AFTER="$(rpc '{"method":"list"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["agents"][0]["agent_state"])')"
     [[ "$AFTER" == "awaiting_operator" ]] && { green "  ok (flipped after ${i}s)"; break; }
 done
-[[ "$AFTER" == "awaiting_operator" ]] || fail "expected 'awaiting_operator' within 15s, got '$AFTER'"
+[[ "$AFTER" == "awaiting_operator" ]] || fail "expected 'awaiting_operator' within 50s, got '$AFTER'"
 
 info "inject raw bytes — should reach cat's stdin unwrapped"
 RESP="$(rpc '{"method":"inject","params":{"name":"silent","data":"HELLO-RAW\n","raw":true}}')"

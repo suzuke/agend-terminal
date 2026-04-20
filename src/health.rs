@@ -25,7 +25,16 @@ const STABILITY_WINDOW: Duration = Duration::from_secs(1800); // 30 min stable �
 /// thresholds (120s+). Flagging Ready-with-short-silence produced false
 /// positives for agents in the middle of tool execution that simply had a
 /// few seconds of quiet between bursts of output.
-const AWAITING_OP_SILENCE: Duration = Duration::from_secs(3);
+///
+/// Threshold chosen to be a true last-resort fallback: structurally
+/// recognizable prompts (y/n, press enter, etc. — see
+/// `state::is_generic_startup_prompt`, plus the backend-specific
+/// `InteractivePrompt` patterns) fire immediately on detection, so the
+/// silence window only matters for prompts whose text we can't pattern
+/// match. 30s is long enough that CLIs with slow splash screens or token
+/// loading don't falsely trip, and still well under the 120s
+/// `check_hang` threshold.
+const AWAITING_OP_SILENCE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -333,10 +342,10 @@ mod tests {
     #[test]
     fn test_awaiting_operator_starting_silence() {
         let h = HealthTracker::new();
-        // Starting + 2s silence → under threshold
-        assert!(!h.check_awaiting_operator(AgentState::Starting, Duration::from_secs(2)));
-        // Starting + 4s silence → flagged
-        assert!(h.check_awaiting_operator(AgentState::Starting, Duration::from_secs(4)));
+        // Starting + 29s silence → under threshold (slow splash/token load)
+        assert!(!h.check_awaiting_operator(AgentState::Starting, Duration::from_secs(29)));
+        // Starting + 31s silence → flagged
+        assert!(h.check_awaiting_operator(AgentState::Starting, Duration::from_secs(31)));
     }
 
     #[test]
