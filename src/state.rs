@@ -230,10 +230,22 @@ impl StatePatterns {
                 (AgentState::RateLimit, r"rate.?limit|429"),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
-                // [docs] Permission approval flow
+                // [measured] Codex 0.120.0 renders approval dialogs with
+                // a distinctive header (`Would you like to run the
+                // following command?`), three numbered options starting
+                // with `Yes, proceed` and ending with `No, and tell
+                // Codex what to do differently`, plus a footer
+                // (`Press enter to confirm or esc to cancel`). Observed
+                // in tests/fixtures/state-replay/codex-perm.raw at byte
+                // ~68K through dismissal at ~90K. The prior pattern
+                // (`Request approval|approve|deny`) never matched any
+                // of the wording. `approve|deny` retained for legacy
+                // and adjacent docs wording; the new alternations cover
+                // the real dialog text. Header + footer are long enough
+                // to avoid false positives on narration lines.
                 (
                     AgentState::PermissionPrompt,
-                    r"Request approval|approve|deny",
+                    r"Would you like to run the following command\?|Yes, proceed|No, and tell Codex|Press enter to confirm or esc to cancel|Request approval|approve|deny",
                 ),
                 // [measured] Codex launches into an update-available modal
                 // when a newer version is published; the banner blocks the
@@ -1297,6 +1309,61 @@ mod tests {
             Some(AgentState::ToolUse),
             "narration `• I'm reading ...` must not fire ToolUse"
         );
+    }
+
+    #[test]
+    fn codex_permission_prompt_dialog_match() {
+        // Codex 0.120.0 approval dialog — header, every option, and
+        // footer must all fire PermissionPrompt. Observed in
+        // codex-perm.raw byte ~68K-90K.
+        let patterns = StatePatterns::for_backend(&Backend::Codex);
+        for sample in [
+            "  Would you like to run the following command?",
+            "  1. Yes, proceed (y)",
+            "› 3. No, and tell Codex what to do differently (esc)",
+            "  Press enter to confirm or esc to cancel",
+        ] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::PermissionPrompt),
+                "expected PermissionPrompt for {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_permission_prompt_legacy_wording_still_matches() {
+        // Keep compat with legacy / docs wording in case earlier Codex
+        // builds or adjacent tooling surface through the same backend.
+        let patterns = StatePatterns::for_backend(&Backend::Codex);
+        for sample in ["Request approval", "approve", "deny"] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::PermissionPrompt),
+                "legacy wording {sample:?} must still fire PermissionPrompt",
+            );
+        }
+    }
+
+    #[test]
+    fn codex_permission_prompt_does_not_false_positive_on_narration() {
+        // Narration lines that precede the dialog (`• I'm writing...`,
+        // `outside the writable sandbox`, `escalated command`) must not
+        // fire PermissionPrompt — they're assistant narration, not the
+        // interactive dialog itself. We only assert they don't fire
+        // PermissionPrompt (they may legitimately match other states).
+        let patterns = StatePatterns::for_backend(&Backend::Codex);
+        for sample in [
+            "• I'm writing the requested content to /tmp/foo.txt.",
+            "  writable sandbox, so I need to run one escalated command",
+            "• Running printf 'hello' > /tmp/foo.txt",
+        ] {
+            assert_ne!(
+                patterns.detect(sample),
+                Some(AgentState::PermissionPrompt),
+                "narration {sample:?} must NOT fire PermissionPrompt",
+            );
+        }
     }
 
     #[test]

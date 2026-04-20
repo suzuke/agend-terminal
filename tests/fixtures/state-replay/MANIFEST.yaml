@@ -122,20 +122,23 @@ fixtures:
     cli_version: "0.120.0"
     recorded_on: "2026-04-20"
     scenario: "prompt 'write hello to /Users/suzuke/codex-perm-test.txt' (path outside default workspace-write sandbox) -> codex requests approval to run an escalated command -> user cancels -> /exit"
-    # Codex PermissionPrompt pattern `Request approval|approve|deny`
-    # never matches. The actual dialog wording in 0.120.0 is
-    # "escalated command" / "outside the writable sandbox" / "You
-    # canceled the request". InteractivePrompt fires at ~byte 1024 —
-    # same root cause as codex-update.raw / codex-tooluse.raw (Update
-    # banner or slash-menu matches `Press enter to continue`). Final
-    # detect() now returns ToolUse because the post-cancel summary
-    # frame retains the `• Ran printf ...` / `└ (no output)` block
-    # from the canceled tool call, which the newly expanded Codex
-    # ToolUse pattern (`• Ran` / `└ <verb>`) matches. The tracker
-    # still reports InteractivePrompt (prio 7) via hysteresis —
-    # byte-level replay cannot cross the 5s passive min_hold.
-    expected_transitions: [starting, interactive_prompt]
-    expected_final_state: interactive_prompt
+    # Codex 0.120.0 dialog wording — `Would you like to run the
+    # following command?` header plus `1. Yes, proceed` / `3. No, and
+    # tell Codex` options plus `Press enter to confirm or esc to
+    # cancel` footer — is now matched by the expanded PermissionPrompt
+    # pattern, firing at byte ~68K when the approval dialog renders.
+    # InteractivePrompt still fires first at ~byte 1024 via the Update
+    # banner (`Press enter to continue`). Upward transition to
+    # PermissionPrompt (prio 8 > InteractivePrompt prio 7) is
+    # instantaneous, so it surfaces in the replay transition log.
+    # After the user cancels, the dialog disappears and the post-
+    # cancel frame shows `• Ran printf ...` / `└ (no output)`, which
+    # the Codex ToolUse pattern matches — hence detect()=tool_use on
+    # the final screen. The tracker retains PermissionPrompt via
+    # hysteresis (byte-level replay cannot cross the 2s/5s min_hold
+    # needed to downgrade from prio 8 to prio 5).
+    expected_transitions: [starting, interactive_prompt, permission]
+    expected_final_state: permission
     expected_final_detect: tool_use
 
   # ── Stage 2a ToolUse recordings (2026-04-20) ────────────────────────
