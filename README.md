@@ -2,6 +2,10 @@
 
 Orchestrate AI coding agents — not just run them.
 
+> ⚠️ **Pre-alpha.** APIs, CLI flags, and `fleet.yaml` schema may change
+> between minor versions. Not for production use. Pin a specific version
+> and read the release notes before upgrading.
+
 ```bash
 cargo install agend-terminal
 agend-terminal demo    # Try it in 30 seconds
