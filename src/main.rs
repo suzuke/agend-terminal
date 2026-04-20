@@ -271,6 +271,7 @@ enum Commands {
     ///
     /// Flow: stage new binary → self-test → stop old daemon → start new →
     /// wait for ready ping → stabilise for N seconds → commit (or rollback).
+    #[cfg(unix)]
     Upgrade {
         /// Path to the new daemon binary.
         #[arg(long)]
@@ -310,17 +311,21 @@ fn main() -> anyhow::Result<()> {
 
     // Self-test mode: the supervisor execs this binary with AGEND_SELF_TEST=1
     // before promoting it. Bypass clap (no subcommand required) and exit
-    // with a clear status the supervisor can key on.
-    if agend_terminal::supervisor::self_test::requested() {
-        let home = home_dir();
-        match agend_terminal::supervisor::self_test::run(&home) {
-            Ok(()) => {
-                eprintln!("agend-terminal self-test: OK");
-                std::process::exit(0);
-            }
-            Err(e) => {
-                eprintln!("agend-terminal self-test: FAIL: {e:#}");
-                std::process::exit(1);
+    // with a clear status the supervisor can key on. Unix-only — see
+    // `src/lib.rs` for the gating rationale.
+    #[cfg(unix)]
+    {
+        if agend_terminal::supervisor::self_test::requested() {
+            let home = home_dir();
+            match agend_terminal::supervisor::self_test::run(&home) {
+                Ok(()) => {
+                    eprintln!("agend-terminal self-test: OK");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("agend-terminal self-test: FAIL: {e:#}");
+                    std::process::exit(1);
+                }
             }
         }
     }
@@ -594,6 +599,7 @@ fn main() -> anyhow::Result<()> {
                 &mut std::io::stdout(),
             );
         }
+        #[cfg(unix)]
         Some(Commands::Upgrade {
             binary,
             to_version,

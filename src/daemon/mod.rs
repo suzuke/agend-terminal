@@ -245,10 +245,14 @@ fn run_core(
     // `AGEND_SUPERVISOR_SOCK` env is set). Must come after agents are up
     // and API is bound — supervisor treats this as "upgrade succeeded".
     // Fire-and-forget: supervisor crashes shouldn't stop the daemon.
-    let pid = std::process::id();
-    let version = env!("CARGO_PKG_VERSION");
-    if let Err(e) = agend_terminal::supervisor::client::notify_ready(pid, version) {
-        tracing::warn!(error = %e, "supervisor ready ping failed (continuing)");
+    // Unix-only (the supervisor itself is Unix-only).
+    #[cfg(unix)]
+    {
+        let pid = std::process::id();
+        let version = env!("CARGO_PKG_VERSION");
+        if let Err(e) = agend_terminal::supervisor::client::notify_ready(pid, version) {
+            tracing::warn!(error = %e, "supervisor ready ping failed (continuing)");
+        }
     }
 
     // If the supervisor just upgraded us, it dropped an upgrade-marker with
@@ -256,6 +260,7 @@ fn run_core(
     // settle, inject a single "daemon upgraded" notice into each, then delete
     // the marker. Spawned so we don't delay the main loop; errors are logged
     // and otherwise ignored (agents missing the message is a cosmetic loss).
+    #[cfg(unix)]
     consume_upgrade_marker(home.to_path_buf(), Arc::clone(&registry));
 
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
@@ -849,6 +854,10 @@ fn strip_resume_args(args: &[String]) -> Vec<String> {
 ///
 /// Failures are logged but never propagated — this is a cosmetic notice;
 /// missing it must not abort daemon startup.
+///
+/// Unix-only: consumes output of `agend_terminal::supervisor::paths::upgrade_marker`,
+/// which is itself gated behind `#[cfg(unix)]` in `src/lib.rs`.
+#[cfg(unix)]
 fn consume_upgrade_marker(home: PathBuf, registry: AgentRegistry) {
     let marker_path = agend_terminal::supervisor::paths::upgrade_marker(&home);
     if !marker_path.exists() {
