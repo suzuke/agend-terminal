@@ -15,9 +15,11 @@
 mod agent_resolve;
 pub mod daemon_spawn;
 mod fleet_normalize;
+pub mod reload;
 pub mod signals;
 mod telegram_init;
 
+pub(crate) use agent_resolve::resolve_one;
 pub use agent_resolve::AgentDef;
 
 use anyhow::{anyhow, Context, Result};
