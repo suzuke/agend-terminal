@@ -53,22 +53,16 @@ pub fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
                 }
                 Ok::<(), anyhow::Error>(())
             }) {
-                if crate::telegram::is_topic_deleted_error(&e) {
-                    if let Some(tid) = topic_id {
-                        tracing::info!(
-                            instance = %instance_owned,
-                            topic_id = tid,
-                            "notify_telegram hit topic_deleted — cleaning up"
-                        );
-                        crate::telegram::cleanup_deleted_topic(
-                            &home_owned,
-                            &instance_owned,
-                            tid,
-                            None,
-                        );
-                    }
+                let handled = crate::telegram::handle_send_failure(
+                    &e,
+                    &home_owned,
+                    &instance_owned,
+                    topic_id,
+                    None,
+                );
+                if !handled {
+                    tracing::warn!(error = %e, "telegram notify failed");
                 }
-                tracing::warn!(error = %e, "telegram notify failed");
             }
         })
         .ok();
