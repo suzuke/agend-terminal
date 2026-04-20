@@ -4,12 +4,19 @@
 //! If AGEND_SMOKE_OUT is set, writes the final byte count to that file too
 //! (so DETACHED_PROCESS runs can be inspected even when stdout is gone).
 
-#![cfg(windows)]
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("pty_smoke_minimal is Windows-only");
+}
 
+#[cfg(windows)]
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+#[cfg(windows)]
 use std::io::Read;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 fn main() -> anyhow::Result<()> {
     let pty = native_pty_system();
     let pair = pty.openpty(PtySize {

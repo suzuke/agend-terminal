@@ -30,18 +30,30 @@
 //!       TUI socket server setup — even though real daemon binds these AFTER
 //!       spawn, this tests whether extra handles in-process affect reads)
 
-#![cfg(windows)]
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("pty_smoke is Windows-only");
+}
 
+#[cfg(windows)]
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+#[cfg(windows)]
 use std::env;
+#[cfg(windows)]
 use std::fs::OpenOptions;
+#[cfg(windows)]
 use std::io::{Read, Write};
+#[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
 const READ_BUDGET_SECS: u64 = 10;
 
+#[cfg(windows)]
 fn main() -> anyhow::Result<()> {
     let mode = env::var("AGEND_SMOKE_MODE").unwrap_or_else(|_| "v1".into());
     let out_path = env::var("AGEND_SMOKE_OUT").ok().map(PathBuf::from);
@@ -158,11 +170,13 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn variant_ge(mode: &str, needle: &str) -> bool {
     let parse = |s: &str| -> u32 { s.trim_start_matches('v').parse().unwrap_or(0) };
     parse(mode) >= parse(needle)
 }
 
+#[cfg(windows)]
 fn read_on_main(
     mut reader: Box<dyn Read + Send>,
     start: Instant,
@@ -192,6 +206,7 @@ fn read_on_main(
     (total, snippet, None)
 }
 
+#[cfg(windows)]
 fn read_in_thread(
     reader: Box<dyn Read + Send>,
     start: Instant,
@@ -206,6 +221,7 @@ fn read_in_thread(
         .unwrap_or((0, Vec::new(), Some("thread read timeout".into())))
 }
 
+#[cfg(windows)]
 fn child_kill(mut child: Box<dyn portable_pty::Child + Send + Sync>) -> anyhow::Result<()> {
     let _ = child.kill();
     Ok(())
