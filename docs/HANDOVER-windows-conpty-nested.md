@@ -163,20 +163,19 @@ Binaries tested (all under the same Win11 Insider Dev 26200 build):
 
 Ship the manifest fix (this PR), stop trying to work around it in our code. Users on 26200 should either (a) switch to Windows stable channel or (b) install and use WezTerm as their terminal until Microsoft fixes it. Users on 22H2/23H2/24H2 GA builds are unaffected (CI `windows-latest` ≈ Server 2022 + Win11 22H2 stays green).
 
-### External corroboration (added 2026-04-19)
+### External bug reports on 26200 — not the same bug (updated 2026-04-20)
 
-Confirmed independently via public bug trackers — this is not an agend-specific or portable-pty-specific issue. Multiple unrelated projects hit different ConPTY/node-pty failures on the same 26200 build:
+> **Earlier drafts of this section claimed these three projects "corroborated" a common 26200 ConPTY OS regression. That was wrong.** After the Session 4 CPR fix landed and `agend-terminal app` worked cleanly on 23H2, a careful reread of the three upstream issues shows each one is a *different* problem. They are kept here only so future diagnosis doesn't mistake them for additional evidence against agend.
 
-| Project | PTY backend | Symptom on build 26200 |
+| Project | Actual symptom | Relation to agend |
 |---|---|---|
-| [pinokiocomputer/pinokio#1017](https://github.com/pinokiocomputer/pinokio/issues/1017) | node-pty (ConPTY → winpty fallback) | `conpty.dll` missing from `System32\` entirely on some boxes; winpty fallback fails with `connect ENOENT \\.\pipe\winpty-conout-...` |
-| [openai/codex#13973](https://github.com/openai/codex/issues/13973) | node-pty ConPTY | MSVC runtime assertion `remove_pty_baton(baton->id)` at `conpty.cc:106`; Abort/Retry dialog appears on first PTY spawn |
-| [google-gemini/gemini-cli#12019](https://github.com/google-gemini/gemini-cli/issues/12019) / [#12060](https://github.com/google-gemini/gemini-cli/issues/12060) | node-pty | "Cannot resize a pty that has already exited" — PTY exits prematurely between commands (build 26200.6901) |
-| **this repo** (`pty_smoke_minimal`) | portable-pty 0.9 ConPTY | 20 bytes of banner then indefinite read-block (build 26200.8246) |
+| [pinokiocomputer/pinokio#1017](https://github.com/pinokiocomputer/pinokio/issues/1017) | `C:\Windows\System32\conpty.dll` **is missing** on certain 26200 boxes; node-pty falls back to the deprecated winpty path and fails at `connect ENOENT \\.\pipe\winpty-conout-...`. | Independent 26200 OS-side packaging regression. agend uses `portable-pty` which talks to `kernelbase.dll!CreatePseudoConsole` (conhost.exe backend), not a sideloaded `conpty.dll`, so this never affected us. |
+| [openai/codex#13973](https://github.com/openai/codex/issues/13973) | MSVC runtime assertion `remove_pty_baton(baton->id)` at `node-pty/src/win/conpty.cc:106`. node-pty-specific refcount/lifecycle bug. | Unrelated to portable-pty. Could have been triggered more often on 26200 because of timing differences, but the root cause is in node-pty's C++ baton tracking — agend's Rust path doesn't have equivalent bookkeeping. |
+| [google-gemini/gemini-cli#12019](https://github.com/google-gemini/gemini-cli/issues/12019) / [#12060](https://github.com/google-gemini/gemini-cli/issues/12060) | "Cannot resize a pty that has already exited" — PTY exits mid-command on 26200.6901. | Plausibly the same *class* of bug as agend's CPR gap (missing reply → child dies at a weird time), but gemini-cli runs node-pty + its own terminal emulator and would need its own fix upstream. Not evidence of any remaining agend-side issue. |
 
-Common factor: all on Windows 11 25H2 build 26200.x. No downstream fixes are known — the issues are all open/unresolved. Microsoft's [official 25H2 known-issues page](https://learn.microsoft.com/en-us/windows/release-health/status-windows-11-25h2) (as of 2026-04-17) lists only a Microsoft-account sign-in bug and a WUSA path bug — **no ConPTY/pseudoconsole regression is officially acknowledged yet**.
+Common factor was just "all three reporters happened to be on 26200", not "26200 breaks ConPTY the same way for everyone". Microsoft's [official 25H2 known-issues page](https://learn.microsoft.com/en-us/windows/release-health/status-windows-11-25h2) as of 2026-04-17 still lists only a Microsoft-account sign-in bug and a WUSA path bug — no acknowledged ConPTY regression. We have **no evidence of any residual agend-side issue on 26200** after the Session 4 fixes.
 
-Rollback path (tested 2026-04-19): user's box had `C:\Windows.old` within the 10-day rollback window → Settings → System → Recovery → **Go back** rolls 25H2 → 24H2 (build 26100) while preserving files and apps. After rollback, `pty_smoke_minimal.exe` should produce the full cmd.exe banner (~100+ bytes) instead of blocking at 20.
+Rollback path (tested 2026-04-19): user's box had `C:\Windows.old` within the 10-day rollback window → Settings → System → Recovery → **Go back** rolls 25H2 → 24H2 (build 26100) while preserving files and apps. This was done before the CPR fix was identified; with the fix, rollback is no longer required for agend to work on 26200.
 
 ## Session 4 correction (2026-04-19) — the *real* root causes were ours
 
@@ -202,7 +201,7 @@ Diagnostic left in the tree: `AGEND_CTRLC_SENTINEL=<path>` env var writes a time
 
 ### What this means for the 25H2/26200 story
 
-The Session-3 verdict ("everything that touches ConPTY on 26200 is broken") was overstated. The CPR-never-replied bug was the dominant symptom on 26200 *and* 23H2 — rolling the OS back didn't fix it, fixing vterm's event listener did. There may still be a genuine 26200 regression (the external corroboration list is real), but for this repo specifically the CPR and Ctrl+C fixes are what mattered.
+The Session-3 verdict ("everything that touches ConPTY on 26200 is broken") was overstated, and the "external corroboration" that supported it was a misread (see the section above). For agend, the CPR-never-replied bug was the entire story: it was the dominant symptom on 26200, it was *still* the symptom on 23H2 after rollback, and fixing vterm's event listener fixed both. We have no remaining evidence of a 26200-specific problem affecting this repo.
 
 ### Diagnostic scripts committed under `scripts/`
 
@@ -212,6 +211,6 @@ The Session-3 verdict ("everything that touches ConPTY on 26200 is broken") was 
 
 ## Open questions for next session
 
-1. Is there *still* a separate 26200-only regression hiding under the CPR fix? Retest `pty_smoke_minimal.exe` on 26200 with a build that includes the CPR auto-reply in `pty_smoke` (or just run the full daemon now that it's fixed) — if it still shows short reads on 26200 but works on 23H2, file the 26200-specific bug.
-2. `agend-terminal app` default shell is still `cmd.exe`; consider changing Windows default to PowerShell for a less spartan first-run experience.
-3. `AGEND_DEBUG_PTY_READ` and `AGEND_CTRLC_SENTINEL` env vars are kept for future Windows diagnostics. Strip them only if the diagnostic noise bothers a reviewer — they cost nothing when unset.
+1. `agend-terminal app` default shell is still `cmd.exe`; consider changing Windows default to PowerShell for a less spartan first-run experience.
+2. `AGEND_DEBUG_PTY_READ` and `AGEND_CTRLC_SENTINEL` env vars are kept for future Windows diagnostics. Strip them only if the diagnostic noise bothers a reviewer — they cost nothing when unset.
+3. If a user later reports a new Windows-only symptom on 26200/next-Insider, start by reproducing with `AGEND_DEBUG_PTY_READ=1` — don't assume "OS regression" until the PTY byte stream proves it. The Session 3 misdiagnosis cost a rollback that turned out not to be needed.
