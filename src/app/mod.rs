@@ -559,17 +559,10 @@ fn pane_from_menu_item(
     }
 }
 
-/// Write bytes to the focused pane's PTY.
+/// Write bytes to the focused pane's PTY (Local) or remote bridge (Remote).
 fn write_to_focused(layout: &Layout, registry: &AgentRegistry, bytes: &[u8]) {
-    if let Some(name) = layout
-        .active_tab()
-        .and_then(|t| t.focused_pane())
-        .map(|p| p.agent_name.clone())
-    {
-        let reg = agent::lock_registry(registry);
-        if let Some(handle) = reg.get(&name) {
-            let _ = agent::write_to_agent(handle, bytes);
-        }
+    if let Some(pane) = layout.active_tab().and_then(|t| t.focused_pane()) {
+        pane.write_input(registry, bytes);
     }
 }
 

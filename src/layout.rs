@@ -1,12 +1,27 @@
 //! Tab and pane layout management — tree-based nested splits.
 
+use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
+use crate::bridge_client::BridgeClient;
 use crate::vterm::VTerm;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use unicode_width::UnicodeWidthStr;
 
+/// How a pane's input/resize is delivered to the underlying process.
+///
+/// `Local` panes route through `AgentRegistry` keyed by `Pane::agent_name` —
+/// the pane doesn't own the PTY, the registry does. `Remote` panes own a
+/// `BridgeClient` that speaks to a daemon-hosted agent over TCP.
+pub enum PaneSource {
+    Local,
+    #[allow(dead_code)] // constructed by Stage 3.4 (app Attached branch)
+    Remote(Arc<Mutex<BridgeClient>>),
+}
+
 /// A single pane displaying one agent's terminal output.
-/// PTY ownership is in AgentRegistry — pane only has subscriber channel + local VTerm.
+/// PTY ownership is in AgentRegistry (Local) or BridgeClient (Remote) —
+/// pane only holds a subscriber channel and a local VTerm.
 pub struct Pane {
     pub agent_name: String,
     pub vterm: VTerm,
@@ -25,6 +40,9 @@ pub struct Pane {
     pub fleet_instance_name: Option<String>,
     /// Active text selection (grid coordinates within this pane's VTerm).
     pub selection: Option<Selection>,
+    /// Whether input/resize go to a local PTY (via registry) or a remote
+    /// daemon-hosted agent (via `BridgeClient`).
+    pub source: PaneSource,
 }
 
 /// Text selection within a pane's VTerm grid.
@@ -55,6 +73,49 @@ impl Pane {
         }
         // Don't auto-scroll if user has scrolled back (they're reading history).
         // User scrolls back to bottom manually via mouse or Ctrl+B [ → j.
+    }
+
+    /// Write bytes (keystrokes, paste) to this pane's underlying process.
+    /// Dispatches on `source`: Local goes through the registry, Remote goes
+    /// through the pane's BridgeClient. Errors are swallowed — a broken pane
+    /// surfaces via its output channel closing, which the app handles at the
+    /// next drain.
+    pub fn write_input(&self, registry: &AgentRegistry, bytes: &[u8]) {
+        match &self.source {
+            PaneSource::Local => {
+                let reg = agent::lock_registry(registry);
+                if let Some(handle) = reg.get(&self.agent_name) {
+                    let _ = agent::write_to_agent(handle, bytes);
+                }
+            }
+            PaneSource::Remote(client) => {
+                let mut c = crate::sync::lock_poisoned(client, "bridge_client");
+                let _ = c.send_input(bytes);
+            }
+        }
+    }
+
+    /// Resize this pane's underlying PTY / remote agent.
+    pub fn resize_pty(&self, registry: &AgentRegistry, cols: u16, rows: u16) {
+        match &self.source {
+            PaneSource::Local => {
+                let reg = agent::lock_registry(registry);
+                if let Some(handle) = reg.get(&self.agent_name) {
+                    if let Ok(master) = handle.pty_master.lock() {
+                        let _ = master.resize(portable_pty::PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                }
+            }
+            PaneSource::Remote(client) => {
+                let mut c = crate::sync::lock_poisoned(client, "bridge_client");
+                let _ = c.send_resize(cols, rows);
+            }
+        }
     }
 }
 
@@ -1163,6 +1224,7 @@ mod tests {
                 has_notification: false,
                 fleet_instance_name: None,
                 selection: None,
+                source: PaneSource::Local,
             }))),
             second: Box::new(PaneNode::Leaf(Box::new(Pane {
                 agent_name: "b".to_string(),
@@ -1176,6 +1238,7 @@ mod tests {
                 has_notification: false,
                 fleet_instance_name: None,
                 selection: None,
+                source: PaneSource::Local,
             }))),
         };
         let area = (0u16, 0u16, 20u16, 10u16);
@@ -1208,6 +1271,7 @@ mod tests {
                 has_notification: false,
                 fleet_instance_name: None,
                 selection: None,
+                source: PaneSource::Local,
             }))),
             second: Box::new(PaneNode::Leaf(Box::new(Pane {
                 agent_name: "b".to_string(),
@@ -1221,6 +1285,7 @@ mod tests {
                 has_notification: false,
                 fleet_instance_name: None,
                 selection: None,
+                source: PaneSource::Local,
             }))),
         };
         let area = (0u16, 0u16, 100u16, 20u16);
@@ -1280,6 +1345,7 @@ mod tests {
             has_notification: false,
             fleet_instance_name: None,
             selection: None,
+            source: PaneSource::Local,
         }
     }
 

@@ -69,61 +69,37 @@ is already called directly from `app::run_app`).
 Today's fail-fast is a compromise because the pane layer only understands
 local PTYs.
 
-### 3.1 — extract `bridge_client` from `src/tui.rs` [NOT DONE]
-- Current `src/tui::attach` (183 LOC) does: resolve port, send cookie,
-  handshake protocol version, spawn output thread (stdout), run input loop
-  (crossterm events).
-- Desired module `src/bridge_client.rs` with a handle like:
-  ```rust
-  pub struct BridgeClient {
-      write: TcpStream,
-      // output is pumped to a user-supplied callback or channel
-  }
-  pub fn connect(home: &Path, name: &str,
-                 on_frame: impl Fn(&[u8]) + Send + 'static)
-      -> Result<BridgeClient>;
-  impl BridgeClient {
-      pub fn send_input(&mut self, bytes: &[u8]) -> Result<()>;
-      pub fn send_resize(&mut self, cols: u16, rows: u16) -> Result<()>;
-  }
-  ```
-- `src/tui::attach` keeps raw-mode + crossterm polling, delegates network
-  plumbing to `BridgeClient`. No behavior change.
-- Does **not** add new consumers yet — keeping this commit small.
+### 3.1 — extract `bridge_client` from `src/tui.rs` [DONE in `a3340b6`]
+`src/bridge_client.rs` owns the connect + cookie + protocol-version
+handshake and the framed send side. The read side is exposed as an owned
+`TcpStream` (via `take_reader()`) so each consumer can park its own thread.
+`tui::attach` keeps raw-mode + crossterm polling and delegates network
+plumbing to `BridgeClient`. No new consumers added in that commit.
 
-### 3.2 — `Pane::Local` / `Pane::Remote` abstraction [NOT DONE]
-- Current `layout::Pane` holds an `AgentHandle` whose PTY is local. Any
-  frame source (local PTY read thread vs. `BridgeClient` callback) should
-  work.
-- Introduce an enum:
-  ```rust
-  enum PaneSource {
-      Local(Arc<Mutex<AgentCore>>),
-      Remote(bridge_client::Handle),
-  }
-  ```
-  or, more conservatively, keep `AgentCore` and give it a pluggable input
-  writer + frame pump.
-- Render path (`render::render_pane`) stays — it already reads a vterm
-  screen buffer, doesn't care about the source.
-- Input path (key → PTY write) switches on source.
+### 3.2 — `Pane::Local` / `Pane::Remote` abstraction [DONE]
+`layout::PaneSource` enum with `Local` (routes through `AgentRegistry` by
+`agent_name`) and `Remote(Arc<Mutex<BridgeClient>>)` (routes through the
+pane's own bridge client). `Pane::write_input` and `Pane::resize_pty`
+dispatch on source. `render::resize_panes` uses `pane.resize_pty` instead
+of inlining `handle.pty_master.resize`. No Remote consumer yet — that's
+3.4. The variant is marked `#[allow(dead_code)]` until then.
 
 ### 3.3 — `spawn_detached` [DONE in Stage 2]
 Already shipped (`aef61d2`). Listed here for traceability.
 
 ### 3.4 — app Owned vs Attached branches [PARTIAL]
 - Owned: today's behavior, untouched.
-- Attached (today): fail-fast with a message. 
+- Attached (today): fail-fast with a message.
 - Attached (3.4 goal): open a tab per agent reachable from the daemon,
-  each pane a `Pane::Remote` connected via `bridge_client`. Requires 3.1
-  and 3.2 landed first.
+  each pane a `Pane::Remote` connected via `bridge_client`. 3.1 and 3.2
+  are now landed — only app wiring remains.
 
-### 3.5 — SIGTERM-only handler for app [NOT DONE]
-App cannot use `bootstrap::signals::install` because `ctrlc` bundles
-SIGINT+SIGTERM+SIGHUP and ratatui's raw mode needs Ctrl+C as a 0x03 byte
-for the focused pane's PTY. Install a SIGTERM-only `libc::sigaction`
-(unix) / console ctrl handler filtered to `CTRL_CLOSE_EVENT` (windows),
-so `agend-terminal stop` can cleanly shut down an Owned app process.
+### 3.5 — SIGTERM-only handler for app [DONE in `a9df3a8`]
+`bootstrap::signals::install_term_only` — Unix `libc::sigaction(SIGTERM)`
+with `SA_RESTART`, Windows `SetConsoleCtrlHandler` filtered to
+`CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT`. SIGINT is
+left to crossterm so Ctrl+C still reaches the focused PTY as `0x03`. Main
+loop polls `signals::term_requested()` each 50ms tick.
 
 ### 3.6 — lifecycle e2e tests [NOT DONE]
 Shell-script driven, not unit tests. Scenarios:

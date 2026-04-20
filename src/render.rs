@@ -179,7 +179,7 @@ pub fn resize_panes(pane_area: Rect, layout: &mut Layout, registry: &AgentRegist
         Some(t) => t,
         None => return,
     };
-    let mut resizes = Vec::new();
+    let mut resizes: Vec<(usize, u16, u16)> = Vec::new();
     if tab.zoomed {
         let focus_id = tab.focus_id;
         if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
@@ -187,7 +187,7 @@ pub fn resize_panes(pane_area: Rect, layout: &mut Layout, registry: &AgentRegist
             let h = pane_area.height.saturating_sub(2);
             if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
                 pane.vterm.resize(w, h);
-                resizes.push((pane.agent_name.clone(), w, h));
+                resizes.push((pane.id, w, h));
             }
         }
     } else {
@@ -196,15 +196,21 @@ pub fn resize_panes(pane_area: Rect, layout: &mut Layout, registry: &AgentRegist
         collect_resize_needs(pane_area, tab.root_mut(), &mut rects, &mut resizes);
         tab.pane_rects = rects;
     }
-    apply_pty_resizes(&resizes, registry);
+    // Dispatch PTY / bridge resize via `Pane::resize_pty` — local panes hit
+    // the registry, remote panes push through their BridgeClient.
+    for (id, cols, rows) in &resizes {
+        if let Some(pane) = tab.root().find_pane(*id) {
+            pane.resize_pty(registry, *cols, *rows);
+        }
+    }
 }
 
-/// Collect (pane_name, width, height) for all panes that need resizing.
+/// Collect (pane_id, width, height) for all panes that need resizing.
 fn collect_resize_needs(
     area: Rect,
     node: &mut PaneNode,
     rects: &mut std::collections::HashMap<usize, (u16, u16, u16, u16)>,
-    resizes: &mut Vec<(String, u16, u16)>,
+    resizes: &mut Vec<(usize, u16, u16)>,
 ) {
     match node {
         PaneNode::Leaf(pane) => {
@@ -213,7 +219,7 @@ fn collect_resize_needs(
             let h = area.height.saturating_sub(2);
             if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
                 pane.vterm.resize(w, h);
-                resizes.push((pane.agent_name.clone(), w, h));
+                resizes.push((pane.id, w, h));
             }
         }
         PaneNode::Split {
@@ -225,26 +231,6 @@ fn collect_resize_needs(
             let [c0, c1] = split_chunks(area, dir, *ratio);
             collect_resize_needs(c0, first, rects, resizes);
             collect_resize_needs(c1, second, rects, resizes);
-        }
-    }
-}
-
-/// Apply PTY resizes with a single registry lock.
-fn apply_pty_resizes(resizes: &[(String, u16, u16)], registry: &AgentRegistry) {
-    if resizes.is_empty() {
-        return;
-    }
-    let reg = agent::lock_registry(registry);
-    for (name, cols, rows) in resizes {
-        if let Some(handle) = reg.get(name.as_str()) {
-            if let Ok(master) = handle.pty_master.lock() {
-                let _ = master.resize(portable_pty::PtySize {
-                    rows: *rows,
-                    cols: *cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-            }
         }
     }
 }

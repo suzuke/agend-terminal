@@ -157,6 +157,7 @@ pub(super) fn create_pane(
         has_notification: false,
         fleet_instance_name: None,
         selection: None,
+        source: crate::layout::PaneSource::Local,
     })
 }
 
@@ -215,6 +216,7 @@ pub(super) fn attach_pane(
         has_notification: false,
         fleet_instance_name: Some(name.to_string()),
         selection: None,
+        source: crate::layout::PaneSource::Local,
     })
 }
 
