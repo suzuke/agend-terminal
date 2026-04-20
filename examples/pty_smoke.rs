@@ -163,7 +163,10 @@ fn variant_ge(mode: &str, needle: &str) -> bool {
     parse(mode) >= parse(needle)
 }
 
-fn read_on_main(mut reader: Box<dyn Read + Send>, start: Instant) -> (usize, Vec<u8>, Option<String>) {
+fn read_on_main(
+    mut reader: Box<dyn Read + Send>,
+    start: Instant,
+) -> (usize, Vec<u8>, Option<String>) {
     let mut total = 0usize;
     let mut snippet: Vec<u8> = Vec::new();
     let mut buf = [0u8; 2048];
@@ -189,7 +192,10 @@ fn read_on_main(mut reader: Box<dyn Read + Send>, start: Instant) -> (usize, Vec
     (total, snippet, None)
 }
 
-fn read_in_thread(reader: Box<dyn Read + Send>, start: Instant) -> (usize, Vec<u8>, Option<String>) {
+fn read_in_thread(
+    reader: Box<dyn Read + Send>,
+    start: Instant,
+) -> (usize, Vec<u8>, Option<String>) {
     let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<u8>, Option<String>)>();
     std::thread::spawn(move || {
         let r = read_on_main(reader, start);

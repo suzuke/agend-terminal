@@ -9,9 +9,6 @@ fn main() {
         // ship an equivalent manifest. See docs/HANDOVER-windows-conpty-nested.md.
         println!("cargo:rerun-if-changed=assets/windows/agend-terminal.rc");
         println!("cargo:rerun-if-changed=assets/windows/agend-terminal.manifest");
-        embed_resource::compile(
-            "assets/windows/agend-terminal.rc",
-            embed_resource::NONE,
-        );
+        embed_resource::compile("assets/windows/agend-terminal.rc", embed_resource::NONE);
     }
 }
