@@ -15,20 +15,28 @@ jobs:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
+          # macOS — macos-13 is the last Intel runner; macos-latest is arm64.
           - target: x86_64-apple-darwin
-            os: macos-latest
-            binary: agend-terminal
+            os: macos-13
+            archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
-            binary: agend-terminal
+            archive: tar.gz
+          # Linux — use native arm64 runner to avoid cross-compile pain with
+          # native deps (arboard/x11). Free for public repos since 2025-01.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            binary: agend-terminal
+            archive: tar.gz
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            binary: agend-terminal
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+          # Windows x64.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -38,26 +46,29 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz ${{ matrix.binary }}
+          tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz agend-terminal
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path target/${{ matrix.target }}/release/agend-terminal.exe `
+            -DestinationPath agend-terminal-${{ matrix.target }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: agend-terminal-${{ matrix.target }}
-          path: agend-terminal-${{ matrix.target }}.tar.gz
+          path: agend-terminal-${{ matrix.target }}.${{ matrix.archive }}
 
   release:
     name: Create Release
@@ -69,8 +80,17 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate SHA256 checksums
+        run: |
+          cd artifacts
+          sha256sum agend-terminal-*.tar.gz agend-terminal-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/*.tar.gz
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/SHA256SUMS
