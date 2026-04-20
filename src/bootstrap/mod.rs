@@ -73,6 +73,11 @@ pub struct PrepareOptions {
     /// If true, initialize Telegram polling when `channel:` is configured.
     /// Set false for tests that don't need real bot traffic.
     pub init_telegram: bool,
+    /// If true, resolve every fleet instance into an [`AgentDef`] (creates
+    /// worktrees, generates instructions, appends resume/model/Claude flags).
+    /// Set false for app mode, where pane_factory spawns on demand from tabs
+    /// and the resolve work would duplicate what pane creation does.
+    pub resolve_agents: bool,
 }
 
 impl Default for PrepareOptions {
@@ -80,6 +85,7 @@ impl Default for PrepareOptions {
         Self {
             mutate_fleet_yaml: true,
             init_telegram: true,
+            resolve_agents: true,
         }
     }
 }
@@ -130,7 +136,11 @@ pub fn prepare(
 
     let mut config = crate::fleet::FleetConfig::load(fleet_path)?;
     fleet_normalize::normalize(&mut config, home, opts.mutate_fleet_yaml);
-    let agents = agent_resolve::resolve(&config, home);
+    let agents = if opts.resolve_agents {
+        agent_resolve::resolve(&config, home)
+    } else {
+        Vec::new()
+    };
 
     let telegram = if opts.init_telegram {
         telegram_init::init(&config, home)
@@ -235,6 +245,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            resolve_agents: false,
         };
         let outcome = prepare(&home, &fleet, opts).expect("prepare");
         match outcome {
@@ -263,6 +274,7 @@ mod tests {
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
             init_telegram: false,
+            resolve_agents: false,
         };
         let outcome = prepare(&home, &fleet, opts).expect("prepare");
         match outcome {

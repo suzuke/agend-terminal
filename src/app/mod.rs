@@ -75,11 +75,60 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<()> {
     let home = crate::home_dir();
+    let fleet_path = fleet_override
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| home.join("fleet.yaml"));
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-
     let (tui_event_tx, tui_event_rx) = crossbeam::channel::bounded::<TuiEvent>(256);
-    let _api_guard = api_server::start_api_server(&home, &registry, tui_event_tx);
+
+    // Preflight via the shared bootstrap seam. Owned → we're the daemon:
+    // bootstrap issued `api.cookie` before we start `api::serve`, so
+    // `inbox::notify_agent`'s `api::call(INJECT, ...)` from Telegram's message
+    // router actually reaches the server. Attached → another daemon owns the
+    // run dir; we skip spinning up our own API server and avoid touching its
+    // files. Err → proceed with TUI but no in-process API (rare — load/flock
+    // failure — TUI remains usable for local panes).
+    let opts = crate::bootstrap::PrepareOptions {
+        resolve_agents: false, // app spawns via pane_factory from tabs
+        ..Default::default()
+    };
+    let (_api_guard, telegram_state, telegram_status) = match crate::bootstrap::prepare(
+        &home,
+        &fleet_path,
+        opts,
+    ) {
+        Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
+            let telegram = prepared.telegram.clone();
+            let status = if telegram.is_some() {
+                render::TelegramStatus::Connected
+            } else {
+                telegram_hooks::telegram_status_from_config(&prepared.config)
+            };
+            let guard = api_server::start_api_server(prepared, &registry, tui_event_tx);
+            (guard, telegram, status)
+        }
+        Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
+            tracing::info!(
+                pid = attached.daemon_pid,
+                path = %attached.run_dir.display(),
+                "attached to existing daemon, skipping in-process API server"
+            );
+            (
+                api_server::noop_guard(),
+                None,
+                render::TelegramStatus::NotConfigured,
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
+            (
+                api_server::noop_guard(),
+                None,
+                render::TelegramStatus::NotConfigured,
+            )
+        }
+    };
 
     // Per-agent AwaitingOperator supervisor: watches for stdout silence during
     // Starting (or recently-entered Ready — some backends like codex match
@@ -102,10 +151,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let pane_rows = rows.saturating_sub(4);
     let pane_cols = cols.saturating_sub(2);
-
-    let fleet_path = fleet_override
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| home.join("fleet.yaml"));
 
     // Reconcile fleet.yaml (agent definitions) with session.json (layout hint)
     let started = session::restore_with_reconciliation(
@@ -140,30 +185,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
     // Start true so restored split panes get correct sizes before first draw.
     let mut needs_resize = true;
-
-    // Initialize Telegram: start polling, auto-create topics, update status
-    let (telegram_state, telegram_status) = {
-        let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-        if let Some(ref config) = fleet {
-            let submit_keys: HashMap<String, String> = config
-                .instances
-                .keys()
-                .filter_map(|name| match config.resolve_instance(name) {
-                    Some(r) => Some((name.clone(), r.submit_key)),
-                    None => {
-                        tracing::warn!(%name, "failed to resolve fleet instance");
-                        None
-                    }
-                })
-                .collect();
-            match crate::telegram::init_from_config(config, &home, submit_keys) {
-                Some(state) => (Some(state), render::TelegramStatus::Connected),
-                None => (None, telegram_hooks::telegram_status_from_config(config)),
-            }
-        } else {
-            (None, render::TelegramStatus::NotConfigured)
-        }
-    };
 
     // Crossterm event reader thread
     let (event_tx, event_rx) = crossbeam::channel::unbounded::<Event>();
