@@ -286,14 +286,7 @@ pub(super) fn handle_key(
         },
         Overlay::ConfirmClose { target } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // Closing the last pane in a tab is a tab close — close_pane_by_id
-                // is a no-op on the final pane, so without this promotion Ctrl+B x
-                // would silently do nothing on a single-pane tab.
-                let is_tab = matches!(target, CloseTarget::Tab)
-                    || ctx
-                        .layout
-                        .active_tab()
-                        .is_some_and(|t| t.root().pane_count() <= 1);
+                let is_tab = matches!(target, CloseTarget::Tab);
                 *overlay = Overlay::None;
                 if is_tab {
                     let idx = ctx.layout.active;
