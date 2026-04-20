@@ -280,6 +280,18 @@ fn run_core(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
     let mut last_snapshot_json = String::new();
 
+    // Hot-reload watcher: poll fleet.yaml mtime on each tick. `known_digest`
+    // starts from the initial fleet (so a reload detects only real changes,
+    // not startup state) and advances as added agents materialize. Removed /
+    // command-changed / args-changed / working_dir-changed are warn-only; see
+    // `bootstrap::reload` docs for policy.
+    let fleet_path = home.join("fleet.yaml");
+    let mut fleet_watcher = crate::bootstrap::reload::FleetWatcher::new(fleet_path.clone());
+    let mut known_digest = crate::fleet::FleetConfig::load(&fleet_path)
+        .ok()
+        .map(|c| crate::bootstrap::reload::digest_from_config(&c))
+        .unwrap_or_default();
+
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
         let (tx, rx) = crossbeam::channel::bounded(1);
@@ -396,6 +408,20 @@ fn run_core(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
         check_schedules(home, &registry);
         check_ci_watches(home, &registry);
+
+        // Hot-reload: poll fleet.yaml; spawn newly-added instances, warn on
+        // changes we can't safely apply in-flight.
+        if let Some(new_cfg) = fleet_watcher.check() {
+            apply_fleet_reload(
+                home,
+                &new_cfg,
+                &mut known_digest,
+                &registry,
+                &configs,
+                &crash_tx,
+                &shutdown,
+            );
+        }
 
         {
             let cfgs = crate::sync::lock_poisoned(&configs, "configs");
@@ -638,6 +664,137 @@ fn run_core(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(1));
     tracing::info!("exiting");
     Ok(())
+}
+
+/// Apply a newly-loaded fleet.yaml to the running daemon.
+///
+/// Policy:
+/// - **added**: resolve via `bootstrap::resolve_one` and spawn in-place. The
+///   new agent gets the same `AgentConfig` registration (for respawn) and
+///   per-agent TUI server as any startup agent.
+/// - **removed / command_changed / args_changed / working_dir_changed**: log
+///   a warn. Tearing down a live PTY to realign fleet.yaml risks destroying
+///   in-progress user work, so the operator has to explicitly `delete` /
+///   `restart` the agent. Mirrors agend-pty's policy.
+/// - **role_changed / topic_id_changed**: log. These fields only matter at
+///   spawn time for instructions generation and Telegram routing; a safe
+///   in-place swap needs more plumbing (instructions files are read by the
+///   agent process, routing tables are cached elsewhere).
+///
+/// `known_digest` is advanced to the new fleet's digest on successful apply
+/// so the next tick's diff is computed relative to the just-applied state.
+#[allow(clippy::too_many_arguments)]
+fn apply_fleet_reload(
+    home: &Path,
+    new_config: &crate::fleet::FleetConfig,
+    known_digest: &mut HashMap<String, crate::bootstrap::reload::InstanceDigest>,
+    registry: &AgentRegistry,
+    configs: &Arc<Mutex<HashMap<String, AgentConfig>>>,
+    crash_tx: &crossbeam::channel::Sender<String>,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    let new_digest = crate::bootstrap::reload::digest_from_config(new_config);
+    let diff = crate::bootstrap::reload::compute_diff(known_digest, &new_digest);
+    if diff.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        added = ?diff.added,
+        removed = ?diff.removed,
+        command_changed = ?diff.command_changed,
+        args_changed = ?diff.args_changed,
+        role_changed = ?diff.role_changed,
+        topic_id_changed = ?diff.topic_id_changed,
+        working_dir_changed = ?diff.working_dir_changed,
+        "fleet.yaml reload",
+    );
+
+    for name in &diff.removed {
+        tracing::warn!(agent = %name, "fleet.yaml removed agent — left running; use `delete` to tear down");
+    }
+    for name in &diff.command_changed {
+        tracing::warn!(agent = %name, "fleet.yaml command changed — requires manual restart (would kill live session)");
+    }
+    for name in &diff.args_changed {
+        tracing::warn!(agent = %name, "fleet.yaml args changed — requires manual restart");
+    }
+    for name in &diff.working_dir_changed {
+        tracing::warn!(agent = %name, "fleet.yaml working_directory changed — requires manual restart");
+    }
+    for name in &diff.role_changed {
+        tracing::info!(agent = %name, "fleet.yaml role changed — won't be reflected until agent respawns");
+    }
+    for name in &diff.topic_id_changed {
+        tracing::info!(agent = %name, "fleet.yaml topic_id changed — won't be reflected until agent respawns");
+    }
+
+    for name in &diff.added {
+        let Some(agent_def) = crate::bootstrap::resolve_one(new_config, home, name) else {
+            tracing::warn!(agent = %name, "failed to resolve newly-added instance");
+            continue;
+        };
+        let (dname, command, args, env, working_dir, submit_key) = agent_def;
+        let worktree_source = working_dir.as_ref().and_then(|wd| {
+            wd.display().to_string().contains(".worktrees/").then(|| {
+                wd.parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_path_buf())
+            })?
+        });
+        crate::sync::lock_poisoned(configs, "configs").insert(
+            dname.clone(),
+            AgentConfig {
+                name: dname.clone(),
+                backend_command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+                working_dir: working_dir.clone(),
+                worktree_source,
+                submit_key: submit_key.clone(),
+            },
+        );
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+        if let Err(e) = agent::spawn_agent(
+            &agent::SpawnConfig {
+                name: &dname,
+                backend_command: &command,
+                args: &args,
+                cols,
+                rows,
+                env: env.as_ref(),
+                working_dir: working_dir.as_deref(),
+                submit_key: &submit_key,
+                home: Some(home),
+                crash_tx: Some(crash_tx.clone()),
+                shutdown: Some(Arc::clone(shutdown)),
+            },
+            registry,
+        ) {
+            tracing::warn!(agent = %dname, error = %e, "failed to spawn reload-added agent");
+            // Roll back the config entry so the next tick retries cleanly.
+            crate::sync::lock_poisoned(configs, "configs").remove(&dname);
+            continue;
+        }
+        let rdir = run_dir(home);
+        let reg = Arc::clone(registry);
+        let n = dname.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("{n}_tui_server"))
+            .spawn(move || serve_agent_tui(&n, &rdir, &reg))
+        {
+            tracing::warn!(agent = %dname, error = %e, "failed to spawn TUI server for reload-added agent");
+        }
+        crate::event_log::log(
+            home,
+            "reload_add",
+            &dname,
+            "agent added via fleet.yaml reload",
+        );
+        tracing::info!(agent = %dname, "spawned via fleet.yaml reload");
+    }
+
+    *known_digest = new_digest;
 }
 
 /// Strip resume-related arguments for fresh respawn.
