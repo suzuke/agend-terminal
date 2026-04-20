@@ -11,4 +11,9 @@
 //! ratatui, teloxide, tokio) so the supervisor binary remains small and its
 //! semantic surface rarely changes.
 
+// Unix-only: the self-healing supervisor uses PID/signal semantics that
+// don't map cleanly to Windows. Windows builds simply omit the upgrade path;
+// see the `#[cfg(unix)]` gates on the Upgrade command and supervisor call
+// sites in `src/main.rs` and `src/daemon/mod.rs`.
+#[cfg(unix)]
 pub mod supervisor;
