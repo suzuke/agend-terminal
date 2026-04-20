@@ -1,19 +1,23 @@
 # Windows Support — Implementation Plan
 
-> Date: 2026-04-17 (rev. — Phase A completed and folded into `main`)
+> Date: 2026-04-17 (rev. 2026-04-20 — Phase A / B / C.1 / C.2 all folded into `main`; Phase C.3 mostly fixed, one unresolved Windows 11 Insider Dev regression)
 > Prereq: Read `docs/EVAL-cross-platform.md` for the state-of-play.
-> Remaining effort: ~1–2 weeks (Phase B + Phase C).
+> Remaining effort: One outstanding bug (C.3 nested-ConPTY hang on Win 11 Insider build 26200, tracked in `docs/HANDOVER-windows-conpty-nested.md`). Everything else that was once Phase B/C is on `main`.
 
 ---
 
 ## Overview
 
-The Unix-only blockers are down to one: IPC. Everything else that used to block a Windows build has already been fixed on `main`.
+The Unix-only blockers are all down. IPC moved to TCP loopback, CI runs on `windows-latest`, and shell wrappers emit `.cmd` on Windows. What remains is a single OS-specific runtime regression.
 
 Phases:
 - **Phase A — DONE**. Platform-agnostic fixes (paths, file locking, PID helpers, chmod guards).
-- **Phase B — TODO**. IPC migration (UDS → TCP or named pipes).
-- **Phase C — TODO**. Validation (Windows CI, ConPTY behavior, backends, smoke test).
+- **Phase B — DONE** (2026-04-17). IPC migration (UDS → TCP loopback + port-file registry in `src/ipc.rs`).
+- **Phase C.1 — DONE**. `windows-latest` in the CI matrix (`.github/workflows/ci.yml`).
+- **Phase C.2 — DONE**. `.cmd` wrappers emitted alongside `.sh` in `src/instructions.rs` / `src/mcp_config.rs`.
+- **Phase C.3 — MOSTLY DONE**. Windows-specific ConPTY fixes landed (DSR CPR auto-reply, Ctrl+C delivery, embed-resource manifest declaring Win10/11 + UTF-8, backend resolution via `which`). **One unresolved case**: nested-ConPTY silent hang on Windows 11 Insider Dev build 26200 — see `docs/HANDOVER-windows-conpty-nested.md` (`Status: unresolved`). GitHub Actions `windows-latest` (Server 2022) is green.
+- **Phase C.4 — DONE (de facto)**. Backend PATH resolution fixed in commit `7fa064a`; `doctor` covers availability.
+- **Phase C.5 — DONE (de facto)**. Real-PTY start/attach/app/stop have been exercised repeatedly (every HANDOVER-windows-* document was produced by running the E2E smoke flow).
 
 ---
 
@@ -33,7 +37,9 @@ Acceptance of Phase A: `grep nix::` in `src/` returns nothing; `grep '"/tmp"'` r
 
 ---
 
-## Phase B — IPC Migration (the remaining blocker)
+## Phase B — IPC Migration (DONE, landed 2026-04-17)
+
+Kept verbatim below for audit / design-rationale reference. **Implementation is in `src/ipc.rs`** and every call-site listed in B.2 has been migrated. `grep 'std::os::unix::net' src/` returns no matches.
 
 Unix domain sockets are the only architectural blocker left. Choose one strategy and land it as a single well-reviewed PR.
 
@@ -101,7 +107,7 @@ pub fn connect_agent(home: &Path, name: &str) -> Result<TcpStream>;
 
 ---
 
-## Phase C — Validation
+## Phase C — Validation (DONE except C.3 nested-ConPTY on build 26200)
 
 ### C.1 Windows CI
 
@@ -171,29 +177,26 @@ Each missing backend should surface a clean error in `doctor`, not a crash.
 ## Task Checklist
 
 ```
-Phase B — IPC migration (single PR)
-  [ ] B.0 Decide strategy (default: TCP localhost everywhere)
-  [ ] B.1 src/ipc.rs — port registry + connect helpers
-  [ ] B.2 Migrate daemon.rs / api.rs / tui.rs / cli.rs to TCP
-  [ ] B.3 Verify framing.rs generics; set_nodelay; loopback-only bind
-  [ ] B.4 Update integration tests
-  [ ] B.5 Delete all std::os::unix imports outside #[cfg(unix)]
-  [ ] B.6 cargo check --target x86_64-pc-windows-msvc passes
+Phase B — IPC migration (DONE 2026-04-17)
+  [x] B.0 Strategy chosen: TCP localhost everywhere
+  [x] B.1 src/ipc.rs — port-file registry + connect helpers
+  [x] B.2 daemon.rs / api.rs / tui.rs / cli.rs / mcp/* / agent.rs / verify.rs / ops.rs migrated
+  [x] B.3 framing.rs already generic; set_nodelay + loopback-only bind applied
+  [x] B.4 integration tests on TCP
+  [x] B.5 No std::os::unix::net outside #[cfg(unix)] blocks (grep clean)
+  [x] B.6 cargo check --target x86_64-pc-windows-msvc passes
 
 Phase C — Validation
-  [ ] C.1 Add Windows to CI matrix
-  [ ] C.2 Generate .cmd wrappers on Windows (instructions.rs, mcp_config.rs)
-  [ ] C.3 ConPTY behavior pass: VTerm, state.rs regexes, resize
-  [ ] C.4 Backend availability smoke tests
-  [ ] C.5 End-to-end smoke on Windows
+  [x] C.1 Windows in CI matrix (.github/workflows/ci.yml)
+  [x] C.2 .cmd wrappers on Windows (instructions.rs, mcp_config.rs)
+  [~] C.3 ConPTY behavior — most fixes landed; nested-ConPTY hang on
+          Win 11 Insider Dev 26200 unresolved (HANDOVER-windows-conpty-nested.md)
+  [x] C.4 Backend availability — which-based PATH resolution (commit 7fa064a)
+  [x] C.5 End-to-end smoke — run repeatedly during C.3 debugging
 ```
 
 ---
 
-## Dependencies
+## Remaining work
 
-```
-B (single PR) ── C.1 ── C.2 ── C.3 ── C.4 ── C.5
-```
-
-Phase B must land first; everything in Phase C depends on a Windows build that runs.
+Only **C.3 nested-ConPTY on Windows 11 Insider Dev build 26200** is open. The symptom, ruled-out causes, and proposed investigation direction are in `docs/HANDOVER-windows-conpty-nested.md`. GitHub Actions `windows-latest` (Server 2022 ≈ Win 11 22H2) is green, so the bug is specific to the 26000+ Insider branch.

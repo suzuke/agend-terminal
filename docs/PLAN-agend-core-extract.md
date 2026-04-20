@@ -1,5 +1,7 @@
 # Plan: extract `agend-core` crate to de-duplicate agend-terminal and agend-pty
 
+> **Status: Not started 2026-04-20** — only the plan itself has been committed (`7953010`). `Cargo.toml` is still a single `[package]` (no `[workspace]`), and there is no `agend-core/` directory. Picking this up needs the prerequisites listed in the pickup memory (third consumer for BackgroundServices, etc.) plus a repo-merge decision with agend-pty.
+
 Worktree: `/Users/suzuke/Documents/Hack/agend-refactor-core-extract`
 Branch:   `refactor/agend-core-extract`
 
