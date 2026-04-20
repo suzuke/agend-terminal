@@ -185,12 +185,24 @@ impl StatePatterns {
                 ),
                 // [docs] Trust-based permission system
                 (AgentState::PermissionPrompt, r"Allow this action|y/n/t"),
+                // [measured] Kiro 2.0.1 renders tool banners as
+                // `● Read .`, `● Write <path>`, etc. — `●` (U+25CF BLACK
+                // CIRCLE) + space + capitalized tool verb. Observed in
+                // tests/fixtures/state-replay/kiro-tooluse.raw at byte
+                // ~40960. Placed above Thinking so the tool banner wins
+                // first-match when both a `●` banner and the `Thinking`
+                // spinner coexist on the same screen. The legacy internal
+                // tool-name alternation (`execute_bash` etc.) is retained
+                // for completeness — those strings appear in tool-output
+                // stack traces and may surface during errors.
+                (
+                    AgentState::ToolUse,
+                    r"●\s+(Read|Write|Edit|Bash|Grep|Glob|Task|List|Search)\b|execute_bash|fs_read|fs_write",
+                ),
                 // [measured] Kiro prints the word "Thinking" during generation
                 // (captured live 2026-04-20, 23 occurrences in a short session).
                 // Earlier pattern "Generating" never matched real output.
                 (AgentState::Thinking, r"Thinking"),
-                // [docs] Tool names in output
-                (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
                 // [measured] Idle prompt
                 (
                     AgentState::Idle,
@@ -1137,6 +1149,44 @@ mod tests {
         // Clear screen, banner alone re-renders.
         drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
         assert_eq!(st.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn kiro_tooluse_banner_match() {
+        // Kiro 2.0.1 renders tool banners as `● <Verb> <target>` — e.g.
+        // `● Read .`, `● Write /tmp/out`. Observed in kiro-tooluse.raw
+        // around byte 40960; byte-level replay cannot surface the
+        // transition (Thinking fires first at ~25088 and ToolUse prio
+        // is lower), but production elapsed time clears the min_hold.
+        let patterns = StatePatterns::for_backend(&Backend::KiroCli);
+        for sample in [
+            "● Read .",
+            "● Write /tmp/out.txt",
+            "● Edit Cargo.toml",
+            "● Bash ls -la",
+            "● Grep TODO src/",
+        ] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "expected ToolUse for {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kiro_tooluse_legacy_internal_names_still_match() {
+        // Preserve backwards-compat: old pattern alternation
+        // (execute_bash|fs_read|fs_write) continues to match stack-trace
+        // / error-surface output that may leak these internal tool IDs.
+        let patterns = StatePatterns::for_backend(&Backend::KiroCli);
+        for sample in ["execute_bash", "fs_read", "fs_write"] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "expected ToolUse for {sample:?}"
+            );
+        }
     }
 
     #[test]

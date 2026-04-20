@@ -195,11 +195,17 @@ fixtures:
     cli_version: "2.0.1"
     recorded_on: "2026-04-20"
     scenario: "--trust-all-tools mode; prompt 'list files in current directory' -> kiro runs tool + prints directory listing -> /quit"
-    # Kiro ToolUse pattern is `execute_bash|fs_read|fs_write` — kiro
-    # 2.0.1 renders the tool call under a different banner so the
-    # pattern never matches on this recording. Detect() returns Ready
-    # at the end because the final screen still shows the "Trust All
-    # Tools active · /quit to exit" status line.
+    # Kiro 2.0.1 tool banner `● Read .` (U+25CF + capitalized verb) is
+    # now covered by an updated ToolUse alternation, verified by the
+    # kiro_tooluse_banner_match unit test. Replay baseline unchanged
+    # because the `Thinking` spinner (prio Thinking=6) fires at byte
+    # ~25088 before the first `● Read` banner at ~40960 (prio ToolUse
+    # =5); hysteresis blocks the downgrade under byte-level replay
+    # where elapsed time does not cross the 2s min_hold. Production
+    # reads between PTY chunks clear the hold and the transition does
+    # surface. Detect() returns Ready at the end because the final
+    # screen still shows the "Trust All Tools active · /quit to exit"
+    # status line.
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: ready
