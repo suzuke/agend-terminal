@@ -152,19 +152,27 @@ fn team_tools() -> Vec<Value> {
 
 fn schedule_tools() -> Vec<Value> {
     vec![
-        json!({"name": "create_schedule", "description": "Create a cron schedule to inject messages.",
+        json!({"name": "create_schedule", "description": "Create a schedule to inject messages. Supply 'cron' for recurring or 'run_at' for one-shot (mutually exclusive). A one-shot auto-disables after firing or being detected as missed.",
             "inputSchema": {"type": "object", "properties": {
-                "cron": {"type": "string"}, "message": {"type": "string"},
-                "target": {"type": "string"}, "label": {"type": "string"},
-                "timezone": {"type": "string"}
-            }, "required": ["cron", "message"]}}),
-        json!({"name": "list_schedules", "description": "List all schedules.",
+                "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring)."},
+                "run_at": {"type": "string", "description": "ISO 8601 one-shot instant. Either with offset ('2026-04-21T15:30:00+08:00') or naive ('2026-04-21T15:30:00') combined with 'timezone'. Must be in the future."},
+                "message": {"type": "string"},
+                "target": {"type": "string"},
+                "label": {"type": "string"},
+                "timezone": {"type": "string", "description": "IANA zone name. Defaults to the detected system timezone."}
+            }, "required": ["message"]}}),
+        json!({"name": "list_schedules", "description": "List all schedules. Each row carries a 'trigger' object: {kind:'cron',expr} or {kind:'once',at}.",
             "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}}}}),
-        json!({"name": "update_schedule", "description": "Update a schedule.",
+        json!({"name": "update_schedule", "description": "Update a schedule. 'cron' and 'run_at' remain mutually exclusive; supplying either replaces the trigger kind.",
             "inputSchema": {"type": "object", "properties": {
-                "id": {"type": "string"}, "cron": {"type": "string"}, "message": {"type": "string"},
-                "target": {"type": "string"}, "label": {"type": "string"},
-                "timezone": {"type": "string"}, "enabled": {"type": "boolean"}
+                "id": {"type": "string"},
+                "cron": {"type": "string"},
+                "run_at": {"type": "string"},
+                "message": {"type": "string"},
+                "target": {"type": "string"},
+                "label": {"type": "string"},
+                "timezone": {"type": "string"},
+                "enabled": {"type": "boolean"}
             }, "required": ["id"]}}),
         json!({"name": "delete_schedule", "description": "Delete a schedule.",
             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}),
