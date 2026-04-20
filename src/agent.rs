@@ -234,7 +234,18 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         args.iter().cloned().chain(extra).collect()
     };
 
-    let mut cmd = CommandBuilder::new(backend_command);
+    // Resolve bare command names to absolute paths via `which` before handing
+    // them to `CommandBuilder`. On Windows, npm global installs drop both a
+    // Unix-style shell-script (no extension) and a `.cmd` wrapper in the same
+    // directory; `CreateProcessW`'s PATHEXT search walks the exact name first
+    // and picks the extensionless Unix script, which blows up with
+    // ERROR_BAD_EXE_FORMAT (193). Pre-resolving gives us the `.cmd` path
+    // unambiguously. On Unix this is a no-op — `execvp` already does the
+    // equivalent PATH walk — but keeping the same code path on both platforms
+    // avoids a `#[cfg(windows)]` split here.
+    let resolved_command =
+        which::which(backend_command).unwrap_or_else(|_| std::path::PathBuf::from(backend_command));
+    let mut cmd = CommandBuilder::new(&resolved_command);
     cmd.args(&enriched_args);
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
