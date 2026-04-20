@@ -208,6 +208,15 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Request approval|approve|deny",
                 ),
+                // [measured] Codex launches into an update-available modal
+                // when a newer version is published; the banner blocks the
+                // REPL until the operator presses Enter to dismiss or select.
+                // Previously this left the agent visibly at Ready (the banner
+                // text still matched "OpenAI Codex") while silently stalled.
+                (
+                    AgentState::InteractivePrompt,
+                    r"Update available!|Press enter to continue",
+                ),
                 // [estimated] Processing state
                 (AgentState::Thinking, r"Thinking"),
                 // [estimated] Patch tool
@@ -832,6 +841,45 @@ mod tests {
             b"\r\n\x1b[31m429 rate limit exceeded\x1b[0m\r\n",
         );
         assert_eq!(st.get_state(), AgentState::RateLimit);
+    }
+
+    #[test]
+    fn pipeline_codex_update_menu_is_interactive_prompt() {
+        // Regression for BUG 2: codex launches with an "Update available!"
+        // modal overlaid on the usual ready banner. Without a dedicated
+        // pattern, the Ready pattern still matched the banner and the
+        // operator saw a "ready" pane that silently ignored input —
+        // really it was waiting on the modal.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        // Banner + modal rendered together on startup.
+        drive(
+            &mut vt,
+            &mut st,
+            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+    }
+
+    #[test]
+    fn pipeline_codex_update_menu_dismiss_returns_to_ready() {
+        // After the operator presses Enter, the modal text leaves the
+        // screen. Screen re-renders with just the ready banner → detect
+        // returns Ready, and after hysteresis the state drops from
+        // InteractivePrompt (prio 7) back to Ready (prio 3).
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        drive(
+            &mut vt,
+            &mut st,
+            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+        // Simulate passive-hold window elapsing so the downgrade can fire.
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        // Clear screen, banner alone re-renders.
+        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
     }
 
     #[test]
