@@ -149,13 +149,16 @@ fixtures:
     cli_version: "2.1.98"
     recorded_on: "2026-04-20"
     scenario: "prompt 'list files in current directory' -> claude runs a tool and prints a directory listing under the ⏺ banner -> /exit"
-    # Tool DID execute (banner `⏺ <files>` visible on final screen) but
-    # the ClaudeCode ToolUse pattern requires a literal tool name
-    # (Read|Bash|Edit|Write|Grep|Glob) after the spinner/dot glyph,
-    # which this CLI version does not print on the banner line. See
-    # FOLLOWUP-tooluse-pattern-gaps.md.
-    expected_transitions: [starting, idle]
-    expected_final_state: idle
+    # Mid-stream banner `⏺ Listing 1 directory…` fires ToolUse at byte
+    # ~9728 after the pattern alternation was extended to include the
+    # claude 2.1.98 -ing verbs (Listing|Reading|Writing|Searching|
+    # Editing). Final detect() returns Idle because the completion
+    # frame shows the bare directory listing under `⏺` without a verb
+    # on the banner line, so only the `❯` prompt glyph matches — the
+    # tracker still reports ToolUse via hysteresis (min_hold=2s not
+    # yet elapsed under byte-level replay).
+    expected_transitions: [starting, idle, tool_use]
+    expected_final_state: tool_use
     expected_final_detect: idle
 
   - file: codex-tooluse.raw

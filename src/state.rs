@@ -144,9 +144,12 @@ impl StatePatterns {
                 // tool-name banners like `⏺ Write(...)` in 2.1.98. Previously
                 // only `●` (U+25CF) was in the class, so `⏺ Write(...)` lines
                 // never matched — see docs/FOLLOWUP-tooluse-pattern-gaps.md.
+                // In-flight banners use -ing verbs (`⏺ Listing ...`,
+                // `⏺ Reading ...`) rather than the bare tool name shown on
+                // the completion banner — covered by the alternation below.
                 (
                     AgentState::ToolUse,
-                    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●⏺].*(Read|Bash|Edit|Write|Grep|Glob)",
+                    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●⏺].*(Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)",
                 ),
                 // [measured] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
@@ -804,6 +807,30 @@ mod tests {
         let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
         let detected = patterns.detect("⏺ Write(/tmp/claude-perm-test.txt)");
         assert_eq!(detected, Some(AgentState::ToolUse));
+    }
+
+    #[test]
+    fn claude_tooluse_ing_verb_match() {
+        // Claude 2.1.98 in-flight banners use present-participle verbs —
+        // `⏺ Listing 1 directory…`, `⏺ Reading file`, etc. — rather than
+        // the bare tool name on the completion banner. Real-PTY recording
+        // claude-tooluse.raw exhibits `⏺ Listing 1 directory…` mid-stream;
+        // this synthetic test anchors each -ing verb we added to the
+        // alternation.
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        for sample in [
+            "⏺ Listing 1 directory…",
+            "⏺ Reading src/main.rs",
+            "⏺ Writing /tmp/out.txt",
+            "⏺ Searching for TODO",
+            "⏺ Editing Cargo.toml",
+        ] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "expected ToolUse for {sample:?}"
+            );
+        }
     }
 
     #[test]
