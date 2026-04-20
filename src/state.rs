@@ -35,6 +35,14 @@ pub enum AgentState {
     Idle,
     ToolUse,
     Thinking,
+    /// Startup stalled on a backend-specific modal that blocks normal use
+    /// (e.g. codex `Update available!` menu). Distinct from
+    /// `PermissionPrompt` so operators can tell "CLI waiting for an OK on
+    /// an update menu" from "CLI asking whether to Allow a tool invocation".
+    /// Higher than `Thinking` because real work cannot progress until the
+    /// modal is dismissed; lower than `PermissionPrompt` because formal
+    /// authorization flows take precedence when both match.
+    InteractivePrompt,
     PermissionPrompt,
     ContextFull,
     RateLimit,
@@ -56,14 +64,15 @@ impl AgentState {
             Self::Idle => 4,
             Self::ToolUse => 5,
             Self::Thinking => 6,
-            Self::PermissionPrompt => 7,
-            Self::ContextFull => 8,
-            Self::RateLimit => 9,
-            Self::UsageLimit => 10,
-            Self::AuthError => 11,
-            Self::ApiError => 12,
-            Self::Crashed => 13,
-            Self::Restarting => 14,
+            Self::InteractivePrompt => 7,
+            Self::PermissionPrompt => 8,
+            Self::ContextFull => 9,
+            Self::RateLimit => 10,
+            Self::UsageLimit => 11,
+            Self::AuthError => 12,
+            Self::ApiError => 13,
+            Self::Crashed => 14,
+            Self::Restarting => 15,
         }
     }
 
@@ -86,6 +95,7 @@ impl AgentState {
             Self::Idle => "idle",
             Self::ToolUse => "tool_use",
             Self::Thinking => "thinking",
+            Self::InteractivePrompt => "interactive_prompt",
             Self::PermissionPrompt => "permission",
             Self::ContextFull => "context_full",
             Self::RateLimit => "rate_limit",
@@ -604,7 +614,7 @@ mod tests {
     #[test]
     fn permission_prompt_higher_than_thinking() {
         let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
-        // PermissionPrompt (priority 6) > Thinking (priority 5) — instant
+        // PermissionPrompt (priority 8) > Thinking (priority 6) — instant
         t.feed("Allow once");
         assert_eq!(t.get_state(), AgentState::PermissionPrompt);
     }

@@ -30,6 +30,7 @@ fn state_color(state: AgentState) -> Color {
         AgentState::Idle => Color::DarkGray,
         AgentState::Thinking => Color::Yellow,
         AgentState::ToolUse => Color::Blue,
+        AgentState::InteractivePrompt => Color::Indexed(214), // orange — matches AwaitingOperator semantics (needs human OK)
         AgentState::PermissionPrompt => Color::Magenta,
         AgentState::ContextFull | AgentState::RateLimit => Color::Indexed(208),
         AgentState::UsageLimit | AgentState::AuthError | AgentState::ApiError => Color::Red,
@@ -108,6 +109,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         let blink = matches!(
             state,
             AgentState::PermissionPrompt
+                | AgentState::InteractivePrompt
                 | AgentState::Hang
                 | AgentState::Restarting
                 | AgentState::AwaitingOperator
