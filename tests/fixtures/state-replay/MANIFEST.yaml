@@ -105,15 +105,16 @@ fixtures:
     cli_version: "2.1.98"
     recorded_on: "2026-04-20"
     scenario: "prompt 'write hello to /tmp/claude-perm-test.txt' -> Allow-once/Deny dialog appears -> Deny -> /exit (final screen shows `⏺ Write(...)` banner + `User rejected write to ...`)"
-    # ToolUse now fires at ~byte 9216: the rejection banner
-    # `⏺ Write(/tmp/claude-perm-test.txt)` matches the ToolUse pattern
-    # after `⏺` (U+23FA) was added to the char class. PermissionPrompt
-    # still does NOT fire — the in-flight Allow-once/Deny dialog
-    # wording is not matched by the current `Allow once|Allow always|
-    # approve` pattern (dialog likely renders via ink overlay or uses
-    # different wording). See docs/FOLLOWUP-permission-pattern-gaps.md.
-    expected_transitions: [starting, idle, tool_use]
-    expected_final_state: tool_use
+    # PermissionPrompt now fires at byte ~9216 via the expanded
+    # claude pattern that matches the actual 2.1.98 dialog wording
+    # (`Esc to cancel · Tab to amend` footer plus `Do you want to …`
+    # question). On the final frame the dialog has been dismissed and
+    # only the `⏺ Write(...)` rejection banner remains — detect()
+    # returns ToolUse, but the tracker retains PermissionPrompt (prio
+    # 8) via hysteresis because byte-level replay never crosses the
+    # 2s min_hold required to downgrade to ToolUse (prio 5).
+    expected_transitions: [starting, idle, permission]
+    expected_final_state: permission
     expected_final_detect: tool_use
 
   - file: codex-perm.raw

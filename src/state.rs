@@ -133,10 +133,19 @@ impl StatePatterns {
                     AgentState::ContextFull,
                     r"compacting context|context.*(full|limit)",
                 ),
-                // [estimated] Ink select component for permissions
+                // [measured] Claude 2.1.98 permission dialog renders as an
+                // Ink overlay with a distinctive footer — `Esc to cancel ·
+                // Tab to amend` — plus a `Do you want to …` question and
+                // `1. Yes / 2. Yes, allow all edits during this session /
+                // 3. No` options. Observed in tests/fixtures/state-replay/
+                // claude-perm.raw at byte ~9216. The previous pattern
+                // (`Allow once|Allow always|approve`) did not match any
+                // wording in this dialog. The footer line is the most
+                // specific anchor; the question prefix and allow-all-edits
+                // option cover variations where the footer is scrolled out.
                 (
                     AgentState::PermissionPrompt,
-                    r"Allow once|Allow always|approve",
+                    r"Esc to cancel · Tab to amend|Do you want to |allow all edits during this session|Allow once|Allow always|approve",
                 ),
                 // [estimated] Ink render during processing
                 (AgentState::Thinking, r"Thinking"),
@@ -855,6 +864,42 @@ mod tests {
         let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
         let detected = patterns.detect("⏺ Write(/tmp/claude-perm-test.txt)");
         assert_eq!(detected, Some(AgentState::ToolUse));
+    }
+
+    #[test]
+    fn claude_permission_prompt_dialog_match() {
+        // Claude 2.1.98 permission dialog — distinctive footer + body.
+        // Observed in claude-perm.raw ~byte 9216.
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        assert_eq!(
+            patterns.detect("Esc to cancel · Tab to amend"),
+            Some(AgentState::PermissionPrompt),
+            "dialog footer must fire PermissionPrompt",
+        );
+        assert_eq!(
+            patterns.detect("Do you want to create /tmp/out.txt?"),
+            Some(AgentState::PermissionPrompt),
+            "dialog question prefix must fire PermissionPrompt",
+        );
+        assert_eq!(
+            patterns.detect("   2. Yes, allow all edits during this session (shift+tab)"),
+            Some(AgentState::PermissionPrompt),
+            "allow-all-edits option must fire PermissionPrompt",
+        );
+    }
+
+    #[test]
+    fn claude_permission_prompt_legacy_wording_still_matches() {
+        // Keep compat with the pre-2.1.98 wording in case earlier
+        // CLI builds surface through the same backend.
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        for sample in ["Allow once", "Allow always", "approve"] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::PermissionPrompt),
+                "legacy wording {sample:?} must still fire PermissionPrompt",
+            );
+        }
     }
 
     #[test]
