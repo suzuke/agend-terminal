@@ -81,6 +81,23 @@ pub fn connect_agent(home: &Path, name: &str) -> Result<TcpStream> {
     connect_port(port).map_err(Into::into)
 }
 
+/// Enumerate agent names whose `*.port` files exist in `run`, excluding the
+/// daemon's own `api.port`. Returned in filesystem order — callers that need
+/// a stable list should sort.
+pub fn list_agent_ports(run: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(run) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".port").map(str::to_string)
+        })
+        .filter(|n| n != API_NAME)
+        .collect()
+}
+
 /// Probe whether an agent's TCP listener is reachable (for `doctor`).
 pub fn probe_agent(run: &Path, name: &str) -> bool {
     match read_port(run, name) {

@@ -15,7 +15,6 @@ use unicode_width::UnicodeWidthStr;
 /// `BridgeClient` that speaks to a daemon-hosted agent over TCP.
 pub enum PaneSource {
     Local,
-    #[allow(dead_code)] // constructed by Stage 3.4 (app Attached branch)
     Remote(Arc<Mutex<BridgeClient>>),
 }
 

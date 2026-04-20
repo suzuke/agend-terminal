@@ -53,19 +53,6 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 
     let fleet_path = fleet_path_override.map(PathBuf::from);
 
-    // Pre-TUI check: app cannot safely coexist with a running daemon because
-    // pane_factory spawns local PTYs that would compete with the daemon's
-    // agents. Fail before ratatui grabs the terminal so the error is visible.
-    if let Some(run_dir) = crate::daemon::find_active_run_dir(&home) {
-        let pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(0);
-        anyhow::bail!(
-            "another agend-terminal daemon is already running (pid {pid}, run_dir {})\n\
-             use `agend-terminal attach <agent>` to connect to one of its agents,\n\
-             or `agend-terminal stop` to free the fleet.",
-            run_dir.display()
-        );
-    }
-
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
@@ -97,12 +84,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
 
     // Preflight via the shared bootstrap seam so `api.cookie` is issued before
     // `api::serve` starts — otherwise `inbox::notify_agent`'s `api::call(INJECT)`
-    // from Telegram's router would silently fail. The Attached arm defends
-    // against a daemon racing in after the pre-TUI check.
+    // from Telegram's router would silently fail.
+    //
+    // `Attached` means another daemon owns the fleet; the TUI connects as a
+    // client (Stage 3.4). `attached_mode` gates every operation that would
+    // conflict with the live daemon — session persistence, fleet.yaml sync,
+    // supervisor spawn, and agent kill on exit.
     let opts = crate::bootstrap::PrepareOptions {
         resolve_agents: false, // app spawns via pane_factory from tabs
         ..Default::default()
     };
+    let mut attached_run_dir: Option<PathBuf> = None;
     let (_api_guard, telegram_state, telegram_status) = match crate::bootstrap::prepare(
         &home,
         &fleet_path,
@@ -126,8 +118,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             tracing::info!(
                 pid = attached.daemon_pid,
                 path = %attached.run_dir.display(),
-                "attached to existing daemon, skipping in-process API server"
+                "attached to existing daemon, connecting as remote client"
             );
+            attached_run_dir = Some(attached.run_dir.clone());
             (
                 api_server::noop_guard(),
                 None,
@@ -143,6 +136,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             )
         }
     };
+    let attached_mode = attached_run_dir.is_some();
 
     // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
     // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
@@ -153,10 +147,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // Per-agent AwaitingOperator supervisor: watches for stdout silence during
     // Starting (or recently-entered Ready — some backends like codex match
     // ready_pattern against the startup banner that precedes the update menu)
-    // and pushes a vterm tail to the agent's Telegram topic. Same thread runs
-    // in daemon mode; lifting it out of the daemon tick lets app mode get the
-    // behavior without pulling in daemon's crash-respawn machinery.
-    crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
+    // and pushes a vterm tail to the agent's Telegram topic. In Attached mode
+    // the daemon already runs its own supervisor against the real registry, so
+    // the app must not also poll a disjoint (empty) registry.
+    if !attached_mode {
+        crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
+    }
 
     let mut layout = Layout::new();
     let mut key_handler = KeyHandler::new();
@@ -172,34 +168,66 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let pane_rows = rows.saturating_sub(4);
     let pane_cols = cols.saturating_sub(2);
 
-    // Reconcile fleet.yaml (agent definitions) with session.json (layout hint)
-    let started = session::restore_with_reconciliation(
-        &home,
-        &fleet_path,
-        &mut layout,
-        &registry,
-        &wakeup_tx,
-        &mut name_counter,
-        pane_cols,
-        pane_rows,
-    );
-    if !started {
-        // Rule 4: nothing to restore → open shell tab
-        pane_factory::spawn_pane_tab(
+    if let Some(ref run_dir) = attached_run_dir {
+        // Attached: one tab per agent the daemon is serving. Tabs derive from
+        // the daemon's `*.port` files (the same list `agend-terminal list`
+        // reads), not from session.json — the daemon is the source of truth
+        // for which agents exist while it's alive. Connect failures are logged
+        // and the corresponding tab is dropped; the app still starts.
+        let mut names = crate::ipc::list_agent_ports(run_dir);
+        names.sort();
+        for name in &names {
+            match pane_factory::create_remote_pane(
+                name,
+                &home,
+                &fleet_path,
+                &mut layout,
+                pane_cols,
+                pane_rows,
+                &wakeup_tx,
+            ) {
+                Ok(pane) => {
+                    let tab_name = pane.agent_name.clone();
+                    layout.add_tab(crate::layout::Tab::new(tab_name, pane));
+                }
+                Err(e) => tracing::warn!(agent = %name, error = %e, "remote pane attach failed"),
+            }
+        }
+        if layout.tabs.is_empty() {
+            tracing::warn!(
+                "attached to daemon but no agents are reachable; check `agend-terminal list`"
+            );
+        }
+    } else {
+        // Owned: reconcile fleet.yaml (agent definitions) with session.json
+        // (layout hint); fall back to a shell tab on cold start.
+        let started = session::restore_with_reconciliation(
+            &home,
+            &fleet_path,
             &mut layout,
             &registry,
-            &home,
-            "shell",
-            &std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string()),
-            &[],
-            None,
-            &HashMap::new(),
-            "\r",
-            pane_cols,
-            pane_rows,
             &wakeup_tx,
             &mut name_counter,
-        )?;
+            pane_cols,
+            pane_rows,
+        );
+        if !started {
+            pane_factory::spawn_pane_tab(
+                &mut layout,
+                &registry,
+                &home,
+                "shell",
+                &std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string()),
+                &[],
+                None,
+                &HashMap::new(),
+                "\r",
+                pane_cols,
+                pane_rows,
+                &wakeup_tx,
+                &mut name_counter,
+            )?;
+        }
     }
 
     // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
@@ -391,17 +419,23 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
     }
 
-    // Save session IDs so resume works after reattach
-    session::save_all_session_ids(&home, &layout);
+    // Attached mode: the daemon owns session state, fleet.yaml reconciliation,
+    // and every agent's PTY. Touching any of them on exit would clobber live
+    // daemon state — `sync_fleet_yaml` in particular would silently delete
+    // fleet entries whose remote connect happened to fail at startup.
+    if !attached_mode {
+        // Save session IDs so resume works after reattach
+        session::save_all_session_ids(&home, &layout);
 
-    // Sync fleet.yaml to match current state, then save layout
-    session::sync_fleet_yaml(&home, &layout);
-    session::save_session(&home, &layout);
+        // Sync fleet.yaml to match current state, then save layout
+        session::sync_fleet_yaml(&home, &layout);
+        session::save_session(&home, &layout);
 
-    // Cleanup: kill all agents
-    for tab in &layout.tabs {
-        for name in tab.root().agent_names() {
-            kill_agent(&registry, &name);
+        // Cleanup: kill all agents
+        for tab in &layout.tabs {
+            for name in tab.root().agent_names() {
+                kill_agent(&registry, &name);
+            }
         }
     }
 

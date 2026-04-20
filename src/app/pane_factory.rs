@@ -11,12 +11,15 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
+use crate::bridge_client::BridgeClient;
+use crate::framing::{self, TAG_DATA};
 use crate::layout::{Layout, Pane, Tab};
 use crate::vterm::VTerm;
 
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Spawn an agent/shell via spawn_agent and add as a new tab.
 #[allow(clippy::too_many_arguments)]
@@ -271,6 +274,76 @@ pub(super) fn create_pane_from_resolved(
     }
     pane.fleet_instance_name = Some(fleet_name.to_string());
     Ok(pane)
+}
+
+/// Build a pane backed by a remote daemon-hosted agent.
+///
+/// Connects a [`BridgeClient`], parks a reader thread that forwards every
+/// `TAG_DATA` frame into the pane's output channel, and returns a pane whose
+/// `source` is `PaneSource::Remote`. The daemon writes the current vterm
+/// dump as the first `TAG_DATA` frame (see `daemon::tui_bridge`), so the
+/// local VTerm starts empty and catches up as soon as the pane is drained —
+/// no explicit dump processing needed here.
+///
+/// `backend` is derived from `fleet.yaml` so the `[from:...]` notification
+/// heuristic in `Pane::drain_output` behaves the same as for Local panes.
+/// A missing fleet entry leaves `backend = None`, disabling only that
+/// heuristic — input/resize still work.
+pub(super) fn create_remote_pane(
+    name: &str,
+    home: &Path,
+    fleet_path: &Path,
+    layout: &mut Layout,
+    cols: u16,
+    rows: u16,
+    wakeup_tx: &crossbeam::channel::Sender<usize>,
+) -> Result<Pane> {
+    let mut client = BridgeClient::connect(home, name, cols, rows)?;
+    let mut reader = client
+        .take_reader()
+        .ok_or_else(|| anyhow::anyhow!("bridge_client reader already taken"))?;
+
+    let pane_id = layout.next_pane_id();
+    let (fwd_tx, pane_rx) = crossbeam::channel::unbounded::<Vec<u8>>();
+    let tx = wakeup_tx.clone();
+    let thread_name = format!("{name}_remote_fwd");
+    std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || loop {
+            match framing::read_tagged_frame(&mut reader) {
+                Ok((TAG_DATA, data)) => {
+                    if fwd_tx.send(data).is_err() {
+                        break;
+                    }
+                    let _ = tx.send(pane_id);
+                }
+                // Daemon never emits TAG_RESIZE toward clients today. Ignore
+                // unknown tags rather than tearing down a healthy session.
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        })
+        .ok();
+
+    let backend = crate::fleet::FleetConfig::load(fleet_path)
+        .ok()
+        .and_then(|f| f.resolve_instance(name))
+        .and_then(|r| Backend::from_command(&r.backend_command));
+
+    Ok(Pane {
+        agent_name: name.to_string(),
+        vterm: VTerm::new(cols, rows),
+        rx: pane_rx,
+        id: pane_id,
+        backend,
+        working_dir: None,
+        display_name: None,
+        scroll_offset: 0,
+        has_notification: false,
+        fleet_instance_name: Some(name.to_string()),
+        selection: None,
+        source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client))),
+    })
 }
 
 /// Resolve a backend command string into (command, args, submit_key).
