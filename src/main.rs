@@ -3,6 +3,7 @@ mod api;
 mod app;
 mod auth_cookie;
 mod backend;
+mod bootstrap;
 mod bugreport;
 mod channel;
 mod cli;
