@@ -54,6 +54,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
 arboard = "3.6.1"
 unicode-width = "0.2"
+which = "6"
 
 # Crypto-grade random for API-connection cookie (P1-10)
 getrandom = "0.2"
