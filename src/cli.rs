@@ -5,150 +5,26 @@ use crate::{agent, api, backend, fleet, inbox};
 use std::path::Path;
 
 /// Start daemon with fleet.yaml config.
+///
+/// Delegates preflight (lock, run dir, cookie, fleet normalize, agent resolve,
+/// telegram init) to [`crate::bootstrap::prepare`]. This routes both `start`
+/// and `app` entry points through the same seam — see the `bootstrap` module
+/// docs for the bug this addresses.
 pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
-    let mut config = fleet::FleetConfig::load(fleet_path)?;
-
-    // Auto-create "general" instance if channel is configured but no general exists.
-    // General is the default coordinator bound to Telegram's General topic (topic_id: 1).
-    if config.channel.is_some() && !config.instances.contains_key("general") {
-        let default_backend = config
-            .defaults
-            .backend
-            .clone()
-            .unwrap_or(backend::Backend::ClaudeCode);
-        config.instances.insert(
-            "general".to_string(),
-            fleet::InstanceConfig {
-                role: Some("Fleet coordinator — routes tasks between agents".to_string()),
-                backend: Some(default_backend),
-                working_directory: None, // resolve_instance will default to $AGEND_HOME/workspace/general
-                topic_id: Some(1),       // Telegram General topic
-                ..Default::default()
-            },
-        );
-        // Persist to fleet.yaml so it's visible to the user
-        let entry = fleet::InstanceYamlEntry {
-            backend: config
-                .defaults
-                .backend
-                .as_ref()
-                .map(|b| b.name().to_string()),
-            working_directory: None,
-            role: Some("Fleet coordinator — routes tasks between agents".to_string()),
-        };
-        if let Err(e) = fleet::add_instance_to_yaml(home, "general", &entry) {
-            tracing::warn!(error = %e, "failed to persist general instance");
+    match crate::bootstrap::prepare(home, fleet_path, Default::default())? {
+        crate::bootstrap::BootstrapOutcome::Owned(prepared) => {
+            if prepared.agents.is_empty() {
+                tracing::error!("no instances found in fleet.yaml");
+                std::process::exit(1);
+            }
+            crate::daemon::run_with_prepared(prepared)
         }
-        // Write topic_id
-        let _ = fleet::update_instance_field(
-            home,
-            "general",
-            "topic_id",
-            serde_yaml::Value::Number(serde_yaml::Number::from(1)),
-        );
-        tracing::info!("auto-created 'general' instance for channel");
+        crate::bootstrap::BootstrapOutcome::Attached(a) => anyhow::bail!(
+            "another agend-terminal daemon is already running (pid {}, run_dir {})",
+            a.daemon_pid,
+            a.run_dir.display()
+        ),
     }
-
-    let mut agents = Vec::new();
-
-    // Prune stale worktrees on startup
-    {
-        let mut seen_repos = std::collections::HashSet::new();
-        for name in config.instance_names() {
-            if let Some(resolved) = config.resolve_instance(&name) {
-                if let Some(ref dir) = resolved.working_directory {
-                    if seen_repos.insert(dir.clone()) {
-                        crate::worktree::prune(dir);
-                    }
-                }
-            }
-        }
-    }
-
-    for name in config.instance_names() {
-        if let Some(mut resolved) = config.resolve_instance(&name) {
-            // Ensure working directory exists
-            if let Some(ref base_dir) = resolved.working_directory {
-                std::fs::create_dir_all(base_dir).ok();
-            }
-
-            // Auto-create git worktree if working_directory is a git repo
-            if let Some(ref base_dir) = resolved.working_directory {
-                if crate::worktree::is_git_repo(base_dir) {
-                    let custom_branch = resolved.git_branch.as_deref();
-                    if let Some(info) = crate::worktree::create(base_dir, &name, custom_branch) {
-                        resolved.working_directory = Some(info.path);
-                    }
-                }
-            }
-
-            // Generate instructions + MCP config
-            if let Some(ref dir) = resolved.working_directory {
-                crate::instructions::generate(dir, &resolved.backend_command);
-            }
-
-            // Add resume args to continue previous session
-            let mut args = resolved.args;
-            if let Some(ref b) = backend::Backend::from_command(&resolved.backend_command) {
-                let p = b.preset();
-                args.extend(p.resume_mode.args_for(home, &name));
-            }
-
-            // Inject --model if specified (format for backend)
-            if let Some(ref model) = resolved.model {
-                let model_val = backend::Backend::from_command(&resolved.backend_command)
-                    .map(|b| b.format_model_arg(model))
-                    .unwrap_or_else(|| model.clone());
-                args.push("--model".to_string());
-                args.push(model_val);
-            }
-
-            // Inject Claude-specific flags
-            if let Some(ref dir) = resolved.working_directory {
-                if resolved.backend_command.contains("claude") {
-                    let mcp_config = dir.join("mcp-config.json");
-                    if mcp_config.exists() {
-                        args.push("--mcp-config".to_string());
-                        args.push(mcp_config.display().to_string());
-                    }
-                    let settings = dir.join("claude-settings.json");
-                    if settings.exists() {
-                        args.push("--settings".to_string());
-                        args.push(settings.display().to_string());
-                    }
-                }
-            }
-
-            agents.push((
-                resolved.name,
-                resolved.backend_command,
-                args,
-                Some(resolved.env),
-                resolved.working_directory,
-                resolved.submit_key,
-            ));
-        }
-    }
-
-    if agents.is_empty() {
-        tracing::error!("no instances found in fleet.yaml");
-        std::process::exit(1);
-    }
-
-    // Initialize Telegram if configured
-    let submit_keys: std::collections::HashMap<String, String> = config
-        .instances
-        .keys()
-        .filter_map(|name| {
-            config
-                .resolve_instance(name)
-                .map(|r| (name.clone(), r.submit_key))
-        })
-        .collect();
-    let _telegram = crate::telegram::init_from_config(&config, home, submit_keys);
-
-    crate::daemon::run(home, agents)?;
-    Ok(())
 }
 
 #[allow(clippy::unwrap_used)]

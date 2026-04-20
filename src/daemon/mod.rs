@@ -93,7 +93,11 @@ pub type AgentDef = (
     String,
 );
 
-/// Start daemon: spawn agents, handle crashes with auto-respawn.
+/// Start daemon: do preflight (lock, run dir, cookie) then run the core loop.
+///
+/// Used by the `Commands::Daemon { agents }` escape hatch path (no fleet.yaml).
+/// The fleet-driven path uses [`run_with_prepared`] instead, which skips the
+/// preflight because [`crate::bootstrap::prepare`] has already done it.
 pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // Acquire exclusive daemon lock (prevents TOCTOU race)
     std::fs::create_dir_all(home)?;
@@ -133,6 +137,25 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
     }
 
+    run_core(home, agents)
+}
+
+/// Start daemon with a fleet already prepared by [`crate::bootstrap::prepare`].
+///
+/// Skips the preflight (lock, run dir, cookie issuance, fleet load/normalize,
+/// telegram init) since bootstrap already performed those. The `OwnedFleet`
+/// is held for the full call so the flock guard, cookie bytes, and Telegram
+/// state stay alive for the daemon's lifetime.
+pub fn run_with_prepared(prepared: Box<crate::bootstrap::OwnedFleet>) -> anyhow::Result<()> {
+    let home = prepared.home.clone();
+    let agents = prepared.agents.clone();
+    tracing::info!(path = %prepared.run_dir.display(), "run dir");
+    // `_owned` keeps lock / cookie / telegram / config alive until return.
+    let _owned = prepared;
+    run_core(&home, agents)
+}
+
+fn run_core(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // External agents registry (connected via `agend-terminal connect`)
