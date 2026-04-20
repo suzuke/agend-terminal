@@ -235,10 +235,24 @@ impl StatePatterns {
                     AgentState::InteractivePrompt,
                     r"Update available!|Press enter to continue",
                 ),
+                // [measured] Codex 0.120.0 renders tool-call blocks as a
+                // two-line region — a `•` title line (`• Explored`,
+                // `• Edited`, `• Ran`) followed by a `└` continuation
+                // line carrying the actual tool call (e.g.
+                // `  └ Read README.md`, `  └ Ran apply_patch`). Observed
+                // in codex-tooluse.raw at byte ~40960. Placed above
+                // Thinking so tool blocks win first-match against the
+                // `• Working (...)` spinner that renders concurrently.
+                // Bare `•` is intentionally NOT in the pattern — it also
+                // prefixes assistant narration lines (`• I'm reading
+                // ...`) and would cause false positives. The legacy
+                // `apply_patch` substring is retained for completeness.
+                (
+                    AgentState::ToolUse,
+                    r"└\s+(Read|Write|Edit|List|Bash|Search|Apply|Ran)\b|•\s+(Explored|Edited|Ran)\b|apply_patch",
+                ),
                 // [estimated] Processing state
                 (AgentState::Thinking, r"Thinking"),
-                // [estimated] Patch tool
-                (AgentState::ToolUse, r"apply_patch"),
                 // [measured] Prompt symbol + model info in status
                 (AgentState::Idle, r"›"),
                 // [measured] Version + model display
@@ -1149,6 +1163,61 @@ mod tests {
         // Clear screen, banner alone re-renders.
         drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
         assert_eq!(st.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn codex_tooluse_title_line_match() {
+        // Codex 0.120.0 emits `• Explored|Edited|Ran` as the title of a
+        // tool-output block. Observed in codex-tooluse.raw ~byte 40960.
+        let patterns = StatePatterns::for_backend(&Backend::Codex);
+        for sample in ["• Explored", "• Edited", "• Ran"] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "expected ToolUse for {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_tooluse_continuation_line_match() {
+        // Continuation line under the title uses `└` (U+2514) + tool
+        // verb — `└ Read README.md`, `└ Write /tmp/x`, etc.
+        let patterns = StatePatterns::for_backend(&Backend::Codex);
+        for sample in [
+            "  └ Read README.md",
+            "  └ Write /tmp/out.txt",
+            "  └ Edit Cargo.toml",
+            "  └ Ran apply_patch",
+            "  └ List src/",
+        ] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "expected ToolUse for {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_tooluse_does_not_false_positive_on_spinner_or_narration() {
+        // `• Working (...)` is the spinner; `• I'm reading ...` is
+        // assistant narration. Neither should fire ToolUse — pattern
+        // must only match the Explored/Edited/Ran titles and the `└`
+        // continuation line. (Codex Thinking pattern is `Thinking`
+        // which never matches the literal `Working` spinner, so these
+        // lines simply fall through to lower-priority matches or None.)
+        let patterns = StatePatterns::for_backend(&Backend::Codex);
+        assert_ne!(
+            patterns.detect("• Working (1s • esc to interrupt)"),
+            Some(AgentState::ToolUse),
+            "`• Working` spinner must not fire ToolUse"
+        );
+        assert_ne!(
+            patterns.detect("• I'm reading README.md from the repo root"),
+            Some(AgentState::ToolUse),
+            "narration `• I'm reading ...` must not fire ToolUse"
+        );
     }
 
     #[test]

@@ -127,12 +127,15 @@ fixtures:
     # canceled the request". InteractivePrompt fires at ~byte 1024 —
     # same root cause as codex-update.raw / codex-tooluse.raw (Update
     # banner or slash-menu matches `Press enter to continue`). Final
-    # detect() returns Idle because the post-cancel summary frame has
-    # the `›` prompt glyph visible again; hysteresis latches
-    # InteractivePrompt.
+    # detect() now returns ToolUse because the post-cancel summary
+    # frame retains the `• Ran printf ...` / `└ (no output)` block
+    # from the canceled tool call, which the newly expanded Codex
+    # ToolUse pattern (`• Ran` / `└ <verb>`) matches. The tracker
+    # still reports InteractivePrompt (prio 7) via hysteresis —
+    # byte-level replay cannot cross the 5s passive min_hold.
     expected_transitions: [starting, interactive_prompt]
     expected_final_state: interactive_prompt
-    expected_final_detect: idle
+    expected_final_detect: tool_use
 
   # ── Stage 2a ToolUse recordings (2026-04-20) ────────────────────────
   # Every recording below DID exercise a real tool call (verified by
@@ -166,12 +169,17 @@ fixtures:
     cli_version: "0.120.0"
     recorded_on: "2026-04-20"
     scenario: "prompt 'read the README.md file' -> codex reads + summarizes -> /exit (recording tail shows the `/exit` slash-command autocomplete menu)"
-    # Codex ToolUse pattern is `apply_patch` only, which does not match
-    # read-file tool calls. InteractivePrompt fires once during the
-    # recording (same root cause as codex-update.raw — either an
-    # `Update available!` banner during startup or the slash-command
-    # menu at the end). Final detect() returns None because the menu
-    # frame covers the idle `›` glyph.
+    # Codex 0.120.0 tool-block format (`• Explored` title + `└ Read
+    # README.md` continuation) is now covered by an expanded Codex
+    # ToolUse pattern, verified by codex_tooluse_title_line_match /
+    # codex_tooluse_continuation_line_match unit tests. Replay
+    # baseline unchanged: InteractivePrompt fires at byte ~1024 from
+    # the `Update available!` banner (prio 7, outranks ToolUse prio
+    # 5); hysteresis blocks the downgrade under byte-level replay
+    # where elapsed time does not cross the 5s passive min_hold.
+    # Final detect() returns None because the tool-block lines scroll
+    # off the visible tail by the final frame (only the `Token usage:`
+    # / `resume ...` summary lines remain).
     expected_transitions: [starting, interactive_prompt]
     expected_final_state: interactive_prompt
     expected_final_detect: null
