@@ -209,11 +209,16 @@ fixtures:
     cli_version: "1.4.0"
     recorded_on: "2026-04-20"
     scenario: "prompt 'read README.md' -> opencode reads + replies -> /exit (recording ends on the opencode session-exit ASCII banner)"
-    # OpenCode has NO ToolUse pattern defined at all (see src/state.rs
-    # Backend::OpenCode patterns). This fixture is the real-PTY anchor
-    # for that gap; adding a ToolUse entry in the pattern table in a
-    # future change will shift this transition sequence and be caught
-    # by replay_manifest_regression.
+    # OpenCode 1.4.0 tool banner format (`✱ Glob ...`, `→ Read ...`) is
+    # now covered by a dedicated ToolUse pattern in Backend::OpenCode,
+    # verified by the opencode_tooluse_banner_match unit test. Replay
+    # baseline is unchanged because the `esc interrupt` spinner (prio
+    # Thinking=6) fires at byte ~11264 before the first `✱ Glob`
+    # banner at byte ~30720 (prio ToolUse=5); hysteresis blocks the
+    # downgrade under byte-level replay where elapsed time does not
+    # cross the 2s min_hold. In production the hold elapses between
+    # PTY reads so tool banners do surface — the unit test anchors
+    # the pattern against drift.
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: null

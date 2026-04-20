@@ -243,6 +243,17 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Permission required|Allow once|Allow always",
                 ),
+                // [measured] OpenCode 1.4.0 prefixes tool banners with
+                // `✱` (U+2731 HEAVY ASTERISK, in-flight) or `→` (U+2192,
+                // completed) followed by the tool name — e.g.
+                // `✱ Glob "README.md" (1 match)` and `→ Read README.md`.
+                // Observed in tests/fixtures/state-replay/opencode-tooluse.raw
+                // at byte ~30720 / ~61440. Priority above the Thinking
+                // pattern so active tool use outranks the generic spinner.
+                (
+                    AgentState::ToolUse,
+                    r"[✱→]\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b",
+                ),
                 // [measured] OpenCode draws `■⬝⬝⬝⬝⬝⬝⬝  esc interrupt` on
                 // its bottom status bar only while a request is in flight;
                 // the line disappears the moment streaming completes.
@@ -1246,6 +1257,29 @@ mod tests {
             b"Ask anything   \xe2\x8c\x85 tab agents\r\n",
         );
         assert_eq!(st.get_state(), AgentState::Idle);
+    }
+
+    #[test]
+    fn opencode_tooluse_banner_match() {
+        // OpenCode 1.4.0 prefixes tool banners with `✱` (in-flight) or
+        // `→` (completed) followed by the capitalized tool name.
+        // Observed in tests/fixtures/state-replay/opencode-tooluse.raw
+        // at ~30720 and ~61440; byte-level replay cannot surface the
+        // transition (Thinking priority > ToolUse and the spinner fires
+        // first), but production elapsed time clears the min_hold.
+        let patterns = StatePatterns::for_backend(&Backend::OpenCode);
+        for sample in [
+            "   ✱ Glob \"README.md\" (1 match)",
+            "   → Read README.md",
+            "   ✱ Write src/lib.rs",
+            "   → Edit Cargo.toml",
+        ] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "expected ToolUse for {sample:?}"
+            );
+        }
     }
 
     // ── Replay harness (empirical A/B test vs pre-Phase-1a) ─────────────
