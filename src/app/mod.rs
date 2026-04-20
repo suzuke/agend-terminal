@@ -116,6 +116,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 telegram_hooks::telegram_status_from_config(&prepared.config)
             };
             let guard = api_server::start_api_server(prepared, &registry, tui_event_tx);
+            // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
+            // the owned app. SIGINT stays with crossterm so Ctrl+C still
+            // reaches the focused pane's PTY as 0x03.
+            crate::bootstrap::signals::install_term_only();
             (guard, telegram, status)
         }
         Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
@@ -140,9 +144,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
     };
 
-    // No ctrlc handler here: ratatui is in raw mode so Ctrl+C must reach the
-    // focused pane's PTY as a 0x03 byte, and ctrlc::set_handler intercepts
-    // SIGINT/SIGTERM/SIGHUP as a bundle with no way to pick only SIGTERM.
+    // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
+    // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
+    // mode), and SIGHUP's default "kill the process group" keeps shell-exit
+    // semantics intact. SIGTERM is the only signal the app intercepts, and
+    // only in the Owned branch — see `install_term_only` above.
 
     // Per-agent AwaitingOperator supervisor: watches for stdout silence during
     // Starting (or recently-entered Ready — some backends like codex match
@@ -214,6 +220,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         .ok();
 
     loop {
+        if crate::bootstrap::signals::term_requested() {
+            tracing::info!("app: SIGTERM received, exiting main loop");
+            break;
+        }
         if needs_resize {
             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
             let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
