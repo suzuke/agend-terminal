@@ -57,22 +57,15 @@ impl Default for UpgradeOptions {
 pub fn run(home: &Path, opts: UpgradeOptions) -> Result<()> {
     // 1. Pre-flight: binary exists and is executable.
     if !opts.new_binary.exists() {
-        anyhow::bail!(
-            "new binary does not exist: {}",
-            opts.new_binary.display()
-        );
+        anyhow::bail!("new binary does not exist: {}", opts.new_binary.display());
     }
-    let abs = std::fs::canonicalize(&opts.new_binary).with_context(|| {
-        format!("canonicalize new binary {}", opts.new_binary.display())
-    })?;
+    let abs = std::fs::canonicalize(&opts.new_binary)
+        .with_context(|| format!("canonicalize new binary {}", opts.new_binary.display()))?;
 
     // 2. Quick sanity check via `--version` — also gives us a version string.
     let reported_version = client::probe_new_binary_version(&abs)
         .with_context(|| format!("probe --version of {}", abs.display()))?;
-    let to_version = opts
-        .to_version
-        .clone()
-        .or(Some(reported_version.clone()));
+    let to_version = opts.to_version.clone().or(Some(reported_version.clone()));
     eprintln!(
         "upgrade: new binary {} reports version: {}",
         abs.display(),
@@ -91,9 +84,11 @@ pub fn run(home: &Path, opts: UpgradeOptions) -> Result<()> {
                      Or run `agend-terminal stop` and then `agend-supervisor` manually."
                 );
             }
-            if !opts.assume_yes && !prompt_yes_no(
-                "install agend-supervisor and migrate the daemon to run under it?",
-            )? {
+            if !opts.assume_yes
+                && !prompt_yes_no(
+                    "install agend-supervisor and migrate the daemon to run under it?",
+                )?
+            {
                 anyhow::bail!("cancelled by user");
             }
             install_supervisor_layout(home, &abs)?;
@@ -118,10 +113,10 @@ pub fn run(home: &Path, opts: UpgradeOptions) -> Result<()> {
     eprintln!("upgrade: current version: {from_version}");
 
     // 5. Stage both binaries into the content store.
-    let new_hash = client::stage_binary(home, &abs)
-        .context("stage new binary into content store")?;
-    let prev_hash = client::stage_current_as_prev(home)
-        .context("stage current binary as rollback target")?;
+    let new_hash =
+        client::stage_binary(home, &abs).context("stage new binary into content store")?;
+    let prev_hash =
+        client::stage_current_as_prev(home).context("stage current binary as rollback target")?;
     if new_hash == prev_hash {
         eprintln!(
             "upgrade: new binary is identical to current ({}); nothing to do.",
@@ -207,8 +202,7 @@ fn install_supervisor_layout(home: &Path, new_daemon_binary: &Path) -> Result<()
     use std::os::unix::fs::symlink;
 
     let bin = paths::bin_dir(home);
-    std::fs::create_dir_all(&bin)
-        .with_context(|| format!("create bin dir {}", bin.display()))?;
+    std::fs::create_dir_all(&bin).with_context(|| format!("create bin dir {}", bin.display()))?;
 
     // Stage the new daemon binary and point current → store/<hash>.
     let hash = client::stage_binary(home, new_daemon_binary)
@@ -226,24 +220,19 @@ fn install_supervisor_layout(home: &Path, new_daemon_binary: &Path) -> Result<()
     // user ran `cargo install agend-terminal`, both bins end up in the
     // same cargo-bin dir.
     let self_exe = std::env::current_exe().context("current_exe for bootstrap")?;
-    let self_dir = self_exe
-        .parent()
-        .context("current_exe has no parent dir")?;
+    let self_dir = self_exe.parent().context("current_exe has no parent dir")?;
     let candidates = [
         self_dir.join("agend-supervisor"),
         // Debug-build fallback (developer installs from source).
         self_dir.join("../agend-supervisor"),
     ];
-    let supervisor = candidates
-        .iter()
-        .find(|p| p.exists())
-        .with_context(|| {
-            format!(
-                "agend-supervisor binary not found near {}. \
+    let supervisor = candidates.iter().find(|p| p.exists()).with_context(|| {
+        format!(
+            "agend-supervisor binary not found near {}. \
                  Install with `cargo install agend-terminal` or build both bins.",
-                self_dir.display()
-            )
-        })?;
+            self_dir.display()
+        )
+    })?;
     let sup_target = std::fs::canonicalize(supervisor)
         .with_context(|| format!("canonicalize {}", supervisor.display()))?;
 

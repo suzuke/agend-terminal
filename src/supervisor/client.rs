@@ -64,8 +64,7 @@ pub fn probe(_home: &Path) -> Result<Option<u32>> {
 ///
 /// Idempotent: if the store already has the same hash we skip the copy.
 pub fn stage_binary(home: &Path, src: &Path) -> Result<String> {
-    let bytes = std::fs::read(src)
-        .with_context(|| format!("read new binary {}", src.display()))?;
+    let bytes = std::fs::read(src).with_context(|| format!("read new binary {}", src.display()))?;
     let hash = sha256_hex(&bytes);
 
     let store = paths::bin_store_dir(home);
@@ -118,8 +117,7 @@ pub fn swap_current(home: &Path, new_hash: &str, prev_hash: &str) -> Result<()> 
     use std::os::unix::fs::symlink;
 
     let bin = paths::bin_dir(home);
-    std::fs::create_dir_all(&bin)
-        .with_context(|| format!("create bin dir {}", bin.display()))?;
+    std::fs::create_dir_all(&bin).with_context(|| format!("create bin dir {}", bin.display()))?;
 
     // Relative targets keep the symlinks portable if $AGEND_HOME is moved.
     let new_rel = PathBuf::from("store").join(new_hash);
@@ -131,8 +129,7 @@ pub fn swap_current(home: &Path, new_hash: &str, prev_hash: &str) -> Result<()> 
     let _ = std::fs::remove_file(&prev_tmp);
     symlink(&prev_rel, &prev_tmp)
         .with_context(|| format!("create prev symlink {}", prev_tmp.display()))?;
-    std::fs::rename(&prev_tmp, paths::prev_link(home))
-        .context("rename prev symlink into place")?;
+    std::fs::rename(&prev_tmp, paths::prev_link(home)).context("rename prev symlink into place")?;
 
     // 2. Update `current`.
     let cur_tmp = bin.join(".current.new");
@@ -159,14 +156,14 @@ pub fn probe_new_binary_version(binary: &Path) -> Result<String> {
         .output()
         .with_context(|| format!("spawn {} --version", binary.display()))?;
     if !out.status.success() {
-        anyhow::bail!(
-            "{} --version exited with {}",
-            binary.display(),
-            out.status
-        );
+        anyhow::bail!("{} --version exited with {}", binary.display(), out.status);
     }
     let txt = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(if txt.is_empty() { "(unknown)".into() } else { txt })
+    Ok(if txt.is_empty() {
+        "(unknown)".into()
+    } else {
+        txt
+    })
 }
 
 /// Run `AGEND_SELF_TEST=1 new_binary` and check it exits 0. The new binary
@@ -212,11 +209,17 @@ where
             None => anyhow::bail!("supervisor closed socket before terminal response"),
         };
         match resp {
-            Response::Progress { stage, ref message, version } => {
+            Response::Progress {
+                stage,
+                ref message,
+                version,
+            } => {
                 check_version(version)?;
                 progress_cb(stage, message);
             }
-            Response::Ok { version, r#final, .. } => {
+            Response::Ok {
+                version, r#final, ..
+            } => {
                 check_version(version)?;
                 if r#final {
                     return Ok(resp);
@@ -241,10 +244,7 @@ where
 
 /// Send a request that expects a single non-streaming response (Ping, Status).
 #[cfg(unix)]
-fn send_recv_single(
-    stream: std::os::unix::net::UnixStream,
-    req: &Request,
-) -> Result<Response> {
+fn send_recv_single(stream: std::os::unix::net::UnixStream, req: &Request) -> Result<Response> {
     let reader = stream.try_clone().context("clone stream")?;
     let mut writer = stream;
     ipc::write_one(&mut writer, req).context("write request")?;
@@ -458,10 +458,7 @@ mod tests {
 
     #[test]
     fn stage_binary_idempotent() {
-        let home = std::env::temp_dir().join(format!(
-            "agend-client-stage-{}",
-            std::process::id()
-        ));
+        let home = std::env::temp_dir().join(format!("agend-client-stage-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
 
         let src = home.join("fake-bin");
@@ -536,7 +533,10 @@ mod tests {
         .expect("symlink current");
 
         let staged = stage_current_as_prev(&home).expect("stage current as prev");
-        assert_eq!(staged, hash, "staging the same bytes must produce the same hash");
+        assert_eq!(
+            staged, hash,
+            "staging the same bytes must produce the same hash"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }

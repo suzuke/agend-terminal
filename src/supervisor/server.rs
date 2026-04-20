@@ -144,10 +144,7 @@ impl SupervisorState {
         tracing::info!(binary = %current.display(), "spawning daemon");
         let mut cmd = Command::new(&current);
         cmd.arg("start")
-            .env(
-                "AGEND_SUPERVISOR_SOCK",
-                paths::supervisor_sock(&self.home),
-            )
+            .env("AGEND_SUPERVISOR_SOCK", paths::supervisor_sock(&self.home))
             .env("AGEND_HOME", &self.home)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
@@ -248,18 +245,9 @@ fn dispatch_event(
     Ok(())
 }
 
-fn handle_child_exit(
-    state: &mut SupervisorState,
-    pid: u32,
-    detail: &str,
-    ev_tx: &Sender<Event>,
-) {
+fn handle_child_exit(state: &mut SupervisorState, pid: u32, detail: &str, ev_tx: &Sender<Event>) {
     // Ignore if this isn't the current child (stale watcher thread).
-    let is_current = state
-        .child
-        .as_ref()
-        .map(|c| c.id() == pid)
-        .unwrap_or(false);
+    let is_current = state.child.as_ref().map(|c| c.id() == pid).unwrap_or(false);
     if !is_current {
         tracing::debug!(pid, "ignoring exit of non-current daemon");
         return;
@@ -268,7 +256,10 @@ fn handle_child_exit(
     // Reap to get status (non-blocking; the poll watcher may race us to
     // the kernel waitpid slot, which is fine — try_wait returns Ok(None)
     // if already reaped).
-    let status = state.child.as_mut().and_then(|c| c.try_wait().ok().flatten());
+    let status = state
+        .child
+        .as_mut()
+        .and_then(|c| c.try_wait().ok().flatten());
     state.child = None;
 
     if state.upgrade_in_progress {
@@ -437,7 +428,11 @@ fn perform_upgrade(
     write_upgrade_marker(&state.home, args)?;
 
     // 3. Stop the current daemon.
-    write_progress(writer, UpgradeStage::StoppingDaemon, "stopping current daemon")?;
+    write_progress(
+        writer,
+        UpgradeStage::StoppingDaemon,
+        "stopping current daemon",
+    )?;
     if let Some(ref mut child) = state.child {
         stop_child(child, DAEMON_STOP_GRACE);
     }
@@ -603,11 +598,7 @@ fn stabilise(
         let slice = remaining.min(Duration::from_millis(500));
         match ev_rx.recv_timeout(slice) {
             Ok(Event::Exited { pid, detail }) => {
-                let is_current = state
-                    .child
-                    .as_ref()
-                    .map(|c| c.id() == pid)
-                    .unwrap_or(false);
+                let is_current = state.child.as_ref().map(|c| c.id() == pid).unwrap_or(false);
                 if !is_current {
                     continue;
                 }
@@ -690,9 +681,7 @@ fn rollback(
     if let Err(e) = swap_current_to(&state.home, &args.prev_hash) {
         ipc::write_one(
             writer,
-            &ipc::err(format!(
-                "rollback failed to repoint current symlink: {e:#}"
-            )),
+            &ipc::err(format!("rollback failed to repoint current symlink: {e:#}")),
         )?;
         return Err(e);
     }
@@ -725,18 +714,13 @@ fn swap_current_to(home: &Path, hash: &str) -> Result<()> {
     let tmp = bin.join(".current.rollback");
     let _ = std::fs::remove_file(&tmp);
     let target = PathBuf::from("store").join(hash);
-    symlink(&target, &tmp)
-        .with_context(|| format!("create rollback symlink {}", tmp.display()))?;
+    symlink(&target, &tmp).with_context(|| format!("create rollback symlink {}", tmp.display()))?;
     std::fs::rename(&tmp, paths::current_link(home))
         .context("rename rollback symlink into place")?;
     Ok(())
 }
 
-fn write_progress(
-    writer: &mut UnixStream,
-    stage: UpgradeStage,
-    message: &str,
-) -> Result<()> {
+fn write_progress(writer: &mut UnixStream, stage: UpgradeStage, message: &str) -> Result<()> {
     tracing::info!(?stage, message, "upgrade progress");
     ipc::write_one(writer, &ipc::progress(stage, message))?;
     Ok(())

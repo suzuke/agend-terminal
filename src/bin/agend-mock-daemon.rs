@@ -24,14 +24,13 @@
 
 #[cfg(unix)]
 fn main() {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        let v = std::env::var("MOCK_VERSION")
-            .unwrap_or_else(|_| "agend-mock-daemon 0.0.0".into());
+        let v = std::env::var("MOCK_VERSION").unwrap_or_else(|_| "agend-mock-daemon 0.0.0".into());
         println!("{v}");
         return;
     }
@@ -56,14 +55,14 @@ fn main() {
     }
 
     // Ready ping — synchronous; returns once supervisor has acked.
-    if let Err(e) =
-        agend_terminal::supervisor::client::notify_ready(std::process::id(), &version)
-    {
+    if let Err(e) = agend_terminal::supervisor::client::notify_ready(std::process::id(), &version) {
         eprintln!("mock: notify_ready failed: {e:#}");
     }
 
     // Sentinel so tests can observe ready-ness.
-    let home = std::env::var("AGEND_HOME").ok().map(std::path::PathBuf::from);
+    let home = std::env::var("AGEND_HOME")
+        .ok()
+        .map(std::path::PathBuf::from);
     if let Some(ref h) = home {
         let sentinel = h.join(format!("mock-ready-{}", std::process::id()));
         let _ = std::fs::write(&sentinel, &version);

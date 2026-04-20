@@ -93,10 +93,7 @@ pub enum Response {
         version: u32,
     },
     /// Generic error. Always terminal.
-    Err {
-        error: String,
-        version: u32,
-    },
+    Err { error: String, version: u32 },
     /// Progress update during a long-running upgrade. Not terminal.
     Progress {
         stage: UpgradeStage,
@@ -248,10 +245,8 @@ mod tests {
 
     #[test]
     fn upgrade_args_defaults() {
-        let args: UpgradeArgs = serde_json::from_str(
-            r#"{"new_hash":"a","prev_hash":"b"}"#,
-        )
-        .expect("parse");
+        let args: UpgradeArgs =
+            serde_json::from_str(r#"{"new_hash":"a","prev_hash":"b"}"#).expect("parse");
         assert_eq!(args.stability_secs, 60);
         assert_eq!(args.ready_timeout_secs, 60);
     }
@@ -310,9 +305,7 @@ mod tests {
         write_one(&mut buf, &req).expect("write");
         assert_eq!(*buf.last().expect("nonempty"), b'\n');
         let mut reader = BufReader::new(Cursor::new(buf));
-        let back: Request = read_one(&mut reader)
-            .expect("read")
-            .expect("non-empty");
+        let back: Request = read_one(&mut reader).expect("read").expect("non-empty");
         assert!(matches!(back, Request::Ping));
     }
 

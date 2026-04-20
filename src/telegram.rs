@@ -408,10 +408,7 @@ pub(crate) fn handle_send_failure(
 /// menu). Returns false when the registry is not attached (daemon bootstrap
 /// not yet wired), the agent is missing, or any lock is poisoned — callers
 /// then fall through to the inbox path rather than dropping messages.
-fn agent_wants_raw_keystrokes(
-    registry: Option<&AgentRegistry>,
-    instance_name: &str,
-) -> bool {
+fn agent_wants_raw_keystrokes(registry: Option<&AgentRegistry>, instance_name: &str) -> bool {
     let Some(registry) = registry else {
         return false;
     };

@@ -38,9 +38,8 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
 
     // 1. Home directory must be usable.
     if !home.exists() {
-        std::fs::create_dir_all(home).with_context(|| {
-            format!("self-test: create home {}", home.display())
-        })?;
+        std::fs::create_dir_all(home)
+            .with_context(|| format!("self-test: create home {}", home.display()))?;
     }
     let meta = std::fs::metadata(home)
         .with_context(|| format!("self-test: stat home {}", home.display()))?;

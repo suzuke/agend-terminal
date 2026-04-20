@@ -46,12 +46,8 @@ fn mock_daemon_bin() -> PathBuf {
 fn temp_home(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "agend-sh-it-{}-{}-{}",
-        std::process::id(),
-        tag,
-        id
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("agend-sh-it-{}-{}-{}", std::process::id(), tag, id));
     std::fs::create_dir_all(&dir).expect("mkdir temp home");
     dir
 }
@@ -108,8 +104,7 @@ fn make_v2_binary(home: &Path) -> PathBuf {
     let dest = home.join("mock-daemon-v2");
     std::fs::write(&dest, &bytes).expect("write v2");
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod v2");
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).expect("chmod v2");
     dest
 }
 
@@ -140,10 +135,7 @@ fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
 }
 
 fn wait_for_supervisor_ready(home: &Path, timeout: Duration) -> bool {
-    wait_until(
-        || matches!(client::probe(home), Ok(Some(_))),
-        timeout,
-    )
+    wait_until(|| matches!(client::probe(home), Ok(Some(_))), timeout)
 }
 
 fn count_ready_sentinels(home: &Path) -> usize {
@@ -152,11 +144,7 @@ fn count_ready_sentinels(home: &Path) -> usize {
         .map(|entries| {
             entries
                 .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with("mock-ready-")
-                })
+                .filter(|e| e.file_name().to_string_lossy().starts_with("mock-ready-"))
                 .count()
         })
         .unwrap_or(0)
@@ -165,10 +153,7 @@ fn count_ready_sentinels(home: &Path) -> usize {
 fn clear_ready_sentinels(home: &Path) {
     if let Ok(entries) = std::fs::read_dir(home) {
         for e in entries.flatten() {
-            if e.file_name()
-                .to_string_lossy()
-                .starts_with("mock-ready-")
-            {
+            if e.file_name().to_string_lossy().starts_with("mock-ready-") {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -253,8 +238,7 @@ fn supervisor_upgrade_rolls_back_on_repeated_crash() {
     // Arm the crash counter BEFORE sending Upgrade. The mock-daemon
     // decrements it once per boot; two boots = two post-ready crashes,
     // which is the stability window's failure threshold (>=2).
-    std::fs::write(env.home.join("mock-crashes-remaining"), "2")
-        .expect("write crash counter");
+    std::fs::write(env.home.join("mock-crashes-remaining"), "2").expect("write crash counter");
     clear_ready_sentinels(&env.home);
 
     let args = ipc::UpgradeArgs {

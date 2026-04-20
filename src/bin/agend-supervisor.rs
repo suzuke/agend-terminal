@@ -9,7 +9,11 @@ fn main() -> anyhow::Result<()> {
     use clap::Parser;
 
     #[derive(Parser)]
-    #[command(name = "agend-supervisor", version, about = "Frozen self-healing supervisor for agend-terminal")]
+    #[command(
+        name = "agend-supervisor",
+        version,
+        about = "Frozen self-healing supervisor for agend-terminal"
+    )]
     struct Args {
         /// Override `$AGEND_HOME` (defaults to the env var, then `~/.agend`).
         #[arg(long)]
