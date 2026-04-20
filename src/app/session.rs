@@ -6,7 +6,7 @@
 //! but missing from fleet are dropped (their splits collapse to their sibling).
 
 use crate::agent::AgentRegistry;
-use crate::backend::{self, Backend};
+use crate::backend::Backend;
 use crate::fleet;
 use crate::layout::{Layout, PaneNode, SplitDir, Tab};
 
@@ -50,30 +50,6 @@ struct SessionPane {
     fleet_instance_name: Option<String>,
     /// User-defined display name override.
     display_name: Option<String>,
-}
-
-/// Persist agent session IDs on detach so resume works after reattach.
-pub(super) fn save_all_session_ids(home: &Path, layout: &Layout) {
-    for tab in &layout.tabs {
-        for id in tab.root().pane_ids() {
-            let Some(pane) = tab.root().find_pane(id) else {
-                continue;
-            };
-            if pane.backend.is_none() {
-                continue;
-            }
-            let Some(ref dir) = pane.working_dir else {
-                continue;
-            };
-            let name = pane
-                .fleet_instance_name
-                .as_deref()
-                .unwrap_or(&pane.agent_name);
-            if let Some(sid) = backend::read_session_id(dir) {
-                backend::save_session_id(home, name, &sid);
-            }
-        }
-    }
 }
 
 /// Sync fleet.yaml to match current pane state on detach.
@@ -274,7 +250,7 @@ fn restore_node_reconciled(
                     if let Some(backend) = Backend::from_command(&resolved.backend_command) {
                         resolved
                             .args
-                            .extend(backend.preset().resume_mode.args_for(home, fleet_name));
+                            .extend(backend.preset().resume_mode.args_for());
                     }
                     placed.insert(fleet_name.clone());
                     let mut pane = super::pane_factory::create_pane_from_resolved(

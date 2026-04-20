@@ -1,4 +1,3 @@
-use anyhow::Result;
 use std::path::Path;
 
 /// Migrate any Claude instructions file left by older agend versions at the
@@ -13,39 +12,6 @@ fn migrate_claude_old_rules_file(working_dir: &Path) {
     }
 }
 
-/// Claude Code: statusline for session ID capture
-fn generate_claude(working_dir: &Path) -> Result<()> {
-    let statusline_path = working_dir.join("statusline.json");
-    let script_ext = if cfg!(windows) { "cmd" } else { "sh" };
-    let script_path = working_dir.join(format!("statusline.{script_ext}"));
-    if !script_path.exists() {
-        let script = if cfg!(windows) {
-            let escaped = statusline_path.display().to_string().replace('"', "\"\"");
-            format!("@echo off\r\nfindstr \"^\" > \"{escaped}\"\r\necho ok\r\n")
-        } else {
-            let escaped = statusline_path.display().to_string().replace('\'', "'\\''");
-            format!("#!/bin/bash\ncat > '{escaped}'\necho ok\n")
-        };
-        std::fs::write(&script_path, &script)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
-        }
-    }
-    let settings_path = working_dir.join("claude-settings.json");
-    if !settings_path.exists() {
-        let settings = serde_json::json!({
-            "statusLine": {
-                "type": "command",
-                "command": script_path.display().to_string()
-            }
-        });
-        std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-    }
-    Ok(())
-}
-
 /// Context for generating agent instructions.
 pub struct AgentContext<'a> {
     pub name: &'a str,
@@ -57,11 +23,7 @@ pub struct AgentContext<'a> {
 /// that are per-session state rather than source-controlled content.
 const AGEND_GITIGNORE: &str = "\
 # agend-managed runtime artifacts
-statusline.json
-statusline.sh
-statusline.cmd
 mcp-config.json
-claude-settings.json
 .claude/settings.local.json
 ";
 
@@ -256,15 +218,8 @@ pub fn generate_with_context(working_dir: &Path, command: &str, ctx: Option<&Age
     // Backend-specific setup (non-MCP).
     // Codex trust is handled inside mcp_config::configure below — do not
     // duplicate it here or concurrent spawns race on ~/.codex/config.toml.
-    let result = match backend {
-        Some(crate::backend::Backend::ClaudeCode) => {
-            migrate_claude_old_rules_file(working_dir);
-            generate_claude(working_dir)
-        }
-        _ => Ok(()),
-    };
-    if let Err(e) = result {
-        tracing::warn!(error = %e, "failed to generate backend config");
+    if matches!(backend, Some(crate::backend::Backend::ClaudeCode)) {
+        migrate_claude_old_rules_file(working_dir);
     }
 
     // MCP config for all backends
@@ -294,16 +249,11 @@ mod tests {
     }
 
     #[test]
-    fn generate_claude_creates_statusline() {
+    fn generate_claude_writes_instructions_and_mcp_config() {
         let dir = tmp_dir("gen_claude");
         generate(&dir, "claude");
-        let ext = if cfg!(windows) { "cmd" } else { "sh" };
-        let script = dir.join(format!("statusline.{ext}"));
-        assert!(script.exists(), "missing {}", script.display());
-        assert!(
-            dir.join("claude-settings.json").exists(),
-            "missing claude-settings.json"
-        );
+        assert!(dir.join(".claude").join("agend.md").exists());
+        assert!(dir.join("mcp-config.json").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -493,8 +443,8 @@ mod tests {
         ensure_project_root(&dir);
         assert!(dir.join(".git").exists(), "missing .git after init");
         let ignore = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
-        assert!(ignore.contains("statusline.json"));
         assert!(ignore.contains("mcp-config.json"));
+        assert!(ignore.contains(".claude/settings.local.json"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

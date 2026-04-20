@@ -11,12 +11,14 @@
 
 use crate::backend::Backend;
 use crate::fleet::{self, FleetConfig, InstanceConfig, InstanceYamlEntry};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Normalize in-memory, optionally persisting fleet.yaml side effects.
 pub(super) fn normalize(config: &mut FleetConfig, home: &Path, persist: bool) {
     auto_create_general(config, home, persist);
-    prune_worktrees(config);
+    walk_resolved_dirs(config);
 }
 
 fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
@@ -64,17 +66,41 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
     tracing::info!("auto-created 'general' instance for channel");
 }
 
-fn prune_worktrees(config: &FleetConfig) {
-    let mut seen = std::collections::HashSet::new();
+/// Single walk of resolved instances: prunes each unique working_directory's
+/// stale worktrees, and groups instance names by directory so we can warn
+/// about shared non-git cwds where resume modes would collide.
+fn walk_resolved_dirs(config: &FleetConfig) {
+    let mut groups: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for name in config.instance_names() {
         if let Some(resolved) = config.resolve_instance(&name) {
-            if let Some(ref dir) = resolved.working_directory {
-                if seen.insert(dir.clone()) {
-                    crate::worktree::prune(dir);
-                }
+            if let Some(dir) = resolved.working_directory {
+                groups.entry(dir).or_default().push(resolved.name);
             }
         }
     }
+    for (dir, names) in &groups {
+        crate::worktree::prune(dir);
+        if names.len() >= 2 && !crate::worktree::is_git_repo(dir) {
+            warn_shared_cwd_once(dir, names);
+        }
+    }
+}
+
+/// Shared cwd without git isolation will collide on resume (all cwd-scoped
+/// `--continue` / `--resume` pick "most recent session in cwd"). Emit once
+/// per directory so hot-reloads don't spam the log with the same warning.
+fn warn_shared_cwd_once(dir: &Path, names: &[String]) {
+    static WARNED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+    let mut guard = crate::sync::lock_poisoned(&WARNED, "shared_cwd_warned");
+    let set = guard.get_or_insert_with(HashSet::new);
+    if !set.insert(dir.to_path_buf()) {
+        return;
+    }
+    tracing::warn!(
+        dir = %dir.display(),
+        instances = ?names,
+        "multiple instances share a non-git working_directory; resume is cwd-scoped and will latest-wins across them. Either `git init` the directory (auto-worktree then isolates each instance) or assign distinct working_directory values per instance."
+    );
 }
 
 #[cfg(test)]

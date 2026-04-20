@@ -410,7 +410,7 @@ fn main() -> anyhow::Result<()> {
                                 let p = b.preset();
                                 let mut a: Vec<String> =
                                     p.args.iter().map(|s| s.to_string()).collect();
-                                a.extend(p.resume_mode.args_for(&home, &name));
+                                a.extend(p.resume_mode.args_for());
                                 (a, p.submit_key.to_string())
                             })
                             .unwrap_or_else(|| (Vec::new(), "\r".to_string()));

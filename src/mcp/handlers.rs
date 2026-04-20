@@ -397,7 +397,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     if let Some(ref b) =
                         crate::backend::Backend::from_command(&resolved.backend_command)
                     {
-                        let resume = b.preset().resume_mode.args_for(&home, name);
+                        let resume = b.preset().resume_mode.args_for();
                         if !resume.is_empty() {
                             if !cmd_args.is_empty() {
                                 cmd_args.push(' ');

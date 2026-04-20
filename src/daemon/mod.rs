@@ -407,17 +407,6 @@ fn run_core(
             );
         }
 
-        {
-            let cfgs = crate::sync::lock_poisoned(&configs, "configs");
-            for (name, config) in cfgs.iter() {
-                if let Some(ref dir) = config.working_dir {
-                    if let Some(sid) = crate::backend::read_session_id(dir) {
-                        crate::backend::save_session_id(home, name, &sid);
-                    }
-                }
-            }
-        }
-
         // Handle crash event (if any)
         let crashed_name = match crashed_name {
             Some(n) => n,
@@ -715,7 +704,7 @@ fn apply_fleet_reload(
 
     let added_count = diff.added.len();
     for (idx, name) in diff.added.iter().enumerate() {
-        let Some(agent_def) = crate::bootstrap::resolve_one(new_config, home, name) else {
+        let Some(agent_def) = crate::bootstrap::resolve_one(new_config, name) else {
             tracing::warn!(agent = %name, "failed to resolve newly-added instance");
             continue;
         };
@@ -813,9 +802,9 @@ fn spawn_and_register_agent(
 /// Strip resume-related arguments for fresh respawn.
 ///
 /// Handles all backend resume patterns:
-/// - `--resume <session-id>` (Claude SavedSession)
 /// - `--resume latest` (Gemini Fixed)
-/// - `--continue` (OpenCode ContinueInCwd)
+/// - `--continue` (Claude/OpenCode ContinueInCwd)
+/// - `--resume` (Kiro ContinueInCwd)
 /// - `resume --last` (Codex positional subcommand in preset args)
 fn strip_resume_args(args: &[String]) -> Vec<String> {
     let mut result = Vec::new();

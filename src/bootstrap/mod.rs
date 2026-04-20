@@ -152,7 +152,7 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     let mut config = crate::fleet::FleetConfig::load(fleet_path)?;
     fleet_normalize::normalize(&mut config, home, opts.mutate_fleet_yaml);
     let agents = if opts.resolve_agents {
-        agent_resolve::resolve(&config, home)
+        agent_resolve::resolve(&config)
     } else {
         Vec::new()
     };

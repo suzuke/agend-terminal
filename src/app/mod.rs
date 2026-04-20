@@ -496,9 +496,6 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // daemon state — `sync_fleet_yaml` in particular would silently delete
     // fleet entries whose remote connect happened to fail at startup.
     if !attached_mode {
-        // Save session IDs so resume works after reattach
-        session::save_all_session_ids(&home, &layout);
-
         // Sync fleet.yaml to match current state, then save layout
         session::sync_fleet_yaml(&home, &layout);
         session::save_session(&home, &layout);

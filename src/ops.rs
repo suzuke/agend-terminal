@@ -381,7 +381,7 @@ pub fn start_instance(home: &Path, args: &Value) -> Value {
         Some(resolved) => {
             let mut cmd_args = resolved.args.join(" ");
             if let Some(ref b) = crate::backend::Backend::from_command(&resolved.backend_command) {
-                let resume = b.preset().resume_mode.args_for(home, name);
+                let resume = b.preset().resume_mode.args_for();
                 if !resume.is_empty() {
                     if !cmd_args.is_empty() {
                         cmd_args.push(' ');

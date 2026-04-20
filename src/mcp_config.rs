@@ -107,7 +107,7 @@ fn upsert_mcp_servers(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Claude Code: .claude/settings.local.json + mcp-config.json + claude-settings.json
+/// Claude Code: .claude/settings.local.json + mcp-config.json
 fn configure_claude(working_dir: &Path) -> Result<()> {
     // Ensure working dir is a git repo (Claude Code needs git root to find .claude/)
     let git_dir = working_dir.join(".git");
@@ -138,39 +138,6 @@ fn configure_claude(working_dir: &Path) -> Result<()> {
     // Write standalone mcp-config.json for --mcp-config flag
     let standalone = working_dir.join("mcp-config.json");
     upsert_mcp_servers(&standalone)?;
-
-    // Write statusline capture script (captures session_id from Claude).
-    // Atomic write so a racing spawn never observes a half-written script
-    // that fails to execute or appears executable with bad contents.
-    let statusline_path = working_dir.join("statusline.json");
-    let script_ext = if cfg!(windows) { "cmd" } else { "sh" };
-    let script_path = working_dir.join(format!("statusline.{script_ext}"));
-    let script = if cfg!(windows) {
-        let escaped = statusline_path.display().to_string().replace('"', "\"\"");
-        format!("@echo off\r\nfindstr \"^\" > \"{escaped}\"\r\necho ok\r\n")
-    } else {
-        let escaped = statusline_path.display().to_string().replace('\'', "'\\''");
-        format!("#!/bin/bash\ncat > '{escaped}'\necho ok\n")
-    };
-    crate::store::atomic_write(&script_path, script.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    // Write claude-settings.json with statusLine config (for --settings flag).
-    let settings_path = working_dir.join("claude-settings.json");
-    let _settings_lock = crate::store::acquire_file_lock(&config_lock_path(&settings_path))?;
-    let settings = json!({
-        "statusLine": {
-            "type": "command",
-            "command": script_path.display().to_string()
-        }
-    });
-    let settings_body = serde_json::to_string_pretty(&settings)?;
-    crate::store::atomic_write(&settings_path, settings_body.as_bytes())?;
-    tracing::debug!(path = %settings_path.display(), "Claude settings written");
 
     Ok(())
 }
@@ -756,12 +723,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- Claude: mcp-config.json + claude-settings.json ---
+    // --- Claude: mcp-config.json + .claude/settings.local.json ---
 
     #[test]
-    fn claude_creates_mcp_config_and_settings() {
+    fn claude_creates_mcp_config() {
         let dir = tmp_dir("claude");
-        // git init so configure_claude doesn't fail
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&dir)
@@ -770,36 +736,6 @@ mod tests {
         configure_claude(&dir).expect("configure");
         assert!(dir.join("mcp-config.json").exists());
         assert!(dir.join(".claude/settings.local.json").exists());
-        assert!(dir.join("claude-settings.json").exists());
-        let ext = if cfg!(windows) { "cmd" } else { "sh" };
-        assert!(dir.join(format!("statusline.{ext}")).exists());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn claude_statusline_script_has_quoted_path() {
-        let dir = tmp_dir("claude_quote");
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&dir)
-            .output()
-            .ok();
-        configure_claude(&dir).expect("configure");
-        let ext = if cfg!(windows) { "cmd" } else { "sh" };
-        let script = std::fs::read_to_string(dir.join(format!("statusline.{ext}"))).expect("read");
-        // Path should be quoted — single quotes on Unix (bash), double quotes
-        // on Windows (cmd.exe doesn't do single-quote quoting).
-        if cfg!(windows) {
-            assert!(
-                script.contains("findstr \"^\" > \""),
-                "statusline path must be double-quoted: {script}"
-            );
-        } else {
-            assert!(
-                script.contains("cat > '"),
-                "statusline path must be single-quoted: {script}"
-            );
-        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

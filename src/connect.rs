@@ -109,11 +109,6 @@ pub fn run(
             args.push("--mcp-config".to_string());
             args.push(mcp_config.display().to_string());
         }
-        let settings = work_dir.join("claude-settings.json");
-        if settings.exists() {
-            args.push("--settings".to_string());
-            args.push(settings.display().to_string());
-        }
     }
     args.extend_from_slice(extra_args);
 
