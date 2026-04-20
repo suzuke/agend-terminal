@@ -1220,6 +1220,19 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(512);
+        // REPLAY_DUMP_AT=N[,N...] dumps the visible vterm grid after the
+        // chunk that crosses each byte offset. Used to inspect dialog /
+        // banner wording mid-stream when a pattern fails to match.
+        let mut dump_offsets: Vec<usize> = std::env::var("REPLAY_DUMP_AT")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|x| x.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        dump_offsets.sort_unstable();
+        let mut dump_idx = 0;
         let backend = match backend_name.as_str() {
             "gemini" => Backend::Gemini,
             "codex" => Backend::Codex,
@@ -1244,6 +1257,19 @@ mod tests {
             let last = transitions.last().map(|x| x.1);
             if last != Some(st.current) {
                 transitions.push((total, st.current));
+            }
+            while dump_idx < dump_offsets.len() && total >= dump_offsets[dump_idx] {
+                eprintln!(
+                    "--- screen at byte {} (requested {}) ---",
+                    total, dump_offsets[dump_idx]
+                );
+                for (i, line) in screen.lines().enumerate() {
+                    let t = line.trim_end();
+                    if !t.is_empty() {
+                        eprintln!("  {:>2}| {}", i + 1, t);
+                    }
+                }
+                dump_idx += 1;
             }
         }
 
