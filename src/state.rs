@@ -1291,4 +1291,135 @@ mod tests {
             }
         }
     }
+
+    // ── Phase 1e: manifest-driven replay regression ─────────────────────
+    //
+    // Feeds each recorded PTY session through vterm + StateTracker and
+    // asserts the observed transition sequence matches the expected list
+    // in MANIFEST.yaml exactly. Catches regressions when backend patterns
+    // are changed without re-recording — any deviation from the baseline
+    // sequence should be reviewed manually (either a legitimate pattern
+    // improvement, or a regression).
+    //
+    // When a CLI version is updated, re-record the fixture, bump
+    // `cli_version` + `recorded_on`, and regenerate the expected
+    // transitions from a manual inspection of the ignored replay_session
+    // output.
+
+    #[derive(serde::Deserialize)]
+    struct ReplayManifest {
+        fixtures: Vec<ReplayFixture>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ReplayFixture {
+        file: String,
+        backend: String,
+        cli_version: String,
+        #[allow(dead_code)]
+        recorded_on: String,
+        #[allow(dead_code)]
+        scenario: String,
+        expected_transitions: Vec<String>,
+        expected_final_state: String,
+        expected_final_detect: Option<String>,
+    }
+
+    fn parse_state(name: &str) -> AgentState {
+        match name {
+            "starting" => AgentState::Starting,
+            "hang" => AgentState::Hang,
+            "awaiting_operator" => AgentState::AwaitingOperator,
+            "ready" => AgentState::Ready,
+            "idle" => AgentState::Idle,
+            "tool_use" => AgentState::ToolUse,
+            "thinking" => AgentState::Thinking,
+            "interactive_prompt" => AgentState::InteractivePrompt,
+            "permission" => AgentState::PermissionPrompt,
+            "context_full" => AgentState::ContextFull,
+            "rate_limit" => AgentState::RateLimit,
+            "usage_limit" => AgentState::UsageLimit,
+            "auth_error" => AgentState::AuthError,
+            "api_error" => AgentState::ApiError,
+            "crashed" => AgentState::Crashed,
+            "restarting" => AgentState::Restarting,
+            other => panic!("unknown state name in manifest: {other}"),
+        }
+    }
+
+    fn parse_backend(name: &str) -> Backend {
+        match name {
+            "claude" | "claude-code" => Backend::ClaudeCode,
+            "kiro" | "kiro-cli" => Backend::KiroCli,
+            "codex" | "codex-cli" => Backend::Codex,
+            "opencode" | "opencode-cli" => Backend::OpenCode,
+            "gemini" | "gemini-cli" => Backend::Gemini,
+            other => panic!("unknown backend name in manifest: {other}"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn replay_manifest_regression() {
+        let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/state-replay");
+        let manifest_path = fixtures_dir.join("MANIFEST.yaml");
+        let raw = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+        let manifest: ReplayManifest = serde_yaml::from_str(&raw)
+            .unwrap_or_else(|e| panic!("parse MANIFEST.yaml: {e}"));
+
+        assert!(
+            !manifest.fixtures.is_empty(),
+            "MANIFEST.yaml must list at least one fixture"
+        );
+
+        for f in &manifest.fixtures {
+            let ctx = format!("{} ({} v{})", f.file, f.backend, f.cli_version);
+            let fixture_path = fixtures_dir.join(&f.file);
+            let bytes = std::fs::read(&fixture_path)
+                .unwrap_or_else(|e| panic!("[{ctx}] read fixture: {e}"));
+
+            let backend = parse_backend(&f.backend);
+            let mut vt = VTerm::new(120, 40);
+            let mut st = StateTracker::new(Some(&backend));
+            let mut observed: Vec<AgentState> = vec![st.current];
+
+            for chunk in bytes.chunks(512) {
+                vt.process(chunk);
+                let rows = vt.rows() as usize;
+                let screen = vt.tail_lines(rows);
+                st.feed(&screen);
+                if observed.last().copied() != Some(st.current) {
+                    observed.push(st.current);
+                }
+            }
+
+            let expected: Vec<AgentState> =
+                f.expected_transitions.iter().map(|s| parse_state(s)).collect();
+            assert_eq!(
+                observed, expected,
+                "[{ctx}] transition mismatch — pattern change or upstream CLI UI drift? \
+                 observed {:?}, expected {:?}",
+                observed, expected
+            );
+
+            let expected_final = parse_state(&f.expected_final_state);
+            assert_eq!(
+                st.current, expected_final,
+                "[{ctx}] final state mismatch: got {:?}, expected {:?}",
+                st.current, expected_final
+            );
+
+            let patterns = StatePatterns::for_backend(&backend);
+            let final_screen = vt.tail_lines(vt.rows() as usize);
+            let detect_result = patterns.detect(&final_screen);
+            let expected_detect = f.expected_final_detect.as_deref().map(parse_state);
+            assert_eq!(
+                detect_result, expected_detect,
+                "[{ctx}] final detect() mismatch: got {:?}, expected {:?}",
+                detect_result, expected_detect
+            );
+        }
+    }
 }

@@ -1,0 +1,73 @@
+# State-detection replay fixtures.
+#
+# Each entry records a real PTY session captured from a specific CLI
+# version. The integration test at tests/state_replay.rs feeds the raw
+# bytes through vterm + StateTracker and asserts the observed transition
+# sequence matches `expected_transitions` exactly.
+#
+# Why version matters: patterns detect literal strings ("esc to cancel",
+# "Type your message", etc.) which change across CLI versions. When a
+# recording stops matching, the failure message must carry the original
+# version so the debugger knows whether it's a pattern regression or an
+# upstream UI change. Do not silently re-record against a newer version
+# without bumping `cli_version` and `recorded_on`.
+#
+# Recording protocol:
+#   script -q /tmp/<backend>-session.raw <cli-command>
+#   # interact: trigger thinking, let it complete, exit
+# Then copy into this directory and add a manifest entry.
+
+fixtures:
+  - file: claude-thinking.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-04-20"
+    scenario: "startup banner to idle prompt; response completes inline"
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+
+  - file: codex-thinking.raw
+    backend: codex
+    cli_version: "0.120.0"
+    recorded_on: "2026-04-20"
+    scenario: "startup hits structural Press-Enter prompt, user was at usage limit"
+    # InteractivePrompt here fires via is_generic_startup_prompt or codex
+    # `Press enter to continue` pattern before the Ready banner appears.
+    # UsageLimit at the end because this recording happened to catch the
+    # quota-exceeded banner — a bonus regression test for that path.
+    expected_transitions: [starting, interactive_prompt, usage_limit]
+    expected_final_state: usage_limit
+    expected_final_detect: usage_limit
+
+  - file: gemini-thinking.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-04-19"
+    scenario: "startup → ready → idle prompt → thinking (recording cut mid-response)"
+    expected_transitions: [starting, ready, idle, thinking]
+    expected_final_state: thinking
+    # Final detect is None because the spinner token cleared off screen
+    # but Thinking remains latched — Phase 1c's LATCHED_STATE_EXPIRY
+    # fallback (30s) would drop it back to Ready in production.
+    expected_final_detect: null
+
+  - file: kiro-thinking.raw
+    backend: kiro-cli
+    cli_version: "2.0.1"
+    recorded_on: "2026-04-20"
+    scenario: "startup splash → idle prompt → thinking (recording cut mid-response)"
+    expected_transitions: [starting, idle, thinking]
+    expected_final_state: thinking
+    # detect() sees Ready on the final screen but hysteresis blocks the
+    # immediate downgrade (Thinking held < 2s min_hold at cut time).
+    expected_final_detect: ready
+
+  - file: opencode-thinking.raw
+    backend: opencode
+    cli_version: "1.4.0"
+    recorded_on: "2026-04-19"
+    scenario: "startup → idle prompt → thinking (recording cut mid-response)"
+    expected_transitions: [starting, idle, thinking]
+    expected_final_state: thinking
+    expected_final_detect: null
