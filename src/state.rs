@@ -86,6 +86,14 @@ impl AgentState {
         matches!(self, Self::Crashed | Self::Restarting)
     }
 
+    /// States where operator reply text should bypass the inbox and reach the
+    /// PTY as raw keystrokes — i.e. the agent is showing an interactive modal
+    /// (startup stall or pattern-matched InteractivePrompt like codex's
+    /// update menu), not a free-form conversation prompt.
+    pub fn wants_raw_keystrokes(self) -> bool {
+        matches!(self, Self::AwaitingOperator | Self::InteractivePrompt)
+    }
+
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Starting => "starting",

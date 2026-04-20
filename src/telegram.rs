@@ -3,6 +3,7 @@
 //! Inbound: Telegram message → inbox + PTY notification
 //! Outbound: reply(text) → Telegram send_message to topic
 
+use crate::agent::AgentRegistry;
 use crate::fleet::ChannelConfig;
 use crate::inbox::{self, InboxMessage};
 use std::collections::HashMap;
@@ -90,6 +91,9 @@ pub struct TelegramState {
     /// See [`crate::fleet::ChannelConfig::Telegram::user_allowlist`] for
     /// semantics of `None` vs `Some(empty)` vs `Some([...])`.
     pub user_allowlist: Option<Vec<i64>>,
+    /// Wired in post-bootstrap by [`attach_registry`]; lets inbound message
+    /// routing read `agent_state` directly instead of via the `LIST` RPC.
+    pub registry: Option<AgentRegistry>,
 }
 
 impl TelegramState {
@@ -113,6 +117,7 @@ impl TelegramState {
             home,
             submit_keys,
             user_allowlist,
+            registry: None,
         }
     }
 
@@ -266,7 +271,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
     let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
 
-    let (instance_name, home, submit_key) = {
+    let (instance_name, home, submit_key, registry) = {
         let mut s = lock_state(state);
         let name = resolve_topic(&mut s, thread_id);
         let sk = s
@@ -274,7 +279,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             .get(&name)
             .cloned()
             .unwrap_or_else(|| "\r".to_string());
-        (name, s.home.clone(), sk)
+        (name, s.home.clone(), sk, s.registry.clone())
     };
 
     tracing::info!(from = username, to = %instance_name, %text, "inbound message");
@@ -285,7 +290,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // raw keystrokes — any inbox prefix ("[telegram:@user] …") would confuse
     // the CLI's prompt parser. In every other state, preserve the existing
     // inbox semantics so agent-authored message handling keeps working.
-    if agent_wants_raw_keystrokes(&home, &instance_name) {
+    if agent_wants_raw_keystrokes(registry.as_ref(), &instance_name) {
         let payload = format!("{text}\n");
         match crate::api::call(
             &home,
@@ -396,39 +401,30 @@ pub(crate) fn handle_send_failure(
     true
 }
 
-/// Query the daemon for the current `agent_state` of one instance.
-/// Returns true when the daemon reports a state that expects raw keyboard
-/// input rather than inbox-wrapped prose: `awaiting_operator` (startup stall)
-/// or `interactive_prompt` (pattern-matched modal like codex's update menu).
-/// Any error (daemon down, agent missing, parse failure) returns false so
-/// we fall through to normal inbox routing rather than silently dropping
-/// messages.
-fn agent_wants_raw_keystrokes(home: &Path, instance_name: &str) -> bool {
-    let resp = match crate::api::call(
-        home,
-        &serde_json::json!({"method": crate::api::method::LIST}),
-    ) {
-        Ok(v) => v,
-        Err(_) => return false,
+/// Read the current `agent_state` of `instance_name` from the in-process
+/// [`AgentRegistry`] and return true when the state expects raw keyboard
+/// input rather than inbox-wrapped prose — i.e. `awaiting_operator` (startup
+/// stall) or `interactive_prompt` (pattern-matched modal like codex's update
+/// menu). Returns false when the registry is not attached (daemon bootstrap
+/// not yet wired), the agent is missing, or any lock is poisoned — callers
+/// then fall through to the inbox path rather than dropping messages.
+fn agent_wants_raw_keystrokes(
+    registry: Option<&AgentRegistry>,
+    instance_name: &str,
+) -> bool {
+    let Some(registry) = registry else {
+        return false;
     };
-    list_response_wants_raw_keystrokes(&resp, instance_name)
-}
-
-/// Pure JSON-inspection half of [`agent_wants_raw_keystrokes`]. Separated
-/// out so the routing logic can be unit-tested without a running daemon.
-fn list_response_wants_raw_keystrokes(resp: &serde_json::Value, instance_name: &str) -> bool {
-    resp["result"]["agents"]
-        .as_array()
-        .and_then(|arr| {
-            arr.iter()
-                .find(|a| a["name"].as_str() == Some(instance_name))
-        })
-        .and_then(|a| a["agent_state"].as_str())
-        .map(|s| {
-            s == crate::state::AgentState::AwaitingOperator.display_name()
-                || s == crate::state::AgentState::InteractivePrompt.display_name()
-        })
-        .unwrap_or(false)
+    let reg = crate::agent::lock_registry(registry);
+    let Some(handle) = reg.get(instance_name) else {
+        return false;
+    };
+    let core = Arc::clone(&handle.core);
+    // Drop the registry lock before grabbing the per-agent core lock; holding
+    // both at once risks deadlocks against code paths that take core → registry.
+    drop(reg);
+    let guard = crate::sync::lock_poisoned(&core, "agent_core");
+    guard.state.current.wants_raw_keystrokes()
 }
 
 /// Send a reply from an agent to Telegram (called from MCP reply tool).
@@ -451,6 +447,15 @@ pub fn send_reply(
         handle_send_failure(e, &home, instance_name, topic_id, Some(state));
     }
     res
+}
+
+/// Wire the in-process [`AgentRegistry`] into an already-initialized
+/// [`TelegramState`]. `init_from_config` runs during bootstrap before the
+/// daemon / app creates the registry, so this two-phase setup lets inbound
+/// message routing read agent state without a cross-thread API round-trip.
+pub fn attach_registry(state: &Arc<Mutex<TelegramState>>, registry: AgentRegistry) {
+    let mut s = lock_state(state);
+    s.registry = Some(registry);
 }
 
 /// Initialize Telegram from fleet config.
@@ -1113,44 +1118,6 @@ instances:
         let home = PathBuf::from("/tmp/agend-test-nonexistent-dir-12345");
         let reg = load_topic_registry(&home);
         assert!(reg.is_empty());
-    }
-
-    #[test]
-    fn list_response_wants_raw_keystrokes_detects_target_states() {
-        let resp = serde_json::json!({
-            "ok": true,
-            "result": {
-                "agents": [
-                    {"name": "alice", "agent_state": "ready"},
-                    {"name": "bob",   "agent_state": "awaiting_operator"},
-                    {"name": "carol", "agent_state": "starting"},
-                    {"name": "dave",  "agent_state": "interactive_prompt"},
-                    {"name": "frank", "agent_state": "permission"},
-                ]
-            }
-        });
-        assert!(!list_response_wants_raw_keystrokes(&resp, "alice"));
-        assert!(list_response_wants_raw_keystrokes(&resp, "bob"));
-        assert!(!list_response_wants_raw_keystrokes(&resp, "carol"));
-        assert!(list_response_wants_raw_keystrokes(&resp, "dave"));
-        // permission prompt is NOT in the raw-keystroke set: its reply flow
-        // is handled separately (approve/deny UI), not free-form keystrokes.
-        assert!(!list_response_wants_raw_keystrokes(&resp, "frank"));
-        // Missing agent returns false (fall through to inbox path)
-        assert!(!list_response_wants_raw_keystrokes(&resp, "eve"));
-    }
-
-    #[test]
-    fn list_response_wants_raw_keystrokes_tolerates_malformed() {
-        // Missing result.agents → false
-        let r1 = serde_json::json!({"ok": false, "error": "daemon down"});
-        assert!(!list_response_wants_raw_keystrokes(&r1, "any"));
-        // agents not an array → false
-        let r2 = serde_json::json!({"result": {"agents": "nope"}});
-        assert!(!list_response_wants_raw_keystrokes(&r2, "any"));
-        // agent without agent_state field → false
-        let r3 = serde_json::json!({"result": {"agents": [{"name": "x"}]}});
-        assert!(!list_response_wants_raw_keystrokes(&r3, "x"));
     }
 
     #[test]

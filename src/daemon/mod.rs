@@ -147,7 +147,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
     }
 
-    run_core(home, agents, None)
+    run_core(home, agents, None, None)
 }
 
 /// Start daemon with a fleet already prepared by [`crate::bootstrap::prepare`].
@@ -166,16 +166,21 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     // Reuse the already-parsed FleetConfig for the initial reload digest;
     // avoids re-reading + re-parsing fleet.yaml inside run_core.
     let initial_digest = crate::bootstrap::reload::digest_from_config(&prepared.config);
+    let telegram = prepared.telegram.clone();
     let _owned = prepared;
-    run_core(&home, agents, Some(initial_digest))
+    run_core(&home, agents, Some(initial_digest), telegram)
 }
 
 fn run_core(
     home: &Path,
     agents: Vec<AgentDef>,
     initial_digest: Option<HashMap<String, crate::bootstrap::reload::InstanceDigest>>,
+    telegram: Option<Arc<Mutex<crate::telegram::TelegramState>>>,
 ) -> anyhow::Result<()> {
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    if let Some(tg) = telegram.as_ref() {
+        crate::telegram::attach_registry(tg, Arc::clone(&registry));
+    }
 
     // External agents registry (connected via `agend-terminal connect`)
     let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));

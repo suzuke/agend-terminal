@@ -51,10 +51,11 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
     };
 
     for (name, core) in handles {
-        // tail is pulled while we hold the core lock; Telegram IO happens
-        // after we release it so slow-network pushes don't block other
-        // agents' updates.
-        let notify_payload: Option<String> = {
+        // Mutate state + pull the tail under the core lock, then drop it
+        // before running `format!` and the Telegram spawn. `tail_lines`
+        // allocates a fresh String, so the lock window is bounded by the
+        // vterm copy — no async IO or string formatting held against it.
+        let notice: Option<(String, Option<u64>)> = {
             let mut core = match core.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
@@ -69,11 +70,7 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
                     prev_state = agent_state.display_name(),
                     "awaiting operator (stalled on interactive prompt)"
                 );
-                Some(format_stall_notice(
-                    &name,
-                    &core.vterm.tail_lines(TAIL_LINES),
-                    Some(silent.as_secs()),
-                ))
+                Some((core.vterm.tail_lines(TAIL_LINES), Some(silent.as_secs())))
             } else if core.state.take_interactive_prompt_notice() {
                 // Pattern-based InteractivePrompt fires immediately on state
                 // entry (no silence window), so the notice also goes out on
@@ -82,17 +79,14 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
                     agent = %name,
                     "interactive prompt detected — forwarding to telegram"
                 );
-                Some(format_stall_notice(
-                    &name,
-                    &core.vterm.tail_lines(TAIL_LINES),
-                    None,
-                ))
+                Some((core.vterm.tail_lines(TAIL_LINES), None))
             } else {
                 None
             }
         };
 
-        if let Some(msg) = notify_payload {
+        if let Some((tail, silent_secs)) = notice {
+            let msg = format_stall_notice(&name, &tail, silent_secs);
             notify_telegram(home, &name, &msg);
         }
     }
