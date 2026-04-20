@@ -25,6 +25,8 @@ pub fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
     };
 
     let text = text.to_string();
+    let home_owned = home.to_path_buf();
+    let instance_owned = instance_name.to_string();
     std::thread::Builder::new()
         .name("tg_notify".into())
         .spawn(move || {
@@ -34,7 +36,7 @@ pub fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
             else {
                 return;
             };
-            if let Err(_e) = rt.block_on(async {
+            if let Err(e) = rt.block_on(async {
                 let bot = teloxide::Bot::new(&token);
                 let chat_id = teloxide::types::ChatId(group_id);
                 match topic_id {
@@ -51,7 +53,16 @@ pub fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
                 }
                 Ok::<(), anyhow::Error>(())
             }) {
-                tracing::warn!(error = %_e, "telegram notify failed");
+                let handled = crate::telegram::handle_send_failure(
+                    &e,
+                    &home_owned,
+                    &instance_owned,
+                    topic_id,
+                    None,
+                );
+                if !handled {
+                    tracing::warn!(error = %e, "telegram notify failed");
+                }
             }
         })
         .ok();

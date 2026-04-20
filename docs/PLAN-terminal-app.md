@@ -325,6 +325,9 @@ agend-terminal          # 無參數：啟動 terminal app
 
 - Status bar 顯示 Telegram 連線狀態
 - 來自 Telegram 的訊息在對應 agent tab 顯示通知 badge
+- Topic 生命週期雙向同步：Close topic 即時觸發 pane 移除；Delete topic 沒有
+  Bot API 事件，採「下一次 agent 發訊息碰到 `message thread not found`」的
+  lazy cleanup（詳見 [PLAN-telegram-topic-delete-sync.md](PLAN-telegram-topic-delete-sync.md)）
 
 ---
 
