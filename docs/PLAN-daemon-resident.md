@@ -1,7 +1,7 @@
 # Plan: daemon-resident bootstrap (tmux-style)
 
 Status: Stages 1 & 2 shipped on main (commits `8a1107e..ece0933`, 2026-04-20,
-pushed). Stage 3 is partially scoped and partially shipped — see §3.
+pushed). Stage 3 complete through §3.6 — see §3.
 
 ## Why this exists
 
@@ -87,12 +87,20 @@ of inlining `handle.pty_master.resize`. No Remote consumer yet — that's
 ### 3.3 — `spawn_detached` [DONE in Stage 2]
 Already shipped (`aef61d2`). Listed here for traceability.
 
-### 3.4 — app Owned vs Attached branches [PARTIAL]
-- Owned: today's behavior, untouched.
-- Attached (today): fail-fast with a message.
-- Attached (3.4 goal): open a tab per agent reachable from the daemon,
-  each pane a `Pane::Remote` connected via `bridge_client`. 3.1 and 3.2
-  are now landed — only app wiring remains.
+### 3.4 — app Owned vs Attached branches [DONE]
+- Owned: unchanged — session restore + shell fallback + supervisor spawn.
+- Attached: enumerates agent names via `ipc::list_agent_ports(run_dir)`,
+  builds one `Pane::Remote` per agent through
+  `app::pane_factory::create_remote_pane` (new), and adds each as a tab. A
+  reader thread parses tagged frames from `BridgeClient::take_reader()`
+  and forwards `TAG_DATA` payloads into the pane's output channel; the
+  daemon's first frame is the vterm dump, so no explicit dump handling
+  is needed client-side.
+- The pre-TUI "another daemon is already running" bail in `src/app/mod.rs`
+  is removed — the Attached branch supersedes it.
+- Attached skips `session::restore_with_reconciliation`,
+  `session::save_*`, `sync_fleet_yaml`, `supervisor::spawn`, and the exit
+  `kill_agent` loop so the app never clobbers daemon-owned state.
 
 ### 3.5 — SIGTERM-only handler for app [DONE in `a9df3a8`]
 `bootstrap::signals::install_term_only` — Unix `libc::sigaction(SIGTERM)`
@@ -101,15 +109,23 @@ with `SA_RESTART`, Windows `SetConsoleCtrlHandler` filtered to
 left to crossterm so Ctrl+C still reaches the focused PTY as `0x03`. Main
 loop polls `signals::term_requested()` each 50ms tick.
 
-### 3.6 — lifecycle e2e tests [NOT DONE]
-Shell-script driven, not unit tests. Scenarios:
-1. `start --detached` → parent exits → daemon still alive, Telegram
-   still delivers.
-2. Second `start` hits the flock → exits with helpful message.
-3. `app` while daemon is live → today: fail-fast; post-3.4: connects.
-4. `stop` → daemon tears down run dir; subsequent `start` cold-starts.
+### 3.6 — lifecycle e2e tests [DONE]
+`scripts/e2e/daemon-lifecycle.sh` runs under an isolated `AGEND_HOME` and
+covers:
+1. `start --detached` → parent exits → daemon PID survives and `list`
+   enumerates the configured fleet.
+2. Second foreground `start` hits the flock → non-zero exit with a
+   "lock/already running/daemon" message; original daemon unaffected.
+3. `app` with daemon live → spawns via `pty.fork`, reaches
+   `bootstrap::prepare`, logs "attached to existing daemon" in `app.log`
+   (positive assertion) and never prints the pre-3.4 fail-fast text
+   (negative assertion); daemon survives the app's SIGTERM exit.
+4. `stop` removes the run dir and terminates the daemon PID; a follow-up
+   `start --detached` cold-starts with a fresh PID.
 
-Tracking: `scripts/e2e/daemon-lifecycle.sh` (does not exist yet).
+Telegram delivery is out of scope for the script (needs a live bot
+token) — the API-cookie regression it would catch is already covered by
+`bootstrap::tests::owned_cookie_is_readable_for_api_serve`.
 
 ## Out of scope for this plan
 
@@ -122,10 +138,12 @@ Tracking: `scripts/e2e/daemon-lifecycle.sh` (does not exist yet).
 
 ## Dead-code warnings on `OwnedFleet` / `AttachedFleet`
 
-`OwnedFleet::fleet_path`, `cookie`, `lock` and `AttachedFleet::home`,
-`fleet_path`, `cookie` are currently unread. They are scaffolding for
-Stage 3 (Attached client will need `cookie` + `fleet_path`; Owned tests
-for the follow-on work will read `cookie` via API). Leaving the warnings
-visible until Stage 3 consumers land is deliberate — suppressing them
-with `#[allow(dead_code)]` would hide the scaffolding at exactly the
-moment we need to remember it exists.
+After Stage 3.4, `OwnedFleet::fleet_path`/`lock` and `AttachedFleet::home`/
+`fleet_path`/`cookie` remain unread. `AttachedFleet::run_dir` is now read
+by the app Attached branch; `OwnedFleet::cookie` is read by the daemon
+issuance path. The remaining fields are scaffolding for follow-on work
+(Attached client could accept a pre-read cookie to avoid
+`auth_cookie::read_cookie` per pane; Owned `fleet_path` surfaces
+intentional structure in the type). Leaving the warnings visible is
+deliberate — suppressing them with `#[allow(dead_code)]` would hide
+scaffolding at exactly the moment we need to remember it exists.
