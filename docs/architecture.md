@@ -773,8 +773,24 @@ policy decision the installer's shell owns.
 - `supervisor::client` — pure (sha256, symlink swap, UDS send/recv).
 - `supervisor::ipc` — serde roundtrip tests on every Request/Response variant.
 - `supervisor::self_test` — passes with valid `fleet.yaml`, fails on corrupt.
-- `supervisor::server` — integration test drives a mock daemon binary through
-  the full success and rollback paths via a temp `$AGEND_HOME`.
+- `supervisor::server` — end-to-end integration tests in
+  `tests/self_healing_supervisor.rs` drive the real `agend-supervisor` binary
+  against a temp `$AGEND_HOME`, using `src/bin/agend-mock-daemon.rs` as the
+  daemon child. Two cases covered:
+  - **Success path**: v1 booted → stage v2 → `Upgrade` → terminal `Ok` →
+    `current` repointed at v2 → v2 sentinel observed.
+  - **Rollback path**: crash counter armed at 2 so the new daemon crashes
+    post-ready twice inside the stability window → supervisor repoints
+    `current` back at v1, deletes the upgrade marker, and responds `Err`.
+    This path also exercises the watcher's `waitpid(WNOHANG)` zombie reap —
+    pure `kill(pid, 0)` liveness probing would leave crashed children as
+    zombies and silently report the upgrade as stable.
+
+  The v2 binary is fabricated by appending padding bytes to the v1
+  mock-daemon so the sha256 differs while behaviour stays identical
+  (ELF/Mach-O loaders ignore trailing bytes). The mock daemon is
+  Unix-only and never shipped — it lives under `src/bin/` purely so
+  `cargo test` builds it into `target/debug/` alongside the supervisor.
 
 ---
 
