@@ -15,7 +15,14 @@ pub(crate) enum TuiEvent {
     InstanceCreated {
         name: String,
         layout: LayoutHint,
+        /// The caller instance (auto-filled by the MCP handler). Used as the
+        /// split anchor when `target_pane` is `None` or not currently displayed.
         spawner: Option<String>,
+        /// Explicit split anchor requested via `create_instance`'s
+        /// `target_pane` argument. When set and the agent is currently
+        /// displayed in any tab, the new pane is attached next to it,
+        /// overriding `spawner`.
+        target_pane: Option<String>,
     },
     InstanceDeleted {
         name: String,
@@ -70,8 +77,17 @@ pub(super) fn handle_tui_event(
             name,
             layout: hint,
             spawner,
+            target_pane,
         } => {
-            handle_instance_created(&name, hint, spawner.as_deref(), layout, registry, wakeup_tx);
+            handle_instance_created(
+                &name,
+                hint,
+                spawner.as_deref(),
+                target_pane.as_deref(),
+                layout,
+                registry,
+                wakeup_tx,
+            );
         }
         TuiEvent::InstanceDeleted { name } => {
             handle_instance_deleted(&name, layout);
@@ -89,15 +105,71 @@ pub(super) fn handle_tui_event(
     }
 }
 
+/// Where a newly-created pane should land.
+#[derive(Debug)]
+enum SplitAnchor {
+    /// Split the pane with this `pane_id` inside the tab at `tab_idx`.
+    Pane { tab_idx: usize, pane_id: usize },
+    /// Split whatever pane is focused in this tab.
+    Focused { tab_idx: usize },
+}
+
+/// Resolve the split anchor for a new instance.
+///
+/// Precedence:
+///   1. `target_pane` — exact pane in whichever tab currently displays it.
+///   2. `spawner` — focused pane of the caller's tab (legacy behavior).
+///   3. `None` — fall back to a new tab.
+///
+/// Only consulted for `SplitRight` / `SplitBelow` hints; `Tab` hints always
+/// return `None` here.
+fn resolve_split_anchor(
+    hint: LayoutHint,
+    target_pane: Option<&str>,
+    spawner: Option<&str>,
+    layout: &Layout,
+) -> Option<SplitAnchor> {
+    if matches!(hint, LayoutHint::Tab) {
+        return None;
+    }
+    if let Some(tp) = target_pane {
+        for (tab_idx, tab) in layout.tabs.iter().enumerate() {
+            if let Some(pane_id) = tab.root().find_pane_id_by_agent(tp) {
+                return Some(SplitAnchor::Pane { tab_idx, pane_id });
+            }
+        }
+        tracing::info!(
+            target_pane = tp,
+            "resolve_split_anchor: target_pane not displayed, falling back to spawner"
+        );
+    }
+    spawner.and_then(|s| {
+        layout
+            .tabs
+            .iter()
+            .position(|tab| tab.root().has_agent(s))
+            .map(|tab_idx| SplitAnchor::Focused { tab_idx })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_instance_created(
     name: &str,
     hint: LayoutHint,
     spawner: Option<&str>,
+    target_pane: Option<&str>,
     layout: &mut Layout,
     registry: &AgentRegistry,
     wakeup_tx: &crossbeam::channel::Sender<usize>,
 ) {
-    tracing::info!(agent = name, hint = ?hint, spawner = ?spawner, tabs_before = layout.tabs.len(), "handle_instance_created begin");
+    tracing::info!(
+        agent = name,
+        hint = ?hint,
+        spawner = ?spawner,
+        target_pane = ?target_pane,
+        tabs_before = layout.tabs.len(),
+        "handle_instance_created begin"
+    );
     if layout.tabs.iter().any(|tab| tab.root().has_agent(name)) {
         tracing::info!(
             agent = name,
@@ -113,15 +185,7 @@ fn handle_instance_created(
     // discarding an attached pane leaves an orphan subscription that lingers
     // until the agent next emits data (indefinite on idle agents). Pre-checking
     // ensures we only attach once.
-    let split_target_idx = match hint {
-        LayoutHint::SplitRight | LayoutHint::SplitBelow => spawner.and_then(|spawner_name| {
-            layout
-                .tabs
-                .iter()
-                .position(|tab| tab.root().has_agent(spawner_name))
-        }),
-        LayoutHint::Tab => None,
-    };
+    let anchor = resolve_split_anchor(hint, target_pane, spawner, layout);
 
     let pane = match super::pane_factory::attach_pane(
         name,
@@ -138,18 +202,27 @@ fn handle_instance_created(
         }
     };
 
-    match (hint, split_target_idx) {
-        (LayoutHint::SplitRight | LayoutHint::SplitBelow, Some(idx)) => {
+    match anchor {
+        Some(a) => {
             let dir = match hint {
                 LayoutHint::SplitRight => SplitDir::Horizontal,
-                _ => SplitDir::Vertical,
+                LayoutHint::SplitBelow => SplitDir::Vertical,
+                // Tab was filtered out by resolve_split_anchor.
+                LayoutHint::Tab => unreachable!("Tab hint never produces a SplitAnchor"),
             };
-            // split_focused consumes the pane. If the rare case of no focused
-            // pane in the target tab occurs, the pane is lost — acceptable
-            // since we've already validated the tab has the spawner agent.
-            layout.tabs[idx].split_focused(dir, pane);
+            match a {
+                SplitAnchor::Pane { tab_idx, pane_id } => {
+                    // split_at_pane consumes `pane`. The pane_id was read from
+                    // the same layout snapshot used to pick the tab, so it must
+                    // still exist here.
+                    layout.tabs[tab_idx].split_at_pane(pane_id, dir, pane);
+                }
+                SplitAnchor::Focused { tab_idx } => {
+                    layout.tabs[tab_idx].split_focused(dir, pane);
+                }
+            }
         }
-        _ => {
+        None => {
             layout.add_tab(Tab::new(name.to_string(), pane));
         }
     }
@@ -495,5 +568,75 @@ mod tests {
         layout.add_tab(Tab::new("kiro".into(), leaf(1, "kiro")));
         remove_agent_pane("ghost", &mut layout);
         assert_eq!(layout.tabs.len(), 1);
+    }
+
+    #[test]
+    fn resolve_anchor_prefers_target_pane_over_spawner() {
+        // target_pane lives in tab 1; spawner lives in tab 0. Precedence says
+        // target_pane wins and we anchor on its exact pane_id.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("caller-tab".into(), leaf(1, "caller")));
+        layout.add_tab(Tab::new("work-tab".into(), leaf(2, "worker")));
+
+        let anchor = resolve_split_anchor(
+            LayoutHint::SplitRight,
+            Some("worker"),
+            Some("caller"),
+            &layout,
+        )
+        .expect("anchor");
+        match anchor {
+            SplitAnchor::Pane { tab_idx, pane_id } => {
+                assert_eq!(tab_idx, 1);
+                assert_eq!(pane_id, 2);
+            }
+            other => panic!("expected SplitAnchor::Pane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_anchor_falls_back_to_spawner_when_target_missing() {
+        // target_pane names an agent that isn't displayed anywhere —
+        // resolution must fall back to the spawner's tab (focused pane).
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("caller-tab".into(), leaf(1, "caller")));
+
+        let anchor = resolve_split_anchor(
+            LayoutHint::SplitBelow,
+            Some("ghost"),
+            Some("caller"),
+            &layout,
+        )
+        .expect("anchor");
+        match anchor {
+            SplitAnchor::Focused { tab_idx } => assert_eq!(tab_idx, 0),
+            other => panic!("expected SplitAnchor::Focused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_anchor_returns_none_when_nothing_matches() {
+        // Nothing to anchor on → caller must fall back to a new tab.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("other".into(), leaf(1, "other")));
+
+        assert!(resolve_split_anchor(
+            LayoutHint::SplitRight,
+            Some("ghost"),
+            Some("ghost"),
+            &layout
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn resolve_anchor_tab_hint_always_none() {
+        // LayoutHint::Tab means "new tab" — the resolver must ignore even
+        // valid target_pane / spawner values.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t".into(), leaf(1, "peer")));
+        assert!(
+            resolve_split_anchor(LayoutHint::Tab, Some("peer"), Some("peer"), &layout).is_none()
+        );
     }
 }

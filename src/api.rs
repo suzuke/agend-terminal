@@ -422,10 +422,15 @@ fn handle_session(
                                 .as_str()
                                 .filter(|s| !s.is_empty())
                                 .map(String::from);
+                            let target_pane = params["target_pane"]
+                                .as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
                             tracing::info!(
                                 agent = name,
                                 layout = ?layout_hint,
                                 spawner = ?spawner,
+                                target_pane = ?target_pane,
                                 channel_len = tx.len(),
                                 "SPAWN emitting InstanceCreated"
                             );
@@ -433,6 +438,7 @@ fn handle_session(
                                 name: name.to_string(),
                                 layout: layout_hint,
                                 spawner,
+                                target_pane,
                             }) {
                                 tracing::warn!(agent = name, error = %e, "InstanceCreated try_send failed");
                             }
