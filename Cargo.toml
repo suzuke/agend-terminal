@@ -8,6 +8,20 @@ repository = "https://github.com/suzuke/agend-terminal"
 keywords = ["agent", "pty", "terminal", "mcp", "orchestration"]
 categories = ["command-line-utilities", "development-tools"]
 
+# Whitelist what ships on crates.io — everything not listed is excluded.
+# Keeps internal docs/scripts/test fixtures out of the published crate.
+# If you add a path the build needs (e.g. a new asset for build.rs), add it here.
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "assets/windows/*",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
+
 [lints.clippy]
 unwrap_used = "deny"
 
