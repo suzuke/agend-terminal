@@ -1062,6 +1062,13 @@ impl Layout {
         self.tabs.push(tab);
     }
 
+    /// Append a tab without changing the active index. Used by the Attached
+    /// app's remote-agent sync so a fleet.yaml hot-reload doesn't yank focus
+    /// from whatever the user is currently working on.
+    pub fn push_tab_preserve_focus(&mut self, tab: Tab) {
+        self.tabs.push(tab);
+    }
+
     pub fn active_tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }

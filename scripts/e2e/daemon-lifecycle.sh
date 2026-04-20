@@ -6,6 +6,8 @@
 #   2. Second start with fleet hits the flock → exits non-zero.
 #   3. app while daemon is live → connects as remote client (Stage 3.4).
 #   4. stop tears down run dir; subsequent start cold-starts.
+#   5. fleet.yaml hot-reload: live daemon picks up a newly-added instance
+#      (hot-reload Phase B/D).
 #
 # Runs entirely under a temporary AGEND_HOME. No install, no touch to the
 # user's real ~/agend. Requires python3 (PTY harness for Scenario 3).
@@ -191,6 +193,37 @@ DAEMON_PID="$(get_daemon_pid)" || fail "cold start has no pid"
 kill -0 "$DAEMON_PID" 2>/dev/null || fail "cold-started daemon $DAEMON_PID not alive"
 [[ "$DAEMON_PID" != "$OLD_PID" ]] || fail "new daemon reuses old pid $OLD_PID (should be impossible)"
 green "  ok (new pid $DAEMON_PID)"
+
+# -------------------- Scenario 5: fleet.yaml hot-reload --------------------
+info "Scenario 5: fleet.yaml mutation is picked up by the live daemon"
+# Baseline: gamma must not be in the fleet yet.
+BASELINE="$(AGEND_HOME="$TEST_HOME" "$BIN" list --json)"
+if echo "$BASELINE" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "gamma" in d else 1)'; then
+    fail "gamma should not be in pre-reload list; got: $BASELINE"
+fi
+# Sleep 1.1s before rewriting so mtime visibly advances past the cold-start
+# read (filesystem mtime resolution can truncate sub-second writes on some FS).
+sleep 1.1
+cat >> "$TEST_HOME/fleet.yaml" <<'YAML'
+  gamma: {}
+YAML
+# Daemon hot-reload tick is 10s; give up to 20s for (tick → resolve → spawn
+# → port bind). Poll every 0.5s so we exit early as soon as gamma appears.
+SUCCEEDED=0
+LAST_LIST=""
+for _ in $(seq 1 40); do
+    LAST_LIST="$(AGEND_HOME="$TEST_HOME" "$BIN" list --json 2>/dev/null || true)"
+    if echo "$LAST_LIST" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if "gamma" in d else 1)' 2>/dev/null; then
+        SUCCEEDED=1
+        break
+    fi
+    sleep 0.5
+done
+[[ "$SUCCEEDED" == "1" ]] || fail "gamma did not appear in list after fleet.yaml reload; last list: $LAST_LIST"
+# And the daemon we started at the top of Scenario 4 is still the same pid —
+# reload must be in-place, not a restart.
+kill -0 "$DAEMON_PID" 2>/dev/null || fail "daemon $DAEMON_PID died during hot-reload"
+green "  ok (gamma picked up via hot-reload, daemon pid unchanged)"
 
 echo
 green "Daemon lifecycle end-to-end tests passed."

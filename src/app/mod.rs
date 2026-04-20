@@ -165,6 +165,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let pane_rows = rows.saturating_sub(4);
     let pane_cols = cols.saturating_sub(2);
 
+    // Remote agent roster (Attached mode). Mirrors `*.port` files the daemon
+    // publishes for each live agent; periodic sync below diffs this against
+    // the filesystem so hot-reload-added agents auto-materialize as tabs.
+    let mut known_remote_agents: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     if let Some(ref run_dir) = attached_run_dir {
         // Attached: one tab per agent the daemon is serving. Tabs derive from
         // the daemon's `*.port` files (the same list `agend-terminal list`
@@ -185,6 +191,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             ) {
                 Ok(pane) => {
                     let tab_name = pane.agent_name.clone();
+                    known_remote_agents.insert(tab_name.clone());
                     layout.add_tab(crate::layout::Tab::new(tab_name, pane));
                 }
                 Err(e) => tracing::warn!(agent = %name, error = %e, "remote pane attach failed"),
@@ -230,6 +237,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // Flag to trigger resize pass after layout changes (split, close, zoom, tab switch).
     // Start true so restored split panes get correct sizes before first draw.
     let mut needs_resize = true;
+
+    // Throttle for Attached-mode remote agent discovery. 2s is short enough
+    // that a fleet.yaml reload (daemon tick is 10s) feels timely but long
+    // enough that the readdir cost is trivial.
+    let mut last_remote_sync = std::time::Instant::now();
 
     // Crossterm event reader thread
     let (event_tx, event_rx) = crossbeam::channel::unbounded::<Event>();
@@ -411,7 +423,64 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 }
             }
             default(std::time::Duration::from_millis(50)) => {
-                // Periodic redraw for state updates
+                // Periodic redraw for state updates. In Attached mode, also
+                // poll the daemon's `*.port` directory every 2s and open a
+                // tab for each newly-appeared remote agent (hot-reload
+                // Phase C). Matches the daemon's add-only policy: removed
+                // agents are logged but their panes stay put so the user's
+                // scrollback isn't destroyed mid-session.
+                if let Some(ref run_dir) = attached_run_dir {
+                    if last_remote_sync.elapsed() >= std::time::Duration::from_secs(2) {
+                        let current: std::collections::HashSet<String> =
+                            crate::ipc::list_agent_ports(run_dir).into_iter().collect();
+                        let mut to_add: Vec<String> = current
+                            .difference(&known_remote_agents)
+                            .cloned()
+                            .collect();
+                        to_add.sort();
+                        for name in &to_add {
+                            match pane_factory::create_remote_pane(
+                                name,
+                                &home,
+                                &fleet_path,
+                                &mut layout,
+                                pane_cols,
+                                pane_rows,
+                                &wakeup_tx,
+                            ) {
+                                Ok(pane) => {
+                                    let tab_name = pane.agent_name.clone();
+                                    known_remote_agents.insert(tab_name.clone());
+                                    layout.push_tab_preserve_focus(
+                                        crate::layout::Tab::new(tab_name, pane),
+                                    );
+                                    needs_resize = true;
+                                    tracing::info!(
+                                        agent = %name,
+                                        "opened tab for newly-appeared remote agent"
+                                    );
+                                }
+                                Err(e) => tracing::warn!(
+                                    agent = %name,
+                                    error = %e,
+                                    "remote pane attach failed during sync",
+                                ),
+                            }
+                        }
+                        let gone: Vec<String> = known_remote_agents
+                            .difference(&current)
+                            .cloned()
+                            .collect();
+                        for name in &gone {
+                            tracing::warn!(
+                                agent = %name,
+                                "daemon-side agent gone; pane retained with stale output",
+                            );
+                            known_remote_agents.remove(name);
+                        }
+                        last_remote_sync = std::time::Instant::now();
+                    }
+                }
             }
         }
     }
