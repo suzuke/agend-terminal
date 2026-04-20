@@ -26,16 +26,19 @@ def find_port(agent):
     for pid_dir in RUN_DIR.glob("*"):
         p = pid_dir / f"{agent}.port"
         if p.exists():
-            return int(p.read_text().strip())
-    return None
+            return int(p.read_text().strip()), pid_dir
+    return None, None
 
 
 def main():
     agent = sys.argv[1]
     hex_bytes = sys.argv[2].replace(" ", "")
     payload = bytes.fromhex(hex_bytes)
-    port = find_port(agent)
+    port, run_dir = find_port(agent)
     sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+    # Stage 8 cookie auth
+    cookie = (run_dir / "api.cookie").read_bytes()
+    sock.sendall(cookie)
     version = read_exact(sock, 1)
     print(f"[tui_send] connected port={port} version={version[0]}")
     # Skip initial dump frame

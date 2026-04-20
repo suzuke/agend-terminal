@@ -6,8 +6,9 @@ PTY reader is actually receiving output from the child process.
 
 Usage:  python tui_dump.py <agent_name> [duration_seconds=10]
 
-Protocol (from src/framing.rs):
-  - 1 byte PROTOCOL_VERSION
+Protocol (from src/framing.rs + src/auth_cookie.rs, Stage 8 onward):
+  - Client sends 32 raw cookie bytes (from {run_dir}/api.cookie)
+  - Server sends 1 byte PROTOCOL_VERSION
   - Then frames: [u8 tag][u32 BE length][bytes]
     tag 0 = PTY data, tag 1 = resize (4 bytes cols+rows)
   - First frame after handshake is the vterm dump (prior buffered output)
@@ -38,8 +39,15 @@ def find_agent_port(agent):
     for pid_dir in RUN_DIR.glob("*"):
         port_file = pid_dir / f"{agent}.port"
         if port_file.exists():
-            return int(port_file.read_text().strip())
-    return None
+            return int(port_file.read_text().strip()), pid_dir
+    return None, None
+
+
+def read_cookie(run_dir):
+    cookie = (run_dir / "api.cookie").read_bytes()
+    if len(cookie) != 32:
+        raise SystemExit(f"unexpected cookie length {len(cookie)}")
+    return cookie
 
 
 def describe(data):
@@ -52,7 +60,7 @@ def main():
     agent = sys.argv[1] if len(sys.argv) > 1 else "sh"
     duration = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
 
-    port = find_agent_port(agent)
+    port, run_dir = find_agent_port(agent)
     if port is None:
         print(f"agent {agent!r} port file not found under {RUN_DIR}", file=sys.stderr)
         sys.exit(2)
@@ -60,6 +68,10 @@ def main():
 
     sock = socket.create_connection(("127.0.0.1", port), timeout=5.0)
     sock.settimeout(duration)
+
+    # Stage 8 auth: send 32-byte cookie before anything else
+    cookie = read_cookie(run_dir)
+    sock.sendall(cookie)
 
     # Read protocol version
     version = read_exact(sock, 1)
