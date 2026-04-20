@@ -169,18 +169,34 @@ Add or remove members. When running inside the TUI, added members migrate into t
 
 ## 7. Schedules
 
-Cron schedules that inject messages to a target instance.
+Schedules inject messages into a target instance either recurringly (cron)
+or at a single future instant (one-shot). One-shots auto-disable after
+firing or being detected as missed (daemon down through the instant).
+
+Each row carries a `trigger` object:
+- Cron: `{"kind": "cron", "expr": "0 9 * * *"}`
+- One-shot: `{"kind": "once", "at": "2026-04-21T15:30:00+08:00"}`
+
+Timezone detection is cross-platform (Linux, macOS, Windows) via the
+`iana-time-zone` crate; supply an explicit `timezone` to override.
 
 ### `create_schedule`
-- **`cron`** (string), **`message`** (string)
-- `target` (string), `label` (string), `timezone` (string)
+- **`message`** (string)
+- Exactly one of:
+  - **`cron`** (string) — 5- or 6-field cron expression.
+  - **`run_at`** (string) — ISO 8601 one-shot instant. Either with offset
+    (`2026-04-21T15:30:00+08:00`) or naive local (`2026-04-21T15:30:00`)
+    combined with `timezone`. Must resolve to the future.
+- `target` (string), `label` (string), `timezone` (string, IANA name).
 
 ### `list_schedules`
 - `target` (string) — optional filter.
 
 ### `update_schedule`
 - **`id`** (string)
-- Any of: `cron`, `message`, `target`, `label`, `timezone`, `enabled` (boolean).
+- Any of: `message`, `target`, `label`, `timezone`, `enabled` (boolean).
+- Trigger change: supply **either** `cron` **or** `run_at`
+  (mutually exclusive). Supplying either replaces the trigger kind.
 
 ### `delete_schedule`
 - **`id`** (string)

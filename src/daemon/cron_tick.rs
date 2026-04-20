@@ -1,22 +1,27 @@
 use crate::agent::{self, AgentRegistry};
+use crate::schedules::Trigger;
 use std::path::Path;
 
-/// Check cron schedules and inject messages for due ones.
+/// Check schedules and inject messages for due ones.
+///
+/// Two trigger kinds are handled:
+/// - `Cron` — fires every time the cron expression lands inside the window
+///   `(last_check, now]`, evaluated in the schedule's declared timezone.
+/// - `Once` — fires exactly once when its absolute `at` instant falls into
+///   the window; after firing (or being detected as missed because the
+///   daemon was down through `at`), the schedule is auto-disabled so it
+///   never triggers again.
 pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
     use cron::Schedule;
     use std::str::FromStr;
 
-    let store: serde_json::Value = match std::fs::read_to_string(home.join("schedules.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-    {
-        Some(v) => v,
-        None => return,
-    };
-    let schedules = match store["schedules"].as_array() {
-        Some(s) => s,
-        None => return,
-    };
+    // Typed load normalises legacy v1 rows (top-level `cron` field) into
+    // `Trigger::Cron` via `ScheduleRaw::From`, so this tick works against
+    // both old and new files without a separate migration pass.
+    let store = crate::schedules::load(home);
+    if store.schedules.is_empty() {
+        return;
+    }
 
     let now_utc = chrono::Utc::now();
     let last_check_path = home.join(".schedule_last_check");
@@ -27,65 +32,58 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
         .unwrap_or_else(|| now_utc - chrono::Duration::seconds(10));
 
     let mut any_triggered = false;
-    for sched in schedules {
-        if !sched["enabled"].as_bool().unwrap_or(true) {
+    for sched in &store.schedules {
+        if !sched.enabled {
             continue;
         }
-        let cron_expr = match sched["cron"].as_str() {
-            Some(c) => c,
-            None => continue,
-        };
-        let full_expr = if cron_expr.split_whitespace().count() == 5 {
-            format!("0 {cron_expr}")
+
+        // Resolve target timezone once — used by Cron dispatch and by
+        // log/error messages. `Once` stores an absolute RFC 3339 instant
+        // so it doesn't need tz to fire, but keeping one tz variable here
+        // keeps the two branches symmetrical.
+        let tz_name: &str = if sched.timezone.is_empty() {
+            crate::schedules::detect_timezone()
         } else {
-            cron_expr.to_string()
+            sched.timezone.as_str()
         };
+        let tz: chrono_tz::Tz = tz_name.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                schedule = %sched.id,
+                timezone = tz_name,
+                "unknown timezone, falling back to UTC"
+            );
+            chrono_tz::UTC
+        });
 
-        let schedule = match Schedule::from_str(&full_expr) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(cron = cron_expr, error = %e, "invalid cron");
-                continue;
+        // Decide whether this schedule is due and whether firing it
+        // consumes it (one-shot auto-disable). The outcome is a small
+        // struct so the firing code below stays unified across kinds.
+        let fire = match &sched.trigger {
+            Trigger::Cron { expr } => {
+                let full = if expr.split_whitespace().count() == 5 {
+                    format!("0 {expr}")
+                } else {
+                    expr.clone()
+                };
+                match Schedule::from_str(&full) {
+                    Ok(s) if is_due_in_tz(&s, tz, last_check_utc, now_utc) => Some(FireDecision {
+                        one_shot: false,
+                        missed: false,
+                    }),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(cron = %expr, error = %e, "invalid cron");
+                        None
+                    }
+                }
             }
+            Trigger::Once { at } => classify_once(at, last_check_utc, now_utc),
         };
+        let Some(fire) = fire else { continue };
 
-        // Evaluate the cron expression in the schedule's declared timezone
-        // (falls back to detected local TZ, then UTC). Previously we always
-        // compared against UTC, so "0 9 * * *" fired at 9 AM UTC regardless
-        // of the user's intent, and a DST transition in the user's region
-        // silently shifted the trigger by 1h. A tz-aware DateTime lets
-        // chrono resolve the wall-clock → instant conversion correctly.
-        // Explicit `match` rather than `unwrap_or_else(detect_timezone)` so
-        // the &str borrowed from `store` (JSON Value) doesn't need to unify
-        // with detect_timezone's &'static str — Rust would otherwise infer
-        // `'static` for the Value borrow and blow up lifetimes.
-        let tz_name: &str = match sched["timezone"].as_str().filter(|s| !s.is_empty()) {
-            Some(s) => s,
-            None => crate::schedules::detect_timezone(),
-        };
-        let tz: chrono_tz::Tz = match tz_name.parse() {
-            Ok(t) => t,
-            Err(_) => {
-                tracing::warn!(
-                    cron = cron_expr,
-                    timezone = tz_name,
-                    "unknown timezone, falling back to UTC"
-                );
-                chrono_tz::UTC
-            }
-        };
-        if !is_due_in_tz(&schedule, tz, last_check_utc, now_utc) {
-            continue;
-        }
-
-        let (sched_id, target) = (
-            sched["id"].as_str().unwrap_or(""),
-            sched["target"].as_str().unwrap_or(""),
-        );
-        let (message, label) = (
-            sched["message"].as_str().unwrap_or(""),
-            sched["label"].as_str().unwrap_or("(unnamed)"),
-        );
+        let (sched_id, target) = (sched.id.as_str(), sched.target.as_str());
+        let message = sched.message.as_str();
+        let label = sched.label.as_deref().unwrap_or("(unnamed)");
 
         tracing::info!(label, target, message, "schedule triggered");
         crate::event_log::log(
@@ -96,7 +94,13 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
         );
 
         let reg = agent::lock_registry(registry);
-        let status = if let Some(handle) = reg.get(target) {
+        let status = if fire.missed {
+            // Daemon was down through the one-shot instant — don't silently
+            // inject a stale message (could be a morning "stand-up" from
+            // three days ago). Just mark it missed so the user can see it
+            // in run_history, and let the auto-disable below retire it.
+            "missed"
+        } else if let Some(handle) = reg.get(target) {
             match agent::inject_to_agent(handle, message.as_bytes()) {
                 Ok(()) => "ok",
                 Err(e) => {
@@ -118,8 +122,13 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
             "ok_inbox"
         };
         drop(reg);
-        if !sched_id.is_empty() {
-            crate::schedules::record_run(home, sched_id, status);
+
+        crate::schedules::record_run(home, sched_id, status);
+        if fire.one_shot {
+            // Even on inject_failed we disable: one-shots are not retry-
+            // safe (the window already rolled forward). The user can
+            // re-create with a new run_at if they want another attempt.
+            crate::schedules::set_enabled(home, sched_id, false);
         }
         any_triggered = true;
     }
@@ -127,6 +136,47 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
     if any_triggered || now_utc.signed_duration_since(last_check_utc).num_seconds() >= 10 {
         let _ = std::fs::write(&last_check_path, now_utc.to_rfc3339());
     }
+}
+
+/// Outcome of deciding that a schedule is due. `one_shot` means "auto-
+/// disable after firing"; `missed` means "the firing instant was before
+/// last_check — record as missed rather than injecting a stale message".
+struct FireDecision {
+    one_shot: bool,
+    missed: bool,
+}
+
+/// Classify a `Once` trigger against the current window.
+/// - `at` inside `(last_check, now]` → fire normally (`one_shot=true`).
+/// - `at` before `last_check` → missed (one_shot=true, missed=true).
+/// - `at` after `now` → not due yet.
+/// - `at` unparseable → warn and treat as not due; the schedule sticks
+///   around so the user can fix it via `update_schedule`.
+fn classify_once(
+    at: &str,
+    last_check_utc: chrono::DateTime<chrono::Utc>,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Option<FireDecision> {
+    let at_utc = match chrono::DateTime::parse_from_rfc3339(at) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(e) => {
+            tracing::warn!(run_at = %at, error = %e, "invalid one-shot run_at");
+            return None;
+        }
+    };
+    if at_utc > now_utc {
+        return None;
+    }
+    if at_utc <= last_check_utc {
+        return Some(FireDecision {
+            one_shot: true,
+            missed: true,
+        });
+    }
+    Some(FireDecision {
+        one_shot: true,
+        missed: false,
+    })
 }
 
 /// Return true if the cron `schedule` would fire at least once in the
@@ -285,5 +335,52 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 4, 19, 9, 0, 2).unwrap();
         // 09:00:00 already passed before `last`, next trigger tomorrow.
         assert!(!is_due_in_tz(&schedule, chrono_tz::UTC, last, now));
+    }
+
+    // --- One-shot classification ---
+
+    #[test]
+    fn once_fires_when_at_inside_window() {
+        let last = Utc.with_ymd_and_hms(2026, 4, 20, 14, 29, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 20, 14, 31, 0).unwrap();
+        let at = "2026-04-20T14:30:00+00:00";
+        let fire = classify_once(at, last, now).expect("fire");
+        assert!(fire.one_shot);
+        assert!(!fire.missed);
+    }
+
+    #[test]
+    fn once_missed_when_at_before_last_check() {
+        let last = Utc.with_ymd_and_hms(2026, 4, 20, 15, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 20, 15, 1, 0).unwrap();
+        let at = "2026-04-20T14:30:00+00:00";
+        let fire = classify_once(at, last, now).expect("fire");
+        assert!(fire.one_shot);
+        assert!(fire.missed);
+    }
+
+    #[test]
+    fn once_skipped_when_at_in_future() {
+        let last = Utc.with_ymd_and_hms(2026, 4, 20, 14, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 20, 14, 5, 0).unwrap();
+        let at = "2026-04-20T14:30:00+00:00";
+        assert!(classify_once(at, last, now).is_none());
+    }
+
+    #[test]
+    fn once_at_offset_zone_resolves_correctly() {
+        // run_at stored as +08:00; matching UTC instant is 8h earlier.
+        let last = Utc.with_ymd_and_hms(2026, 4, 20, 6, 29, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 20, 6, 31, 0).unwrap();
+        let at = "2026-04-20T14:30:00+08:00"; // = 06:30 UTC
+        let fire = classify_once(at, last, now).expect("fire");
+        assert!(!fire.missed);
+    }
+
+    #[test]
+    fn once_unparseable_at_does_not_fire() {
+        let last = Utc.with_ymd_and_hms(2026, 4, 20, 14, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 4, 20, 15, 0, 0).unwrap();
+        assert!(classify_once("not a date", last, now).is_none());
     }
 }
