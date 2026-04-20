@@ -40,6 +40,24 @@ fixtures:
     expected_final_state: usage_limit
     expected_final_detect: usage_limit
 
+  - file: codex-update.raw
+    backend: codex
+    cli_version: "0.120.0"
+    recorded_on: "2026-04-20"
+    scenario: "startup with Update available! menu, dismissed, then short prompt + response"
+    # Transitions: Starting → InteractivePrompt when Update menu renders.
+    # No further transitions observed in replay because hysteresis
+    # (InteractivePrompt is active-state, 2s min_hold) does not elapse
+    # during byte-level replay — each chunk is processed in microseconds.
+    # In production the hold always elapses between PTY reads, so
+    # dismissal drops back to Ready/Idle (unit test
+    # `pipeline_codex_update_menu_dismiss_returns_to_ready` covers that).
+    # Final detect() returns Idle because the menu text has scrolled off
+    # and the `› ` prompt glyph is visible on the final grid.
+    expected_transitions: [starting, interactive_prompt]
+    expected_final_state: interactive_prompt
+    expected_final_detect: idle
+
   - file: gemini-thinking.raw
     backend: gemini
     cli_version: "0.37.1"
