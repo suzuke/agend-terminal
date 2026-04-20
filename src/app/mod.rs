@@ -130,6 +130,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
     };
 
+    // Note: we deliberately do NOT install `bootstrap::signals::install` here.
+    // ratatui runs in raw mode, so Ctrl+C must reach the focused pane's PTY as
+    // a 0x03 byte. ctrlc::set_handler intercepts SIGINT/SIGTERM/SIGHUP as a
+    // bundle (no way to pick only SIGTERM) and would hijack that delivery.
+    // TODO(stage-3): install a SIGTERM-only handler via libc::sigaction so
+    // `agend-terminal stop` can cleanly shut down an Owned app process.
+
     // Per-agent AwaitingOperator supervisor: watches for stdout silence during
     // Starting (or recently-entered Ready — some backends like codex match
     // ready_pattern against the startup banner that precedes the update menu)

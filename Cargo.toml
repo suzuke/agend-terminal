@@ -46,7 +46,7 @@ regex = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

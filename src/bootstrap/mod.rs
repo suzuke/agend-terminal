@@ -15,6 +15,7 @@
 
 mod agent_resolve;
 mod fleet_normalize;
+pub mod signals;
 mod telegram_init;
 
 pub use agent_resolve::AgentDef;
