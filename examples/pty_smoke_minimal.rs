@@ -69,7 +69,11 @@ fn main() -> anyhow::Result<()> {
             .open(p)
         {
             use std::io::Write;
-            let _ = writeln!(f, "MINIMAL total_bytes={total} launched_at={:?}", std::time::SystemTime::now());
+            let _ = writeln!(
+                f,
+                "MINIMAL total_bytes={total} launched_at={:?}",
+                std::time::SystemTime::now()
+            );
         }
     }
     Ok(())

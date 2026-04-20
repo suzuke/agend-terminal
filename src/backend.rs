@@ -637,10 +637,7 @@ mod tests {
         // but failed when run locally through Git Bash.
         let unixish = cmd.starts_with('/');
         let winish = cmd.chars().nth(1) == Some(':') && cmd.chars().nth(2) == Some('\\');
-        assert!(
-            unixish || winish,
-            "unexpected shell path shape: {cmd:?}"
-        );
+        assert!(unixish || winish, "unexpected shell path shape: {cmd:?}");
     }
 
     #[test]
