@@ -286,43 +286,47 @@ pub(super) fn handle_key(
         },
         Overlay::ConfirmClose { target } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let is_tab = matches!(target, CloseTarget::Tab);
+                // Closing the last pane in a tab is a tab close — close_pane_by_id
+                // is a no-op on the final pane, so without this promotion Ctrl+B x
+                // would silently do nothing on a single-pane tab.
+                let is_tab = matches!(target, CloseTarget::Tab)
+                    || ctx
+                        .layout
+                        .active_tab()
+                        .is_some_and(|t| t.root().pane_count() <= 1);
                 *overlay = Overlay::None;
                 if is_tab {
-                    if ctx.layout.tabs.len() > 1 {
-                        let idx = ctx.layout.active;
-                        // Collect fleet names before closing tab
-                        let fleet_names: Vec<String> = ctx
-                            .layout
-                            .tabs
-                            .get(idx)
-                            .into_iter()
-                            .flat_map(|t| {
-                                t.root().pane_ids().into_iter().filter_map(|id| {
-                                    t.root()
-                                        .find_pane(id)
-                                        .and_then(|p| p.fleet_instance_name.clone())
-                                })
+                    let idx = ctx.layout.active;
+                    // Collect fleet names before closing tab
+                    let fleet_names: Vec<String> = ctx
+                        .layout
+                        .tabs
+                        .get(idx)
+                        .into_iter()
+                        .flat_map(|t| {
+                            t.root().pane_ids().into_iter().filter_map(|id| {
+                                t.root()
+                                    .find_pane(id)
+                                    .and_then(|p| p.fleet_instance_name.clone())
                             })
-                            .collect();
-                        for fname in &fleet_names {
-                            super::telegram_hooks::maybe_delete_telegram_topic(
-                                ctx.telegram_state,
-                                ctx.home,
-                                fname,
-                            );
-                        }
-                        if !fleet_names.is_empty() {
-                            let _ =
-                                crate::fleet::remove_instances_from_yaml(ctx.home, &fleet_names);
-                        }
-                        if let Some(tab) = ctx.layout.close_tab(idx) {
-                            for name in tab.root().agent_names() {
-                                super::kill_agent(ctx.registry, &name);
-                            }
-                        }
-                        outcome.needs_resize = true;
+                        })
+                        .collect();
+                    for fname in &fleet_names {
+                        super::telegram_hooks::maybe_delete_telegram_topic(
+                            ctx.telegram_state,
+                            ctx.home,
+                            fname,
+                        );
                     }
+                    if !fleet_names.is_empty() {
+                        let _ = crate::fleet::remove_instances_from_yaml(ctx.home, &fleet_names);
+                    }
+                    if let Some(tab) = ctx.layout.close_tab(idx) {
+                        for name in tab.root().agent_names() {
+                            super::kill_agent(ctx.registry, &name);
+                        }
+                    }
+                    outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
                     // Remove from fleet.yaml before closing pane
                     let fid = tab.focus_id;

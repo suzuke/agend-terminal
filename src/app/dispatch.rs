@@ -117,11 +117,9 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             });
         }
         Action::CloseTab => {
-            if ctx.layout.tabs.len() > 1 {
-                out.new_overlay = Some(Overlay::ConfirmClose {
-                    target: CloseTarget::Tab,
-                });
-            }
+            out.new_overlay = Some(Overlay::ConfirmClose {
+                target: CloseTarget::Tab,
+            });
         }
         Action::FocusUp => {
             if let Some(tab) = ctx.layout.active_tab_mut() {
