@@ -64,6 +64,7 @@ pub(super) fn handle_tui_event(
     registry: &AgentRegistry,
     wakeup_tx: &crossbeam::channel::Sender<usize>,
 ) {
+    tracing::info!(event = ?event, tabs = layout.tabs.len(), "handle_tui_event");
     match event {
         TuiEvent::InstanceCreated {
             name,
@@ -407,6 +408,7 @@ fn handle_team_members_changed(
 
 /// Remove ALL panes for the given agent from every tab. Cleans up empty tabs.
 pub(super) fn remove_agent_pane(name: &str, layout: &mut Layout) {
+    let mut removed = 0usize;
     loop {
         let target = layout.tabs.iter().enumerate().find_map(|(tab_idx, tab)| {
             tab.root()
@@ -417,10 +419,81 @@ pub(super) fn remove_agent_pane(name: &str, layout: &mut Layout) {
             Some(t) => t,
             None => break,
         };
-        if layout.tabs[tab_idx].root().pane_count() <= 1 {
+        let pane_count = layout.tabs[tab_idx].root().pane_count();
+        if pane_count <= 1 {
+            tracing::info!(
+                agent = name,
+                tab_idx,
+                pane_id,
+                "remove_agent_pane: closing tab (single pane)"
+            );
             layout.close_tab(tab_idx);
         } else {
+            tracing::info!(
+                agent = name,
+                tab_idx,
+                pane_id,
+                pane_count,
+                "remove_agent_pane: closing pane (multi pane)"
+            );
             layout.tabs[tab_idx].close_pane_by_id(pane_id);
         }
+        removed += 1;
+    }
+    if removed == 0 {
+        tracing::info!(
+            agent = name,
+            tabs = layout.tabs.len(),
+            "remove_agent_pane: no matching pane found"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::layout::{Pane, PaneSource, Tab};
+    use crate::vterm::VTerm;
+
+    fn leaf(id: usize, agent: &str) -> Pane {
+        Pane {
+            agent_name: agent.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam::channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    #[test]
+    fn remove_agent_pane_closes_single_pane_tab() {
+        // Reproduces the Telegram topic-close bug: a single-pane tab must be
+        // removed (not just its pane) when the agent is deleted, otherwise the
+        // tab persists pointing to a dead agent.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("opencode".into(), leaf(1, "opencode")));
+        layout.add_tab(Tab::new("kiro".into(), leaf(2, "kiro")));
+        assert_eq!(layout.tabs.len(), 2);
+
+        remove_agent_pane("opencode", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1, "single-pane tab should be removed");
+        assert_eq!(layout.tabs[0].name, "kiro");
+    }
+
+    #[test]
+    fn remove_agent_pane_noop_when_agent_missing() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("kiro".into(), leaf(1, "kiro")));
+        remove_agent_pane("ghost", &mut layout);
+        assert_eq!(layout.tabs.len(), 1);
     }
 }
