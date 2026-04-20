@@ -35,6 +35,14 @@ pub enum AgentState {
     Idle,
     ToolUse,
     Thinking,
+    /// Startup stalled on a backend-specific modal that blocks normal use
+    /// (e.g. codex `Update available!` menu). Distinct from
+    /// `PermissionPrompt` so operators can tell "CLI waiting for an OK on
+    /// an update menu" from "CLI asking whether to Allow a tool invocation".
+    /// Higher than `Thinking` because real work cannot progress until the
+    /// modal is dismissed; lower than `PermissionPrompt` because formal
+    /// authorization flows take precedence when both match.
+    InteractivePrompt,
     PermissionPrompt,
     ContextFull,
     RateLimit,
@@ -56,14 +64,15 @@ impl AgentState {
             Self::Idle => 4,
             Self::ToolUse => 5,
             Self::Thinking => 6,
-            Self::PermissionPrompt => 7,
-            Self::ContextFull => 8,
-            Self::RateLimit => 9,
-            Self::UsageLimit => 10,
-            Self::AuthError => 11,
-            Self::ApiError => 12,
-            Self::Crashed => 13,
-            Self::Restarting => 14,
+            Self::InteractivePrompt => 7,
+            Self::PermissionPrompt => 8,
+            Self::ContextFull => 9,
+            Self::RateLimit => 10,
+            Self::UsageLimit => 11,
+            Self::AuthError => 12,
+            Self::ApiError => 13,
+            Self::Crashed => 14,
+            Self::Restarting => 15,
         }
     }
 
@@ -86,6 +95,7 @@ impl AgentState {
             Self::Idle => "idle",
             Self::ToolUse => "tool_use",
             Self::Thinking => "thinking",
+            Self::InteractivePrompt => "interactive_prompt",
             Self::PermissionPrompt => "permission",
             Self::ContextFull => "context_full",
             Self::RateLimit => "rate_limit",
@@ -158,11 +168,21 @@ impl StatePatterns {
                     r"Too Many Requests|ThrottlingError|429",
                 ),
                 // [docs] Context overflow triggers compaction
-                (AgentState::ContextFull, r"context window overflow|/compact"),
+                // `/compact` was previously included but matches the slash-
+                // command autocomplete menu (kiro lists `/compact` alongside
+                // other commands when user types `/`), producing a false
+                // ContextFull on any `/` keypress. "compacting context"
+                // covers the actual in-progress compaction message.
+                (
+                    AgentState::ContextFull,
+                    r"context window overflow|compacting context",
+                ),
                 // [docs] Trust-based permission system
                 (AgentState::PermissionPrompt, r"Allow this action|y/n/t"),
-                // [docs] Processing indicator
-                (AgentState::Thinking, r"Generating"),
+                // [measured] Kiro prints the word "Thinking" during generation
+                // (captured live 2026-04-20, 23 occurrences in a short session).
+                // Earlier pattern "Generating" never matched real output.
+                (AgentState::Thinking, r"Thinking"),
                 // [docs] Tool names in output
                 (AgentState::ToolUse, r"execute_bash|fs_read|fs_write"),
                 // [measured] Idle prompt
@@ -188,6 +208,15 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Request approval|approve|deny",
                 ),
+                // [measured] Codex launches into an update-available modal
+                // when a newer version is published; the banner blocks the
+                // REPL until the operator presses Enter to dismiss or select.
+                // Previously this left the agent visibly at Ready (the banner
+                // text still matched "OpenAI Codex") while silently stalled.
+                (
+                    AgentState::InteractivePrompt,
+                    r"Update available!|Press enter to continue",
+                ),
                 // [estimated] Processing state
                 (AgentState::Thinking, r"Thinking"),
                 // [estimated] Patch tool
@@ -208,8 +237,11 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Permission required|Allow once|Allow always",
                 ),
-                // [docs] Busy text
-                (AgentState::Thinking, r"Working"),
+                // [measured] OpenCode draws `■⬝⬝⬝⬝⬝⬝⬝  esc interrupt` on
+                // its bottom status bar only while a request is in flight;
+                // the line disappears the moment streaming completes.
+                // Earlier pattern "Working" never matched real output.
+                (AgentState::Thinking, r"esc interrupt"),
                 // [measured] Update dialog that may block
                 (
                     AgentState::PermissionPrompt,
@@ -241,8 +273,13 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Allow once|Allow for this session|suggest changes",
                 ),
-                // [estimated] Processing indicator
-                (AgentState::Thinking, r"Thinking"),
+                // [measured] Gemini's spinner line ("⠦ Thinking... (esc to
+                // cancel, Ns)") only renders while a request is in flight and
+                // is overwritten in place when streaming completes. Matching
+                // the bare word "Thinking" previously latched the state and
+                // never released — chat history kept the token visible on
+                // screen and detect() kept returning Thinking forever.
+                (AgentState::Thinking, r"esc to cancel"),
                 // [estimated] MCP tool execution
                 (AgentState::ToolUse, r"tool.*call|MCP.*tool"),
                 // [measured] Input prompt text
@@ -604,7 +641,7 @@ mod tests {
     #[test]
     fn permission_prompt_higher_than_thinking() {
         let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Thinking, 0);
-        // PermissionPrompt (priority 6) > Thinking (priority 5) — instant
+        // PermissionPrompt (priority 8) > Thinking (priority 6) — instant
         t.feed("Allow once");
         assert_eq!(t.get_state(), AgentState::PermissionPrompt);
     }
@@ -804,6 +841,146 @@ mod tests {
             b"\r\n\x1b[31m429 rate limit exceeded\x1b[0m\r\n",
         );
         assert_eq!(st.get_state(), AgentState::RateLimit);
+    }
+
+    #[test]
+    fn pipeline_codex_update_menu_is_interactive_prompt() {
+        // Regression for BUG 2: codex launches with an "Update available!"
+        // modal overlaid on the usual ready banner. Without a dedicated
+        // pattern, the Ready pattern still matched the banner and the
+        // operator saw a "ready" pane that silently ignored input —
+        // really it was waiting on the modal.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        // Banner + modal rendered together on startup.
+        drive(
+            &mut vt,
+            &mut st,
+            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+    }
+
+    #[test]
+    fn pipeline_codex_update_menu_dismiss_returns_to_ready() {
+        // After the operator presses Enter, the modal text leaves the
+        // screen. Screen re-renders with just the ready banner → detect
+        // returns Ready, and after hysteresis the state drops from
+        // InteractivePrompt (prio 7) back to Ready (prio 3).
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        drive(
+            &mut vt,
+            &mut st,
+            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+        // Simulate passive-hold window elapsing so the downgrade can fire.
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        // Clear screen, banner alone re-renders.
+        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn pipeline_kiro_thinking_via_vterm() {
+        // Regression for BUG 3: kiro-cli prints the literal word "Thinking"
+        // during generation. The old pattern "Generating" never fired.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::KiroCli));
+        drive(&mut vt, &mut st, b"ask a question or describe a task\r\n");
+        assert_eq!(st.get_state(), AgentState::Idle);
+        drive(&mut vt, &mut st, b"Thinking...\r\n");
+        assert_eq!(st.get_state(), AgentState::Thinking);
+    }
+
+    #[test]
+    fn pipeline_kiro_slash_menu_does_not_trigger_context_full() {
+        // Regression: kiro's slash-command autocomplete renders `/compact`
+        // as one entry among many when the user types `/`. The old
+        // ContextFull pattern `|/compact` matched that menu text and
+        // wrongly reported the agent as ContextFull on every `/` keypress.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::KiroCli));
+        drive(&mut vt, &mut st, b"Trust All Tools active\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+        // User opens slash menu — `/compact` is listed alongside `/quit`.
+        drive(
+            &mut vt,
+            &mut st,
+            b"/quit    Quit the application\r\n/compact Compact context\r\n",
+        );
+        assert_ne!(
+            st.get_state(),
+            AgentState::ContextFull,
+            "slash-menu listing /compact must not trigger ContextFull"
+        );
+    }
+
+    #[test]
+    fn pipeline_opencode_thinking_via_vterm() {
+        // Regression for BUG 4: opencode never prints "Working". While a
+        // request is in flight it draws `■⬝⬝⬝⬝⬝⬝⬝  esc interrupt` on its
+        // bottom bar; that line disappears once streaming completes.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::OpenCode));
+        drive(
+            &mut vt,
+            &mut st,
+            b"\xe2\x96\xa0\xe2\xac\x9d\xe2\xac\x9d\xe2\xac\x9d\xe2\xac\x9d  esc interrupt   tab agents\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::Thinking);
+    }
+
+    #[test]
+    fn pipeline_gemini_thinking_via_vterm() {
+        // Regression for BUG 1: matching on the bare word "Thinking"
+        // latched the state permanently because chat history kept the
+        // token visible. "esc to cancel" lives only on the active spinner
+        // line and is overwritten when streaming completes.
+        let mut vt = VTerm::new(120, 24);
+        let mut st = StateTracker::new(Some(&Backend::Gemini));
+        drive(&mut vt, &mut st, b"Type your message or @path/to/file\r\n");
+        assert_eq!(st.get_state(), AgentState::Idle);
+        drive(
+            &mut vt,
+            &mut st,
+            b"\xe2\xa0\xa6 Thinking... (esc to cancel, 2s)\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::Thinking);
+    }
+
+    #[test]
+    fn pipeline_gemini_chat_history_does_not_latch_thinking() {
+        // Once the spinner line is gone, "Thinking" left behind in chat
+        // history (e.g. the model's narrative) must NOT keep detect() in
+        // Thinking. After hysteresis, screen should allow transition back
+        // to Idle on "Type your message" prompt re-appearing.
+        let mut vt = VTerm::new(120, 24);
+        let mut st = StateTracker::new(Some(&Backend::Gemini));
+        drive(
+            &mut vt,
+            &mut st,
+            b"\xe2\xa0\xa6 Thinking... (esc to cancel, 2s)\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::Thinking);
+        // Simulate hysteresis window closing — in production this is wall
+        // time between reads, here we backdate `since` so the passive-hold
+        // gate doesn't block the downgrade.
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        // Clear screen, redraw with "I was thinking about..." in chat
+        // history and a fresh prompt. "Thinking" alone would have latched;
+        // now only the spinner line matches — and it's gone.
+        drive(
+            &mut vt,
+            &mut st,
+            b"\x1b[2J\x1b[HI was thinking about your question. 2+2 = 4.\r\nType your message or @path/to/file\r\n",
+        );
+        assert_eq!(
+            st.get_state(),
+            AgentState::Idle,
+            "stale 'Thinking' word in chat history must not latch"
+        );
     }
 
     #[test]

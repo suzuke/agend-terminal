@@ -351,6 +351,7 @@ mod tests {
             AgentState::Idle,
             AgentState::Thinking,
             AgentState::ToolUse,
+            AgentState::InteractivePrompt,
             AgentState::PermissionPrompt,
             AgentState::Hang,
             AgentState::AwaitingOperator,
