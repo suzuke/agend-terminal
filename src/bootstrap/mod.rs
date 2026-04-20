@@ -262,6 +262,65 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// Regression: the Telegram-in-app bug was caused by `api::serve` reading
+    /// `api.cookie` from the run dir (src/api.rs:123) and aborting when the
+    /// file was missing. If bootstrap::prepare ever stopped issuing the cookie
+    /// before returning Owned, every `api::call` from `inbox::notify_agent`
+    /// would silently fail again. This test binds the invariant: after prepare
+    /// returns Owned, `auth_cookie::read_cookie` succeeds with the same bytes.
+    #[test]
+    fn owned_cookie_is_readable_for_api_serve() {
+        let home = tmp_home("api_cookie");
+        let fleet = write_minimal_fleet(&home);
+        let opts = PrepareOptions {
+            mutate_fleet_yaml: false,
+            init_telegram: false,
+            resolve_agents: false,
+        };
+        let outcome = prepare(&home, &fleet, opts).expect("prepare");
+        let BootstrapOutcome::Owned(o) = outcome else {
+            panic!("expected Owned");
+        };
+        // api::serve calls read_cookie and aborts on Err — this is the exact
+        // call path it would use. Must succeed with a 32-byte cookie.
+        let read = crate::auth_cookie::read_cookie(&o.run_dir).expect("read_cookie");
+        assert_eq!(read.len(), 32);
+        assert_eq!(read, o.cookie);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Refuse to silently attach to a daemon that has no `api.cookie`. The
+    /// alternative — treat cookie-less run dirs as Attached — would mean a
+    /// client could land in a state where it thinks a daemon is live but has
+    /// no way to authenticate against its API.
+    #[test]
+    fn attach_fails_when_cookie_missing() {
+        let home = tmp_home("no_cookie");
+        let fleet = write_minimal_fleet(&home);
+        let run = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&run).expect("mkdir run");
+        write_daemon_identity(&run);
+        // Deliberately DO NOT call auth_cookie::issue. find_active_run_dir
+        // will see the live-looking run dir, try_attach will then bail on
+        // read_cookie, and prepare returns Err.
+
+        let opts = PrepareOptions {
+            mutate_fleet_yaml: false,
+            init_telegram: false,
+            resolve_agents: false,
+        };
+        let err = match prepare(&home, &fleet, opts) {
+            Ok(_) => panic!("must not silently Attach or Own when cookie is missing"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("api.cookie"),
+            "error should mention api.cookie, got: {msg}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn prepare_attaches_when_run_dir_alive() {
         // Simulate a live daemon by creating a run dir with current PID + cookie.
