@@ -56,31 +56,29 @@ fn temp_home(tag: &str) -> PathBuf {
     dir
 }
 
-/// Drop guard that SIGKILLs the supervisor and wipes the home dir on
-/// teardown, so a failing assert doesn't leak processes or tmp files.
+/// Drop guard that SIGTERMs the supervisor (escalating to SIGKILL) and
+/// wipes the home dir, so a failing assert doesn't leak processes or tmp
+/// files.
 struct TestEnv {
     home: PathBuf,
-    supervisor: Option<Child>,
+    supervisor: Child,
 }
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        if let Some(mut child) = self.supervisor.take() {
-            unsafe {
-                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        unsafe {
+            libc::kill(self.supervisor.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if matches!(self.supervisor.try_wait(), Ok(Some(_))) {
+                break;
             }
-            // Brief wait; fall back to SIGKILL.
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < deadline {
-                if matches!(child.try_wait(), Ok(Some(_))) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if matches!(child.try_wait(), Ok(None)) {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if matches!(self.supervisor.try_wait(), Ok(None)) {
+            let _ = self.supervisor.kill();
+            let _ = self.supervisor.wait();
         }
         let _ = std::fs::remove_dir_all(&self.home);
     }
@@ -177,34 +175,42 @@ fn clear_ready_sentinels(home: &Path) {
     }
 }
 
-// --- tests -----------------------------------------------------------------
-
-#[test]
-fn supervisor_upgrade_success_path() {
-    let home = temp_home("success");
+/// Shared prologue: seed v1, spawn supervisor, wait until v1 booted, stage v2
+/// and swap the symlinks. Returns the env guard and both hashes.
+fn setup_upgrade_scenario(tag: &str) -> (TestEnv, String, String) {
+    let home = temp_home(tag);
     let v1_hash = seed_initial_install(&home);
 
     let env = TestEnv {
         home: home.clone(),
-        supervisor: Some(start_supervisor(&home)),
+        supervisor: start_supervisor(&home),
     };
 
     assert!(
-        wait_for_supervisor_ready(&home, Duration::from_secs(10)),
+        wait_for_supervisor_ready(&env.home, Duration::from_secs(10)),
         "supervisor didn't answer Ping within 10s"
     );
     assert!(
-        wait_until(|| count_ready_sentinels(&home) >= 1, Duration::from_secs(10)),
+        wait_until(
+            || count_ready_sentinels(&env.home) >= 1,
+            Duration::from_secs(10),
+        ),
         "v1 daemon never wrote a ready-sentinel"
     );
 
-    // Fabricate v2 + stage it.
-    let v2_path = make_v2_binary(&home);
-    let v2_hash = client::stage_binary(&home, &v2_path).expect("stage v2");
-    assert_ne!(v1_hash, v2_hash, "v1 and v2 must have distinct hashes");
+    let v2_path = make_v2_binary(&env.home);
+    let v2_hash = client::stage_binary(&env.home, &v2_path).expect("stage v2");
+    client::swap_current(&env.home, &v2_hash, &v1_hash).expect("swap symlinks");
 
-    // CLI's pre-upgrade steps: swap current → store/<v2>, prev → store/<v1>.
-    client::swap_current(&home, &v2_hash, &v1_hash).expect("swap symlinks");
+    (env, v1_hash, v2_hash)
+}
+
+// --- tests -----------------------------------------------------------------
+
+#[test]
+fn supervisor_upgrade_success_path() {
+    let (env, v1_hash, v2_hash) = setup_upgrade_scenario("success");
+    assert_ne!(v1_hash, v2_hash, "v1 and v2 must have distinct hashes");
 
     // Send the Upgrade request. Short stability window keeps the test fast;
     // it's still long enough to catch an immediate post-ready crash.
@@ -216,8 +222,8 @@ fn supervisor_upgrade_success_path() {
         stability_secs: 2,
         ready_timeout_secs: 10,
     };
-    clear_ready_sentinels(&home);
-    let resp = client::send_upgrade(&home, args, |stage, msg| {
+    clear_ready_sentinels(&env.home);
+    let resp = client::send_upgrade(&env.home, args, |stage, msg| {
         eprintln!("[test success] stage={stage:?} {msg}");
     })
     .expect("send_upgrade");
@@ -228,53 +234,28 @@ fn supervisor_upgrade_success_path() {
     }
 
     // current now points at v2; prev at v1.
-    let cur = std::fs::read_link(paths::current_link(&home)).expect("read current");
+    let cur = std::fs::read_link(paths::current_link(&env.home)).expect("read current");
     assert_eq!(cur, PathBuf::from("store").join(&v2_hash));
-    let prev = std::fs::read_link(paths::prev_link(&home)).expect("read prev");
+    let prev = std::fs::read_link(paths::prev_link(&env.home)).expect("read prev");
     assert_eq!(prev, PathBuf::from("store").join(&v1_hash));
 
     // v2 actually booted — at least one new ready-sentinel appeared.
     assert!(
-        count_ready_sentinels(&home) >= 1,
+        count_ready_sentinels(&env.home) >= 1,
         "v2 daemon never wrote a ready-sentinel after upgrade"
     );
-
-    // Explicit cleanup so the assertion order is obvious; drop guard would
-    // handle it anyway.
-    // TestEnv's Drop guard SIGTERMs the supervisor and wipes the home dir.
-    drop(env);
 }
 
 #[test]
 fn supervisor_upgrade_rolls_back_on_repeated_crash() {
-    let home = temp_home("rollback");
-    let v1_hash = seed_initial_install(&home);
-
-    let env = TestEnv {
-        home: home.clone(),
-        supervisor: Some(start_supervisor(&home)),
-    };
-
-    assert!(
-        wait_for_supervisor_ready(&home, Duration::from_secs(10)),
-        "supervisor didn't answer Ping within 10s"
-    );
-    assert!(
-        wait_until(|| count_ready_sentinels(&home) >= 1, Duration::from_secs(10)),
-        "v1 daemon never wrote a ready-sentinel"
-    );
-
-    // Stage v2, swap symlinks.
-    let v2_path = make_v2_binary(&home);
-    let v2_hash = client::stage_binary(&home, &v2_path).expect("stage v2");
-    client::swap_current(&home, &v2_hash, &v1_hash).expect("swap symlinks");
+    let (env, v1_hash, v2_hash) = setup_upgrade_scenario("rollback");
 
     // Arm the crash counter BEFORE sending Upgrade. The mock-daemon
     // decrements it once per boot; two boots = two post-ready crashes,
     // which is the stability window's failure threshold (>=2).
-    std::fs::write(home.join("mock-crashes-remaining"), "2")
+    std::fs::write(env.home.join("mock-crashes-remaining"), "2")
         .expect("write crash counter");
-    clear_ready_sentinels(&home);
+    clear_ready_sentinels(&env.home);
 
     let args = ipc::UpgradeArgs {
         new_hash: v2_hash.clone(),
@@ -284,7 +265,7 @@ fn supervisor_upgrade_rolls_back_on_repeated_crash() {
         stability_secs: 10,
         ready_timeout_secs: 10,
     };
-    let resp = client::send_upgrade(&home, args, |stage, msg| {
+    let resp = client::send_upgrade(&env.home, args, |stage, msg| {
         eprintln!("[test rollback] stage={stage:?} {msg}");
     })
     .expect("send_upgrade");
@@ -300,7 +281,7 @@ fn supervisor_upgrade_rolls_back_on_repeated_crash() {
     }
 
     // Supervisor should have repointed current → store/<v1>.
-    let cur = std::fs::read_link(paths::current_link(&home)).expect("read current");
+    let cur = std::fs::read_link(paths::current_link(&env.home)).expect("read current");
     assert_eq!(
         cur,
         PathBuf::from("store").join(&v1_hash),
@@ -310,26 +291,26 @@ fn supervisor_upgrade_rolls_back_on_repeated_crash() {
     // Upgrade marker must be deleted on rollback so a later unrelated
     // crash-respawn doesn't misreport as "daemon upgraded".
     assert!(
-        !paths::upgrade_marker(&home).exists(),
+        !paths::upgrade_marker(&env.home).exists(),
         "upgrade marker should be deleted after rollback"
     );
 
     // The respawned v1 daemon should eventually write a new ready sentinel.
     assert!(
-        wait_until(|| count_ready_sentinels(&home) >= 1, Duration::from_secs(10)),
+        wait_until(
+            || count_ready_sentinels(&env.home) >= 1,
+            Duration::from_secs(10),
+        ),
         "post-rollback v1 daemon never wrote a ready-sentinel"
     );
 
     // Crash counter was fully consumed by v2 — v1's post-rollback boot must
     // not have crashed on it.
-    let remaining = std::fs::read_to_string(home.join("mock-crashes-remaining"))
+    let remaining = std::fs::read_to_string(env.home.join("mock-crashes-remaining"))
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     assert_eq!(
         remaining, "0",
         "expected crash counter fully consumed; got {remaining:?}"
     );
-
-    // TestEnv's Drop guard SIGTERMs the supervisor and wipes the home dir.
-    drop(env);
 }
