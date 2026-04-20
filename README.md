@@ -114,6 +114,19 @@ No configuration needed. `.worktrees` auto-added to `.gitignore`.
 - Crash notifications via Telegram
 - 30-minute stability window prevents permanent failure from occasional crashes
 
+## Telegram Integration
+
+Each agent gets its own forum topic; messages route by topic. Topic lifecycle
+is bidirectional:
+
+- **Delete a pane in app → topic is deleted in Telegram** (immediate).
+- **Close topic in Telegram → pane is removed in app** (immediate, via the
+  `forum_topic_closed` service message).
+- **Delete topic in Telegram → pane is removed in app** (lazy, on the next
+  agent send to that topic). Telegram Bot API does not emit a deletion event,
+  so the cleanup fires the first time a send returns
+  `message thread not found`. Prefer Close if you want immediate cleanup.
+
 ## Backends
 
 | Backend | Command | Status |

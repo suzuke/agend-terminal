@@ -1282,7 +1282,10 @@ mod tests {
         st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
         drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
         assert_eq!(st.get_state(), AgentState::Ready);
-        assert!(!st.take_interactive_prompt_notice(), "no notice while Ready");
+        assert!(
+            !st.take_interactive_prompt_notice(),
+            "no notice while Ready"
+        );
 
         // Second modal appears.
         drive(
@@ -1651,11 +1654,7 @@ mod tests {
         // banner wording mid-stream when a pattern fails to match.
         let mut dump_offsets: Vec<usize> = std::env::var("REPLAY_DUMP_AT")
             .ok()
-            .map(|s| {
-                s.split(',')
-                    .filter_map(|x| x.trim().parse().ok())
-                    .collect()
-            })
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
             .unwrap_or_default();
         dump_offsets.sort_unstable();
         let mut dump_idx = 0;

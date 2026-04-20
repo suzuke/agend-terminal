@@ -216,25 +216,21 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     if msg.forum_topic_closed().is_some() {
         let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
         if let Some(tid) = thread_id {
-            let mut s = lock_state(state);
-            if let Some(instance_name) = s.topic_to_instance.remove(&tid) {
-                s.instance_to_topic.remove(&instance_name);
-                let home = s.home.clone();
-                drop(s);
-                tracing::info!(topic_id = tid, instance = %instance_name, "topic closed, deleting instance");
-                // Kill + remove via API
-                let _ = crate::api::call(
-                    &home,
-                    &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": instance_name}}),
-                );
-                // Remove from fleet.yaml
-                if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, &instance_name) {
-                    tracing::warn!(instance = %instance_name, error = %e, "failed to remove from fleet.yaml");
+            let instance_name = {
+                let s = lock_state(state);
+                s.topic_to_instance.get(&tid).cloned()
+            };
+            match instance_name {
+                Some(name) => {
+                    let home = lock_state(state).home.clone();
+                    tracing::info!(topic_id = tid, instance = %name, "topic closed, deleting instance");
+                    cleanup_deleted_topic(&home, &name, tid, Some(state));
                 }
-                return;
+                None => tracing::warn!(topic_id = tid, "topic closed (no matching instance)"),
             }
+            return;
         }
-        tracing::warn!("topic closed (no matching instance)");
+        tracing::warn!("topic closed (no thread_id)");
         return;
     }
 
@@ -332,6 +328,54 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     );
 }
 
+/// Classify a send error as "the bound topic was deleted out from under us".
+///
+/// Telegram Bot API lands this as `ApiError::Unknown("Bad Request: message
+/// thread not found")` — there is no typed variant in teloxide 0.10 and no
+/// `forum_topic_deleted` service message at the API level, so string match
+/// against the full error chain is the most robust option. Both conditions
+/// (error chain contains the phrase, case-insensitive) must hold to trigger
+/// cleanup, matching the wording Telegram has used since forum topics shipped
+/// in Bot API 6.3.
+pub(crate) fn is_topic_deleted_error(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_lowercase();
+    s.contains("message thread not found")
+}
+
+/// Cleanup path when a topic is known-deleted.
+///
+/// Invoked from two places: (1) the `forum_topic_closed` service-message
+/// handler (user used Close, not Delete — Telegram notifies us), and (2) the
+/// error path of any outbound send that hits "message thread not found" (user
+/// used Delete — Telegram never notifies us, the next send is our only signal).
+///
+/// `state` is optional because some send paths (`notify_telegram`,
+/// `try_telegram_reply`) resolve topic_id from fleet.yaml without ever holding
+/// the in-memory state. Those paths still get the instance killed and fleet
+/// entry removed; the in-memory maps are cleaned on the next send via the
+/// state-aware paths (or at process restart).
+pub(crate) fn cleanup_deleted_topic(
+    home: &Path,
+    instance_name: &str,
+    tid: i32,
+    state: Option<&Arc<Mutex<TelegramState>>>,
+) {
+    if let Some(state) = state {
+        let mut s = lock_state(state);
+        s.topic_to_instance.remove(&tid);
+        s.instance_to_topic.remove(instance_name);
+        s.submit_keys.remove(instance_name);
+    }
+    // Kill + remove via API — emits TuiEvent::InstanceDeleted in owned app mode.
+    let _ = crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": instance_name}}),
+    );
+    if let Err(e) = crate::fleet::remove_instance_from_yaml(home, instance_name) {
+        tracing::warn!(instance = %instance_name, error = %e, "failed to remove from fleet.yaml");
+    }
+}
+
 /// Query the daemon for the current `agent_state` of one instance.
 /// Returns true when the daemon reports a state that expects raw keyboard
 /// input rather than inbox-wrapped prose: `awaiting_operator` (startup stall)
@@ -375,13 +419,27 @@ pub fn send_reply(
     text: &str,
 ) -> anyhow::Result<()> {
     let s = lock_state(state);
-    let (bot, group_id, topic_id) = (
+    let (bot, group_id, topic_id, home) = (
         s.bot.clone(),
         s.group_id,
         s.instance_to_topic.get(instance_name).copied(),
+        s.home.clone(),
     );
     drop(s);
-    telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text))
+    let res = telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text));
+    if let Err(e) = &res {
+        if is_topic_deleted_error(e) {
+            if let Some(tid) = topic_id {
+                tracing::info!(
+                    instance = %instance_name,
+                    topic_id = tid,
+                    "send_reply hit topic_deleted — cleaning up"
+                );
+                cleanup_deleted_topic(&home, instance_name, tid, Some(state));
+            }
+        }
+    }
+    res
 }
 
 /// Initialize Telegram from fleet config.
@@ -496,15 +554,28 @@ impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
 
     fn send_reply(&self, instance_name: &str, text: &str) -> crate::channel::SendResult {
         let s = lock_state(self);
-        let (bot, group_id, topic_id) = (
+        let (bot, group_id, topic_id, home) = (
             s.bot.clone(),
             s.group_id,
             s.instance_to_topic.get(instance_name).copied(),
+            s.home.clone(),
         );
         drop(s);
         match telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text)) {
             Ok(()) => crate::channel::SendResult::Sent,
-            Err(e) => crate::channel::SendResult::Failed(format!("{e}")),
+            Err(e) => {
+                if is_topic_deleted_error(&e) {
+                    if let Some(tid) = topic_id {
+                        tracing::info!(
+                            instance = %instance_name,
+                            topic_id = tid,
+                            "adapter send_reply hit topic_deleted — cleaning up"
+                        );
+                        cleanup_deleted_topic(&home, instance_name, tid, Some(self));
+                    }
+                }
+                crate::channel::SendResult::Failed(format!("{e}"))
+            }
         }
     }
 
@@ -609,7 +680,7 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
         .instances
         .get(instance_name)
         .and_then(|inst| inst.topic_id);
-    let msg_id = telegram_runtime().block_on(async {
+    let result = telegram_runtime().block_on(async {
         let bot = teloxide::Bot::new(&ch.token);
         let chat_id = teloxide::types::ChatId(ch.group_id);
         let sent = match topic_id {
@@ -626,8 +697,24 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
             }
         };
         Ok::<i32, anyhow::Error>(sent.id.0)
-    })?;
-    Ok((msg_id, ch.group_id))
+    });
+    match result {
+        Ok(msg_id) => Ok((msg_id, ch.group_id)),
+        Err(e) => {
+            if is_topic_deleted_error(&e) {
+                if let Some(tid) = topic_id {
+                    let home = crate::home_dir();
+                    tracing::info!(
+                        instance = %instance_name,
+                        topic_id = tid,
+                        "try_telegram_reply hit topic_deleted — cleaning up"
+                    );
+                    cleanup_deleted_topic(&home, instance_name, tid, None);
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// React to a message with an emoji.
@@ -1072,5 +1159,86 @@ instances:
         // agent without agent_state field → false
         let r3 = serde_json::json!({"result": {"agents": [{"name": "x"}]}});
         assert!(!list_response_wants_raw_keystrokes(&r3, "x"));
+    }
+
+    #[test]
+    fn is_topic_deleted_error_matches_thread_not_found() {
+        // Exact wording returned by Telegram Bot API when the thread was deleted.
+        let e = anyhow::anyhow!("Bad Request: message thread not found");
+        assert!(is_topic_deleted_error(&e));
+    }
+
+    #[test]
+    fn is_topic_deleted_error_case_insensitive() {
+        let e = anyhow::anyhow!("BAD REQUEST: MESSAGE THREAD NOT FOUND");
+        assert!(is_topic_deleted_error(&e));
+    }
+
+    #[test]
+    fn is_topic_deleted_error_matches_wrapped_context() {
+        // Errors often get `.context(...)` wrapped; Alternate debug formatter
+        // (`{:#}`) flattens the chain into a single string we can inspect.
+        let inner = anyhow::anyhow!("Bad Request: message thread not found");
+        let wrapped = inner.context("sending to topic 42");
+        assert!(is_topic_deleted_error(&wrapped));
+    }
+
+    #[test]
+    fn is_topic_deleted_error_rejects_unrelated() {
+        // Common transient / auth errors must NOT trigger cleanup.
+        for msg in [
+            "network timeout",
+            "Bad Request: chat not found",
+            "Forbidden: bot was blocked by the user",
+            "Too Many Requests: retry after 5",
+            "Bad Request: message to edit not found",
+        ] {
+            let e = anyhow::anyhow!(msg.to_string());
+            assert!(
+                !is_topic_deleted_error(&e),
+                "classifier must not match: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_deleted_topic_clears_state_maps() {
+        // State-aware cleanup path: topic_to_instance / instance_to_topic /
+        // submit_keys entries must all be purged atomically. api::call and
+        // fleet.yaml removal fail silently when there's no daemon/file — that
+        // matches the production contract (we log and move on).
+        use std::sync::{Arc, Mutex};
+        let home = tmp_home("cleanup-state");
+        let mut topic_map = HashMap::new();
+        topic_map.insert("agent1".to_string(), 42);
+        topic_map.insert("agent2".to_string(), 43);
+        let mut submit_keys = HashMap::new();
+        submit_keys.insert("agent1".to_string(), "\r".to_string());
+        let state = Arc::new(Mutex::new(TelegramState::new(
+            "tok",
+            -1,
+            topic_map,
+            home.clone(),
+            submit_keys,
+            None,
+        )));
+
+        cleanup_deleted_topic(&home, "agent1", 42, Some(&state));
+
+        let s = state.lock().expect("lock");
+        assert!(!s.topic_to_instance.contains_key(&42));
+        assert!(!s.instance_to_topic.contains_key("agent1"));
+        assert!(!s.submit_keys.contains_key("agent1"));
+        // agent2 untouched.
+        assert_eq!(s.topic_to_instance.get(&43), Some(&"agent2".to_string()));
+        assert_eq!(s.instance_to_topic.get("agent2"), Some(&43));
+    }
+
+    #[test]
+    fn cleanup_deleted_topic_without_state_is_noop_on_maps() {
+        // No-state path (try_telegram_reply / notify_telegram) relies on
+        // api::call + fleet.yaml cleanup; must not panic when state is None.
+        let home = tmp_home("cleanup-nostate");
+        cleanup_deleted_topic(&home, "ghost", 99, None);
     }
 }
