@@ -1,10 +1,9 @@
 //! Bootstrap seam shared by `start` (daemon) and `app` (TUI) entry points.
 //!
-//! Prior to this module, `cli::start_with_fleet` and `app::run` each did their
-//! own preflight — create run dir, write `.daemon`, issue api.cookie, normalize
-//! fleet.yaml, init telegram — with subtle divergences that caused the
-//! `api.cookie missing; aborting serve` regression in app mode. This module
-//! centralizes every pre-spawn concern behind one call: [`prepare`].
+//! Centralizes every pre-spawn concern behind one call: [`prepare`]. Both
+//! daemon and app callers go through the same preflight (run dir, `.daemon`,
+//! `api.cookie`, fleet load/normalize, telegram init) so their run-time state
+//! cannot diverge.
 //!
 //! Outcome:
 //! - [`BootstrapOutcome::Owned`]: this process is the daemon. Holds the
@@ -132,7 +131,7 @@ pub fn prepare(
     let run_dir = crate::daemon::run_dir(home);
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("create run dir {}", run_dir.display()))?;
-    write_daemon_identity(&run_dir);
+    crate::daemon::write_daemon_id(&run_dir);
 
     let cookie = crate::auth_cookie::issue(&run_dir).context("issue api.cookie")?;
 
@@ -175,7 +174,7 @@ fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
             run_dir.display()
         )
     })?;
-    let daemon_pid = read_daemon_pid(&run_dir).unwrap_or(0);
+    let daemon_pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(0);
     Ok(Some(AttachedFleet {
         home: home.to_path_buf(),
         fleet_path: fleet_path.to_path_buf(),
@@ -193,23 +192,6 @@ fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
     file.try_lock_exclusive()
         .map_err(|e| anyhow!("another agend-terminal daemon is already running (lock held): {e}"))?;
     Ok(DaemonLock { _file: file })
-}
-
-fn write_daemon_identity(run_dir: &Path) {
-    let pid = std::process::id();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = std::fs::write(run_dir.join(".daemon"), format!("{pid}:{now}"));
-}
-
-fn read_daemon_pid(run_dir: &Path) -> Option<u32> {
-    let content = std::fs::read_to_string(run_dir.join(".daemon")).ok()?;
-    content
-        .trim()
-        .split_once(':')
-        .and_then(|(pid, _)| pid.parse().ok())
 }
 
 #[cfg(test)]
@@ -300,7 +282,7 @@ mod tests {
         let fleet = write_minimal_fleet(&home);
         let run = crate::daemon::run_dir(&home);
         std::fs::create_dir_all(&run).expect("mkdir run");
-        write_daemon_identity(&run);
+        crate::daemon::write_daemon_id(&run);
         // Deliberately DO NOT call auth_cookie::issue. find_active_run_dir
         // will see the live-looking run dir, try_attach will then bail on
         // read_cookie, and prepare returns Err.
@@ -329,7 +311,7 @@ mod tests {
         let fleet = write_minimal_fleet(&home);
         let run = crate::daemon::run_dir(&home);
         std::fs::create_dir_all(&run).expect("mkdir run");
-        write_daemon_identity(&run);
+        crate::daemon::write_daemon_id(&run);
         let _ = crate::auth_cookie::issue(&run).expect("issue cookie for fake daemon");
 
         let opts = PrepareOptions {

@@ -81,7 +81,7 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if let Some(run_dir) = crate::daemon::find_active_run_dir(home) {
-            let daemon_pid = read_daemon_pid(&run_dir).unwrap_or(spawn_pid);
+            let daemon_pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(spawn_pid);
             return Ok(DaemonHandle {
                 pid: daemon_pid,
                 run_dir,
@@ -104,12 +104,4 @@ pub struct DaemonHandle {
     pub pid: u32,
     pub run_dir: PathBuf,
     pub log_path: PathBuf,
-}
-
-fn read_daemon_pid(run_dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(run_dir.join(".daemon"))
-        .ok()?
-        .trim()
-        .split_once(':')
-        .and_then(|(pid, _)| pid.parse().ok())
 }

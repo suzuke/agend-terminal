@@ -74,13 +74,23 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
 }
 
 /// Write daemon identity file for PID reuse detection.
-fn write_daemon_id(run_dir: &Path) {
+pub(crate) fn write_daemon_id(run_dir: &Path) {
     let pid = std::process::id();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let _ = std::fs::write(run_dir.join(".daemon"), format!("{pid}:{now}"));
+}
+
+/// Read the PID recorded in `{run_dir}/.daemon`. Returns `None` if the file is
+/// missing or malformed — callers should treat that as "unknown PID".
+pub(crate) fn read_daemon_pid(run_dir: &Path) -> Option<u32> {
+    std::fs::read_to_string(run_dir.join(".daemon"))
+        .ok()?
+        .trim()
+        .split_once(':')
+        .and_then(|(pid, _)| pid.parse().ok())
 }
 
 /// Agent definition tuple for daemon startup.
@@ -146,11 +156,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 /// telegram init) since bootstrap already performed those. The `OwnedFleet`
 /// is held for the full call so the flock guard, cookie bytes, and Telegram
 /// state stay alive for the daemon's lifetime.
-pub fn run_with_prepared(prepared: Box<crate::bootstrap::OwnedFleet>) -> anyhow::Result<()> {
-    let home = prepared.home.clone();
-    let agents = prepared.agents.clone();
+pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> anyhow::Result<()> {
     tracing::info!(path = %prepared.run_dir.display(), "run dir");
-    // `_owned` keeps lock / cookie / telegram / config alive until return.
+    // Move the agent vec out without cloning (~N×String+Vec+HashMap). `home`
+    // is a short PathBuf — cheap to clone. Keep `prepared` alive through the
+    // scope so flock / cookie / telegram / config persist for the full run.
+    let home = prepared.home.clone();
+    let agents = std::mem::take(&mut prepared.agents);
     let _owned = prepared;
     run_core(&home, agents)
 }

@@ -1,21 +1,16 @@
 //! Per-instance spawn preparation: take a normalized [`FleetConfig`] and walk
-//! each instance, producing a spawn-ready [`AgentDef`].
-//!
-//! Responsibilities mirror the old `cli::start_with_fleet` inline block:
-//! - Ensure working directory exists.
-//! - Create a git worktree when `working_directory` is inside a git repo.
-//! - Generate instruction files + MCP config under the working dir.
-//! - Append resume mode args, `--model`, and Claude-specific
-//!   `--mcp-config` / `--settings` flags when their files are present.
+//! each instance, producing a spawn-ready [`AgentDef`]. For each instance we
+//! ensure the working directory, create a git worktree when applicable,
+//! generate instruction + MCP config files, and append resume / model /
+//! Claude-specific flags when their files are present.
 
 use crate::backend;
 use crate::fleet::FleetConfig;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Agent spawn tuple consumed by `daemon::run_with_prepared` (and, eventually,
-/// `app`'s owned mode). Matches the existing `daemon::AgentDef` shape so the
-/// migration is a pure move, not a reshape.
+/// Agent spawn tuple consumed by `daemon::run_with_prepared`. Matches the
+/// shape of `daemon::AgentDef`.
 pub type AgentDef = (
     String,
     String,

@@ -53,25 +53,11 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 
     let fleet_path = fleet_path_override.map(PathBuf::from);
 
-    // Pre-TUI check: if another daemon is running, we can't safely own the
-    // fleet (our pane_factory would spawn local PTYs that compete with the
-    // daemon's agents). Fail before ratatui grabs the terminal so the error
-    // message is visible. Users who want to interact with a running daemon's
-    // agent should use `agend-terminal attach <name>`.
-    //
-    // This is the Stage 3.4 compromise: without a Pane::Remote source, the
-    // app TUI can only be meaningful as the Owned daemon. Full attach-mode
-    // with remote panes requires the bridge_client extraction tracked in
-    // docs/PLAN-daemon-resident.md (Stage 3.1/3.2/3.6).
+    // Pre-TUI check: app cannot safely coexist with a running daemon because
+    // pane_factory spawns local PTYs that would compete with the daemon's
+    // agents. Fail before ratatui grabs the terminal so the error is visible.
     if let Some(run_dir) = crate::daemon::find_active_run_dir(&home) {
-        let pid = std::fs::read_to_string(run_dir.join(".daemon"))
-            .ok()
-            .and_then(|s| {
-                s.trim()
-                    .split_once(':')
-                    .and_then(|(p, _)| p.parse::<u32>().ok())
-            })
-            .unwrap_or(0);
+        let pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(0);
         anyhow::bail!(
             "another agend-terminal daemon is already running (pid {pid}, run_dir {})\n\
              use `agend-terminal attach <agent>` to connect to one of its agents,\n\
@@ -109,13 +95,10 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let (tui_event_tx, tui_event_rx) = crossbeam::channel::bounded::<TuiEvent>(256);
 
-    // Preflight via the shared bootstrap seam. Owned → we're the daemon:
-    // bootstrap issued `api.cookie` before we start `api::serve`, so
-    // `inbox::notify_agent`'s `api::call(INJECT, ...)` from Telegram's message
-    // router actually reaches the server. Attached → another daemon owns the
-    // run dir; we skip spinning up our own API server and avoid touching its
-    // files. Err → proceed with TUI but no in-process API (rare — load/flock
-    // failure — TUI remains usable for local panes).
+    // Preflight via the shared bootstrap seam so `api.cookie` is issued before
+    // `api::serve` starts — otherwise `inbox::notify_agent`'s `api::call(INJECT)`
+    // from Telegram's router would silently fail. The Attached arm defends
+    // against a daemon racing in after the pre-TUI check.
     let opts = crate::bootstrap::PrepareOptions {
         resolve_agents: false, // app spawns via pane_factory from tabs
         ..Default::default()
@@ -157,12 +140,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
     };
 
-    // Note: we deliberately do NOT install `bootstrap::signals::install` here.
-    // ratatui runs in raw mode, so Ctrl+C must reach the focused pane's PTY as
-    // a 0x03 byte. ctrlc::set_handler intercepts SIGINT/SIGTERM/SIGHUP as a
-    // bundle (no way to pick only SIGTERM) and would hijack that delivery.
-    // TODO(stage-3): install a SIGTERM-only handler via libc::sigaction so
-    // `agend-terminal stop` can cleanly shut down an Owned app process.
+    // No ctrlc handler here: ratatui is in raw mode so Ctrl+C must reach the
+    // focused pane's PTY as a 0x03 byte, and ctrlc::set_handler intercepts
+    // SIGINT/SIGTERM/SIGHUP as a bundle with no way to pick only SIGTERM.
 
     // Per-agent AwaitingOperator supervisor: watches for stdout silence during
     // Starting (or recently-entered Ready — some backends like codex match
