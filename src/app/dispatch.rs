@@ -112,9 +112,18 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             }
         }
         Action::ClosePane => {
-            out.new_overlay = Some(Overlay::ConfirmClose {
-                target: CloseTarget::Pane,
-            });
+            // A single-pane tab has nothing to pane-close — promote to tab close
+            // so the confirm prompt accurately warns about killing the agent.
+            let target = if ctx
+                .layout
+                .active_tab()
+                .is_some_and(|t| t.root().pane_count() <= 1)
+            {
+                CloseTarget::Tab
+            } else {
+                CloseTarget::Pane
+            };
+            out.new_overlay = Some(Overlay::ConfirmClose { target });
         }
         Action::CloseTab => {
             out.new_overlay = Some(Overlay::ConfirmClose {
