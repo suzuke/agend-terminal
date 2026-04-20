@@ -321,6 +321,33 @@ impl StatePatterns {
     }
 }
 
+/// Cheap structural test for a generic startup-time interactive prompt.
+///
+/// Only called while the agent is still in `Starting` state, so false
+/// positives during Thinking/Ready (where model output might legitimately
+/// contain strings like `(y/n)` as examples) are avoided by the caller
+/// gating on state. The token set is restricted to glyph sequences that
+/// effectively never appear outside of a real TUI prompt — broad catches
+/// like a trailing `?` or `:` are intentionally excluded because they fire
+/// on ordinary prose.
+///
+/// Complements `check_awaiting_operator` silence detection:
+/// - When the prompt text is recognized structurally we transition to
+///   `InteractivePrompt` immediately (no waiting on a silence window).
+/// - Unknown prompts that happen not to use any of these tokens still fall
+///   through to the silence fallback in `daemon::supervisor`.
+fn is_generic_startup_prompt(text: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // Case-insensitive so `(Y/n)` etc. hit the same token set.
+        Regex::new(
+            r"(?i)\(y/n\)|\(yes/no\)|\[y/n\]|press\s+(enter|return|any\s+key)",
+        )
+        .expect("generic startup prompt regex compiles")
+    });
+    re.is_match(text)
+}
+
 /// Tracks state with hysteresis.
 pub struct StateTracker {
     pub current: AgentState,
@@ -383,7 +410,22 @@ impl StateTracker {
         if let Some(ref patterns) = self.patterns {
             match patterns.detect(screen_text) {
                 Some(detected) => self.transition(detected),
-                None => self.maybe_expire_latched_state(),
+                None => {
+                    // Starting-only structural fallback: if the pattern
+                    // catalog didn't recognize anything but the screen
+                    // contains a generic prompt token (y/n, press enter,
+                    // etc.), this is almost certainly a startup-time
+                    // dialog waiting for the operator. Flag it as
+                    // InteractivePrompt immediately instead of waiting
+                    // on `check_awaiting_operator`'s silence window.
+                    if matches!(self.current, AgentState::Starting)
+                        && is_generic_startup_prompt(screen_text)
+                    {
+                        self.transition(AgentState::InteractivePrompt);
+                    } else {
+                        self.maybe_expire_latched_state();
+                    }
+                }
             }
         }
     }
@@ -643,6 +685,64 @@ mod tests {
         t.feed("arbitrary text without any markers");
         assert_eq!(t.get_state(), AgentState::Ready);
         assert_eq!(t.since, since_before);
+    }
+
+    // ── Phase 1d: structural startup prompt detection ──────────────────
+
+    #[test]
+    fn generic_startup_prompt_matches_yes_no() {
+        assert!(is_generic_startup_prompt("Trust this workspace? (y/n)"));
+        assert!(is_generic_startup_prompt("Continue? (Y/n)"));
+        assert!(is_generic_startup_prompt("Accept? (yes/no)"));
+        assert!(is_generic_startup_prompt("Overwrite [y/N]?"));
+        assert!(is_generic_startup_prompt("Use default [Y/n]"));
+    }
+
+    #[test]
+    fn generic_startup_prompt_matches_press_enter() {
+        assert!(is_generic_startup_prompt("Press enter to continue"));
+        assert!(is_generic_startup_prompt("PRESS ENTER to dismiss"));
+        assert!(is_generic_startup_prompt("Press Return when ready"));
+        assert!(is_generic_startup_prompt("press any key to exit"));
+    }
+
+    #[test]
+    fn generic_startup_prompt_rejects_ordinary_prose() {
+        // Question marks and colons alone must not trigger — AI model
+        // output is full of these.
+        assert!(!is_generic_startup_prompt("Should I continue with the refactor?"));
+        assert!(!is_generic_startup_prompt("Next steps:"));
+        assert!(!is_generic_startup_prompt("Select: option A vs option B"));
+        assert!(!is_generic_startup_prompt("Type your message"));
+        assert!(!is_generic_startup_prompt(""));
+    }
+
+    #[test]
+    fn starting_transitions_to_interactive_prompt_on_generic_token() {
+        // Starting + pattern-None + generic prompt → InteractivePrompt,
+        // no silence waiting required.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+        t.feed("Trust this workspace? (y/n)");
+        assert_eq!(t.get_state(), AgentState::InteractivePrompt);
+    }
+
+    #[test]
+    fn non_starting_ignores_generic_prompt_token() {
+        // Ready + a model output containing `(y/n)` must not flip state —
+        // false positives here were the reason we scope generic detection
+        // to Starting.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Ready, 0);
+        t.feed("Here's an example: `git clean -n (y/n)` — the -n flag previews");
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn starting_without_generic_prompt_stays_starting() {
+        // Starting + no recognized pattern + no generic token → still
+        // Starting; silence fallback in supervisor handles this.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Starting, 0);
+        t.feed("loading configuration...");
+        assert_eq!(t.get_state(), AgentState::Starting);
     }
 
     #[test]
