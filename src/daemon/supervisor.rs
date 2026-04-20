@@ -63,36 +63,29 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
             let silent = core.state.last_output.elapsed();
             if core.health.check_awaiting_operator(agent_state, silent) {
                 core.state.set_awaiting_operator();
-                let tail = core.vterm.tail_lines(TAIL_LINES);
                 tracing::info!(
                     agent = %name,
                     silent_secs = silent.as_secs(),
                     prev_state = agent_state.display_name(),
                     "awaiting operator (stalled on interactive prompt)"
                 );
-                Some(format!(
-                    "⚠️ {name} 靜默 {silent_secs}s，可能卡在互動 prompt\n\
-                     ────────\n\
-                     {tail}\n\
-                     ────────\n\
-                     💬 回覆將以原始鍵盤輸入寫入 agent stdin",
-                    silent_secs = silent.as_secs(),
+                Some(format_stall_notice(
+                    &name,
+                    &core.vterm.tail_lines(TAIL_LINES),
+                    Some(silent.as_secs()),
                 ))
             } else if core.state.take_interactive_prompt_notice() {
                 // Pattern-based InteractivePrompt fires immediately on state
                 // entry (no silence window), so the notice also goes out on
                 // the first tick after entry rather than waiting for quiet.
-                let tail = core.vterm.tail_lines(TAIL_LINES);
                 tracing::info!(
                     agent = %name,
                     "interactive prompt detected — forwarding to telegram"
                 );
-                Some(format!(
-                    "⚠️ {name} 卡在互動 prompt\n\
-                     ────────\n\
-                     {tail}\n\
-                     ────────\n\
-                     💬 回覆將以原始鍵盤輸入寫入 agent stdin",
+                Some(format_stall_notice(
+                    &name,
+                    &core.vterm.tail_lines(TAIL_LINES),
+                    None,
                 ))
             } else {
                 None
@@ -103,4 +96,22 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
             notify_telegram(home, &name, &msg);
         }
     }
+}
+
+/// Build the Telegram notice shown when an agent is blocked on an interactive
+/// prompt. `silent_secs = Some` for the AwaitingOperator time-based fallback
+/// (reports how long the agent has been quiet); `None` for pattern-matched
+/// InteractivePrompt (no silence window).
+fn format_stall_notice(name: &str, tail: &str, silent_secs: Option<u64>) -> String {
+    let header = match silent_secs {
+        Some(s) => format!("⚠️ {name} 靜默 {s}s，可能卡在互動 prompt"),
+        None => format!("⚠️ {name} 卡在互動 prompt"),
+    };
+    format!(
+        "{header}\n\
+         ────────\n\
+         {tail}\n\
+         ────────\n\
+         💬 回覆將以原始鍵盤輸入寫入 agent stdin"
+    )
 }
