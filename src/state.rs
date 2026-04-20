@@ -140,10 +140,13 @@ impl StatePatterns {
                 ),
                 // [estimated] Ink render during processing
                 (AgentState::Thinking, r"Thinking"),
-                // [estimated] Tool name with spinner/status icon prefix
+                // [measured] Completion glyph `⏺` (U+23FA RECORD) prefixes
+                // tool-name banners like `⏺ Write(...)` in 2.1.98. Previously
+                // only `●` (U+25CF) was in the class, so `⏺ Write(...)` lines
+                // never matched — see docs/FOLLOWUP-tooluse-pattern-gaps.md.
                 (
                     AgentState::ToolUse,
-                    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●].*(Read|Bash|Edit|Write|Grep|Glob)",
+                    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●⏺].*(Read|Bash|Edit|Write|Grep|Glob)",
                 ),
                 // [measured] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
@@ -788,6 +791,18 @@ mod tests {
     fn claude_tooluse_spinner_match() {
         let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
         let detected = patterns.detect("⠋Read file.txt");
+        assert_eq!(detected, Some(AgentState::ToolUse));
+    }
+
+    #[test]
+    fn claude_tooluse_record_glyph_match() {
+        // Claude 2.1.98 prefixes completed-tool banners with `⏺` (U+23FA,
+        // RECORD) — distinct from `●` (U+25CF). Real-PTY recording
+        // claude-perm.raw exhibits `⏺ Write(/tmp/...)` after the user
+        // denies a write; both glyph and verb must be in the pattern for
+        // the state to fire.
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let detected = patterns.detect("⏺ Write(/tmp/claude-perm-test.txt)");
         assert_eq!(detected, Some(AgentState::ToolUse));
     }
 
