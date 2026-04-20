@@ -89,7 +89,8 @@ Create one or more agent instances.
 - `args` (string), `model` (string), `working_directory` (string)
 - `branch` (string) — if set, a git worktree is created.
 - `task` (string) — initial task injected after spawn.
-- `layout` (string enum: `tab` | `split-right` | `split-below`) — TUI placement relative to caller.
+- `layout` (string enum: `tab` | `split-right` | `split-below`) — TUI placement. Relative to `target_pane` if set, otherwise relative to the caller's focused pane.
+- `target_pane` (string) — name of an existing instance. With `layout=split-right` or `split-below`, the new pane is attached next to that instance's pane in whichever tab currently hosts it. Precedence: `target_pane` → caller's tab → new tab (silent fallback when the target isn't displayed).
 - `team` (string) + one of:
   - `count` (integer) — homogeneous team: spawn `<team>-1`..`<team>-N` all on `backend`.
   - `backends` (array<string>) — heterogeneous team: member *i* uses `backends[i]` (e.g. `backends: ["codex", "kiro-cli", "gemini"]`). Length dictates member count; `count` is ignored when `backends` is set.

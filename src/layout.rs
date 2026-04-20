@@ -954,8 +954,16 @@ impl Tab {
     }
 
     pub fn split_focused(&mut self, dir: SplitDir, new_pane: Pane) -> bool {
+        self.split_at_pane(self.focus_id, dir, new_pane)
+    }
+
+    /// Split the pane with `target_id` in `dir`, attaching `new_pane` as the
+    /// second child. Returns `true` if the target was found and split; `false`
+    /// if the target was absent (the tree is left unchanged and `new_pane` is
+    /// dropped — callers who need recovery should check `has_agent` first).
+    pub fn split_at_pane(&mut self, target_id: usize, dir: SplitDir, new_pane: Pane) -> bool {
         let root = self.root.take().expect("root is always Some");
-        let (new_root, remaining) = split_in_tree(root, self.focus_id, dir, new_pane);
+        let (new_root, remaining) = split_in_tree(root, target_id, dir, new_pane);
         self.root = Some(new_root);
         remaining.is_none()
     }
@@ -1359,6 +1367,28 @@ mod tests {
         let mut p = leaf(id, name);
         p.backend = Some(Backend::ClaudeCode);
         p
+    }
+
+    #[test]
+    fn split_at_pane_targets_non_focused_pane() {
+        // split_at_pane must honor the explicit target_id even when a
+        // different pane is focused — this is what `target_pane` in
+        // create_instance relies on.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        // Focus stays on pane 1, but we target pane 2.
+        assert_eq!(tab.focus_id, 1);
+        assert!(tab.split_at_pane(2, SplitDir::Horizontal, leaf(3, "c")));
+        assert_eq!(tab.root().pane_count(), 3);
+        assert!(tab.root().has_agent("c"));
+    }
+
+    #[test]
+    fn split_at_pane_returns_false_when_target_missing() {
+        // Nonexistent target_id must leave the tree intact.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(!tab.split_at_pane(999, SplitDir::Vertical, leaf(2, "b")));
+        assert_eq!(tab.root().pane_count(), 1);
     }
 
     #[test]

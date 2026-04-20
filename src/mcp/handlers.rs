@@ -737,13 +737,18 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
         .and_then(|v| v.as_str())
         .map(String::from);
     let layout = args.get("layout").and_then(|v| v.as_str()).unwrap_or("tab");
+    let target_pane = args
+        .get("target_pane")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
 
     match crate::api::call(
         home,
         &json!({"method": crate::api::method::SPAWN, "params": {
             "name": name, "backend": command, "args": &cmd_args,
             "working_directory": work_dir,
-            "layout": layout, "spawner": instance_name
+            "layout": layout, "spawner": instance_name,
+            "target_pane": target_pane
         }}),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {

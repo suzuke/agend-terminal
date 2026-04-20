@@ -78,7 +78,8 @@ fn instance_tools() -> Vec<Value> {
                 "working_directory": {"type": "string"},
                 "branch": {"type": "string", "description": "Git branch — creates worktree if specified"},
                 "task": {"type": "string", "description": "Initial task to inject after spawn"},
-                "layout": {"type": "string", "enum": ["tab", "split-right", "split-below"], "description": "TUI layout: tab (default), split-right, or split-below relative to caller"},
+                "layout": {"type": "string", "enum": ["tab", "split-right", "split-below"], "description": "TUI layout: tab (default), split-right, or split-below. Places the new pane relative to `target_pane` if given, otherwise relative to the caller."},
+                "target_pane": {"type": "string", "description": "Name of an existing instance. When set with layout=split-right/split-below, the new pane is attached next to that instance's pane (wherever it currently lives), instead of the caller's focused pane. Falls back to caller, then new tab, if the target isn't currently displayed."},
                 "count": {"type": "integer", "description": "Number of instances to spawn (requires team; ignored when `backends` is set)"},
                 "team": {"type": "string", "description": "Team name — members become <team>-1, <team>-2, ... grouped in one tab"},
                 "backends": {"type": "array", "items": {"type": "string"}, "description": "Per-member backend list for a mixed-backend team (requires team). Length dictates member count."},
@@ -265,6 +266,32 @@ mod tests {
         assert!(
             !required_strs.contains(&"command"),
             "command should NOT be required (backend is preferred, default is claude)"
+        );
+    }
+
+    #[test]
+    fn create_instance_has_target_pane_param() {
+        // target_pane is optional but must be declared so MCP clients surface
+        // it to the agent — without it, agents can't place new panes next to
+        // a specific peer.
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let create = tools
+            .iter()
+            .find(|t| t["name"] == "create_instance")
+            .expect("create_instance tool not found");
+        let props = &create["inputSchema"]["properties"];
+        assert!(
+            props["target_pane"].is_object(),
+            "create_instance should expose 'target_pane'"
+        );
+        let required = create["inputSchema"]["required"]
+            .as_array()
+            .expect("required");
+        let required_strs: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            !required_strs.contains(&"target_pane"),
+            "target_pane must stay optional"
         );
     }
 
