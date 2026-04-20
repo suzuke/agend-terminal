@@ -1,11 +1,14 @@
-//! TUI client: connects to daemon's agent TCP port, raw terminal passthrough.
+//! TUI client: raw-mode CLI attach onto a daemon-hosted agent.
 //!
-//! Ctrl+B d to detach. Agent keeps running.
+//! Ctrl+B d to detach. Agent keeps running. Network plumbing lives in
+//! [`crate::bridge_client`]; this module only owns raw mode + crossterm
+//! event translation + stdout pumping.
 
-use crate::framing::{self, PROTOCOL_VERSION, TAG_DATA};
+use crate::bridge_client::BridgeClient;
+use crate::framing::{self, TAG_DATA};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 /// RAII guard for crossterm raw mode.
@@ -18,47 +21,22 @@ impl Drop for RawModeGuard {
 
 /// Resolve the agent's TCP port, connect, enter raw mode, bridge terminal.
 pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
-    let mut stream = crate::ipc::connect_agent(home, name)
-        .map_err(|e| anyhow::anyhow!("Failed to connect to agent '{name}': {e}"))?;
-
-    // P1-10: send the 32-byte per-daemon cookie before anything else. The
-    // daemon's TUI server reads and verifies it before replying with the
-    // protocol version byte. Missing / wrong cookie → connection dropped.
-    let run = crate::daemon::find_active_run_dir(home)
-        .ok_or_else(|| anyhow::anyhow!("no active daemon (run dir not found)"))?;
-    let cookie = crate::auth_cookie::read_cookie(&run)?;
-    crate::auth_cookie::write_tui_auth(&mut stream, &cookie)
-        .map_err(|e| anyhow::anyhow!("Failed to send TUI auth: {e}"))?;
-
-    // Read protocol version byte from server
-    let mut version_buf = [0u8; 1];
-    stream
-        .read_exact(&mut version_buf)
-        .map_err(|e| anyhow::anyhow!("Failed to read protocol version: {e}"))?;
-    if version_buf[0] != PROTOCOL_VERSION {
-        anyhow::bail!(
-            "Protocol version mismatch: server={} client={}",
-            version_buf[0],
-            PROTOCOL_VERSION
-        );
-    }
+    let (cols, rows) = terminal::size().unwrap_or((120, 40));
+    let mut bridge = BridgeClient::connect(home, name, cols, rows)?;
 
     terminal::enable_raw_mode()?;
     let _guard = RawModeGuard;
 
-    let mut write_stream = stream.try_clone()?;
-    let read_stream = stream;
-
-    // Send initial terminal size
-    let (cols, rows) = terminal::size().unwrap_or((120, 40));
-    let _ = framing::write_resize(&mut write_stream, cols, rows);
+    let reader = bridge
+        .take_reader()
+        .ok_or_else(|| anyhow::anyhow!("bridge reader already taken"))?;
 
     // Output thread: agent → terminal stdout
     std::thread::Builder::new()
         .name("tui_output".into())
         .spawn(move || {
             let mut stdout = std::io::stdout();
-            let mut reader = read_stream;
+            let mut reader = reader;
             loop {
                 match framing::read_tagged_frame(&mut reader) {
                     Ok((TAG_DATA, data)) => {
@@ -95,7 +73,7 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
                     // Not 'd' — send Ctrl+B + current key
                     let mut bytes = vec![0x02];
                     bytes.extend(key_to_bytes(code, modifiers));
-                    if framing::write_frame(&mut write_stream, &bytes).is_err() {
+                    if bridge.send_input(&bytes).is_err() {
                         break;
                     }
                     continue;
@@ -105,17 +83,17 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
                     continue;
                 }
                 let bytes = key_to_bytes(code, modifiers);
-                if !bytes.is_empty() && framing::write_frame(&mut write_stream, &bytes).is_err() {
+                if !bytes.is_empty() && bridge.send_input(&bytes).is_err() {
                     break;
                 }
             }
             Ok(Event::Paste(text)) => {
-                if framing::write_frame(&mut write_stream, text.as_bytes()).is_err() {
+                if bridge.send_input(text.as_bytes()).is_err() {
                     break;
                 }
             }
             Ok(Event::Resize(cols, rows)) => {
-                if framing::write_resize(&mut write_stream, cols, rows).is_err() {
+                if bridge.send_resize(cols, rows).is_err() {
                     break;
                 }
             }
