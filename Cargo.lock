@@ -27,6 +27,7 @@ dependencies = [
  "embed-resource",
  "fs2",
  "getrandom 0.2.17",
+ "iana-time-zone",
  "libc",
  "portable-pty",
  "ratatui",

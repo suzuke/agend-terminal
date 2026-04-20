@@ -58,6 +58,7 @@ which = "6"
 
 # Crypto-grade random for API-connection cookie (P1-10)
 getrandom = "0.2"
+iana-time-zone = "0.1.65"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

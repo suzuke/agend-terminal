@@ -15,11 +15,17 @@ static DETECTED_TZ: OnceLock<String> = OnceLock::new();
 
 /// Return the detected system timezone as a stable `&'static str`.
 ///
-/// Precedence: `TZ` env at first call → `/etc/localtime` symlink → `"UTC"`.
-/// The detection runs once; later mutations of `$TZ` are intentionally
-/// ignored, because (a) schedules carry their own per-row `timezone` field
-/// that is the real source of truth for cron evaluation, and (b) leaking a
-/// new string on every env toggle was the original P2-6 bug.
+/// Precedence: `TZ` env at first call → `iana_time_zone::get_timezone()`
+/// → `"UTC"`. The detection runs once; later mutations of `$TZ` are
+/// intentionally ignored, because (a) schedules carry their own per-row
+/// `timezone` field that is the real source of truth for cron evaluation,
+/// and (b) leaking a new string on every env toggle was the original P2-6 bug.
+///
+/// `iana-time-zone` resolves an IANA name on all supported platforms:
+/// Linux reads `/etc/localtime`, macOS calls CoreFoundation, Windows reads
+/// the registry and maps Windows TZ names to IANA. This replaces the old
+/// Unix-only `/etc/localtime` symlink parse, which silently fell through
+/// to UTC on Windows.
 pub fn detect_timezone() -> &'static str {
     DETECTED_TZ
         .get_or_init(|| {
@@ -28,10 +34,9 @@ pub fn detect_timezone() -> &'static str {
                     return tz;
                 }
             }
-            if let Ok(link) = std::fs::read_link("/etc/localtime") {
-                let path = link.display().to_string();
-                if let Some(tz) = path.split("/zoneinfo/").nth(1) {
-                    return tz.to_string();
+            if let Ok(tz) = iana_time_zone::get_timezone() {
+                if !tz.is_empty() {
+                    return tz;
                 }
             }
             "UTC".to_string()
@@ -294,6 +299,19 @@ mod tests {
         assert_eq!(history[2]["status"], "inject_failed");
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn detect_timezone_returns_parseable_iana_name() {
+        // Downstream (`cron_tick.rs`) parses the result via `chrono_tz::Tz::from_str`.
+        // Lock in that contract across platforms so a Windows run cannot silently
+        // produce a Windows-only TZ name (e.g. "Taipei Standard Time") that the
+        // cron tick would reject. The value is either whatever the CI host's
+        // system TZ maps to, or the "UTC" fallback — both must parse.
+        let tz = super::detect_timezone();
+        assert!(!tz.is_empty(), "detect_timezone returned empty string");
+        tz.parse::<chrono_tz::Tz>()
+            .unwrap_or_else(|e| panic!("detect_timezone returned {tz:?} which chrono_tz cannot parse: {e}"));
     }
 
     #[test]
