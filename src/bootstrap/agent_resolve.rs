@@ -7,7 +7,7 @@
 use crate::backend;
 use crate::fleet::FleetConfig;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Agent spawn tuple consumed by `daemon::run_with_prepared`. Matches the
 /// shape of `daemon::AgentDef`.
@@ -21,11 +21,11 @@ pub type AgentDef = (
 );
 
 /// Resolve every instance in `config` into a spawn-ready [`AgentDef`].
-pub(super) fn resolve(config: &FleetConfig, home: &Path) -> Vec<AgentDef> {
+pub(super) fn resolve(config: &FleetConfig) -> Vec<AgentDef> {
     config
         .instance_names()
         .into_iter()
-        .filter_map(|name| resolve_one(config, home, &name))
+        .filter_map(|name| resolve_one(config, &name))
         .collect()
 }
 
@@ -35,7 +35,7 @@ pub(super) fn resolve(config: &FleetConfig, home: &Path) -> Vec<AgentDef> {
 /// resolved. Side effects (worktree creation, instruction generation) mirror
 /// [`resolve`] so hot-reload-added agents are set up identically to ones
 /// materialized at startup.
-pub(crate) fn resolve_one(config: &FleetConfig, home: &Path, name: &str) -> Option<AgentDef> {
+pub(crate) fn resolve_one(config: &FleetConfig, name: &str) -> Option<AgentDef> {
     let mut resolved = config.resolve_instance(name)?;
 
     if let Some(ref base_dir) = resolved.working_directory {
@@ -61,7 +61,7 @@ pub(crate) fn resolve_one(config: &FleetConfig, home: &Path, name: &str) -> Opti
     let mut args = resolved.args;
     if let Some(ref b) = backend::Backend::from_command(&resolved.backend_command) {
         let p = b.preset();
-        args.extend(p.resume_mode.args_for(home, name));
+        args.extend(p.resume_mode.args_for());
     }
 
     if let Some(ref model) = resolved.model {
@@ -80,11 +80,6 @@ pub(crate) fn resolve_one(config: &FleetConfig, home: &Path, name: &str) -> Opti
             if mcp_config.exists() {
                 args.push("--mcp-config".to_string());
                 args.push(mcp_config.display().to_string());
-            }
-            let settings = dir.join("claude-settings.json");
-            if settings.exists() {
-                args.push("--settings".to_string());
-                args.push(settings.display().to_string());
             }
         }
     }

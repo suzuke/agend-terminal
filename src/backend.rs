@@ -86,59 +86,26 @@ impl<'de> Deserialize<'de> for Backend {
 /// How to resume a previous session.
 #[derive(Debug, Clone)]
 pub enum ResumeMode {
-    /// Resumes most recent session in cwd (safe if each instance has own working_dir).
-    /// flag is the CLI flag to use (e.g., "--continue" for Claude, "--resume" for Kiro).
+    /// Resumes most recent session in cwd (safe when each instance has its own
+    /// working_dir — the fleet's auto-worktree ensures this for git repos).
+    /// `flag` is the CLI flag to use (e.g., `--continue` for Claude/OpenCode,
+    /// `--resume` for Kiro).
     ContinueInCwd { flag: &'static str },
-    /// Use --resume-id <saved-session-id> (needs captured ID from file)
-    SavedSession { flag: &'static str },
-    /// Fixed args (e.g., Gemini --resume latest)
+    /// Fixed args (e.g., Gemini `--resume latest`).
     Fixed { args: &'static [&'static str] },
-    /// Not supported
+    /// Not supported.
     NotSupported,
 }
 
 impl ResumeMode {
-    /// Get resume args. For ContinueInCwd, always returns --continue.
-    /// For others, reads saved session ID from file.
-    pub fn args_for(&self, home: &std::path::Path, instance_name: &str) -> Vec<String> {
+    /// Get resume args for spawning.
+    pub fn args_for(&self) -> Vec<String> {
         match self {
             ResumeMode::ContinueInCwd { flag } => vec![flag.to_string()],
             ResumeMode::Fixed { args } => args.iter().map(|s| s.to_string()).collect(),
             ResumeMode::NotSupported => vec![],
-            _ => {
-                // Read saved session ID
-                let sid_file = home.join("sessions").join(format!("{instance_name}.sid"));
-                let session_id = std::fs::read_to_string(&sid_file)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-
-                match (self, session_id) {
-                    (ResumeMode::SavedSession { flag }, Some(sid)) => vec![flag.to_string(), sid],
-                    _ => vec![], // No saved session
-                }
-            }
         }
     }
-}
-
-/// Read session_id from an agent's statusline.json.
-pub fn read_session_id(working_dir: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(working_dir.join("statusline.json"))
-        .ok()
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|d| {
-            d.get("session_id")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-}
-
-/// Save a captured session ID for an instance.
-pub fn save_session_id(home: &std::path::Path, instance_name: &str, session_id: &str) {
-    let dir = home.join("sessions");
-    std::fs::create_dir_all(&dir).ok();
-    let _ = std::fs::write(dir.join(format!("{instance_name}.sid")), session_id);
 }
 
 /// Preset configuration for a backend.
@@ -185,7 +152,7 @@ impl Backend {
                 submit_key: "\r",
                 inject_prefix: "",
                 typed_inject: false,
-                resume_mode: ResumeMode::SavedSession { flag: "--resume" },
+                resume_mode: ResumeMode::ContinueInCwd { flag: "--continue" },
                 quit_command: "/exit",
                 // Not under `.claude/rules/` to avoid double-loading: we pass this
                 // file explicitly via `--append-system-prompt-file` (see spawn_flags).
@@ -372,8 +339,8 @@ impl Backend {
     /// unconditionally from every spawn path.
     ///
     /// Claude Code gets `--append-system-prompt-file` (instructions) plus
-    /// `--mcp-config` / `--settings` (MCP wiring). Other backends rely on
-    /// their own auto-discovery mechanisms and return an empty vec.
+    /// `--mcp-config` (MCP wiring). Other backends rely on their own
+    /// auto-discovery mechanisms and return an empty vec.
     pub fn spawn_flags(&self, working_dir: &std::path::Path) -> Vec<String> {
         let mut out = Vec::new();
         if matches!(self, Backend::ClaudeCode) {
@@ -386,11 +353,6 @@ impl Backend {
             if mcp.exists() {
                 out.push("--mcp-config".to_string());
                 out.push(mcp.display().to_string());
-            }
-            let settings = working_dir.join("claude-settings.json");
-            if settings.exists() {
-                out.push("--settings".to_string());
-                out.push(settings.display().to_string());
             }
         }
         out
@@ -497,26 +459,23 @@ mod tests {
 
     #[test]
     fn resume_mode_types() {
-        let claude = Backend::ClaudeCode.preset();
-        assert!(matches!(
-            claude.resume_mode,
-            ResumeMode::SavedSession { .. }
-        ));
-
-        let kiro = Backend::KiroCli.preset();
-        assert!(matches!(kiro.resume_mode, ResumeMode::ContinueInCwd { .. }));
-
-        let codex = Backend::Codex.preset();
-        assert!(matches!(codex.resume_mode, ResumeMode::NotSupported));
-
-        let gemini = Backend::Gemini.preset();
-        assert!(matches!(gemini.resume_mode, ResumeMode::Fixed { .. }));
-
-        let opencode = Backend::OpenCode.preset();
-        assert!(matches!(
-            opencode.resume_mode,
-            ResumeMode::ContinueInCwd { .. }
-        ));
+        assert_eq!(
+            Backend::ClaudeCode.preset().resume_mode.args_for(),
+            vec!["--continue"]
+        );
+        assert_eq!(
+            Backend::KiroCli.preset().resume_mode.args_for(),
+            vec!["--resume"]
+        );
+        assert!(Backend::Codex.preset().resume_mode.args_for().is_empty());
+        assert_eq!(
+            Backend::Gemini.preset().resume_mode.args_for(),
+            vec!["--resume", "latest"]
+        );
+        assert_eq!(
+            Backend::OpenCode.preset().resume_mode.args_for(),
+            vec!["--continue"]
+        );
     }
 
     #[test]
@@ -666,8 +625,7 @@ mod tests {
     #[test]
     fn resume_mode_continue_in_cwd_args() {
         let mode = ResumeMode::ContinueInCwd { flag: "--continue" };
-        let args = mode.args_for(std::path::Path::new("/tmp"), "test");
-        assert_eq!(args, vec!["--continue".to_string()]);
+        assert_eq!(mode.args_for(), vec!["--continue".to_string()]);
     }
 
     #[test]
@@ -675,15 +633,15 @@ mod tests {
         let mode = ResumeMode::Fixed {
             args: &["--resume", "latest"],
         };
-        let args = mode.args_for(std::path::Path::new("/tmp"), "test");
-        assert_eq!(args, vec!["--resume".to_string(), "latest".to_string()]);
+        assert_eq!(
+            mode.args_for(),
+            vec!["--resume".to_string(), "latest".to_string()]
+        );
     }
 
     #[test]
     fn resume_mode_not_supported_args() {
-        let mode = ResumeMode::NotSupported;
-        let args = mode.args_for(std::path::Path::new("/tmp"), "test");
-        assert!(args.is_empty());
+        assert!(ResumeMode::NotSupported.args_for().is_empty());
     }
 
     #[test]
@@ -761,7 +719,6 @@ mod tests {
         let flags = Backend::ClaudeCode.spawn_flags(&dir);
         assert!(flags.contains(&"--append-system-prompt-file".to_string()));
         assert!(!flags.contains(&"--mcp-config".to_string()));
-        assert!(!flags.contains(&"--settings".to_string()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -771,7 +728,6 @@ mod tests {
         std::fs::create_dir_all(dir.join(".claude")).unwrap();
         std::fs::write(dir.join(".claude/agend.md"), "x").unwrap();
         std::fs::write(dir.join("mcp-config.json"), "{}").unwrap();
-        std::fs::write(dir.join("claude-settings.json"), "{}").unwrap();
         let flags = Backend::ClaudeCode.spawn_flags(&dir);
         // Each flag appears exactly once, followed by its path arg.
         assert_eq!(
@@ -780,7 +736,7 @@ mod tests {
                 .filter(|s| s.starts_with("--"))
                 .collect::<Vec<_>>()
                 .len(),
-            3
+            2
         );
         assert!(flags
             .windows(2)
@@ -788,9 +744,6 @@ mod tests {
         assert!(flags
             .windows(2)
             .any(|w| w[0] == "--mcp-config" && w[1].ends_with("mcp-config.json")));
-        assert!(flags
-            .windows(2)
-            .any(|w| w[0] == "--settings" && w[1].ends_with("claude-settings.json")));
         std::fs::remove_dir_all(&dir).ok();
     }
 
