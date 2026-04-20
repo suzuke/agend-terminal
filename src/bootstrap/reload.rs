@@ -6,7 +6,7 @@
 //! - **Removed / command-changed / args-changed / working-dir-changed** are
 //!   warn-only — replacing a live PTY risks losing user state (ongoing agent
 //!   session, open editor, etc.), so the operator must explicitly delete or
-//!   replace the instance. This mirrors agend-pty's policy.
+//!   replace the instance.
 //! - **Role / topic_id** changes are logged and left for a future in-place
 //!   update (instructions regen + registry metadata swap). Not done here
 //!   because the runtime doesn't consume those fields after spawn; re-running
@@ -123,9 +123,9 @@ pub fn compute_diff(
 /// Build a digest map from a FleetConfig.
 pub fn digest_from_config(config: &FleetConfig) -> HashMap<String, InstanceDigest> {
     config
-        .instances
-        .keys()
-        .filter_map(|name| InstanceDigest::from_config(config, name).map(|d| (name.clone(), d)))
+        .instance_names()
+        .into_iter()
+        .filter_map(|name| InstanceDigest::from_config(config, &name).map(|d| (name, d)))
         .collect()
 }
 

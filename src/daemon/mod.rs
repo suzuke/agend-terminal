@@ -147,7 +147,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
     }
 
-    run_core(home, agents)
+    run_core(home, agents, None)
 }
 
 /// Start daemon with a fleet already prepared by [`crate::bootstrap::prepare`].
@@ -163,11 +163,18 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     // scope so flock / cookie / telegram / config persist for the full run.
     let home = prepared.home.clone();
     let agents = std::mem::take(&mut prepared.agents);
+    // Reuse the already-parsed FleetConfig for the initial reload digest;
+    // avoids re-reading + re-parsing fleet.yaml inside run_core.
+    let initial_digest = crate::bootstrap::reload::digest_from_config(&prepared.config);
     let _owned = prepared;
-    run_core(&home, agents)
+    run_core(&home, agents, Some(initial_digest))
 }
 
-fn run_core(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
+fn run_core(
+    home: &Path,
+    agents: Vec<AgentDef>,
+    initial_digest: Option<HashMap<String, crate::bootstrap::reload::InstanceDigest>>,
+) -> anyhow::Result<()> {
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // External agents registry (connected via `agend-terminal connect`)
@@ -190,57 +197,10 @@ fn run_core(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
     tracing::info!(count = agents.len(), "starting agents");
 
-    for (name, command, args, env, working_dir, submit_key) in &agents {
-        let worktree_source = working_dir.as_ref().and_then(|wd| {
-            wd.display().to_string().contains(".worktrees/").then(|| {
-                wd.parent()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.to_path_buf())
-            })?
-        });
-        crate::sync::lock_poisoned(&configs, "configs").insert(
-            name.clone(),
-            AgentConfig {
-                name: name.clone(),
-                backend_command: command.clone(),
-                args: args.clone(),
-                env: env.clone(),
-                working_dir: working_dir.clone(),
-                worktree_source,
-                submit_key: submit_key.clone(),
-            },
-        );
-
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-        agent::spawn_agent(
-            &agent::SpawnConfig {
-                name,
-                backend_command: command,
-                args,
-                cols,
-                rows,
-                env: env.as_ref(),
-                working_dir: working_dir.as_deref(),
-                submit_key,
-                home: Some(home),
-                crash_tx: Some(crash_tx.clone()),
-                shutdown: Some(Arc::clone(&shutdown)),
-            },
-            &registry,
-        )?;
-
-        let rdir = run_dir(home);
-        let reg = Arc::clone(&registry);
-        let n = name.clone();
-        std::thread::Builder::new()
-            .name(format!("{n}_tui_server"))
-            .spawn(move || serve_agent_tui(&n, &rdir, &reg))?;
+    for def in &agents {
+        spawn_and_register_agent(home, def, &registry, &configs, &crash_tx, &shutdown)?;
         if agents.len() > 1 {
-            let stagger_ms: u64 = std::env::var("AGEND_SPAWN_STAGGER_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(500);
-            std::thread::sleep(std::time::Duration::from_millis(stagger_ms));
+            std::thread::sleep(spawn_stagger());
         }
     }
 
@@ -287,10 +247,12 @@ fn run_core(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // `bootstrap::reload` docs for policy.
     let fleet_path = home.join("fleet.yaml");
     let mut fleet_watcher = crate::bootstrap::reload::FleetWatcher::new(fleet_path.clone());
-    let mut known_digest = crate::fleet::FleetConfig::load(&fleet_path)
-        .ok()
-        .map(|c| crate::bootstrap::reload::digest_from_config(&c))
-        .unwrap_or_default();
+    let mut known_digest = initial_digest.unwrap_or_else(|| {
+        crate::fleet::FleetConfig::load(&fleet_path)
+            .ok()
+            .map(|c| crate::bootstrap::reload::digest_from_config(&c))
+            .unwrap_or_default()
+    });
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -675,7 +637,7 @@ fn run_core(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 /// - **removed / command_changed / args_changed / working_dir_changed**: log
 ///   a warn. Tearing down a live PTY to realign fleet.yaml risks destroying
 ///   in-progress user work, so the operator has to explicitly `delete` /
-///   `restart` the agent. Mirrors agend-pty's policy.
+///   `restart` the agent.
 /// - **role_changed / topic_id_changed**: log. These fields only matter at
 ///   spawn time for instructions generation and Telegram routing; a safe
 ///   in-place swap needs more plumbing (instructions files are read by the
@@ -729,72 +691,101 @@ fn apply_fleet_reload(
         tracing::info!(agent = %name, "fleet.yaml topic_id changed — won't be reflected until agent respawns");
     }
 
-    for name in &diff.added {
+    let added_count = diff.added.len();
+    for (idx, name) in diff.added.iter().enumerate() {
         let Some(agent_def) = crate::bootstrap::resolve_one(new_config, home, name) else {
             tracing::warn!(agent = %name, "failed to resolve newly-added instance");
             continue;
         };
-        let (dname, command, args, env, working_dir, submit_key) = agent_def;
-        let worktree_source = working_dir.as_ref().and_then(|wd| {
-            wd.display().to_string().contains(".worktrees/").then(|| {
-                wd.parent()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.to_path_buf())
-            })?
-        });
-        crate::sync::lock_poisoned(configs, "configs").insert(
-            dname.clone(),
-            AgentConfig {
-                name: dname.clone(),
-                backend_command: command.clone(),
-                args: args.clone(),
-                env: env.clone(),
-                working_dir: working_dir.clone(),
-                worktree_source,
-                submit_key: submit_key.clone(),
-            },
-        );
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-        if let Err(e) = agent::spawn_agent(
-            &agent::SpawnConfig {
-                name: &dname,
-                backend_command: &command,
-                args: &args,
-                cols,
-                rows,
-                env: env.as_ref(),
-                working_dir: working_dir.as_deref(),
-                submit_key: &submit_key,
-                home: Some(home),
-                crash_tx: Some(crash_tx.clone()),
-                shutdown: Some(Arc::clone(shutdown)),
-            },
-            registry,
-        ) {
-            tracing::warn!(agent = %dname, error = %e, "failed to spawn reload-added agent");
-            // Roll back the config entry so the next tick retries cleanly.
-            crate::sync::lock_poisoned(configs, "configs").remove(&dname);
-            continue;
-        }
-        let rdir = run_dir(home);
-        let reg = Arc::clone(registry);
-        let n = dname.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name(format!("{n}_tui_server"))
-            .spawn(move || serve_agent_tui(&n, &rdir, &reg))
+        let added_name = agent_def.0.clone();
+        if let Err(e) =
+            spawn_and_register_agent(home, &agent_def, registry, configs, crash_tx, shutdown)
         {
-            tracing::warn!(agent = %dname, error = %e, "failed to spawn TUI server for reload-added agent");
+            tracing::warn!(agent = %added_name, error = %e, "failed to spawn reload-added agent");
+            continue;
         }
         crate::event_log::log(
             home,
             "reload_add",
-            &dname,
+            &added_name,
             "agent added via fleet.yaml reload",
         );
-        tracing::info!(agent = %dname, "spawned via fleet.yaml reload");
+        tracing::info!(agent = %added_name, "spawned via fleet.yaml reload");
+        if added_count > 1 && idx + 1 < added_count {
+            std::thread::sleep(spawn_stagger());
+        }
     }
 
     *known_digest = new_digest;
+}
+
+/// Staggered-spawn delay — rate-limits PTY init during multi-agent bursts
+/// (startup or hot-reload). Tunable via `AGEND_SPAWN_STAGGER_MS`.
+fn spawn_stagger() -> std::time::Duration {
+    let ms: u64 = std::env::var("AGEND_SPAWN_STAGGER_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Shared "spawn one agent + register respawn config + start per-agent TUI
+/// server" path. Used by startup (run_core), hot-reload (apply_fleet_reload),
+/// and any future add-agent call site. Rolls back the `configs` entry on
+/// spawn failure so retries start clean.
+fn spawn_and_register_agent(
+    home: &Path,
+    def: &crate::bootstrap::AgentDef,
+    registry: &AgentRegistry,
+    configs: &Arc<Mutex<HashMap<String, AgentConfig>>>,
+    crash_tx: &crossbeam::channel::Sender<String>,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
+    let (name, command, args, env, working_dir, submit_key) = def;
+    let worktree_source = working_dir
+        .as_ref()
+        .and_then(|wd| crate::worktree::source_repo_of(wd));
+    crate::sync::lock_poisoned(configs, "configs").insert(
+        name.clone(),
+        AgentConfig {
+            name: name.clone(),
+            backend_command: command.clone(),
+            args: args.clone(),
+            env: env.clone(),
+            working_dir: working_dir.clone(),
+            worktree_source,
+            submit_key: submit_key.clone(),
+        },
+    );
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    if let Err(e) = agent::spawn_agent(
+        &agent::SpawnConfig {
+            name,
+            backend_command: command,
+            args,
+            cols,
+            rows,
+            env: env.as_ref(),
+            working_dir: working_dir.as_deref(),
+            submit_key,
+            home: Some(home),
+            crash_tx: Some(crash_tx.clone()),
+            shutdown: Some(Arc::clone(shutdown)),
+        },
+        registry,
+    ) {
+        crate::sync::lock_poisoned(configs, "configs").remove(name);
+        return Err(e);
+    }
+
+    let rdir = run_dir(home);
+    let reg = Arc::clone(registry);
+    let n = name.clone();
+    std::thread::Builder::new()
+        .name(format!("{n}_tui_server"))
+        .spawn(move || serve_agent_tui(&n, &rdir, &reg))?;
+    Ok(())
 }
 
 /// Strip resume-related arguments for fresh respawn.

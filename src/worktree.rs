@@ -21,6 +21,18 @@ pub fn is_git_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+/// Recover the source repo path from a worktree working directory.
+///
+/// Matches the layout `agent_resolve` creates via `worktree::create`:
+/// `{source_repo}/.worktrees/{name}`. Returns `None` when `working_dir` is
+/// not inside a `.worktrees/` directory or lacks the two expected ancestors.
+pub fn source_repo_of(working_dir: &Path) -> Option<PathBuf> {
+    if !working_dir.display().to_string().contains(".worktrees/") {
+        return None;
+    }
+    working_dir.parent()?.parent().map(|p| p.to_path_buf())
+}
+
 /// Check if a git repo has at least one commit (valid HEAD).
 fn has_commits(repo_dir: &Path) -> bool {
     std::process::Command::new("git")
