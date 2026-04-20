@@ -90,6 +90,50 @@ fixtures:
     expected_final_state: thinking
     expected_final_detect: null
 
+  # ── Stage 2b PermissionPrompt recordings (2026-04-20) ───────────────
+  # Both recordings verified a real permission dialog appearing — claude
+  # showed "User rejected write to..." after Deny, codex showed
+  # "✗ You canceled the request to run printf 'hello' > ..." for a path
+  # outside its workspace-write sandbox. Neither observed transition
+  # sequence contains AgentState::PermissionPrompt: each backend's
+  # permission pattern fails to match the actual dialog wording. Gap is
+  # tracked in docs/FOLLOWUP-permission-pattern-gaps.md; treat these as
+  # regression anchors per Stage 2a convention.
+
+  - file: claude-perm.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-04-20"
+    scenario: "prompt 'write hello to /tmp/claude-perm-test.txt' -> Allow-once/Deny dialog appears -> Deny -> /exit (final screen shows `User rejected write to ../../tmp/claude-perm-test.txt`)"
+    # ClaudeCode PermissionPrompt pattern `Allow once|Allow always|
+    # approve` never matches on this recording. Likely the dialog text
+    # uses different wording (e.g., "Yes, proceed" / "No, keep asking")
+    # or ink renders the dialog as a modal overlay outside the
+    # vterm-visible grid. Also note: the same recording exposes the
+    # Stage 2a claude ToolUse gap — `⏺ Write(...)` is visible but the
+    # pattern char class has `●` (U+25CF), not `⏺` (U+23FA).
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+
+  - file: codex-perm.raw
+    backend: codex
+    cli_version: "0.120.0"
+    recorded_on: "2026-04-20"
+    scenario: "prompt 'write hello to /Users/suzuke/codex-perm-test.txt' (path outside default workspace-write sandbox) -> codex requests approval to run an escalated command -> user cancels -> /exit"
+    # Codex PermissionPrompt pattern `Request approval|approve|deny`
+    # never matches. The actual dialog wording in 0.120.0 is
+    # "escalated command" / "outside the writable sandbox" / "You
+    # canceled the request". InteractivePrompt fires at ~byte 1024 —
+    # same root cause as codex-update.raw / codex-tooluse.raw (Update
+    # banner or slash-menu matches `Press enter to continue`). Final
+    # detect() returns Idle because the post-cancel summary frame has
+    # the `›` prompt glyph visible again; hysteresis latches
+    # InteractivePrompt.
+    expected_transitions: [starting, interactive_prompt]
+    expected_final_state: interactive_prompt
+    expected_final_detect: idle
+
   # ── Stage 2a ToolUse recordings (2026-04-20) ────────────────────────
   # Every recording below DID exercise a real tool call (verified by
   # final-screen tool banners / session summaries), yet none of the
