@@ -60,7 +60,7 @@ fixtures:
 
   - file: gemini-thinking.raw
     backend: gemini
-    cli_version: "0.37.1"
+    cli_version: "0.38.2"
     recorded_on: "2026-04-19"
     scenario: "startup → ready → idle prompt → thinking (recording cut mid-response)"
     expected_transitions: [starting, ready, idle, thinking]
@@ -186,17 +186,23 @@ fixtures:
 
   - file: gemini-tooluse.raw
     backend: gemini
-    cli_version: "0.37.1"
+    cli_version: "0.38.2"
     recorded_on: "2026-04-20"
     scenario: "--yolo mode; prompt 'read package.json' -> gemini reads + replies -> /quit (session summary shows `Tool Calls: 1 ✓ 1`)"
-    # Gemini ToolUse pattern `tool.*call|MCP.*tool` only matches the
-    # end-of-session summary line "Tool Calls:" — by which point the
-    # agent is already exiting. No in-flight tool banner pattern is
-    # defined for the Gemini spinner. Final detect is None because the
-    # goodbye frame replaces the prompt line.
+    # Gemini 0.38.2 in-flight tool banner `✓ ReadFile Cargo.toml` is
+    # now covered by an expanded ToolUse alternation, verified by the
+    # gemini_tooluse_banner_match unit test. Transition sequence
+    # unchanged: the spinner line (`⠦ Thinking... esc to cancel`)
+    # fires at byte ~16384 — well before the first `✓ ReadFile`
+    # banner at ~143360; Thinking (prio 6) > ToolUse (prio 5) and
+    # byte-level replay never crosses the 2s min_hold. Production
+    # reads between PTY chunks clear the hold and the transition
+    # does surface. Final detect() shifted from null → tool_use
+    # because the `✓ ReadFile Cargo.toml` line is still above the
+    # exit summary box on the final 40-row grid.
     expected_transitions: [starting, ready, idle, thinking]
     expected_final_state: thinking
-    expected_final_detect: null
+    expected_final_detect: tool_use
 
   - file: kiro-tooluse.raw
     backend: kiro-cli

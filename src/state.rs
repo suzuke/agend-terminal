@@ -316,6 +316,19 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Allow once|Allow for this session|suggest changes",
                 ),
+                // [measured] Gemini 0.38.2 renders completed tool calls as
+                // `✓  ReadFile  Cargo.toml` — `✓` (U+2713 CHECK MARK) + a
+                // CamelCase tool name + target. Observed in
+                // tests/fixtures/state-replay/gemini-tooluse.raw at byte
+                // ~143360. Placed above Thinking so the tool banner wins
+                // first-match against the concurrent `⠦ Thinking... (esc
+                // to cancel)` spinner. The existing `tool.*call|MCP.*tool`
+                // alternation is retained for the end-of-session
+                // `Tool Calls: 1` summary and MCP-tool surfaces.
+                (
+                    AgentState::ToolUse,
+                    r"✓\s+(ReadFile|WriteFile|ReadManyFiles|Edit|Shell|WebFetch|Glob|GoogleSearch|MemoryTool|ReadFolder)\b|tool.*call|MCP.*tool",
+                ),
                 // [measured] Gemini's spinner line ("⠦ Thinking... (esc to
                 // cancel, Ns)") only renders while a request is in flight and
                 // is overwritten in place when streaming completes. Matching
@@ -323,8 +336,6 @@ impl StatePatterns {
                 // never released — chat history kept the token visible on
                 // screen and detect() kept returning Thinking forever.
                 (AgentState::Thinking, r"esc to cancel"),
-                // [estimated] MCP tool execution
-                (AgentState::ToolUse, r"tool.*call|MCP.*tool"),
                 // [measured] Input prompt text
                 (AgentState::Idle, r"Type your message"),
                 // [measured] Full ready prompt + YOLO mode
@@ -1163,6 +1174,29 @@ mod tests {
         // Clear screen, banner alone re-renders.
         drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
         assert_eq!(st.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn gemini_tooluse_banner_match() {
+        // Gemini 0.38.2 renders completed tool calls as `✓ <ToolName>
+        // <target>`. Observed in gemini-tooluse.raw ~byte 143360.
+        // Byte-level replay cannot surface the transition (Thinking
+        // latches at ~16384 before the banner at ~143360, prio 6 >
+        // prio 5), but production elapsed time clears the min_hold.
+        let patterns = StatePatterns::for_backend(&Backend::Gemini);
+        for sample in [
+            "   ✓  ReadFile  Cargo.toml",
+            "   ✓  WriteFile  /tmp/out.txt",
+            "   ✓  Edit  Cargo.toml",
+            "   ✓  Shell  ls -la",
+            "   ✓  WebFetch  https://example.com",
+        ] {
+            assert_eq!(
+                patterns.detect(sample),
+                Some(AgentState::ToolUse),
+                "expected ToolUse for {sample:?}"
+            );
+        }
     }
 
     #[test]
