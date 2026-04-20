@@ -1,7 +1,7 @@
 # FOLLOWUP: ToolUse pattern coverage gaps (Stage 2a finding)
 
 **Filed**: 2026-04-20
-**Status**: Open — pattern work, not blocking Stage 2a fixture landing
+**Status**: Closed 2026-04-20 — all 5 backends' ToolUse patterns fixed on `main` (commits `f65d295 ⇢ 24ff0e0`)
 **Origin**: `docs/PLAN-state-replay-fixture-expansion.md` Stage 2a recording run
 
 ## What happened

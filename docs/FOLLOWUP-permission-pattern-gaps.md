@@ -1,7 +1,7 @@
 # FOLLOWUP: PermissionPrompt pattern coverage gaps (Stage 2b finding)
 
 **Filed**: 2026-04-20
-**Status**: Open — pattern work, not blocking Stage 2b fixture landing
+**Status**: Closed 2026-04-20 — claude + codex PermissionPrompt patterns fixed on `main` (commits `de2b197 ⇢ 4aa1dbf`, rebased to `5c95982 ⇢ 24ff0e0`)
 **Origin**: `docs/PLAN-state-replay-fixture-expansion.md` Stage 2b recording run
 **Sibling**: `docs/FOLLOWUP-tooluse-pattern-gaps.md` (same root cause, different state)
 
