@@ -340,6 +340,11 @@ fn hash_screen(text: &str) -> u64 {
 }
 
 impl StateTracker {
+    /// Max time a self-expiring active state (Thinking / ToolUse) may stay
+    /// latched when the screen keeps updating but no pattern matches on it.
+    /// See `maybe_expire_latched_state` for rationale.
+    const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);
+
     pub fn new(backend: Option<&Backend>) -> Self {
         Self {
             current: AgentState::Starting,
@@ -362,6 +367,11 @@ impl StateTracker {
     /// detection runs against the full screen text. Because we always feed
     /// the current grid (not an accumulation), dismissed prompts drop out of
     /// detection on the next call — no stale-buffer lag.
+    ///
+    /// When detection returns `None` on a changed screen we fall through to
+    /// `maybe_expire_latched_state`, which drops long-held active states back
+    /// to Ready so the tracker cannot get stuck if a marker pattern briefly
+    /// disappears without the Ready pattern re-matching.
     pub fn feed(&mut self, screen_text: &str) {
         let hash = hash_screen(screen_text);
         if self.last_screen_hash == Some(hash) {
@@ -371,9 +381,33 @@ impl StateTracker {
         self.last_output = Instant::now();
 
         if let Some(ref patterns) = self.patterns {
-            if let Some(detected) = patterns.detect(screen_text) {
-                self.transition(detected);
+            match patterns.detect(screen_text) {
+                Some(detected) => self.transition(detected),
+                None => self.maybe_expire_latched_state(),
             }
+        }
+    }
+
+    /// Fallback when the screen changed but no pattern matched.
+    ///
+    /// Active-state markers (Thinking "esc to cancel", ToolUse tool banners)
+    /// can stop rendering while the CLI still shows on-screen content that
+    /// happens not to match the backend's Ready pattern either — e.g. a
+    /// mid-scroll render between the spinner clearing and the prompt
+    /// re-appearing. Without a fallback the tracker would stay latched on
+    /// the prior active state indefinitely.
+    ///
+    /// If the current state is a self-expiring active state
+    /// (Thinking / ToolUse) and it has been held longer than
+    /// `LATCHED_STATE_EXPIRY`, drop to Ready. Everything else is excluded:
+    /// InteractivePrompt / PermissionPrompt need explicit operator action,
+    /// errors transition instantly on the next matching screen, and
+    /// Starting / AwaitingOperator / Hang are driven by their own
+    /// supervisors (see `daemon::supervisor`).
+    fn maybe_expire_latched_state(&mut self) {
+        let expiring = matches!(self.current, AgentState::Thinking | AgentState::ToolUse);
+        if expiring && self.since.elapsed() >= Self::LATCHED_STATE_EXPIRY {
+            self.transition(AgentState::Ready);
         }
     }
 
@@ -555,6 +589,76 @@ mod tests {
         // Re-transition to same state — should be no-op
         t.transition(AgentState::Thinking);
         assert_eq!(t.since, since_before);
+    }
+
+    // ── Phase 1c: latched-state fallback ────────────────────────────────
+
+    #[test]
+    fn feed_fallback_expires_thinking_after_threshold() {
+        // Thinking held past LATCHED_STATE_EXPIRY (30s) with no pattern
+        // matching on the current screen must drop to Ready so a vanished
+        // spinner cannot latch the tracker.
+        let mut t = tracker_at(&Backend::Gemini, AgentState::Thinking, 31);
+        // Fresh screen content that matches no pattern for gemini.
+        t.feed("some unrelated output that matches nothing");
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn feed_fallback_does_not_expire_before_threshold() {
+        // Under the threshold Thinking must stay — legitimate thinking can
+        // run for tens of seconds with a quiet but still-active spinner.
+        let mut t = tracker_at(&Backend::Gemini, AgentState::Thinking, 10);
+        t.feed("some unrelated output that matches nothing");
+        assert_eq!(t.get_state(), AgentState::Thinking);
+    }
+
+    #[test]
+    fn feed_fallback_expires_tooluse_after_threshold() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+        t.feed("no tool banner, no ready footer visible here");
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn feed_fallback_does_not_expire_permission_prompt() {
+        // PermissionPrompt must be dismissed by the operator, not by time.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 120);
+        t.feed("nothing matches here");
+        assert_eq!(t.get_state(), AgentState::PermissionPrompt);
+    }
+
+    #[test]
+    fn feed_fallback_does_not_expire_interactive_prompt() {
+        let mut t = tracker_at(&Backend::Codex, AgentState::InteractivePrompt, 120);
+        t.feed("nothing matches here");
+        assert_eq!(t.get_state(), AgentState::InteractivePrompt);
+    }
+
+    #[test]
+    fn feed_fallback_no_op_when_already_ready() {
+        // Ready → Ready must not reset `since` (that would defeat the hold).
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Ready, 60);
+        let since_before = t.since;
+        t.feed("arbitrary text without any markers");
+        assert_eq!(t.get_state(), AgentState::Ready);
+        assert_eq!(t.since, since_before);
+    }
+
+    #[test]
+    fn feed_fallback_gated_by_hash_dedup() {
+        // If the screen hasn't changed, fallback must not fire even if the
+        // tracker has been latched forever — the hash dedup short-circuits
+        // feed() before detection runs. Feed the same no-match text twice;
+        // only the first call can possibly trigger the fallback path.
+        let mut t = tracker_at(&Backend::Gemini, AgentState::Thinking, 31);
+        t.feed("no marker");
+        // Tracker already dropped to Ready on the first feed. Reset to
+        // Thinking to exercise the dedup-gate specifically.
+        t.current = AgentState::Thinking;
+        t.since = Instant::now() - Duration::from_secs(31);
+        t.feed("no marker"); // same text → hash dedup → early return
+        assert_eq!(t.get_state(), AgentState::Thinking);
     }
 
     #[test]
