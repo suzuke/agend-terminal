@@ -166,15 +166,21 @@ fn ratio_bounds(total: u16) -> (f32, f32) {
 }
 
 impl PaneNode {
-    pub fn pane_ids(&self) -> Vec<usize> {
+    /// Collect pane IDs into an existing buffer (avoids per-call allocation).
+    pub fn collect_pane_ids(&self, buf: &mut Vec<usize>) {
         match self {
-            PaneNode::Leaf(p) => vec![p.id],
+            PaneNode::Leaf(p) => buf.push(p.id),
             PaneNode::Split { first, second, .. } => {
-                let mut ids = first.pane_ids();
-                ids.extend(second.pane_ids());
-                ids
+                first.collect_pane_ids(buf);
+                second.collect_pane_ids(buf);
             }
         }
+    }
+
+    pub fn pane_ids(&self) -> Vec<usize> {
+        let mut ids = Vec::new();
+        self.collect_pane_ids(&mut ids);
+        ids
     }
 
     pub fn find_pane(&self, id: usize) -> Option<&Pane> {

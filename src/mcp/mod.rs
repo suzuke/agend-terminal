@@ -17,14 +17,15 @@ use std::io::{self, BufRead, BufReader, Write};
 /// behaviour). A tool on the deny-set is always rejected; if the allow-set
 /// is non-empty, only tools on the allow-set (minus any deny-set entries)
 /// are exposed / callable.
-fn tool_acl() -> (HashSet<String>, HashSet<String>) {
-    fn parse_csv(v: &str) -> HashSet<String> {
-        v.split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
-    }
+fn parse_csv(v: &str) -> HashSet<String> {
+    v.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn read_acl_from_env() -> (HashSet<String>, HashSet<String>) {
     let allow = std::env::var("AGEND_MCP_TOOLS_ALLOW")
         .ok()
         .map(|v| parse_csv(&v))
@@ -36,9 +37,14 @@ fn tool_acl() -> (HashSet<String>, HashSet<String>) {
     (allow, deny)
 }
 
-/// Returns true if `tool` is callable under the configured ACL.
-pub(crate) fn tool_is_allowed(tool: &str) -> bool {
-    let (allow, deny) = tool_acl();
+fn tool_acl() -> &'static (HashSet<String>, HashSet<String>) {
+    use std::sync::OnceLock;
+    static ACL: OnceLock<(HashSet<String>, HashSet<String>)> = OnceLock::new();
+    ACL.get_or_init(read_acl_from_env)
+}
+
+/// Check if a tool is allowed given explicit allow/deny sets.
+fn check_allowed(tool: &str, allow: &HashSet<String>, deny: &HashSet<String>) -> bool {
     if deny.contains(tool) {
         return false;
     }
@@ -46,6 +52,12 @@ pub(crate) fn tool_is_allowed(tool: &str) -> bool {
         return true;
     }
     allow.contains(tool)
+}
+
+/// Returns true if `tool` is callable under the configured ACL.
+pub(crate) fn tool_is_allowed(tool: &str) -> bool {
+    let (allow, deny) = tool_acl();
+    check_allowed(tool, allow, deny)
 }
 
 /// Filter a `tool_definitions()` value in place to drop tools blocked by the
@@ -60,13 +72,7 @@ pub(crate) fn filter_tools(defs: Value) -> Value {
         .into_iter()
         .filter(|t| {
             let n = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if deny.contains(n) {
-                return false;
-            }
-            if allow.is_empty() {
-                return true;
-            }
-            allow.contains(n)
+            check_allowed(n, allow, deny)
         })
         .collect();
     json!({ "tools": filtered })
@@ -278,80 +284,54 @@ fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
 mod tests {
     use super::*;
 
-    /// Serialises tests that mutate the AGEND_MCP_TOOLS_* env vars.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        crate::sync::lock_poisoned(LOCK.get_or_init(|| Mutex::new(())), "mcp_env_guard")
-    }
-
-    fn save_env() -> (Option<String>, Option<String>) {
-        (
-            std::env::var("AGEND_MCP_TOOLS_ALLOW").ok(),
-            std::env::var("AGEND_MCP_TOOLS_DENY").ok(),
-        )
-    }
-    fn restore_env(prev: (Option<String>, Option<String>)) {
-        match prev.0 {
-            Some(v) => std::env::set_var("AGEND_MCP_TOOLS_ALLOW", v),
-            None => std::env::remove_var("AGEND_MCP_TOOLS_ALLOW"),
-        }
-        match prev.1 {
-            Some(v) => std::env::set_var("AGEND_MCP_TOOLS_DENY", v),
-            None => std::env::remove_var("AGEND_MCP_TOOLS_DENY"),
-        }
+    fn allow(tools: &[&str]) -> HashSet<String> {
+        tools.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn tool_acl_default_allows_everything() {
-        let _g = env_guard();
-        let prev = save_env();
-        std::env::remove_var("AGEND_MCP_TOOLS_ALLOW");
-        std::env::remove_var("AGEND_MCP_TOOLS_DENY");
-        assert!(tool_is_allowed("delete_instance"));
-        assert!(tool_is_allowed("send_to_instance"));
-        restore_env(prev);
+    fn acl_empty_allows_everything() {
+        let empty = HashSet::new();
+        assert!(check_allowed("delete_instance", &empty, &empty));
+        assert!(check_allowed("send_to_instance", &empty, &empty));
     }
 
     #[test]
-    fn tool_acl_deny_blocks_tool() {
-        let _g = env_guard();
-        let prev = save_env();
-        std::env::set_var("AGEND_MCP_TOOLS_DENY", "delete_instance, shutdown");
-        std::env::remove_var("AGEND_MCP_TOOLS_ALLOW");
-        assert!(!tool_is_allowed("delete_instance"));
-        assert!(!tool_is_allowed("shutdown"));
-        assert!(tool_is_allowed("inbox")); // not on deny list
-        restore_env(prev);
+    fn acl_deny_blocks_tool() {
+        let empty = HashSet::new();
+        let deny = allow(&["delete_instance", "shutdown"]);
+        assert!(!check_allowed("delete_instance", &empty, &deny));
+        assert!(!check_allowed("shutdown", &empty, &deny));
+        assert!(check_allowed("inbox", &empty, &deny));
     }
 
     #[test]
-    fn tool_acl_allow_restricts_to_list() {
-        let _g = env_guard();
-        let prev = save_env();
-        std::env::set_var("AGEND_MCP_TOOLS_ALLOW", "inbox,send_to_instance");
-        std::env::remove_var("AGEND_MCP_TOOLS_DENY");
-        assert!(tool_is_allowed("inbox"));
-        assert!(tool_is_allowed("send_to_instance"));
-        assert!(!tool_is_allowed("delete_instance"));
-        restore_env(prev);
+    fn acl_allow_restricts_to_list() {
+        let empty = HashSet::new();
+        let allow_set = allow(&["inbox", "send_to_instance"]);
+        assert!(check_allowed("inbox", &allow_set, &empty));
+        assert!(check_allowed("send_to_instance", &allow_set, &empty));
+        assert!(!check_allowed("delete_instance", &allow_set, &empty));
     }
 
     #[test]
-    fn tool_acl_deny_overrides_allow() {
-        let _g = env_guard();
-        let prev = save_env();
-        std::env::set_var("AGEND_MCP_TOOLS_ALLOW", "inbox,delete_instance");
-        std::env::set_var("AGEND_MCP_TOOLS_DENY", "delete_instance");
-        assert!(tool_is_allowed("inbox"));
-        assert!(!tool_is_allowed("delete_instance"));
-        restore_env(prev);
+    fn acl_deny_overrides_allow() {
+        let allow_set = allow(&["inbox", "delete_instance"]);
+        let deny = allow(&["delete_instance"]);
+        assert!(check_allowed("inbox", &allow_set, &deny));
+        assert!(!check_allowed("delete_instance", &allow_set, &deny));
+    }
+
+    #[test]
+    fn parse_csv_handles_whitespace_and_empty() {
+        let parsed = parse_csv("  foo , bar ,, baz ");
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed.contains("foo"));
+        assert!(parsed.contains("bar"));
+        assert!(parsed.contains("baz"));
     }
 
     #[test]
     fn read_message_eof_during_bad_content_length_resync() {
-        // Content-Length with garbage value, followed by immediate EOF.
-        // Must return Ok(None), not loop forever.
         let input = b"Content-Length: garbage\n";
         let mut reader = io::BufReader::new(&input[..]);
         let result = read_message(&mut reader).expect("should not error");
@@ -360,33 +340,9 @@ mod tests {
 
     #[test]
     fn read_message_resync_after_bad_content_length() {
-        // Bad header + separator, then a valid NDJSON line follows.
         let input = b"Content-Length: xyz\n\n{\"ok\":true}\n";
         let mut reader = io::BufReader::new(&input[..]);
         let result = read_message(&mut reader).expect("should not error");
         assert_eq!(result.as_deref(), Some("{\"ok\":true}"));
-    }
-
-    #[test]
-    fn filter_tools_removes_blocked_tools_from_list() {
-        let _g = env_guard();
-        let prev = save_env();
-        std::env::set_var("AGEND_MCP_TOOLS_DENY", "delete_instance");
-        std::env::remove_var("AGEND_MCP_TOOLS_ALLOW");
-
-        let defs = json!({
-            "tools": [
-                {"name": "inbox"},
-                {"name": "delete_instance"},
-                {"name": "send_to_instance"}
-            ]
-        });
-        let filtered = filter_tools(defs);
-        let arr = filtered["tools"].as_array().expect("tools array");
-        let names: Vec<&str> = arr.iter().filter_map(|v| v["name"].as_str()).collect();
-        assert!(names.contains(&"inbox"));
-        assert!(names.contains(&"send_to_instance"));
-        assert!(!names.contains(&"delete_instance"));
-        restore_env(prev);
     }
 }
