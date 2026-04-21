@@ -25,7 +25,6 @@ mod keybinds;
 mod layout;
 mod mcp;
 mod mcp_config;
-mod ops;
 mod process;
 mod quickstart;
 mod render;
