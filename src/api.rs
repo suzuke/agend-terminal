@@ -1506,4 +1506,39 @@ mod tests {
         assert_eq!(resp["ok"], true);
         stop_server(&shutdown, &home);
     }
+
+    // -----------------------------------------------------------------------
+    // Slice A characterization: LIST + STATUS response shapes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_list_returns_agents_array_and_protocol_version() {
+        let (port, home, _notifier, shutdown) = start_test_server("list-shape");
+        let resp = api_request(port, &home, &json!({"method": "list"}));
+        assert_eq!(resp["ok"], true);
+        let result = &resp["result"];
+        assert!(
+            result["protocol_version"].is_number(),
+            "expected protocol_version number, got: {result}"
+        );
+        assert!(
+            result["agents"].is_array(),
+            "expected agents array, got: {result}"
+        );
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_status_returns_agents_and_timestamp() {
+        let (port, home, _notifier, shutdown) = start_test_server("status-shape");
+        let resp = api_request(port, &home, &json!({"method": "status"}));
+        assert_eq!(resp["ok"], true);
+        let result = &resp["result"];
+        // With no snapshot file, agents is empty and timestamp is null
+        assert!(
+            result["agents"].is_array(),
+            "expected agents array, got: {result}"
+        );
+        stop_server(&shutdown, &home);
+    }
 }
