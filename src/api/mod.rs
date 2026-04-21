@@ -942,6 +942,64 @@ mod tests {
         stop_server(&shutdown, &home);
     }
 
+    /// Positive-pin companion to `dispatch_create_team_emits_team_created`:
+    /// uses `true` (resolved via PATH — `/usr/bin/true` on macOS,
+    /// `/bin/true` or `/usr/bin/true` on Linux) as a harmless real
+    /// backend so `spawn_one` actually succeeds, exercising the
+    /// non-empty `spawned` branch of `handle_create_team` and proving
+    /// the `TeamCreated` emission path end-to-end.
+    ///
+    /// Context (see `LESSONS-04-21.md` open items): headless daemon mode
+    /// passes `notifier = None`, so the emission block in
+    /// `handlers/team.rs:153-161` is unreachable by the standard E2E
+    /// smoke. Prior coverage used a three-piece equivalence bracket —
+    /// (a) negative pin via the sibling test above, (b) byte-identical
+    /// refactor verdict from at-dev-3 on the emission block, (c) runtime
+    /// abort-point evidence from smoke logs. This positive pin replaces
+    /// (a)+(c) with a direct in-process assertion that a successful
+    /// spawn results in the expected `ApiEvent::TeamCreated` payload.
+    ///
+    /// `#[cfg(unix)]` — `true(1)` is a universal harmless real backend
+    /// on Unix; Windows lacks a directly equivalent short-lived builtin
+    /// and the LESSONS open item is scoped to a proof-of-concept. A
+    /// Windows-specific positive pin can be added as a follow-up
+    /// without changing this test.
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_create_team_emits_team_created_positive() {
+        let (port, home, notifier, shutdown) = start_test_server("dispatch-team-pos");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "create_team",
+                "params": {
+                    "name": "positive_pin",
+                    "backend": "true",
+                    "count": 1
+                }
+            }),
+        );
+        assert_eq!(resp["ok"], true, "create_team failed: {resp:?}");
+        assert_eq!(
+            resp["spawned"].as_array().map(|a| a.len()),
+            Some(1),
+            "expected 1 spawned agent, got {resp:?}"
+        );
+        // The notifier emission in `handle_create_team` happens synchronously
+        // before the response is written to the wire (see handlers/team.rs
+        // L153-161), so by the time `api_request` returns, the event is
+        // already in `RecordingNotifier`'s buffer — no polling needed.
+        let events = notifier.take();
+        assert_eq!(events.len(), 1, "expected 1 event, got {events:?}");
+        let ApiEvent::TeamCreated { name, members } = &events[0] else {
+            panic!("expected TeamCreated, got {:?}", events[0])
+        };
+        assert_eq!(name, "positive_pin");
+        assert_eq!(members, &["positive_pin-1"]);
+        stop_server(&shutdown, &home);
+    }
+
     #[test]
     fn dispatch_update_team_emits_members_changed() {
         let (port, home, notifier, shutdown) = start_test_server("dispatch-update-team");
