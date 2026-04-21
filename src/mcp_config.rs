@@ -64,6 +64,24 @@ fn mcp_server_entry() -> serde_json::Value {
     })
 }
 
+/// Render a string value as a TOML string literal, picking the form that
+/// survives escape parsing.
+///
+/// Single-quoted literal strings (`'foo\bar'`) don't interpret escapes, which
+/// is what we want for Windows paths — a double-quoted `"C:\Users\..."` makes
+/// codex reject its own config.toml with "too few unicode value digits" when
+/// the path happens to contain `\U`, `\n`, `\t`, etc. Fall back to the
+/// backslash-escaped double-quoted form only if the value itself contains a
+/// single quote, which a single-line literal cannot represent.
+fn toml_string_value(s: &str) -> String {
+    if s.contains('\'') {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        format!("'{s}'")
+    }
+}
+
 /// Per-config flock path for a given config file. Two concurrent `configure`
 /// calls targeting the same working_directory would otherwise interleave
 /// their read→mutate→write cycles (one reads stale content, applies its
@@ -339,14 +357,20 @@ fn configure_codex(working_dir: &Path) -> Result<()> {
         } else {
             "\n"
         };
+        // Single-quoted TOML literal strings survive Windows paths whose
+        // escape sequences (`\U`, `\n`, `\t`) would blow up a double-quoted
+        // basic string. `binary_path()` is a `current_exe` result on Windows,
+        // always `C:\Users\...`.
+        let bin_lit = toml_string_value(&bin);
+        let home_lit = toml_string_value(&home);
         writeln!(
             f,
             r#"{prefix}[mcp_servers.agend-terminal]
-command = "{bin}"
+command = {bin_lit}
 args = ["mcp"]
 
 [mcp_servers.agend-terminal.env]
-AGEND_HOME = "{home}""#
+AGEND_HOME = {home_lit}"#
         )?;
     }
     tracing::debug!(path = %config_path.display(), "configured MCP");
@@ -960,6 +984,73 @@ mod tests {
             after.matches(&new_key).count(),
             0,
             "new-form key must not be appended when legacy form is already present"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn toml_string_value_uses_literal_for_windows_paths() {
+        // A Windows path contains `\U`, `\n`, `\t`, … — TOML basic strings
+        // interpret those as escape triggers, so the right representation is
+        // a single-quoted literal string which preserves every byte as-is.
+        assert_eq!(
+            toml_string_value(r"C:\Users\alice\agend"),
+            "'C:\\Users\\alice\\agend'"
+        );
+        assert_eq!(toml_string_value("/home/alice"), "'/home/alice'");
+    }
+
+    #[test]
+    fn toml_string_value_falls_back_to_escaped_double_quoted_for_apostrophes() {
+        // Single-line literal strings can't contain a single quote. Fall back
+        // to basic-string form with `\` and `"` escaped.
+        assert_eq!(toml_string_value("it's mine"), "\"it's mine\"");
+        assert_eq!(
+            toml_string_value(r"C:\Program' Files\x"),
+            r#""C:\\Program' Files\\x""#
+        );
+    }
+
+    #[test]
+    fn configure_codex_writes_parseable_toml_for_windows_style_binary_path() {
+        // Regression for the "config.toml: too few unicode value digits" crash.
+        // configure_codex writes per-project `.codex/config.toml` with
+        // `command = "<binary_path>"`. `binary_path()` is `current_exe()` —
+        // on Windows this is always a backslashed path and commonly contains
+        // `\U` / `\d` (basic-string invalid escapes).
+        //
+        // We can't easily override current_exe() in tests, but the bug only
+        // matters when the emitted file is parseable TOML. Call configure,
+        // round-trip the output through a real TOML parser, and assert the
+        // `mcp_servers.agend-terminal.command` field matches what we tried to
+        // write.
+        //
+        // Use with_codex_home_override so the `codex_trust_directory` call
+        // inside `configure_codex` doesn't write to the dev's real
+        // `~/.codex/config.toml`.
+        let dir = tmp_dir("configure_codex_parse");
+        let codex_home = dir.join(".codex_home");
+        std::fs::create_dir_all(&codex_home).expect("create codex home override");
+        with_codex_home_override(&codex_home, || {
+            configure_codex(&dir).expect("configure_codex");
+        });
+
+        let content =
+            std::fs::read_to_string(dir.join(".codex/config.toml")).expect("read config.toml");
+        let parsed: toml::Value = toml::from_str(&content).unwrap_or_else(|e| {
+            panic!("configure_codex must write parseable TOML (was: {e})\n{content}")
+        });
+
+        let cmd = parsed
+            .get("mcp_servers")
+            .and_then(|v| v.get("agend-terminal"))
+            .and_then(|v| v.get("command"))
+            .and_then(|v| v.as_str())
+            .expect("mcp_servers.agend-terminal.command missing after round-trip");
+        assert_eq!(
+            cmd,
+            binary_path(),
+            "round-tripped command must equal binary_path() verbatim (no escape mangling)"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
