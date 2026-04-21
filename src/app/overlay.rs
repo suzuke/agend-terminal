@@ -323,7 +323,7 @@ pub(super) fn handle_key(
                     }
                     for (name, wd) in &closed {
                         if let Some(wd) = wd {
-                            crate::ops::cleanup_working_dir(ctx.home, name, wd);
+                            crate::agent_ops::cleanup_working_dir(ctx.home, name, wd);
                         }
                     }
                     outcome.needs_resize = true;
@@ -348,7 +348,7 @@ pub(super) fn handle_key(
                         outcome.needs_resize = true;
                     }
                     if let Some((name, Some(wd))) = closed {
-                        crate::ops::cleanup_working_dir(ctx.home, &name, &wd);
+                        crate::agent_ops::cleanup_working_dir(ctx.home, &name, &wd);
                     }
                 }
             }

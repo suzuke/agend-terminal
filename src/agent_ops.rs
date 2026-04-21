@@ -1,7 +1,3 @@
-// Commit 1 of Task #9 Option C is pure-additive: these functions exist but
-// have no callers yet (ops.rs and mcp/handlers.rs still use inline copies).
-// The swap lands in Commit 2. Matches the `#![allow(dead_code)]` on ops.rs.
-#![allow(dead_code)]
 //! Agent-level helpers shared between `ops.rs` and `mcp/handlers.rs`.
 //!
 //! These primitives were duplicated (with drift) between the two layers —
