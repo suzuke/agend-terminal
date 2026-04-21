@@ -118,7 +118,7 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: "test-attach",
-            backend_command: "/bin/bash",
+            backend_command: crate::default_shell(),
             args: &args,
             spawn_mode: backend::SpawnMode::Fresh,
             cols: 80,
@@ -326,11 +326,12 @@ pub fn run_demo() -> anyhow::Result<()> {
 
     let (crash_tx, _rx) = crossbeam::channel::unbounded::<String>();
     let args: Vec<String> = vec![];
+    let shell = crate::default_shell();
     for name in &["alice", "bob"] {
         agent::spawn_agent(
             &agent::SpawnConfig {
                 name,
-                backend_command: "/bin/bash",
+                backend_command: shell,
                 args: &args,
                 spawn_mode: backend::SpawnMode::Fresh,
                 cols: 60,

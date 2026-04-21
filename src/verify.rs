@@ -43,11 +43,11 @@ impl TestResult {
     }
 }
 
-/// Create a default SpawnConfig for test agents (bash).
+/// Create a default SpawnConfig for test agents (platform shell).
 fn test_spawn_config<'a>(name: &'a str, home: Option<&'a Path>) -> agent::SpawnConfig<'a> {
     agent::SpawnConfig {
         name,
-        backend_command: "/bin/bash",
+        backend_command: crate::default_shell(),
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
         cols: 80,
@@ -388,7 +388,7 @@ fn test_send(home: &Path) -> TestResult {
 fn test_create_delete(home: &Path) -> TestResult {
     if api::call(
         home,
-        &json!({"method": api::method::SPAWN, "params": {"name": "verify-dynamic", "backend": "/bin/bash"}}),
+        &json!({"method": api::method::SPAWN, "params": {"name": "verify-dynamic", "backend": crate::default_shell()}}),
     )
     .is_err()
     {

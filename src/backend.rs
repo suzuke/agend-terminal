@@ -14,7 +14,8 @@ pub enum Backend {
     OpenCode,
     Gemini,
     /// Generic shell (bash/zsh/sh). No preset wiring — inject/ready/resume are
-    /// all no-ops. Command defaults to `$SHELL` or `/bin/sh`.
+    /// all no-ops. Command defaults to `$SHELL` or the platform default
+    /// (`/bin/bash` on Unix, `cmd.exe` on Windows).
     Shell,
     /// Arbitrary executable path. No preset behavior; the stored string is the
     /// command to spawn verbatim.
@@ -54,8 +55,9 @@ impl Backend {
     }
 
     /// Actual command path to spawn. For [`Backend::Shell`] resolves to
-    /// `$SHELL` (with `/bin/sh` as fallback). For [`Backend::Raw`] returns the
-    /// literal stored path. For presets returns the static preset command.
+    /// `$SHELL` (falling back to the platform default — `/bin/bash` on Unix,
+    /// `cmd.exe` on Windows). For [`Backend::Raw`] returns the literal stored
+    /// path. For presets returns the static preset command.
     #[allow(dead_code)] // Call sites migrate in follow-up commits.
     pub fn command_string(&self) -> String {
         match self {
@@ -64,7 +66,9 @@ impl Backend {
             | Backend::Codex
             | Backend::OpenCode
             | Backend::Gemini => self.preset().command.to_string(),
-            Backend::Shell => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            Backend::Shell => {
+                std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string())
+            }
             Backend::Raw(path) => path.clone(),
         }
     }
@@ -622,15 +626,19 @@ mod tests {
         // Whatever $SHELL is in test env, result must be non-empty.
         let cmd = Backend::Shell.command_string();
         assert!(!cmd.is_empty());
-        // Unix: `/bin/bash`, `/bin/zsh`, etc.; fallback `/bin/sh`. Windows
+        // Unix: `/bin/bash`, `/bin/zsh`, etc.; fallback `/bin/bash`. Windows
         // under Git Bash translates POSIX SHELL into a Win32 path like
         // `C:\Program Files\Git\bin\bash.exe` before the child sees it, so
-        // accept drive-letter paths too. CI's plain PowerShell doesn't do
-        // the translation, which is why this test was green on windows-latest
-        // but failed when run locally through Git Bash.
+        // accept drive-letter paths too. CI's plain PowerShell has no $SHELL
+        // at all, so the Windows fallback is the bare `cmd.exe` name (PATH
+        // resolution handled by the shell spawn later).
         let unixish = cmd.starts_with('/');
         let winish = cmd.chars().nth(1) == Some(':') && cmd.chars().nth(2) == Some('\\');
-        assert!(unixish || winish, "unexpected shell path shape: {cmd:?}");
+        let bare_exe = cmd.ends_with(".exe") && !cmd.contains(['/', '\\']);
+        assert!(
+            unixish || winish || bare_exe,
+            "unexpected shell path shape: {cmd:?}"
+        );
     }
 
     #[test]
