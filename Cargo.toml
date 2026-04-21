@@ -82,3 +82,8 @@ windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_S
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "2"
+
+[dev-dependencies]
+# Used only for asserting that codex_trust_directory writes syntactically
+# valid TOML — the prod code appends raw text, it doesn't depend on this crate.
+toml = "0.8"

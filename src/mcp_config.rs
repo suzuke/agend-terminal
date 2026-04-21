@@ -375,7 +375,21 @@ fn codex_trust_directory(dir: &Path) {
     let config_path = codex_dir.join("config.toml");
     let lock_path = codex_dir.join(".config.toml.lock");
     let dir_str = dir.display().to_string();
-    let toml_key = format!("[projects.\"{dir_str}\"]");
+    // TOML literal strings (single-quoted) don't interpret escapes, which
+    // matters on Windows where paths contain `\U`, `\n`, etc. — a double-
+    // quoted `[projects."C:\Users\..."]` triggers codex's TOML parser with
+    // "too few unicode value digits". Fall back to escaped double-quoted
+    // only if the path contains a single quote (rare on Windows, impossible
+    // to represent otherwise inside a single-line literal).
+    let toml_key = if dir_str.contains('\'') {
+        let escaped = dir_str.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("[projects.\"{escaped}\"]")
+    } else {
+        format!("[projects.'{dir_str}']")
+    };
+    // Legacy double-quoted form written by pre-fix builds — detect so we
+    // don't append a duplicate on top of an already-broken entry.
+    let legacy_key = format!("[projects.\"{dir_str}\"]");
 
     // Shared helper — deliberately no truncate(true) (flock is on the
     // inode, file contents don't matter). Held for the rest of this
@@ -390,7 +404,7 @@ fn codex_trust_directory(dir: &Path) {
 
     // Re-read under the lock so a racing writer's entry is visible.
     let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-    if content.contains(&toml_key) {
+    if content.contains(&toml_key) || content.contains(&legacy_key) {
         return;
     }
 
@@ -784,7 +798,7 @@ mod tests {
         });
 
         let content = std::fs::read_to_string(&config_path).expect("read");
-        let key = format!("[projects.\"{}\"]", work_dir.display());
+        let key = format!("[projects.'{}']", work_dir.display());
         assert!(content.contains(&key), "missing {key} in {content}");
         assert!(content.contains("trust_level = \"trusted\""));
         std::fs::remove_dir_all(&dir).ok();
@@ -806,7 +820,7 @@ mod tests {
         });
 
         let content = std::fs::read_to_string(&config_path).expect("read");
-        let key = format!("[projects.\"{}\"]", work_dir.display());
+        let key = format!("[projects.'{}']", work_dir.display());
         assert_eq!(
             content.matches(&key).count(),
             1,
@@ -846,7 +860,7 @@ mod tests {
         }
 
         let content = std::fs::read_to_string(&config_path).expect("read");
-        let key = format!("[projects.\"{}\"]", work_dir.display());
+        let key = format!("[projects.'{}']", work_dir.display());
         assert_eq!(
             content.matches(&key).count(),
             1,
@@ -856,17 +870,52 @@ mod tests {
             content.contains("trust_level = \"trusted\""),
             "trust_level must be present after concurrent writes:\n{content}"
         );
-        // Sanity: every non-empty line is either a section header or key=val.
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            assert!(
-                trimmed.starts_with('[') || trimmed.contains('='),
-                "malformed toml line detected (likely interleaved writes): {line:?}"
-            );
-        }
+        // Real TOML parse — catches interleaved writes AND any future escape
+        // mismatch (e.g. the pre-fix double-quoted `[projects."..."]` bug where
+        // Windows backslashes got interpreted as unicode escapes).
+        toml::from_str::<toml::Value>(&content)
+            .unwrap_or_else(|e| panic!("invalid TOML after concurrent writes: {e}\n{content}"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_trust_windows_path_stays_valid_toml() {
+        // Regression guard for commit a457430 bug: when a path contains a TOML
+        // escape trigger (`\U`, `\n`, `\t`, …), a double-quoted `[projects."..."]`
+        // header silently broke codex's config.toml parser. The existing Unix
+        // /tmp-based tests never had a backslash in the path to trigger it.
+        //
+        // Fake a Windows-shape path via raw PathBuf so this test runs on every
+        // platform. codex_trust_directory will treat it as an opaque string and
+        // write it into config.toml — we then round-trip through a real TOML
+        // parser to confirm the file is syntactically valid.
+        let dir = tmp_dir("codex_trust_win_path");
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create .codex");
+        let config_path = codex_dir.join("config.toml");
+
+        let work_dir = std::path::PathBuf::from(r"C:\Users\alice\.agend\workspace\project");
+
+        with_codex_home_override(&codex_dir, || {
+            codex_trust_directory(&work_dir);
+        });
+
+        let content = std::fs::read_to_string(&config_path).expect("read");
+        let parsed: toml::Value = toml::from_str(&content)
+            .unwrap_or_else(|e| panic!("path-with-backslashes broke config.toml: {e}\n{content}"));
+        let projects = parsed
+            .get("projects")
+            .and_then(|v| v.as_table())
+            .expect("projects table missing");
+        let entry = projects
+            .get(r"C:\Users\alice\.agend\workspace\project")
+            .and_then(|v| v.as_table())
+            .expect("project entry missing — key was mangled during round-trip");
+        assert_eq!(
+            entry.get("trust_level").and_then(|v| v.as_str()),
+            Some("trusted"),
+            "trust_level wrong in round-tripped entry: {entry:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
