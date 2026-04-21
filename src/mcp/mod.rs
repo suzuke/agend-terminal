@@ -9,7 +9,7 @@ pub mod tools;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 
 /// Tool authz: returns `(allow, deny)` sets parsed from
 /// `AGEND_MCP_TOOLS_ALLOW` / `AGEND_MCP_TOOLS_DENY` (comma-separated,
@@ -84,7 +84,7 @@ struct JsonRpcRequest {
 
 /// Read a message from stdin — supports both NDJSON (Claude Code) and Content-Length framing.
 /// Auto-detects format: if first non-empty char is '{', it's NDJSON. Otherwise Content-Length.
-fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<String>> {
+fn read_message(reader: &mut impl BufRead) -> anyhow::Result<Option<String>> {
     let mut line = String::new();
     loop {
         line.clear();
@@ -116,7 +116,9 @@ fn read_message(reader: &mut BufReader<io::StdinLock>) -> anyhow::Result<Option<
                         "invalid Content-Length; frame discarded"
                     );
                     let mut empty = String::new();
-                    let _ = reader.read_line(&mut empty);
+                    if reader.read_line(&mut empty)? == 0 {
+                        return Ok(None); // EOF while resync
+                    }
                     continue;
                 }
             };
@@ -344,6 +346,25 @@ mod tests {
         assert!(tool_is_allowed("inbox"));
         assert!(!tool_is_allowed("delete_instance"));
         restore_env(prev);
+    }
+
+    #[test]
+    fn read_message_eof_during_bad_content_length_resync() {
+        // Content-Length with garbage value, followed by immediate EOF.
+        // Must return Ok(None), not loop forever.
+        let input = b"Content-Length: garbage\n";
+        let mut reader = io::BufReader::new(&input[..]);
+        let result = read_message(&mut reader).expect("should not error");
+        assert!(result.is_none(), "expected None on EOF during resync");
+    }
+
+    #[test]
+    fn read_message_resync_after_bad_content_length() {
+        // Bad header + separator, then a valid NDJSON line follows.
+        let input = b"Content-Length: xyz\n\n{\"ok\":true}\n";
+        let mut reader = io::BufReader::new(&input[..]);
+        let result = read_message(&mut reader).expect("should not error");
+        assert_eq!(result.as_deref(), Some("{\"ok\":true}"));
     }
 
     #[test]
