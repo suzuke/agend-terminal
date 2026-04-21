@@ -320,12 +320,16 @@ fn branch_rejects_invalid_names() {
 // When the daemon is not running, tools that call api::call should either
 // fall back gracefully or return a clear error. No panics, no hangs.
 
-/// Helper: call a tool in a home dir with no running daemon.
-fn call_tool_no_daemon(tool: &str, args: &Value) -> Value {
+#[test]
+fn list_instances_falls_back_when_daemon_down() {
     let home = temp_home("no-daemon");
-    let result = call_tool(&home, tool, args);
+    let result = call_tool(&home, "list_instances", &json!({}));
     std::fs::remove_dir_all(&home).ok();
-    result
+    // Should fall back to file-based list, returning an "instances" array
+    assert!(
+        result.get("instances").is_some(),
+        "expected instances array fallback, got: {result}"
+    );
 }
 
 #[test]
@@ -351,16 +355,6 @@ fn send_to_instance_falls_back_when_daemon_down() {
         "expected unavailable/direct note, got: {note}"
     );
     std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn list_instances_falls_back_when_daemon_down() {
-    let result = call_tool_no_daemon("list_instances", &json!({}));
-    // Should fall back to file-based list, returning an "instances" array
-    assert!(
-        result.get("instances").is_some(),
-        "expected instances array fallback, got: {result}"
-    );
 }
 
 /// Per-tool daemon-down behavior pinned to specific response shapes.
@@ -515,7 +509,7 @@ fn broadcast_team_takes_priority_over_targets() {
 }
 
 #[test]
-fn broadcast_without_team_or_targets_sends_to_all() {
+fn broadcast_without_team_or_targets_returns_valid_response() {
     let home = temp_home("bcast-all");
     // No daemon running → list_agents returns empty → sent_to should be empty
     let result = call_tool_as(
@@ -534,5 +528,29 @@ fn broadcast_without_team_or_targets_sends_to_all() {
     // Self should never appear even if list_agents somehow included it
     let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
     assert!(!names.contains(&"sender"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn broadcast_with_tags_falls_through_to_all() {
+    // tags param is mentioned in code comment but not implemented.
+    // When only tags is provided (no team, no targets), broadcast falls
+    // through to the all-agents path. This test pins that behavior.
+    let home = temp_home("bcast-tags");
+    let result = call_tool_as(
+        &home,
+        "sender",
+        "broadcast",
+        &json!({"tags": ["backend"], "message": "hello tagged"}),
+    );
+    let sent = result["sent_to"].as_array().expect("sent_to array");
+    // No daemon → list_agents empty → sent_to empty (tags ignored)
+    assert!(
+        result.get("count").is_some(),
+        "expected count field, got: {result}"
+    );
+    // tags param had no effect — same as no-filter broadcast
+    let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
+    assert!(!names.contains(&"sender"), "self should be excluded");
     std::fs::remove_dir_all(&home).ok();
 }
