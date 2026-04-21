@@ -383,3 +383,140 @@ fn api_dependent_tools_do_not_panic_when_daemon_down() {
     }
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Slice 3: Broadcast Target Resolution
+// ---------------------------------------------------------------------------
+// Priority: team > targets > (all). Self is always excluded.
+
+/// Helper: create a team by writing directly to the teams store file.
+fn setup_team(home: &std::path::Path, name: &str, members: &[&str]) {
+    let store_path = home.join("teams.json");
+    let members_json: Vec<Value> = members.iter().map(|m| json!(m)).collect();
+    let store = if store_path.exists() {
+        let content = std::fs::read_to_string(&store_path).unwrap_or_default();
+        serde_json::from_str::<Value>(&content).unwrap_or(json!({"schema_version": 1, "teams": []}))
+    } else {
+        json!({"schema_version": 1, "teams": []})
+    };
+    let mut teams = store["teams"].as_array().cloned().unwrap_or_default();
+    teams.push(json!({
+        "name": name,
+        "members": members_json,
+        "created_at": "2026-01-01T00:00:00Z"
+    }));
+    let new_store = json!({"schema_version": 1, "teams": teams});
+    std::fs::write(
+        &store_path,
+        serde_json::to_string_pretty(&new_store).expect("json"),
+    )
+    .expect("write teams.json");
+}
+
+#[test]
+fn broadcast_with_team_resolves_to_team_members() {
+    let home = temp_home("bcast-team");
+    setup_team(&home, "my-team", &["agent-a", "agent-b"]);
+    let result = call_tool_as(
+        &home,
+        "sender",
+        "broadcast",
+        &json!({"team": "my-team", "message": "hello team"}),
+    );
+    // Should resolve to team members, excluding self
+    let sent = result["sent_to"].as_array();
+    assert!(sent.is_some(), "expected sent_to array, got: {result}");
+    let sent = sent.expect("sent_to");
+    // sender is not in the team, so all members should be included
+    let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
+    assert!(names.contains(&"agent-a"), "expected agent-a in {names:?}");
+    assert!(names.contains(&"agent-b"), "expected agent-b in {names:?}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn broadcast_with_targets_uses_explicit_list() {
+    let home = temp_home("bcast-targets");
+    let result = call_tool_as(
+        &home,
+        "sender",
+        "broadcast",
+        &json!({"targets": ["target-1", "target-2"], "message": "hello"}),
+    );
+    let sent = result["sent_to"].as_array().expect("sent_to array");
+    let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"target-1"));
+    assert!(names.contains(&"target-2"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn broadcast_excludes_self_from_targets() {
+    let home = temp_home("bcast-self");
+    let result = call_tool_as(
+        &home,
+        "me",
+        "broadcast",
+        &json!({"targets": ["me", "other"], "message": "hello"}),
+    );
+    let sent = result["sent_to"].as_array().expect("sent_to array");
+    let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        !names.contains(&"me"),
+        "self should be excluded, got: {names:?}"
+    );
+    assert!(names.contains(&"other"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn broadcast_team_takes_priority_over_targets() {
+    let home = temp_home("bcast-priority");
+    setup_team(&home, "priority-team", &["team-member"]);
+    // Pass both team and targets — team should win
+    let result = call_tool_as(
+        &home,
+        "sender",
+        "broadcast",
+        &json!({
+            "team": "priority-team",
+            "targets": ["explicit-target"],
+            "message": "hello"
+        }),
+    );
+    let sent = result["sent_to"].as_array().expect("sent_to array");
+    let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
+    assert!(
+        names.contains(&"team-member"),
+        "team should take priority, got: {names:?}"
+    );
+    assert!(
+        !names.contains(&"explicit-target"),
+        "explicit target should be ignored when team is set, got: {names:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn broadcast_without_team_or_targets_sends_to_all() {
+    let home = temp_home("bcast-all");
+    // No daemon running → list_agents returns empty → sent_to should be empty
+    let result = call_tool_as(
+        &home,
+        "sender",
+        "broadcast",
+        &json!({"message": "hello everyone"}),
+    );
+    let sent = result["sent_to"].as_array().expect("sent_to array");
+    // With no daemon, list_agents() returns empty, so sent_to is empty
+    // The key invariant: it doesn't panic and returns a valid response
+    assert!(
+        result.get("count").is_some(),
+        "expected count field, got: {result}"
+    );
+    // Self should never appear even if list_agents somehow included it
+    let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
+    assert!(!names.contains(&"sender"));
+    std::fs::remove_dir_all(&home).ok();
+}
