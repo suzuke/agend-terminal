@@ -212,7 +212,9 @@ fn parse_run_at(raw: &str, tz_name: &str) -> Result<String, String> {
     let naive = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M"))
         .map_err(|e| format!("invalid run_at {raw:?}: {e} (expected ISO 8601)"))?;
-    let tz: chrono_tz::Tz = tz_name.parse().unwrap_or(chrono_tz::UTC);
+    let tz: chrono_tz::Tz = tz_name
+        .parse()
+        .map_err(|_| format!("unknown timezone: {tz_name}"))?;
     use chrono::TimeZone;
     match tz.from_local_datetime(&naive).single() {
         Some(dt) => Ok(dt.to_rfc3339()),
