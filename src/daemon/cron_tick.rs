@@ -46,14 +46,17 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
         } else {
             sched.timezone.as_str()
         };
-        let tz: chrono_tz::Tz = tz_name.parse().unwrap_or_else(|_| {
-            tracing::warn!(
-                schedule = %sched.id,
-                timezone = tz_name,
-                "unknown timezone, falling back to UTC"
-            );
-            chrono_tz::UTC
-        });
+        let tz: chrono_tz::Tz = match tz_name.parse() {
+            Ok(t) => t,
+            Err(_) => {
+                tracing::error!(
+                    schedule = %sched.id,
+                    timezone = tz_name,
+                    "unknown timezone, skipping schedule"
+                );
+                continue;
+            }
+        };
 
         // Decide whether this schedule is due and whether firing it
         // consumes it (one-shot auto-disable). The outcome is a small
@@ -314,17 +317,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_timezone_name_falls_back_to_utc() {
-        // `check_schedules` uses `tz_name.parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::UTC)`
-        // — lock in that contract so a future rewrite can't silently start panicking
-        // or treating the fallback as a different zone.
-        let resolved: chrono_tz::Tz = "Not/A_Real_Zone"
-            .parse::<chrono_tz::Tz>()
-            .unwrap_or(chrono_tz::UTC);
-        assert_eq!(resolved, chrono_tz::UTC);
-        // And the empty string also cleanly falls back.
-        let resolved: chrono_tz::Tz = "".parse::<chrono_tz::Tz>().unwrap_or(chrono_tz::UTC);
-        assert_eq!(resolved, chrono_tz::UTC);
+    fn unknown_timezone_name_is_rejected() {
+        // Invalid timezone names must fail to parse so check_schedules
+        // skips them rather than silently falling back to UTC.
+        assert!("Not/A_Real_Zone".parse::<chrono_tz::Tz>().is_err());
+        assert!("".parse::<chrono_tz::Tz>().is_err());
     }
 
     #[test]
