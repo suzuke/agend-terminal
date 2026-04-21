@@ -8,7 +8,7 @@
 
 use std::process::Command;
 
-use super::OpenInTerminal;
+use super::{spawn_detached, OpenInTerminal};
 
 pub struct WindowsTerminal {
     terminal: String,
@@ -34,11 +34,9 @@ impl OpenInTerminal for WindowsTerminal {
 }
 
 fn run_wt(cmd: &[&str]) -> anyhow::Result<()> {
-    let status = Command::new("wt.exe").args(cmd).status()?;
-    if !status.success() {
-        anyhow::bail!("wt.exe failed with {status}");
-    }
-    Ok(())
+    let mut c = Command::new("wt.exe");
+    c.args(cmd);
+    spawn_detached(c)
 }
 
 fn run_conhost(cmd: &[&str]) -> anyhow::Result<()> {
@@ -46,16 +44,9 @@ fn run_conhost(cmd: &[&str]) -> anyhow::Result<()> {
     // conhost window. The quoted "title" is consumed by `start` as the
     // new window title — skipping it would make start treat prog as a
     // title instead. (Documented gotcha in cmd.exe.)
-    let status = Command::new("cmd")
-        .arg("/c")
-        .arg("start")
-        .arg("agend-terminal")
-        .args(cmd)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("cmd /c start failed with {status}");
-    }
-    Ok(())
+    let mut c = Command::new("cmd");
+    c.arg("/c").arg("start").arg("agend-terminal").args(cmd);
+    spawn_detached(c)
 }
 
 /// PLAN contract: "other | treated as executable, invoked with `app` as
@@ -64,10 +55,12 @@ fn run_conhost(cmd: &[&str]) -> anyhow::Result<()> {
 /// name) as its argv. Power users who configure `alacritty.exe` etc.
 /// will probably want `-e` style dispatch — revisit in task #4 after
 /// real usage signal.
+///
+/// Must detach — if `other` is a real foreground terminal emulator
+/// (alacritty.exe, wezterm-gui.exe), `.status()` would block the tray
+/// for the window's full lifetime (same class as the Linux bug).
 fn run_other(exe: &str, cmd: &[&str]) -> anyhow::Result<()> {
-    let status = Command::new(exe).args(&cmd[1..]).status()?;
-    if !status.success() {
-        anyhow::bail!("{exe} failed with {status}");
-    }
-    Ok(())
+    let mut c = Command::new(exe);
+    c.args(&cmd[1..]);
+    spawn_detached(c)
 }

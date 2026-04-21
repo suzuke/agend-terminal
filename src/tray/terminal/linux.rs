@@ -4,7 +4,7 @@
 
 use std::{path::Path, process::Command};
 
-use super::OpenInTerminal;
+use super::{spawn_detached, OpenInTerminal};
 
 pub struct LinuxTerminal {
     terminal: String,
@@ -53,11 +53,10 @@ impl OpenInTerminal for LinuxTerminal {
                 c.arg("-e").args(cmd);
             }
         }
-        let status = c.status()?;
-        if !status.success() {
-            anyhow::bail!("{term} failed with {status}");
-        }
-        Ok(())
+        // Must detach — xterm/kitty/alacritty/many konsole setups stay
+        // foreground, so .status() would freeze the tray event loop for
+        // the lifetime of the spawned terminal window.
+        spawn_detached(c)
     }
 }
 

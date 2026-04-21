@@ -3,7 +3,7 @@
 
 use std::process::Command;
 
-use super::OpenInTerminal;
+use super::{spawn_detached, OpenInTerminal};
 
 pub struct MacTerminal {
     terminal: String,
@@ -32,32 +32,24 @@ impl OpenInTerminal for MacTerminal {
 /// `open -na <app> --args <cmd...>` — Terminal.app interprets the trailing
 /// args as the command to run in the new window.
 fn run_open(app: &str, cmd: &[&str]) -> anyhow::Result<()> {
-    let status = Command::new("open")
-        .arg("-na")
-        .arg(app)
-        .arg("--args")
-        .args(cmd)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("open -na {app} failed with {status}");
-    }
-    Ok(())
+    let mut c = Command::new("open");
+    c.arg("-na").arg(app).arg("--args").args(cmd);
+    // `open` is already fire-and-forget — routing through
+    // `spawn_detached` keeps behaviour uniform with the Linux path so
+    // this trait never blocks the tray event loop (see mod.rs).
+    spawn_detached(c)
 }
 
 /// `open -na Ghostty --args -e '<shell-quoted cmd>'` — Ghostty treats `-e`
 /// as a shell command string.
 fn run_open_dash_e(app: &str, cmd: &[&str]) -> anyhow::Result<()> {
-    let status = Command::new("open")
-        .arg("-na")
+    let mut c = Command::new("open");
+    c.arg("-na")
         .arg(app)
         .arg("--args")
         .arg("-e")
-        .arg(shell_quote(cmd))
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("open -na {app} -e failed with {status}");
-    }
-    Ok(())
+        .arg(shell_quote(cmd));
+    spawn_detached(c)
 }
 
 /// iTerm2 ignores `open --args` on an already-running instance, so we
@@ -70,11 +62,9 @@ fn run_iterm(cmd: &[&str]) -> anyhow::Result<()> {
     create window with default profile command "{cmd_str}"
 end tell"#
     );
-    let status = Command::new("osascript").arg("-e").arg(&script).status()?;
-    if !status.success() {
-        anyhow::bail!("osascript (iTerm2) failed with {status}");
-    }
-    Ok(())
+    let mut c = Command::new("osascript");
+    c.arg("-e").arg(&script);
+    spawn_detached(c)
 }
 
 /// Minimal POSIX-style shell quoting. Used for terminals that take a
