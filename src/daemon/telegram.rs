@@ -4,6 +4,17 @@ use teloxide::prelude::Requester;
 
 /// Send a notification to Telegram (instance topic or general).
 pub fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
+    notify_telegram_inner(home, instance_name, text, false);
+}
+
+/// Send a notification with Telegram's `disable_notification` flag set — the
+/// message still appears in the topic but does not push/vibrate the operator.
+/// Use for state-recovery pings that should not compete with real alerts.
+pub fn notify_telegram_silent(home: &Path, instance_name: &str, text: &str) {
+    notify_telegram_inner(home, instance_name, text, true);
+}
+
+fn notify_telegram_inner(home: &Path, instance_name: &str, text: &str, disable_notification: bool) {
     let config = match crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
         Ok(c) => c,
         Err(_) => return,
@@ -41,14 +52,20 @@ pub fn notify_telegram(home: &Path, instance_name: &str, text: &str) {
                 let chat_id = teloxide::types::ChatId(group_id);
                 match topic_id {
                     Some(tid) if tid != 1 => {
-                        bot.send_message(chat_id, &text)
-                            .message_thread_id(teloxide::types::ThreadId(
-                                teloxide::types::MessageId(tid),
-                            ))
-                            .await?;
+                        let mut req = bot.send_message(chat_id, &text).message_thread_id(
+                            teloxide::types::ThreadId(teloxide::types::MessageId(tid)),
+                        );
+                        if disable_notification {
+                            req = req.disable_notification(true);
+                        }
+                        req.await?;
                     }
                     _ => {
-                        bot.send_message(chat_id, &text).await?;
+                        let mut req = bot.send_message(chat_id, &text);
+                        if disable_notification {
+                            req = req.disable_notification(true);
+                        }
+                        req.await?;
                     }
                 }
                 Ok::<(), anyhow::Error>(())

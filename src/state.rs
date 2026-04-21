@@ -445,6 +445,12 @@ pub struct StateTracker {
     /// then triggered again) re-arms it, but repeated supervisor ticks while
     /// still in the same InteractivePrompt won't re-spam.
     interactive_prompt_pending_notice: bool,
+    /// Set to true the moment we leave a blocked state (InteractivePrompt /
+    /// AwaitingOperator) to a non-blocked state; cleared by
+    /// `take_recovery_notice()` once the supervisor has forwarded a Telegram
+    /// "ready again" notice. Pairs with `interactive_prompt_pending_notice`
+    /// so operators get symmetrical enter/exit signals.
+    interactive_recovery_pending_notice: bool,
 }
 
 fn hash_screen(text: &str) -> u64 {
@@ -467,6 +473,7 @@ impl StateTracker {
             last_screen_hash: None,
             patterns: backend.map(StatePatterns::for_backend),
             interactive_prompt_pending_notice: false,
+            interactive_recovery_pending_notice: false,
         }
     }
 
@@ -477,6 +484,20 @@ impl StateTracker {
     pub fn take_interactive_prompt_notice(&mut self) -> bool {
         if self.interactive_prompt_pending_notice {
             self.interactive_prompt_pending_notice = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns true at most once per recovery from a blocked state
+    /// (InteractivePrompt / AwaitingOperator → non-blocked). The supervisor
+    /// calls this each tick; it returns true only on the first tick after the
+    /// recovery transition so Telegram sees one "ready again" notice, not
+    /// one per tick.
+    pub fn take_recovery_notice(&mut self) -> bool {
+        if self.interactive_recovery_pending_notice {
+            self.interactive_recovery_pending_notice = false;
             true
         } else {
             false
@@ -617,6 +638,17 @@ impl StateTracker {
         // no-op path (rejected by hysteresis) doesn't arm.
         if self.current == AgentState::InteractivePrompt && prev != AgentState::InteractivePrompt {
             self.interactive_prompt_pending_notice = true;
+        }
+
+        // Symmetric recovery notice: whenever we leave a blocked state
+        // (InteractivePrompt / AwaitingOperator) for a non-blocked state,
+        // arm a one-shot "ready again" notice. Also gated on the actual
+        // transition so hysteresis-rejected calls don't arm.
+        if prev.wants_raw_keystrokes()
+            && !self.current.wants_raw_keystrokes()
+            && prev != self.current
+        {
+            self.interactive_recovery_pending_notice = true;
         }
     }
 }
@@ -1327,6 +1359,74 @@ mod tests {
         // Clear screen, banner alone re-renders.
         drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
         assert_eq!(st.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn recovery_notice_armed_when_leaving_interactive_prompt() {
+        // Fresh tracker has nothing armed.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        assert!(!st.take_recovery_notice());
+
+        // Enter InteractivePrompt.
+        drive(
+            &mut vt,
+            &mut st,
+            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+        // Still nothing to report — we only arm when we LEAVE the blocked
+        // state, not when we enter it.
+        assert!(!st.take_recovery_notice());
+
+        // Dismiss → Ready.
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+
+        // First take fires; subsequent ticks within the same Ready don't
+        // re-spam.
+        assert!(st.take_recovery_notice(), "recovery must arm on exit");
+        assert!(
+            !st.take_recovery_notice(),
+            "supervisor ticks after the first must not re-arm"
+        );
+    }
+
+    #[test]
+    fn recovery_notice_armed_when_leaving_awaiting_operator() {
+        // AwaitingOperator → Ready goes through `transition()` with the
+        // forced AwaitingOperator as the previous state, so the symmetric
+        // arm path still fires.
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        st.set_awaiting_operator();
+        assert_eq!(st.get_state(), AgentState::AwaitingOperator);
+        assert!(!st.take_recovery_notice());
+
+        // Fresh Ready banner appears. Ready (prio 3) > AwaitingOperator
+        // (prio 2) so the transition is immediate.
+        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+        assert!(
+            st.take_recovery_notice(),
+            "recovery must arm on AwaitingOperator → Ready"
+        );
+    }
+
+    #[test]
+    fn recovery_notice_not_armed_for_unrelated_transitions() {
+        // Ready → Thinking → Ready must not arm the recovery notice: the
+        // operator never saw a blocked state, so "ready again" is noise.
+        let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+        st.current = AgentState::Ready;
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        st.transition(AgentState::Thinking);
+        assert_eq!(st.get_state(), AgentState::Thinking);
+        st.since = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        st.transition(AgentState::Ready);
+        assert_eq!(st.get_state(), AgentState::Ready);
+        assert!(!st.take_recovery_notice());
     }
 
     #[test]
