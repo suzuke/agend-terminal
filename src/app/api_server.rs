@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::TuiEventSender;
+use super::TuiNotifier;
 
 pub(super) struct ApiGuard {
     run_dir: Option<PathBuf>,
@@ -48,6 +49,8 @@ pub(super) fn start_api_server(
     let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    let notifier: Arc<dyn crate::api::ApiNotifier> = Arc::new(TuiNotifier { tx: tui_tx });
+
     std::thread::Builder::new()
         .name("app_api_server".into())
         .spawn(move || {
@@ -57,7 +60,7 @@ pub(super) fn start_api_server(
                 shutdown,
                 configs,
                 externals,
-                Some(tui_tx),
+                Some(notifier),
             );
         })
         .ok();

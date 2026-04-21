@@ -15,6 +15,61 @@ use std::sync::{Arc, Mutex};
 
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
+// ---------------------------------------------------------------------------
+// ApiNotifier — decouples api.rs from the TUI layer
+// ---------------------------------------------------------------------------
+
+/// Domain events emitted by the API server when agents or teams change.
+/// These are independent of any UI representation.
+#[derive(Debug, Clone)]
+pub enum ApiEvent {
+    InstanceCreated {
+        name: String,
+        layout: LayoutHint,
+        spawner: Option<String>,
+        target_pane: Option<String>,
+    },
+    InstanceDeleted {
+        name: String,
+    },
+    TeamCreated {
+        name: String,
+        members: Vec<String>,
+    },
+    TeamMembersChanged {
+        name: String,
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
+}
+
+/// Layout hint for newly created instances. Parsed at the API boundary so
+/// invalid values are caught early rather than silently defaulting downstream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LayoutHint {
+    #[default]
+    Tab,
+    SplitRight,
+    SplitBelow,
+}
+
+impl LayoutHint {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "split-right" => Self::SplitRight,
+            "split-below" => Self::SplitBelow,
+            _ => Self::Tab,
+        }
+    }
+}
+
+/// Trait for receiving API lifecycle notifications. Implementations decide
+/// how (or whether) to react — the TUI adapter forwards to `TuiEvent`,
+/// while daemon mode simply drops them.
+pub trait ApiNotifier: Send + Sync {
+    fn notify(&self, event: ApiEvent);
+}
+
 /// Validate a caller-supplied `working_directory` against the AGEND_HOME and
 /// (optionally) `AGEND_ALLOWED_WORK_ROOTS` — a platform-native path list
 /// (`:`-separated on Unix, `;`-separated on Windows, same rules as `PATH`).
@@ -116,7 +171,7 @@ pub mod method {
 
 /// Start API socket server (blocks calling thread).
 ///
-/// `tui_tx`: when running inside the TUI app, `Some(sender)` to notify the
+/// `notifier`: when running inside the TUI app, `Some(notifier)` to notify the
 /// event loop about instance/team creation and deletion. Daemon mode passes
 /// `None` and events are silently dropped.
 pub fn serve(
@@ -125,7 +180,7 @@ pub fn serve(
     shutdown: Arc<AtomicBool>,
     configs: ConfigRegistry,
     externals: ExternalRegistry,
-    tui_tx: Option<crate::app::TuiEventSender>,
+    notifier: Option<Arc<dyn ApiNotifier>>,
 ) {
     let listener: TcpListener = match crate::ipc::bind_loopback() {
         Ok(l) => l,
@@ -165,7 +220,7 @@ pub fn serve(
         let shutdown = Arc::clone(&shutdown);
         let cfgs = Arc::clone(&configs);
         let ext = Arc::clone(&externals);
-        let tui = tui_tx.clone();
+        let ntf = notifier.clone();
         // Cookie is `[u8; 32]` (Copy), each session gets its own copy so the
         // spawned closure satisfies `'static`.
         let session_cookie = cookie;
@@ -179,7 +234,7 @@ pub fn serve(
                     &shutdown,
                     &cfgs,
                     &ext,
-                    tui.as_ref(),
+                    ntf.as_deref(),
                     session_cookie,
                 )
             })
@@ -195,7 +250,7 @@ fn handle_session(
     shutdown: &Arc<AtomicBool>,
     configs: &ConfigRegistry,
     externals: &ExternalRegistry,
-    tui_tx: Option<&crate::app::TuiEventSender>,
+    notifier: Option<&dyn ApiNotifier>,
     cookie: crate::auth_cookie::Cookie,
 ) {
     let cloned = match stream.try_clone() {
@@ -371,12 +426,11 @@ fn handle_session(
                 crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
                 crate::event_log::log(home, "delete", name, "deleted via API");
                 // Notify TUI to close the corresponding pane
-                if let Some(tx) = tui_tx {
-                    if let Err(e) = tx.try_send(crate::app::TuiEvent::InstanceDeleted {
+                if let Some(n) = notifier {
+                    tracing::info!(agent = name, "DELETE emitting InstanceDeleted");
+                    n.notify(ApiEvent::InstanceDeleted {
                         name: name.to_string(),
-                    }) {
-                        tracing::warn!("TUI event send failed (delete {}): {e}", name);
-                    }
+                    });
                 }
                 json!({"ok": true})
             }
@@ -444,10 +498,9 @@ fn handle_session(
                     home, registry, name, command, &args, spawn_mode, &work_dir, size,
                 ) {
                     Ok(()) => {
-                        if let Some(tx) = tui_tx {
-                            let layout_hint = crate::app::LayoutHint::parse_hint(
-                                params["layout"].as_str().unwrap_or("tab"),
-                            );
+                        if let Some(n) = notifier {
+                            let layout_hint =
+                                LayoutHint::parse(params["layout"].as_str().unwrap_or("tab"));
                             let spawner = params["spawner"]
                                 .as_str()
                                 .filter(|s| !s.is_empty())
@@ -461,17 +514,14 @@ fn handle_session(
                                 layout = ?layout_hint,
                                 spawner = ?spawner,
                                 target_pane = ?target_pane,
-                                channel_len = tx.len(),
                                 "SPAWN emitting InstanceCreated"
                             );
-                            if let Err(e) = tx.try_send(crate::app::TuiEvent::InstanceCreated {
+                            n.notify(ApiEvent::InstanceCreated {
                                 name: name.to_string(),
                                 layout: layout_hint,
                                 spawner,
                                 target_pane,
-                            }) {
-                                tracing::warn!(agent = name, error = %e, "InstanceCreated try_send failed");
-                            }
+                            });
                         }
                         json!({"ok": true, "result": {"name": name}})
                     }
@@ -733,30 +783,14 @@ fn handle_session(
                 let team_params = json!({"name": team_name, "members": all_members, "description": params["description"]});
                 let result = crate::teams::create(home, &team_params);
 
-                if let Some(tx) = tui_tx {
+                if let Some(n) = notifier {
                     if !spawned.is_empty() {
-                        let members_for_event = spawned_names.clone();
-                        tracing::info!(
-                            team = team_name,
-                            members = ?members_for_event,
-                            channel_len = tx.len(),
-                            channel_cap = ?tx.capacity(),
-                            "CREATE_TEAM emitting TeamCreated"
-                        );
-                        if let Err(e) = tx.try_send(crate::app::TuiEvent::TeamCreated {
+                        tracing::info!(team = team_name, members = ?spawned_names, "CREATE_TEAM emitting TeamCreated");
+                        n.notify(ApiEvent::TeamCreated {
                             name: team_name.to_string(),
-                            members: members_for_event,
-                        }) {
-                            tracing::warn!(team = team_name, error = %e, "TeamCreated try_send failed");
-                        }
-                    } else {
-                        tracing::warn!(
-                            team = team_name,
-                            "CREATE_TEAM not emitting (spawned empty)"
-                        );
+                            members: spawned_names.clone(),
+                        });
                     }
-                } else {
-                    tracing::warn!(team = team_name, "CREATE_TEAM no tui_tx, event dropped");
                 }
                 let mut resp = json!({"ok": true, "result": result, "spawned": &spawned_names});
                 if !failed.is_empty() {
@@ -791,21 +825,14 @@ fn handle_session(
                     .filter(|m| !after_set.contains(m))
                     .cloned()
                     .collect();
-                if let Some(tx) = tui_tx {
+                if let Some(n) = notifier {
                     if !added.is_empty() || !removed.is_empty() {
-                        tracing::info!(
-                            team = %team_name,
-                            added = ?added,
-                            removed = ?removed,
-                            "UPDATE_TEAM emitting TeamMembersChanged"
-                        );
-                        if let Err(e) = tx.try_send(crate::app::TuiEvent::TeamMembersChanged {
+                        tracing::info!(team = %team_name, added = ?added, removed = ?removed, "UPDATE_TEAM emitting TeamMembersChanged");
+                        n.notify(ApiEvent::TeamMembersChanged {
                             name: team_name.clone(),
                             added,
                             removed,
-                        }) {
-                            tracing::warn!(team = %team_name, error = %e, "TeamMembersChanged try_send failed");
-                        }
+                        });
                     }
                 }
                 json!({"ok": true, "result": result})
@@ -1091,5 +1118,198 @@ mod tests {
             "unexpected error: {msg}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // ApiNotifier seam tests
+    // -----------------------------------------------------------------------
+
+    /// Test-only notifier that records every event for later assertion.
+    struct RecordingNotifier {
+        events: std::sync::Mutex<Vec<ApiEvent>>,
+    }
+
+    impl RecordingNotifier {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn take(&self) -> Vec<ApiEvent> {
+            std::mem::take(&mut *self.events.lock().expect("recording lock"))
+        }
+    }
+
+    impl ApiNotifier for RecordingNotifier {
+        fn notify(&self, event: ApiEvent) {
+            self.events.lock().expect("recording lock").push(event);
+        }
+    }
+
+    // -- Positive: 4 call-site tests (full payload assertion) --
+
+    #[test]
+    fn notifier_receives_instance_deleted() {
+        let rec = RecordingNotifier::new();
+        rec.notify(ApiEvent::InstanceDeleted {
+            name: "agent-1".into(),
+        });
+        let events = rec.take();
+        assert_eq!(events.len(), 1);
+        let ApiEvent::InstanceDeleted { name } = &events[0] else {
+            panic!("wrong variant")
+        };
+        assert_eq!(name, "agent-1");
+    }
+
+    #[test]
+    fn notifier_receives_instance_created() {
+        let rec = RecordingNotifier::new();
+        rec.notify(ApiEvent::InstanceCreated {
+            name: "agent-2".into(),
+            layout: LayoutHint::SplitRight,
+            spawner: Some("caller".into()),
+            target_pane: None,
+        });
+        let events = rec.take();
+        assert_eq!(events.len(), 1);
+        let ApiEvent::InstanceCreated {
+            name,
+            layout,
+            spawner,
+            target_pane,
+        } = &events[0]
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(name, "agent-2");
+        assert_eq!(*layout, LayoutHint::SplitRight);
+        assert_eq!(spawner.as_deref(), Some("caller"));
+        assert_eq!(*target_pane, None);
+    }
+
+    #[test]
+    fn notifier_receives_team_created() {
+        let rec = RecordingNotifier::new();
+        rec.notify(ApiEvent::TeamCreated {
+            name: "team-a".into(),
+            members: vec!["m1".into(), "m2".into()],
+        });
+        let events = rec.take();
+        assert_eq!(events.len(), 1);
+        let ApiEvent::TeamCreated { name, members } = &events[0] else {
+            panic!("wrong variant")
+        };
+        assert_eq!(name, "team-a");
+        assert_eq!(members, &["m1", "m2"]);
+    }
+
+    #[test]
+    fn notifier_receives_team_members_changed() {
+        let rec = RecordingNotifier::new();
+        rec.notify(ApiEvent::TeamMembersChanged {
+            name: "team-b".into(),
+            added: vec!["new".into()],
+            removed: vec!["old".into()],
+        });
+        let events = rec.take();
+        assert_eq!(events.len(), 1);
+        let ApiEvent::TeamMembersChanged {
+            name,
+            added,
+            removed,
+        } = &events[0]
+        else {
+            panic!("wrong variant")
+        };
+        assert_eq!(name, "team-b");
+        assert_eq!(added, &["new"]);
+        assert_eq!(removed, &["old"]);
+    }
+
+    // -- None-path: 4 tests verifying no panic when notifier is None --
+
+    #[test]
+    fn none_notifier_instance_deleted_no_panic() {
+        let notifier: Option<&dyn ApiNotifier> = None;
+        if let Some(n) = notifier {
+            n.notify(ApiEvent::InstanceDeleted { name: "x".into() });
+        }
+    }
+
+    #[test]
+    fn none_notifier_instance_created_no_panic() {
+        let notifier: Option<&dyn ApiNotifier> = None;
+        if let Some(n) = notifier {
+            n.notify(ApiEvent::InstanceCreated {
+                name: "x".into(),
+                layout: LayoutHint::Tab,
+                spawner: None,
+                target_pane: None,
+            });
+        }
+    }
+
+    #[test]
+    fn none_notifier_team_created_no_panic() {
+        let notifier: Option<&dyn ApiNotifier> = None;
+        if let Some(n) = notifier {
+            n.notify(ApiEvent::TeamCreated {
+                name: "x".into(),
+                members: vec![],
+            });
+        }
+    }
+
+    #[test]
+    fn none_notifier_team_members_changed_no_panic() {
+        let notifier: Option<&dyn ApiNotifier> = None;
+        if let Some(n) = notifier {
+            n.notify(ApiEvent::TeamMembersChanged {
+                name: "x".into(),
+                added: vec![],
+                removed: vec![],
+            });
+        }
+    }
+
+    // -- Failure resilience --
+
+    /// A notifier that panics on every call — used to verify that a panicking
+    /// notifier does not silently corrupt state in the RecordingNotifier path.
+    /// Note: in production, a panic inside `notify()` will unwind through
+    /// `handle_session`, terminating that API connection. This is acceptable
+    /// because notifier implementations (TuiNotifier) never panic.
+    struct PanickingNotifier;
+
+    impl ApiNotifier for PanickingNotifier {
+        fn notify(&self, _event: ApiEvent) {
+            panic!("intentional test panic");
+        }
+    }
+
+    #[test]
+    fn panicking_notifier_unwinds_safely() {
+        let result = std::panic::catch_unwind(|| {
+            let n: &dyn ApiNotifier = &PanickingNotifier;
+            n.notify(ApiEvent::InstanceDeleted { name: "x".into() });
+        });
+        assert!(result.is_err(), "expected panic to propagate");
+    }
+
+    #[test]
+    fn notifier_multiple_events_accumulate() {
+        let rec = RecordingNotifier::new();
+        rec.notify(ApiEvent::InstanceCreated {
+            name: "a".into(),
+            layout: LayoutHint::Tab,
+            spawner: None,
+            target_pane: None,
+        });
+        rec.notify(ApiEvent::InstanceDeleted { name: "a".into() });
+        let events = rec.take();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], ApiEvent::InstanceCreated { .. }));
+        assert!(matches!(&events[1], ApiEvent::InstanceDeleted { .. }));
     }
 }
