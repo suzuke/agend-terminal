@@ -1529,4 +1529,160 @@ mod tests {
 
         stop_server(&shutdown, &home);
     }
+
+    // -----------------------------------------------------------------------
+    // Slice B characterization: INJECT + KILL + DELETE + SPAWN error branches
+    // -----------------------------------------------------------------------
+    // Convention: every writeln+continue → return conversion must have its
+    // early-error branch pinned here.
+
+    // -- INJECT --
+
+    #[test]
+    fn dispatch_inject_validate_name_fail() {
+        let (port, home, _n, shutdown) = start_test_server("inject-badname");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "inject", "params": {"name": "../escape", "data": "x"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().is_some());
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_inject_agent_not_found() {
+        let (port, home, _n, shutdown) = start_test_server("inject-notfound");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "inject", "params": {"name": "ghost", "data": "x"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not found")));
+        stop_server(&shutdown, &home);
+    }
+
+    // -- KILL --
+
+    #[test]
+    fn dispatch_kill_validate_name_fail() {
+        let (port, home, _n, shutdown) = start_test_server("kill-badname");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "kill", "params": {"name": "../escape"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().is_some());
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_kill_agent_not_found() {
+        let (port, home, _n, shutdown) = start_test_server("kill-notfound");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "kill", "params": {"name": "ghost"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not found")));
+        stop_server(&shutdown, &home);
+    }
+
+    // -- DELETE --
+
+    #[test]
+    fn dispatch_delete_validate_name_fail() {
+        let (port, home, _n, shutdown) = start_test_server("delete-badname");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "delete", "params": {"name": "../escape"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().is_some());
+        stop_server(&shutdown, &home);
+    }
+
+    // DELETE happy path already covered by dispatch_delete_emits_instance_deleted (Slice 4)
+
+    // -- SPAWN --
+
+    #[test]
+    fn dispatch_spawn_missing_name() {
+        let (port, home, _n, shutdown) = start_test_server("spawn-noname");
+        let resp = api_request(port, &home, &json!({"method": "spawn", "params": {}}));
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("missing")));
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_spawn_validate_name_fail() {
+        let (port, home, _n, shutdown) = start_test_server("spawn-badname");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "spawn", "params": {"name": "../escape"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().is_some());
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_spawn_backend_not_found() {
+        let (port, home, _n, shutdown) = start_test_server("spawn-badbinary");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "spawn", "params": {"name": "test-agent", "backend": "nonexistent-binary-xyz"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().is_some());
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_spawn_working_directory_rejected() {
+        let (port, home, _n, shutdown) = start_test_server("spawn-badwd");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "spawn", "params": {"name": "test-wd", "working_directory": "/etc/foo"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().is_some());
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_delete_external_success() {
+        let (port, home, _n, shutdown) = start_test_server("del-ext");
+        // Register an external agent
+        let _ = api_request(
+            port,
+            &home,
+            &json!({"method": "register_external", "params": {"name": "ext-1", "backend": "x", "pid": 1}}),
+        );
+        // Delete it — exercises the external early-return success path
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "delete", "params": {"name": "ext-1"}}),
+        );
+        assert_eq!(resp["ok"], true);
+        stop_server(&shutdown, &home);
+    }
+
+    // SPAWN happy path + dedup are disclosed known gaps — require real agent spawn
 }
