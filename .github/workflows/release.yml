@@ -18,9 +18,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS — macos-13 is the last Intel runner; macos-latest is arm64.
+          # macOS — both targets build on macos-latest (arm64 host).
+          # x86_64 is cross-compiled; deps are pure Rust / FFI-only so no
+          # C toolchain needed. Avoids macos-13 Intel runner queue delays.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
