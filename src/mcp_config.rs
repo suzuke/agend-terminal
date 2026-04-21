@@ -319,42 +319,75 @@ fn configure_codex(working_dir: &Path) -> Result<()> {
     let bin = binary_path();
     let home = home_path();
 
-    // Write per-project .codex/config.toml with MCP server config
     let codex_dir = working_dir.join(".codex");
     std::fs::create_dir_all(&codex_dir)?;
     let config_path = codex_dir.join("config.toml");
 
-    // Read existing config to preserve other settings
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    // Flock + atomic write so two concurrent spawns can't interleave their
+    // strip→append cycles on the same config.toml.
+    let _lock = crate::store::acquire_file_lock(&config_lock_path(&config_path))?;
 
-    // Only write MCP section if not already configured
-    if !existing.contains("[mcp_servers.agend-terminal]") {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&config_path)?;
-        let prefix = if existing.is_empty() || existing.ends_with('\n') {
-            ""
-        } else {
-            "\n"
-        };
-        writeln!(
-            f,
-            r#"{prefix}[mcp_servers.agend-terminal]
+    // Re-read under the lock. Any existing `[mcp_servers.agend-terminal]` /
+    // `[mcp_servers.agend-terminal.env]` block is stripped before we write a
+    // fresh one — otherwise a stale binary path from a prior build (e.g. a
+    // worktree that has since been removed) would silently persist and fail
+    // at codex MCP startup with ENOENT.
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let mut stripped = strip_agend_mcp_sections(&existing);
+    // Collapse trailing blank lines so re-runs don't accumulate them.
+    while stripped.ends_with("\n\n") {
+        stripped.pop();
+    }
+    if !stripped.is_empty() && !stripped.ends_with('\n') {
+        stripped.push('\n');
+    }
+    let separator = if stripped.is_empty() { "" } else { "\n" };
+
+    let new_block = format!(
+        r#"{separator}[mcp_servers.agend-terminal]
 command = "{bin}"
 args = ["mcp"]
 
 [mcp_servers.agend-terminal.env]
-AGEND_HOME = "{home}""#
-        )?;
-    }
+AGEND_HOME = "{home}"
+"#
+    );
+    let body = format!("{stripped}{new_block}");
+    crate::store::atomic_write(&config_path, body.as_bytes())?;
     tracing::debug!(path = %config_path.display(), "configured MCP");
 
     // Auto-trust working directory in ~/.codex/config.toml
     codex_trust_directory(working_dir);
 
     Ok(())
+}
+
+/// Remove any `[mcp_servers.agend-terminal]` / `[mcp_servers.agend-terminal.env]`
+/// sections from a TOML string, preserving every other section and comment.
+/// A section runs from its `[header]` line through the line before the next
+/// `[header]` at the start of a line, or end-of-file.
+fn strip_agend_mcp_sections(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut in_target = false;
+    for raw_line in content.split_inclusive('\n') {
+        let trimmed = raw_line.trim();
+        // A section header is a line whose trimmed form is `[...]` — this
+        // matches both tables (`[foo]`) and array-of-tables (`[[foo]]`), and
+        // excludes value lines that start with `[` inside a string.
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_target = matches!(
+                trimmed,
+                "[mcp_servers.agend-terminal]" | "[mcp_servers.agend-terminal.env]"
+            );
+            if in_target {
+                continue;
+            }
+        }
+        if !in_target {
+            out.push_str(raw_line);
+        }
+    }
+    out
 }
 
 /// Add a directory to Codex's trusted projects in ~/.codex/config.toml.
@@ -1035,5 +1068,181 @@ mod tests {
             "function must not create the codex dir when it's absent"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- configure_codex: MCP block must refresh, not skip-if-exists ---
+
+    #[test]
+    fn codex_config_refreshes_stale_binary_path() {
+        // Regression guard: pre-fix code used an append-only write gated by
+        // `!existing.contains("[mcp_servers.agend-terminal]")`, so a stale
+        // binary path (e.g. from a removed worktree build) silently persisted
+        // and codex MCP startup failed with ENOENT. The rewrite must replace
+        // the `command` field with the current binary path.
+        let dir = tmp_dir("codex_cfg_refresh");
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create .codex");
+        let config_path = codex_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[mcp_servers.agend-terminal]\n\
+             command = \"/nonexistent/stale/binary\"\n\
+             args = [\"mcp\"]\n\
+             \n\
+             [mcp_servers.agend-terminal.env]\n\
+             AGEND_HOME = \"/old/home\"\n",
+        )
+        .expect("seed stale");
+
+        // Point ~/.codex at a non-existent dir so codex_trust_directory no-ops.
+        let fake_home = dir.join("fake-codex-home");
+        with_codex_home_override(&fake_home, || {
+            configure_codex(&dir).expect("configure");
+        });
+
+        let content = std::fs::read_to_string(&config_path).expect("read");
+        assert!(
+            !content.contains("/nonexistent/stale/binary"),
+            "stale command must be overwritten:\n{content}"
+        );
+        assert!(
+            !content.contains("/old/home"),
+            "stale AGEND_HOME must be overwritten:\n{content}"
+        );
+        let parsed: toml::Value = toml::from_str(&content).expect("valid TOML after rewrite");
+        let cmd = parsed["mcp_servers"]["agend-terminal"]["command"]
+            .as_str()
+            .expect("command string");
+        assert_ne!(cmd, "/nonexistent/stale/binary");
+        // Exactly one of each header — the stripper must not leave orphans.
+        assert_eq!(content.matches("[mcp_servers.agend-terminal]").count(), 1);
+        assert_eq!(
+            content.matches("[mcp_servers.agend-terminal.env]").count(),
+            1
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_config_preserves_unrelated_sections() {
+        // Other TOML sections (user settings, profiles) must survive the
+        // strip+rewrite cycle. The stripper only targets the two agend-terminal
+        // headers by exact match.
+        let dir = tmp_dir("codex_cfg_preserve");
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create .codex");
+        let config_path = codex_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "model = \"gpt-5\"\n\
+             \n\
+             [mcp_servers.agend-terminal]\n\
+             command = \"/old\"\n\
+             args = [\"mcp\"]\n\
+             \n\
+             [mcp_servers.agend-terminal.env]\n\
+             AGEND_HOME = \"/old\"\n\
+             \n\
+             [profile.custom]\n\
+             model = \"other\"\n",
+        )
+        .expect("seed");
+
+        let fake_home = dir.join("fake-codex-home");
+        with_codex_home_override(&fake_home, || {
+            configure_codex(&dir).expect("configure");
+        });
+
+        let content = std::fs::read_to_string(&config_path).expect("read");
+        let parsed: toml::Value = toml::from_str(&content).expect("valid TOML");
+        assert_eq!(
+            parsed["model"].as_str(),
+            Some("gpt-5"),
+            "top-level key dropped:\n{content}"
+        );
+        assert_eq!(
+            parsed["profile"]["custom"]["model"].as_str(),
+            Some("other"),
+            "unrelated section dropped:\n{content}"
+        );
+        assert!(
+            !content.contains("\"/old\""),
+            "stale value leaked:\n{content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_config_idempotent_across_reruns() {
+        // Re-running configure twice must leave the file byte-identical —
+        // no duplicated headers, no drifting whitespace.
+        let dir = tmp_dir("codex_cfg_idem");
+        std::fs::create_dir_all(dir.join(".codex")).expect("create .codex");
+        let fake_home = dir.join("fake-codex-home");
+
+        with_codex_home_override(&fake_home, || {
+            configure_codex(&dir).expect("first");
+        });
+        let after_first =
+            std::fs::read_to_string(dir.join(".codex/config.toml")).expect("read first");
+        with_codex_home_override(&fake_home, || {
+            configure_codex(&dir).expect("second");
+        });
+        let after_second =
+            std::fs::read_to_string(dir.join(".codex/config.toml")).expect("read second");
+
+        assert_eq!(
+            after_first, after_second,
+            "second run drifted file:\nfirst:\n{after_first}\nsecond:\n{after_second}"
+        );
+        assert_eq!(
+            after_second.matches("[mcp_servers.agend-terminal]").count(),
+            1
+        );
+        assert_eq!(
+            after_second
+                .matches("[mcp_servers.agend-terminal.env]")
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn codex_config_strips_only_agend_headers() {
+        // Unit test for the stripper: only the two exact header names match.
+        // A sibling `[mcp_servers.other]` must survive, and a comment that
+        // mentions the header text but doesn't open a section must not
+        // trigger the stripper.
+        let input = "# [mcp_servers.agend-terminal] mentioned in top-level comment\n\
+                     [other]\n\
+                     value = 1\n\
+                     \n\
+                     [mcp_servers.agend-terminal]\n\
+                     command = \"x\"\n\
+                     \n\
+                     [mcp_servers.other]\n\
+                     command = \"y\"\n\
+                     \n\
+                     [mcp_servers.agend-terminal.env]\n\
+                     AGEND_HOME = \"h\"\n";
+        let out = strip_agend_mcp_sections(input);
+        assert!(
+            !out.contains("command = \"x\""),
+            "target body leaked: {out}"
+        );
+        assert!(
+            !out.contains("AGEND_HOME = \"h\""),
+            "target env body leaked: {out}"
+        );
+        assert!(out.contains("[other]"), "unrelated section dropped: {out}");
+        assert!(
+            out.contains("[mcp_servers.other]"),
+            "sibling mcp_servers dropped: {out}"
+        );
+        assert!(
+            out.contains("# [mcp_servers.agend-terminal] mentioned in top-level comment"),
+            "top-level comment dropped — stripper matched comment as header: {out}"
+        );
     }
 }
