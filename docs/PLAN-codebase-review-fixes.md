@@ -1,9 +1,10 @@
-# Codebase Review Fix Plan
+# Codebase Review Fix Plan — COMPLETE
 
 **Date:** 2026-04-21
+**Completed:** 2026-04-21
 **Scope:** Full codebase review → 17 findings, 11 actionable items across 3 phases
 
-**Status: ALL DONE**
+**Status: COMPLETE** (C3 deferred by design — low priority, 17 call sites)
 - Phase A (P0): DONE — merged 9b1863a
 - Phase B1+B2 (cron): DONE — merged via fix/p1-cron-robustness
 - Phase B3 (regex): DONE — merged via fix/p1-fleet-regex-safety
