@@ -12,6 +12,8 @@ mod connect;
 mod daemon;
 mod decisions;
 mod deployments;
+#[cfg(feature = "discord")]
+mod discord;
 mod error;
 mod event_log;
 mod fleet;

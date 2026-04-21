@@ -134,40 +134,86 @@ pub fn drain_inbox(home: &Path, instance_name: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Channel (Telegram)
+// Channel dispatch (Telegram / Discord)
 // ---------------------------------------------------------------------------
+
+/// Detect the active channel type from fleet.yaml.
+fn is_discord_channel(home: &Path) -> bool {
+    #[cfg(feature = "discord")]
+    {
+        let fleet_path = home.join("fleet.yaml");
+        if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {
+            return matches!(config.channel, Some(crate::fleet::ChannelConfig::Discord { .. }));
+        }
+    }
+    let _ = home;
+    false
+}
 
 pub fn reply(home: &Path, instance_name: &str, text: &str) -> Value {
     tracing::info!(from = %instance_name, %text, "reply");
     let fleet_path = home.join("fleet.yaml");
-    if fleet_path.exists() {
-        match crate::telegram::try_telegram_reply(instance_name, text) {
-            Ok((msg_id, chat_id)) => json!({
-                "message_id": msg_id.to_string(),
-                "chat_id": chat_id.to_string(),
+    if !fleet_path.exists() {
+        return json!({"error": "No fleet.yaml — cannot send reply"});
+    }
+    #[cfg(feature = "discord")]
+    if is_discord_channel(home) {
+        return match crate::discord::try_discord_reply(instance_name, text) {
+            Ok((msg_id, channel_id)) => json!({
+                "message_id": msg_id,
+                "chat_id": channel_id,
             }),
             Err(e) => json!({"error": format!("{e}")}),
-        }
-    } else {
-        json!({"error": "No fleet.yaml — cannot send reply"})
+        };
+    }
+    match crate::telegram::try_telegram_reply(instance_name, text) {
+        Ok((msg_id, chat_id)) => json!({
+            "message_id": msg_id.to_string(),
+            "chat_id": chat_id.to_string(),
+        }),
+        Err(e) => json!({"error": format!("{e}")}),
     }
 }
 
-pub fn react(instance_name: &str, emoji: &str, message_id: Option<&str>) -> Value {
+pub fn react(home: &Path, instance_name: &str, emoji: &str, message_id: Option<&str>) -> Value {
+    #[cfg(feature = "discord")]
+    if is_discord_channel(home) {
+        return match crate::discord::try_discord_react(instance_name, emoji, message_id) {
+            Ok(()) => json!({"emoji": emoji}),
+            Err(e) => json!({"error": format!("{e}")}),
+        };
+    }
+    let _ = home;
     match crate::telegram::try_telegram_react(instance_name, emoji, message_id) {
         Ok(()) => json!({"emoji": emoji}),
         Err(e) => json!({"error": format!("{e}")}),
     }
 }
 
-pub fn edit_message(instance_name: &str, message_id: &str, text: &str) -> Value {
+pub fn edit_message(home: &Path, instance_name: &str, message_id: &str, text: &str) -> Value {
+    #[cfg(feature = "discord")]
+    if is_discord_channel(home) {
+        return match crate::discord::try_discord_edit(instance_name, message_id, text) {
+            Ok(()) => json!({"message_id": message_id}),
+            Err(e) => json!({"error": format!("{e}")}),
+        };
+    }
+    let _ = home;
     match crate::telegram::try_telegram_edit(instance_name, message_id, text) {
         Ok(()) => json!({"message_id": message_id}),
         Err(e) => json!({"error": format!("{e}")}),
     }
 }
 
-pub fn download_attachment(instance_name: &str, file_id: &str) -> Value {
+pub fn download_attachment(home: &Path, instance_name: &str, file_id: &str) -> Value {
+    #[cfg(feature = "discord")]
+    if is_discord_channel(home) {
+        return match crate::discord::try_discord_download(instance_name, file_id) {
+            Ok(path) => json!({"path": path}),
+            Err(e) => json!({"error": format!("{e}")}),
+        };
+    }
+    let _ = home;
     match crate::telegram::try_download_attachment(instance_name, file_id) {
         Ok(path) => json!({"path": path}),
         Err(e) => json!({"error": format!("{e}")}),
@@ -282,7 +328,17 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 tracing::warn!(error = %e, "failed to persist to fleet.yaml");
             }
-            let topic_id = crate::telegram::create_topic_for_instance(home, name);
+            let topic_id = if !is_discord_channel(home) {
+                crate::telegram::create_topic_for_instance(home, name)
+            } else {
+                None
+            };
+            #[cfg(feature = "discord")]
+            let channel_id = if is_discord_channel(home) {
+                crate::discord::create_channel_for_instance(home, name)
+            } else {
+                None
+            };
             if let Some(ref task_text) = task {
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 let _ = crate::api::call(
@@ -293,6 +349,10 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
             let mut result = json!({"name": name, "backend": command});
             if let Some(tid) = topic_id {
                 result["topic_id"] = json!(tid);
+            }
+            #[cfg(feature = "discord")]
+            if let Some(ref cid) = channel_id {
+                result["channel_id"] = json!(cid);
             }
             result
         }
@@ -332,9 +392,22 @@ pub fn delete_instance(home: &Path, args: &Value) -> Value {
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         tracing::warn!(error = %e, "failed to remove from fleet.yaml");
     }
-    // Delete the Telegram topic if one exists
+    // Delete the channel/topic if one exists
     if let Some(tid) = topic_id {
-        crate::telegram::delete_topic(home, tid);
+        if !is_discord_channel(home) {
+            crate::telegram::delete_topic(home, tid);
+        }
+    }
+    #[cfg(feature = "discord")]
+    {
+        let channel_id = fleet
+            .as_ref()
+            .and_then(|c| c.instances.get(name))
+            .and_then(|i| i.channel_id.as_ref())
+            .and_then(|s| s.parse::<u64>().ok());
+        if let Some(cid) = channel_id {
+            crate::discord::delete_channel(home, cid);
+        }
     }
     // Clean up working directory
     if let Some(ref wd) = working_dir {

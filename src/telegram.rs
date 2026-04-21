@@ -461,12 +461,15 @@ pub fn init_from_config(
     home: &Path,
     submit_keys: HashMap<String, String>,
 ) -> Option<Arc<Mutex<TelegramState>>> {
-    let ChannelConfig::Telegram {
+    let Some(ChannelConfig::Telegram {
         bot_token_env,
         group_id,
         user_allowlist,
         ..
-    } = config.channel.as_ref()?;
+    }) = config.channel.as_ref()
+    else {
+        return None;
+    };
     let token = match std::env::var(bot_token_env) {
         Ok(t) => t,
         Err(_) => {
@@ -669,7 +672,7 @@ fn resolve_channel() -> anyhow::Result<(TelegramChannel, crate::fleet::FleetConf
                 config,
             ))
         }
-        None => anyhow::bail!("No Telegram channel configured"),
+        _ => anyhow::bail!("No Telegram channel configured"),
     }
 }
 

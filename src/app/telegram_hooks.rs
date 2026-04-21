@@ -24,7 +24,17 @@ pub(super) fn telegram_status_from_config(
                 render::TelegramStatus::NoToken
             }
         }
-        None => render::TelegramStatus::NotConfigured,
+        #[cfg(feature = "discord")]
+        Some(crate::fleet::ChannelConfig::Discord {
+            ref bot_token_env, ..
+        }) => {
+            if std::env::var(bot_token_env).is_ok() {
+                render::TelegramStatus::Connected
+            } else {
+                render::TelegramStatus::NoToken
+            }
+        }
+        _ => render::TelegramStatus::NotConfigured,
     }
 }
 
@@ -90,5 +100,79 @@ pub(super) fn maybe_delete_telegram_topic(
     let home = home.to_path_buf();
     std::thread::spawn(move || {
         crate::telegram::delete_topic(&home, tid);
+    });
+}
+
+
+// ---------------------------------------------------------------------------
+// Discord channel hooks
+// ---------------------------------------------------------------------------
+
+/// Create a Discord channel for a newly spawned fleet instance (non-blocking).
+#[cfg(feature = "discord")]
+#[allow(dead_code)]
+pub(super) fn maybe_create_discord_channel(
+    ds: &Option<Arc<Mutex<crate::discord::DiscordState>>>,
+    registry: &AgentRegistry,
+    home: &Path,
+    pane: &Pane,
+) {
+    let Some(ds) = ds else { return };
+    let Some(fleet_name) = &pane.fleet_instance_name else {
+        return;
+    };
+    {
+        let s = crate::discord::lock_state(ds);
+        if s.instance_to_channel.contains_key(fleet_name) {
+            return;
+        }
+    }
+    let submit_key = {
+        let reg = agent::lock_registry(registry);
+        reg.get(&pane.agent_name)
+            .map(|h| h.submit_key.clone())
+            .unwrap_or_else(|| "\r".to_string())
+    };
+    let ds = Arc::clone(ds);
+    let home = home.to_path_buf();
+    let fleet_name = fleet_name.clone();
+    std::thread::spawn(move || {
+        match crate::discord::create_channel_for_instance(&home, &fleet_name) {
+            Some(cid_str) => {
+                if let Ok(cid) = cid_str.parse::<u64>() {
+                    let mut s = crate::discord::lock_state(&ds);
+                    s.instance_to_channel.insert(fleet_name.clone(), cid);
+                    s.channel_to_instance.insert(cid, fleet_name.clone());
+                    s.submit_keys.insert(fleet_name, submit_key);
+                }
+            }
+            None => tracing::warn!(%fleet_name, "failed to create Discord channel"),
+        }
+    });
+}
+
+/// Delete Discord channel for a fleet instance (non-blocking).
+#[cfg(feature = "discord")]
+#[allow(dead_code)]
+pub(super) fn maybe_delete_discord_channel(
+    ds: &Option<Arc<Mutex<crate::discord::DiscordState>>>,
+    home: &Path,
+    fleet_name: &str,
+) {
+    let Some(ds) = ds else { return };
+    let cid = {
+        let mut s = crate::discord::lock_state(ds);
+        match s.instance_to_channel.remove(fleet_name) {
+            Some(cid) => {
+                s.channel_to_instance.remove(&cid);
+                s.submit_keys.remove(fleet_name);
+                cid
+            }
+            None => return,
+        }
+    };
+    let home = home.to_path_buf();
+    std::thread::spawn(move || {
+        crate::discord::delete_channel(&home, cid);
     });
 }

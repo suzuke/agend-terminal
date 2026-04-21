@@ -43,10 +43,30 @@ pub enum ChannelConfig {
         #[serde(default)]
         user_allowlist: Option<Vec<i64>>,
     },
+
+    #[cfg(feature = "discord")]
+    #[serde(rename = "discord")]
+    Discord {
+        /// Env var name containing the Discord bot token.
+        bot_token_env: String,
+        /// Discord Guild (server) ID -- string to avoid YAML f64 precision loss.
+        guild_id: String,
+        /// Category name to auto-create/find.
+        #[serde(default = "default_category_name")]
+        category_name: String,
+        /// Optional allowlist of Discord user IDs (snowflake strings).
+        #[serde(default)]
+        user_allowlist: Option<Vec<String>>,
+    },
 }
 
 fn default_mode() -> String {
     "topic".to_string()
+}
+
+#[cfg(feature = "discord")]
+fn default_category_name() -> String {
+    "AgEnD Agents".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -81,6 +101,9 @@ pub struct InstanceConfig {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
+    /// Discord channel ID -- snowflake as string.
+    #[cfg(feature = "discord")]
+    pub channel_id: Option<String>,
     /// Custom git branch name for worktree. TS version uses "worktree_source".
     #[serde(alias = "worktree_source")]
     pub git_branch: Option<String>,
@@ -237,6 +260,8 @@ impl FleetConfig {
             cols,
             rows,
             topic_id: inst.topic_id,
+            #[cfg(feature = "discord")]
+            channel_id: inst.channel_id.clone(),
             git_branch: inst.git_branch.clone(),
             model,
         })
@@ -262,6 +287,8 @@ pub struct ResolvedInstance {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
+    #[cfg(feature = "discord")]
+    pub channel_id: Option<String>,
     pub git_branch: Option<String>,
     pub model: Option<String>,
 }
@@ -630,7 +657,7 @@ instances:
                 assert_eq!(group_id, -100123456);
                 assert_eq!(mode, "topic");
             }
-            None => panic!("channel should be Some"),
+            _ => panic!("unexpected channel variant"),
         }
 
         fs::remove_dir_all(&dir).ok();
@@ -654,7 +681,7 @@ instances: {}
             Some(ChannelConfig::Telegram { ref mode, .. }) => {
                 assert_eq!(mode, "topic", "default mode should be 'topic'");
             }
-            None => panic!("channel should be Some"),
+            _ => panic!("unexpected channel variant"),
         }
 
         fs::remove_dir_all(&dir).ok();

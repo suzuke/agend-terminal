@@ -19,6 +19,14 @@ fn notify_telegram_inner(home: &Path, instance_name: &str, text: &str, disable_n
         Ok(c) => c,
         Err(_) => return,
     };
+
+    // Dispatch to Discord if configured
+    #[cfg(feature = "discord")]
+    if matches!(config.channel, Some(crate::fleet::ChannelConfig::Discord { .. })) {
+        notify_discord(home, instance_name, text, &config);
+        return;
+    }
+
     let (token, group_id, topic_id) = match &config.channel {
         Some(crate::fleet::ChannelConfig::Telegram {
             bot_token_env,
@@ -32,7 +40,7 @@ fn notify_telegram_inner(home: &Path, instance_name: &str, text: &str, disable_n
             ),
             Err(_) => return,
         },
-        None => return,
+        _ => return,
     };
 
     let text = text.to_string();
@@ -80,6 +88,54 @@ fn notify_telegram_inner(home: &Path, instance_name: &str, text: &str, disable_n
                 if !handled {
                     tracing::warn!(error = %e, "telegram notify failed");
                 }
+            }
+        })
+        .ok();
+}
+
+
+/// Send a notification to Discord (instance channel).
+#[cfg(feature = "discord")]
+fn notify_discord(
+    _home: &Path,
+    instance_name: &str,
+    text: &str,
+    config: &crate::fleet::FleetConfig,
+) {
+    let channel_id = config
+        .instances
+        .get(instance_name)
+        .and_then(|i| i.channel_id.as_ref())
+        .and_then(|s| s.parse::<u64>().ok());
+    let Some(channel_id) = channel_id else { return };
+
+    let bot_token_env = match &config.channel {
+        Some(crate::fleet::ChannelConfig::Discord { bot_token_env, .. }) => bot_token_env.clone(),
+        _ => return,
+    };
+    let token = match std::env::var(&bot_token_env) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let text = text.to_string();
+    std::thread::Builder::new()
+        .name("discord_notify".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            if let Err(e) = rt.block_on(async {
+                let http = serenity::all::Http::new(&token);
+                let cid = serenity::all::ChannelId::new(channel_id);
+                cid.send_message(&http, serenity::all::CreateMessage::new().content(&text))
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            }) {
+                tracing::warn!(error = %e, "discord notify failed");
             }
         })
         .ok();

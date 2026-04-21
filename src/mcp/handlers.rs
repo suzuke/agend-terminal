@@ -1,6 +1,5 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
-use crate::telegram;
 use serde_json::{json, Value};
 
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
@@ -12,30 +11,15 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     };
 
     match tool {
-        // --- Channel ---
+        // --- Channel (dispatched via ops for Telegram/Discord) ---
         "reply" => {
             let text = args["text"].as_str().unwrap_or("");
-            tracing::info!(from = %instance_name, %text, "reply");
-            let fleet_path = home.join("fleet.yaml");
-            if fleet_path.exists() {
-                match telegram::try_telegram_reply(&instance_name, text) {
-                    Ok((msg_id, chat_id)) => json!({
-                        "message_id": msg_id.to_string(),
-                        "chat_id": chat_id.to_string(),
-                    }),
-                    Err(e) => json!({"error": format!("{e}")}),
-                }
-            } else {
-                json!({"error": "No fleet.yaml — cannot send reply"})
-            }
+            crate::ops::reply(&home, &instance_name, text)
         }
         "react" => {
             let emoji = args["emoji"].as_str().unwrap_or("");
             let message_id = args["message_id"].as_str();
-            match telegram::try_telegram_react(&instance_name, emoji, message_id) {
-                Ok(()) => json!({"emoji": emoji}),
-                Err(e) => json!({"error": format!("{e}")}),
-            }
+            crate::ops::react(&home, &instance_name, emoji, message_id)
         }
         "edit_message" => {
             let message_id = match args["message_id"].as_str() {
@@ -46,20 +30,14 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(t) => t,
                 None => return json!({"error": "missing 'text'"}),
             };
-            match telegram::try_telegram_edit(&instance_name, message_id, text) {
-                Ok(()) => json!({"message_id": message_id}),
-                Err(e) => json!({"error": format!("{e}")}),
-            }
+            crate::ops::edit_message(&home, &instance_name, message_id, text)
         }
         "download_attachment" => {
             let file_id = match args["file_id"].as_str() {
                 Some(f) => f,
                 None => return json!({"error": "missing 'file_id'"}),
             };
-            match telegram::try_download_attachment(&instance_name, file_id) {
-                Ok(path) => json!({"path": path}),
-                Err(e) => json!({"error": format!("{e}")}),
-            }
+            crate::ops::download_attachment(&home, &instance_name, file_id)
         }
 
         // --- Cross-instance communication ---
@@ -293,7 +271,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                             for inst_name in &spawned {
                                 let h = &home;
                                 s.spawn(move || {
-                                    telegram::create_topic_for_instance(h, inst_name);
+                                    crate::telegram::create_topic_for_instance(h, inst_name);
                                 });
                             }
                         });
@@ -367,7 +345,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             }
             // Delete the Telegram topic if one exists
             if let Some(tid) = topic_id {
-                telegram::delete_topic(&home, tid);
+                crate::telegram::delete_topic(&home, tid);
             }
             // Clean up working directory
             if let Some(ref wd) = working_dir {
