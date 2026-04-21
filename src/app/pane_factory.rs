@@ -369,17 +369,118 @@ pub(super) fn resolve_backend(backend_name: &str) -> (String, String) {
     }
 }
 
-/// Dedup a base name against fleet.yaml. Returns `base` if free, else `base-2`, `base-3`…
+/// Mint a unique fleet instance name like `base-a3f2c1`.
+///
+/// Suffix is 6 hex chars derived from the current subsecond nanos XORed with a
+/// process-local counter, so two spawns in the same nanosecond still differ.
+/// Collision probability against fleet.yaml ∪ `workspace/` ∪ `inbox/` is
+/// checked and retried up to 100 times before falling back to `-N`.
+///
+/// Always adding a suffix (vs. returning bare `base` when free) is deliberate:
+/// each spawn gets a fresh workspace directory, so closing "codex" and
+/// opening another never silently reuses `workspace/codex/` with its leftover
+/// `.codex/`, `AGENTS.md`, and git state.
 pub(super) fn unique_fleet_name(home: &Path, base: &str) -> String {
-    let Some(fleet) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok() else {
-        return base.to_string();
+    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+    let taken = |name: &str| -> bool {
+        if fleet
+            .as_ref()
+            .is_some_and(|f| f.instances.contains_key(name))
+        {
+            return true;
+        }
+        if home.join("workspace").join(name).exists() {
+            return true;
+        }
+        if crate::inbox::inbox_path(home, name).exists() {
+            return true;
+        }
+        false
     };
-    if !fleet.instances.contains_key(base) {
-        return base.to_string();
+    for _ in 0..100 {
+        let candidate = format!("{base}-{:06x}", short_id());
+        if !taken(&candidate) {
+            return candidate;
+        }
     }
-    // Infinite iterator over 2.. always finds a unique name
+    // Extremely unlikely fallback when 100 random suffixes all collide
     (2..)
         .map(|n| format!("{base}-{n}"))
-        .find(|c| !fleet.instances.contains_key(c))
+        .find(|c| !taken(c))
         .expect("infinite iterator")
+}
+
+/// 24-bit id derived from the current subsecond nanos XORed with a process-
+/// local counter. Same-nanosecond callers still differ via the counter.
+fn short_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    (nanos ^ seq) & 0xFF_FFFF
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("agend_unique_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create tmp home");
+        p
+    }
+
+    #[test]
+    fn unique_name_always_suffixed() {
+        let home = tmp_home("always");
+        let name = unique_fleet_name(&home, "codex");
+        assert!(name.starts_with("codex-"), "name was {name}");
+        let suffix = &name["codex-".len()..];
+        assert_eq!(suffix.len(), 6, "expected 6-hex suffix, got {name}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "non-hex suffix in {name}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unique_name_successive_calls_differ() {
+        let home = tmp_home("diff");
+        let a = unique_fleet_name(&home, "codex");
+        // Realize `a` as a workspace so the next call must not collide with it.
+        std::fs::create_dir_all(home.join("workspace").join(&a)).expect("create a");
+        let b = unique_fleet_name(&home, "codex");
+        assert_ne!(a, b);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unique_name_skips_workspace_collision() {
+        let home = tmp_home("ws");
+        // Pre-create a workspace whose name could plausibly be minted; since
+        // the suffix is random we just assert the returned name isn't that
+        // directory.
+        let blocked = "codex-000000";
+        std::fs::create_dir_all(home.join("workspace").join(blocked)).expect("create workspace");
+        let name = unique_fleet_name(&home, "codex");
+        assert_ne!(name, blocked);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unique_name_skips_inbox_collision() {
+        let home = tmp_home("ib");
+        let blocked = "codex-000000";
+        std::fs::create_dir_all(home.join("inbox")).expect("create inbox");
+        std::fs::write(home.join("inbox").join(format!("{blocked}.jsonl")), "")
+            .expect("write inbox file");
+        let name = unique_fleet_name(&home, "codex");
+        assert_ne!(name, blocked);
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

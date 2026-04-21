@@ -290,52 +290,65 @@ pub(super) fn handle_key(
                 *overlay = Overlay::None;
                 if is_tab {
                     let idx = ctx.layout.active;
-                    // Collect fleet names before closing tab
-                    let fleet_names: Vec<String> = ctx
+                    let closed: Vec<(String, Option<std::path::PathBuf>)> = ctx
                         .layout
                         .tabs
                         .get(idx)
                         .into_iter()
                         .flat_map(|t| {
                             t.root().pane_ids().into_iter().filter_map(|id| {
-                                t.root()
-                                    .find_pane(id)
-                                    .and_then(|p| p.fleet_instance_name.clone())
+                                t.root().find_pane(id).and_then(|p| {
+                                    p.fleet_instance_name
+                                        .clone()
+                                        .map(|name| (name, p.working_dir.clone()))
+                                })
                             })
                         })
                         .collect();
-                    for fname in &fleet_names {
+                    for (name, _) in &closed {
                         super::telegram_hooks::maybe_delete_telegram_topic(
                             ctx.telegram_state,
                             ctx.home,
-                            fname,
+                            name,
                         );
                     }
-                    if !fleet_names.is_empty() {
-                        let _ = crate::fleet::remove_instances_from_yaml(ctx.home, &fleet_names);
+                    if !closed.is_empty() {
+                        let names: Vec<String> = closed.iter().map(|(n, _)| n.clone()).collect();
+                        let _ = crate::fleet::remove_instances_from_yaml(ctx.home, &names);
                     }
                     if let Some(tab) = ctx.layout.close_tab(idx) {
                         for name in tab.root().agent_names() {
                             super::kill_agent(ctx.registry, &name);
                         }
                     }
+                    for (name, wd) in &closed {
+                        if let Some(wd) = wd {
+                            crate::ops::cleanup_working_dir(ctx.home, name, wd);
+                        }
+                    }
                     outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
-                    // Remove from fleet.yaml before closing pane
                     let fid = tab.focus_id;
-                    if let Some(pane) = tab.root().find_pane(fid) {
-                        if let Some(ref fleet_name) = pane.fleet_instance_name {
-                            super::telegram_hooks::maybe_delete_telegram_topic(
-                                ctx.telegram_state,
-                                ctx.home,
-                                fleet_name,
-                            );
-                            let _ = crate::fleet::remove_instance_from_yaml(ctx.home, fleet_name);
-                        }
+                    let closed: Option<(String, Option<std::path::PathBuf>)> =
+                        tab.root().find_pane(fid).and_then(|p| {
+                            p.fleet_instance_name
+                                .clone()
+                                .map(|name| (name, p.working_dir.clone()))
+                        });
+                    if let Some((ref fleet_name, _)) = closed {
+                        super::telegram_hooks::maybe_delete_telegram_topic(
+                            ctx.telegram_state,
+                            ctx.home,
+                            fleet_name,
+                        );
+                        let _ = crate::fleet::remove_instance_from_yaml(ctx.home, fleet_name);
                     }
                     if let Some(name) = tab.close_focused() {
                         super::kill_agent(ctx.registry, &name);
                         outcome.needs_resize = true;
+                    }
+                    if let Some((name, Some(wd))) = closed {
+                        crate::ops::cleanup_working_dir(ctx.home, &name, &wd);
                     }
                 }
             }
