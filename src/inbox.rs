@@ -53,7 +53,7 @@ pub struct InboxMessage {
     pub timestamp: String,
 }
 
-fn inbox_path(home: &Path, name: &str) -> PathBuf {
+pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
     home.join("inbox").join(format!("{name}.jsonl"))
 }
 

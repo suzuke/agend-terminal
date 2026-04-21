@@ -369,17 +369,139 @@ pub(super) fn resolve_backend(backend_name: &str) -> (String, String) {
     }
 }
 
-/// Dedup a base name against fleet.yaml. Returns `base` if free, else `base-2`, `base-3`…
+/// Mint a unique fleet instance name like `base-a3f2c1`.
+///
+/// Suffix is 6 hex chars derived from the current subsecond nanos XORed with a
+/// process-local counter, so two spawns in the same nanosecond still differ.
+/// Collision probability against fleet.yaml ∪ `workspace/` ∪ `inbox/` is
+/// checked and retried up to 100 times before falling back to `-N`.
+///
+/// Always adding a suffix (vs. returning bare `base` when free) is deliberate:
+/// each spawn gets a fresh workspace directory, so closing "codex" and
+/// opening another never silently reuses `workspace/codex/` with its leftover
+/// `.codex/`, `AGENTS.md`, and git state.
 pub(super) fn unique_fleet_name(home: &Path, base: &str) -> String {
-    let Some(fleet) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok() else {
-        return base.to_string();
+    unique_fleet_name_with(home, base, std::iter::from_fn(|| Some(short_id())))
+}
+
+/// Testable core of [`unique_fleet_name`]: takes the suffix iterator as input
+/// so tests can inject a deterministic sequence and actually exercise the
+/// collision-skip path (a random `short_id()` lands in a pre-seeded collision
+/// bucket with probability ~10⁻⁷, so the tests would otherwise be vacuous).
+fn unique_fleet_name_with(home: &Path, base: &str, mut ids: impl Iterator<Item = u32>) -> String {
+    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+    let taken = |name: &str| -> bool {
+        if fleet
+            .as_ref()
+            .is_some_and(|f| f.instances.contains_key(name))
+        {
+            return true;
+        }
+        if home.join("workspace").join(name).exists() {
+            return true;
+        }
+        if crate::inbox::inbox_path(home, name).exists() {
+            return true;
+        }
+        false
     };
-    if !fleet.instances.contains_key(base) {
-        return base.to_string();
+    for _ in 0..100 {
+        let id = ids.next().unwrap_or(0);
+        let candidate = format!("{base}-{id:06x}");
+        if !taken(&candidate) {
+            return candidate;
+        }
     }
-    // Infinite iterator over 2.. always finds a unique name
+    // Extremely unlikely fallback when 100 suffixes all collide
     (2..)
         .map(|n| format!("{base}-{n}"))
-        .find(|c| !fleet.instances.contains_key(c))
+        .find(|c| !taken(c))
         .expect("infinite iterator")
+}
+
+/// 24-bit id derived from the current subsecond nanos XORed with a process-
+/// local counter. Same-nanosecond callers still differ via the counter.
+fn short_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    (nanos ^ seq) & 0xFF_FFFF
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("agend_unique_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("create tmp home");
+        p
+    }
+
+    #[test]
+    fn unique_name_always_suffixed() {
+        let home = tmp_home("always");
+        let name = unique_fleet_name(&home, "codex");
+        assert!(name.starts_with("codex-"), "name was {name}");
+        let suffix = &name["codex-".len()..];
+        assert_eq!(suffix.len(), 6, "expected 6-hex suffix, got {name}");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_hexdigit()),
+            "non-hex suffix in {name}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unique_name_successive_calls_differ() {
+        let home = tmp_home("diff");
+        let a = unique_fleet_name(&home, "codex");
+        // Realize `a` as a workspace so the next call must not collide with it.
+        std::fs::create_dir_all(home.join("workspace").join(&a)).expect("create a");
+        let b = unique_fleet_name(&home, "codex");
+        assert_ne!(a, b);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unique_name_skips_workspace_collision() {
+        let home = tmp_home("ws");
+        std::fs::create_dir_all(home.join("workspace/codex-000001")).expect("seed 1");
+        std::fs::create_dir_all(home.join("workspace/codex-000002")).expect("seed 2");
+        // Feed id sequence that hits both collisions then succeeds on 3
+        let name = unique_fleet_name_with(&home, "codex", [0x1u32, 0x2, 0x3].into_iter());
+        assert_eq!(name, "codex-000003");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unique_name_skips_inbox_collision() {
+        let home = tmp_home("ib");
+        std::fs::create_dir_all(home.join("inbox")).expect("create inbox");
+        std::fs::write(home.join("inbox/codex-000001.jsonl"), "").expect("seed 1");
+        std::fs::write(home.join("inbox/codex-000002.jsonl"), "").expect("seed 2");
+        let name = unique_fleet_name_with(&home, "codex", [0x1u32, 0x2, 0x3].into_iter());
+        assert_eq!(name, "codex-000003");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unique_name_falls_back_after_100_collisions() {
+        let home = tmp_home("fallback");
+        // Seed the exact 100 suffixes the iterator will produce
+        for n in 1..=100u32 {
+            std::fs::create_dir_all(home.join("workspace").join(format!("codex-{n:06x}")))
+                .expect("seed");
+        }
+        let name =
+            unique_fleet_name_with(&home, "codex", (1u32..=100).collect::<Vec<_>>().into_iter());
+        // Fallback path uses `-N` counter starting at 2
+        assert_eq!(name, "codex-2");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
