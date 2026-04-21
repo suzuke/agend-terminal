@@ -199,30 +199,22 @@ pub struct SpawnConfig<'a> {
     pub shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Result<()> {
+/// Build a `CommandBuilder` with resolved args, env, and working directory.
+///
+/// Extracted from `spawn_agent` so the command-construction logic (arg
+/// enrichment, env filtering, PATH prepend, cwd validation) is isolated
+/// from the PTY plumbing that follows.
+fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option<Backend>)> {
     let SpawnConfig {
         name,
         backend_command,
         args,
         spawn_mode,
-        cols,
-        rows,
-        env,
         working_dir,
-        submit_key,
+        env,
         home,
-        crash_tx,
-        shutdown,
+        ..
     } = config;
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: *rows,
-            cols: *cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
 
     let detected_backend = Backend::from_command(backend_command);
 
@@ -317,14 +309,6 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                 .map_err(|e| anyhow::anyhow!("working_directory escapes via symlink: {e}"))?;
             cmd.cwd(&resolved);
         } else {
-            // No `home` means no allow-list to validate against. All
-            // production spawn paths thread `home` through `SpawnConfig`; the
-            // only call sites that legitimately pass `None` are ad-hoc test
-            // spawns (tests/integration.rs). Emit a warn so that if a future
-            // code path regresses and spawns without home, the lost
-            // symlink-escape guard shows up in logs instead of silently
-            // degrading. Tests suppress tracing output so this stays quiet
-            // under `cargo test` while still being visible in a live daemon.
             tracing::warn!(
                 instance = %name,
                 dir = %dir.display(),
@@ -334,6 +318,37 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             cmd.cwd(dir);
         }
     }
+
+    Ok((cmd, detected_backend))
+}
+
+pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Result<()> {
+    let SpawnConfig {
+        name,
+        backend_command,
+        args: _,
+        spawn_mode: _,
+        cols,
+        rows,
+        env: _,
+        working_dir,
+        submit_key,
+        home,
+        crash_tx,
+        shutdown,
+    } = config;
+
+    let (cmd, detected_backend) = build_command(config)?;
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: *rows,
+            cols: *cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
 
     let child = pair
         .slave
@@ -460,7 +475,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         }
     }
 
-    tracing::info!(agent = name, backend = backend_command, args = %args.join(" "), "spawned");
+    tracing::info!(agent = name, backend = backend_command, args = %config.args.join(" "), "spawned");
     Ok(())
 }
 
