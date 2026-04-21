@@ -1,45 +1,18 @@
 //! Generate MCP server configuration for each backend.
 //!
 //! Reference: https://github.com/suzuke/AgEnD (TypeScript version)
+//!
+//! **Scope rule:** every write here must land inside `$AGEND_HOME` or inside
+//! the agent's `working_directory`. User-global tool configs (`~/.codex/`,
+//! `~/.claude/`, etc.) are off-limits — mutating them risks corrupting the
+//! user's personal CLI setup and can't be cleanly undone. If a backend seems
+//! to need global state (codex trust prompt was the reason for the old
+//! `codex_trust_directory` write), reach for a CLI flag or `dismiss_patterns`
+//! in `src/backend.rs` instead.
 
 use anyhow::Result;
 use serde_json::json;
 use std::path::{Path, PathBuf};
-
-#[cfg(test)]
-use std::cell::RefCell;
-
-#[cfg(test)]
-thread_local! {
-    /// Test-only override for `~/.codex`. When set, [`codex_home`] returns this
-    /// path instead of the real user home. Prevents test runs from polluting
-    /// the developer's real `~/.codex/config.toml`.
-    static CODEX_HOME_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
-}
-
-/// Resolve the effective `~/.codex` directory. In tests, a thread-local
-/// override takes precedence so integration-style tests can redirect writes
-/// to a scratch directory.
-fn codex_home() -> PathBuf {
-    #[cfg(test)]
-    {
-        if let Some(p) = CODEX_HOME_OVERRIDE.with(|c| c.borrow().clone()) {
-            return p;
-        }
-    }
-    dirs_home().join(".codex")
-}
-
-/// Run `f` with the codex-home path overridden to `path` on the current thread.
-/// Test-only helper so tests that invoke `generate`/`codex_trust_directory`
-/// don't write into the real `$HOME/.codex`.
-#[cfg(test)]
-pub(crate) fn with_codex_home_override<R>(path: &Path, f: impl FnOnce() -> R) -> R {
-    let prev = CODEX_HOME_OVERRIDE.with(|c| c.replace(Some(path.to_path_buf())));
-    let result = f();
-    CODEX_HOME_OVERRIDE.with(|c| *c.borrow_mut() = prev);
-    result
-}
 
 /// Get the agend-terminal binary path for MCP server config.
 fn binary_path() -> String {
@@ -347,13 +320,20 @@ fn configure_codex(working_dir: &Path) -> Result<()> {
     }
     let separator = if stripped.is_empty() { "" } else { "\n" };
 
+    // Single-quoted TOML literal strings preserve backslashes verbatim;
+    // a double-quoted basic string interprets `\U` / `\n` / `\t` as escapes
+    // and codex rejects its own config.toml on Windows when the binary path
+    // happens to contain any of them. See `toml_string_value` for the
+    // apostrophe fallback.
+    let bin_lit = toml_string_value(&bin);
+    let home_lit = toml_string_value(&home);
     let body = format!(
         r#"{stripped}{separator}{CODEX_MCP_HEADER}
-command = "{bin}"
+command = {bin_lit}
 args = ["mcp"]
 
 {CODEX_MCP_ENV_HEADER}
-AGEND_HOME = "{home}"
+AGEND_HOME = {home_lit}
 "#
     );
 
@@ -365,10 +345,30 @@ AGEND_HOME = "{home}"
     }
     tracing::debug!(path = %config_path.display(), "configured MCP");
 
-    // Auto-trust working directory in ~/.codex/config.toml
-    codex_trust_directory(working_dir);
+    // NOTE: intentionally no `codex_trust_directory` write to
+    // `~/.codex/config.toml`. That file is the user's personal codex config
+    // and must stay untouched. The trust prompt is handled by
+    // `--dangerously-bypass-approvals-and-sandbox` on the codex command line
+    // (see `src/backend.rs`) plus the "Do you trust" dismiss_pattern as a
+    // fallback. Writing here would pollute user state and has caused multiple
+    // production bugs (see removed `codex_trust_directory` in git history).
 
     Ok(())
+}
+
+/// Render a string value as a TOML string, picking whichever quoting style
+/// survives on the target. Windows paths routinely contain `\U` / `\d` / …
+/// which a double-quoted basic string interprets as escapes and then fails
+/// to parse. Single-quoted literal strings don't interpret anything, so they
+/// round-trip any path. Fall back to an escaped basic string only if the
+/// value contains a `'`, which a single-line literal can't represent.
+fn toml_string_value(s: &str) -> String {
+    if s.contains('\'') {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        format!("'{s}'")
+    }
 }
 
 /// Remove any `[mcp_servers.agend-terminal]` / `[mcp_servers.agend-terminal.env]`
@@ -394,84 +394,6 @@ fn strip_agend_mcp_sections(content: &str) -> String {
         }
     }
     out
-}
-
-/// Add a directory to Codex's trusted projects in ~/.codex/config.toml.
-///
-/// Serialized across concurrent spawns via a sibling `.lock` file. Without the
-/// flock, parallel `create_instance` calls race: two writers interleave their
-/// `writeln!` syscalls and produce `[projects."a"][projects."b"]` on one line,
-/// which breaks `codex` config parsing. The lock scope also re-reads the file
-/// *after* acquisition, so a racing writer's entry is visible and we don't
-/// append a duplicate.
-fn codex_trust_directory(dir: &Path) {
-    let codex_dir = codex_home();
-    // If ~/.codex doesn't exist, codex isn't installed — silently skip,
-    // matching pre-lock behavior where OpenOptions::create would fail.
-    if !codex_dir.exists() {
-        return;
-    }
-    let config_path = codex_dir.join("config.toml");
-    let lock_path = codex_dir.join(".config.toml.lock");
-    let dir_str = dir.display().to_string();
-    // TOML literal strings (single-quoted) don't interpret escapes, which
-    // matters on Windows where paths contain `\U`, `\n`, etc. — a double-
-    // quoted `[projects."C:\Users\..."]` triggers codex's TOML parser with
-    // "too few unicode value digits". Fall back to escaped double-quoted
-    // only if the path contains a single quote (rare on Windows, impossible
-    // to represent otherwise inside a single-line literal).
-    let toml_key = if dir_str.contains('\'') {
-        let escaped = dir_str.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("[projects.\"{escaped}\"]")
-    } else {
-        format!("[projects.'{dir_str}']")
-    };
-    // Legacy double-quoted form written by pre-fix builds — detect so we
-    // don't append a duplicate on top of an already-broken entry.
-    let legacy_key = format!("[projects.\"{dir_str}\"]");
-
-    // Shared helper — deliberately no truncate(true) (flock is on the
-    // inode, file contents don't matter). Held for the rest of this
-    // function and auto-released on drop.
-    let _lock_file = match crate::store::acquire_file_lock(&lock_path) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, "codex trust: lock acquisition failed");
-            return;
-        }
-    };
-
-    // Re-read under the lock so a racing writer's entry is visible.
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-    if content.contains(&toml_key) || content.contains(&legacy_key) {
-        return;
-    }
-
-    use std::io::Write;
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config_path)
-    else {
-        return;
-    };
-    let prefix = if content.is_empty() || content.ends_with('\n') {
-        ""
-    } else {
-        "\n"
-    };
-    // Single write_all of a pre-formatted buffer so a would-be interleave
-    // across multiple write() syscalls is impossible.
-    let entry = format!("{prefix}{toml_key}\ntrust_level = \"trusted\"\n");
-    if let Err(e) = f.write_all(entry.as_bytes()) {
-        tracing::warn!(error = %e, "codex trust: write failed");
-        return;
-    }
-    tracing::debug!(dir = %dir_str, "Codex directory trusted");
-}
-
-fn dirs_home() -> std::path::PathBuf {
-    crate::user_home_dir()
 }
 
 /// Detect backend from command name and configure MCP.
@@ -820,187 +742,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- codex_trust_directory ---
+    // --- toml_string_value helper ---
 
     #[test]
-    fn codex_trust_writes_toml() {
-        let dir = tmp_dir("codex_trust");
-        let codex_dir = dir.join(".codex");
-        std::fs::create_dir_all(&codex_dir).expect("create .codex");
-        let config_path = codex_dir.join("config.toml");
-
-        let work_dir = dir.join("project");
-        std::fs::create_dir_all(&work_dir).expect("create project");
-
-        with_codex_home_override(&codex_dir, || {
-            codex_trust_directory(&work_dir);
-        });
-
-        let content = std::fs::read_to_string(&config_path).expect("read");
-        let key = format!("[projects.'{}']", work_dir.display());
-        assert!(content.contains(&key), "missing {key} in {content}");
-        assert!(content.contains("trust_level = \"trusted\""));
-        std::fs::remove_dir_all(&dir).ok();
+    fn toml_string_value_uses_literal_for_paths_with_backslashes() {
+        // Windows paths contain `\U` / `\d` / … which a TOML basic string
+        // interprets as escape triggers. Literal (single-quoted) form is the
+        // safe choice — it's what configure_codex emits for command/AGEND_HOME.
+        assert_eq!(
+            toml_string_value(r"C:\Users\alice\agend"),
+            "'C:\\Users\\alice\\agend'"
+        );
+        assert_eq!(toml_string_value("/home/alice"), "'/home/alice'");
     }
 
     #[test]
-    fn codex_trust_idempotent() {
-        let dir = tmp_dir("codex_trust_idem");
-        let codex_dir = dir.join(".codex");
-        std::fs::create_dir_all(&codex_dir).expect("create .codex");
-        let config_path = codex_dir.join("config.toml");
-
-        let work_dir = dir.join("project");
-        std::fs::create_dir_all(&work_dir).expect("create project");
-
-        with_codex_home_override(&codex_dir, || {
-            codex_trust_directory(&work_dir);
-            codex_trust_directory(&work_dir);
-        });
-
-        let content = std::fs::read_to_string(&config_path).expect("read");
-        let key = format!("[projects.'{}']", work_dir.display());
+    fn toml_string_value_escapes_basic_string_when_apostrophe_present() {
+        // Single-line literal can't contain a `'` — fall back to basic string
+        // with `\` and `"` escaped.
+        assert_eq!(toml_string_value("it's mine"), "\"it's mine\"");
         assert_eq!(
-            content.matches(&key).count(),
-            1,
-            "entry must not duplicate on second call"
+            toml_string_value(r"C:\Program' Files\x"),
+            r#""C:\\Program' Files\\x""#
         );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn codex_trust_concurrent_writes_stay_valid() {
-        // P0-5 regression guard: codex was the only backend with a flock in the
-        // original code; Stage 2 extended the pattern to the others. This test
-        // exercises codex_trust_directory from 8 threads racing on the same
-        // config.toml and asserts:
-        //   1. The file is syntactically valid TOML at the end.
-        //   2. The trusted-project entry appears exactly once (idempotent under race).
-        let dir = tmp_dir("codex_trust_concurrent");
-        let codex_dir = dir.join(".codex");
-        std::fs::create_dir_all(&codex_dir).expect("create .codex");
-        let config_path = codex_dir.join("config.toml");
-        let work_dir = dir.join("project");
-        std::fs::create_dir_all(&work_dir).expect("create project");
-
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let codex_dir = codex_dir.clone();
-                let work_dir = work_dir.clone();
-                std::thread::spawn(move || {
-                    with_codex_home_override(&codex_dir, || {
-                        codex_trust_directory(&work_dir);
-                    });
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().expect("thread join");
-        }
-
-        let content = std::fs::read_to_string(&config_path).expect("read");
-        let key = format!("[projects.'{}']", work_dir.display());
-        assert_eq!(
-            content.matches(&key).count(),
-            1,
-            "8 concurrent calls must still produce exactly one entry, got:\n{content}"
-        );
-        assert!(
-            content.contains("trust_level = \"trusted\""),
-            "trust_level must be present after concurrent writes:\n{content}"
-        );
-        // Real TOML parse — catches interleaved writes AND any future escape
-        // mismatch (e.g. the pre-fix double-quoted `[projects."..."]` bug where
-        // Windows backslashes got interpreted as unicode escapes).
-        toml::from_str::<toml::Value>(&content)
-            .unwrap_or_else(|e| panic!("invalid TOML after concurrent writes: {e}\n{content}"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn codex_trust_windows_path_stays_valid_toml() {
-        // Regression guard for commit a457430 bug: when a path contains a TOML
-        // escape trigger (`\U`, `\n`, `\t`, …), a double-quoted `[projects."..."]`
-        // header silently broke codex's config.toml parser. The existing Unix
-        // /tmp-based tests never had a backslash in the path to trigger it.
-        //
-        // Fake a Windows-shape path via raw PathBuf so this test runs on every
-        // platform. codex_trust_directory will treat it as an opaque string and
-        // write it into config.toml — we then round-trip through a real TOML
-        // parser to confirm the file is syntactically valid.
-        let dir = tmp_dir("codex_trust_win_path");
-        let codex_dir = dir.join(".codex");
-        std::fs::create_dir_all(&codex_dir).expect("create .codex");
-        let config_path = codex_dir.join("config.toml");
-
-        let work_dir = std::path::PathBuf::from(r"C:\Users\alice\.agend\workspace\project");
-
-        with_codex_home_override(&codex_dir, || {
-            codex_trust_directory(&work_dir);
-        });
-
-        let content = std::fs::read_to_string(&config_path).expect("read");
-        let parsed: toml::Value = toml::from_str(&content)
-            .unwrap_or_else(|e| panic!("path-with-backslashes broke config.toml: {e}\n{content}"));
-        let projects = parsed
-            .get("projects")
-            .and_then(|v| v.as_table())
-            .expect("projects table missing");
-        let entry = projects
-            .get(r"C:\Users\alice\.agend\workspace\project")
-            .and_then(|v| v.as_table())
-            .expect("project entry missing — key was mangled during round-trip");
-        assert_eq!(
-            entry.get("trust_level").and_then(|v| v.as_str()),
-            Some("trusted"),
-            "trust_level wrong in round-tripped entry: {entry:?}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn codex_trust_dedupes_against_legacy_double_quoted_entry() {
-        // Upgrade-path guard: a pre-fix build wrote `[projects."<path>"]` with
-        // double-quoted TOML keys. When the user upgrades and re-runs, the new
-        // writer uses single-quoted `[projects.'<path>']`. Without legacy_key
-        // dedup, both forms would coexist for the same path — a third variant
-        // could even be added later. Assert the legacy form is detected and
-        // no new entry is appended.
-        let dir = tmp_dir("codex_trust_legacy_dedup");
-        let codex_dir = dir.join(".codex");
-        std::fs::create_dir_all(&codex_dir).expect("create .codex");
-        let config_path = codex_dir.join("config.toml");
-        let work_dir = dir.join("project");
-        std::fs::create_dir_all(&work_dir).expect("create project");
-
-        // Seed the file with a legacy double-quoted entry for the same path.
-        // Unix-shape paths contain no backslashes, so this is still valid TOML
-        // (the bug only triggered on Windows paths with `\U` etc.).
-        let legacy_entry = format!(
-            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-            work_dir.display()
-        );
-        std::fs::write(&config_path, &legacy_entry).expect("seed legacy config");
-        let before = std::fs::read_to_string(&config_path).expect("read");
-
-        with_codex_home_override(&codex_dir, || {
-            codex_trust_directory(&work_dir);
-        });
-
-        let after = std::fs::read_to_string(&config_path).expect("read");
-        assert_eq!(
-            before, after,
-            "legacy entry must be detected — file must not be modified"
-        );
-        let legacy_key = format!("[projects.\"{}\"]", work_dir.display());
-        let new_key = format!("[projects.'{}']", work_dir.display());
-        assert_eq!(after.matches(&legacy_key).count(), 1);
-        assert_eq!(
-            after.matches(&new_key).count(),
-            0,
-            "new-form key must not be appended when legacy form is already present"
-        );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1057,26 +821,49 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn codex_trust_skips_when_codex_dir_missing() {
-        let dir = tmp_dir("codex_trust_absent");
-        // Point override at a non-existent codex home — function should no-op.
-        let fake_codex = dir.join("no-such-codex");
-        let work_dir = dir.join("project");
-        std::fs::create_dir_all(&work_dir).ok();
-
-        with_codex_home_override(&fake_codex, || {
-            codex_trust_directory(&work_dir);
-        });
-
-        assert!(
-            !fake_codex.exists(),
-            "function must not create the codex dir when it's absent"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     // --- configure_codex: MCP block must refresh, not skip-if-exists ---
+
+    /// Regression for the `~/.codex/config.toml` write that was removed in
+    /// this refactor. configure_codex used to trail with `codex_trust_directory`
+    /// which mutated the user's global config — shipped two escape bugs into
+    /// production, raced with the codex CLI's own writer, and left entries
+    /// behind on uninstall. `agend must never touch user-global tool config`
+    /// is now the rule (see the module doc comment). This test asserts that
+    /// a fresh configure_codex against a *fresh* user HOME does not touch it.
+    #[test]
+    fn configure_codex_never_writes_to_user_home() {
+        // Redirect HOME (Unix) and USERPROFILE (Windows) to a scratch dir.
+        // If configure_codex regresses and starts writing to `~/.codex/`
+        // again, it'll create `<scratch>/.codex/` and the test fails.
+        let scratch = tmp_dir("no_global_write");
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        std::env::set_var("HOME", &scratch);
+        std::env::set_var("USERPROFILE", &scratch);
+
+        let work_dir = scratch.join("project");
+        std::fs::create_dir_all(&work_dir).expect("mkdir project");
+        let result = configure_codex(&work_dir);
+
+        // Restore env before any assertion panics, so a failure doesn't
+        // poison subsequent tests in the same process.
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_userprofile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        result.expect("configure_codex");
+        let maybe_global = scratch.join(".codex");
+        assert!(
+            !maybe_global.exists(),
+            "configure_codex must not create ~/.codex — user-global config is off-limits"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
 
     #[test]
     fn codex_config_refreshes_stale_binary_path() {
@@ -1100,11 +887,7 @@ mod tests {
         )
         .expect("seed stale");
 
-        // Point ~/.codex at a non-existent dir so codex_trust_directory no-ops.
-        let fake_home = dir.join("fake-codex-home");
-        with_codex_home_override(&fake_home, || {
-            configure_codex(&dir).expect("configure");
-        });
+        configure_codex(&dir).expect("configure");
 
         let content = std::fs::read_to_string(&config_path).expect("read");
         assert!(
@@ -1151,10 +934,7 @@ mod tests {
         )
         .expect("seed");
 
-        let fake_home = dir.join("fake-codex-home");
-        with_codex_home_override(&fake_home, || {
-            configure_codex(&dir).expect("configure");
-        });
+        configure_codex(&dir).expect("configure");
 
         let content = std::fs::read_to_string(&config_path).expect("read");
         let parsed: toml::Value = toml::from_str(&content).expect("valid TOML");
@@ -1181,16 +961,11 @@ mod tests {
         // no duplicated headers, no drifting whitespace.
         let dir = tmp_dir("codex_cfg_idem");
         std::fs::create_dir_all(dir.join(".codex")).expect("create .codex");
-        let fake_home = dir.join("fake-codex-home");
 
-        with_codex_home_override(&fake_home, || {
-            configure_codex(&dir).expect("first");
-        });
+        configure_codex(&dir).expect("first");
         let after_first =
             std::fs::read_to_string(dir.join(".codex/config.toml")).expect("read first");
-        with_codex_home_override(&fake_home, || {
-            configure_codex(&dir).expect("second");
-        });
+        configure_codex(&dir).expect("second");
         let after_second =
             std::fs::read_to_string(dir.join(".codex/config.toml")).expect("read second");
 

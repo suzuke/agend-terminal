@@ -216,8 +216,8 @@ pub fn generate_with_context(working_dir: &Path, command: &str, ctx: Option<&Age
     }
 
     // Backend-specific setup (non-MCP).
-    // Codex trust is handled inside mcp_config::configure below — do not
-    // duplicate it here or concurrent spawns race on ~/.codex/config.toml.
+    // Codex trust-prompt handling is via CLI flag + dismiss_patterns — see
+    // `src/backend.rs`. We deliberately do not write to `~/.codex/config.toml`.
     if matches!(backend, Some(crate::backend::Backend::ClaudeCode)) {
         migrate_claude_old_rules_file(working_dir);
     }
@@ -254,30 +254,6 @@ mod tests {
         generate(&dir, "claude");
         assert!(dir.join(".claude").join("agend.md").exists());
         assert!(dir.join("mcp-config.json").exists());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn generate_codex_trusts_directory() {
-        let dir = tmp_dir("gen_codex");
-        // Redirect ~/.codex writes into a scratch dir so the real
-        // $HOME/.codex/config.toml is never touched by the test suite.
-        let codex_home = dir.join(".codex_home");
-        std::fs::create_dir_all(&codex_home).unwrap();
-        crate::mcp_config::with_codex_home_override(&codex_home, || {
-            generate(&dir, "codex");
-        });
-        let codex_config = codex_home.join("config.toml");
-        assert!(
-            codex_config.exists(),
-            "codex config not written under override"
-        );
-        let toml = std::fs::read_to_string(&codex_config).unwrap();
-        assert!(
-            toml.contains(&dir.display().to_string()),
-            "codex trust missing for {}",
-            dir.display()
-        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -392,11 +368,7 @@ mod tests {
         let dir = tmp_dir("gen_codex_preserve");
         let user_content = "# Existing project AGENTS\n\nImportant user rules.\n";
         std::fs::write(dir.join("AGENTS.md"), user_content).unwrap();
-        let codex_home = dir.join(".codex_home");
-        std::fs::create_dir_all(&codex_home).unwrap();
-        crate::mcp_config::with_codex_home_override(&codex_home, || {
-            generate(&dir, "codex");
-        });
+        generate(&dir, "codex");
         let after = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert!(
             after.contains("Important user rules."),
@@ -423,15 +395,9 @@ mod tests {
     fn generate_shared_file_is_idempotent_across_spawns() {
         let dir = tmp_dir("gen_shared_idempotent");
         std::fs::write(dir.join("AGENTS.md"), "# user head\n").unwrap();
-        let codex_home = dir.join(".codex_home");
-        std::fs::create_dir_all(&codex_home).unwrap();
-        crate::mcp_config::with_codex_home_override(&codex_home, || {
-            generate(&dir, "codex");
-        });
+        generate(&dir, "codex");
         let once = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        crate::mcp_config::with_codex_home_override(&codex_home, || {
-            generate(&dir, "codex");
-        });
+        generate(&dir, "codex");
         let twice = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         assert_eq!(once, twice, "shared-file merge drifted between spawns");
         std::fs::remove_dir_all(&dir).ok();
