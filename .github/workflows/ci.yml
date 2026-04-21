@@ -24,6 +24,18 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      # tray-icon / tao on Linux link against GTK3 + the ayatana app-
+      # indicator — these come from `libgtk-3-dev` (provides glib-2.0.pc,
+      # gobject-2.0.pc, etc.) and `libayatana-appindicator3-dev`. The
+      # runner image does NOT ship them by default, so the `Clippy (tray
+      # feature)` step fails in gobject-sys' build script on a cache
+      # miss. Pin to Linux only — macOS + Windows use native APIs.
+      - name: Install Linux tray deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+
       - name: Format check
         run: cargo fmt --check
 
