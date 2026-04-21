@@ -53,7 +53,7 @@ agend-terminal demo
 # Or start with your own agents
 cat > ~/.agend-terminal/fleet.yaml << 'YAML'
 defaults:
-  backend: claude-code
+  backend: claude
 
 instances:
   dev:
