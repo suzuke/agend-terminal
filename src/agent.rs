@@ -565,7 +565,6 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
         shutdown,
     } = ctx;
     let mut buf = [0u8; 8192];
-    let mut detect_buf = Vec::with_capacity(4096);
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
     let debug_reads = std::env::var("AGEND_DEBUG_PTY_READ").is_ok();
     let mut read_count: u64 = 0;
@@ -602,29 +601,27 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
                 }
                 let data = &buf[..n_bytes];
 
-                // Auto-dismiss trust/update dialogs (cooldown: 10s after last dismiss)
-                let in_cooldown = dismiss_cooldown_until
-                    .map(|t| std::time::Instant::now() < t)
-                    .unwrap_or(false);
-                if !in_cooldown
-                    && try_dismiss_dialog(name, data, &mut detect_buf, pty_writer, dismiss_patterns)
-                {
-                    dismiss_cooldown_until =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
-                }
-
-                // Feed VTerm + state detection + broadcast (under same lock = atomic)
-                {
+                // Feed VTerm + state detection + broadcast (under same lock = atomic),
+                // then scan the rendered screen for dismiss patterns. Scanning
+                // post-render means we match what the user actually sees —
+                // Ink-style TUIs that draw char-by-char with cursor positioning
+                // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
+                let screen = {
                     let mut c = crate::sync::lock_poisoned(core, "agent_core");
                     c.vterm.process(data);
-                    // Detection runs against the current vterm screen. The
-                    // grid already has ANSI resolved, so state.feed() gets
-                    // plain user-visible text. Hash-dedup inside feed()
-                    // skips cycles where the screen didn't change.
                     let rows = c.vterm.rows() as usize;
                     let screen = c.vterm.tail_lines(rows);
                     c.state.feed(&screen);
                     c.subscribers.retain(|tx| tx.send(data.to_vec()).is_ok());
+                    screen
+                };
+
+                let in_cooldown = dismiss_cooldown_until
+                    .map(|t| std::time::Instant::now() < t)
+                    .unwrap_or(false);
+                if !in_cooldown && try_dismiss_dialog(name, &screen, pty_writer, dismiss_patterns) {
+                    dismiss_cooldown_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
                 }
             }
             Err(e) => {
@@ -739,25 +736,20 @@ fn handle_pty_close(
 }
 
 /// Try to auto-dismiss dialogs using backend-configurable patterns. Returns true if dismissed.
+/// `screen` is the VTerm-rendered view the user sees — not raw PTY bytes —
+/// so Ink-style TUIs that paint char-by-char with cursor positioning still match.
 pub fn try_dismiss_dialog(
     name: &str,
-    data: &[u8],
-    detect_buf: &mut Vec<u8>,
+    screen: &str,
     pty_writer: &PtyWriter,
     dismiss_patterns: &[(String, Vec<u8>)],
 ) -> bool {
     if dismiss_patterns.is_empty() {
         return false;
     }
-    detect_buf.extend_from_slice(data);
-    if detect_buf.len() > 8192 {
-        let d = detect_buf.len() - 8192;
-        detect_buf.drain(..d);
-    }
-    let clean = strip_ansi(&String::from_utf8_lossy(detect_buf));
 
     for (pattern, key_seq) in dismiss_patterns {
-        if clean.contains(pattern.as_str()) {
+        if screen.contains(pattern.as_str()) {
             tracing::info!(agent = name, pattern, "auto-dismissing dialog");
             // Delayed write: TUI escape-sequence parsers need time to distinguish
             // \x1b (ESC key) from \x1b[ (CSI start).  Writing immediately causes
@@ -793,7 +785,6 @@ pub fn try_dismiss_dialog(
                 }
                 tracing::debug!(agent = %agent, "dismiss keystrokes sent");
             });
-            detect_buf.clear();
             return true;
         }
     }
@@ -972,5 +963,50 @@ mod tests {
         assert!(!is_sensitive_env_key("LANG"));
         assert!(!is_sensitive_env_key("TERM"));
         assert!(!is_sensitive_env_key("PROMPT_OVERRIDE"));
+    }
+
+    fn test_writer() -> PtyWriter {
+        Arc::new(Mutex::new(Box::new(Vec::<u8>::new())))
+    }
+
+    #[test]
+    fn dismiss_fires_when_pattern_in_screen() {
+        let patterns = vec![("Do you trust".to_string(), b"\n".to_vec())];
+        let hit = try_dismiss_dialog(
+            "t",
+            "Do you trust the contents of this directory?",
+            &test_writer(),
+            &patterns,
+        );
+        assert!(hit);
+    }
+
+    #[test]
+    fn dismiss_skips_when_pattern_absent() {
+        let patterns = vec![("Do you trust".to_string(), b"\n".to_vec())];
+        let hit = try_dismiss_dialog("t", "unrelated screen content", &test_writer(), &patterns);
+        assert!(!hit);
+    }
+
+    #[test]
+    fn dismiss_skips_when_no_patterns() {
+        assert!(!try_dismiss_dialog("t", "anything", &test_writer(), &[]));
+    }
+
+    #[test]
+    fn dismiss_matches_ink_style_cursor_painted_prompt() {
+        // Regression for macOS: Ink-based TUIs (codex) paint text by
+        // positioning the cursor before each segment. VTerm resolves this
+        // into a clean screen; the old raw-byte strip_ansi path was fragile
+        // on such streams. Drive VTerm with BSU + cursor positioning and
+        // confirm the rendered screen still contains the pattern literally.
+        let mut vt = crate::vterm::VTerm::new(80, 24);
+        vt.process(b"\x1b[?2026h"); // begin synchronized update
+        vt.process(b"\x1b[5;2HDo you trust"); // row 5 col 2
+        vt.process(b"\x1b[5;15H the contents of this directory?");
+        vt.process(b"\x1b[?2026l"); // end synchronized update
+        let screen = vt.tail_lines(24);
+        let patterns = vec![("Do you trust".to_string(), b"\n".to_vec())];
+        assert!(try_dismiss_dialog("t", &screen, &test_writer(), &patterns));
     }
 }

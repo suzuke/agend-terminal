@@ -220,10 +220,13 @@ impl Backend {
                 inject_instructions_on_ready: false,
                 ready_timeout_secs: 20,
                 dismiss_patterns: &[
-                    // Trust directory prompt: "Yes, continue" is pre-selected → Enter
-                    ("Do you trust", b"\n"),
+                    // Trust directory prompt: "Yes, continue" is pre-selected → Enter.
+                    // CR (\r), not LF — Ink's keyboard reader treats CR as Enter.
+                    // macOS openpty doesn't translate LF→CR on input (ConPTY does),
+                    // so LF here would silently no-op on mac.
+                    ("Do you trust", b"\r"),
                     // Auto-update prompt: "Please restart Codex" → Enter
-                    ("Please restart", b"\n"),
+                    ("Please restart", b"\r"),
                 ],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),

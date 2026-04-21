@@ -5,6 +5,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-04-21
+
 Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area.
 
 ### Added
@@ -40,6 +42,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 - Worktree creation handles empty-repo + set-git-config edge cases.
 - Bugreport redacts `group_id`.
 - Various clippy 1.95 fixes (`collapsible_if`, `type_complexity`, `unwrap_used`, overlay bounds match guards).
+- **Unique instance names on every spawn** — 6-hex suffix against `fleet.yaml` ∪ `workspace/` ∪ `inbox/`; pane close cleans up the workspace and inbox entry so the next spawn cannot accidentally resume a stale agent session.
+- **Codex trust prompt auto-dismiss now works on macOS** — dismiss pattern matching runs against the VTerm-rendered screen (not a hand-rolled strip_ansi over raw bytes), so Ink-style char-by-char cursor-positioned paints still match. Codex dismiss key switched from LF to CR — macOS/openpty does not translate LF→CR on input like ConPTY does, so LF was silently acting as Ctrl+J (move selection down).
 
 ### Removed
 
@@ -92,5 +96,6 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/85f2bc3...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/suzuke/agend-terminal/compare/85f2bc3...v0.3.1
 [0.3.0]: https://github.com/suzuke/agend-terminal/commit/85f2bc3
