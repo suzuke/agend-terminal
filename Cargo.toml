@@ -25,6 +25,13 @@ include = [
 [lints.clippy]
 unwrap_used = "deny"
 
+# Menu-bar / system-tray resident app (see docs/PLAN-tray-resident.md).
+# Scaffold only — `tray-icon` + `tao` land with PLAN task #4 (event loop).
+# Default build stays lean: no new deps unless `--features tray` is passed.
+[features]
+default = []
+tray = []
+
 [profile.release]
 strip = true
 lto = true
