@@ -337,17 +337,19 @@ fn send_to_instance_falls_back_when_daemon_down() {
         "send_to_instance",
         &json!({"target": "other-agent", "message": "hello"}),
     );
-    // Should succeed via direct inbox delivery with a "note" about API unavailable
-    assert!(
-        result.get("target").is_some() || result.get("error").is_some(),
-        "expected fallback delivery or error, got: {result}"
+    // Fallback: direct inbox delivery returns target + note about API unavailable
+    assert_eq!(
+        result["target"].as_str(),
+        Some("other-agent"),
+        "expected target in fallback response, got: {result}"
     );
-    if let Some(note) = result["note"].as_str() {
-        assert!(
-            note.to_lowercase().contains("unavailable") || note.to_lowercase().contains("direct"),
-            "expected unavailable/direct note, got: {note}"
-        );
-    }
+    let note = result["note"]
+        .as_str()
+        .expect("expected 'note' field in fallback response");
+    assert!(
+        note.to_lowercase().contains("unavailable") || note.to_lowercase().contains("direct"),
+        "expected unavailable/direct note, got: {note}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -361,26 +363,40 @@ fn list_instances_falls_back_when_daemon_down() {
     );
 }
 
-/// Tools that call api::call and may fall back to ops or return an error
-/// when the daemon is unavailable. The key invariant: no panic, no hang.
-const API_DEPENDENT_TOOLS: &[(&str, &str)] = &[
-    ("describe_instance", r#"{"name":"nonexistent"}"#),
-    ("delete_instance", r#"{"name":"nonexistent"}"#),
-    ("replace_instance", r#"{"name":"nonexistent"}"#),
-];
+/// Per-tool daemon-down behavior pinned to specific response shapes.
+#[test]
+fn describe_instance_returns_error_when_daemon_down() {
+    let home = temp_home("desc-no-daemon");
+    let result = call_tool(&home, "describe_instance", &json!({"name": "nonexistent"}));
+    assert!(
+        result.get("error").is_some(),
+        "describe_instance should return error when daemon down, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
 
 #[test]
-fn api_dependent_tools_do_not_panic_when_daemon_down() {
-    let home = temp_home("api-down");
-    for (tool, args_str) in API_DEPENDENT_TOOLS {
-        let args: Value = serde_json::from_str(args_str).expect("parse args");
-        let result = call_tool(&home, tool, &args);
-        // Must return *something* — error or fallback result. No panic, no hang.
-        assert!(
-            result.is_object(),
-            "tool={tool}: expected JSON object, got: {result}"
-        );
-    }
+fn delete_instance_succeeds_via_ops_when_daemon_down() {
+    let home = temp_home("del-no-daemon");
+    let result = call_tool(&home, "delete_instance", &json!({"name": "nonexistent"}));
+    // delete_instance falls back to ops::delete_instance which touches files only
+    assert_eq!(
+        result["name"].as_str(),
+        Some("nonexistent"),
+        "delete_instance should succeed via ops fallback, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn replace_instance_returns_error_when_daemon_down() {
+    let home = temp_home("replace-no-daemon");
+    let result = call_tool(&home, "replace_instance", &json!({"name": "nonexistent"}));
+    // replace_instance needs daemon to list agents; without it, returns error or note
+    assert!(
+        result.get("error").is_some() || result.get("note").is_some(),
+        "replace_instance should return error/note when daemon down, got: {result}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
