@@ -624,6 +624,7 @@ fn pane_from_menu_item(
                     rows,
                     wakeup_tx,
                     name_counter,
+                    crate::backend::SpawnMode::Fresh,
                 )
             } else {
                 // Preset args are added by spawn_agent; no need to compose here.
@@ -660,6 +661,7 @@ fn pane_from_menu_item(
                 rows,
                 wakeup_tx,
                 name_counter,
+                crate::backend::SpawnMode::Resume,
             )
         }
     }

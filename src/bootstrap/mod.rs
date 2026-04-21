@@ -142,6 +142,14 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
         return Ok(BootstrapOutcome::Attached(attached));
     }
 
+    // We hold the exclusive daemon lock, so no one else is attaching or
+    // creating run dirs. Sweep any `~/.agend/run/*` left behind by prior
+    // daemons whose PIDs have since been recycled — otherwise the first
+    // one `find_active_run_dir` visits on a later app launch can lure that
+    // process into attaching to a dead daemon (symptom: input lag from 2s
+    // port-poll hitting closed sockets).
+    crate::daemon::sweep_stale_run_dirs(home);
+
     let run_dir = crate::daemon::run_dir(home);
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("create run dir {}", run_dir.display()))?;
@@ -178,10 +186,25 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 /// Return `Some(AttachedFleet)` if a live daemon owns the run dir, else `None`.
 /// Errors if the cookie file is missing — that would mean a running daemon
 /// without auth, which we refuse to silently join.
+///
+/// Probe `api.port` to guard against PID reuse: `is_pid_alive` can't tell
+/// a live daemon from a recycled-PID impostor (#6, Windows input-lag bug).
+/// Probe failure alone is NOT enough to delete the run dir — `try_attach`
+/// runs before the daemon lock, and a failing probe can also mean a live
+/// daemon is mid-bootstrap and hasn't bound its port yet; deleting would
+/// clobber its state (#7). Return `None` on failure and let the caller's
+/// lock acquisition + `sweep_stale_run_dirs` distinguish dead from starting.
 fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
     let Some(run_dir) = crate::daemon::find_active_run_dir(home) else {
         return Ok(None);
     };
+    if !crate::ipc::probe_api(&run_dir) {
+        tracing::debug!(
+            path = %run_dir.display(),
+            "api.port unreachable — skipping attach (sweep will clean if truly stale)"
+        );
+        return Ok(None);
+    }
     let cookie = crate::auth_cookie::read_cookie(&run_dir)
         .with_context(|| format!("existing daemon at {} has no api.cookie", run_dir.display()))?;
     let daemon_pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(0);
@@ -230,6 +253,16 @@ mod tests {
         )
         .expect("write fleet.yaml");
         path
+    }
+
+    /// Stand up a loopback listener and write its port as `api.port` inside
+    /// `run_dir`, mimicking a real daemon for `probe_api` purposes. Returns
+    /// the listener so the caller keeps it alive for the duration of the test.
+    fn fake_api_listener(run_dir: &Path) -> std::net::TcpListener {
+        let listener = crate::ipc::bind_loopback().expect("bind");
+        let port = crate::ipc::local_port(&listener);
+        crate::ipc::write_port(run_dir, crate::ipc::API_NAME, port).expect("write api.port");
+        listener
     }
 
     #[test]
@@ -282,10 +315,14 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Refuse to silently attach to a daemon that has no `api.cookie`. The
-    /// alternative — treat cookie-less run dirs as Attached — would mean a
-    /// client could land in a state where it thinks a daemon is live but has
-    /// no way to authenticate against its API.
+    /// Refuse to silently attach to a daemon that has a live api port but
+    /// no `api.cookie`. The alternative — treat cookie-less run dirs as
+    /// Attached — would mean a client could land in a state where it thinks
+    /// a daemon is live but has no way to authenticate against its API.
+    ///
+    /// Note: a run dir with no listener on api.port is now treated as stale
+    /// and swept, not as a cookie-less daemon (that case is covered by
+    /// `prepare_sweeps_run_dir_with_dead_api`).
     #[test]
     fn attach_fails_when_cookie_missing() {
         let home = tmp_home("no_cookie");
@@ -293,9 +330,9 @@ mod tests {
         let run = crate::daemon::run_dir(&home);
         std::fs::create_dir_all(&run).expect("mkdir run");
         crate::daemon::write_daemon_id(&run);
-        // Deliberately DO NOT call auth_cookie::issue. find_active_run_dir
-        // will see the live-looking run dir, try_attach will then bail on
-        // read_cookie, and prepare returns Err.
+        let _listener = fake_api_listener(&run);
+        // Deliberately DO NOT call auth_cookie::issue. probe_api will pass
+        // (listener is alive), try_attach will then bail on read_cookie.
 
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
@@ -316,13 +353,14 @@ mod tests {
 
     #[test]
     fn prepare_attaches_when_run_dir_alive() {
-        // Simulate a live daemon by creating a run dir with current PID + cookie.
+        // Simulate a live daemon: current PID + cookie + bound api port.
         let home = tmp_home("attached");
         let fleet = write_minimal_fleet(&home);
         let run = crate::daemon::run_dir(&home);
         std::fs::create_dir_all(&run).expect("mkdir run");
         crate::daemon::write_daemon_id(&run);
         let _ = crate::auth_cookie::issue(&run).expect("issue cookie for fake daemon");
+        let _listener = fake_api_listener(&run);
 
         let opts = PrepareOptions {
             mutate_fleet_yaml: false,
@@ -339,6 +377,129 @@ mod tests {
                 panic!("expected Attached when live daemon owns run_dir")
             }
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Regression for the "lag from attached to dead daemon" bug.
+    ///
+    /// A previous daemon died; Windows recycled its PID for an unrelated
+    /// process so `is_pid_alive` keeps returning true. Without a port probe
+    /// bootstrap would Attach to a run dir where nothing is listening — the
+    /// TUI's 2-second port poll would then spin on failing TCP connects and
+    /// starve the input loop.
+    ///
+    /// Expectation: the stale run dir is swept, `prepare` returns Owned with
+    /// a fresh run dir for the current process, and the old `.daemon` /
+    /// `api.cookie` files are gone.
+    #[test]
+    fn prepare_sweeps_run_dir_with_dead_api() {
+        let home = tmp_home("dead_api");
+        let fleet = write_minimal_fleet(&home);
+        // Use a dir name = current pid so is_pid_alive returns true, but
+        // never open a listener — probe_api must fail.
+        let run = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&run).expect("mkdir run");
+        crate::daemon::write_daemon_id(&run);
+        let stale_cookie_bytes = crate::auth_cookie::issue(&run).expect("issue cookie");
+
+        let opts = PrepareOptions {
+            mutate_fleet_yaml: false,
+            init_telegram: false,
+            resolve_agents: false,
+        };
+        let outcome = prepare(&home, &fleet, opts).expect("prepare");
+        match outcome {
+            BootstrapOutcome::Owned(o) => {
+                // run_dir is pid-keyed so the path may be the same, but the
+                // stale state must have been wiped and re-issued fresh.
+                assert_ne!(
+                    o.cookie, stale_cookie_bytes,
+                    "fresh cookie must differ from the stale one we planted"
+                );
+                let fresh = crate::auth_cookie::read_cookie(&o.run_dir).expect("read");
+                assert_eq!(fresh, o.cookie);
+            }
+            BootstrapOutcome::Attached(_) => {
+                panic!("must not Attach to a run dir whose api.port is dead");
+            }
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Sweep removes a pid-named dir whose `api.port` has no listener, even
+    /// when `is_pid_alive` still returns true (PID reuse). Non-pid siblings
+    /// (stray files, lock files written later) must be left alone.
+    #[test]
+    fn sweep_stale_run_dirs_removes_dead_api_entries() {
+        let home = tmp_home("sweep");
+        let run_base = home.join("run");
+        std::fs::create_dir_all(&run_base).expect("mkdir run");
+
+        // Use our own pid for the stale dir name: is_pid_alive returns true
+        // (we're running), but no listener is bound so probe_api returns
+        // false — the combination that used to leak across sessions.
+        let our_pid = std::process::id().to_string();
+        let stale = run_base.join(&our_pid);
+        std::fs::create_dir_all(&stale).expect("mkdir stale");
+        std::fs::write(stale.join(".daemon"), format!("{our_pid}:0")).expect("write .daemon");
+        // Non-pid sibling — sweep must leave it alone.
+        let non_pid = run_base.join("not-a-pid");
+        std::fs::create_dir_all(&non_pid).expect("mkdir non-pid");
+
+        crate::daemon::sweep_stale_run_dirs(&home);
+
+        assert!(
+            !stale.exists(),
+            "stale pid-named dir with dead api must be swept"
+        );
+        assert!(
+            non_pid.exists(),
+            "non-pid-named sibling must be left intact"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Issue #7 regression: when a daemon is mid-bootstrap — `.daemon` and
+    /// `api.cookie` written but `api.port` not bound yet — `try_attach` must
+    /// NOT `remove_dir_all` the run dir. Prior to this fix a racing `app`
+    /// process could clobber a live daemon's state, because `probe_api` fails
+    /// during the bootstrap window and the old code treated that as "stale".
+    ///
+    /// Expectation: `try_attach` returns `None` (port not listening ⇒ not
+    /// ready to attach), but all files in the run dir survive untouched, so
+    /// the bootstrapping daemon can finish writing its state.
+    #[test]
+    fn try_attach_preserves_run_dir_when_port_unreachable() {
+        let home = tmp_home("mid_bootstrap");
+        let fleet = write_minimal_fleet(&home);
+        let run = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&run).expect("mkdir run");
+        crate::daemon::write_daemon_id(&run);
+        let planted_cookie =
+            crate::auth_cookie::issue(&run).expect("issue cookie to simulate bootstrap");
+        // Deliberately skip `fake_api_listener` / `write_port` — this is the
+        // exact state of a daemon between `auth_cookie::issue` and
+        // `api::serve` binding its loopback port.
+
+        let outcome = try_attach(&home, &fleet).expect("try_attach");
+        assert!(
+            outcome.is_none(),
+            "must not attach when api.port is unreachable"
+        );
+        assert!(
+            run.exists(),
+            "mid-bootstrap run dir must not be deleted by try_attach (issue #7)"
+        );
+        assert!(
+            run.join(".daemon").exists(),
+            ".daemon file must survive try_attach probe failure"
+        );
+        let surviving = crate::auth_cookie::read_cookie(&run)
+            .expect("cookie file must survive try_attach probe failure");
+        assert_eq!(
+            surviving, planted_cookie,
+            "cookie bytes must be unchanged — try_attach must not have rewritten"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
