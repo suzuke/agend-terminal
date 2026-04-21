@@ -10,6 +10,9 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
         None => return json!({"ok": false, "error": "missing name"}),
     };
     let before = crate::teams::get_members(ctx.home, &team_name);
+    // Snapshot the pre-mutation roster so the TUI event carries the
+    // *effective* diff (noop adds like re-adding an existing member
+    // must not trigger a pane move).
     let result = crate::teams::update(ctx.home, params);
     let after = crate::teams::get_members(ctx.home, &team_name);
     let before_set: std::collections::HashSet<&String> = before.iter().collect();

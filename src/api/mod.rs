@@ -1513,4 +1513,78 @@ mod tests {
         assert_eq!(events.len(), 0, "noop diff should not emit event");
         stop_server(&shutdown, &home);
     }
+
+    // -----------------------------------------------------------------------
+    // Slice C2 characterization: CREATE_TEAM
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_create_team_missing_name() {
+        let (port, home, _n, shutdown) = start_test_server("ct-noname");
+        let resp = api_request(port, &home, &json!({"method": "create_team", "params": {}}));
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("missing")));
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_create_team_all_spawns_failed() {
+        let (port, home, _n, shutdown) = start_test_server("ct-allfail");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "create_team",
+                "params": {
+                    "name": "fail-team",
+                    "backend": "nonexistent-binary-xyz",
+                    "count": 2
+                }
+            }),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().is_some_and(|e| e.contains("failed")));
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_create_team_zero_count_succeeds() {
+        let (port, home, notifier, shutdown) = start_test_server("ct-zero");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "create_team",
+                "params": {"name": "empty-team"}
+            }),
+        );
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["spawned"], json!([]));
+        assert!(resp.get("failed").is_none(), "no failed field expected");
+        // No spawns → no TeamCreated event
+        let events = notifier.take();
+        assert_eq!(events.len(), 0, "zero-count should not emit TeamCreated");
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_create_team_with_existing_members_only() {
+        let (port, home, notifier, shutdown) = start_test_server("ct-members");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "create_team",
+                "params": {"name": "ref-team", "members": ["a", "b"]}
+            }),
+        );
+        assert_eq!(resp["ok"], true);
+        assert_eq!(resp["spawned"], json!([]));
+        // No spawns → no TeamCreated event
+        let events = notifier.take();
+        assert_eq!(events.len(), 0, "no spawns should not emit TeamCreated");
+        stop_server(&shutdown, &home);
+    }
 }
