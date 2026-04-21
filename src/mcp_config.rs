@@ -315,6 +315,10 @@ fn configure_opencode(working_dir: &Path) -> Result<()> {
 /// `codex mcp add` only writes to global config and doesn't support per-project.
 /// But Codex loads .codex/config.toml from the project root (trusted projects only).
 /// This gives us per-instance AGEND_INSTANCE_NAME via project-level config.
+/// Section headers owned by this writer — the two tables we strip+rewrite.
+const CODEX_MCP_HEADER: &str = "[mcp_servers.agend-terminal]";
+const CODEX_MCP_ENV_HEADER: &str = "[mcp_servers.agend-terminal.env]";
+
 fn configure_codex(working_dir: &Path) -> Result<()> {
     let bin = binary_path();
     let home = home_path();
@@ -327,14 +331,14 @@ fn configure_codex(working_dir: &Path) -> Result<()> {
     // strip→append cycles on the same config.toml.
     let _lock = crate::store::acquire_file_lock(&config_lock_path(&config_path))?;
 
-    // Re-read under the lock. Any existing `[mcp_servers.agend-terminal]` /
-    // `[mcp_servers.agend-terminal.env]` block is stripped before we write a
-    // fresh one — otherwise a stale binary path from a prior build (e.g. a
-    // worktree that has since been removed) would silently persist and fail
-    // at codex MCP startup with ENOENT.
+    // Re-read under the lock. Any existing agend-terminal block is stripped
+    // before we write a fresh one — otherwise a stale binary path from a
+    // prior build (e.g. a worktree that has since been removed) would
+    // silently persist and fail at codex MCP startup with ENOENT.
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let mut stripped = strip_agend_mcp_sections(&existing);
-    // Collapse trailing blank lines so re-runs don't accumulate them.
+    // Normalize to exactly one trailing newline on non-empty content so the
+    // next `\n` we emit produces a single blank-line separator.
     while stripped.ends_with("\n\n") {
         stripped.pop();
     }
@@ -343,17 +347,22 @@ fn configure_codex(working_dir: &Path) -> Result<()> {
     }
     let separator = if stripped.is_empty() { "" } else { "\n" };
 
-    let new_block = format!(
-        r#"{separator}[mcp_servers.agend-terminal]
+    let body = format!(
+        r#"{stripped}{separator}{CODEX_MCP_HEADER}
 command = "{bin}"
 args = ["mcp"]
 
-[mcp_servers.agend-terminal.env]
+{CODEX_MCP_ENV_HEADER}
 AGEND_HOME = "{home}"
 "#
     );
-    let body = format!("{stripped}{new_block}");
-    crate::store::atomic_write(&config_path, body.as_bytes())?;
+
+    // Skip the atomic_write (temp file + fsync + rename) when the file is
+    // already up to date. configure_codex runs on every codex pane spawn, so
+    // the steady-state call is the no-op case.
+    if existing != body {
+        crate::store::atomic_write(&config_path, body.as_bytes())?;
+    }
     tracing::debug!(path = %config_path.display(), "configured MCP");
 
     // Auto-trust working directory in ~/.codex/config.toml
@@ -371,14 +380,11 @@ fn strip_agend_mcp_sections(content: &str) -> String {
     let mut in_target = false;
     for raw_line in content.split_inclusive('\n') {
         let trimmed = raw_line.trim();
-        // A section header is a line whose trimmed form is `[...]` — this
-        // matches both tables (`[foo]`) and array-of-tables (`[[foo]]`), and
-        // excludes value lines that start with `[` inside a string.
+        // A section header is a line whose trimmed form is `[...]` — matches
+        // both tables (`[foo]`) and array-of-tables (`[[foo]]`), and excludes
+        // value lines that start with `[` inside a string.
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_target = matches!(
-                trimmed,
-                "[mcp_servers.agend-terminal]" | "[mcp_servers.agend-terminal.env]"
-            );
+            in_target = trimmed == CODEX_MCP_HEADER || trimmed == CODEX_MCP_ENV_HEADER;
             if in_target {
                 continue;
             }
@@ -1115,11 +1121,8 @@ mod tests {
             .expect("command string");
         assert_ne!(cmd, "/nonexistent/stale/binary");
         // Exactly one of each header — the stripper must not leave orphans.
-        assert_eq!(content.matches("[mcp_servers.agend-terminal]").count(), 1);
-        assert_eq!(
-            content.matches("[mcp_servers.agend-terminal.env]").count(),
-            1
-        );
+        assert_eq!(content.matches(CODEX_MCP_HEADER).count(), 1);
+        assert_eq!(content.matches(CODEX_MCP_ENV_HEADER).count(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1195,16 +1198,8 @@ mod tests {
             after_first, after_second,
             "second run drifted file:\nfirst:\n{after_first}\nsecond:\n{after_second}"
         );
-        assert_eq!(
-            after_second.matches("[mcp_servers.agend-terminal]").count(),
-            1
-        );
-        assert_eq!(
-            after_second
-                .matches("[mcp_servers.agend-terminal.env]")
-                .count(),
-            1
-        );
+        assert_eq!(after_second.matches(CODEX_MCP_HEADER).count(), 1);
+        assert_eq!(after_second.matches(CODEX_MCP_ENV_HEADER).count(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
