@@ -3,6 +3,8 @@
 //! Each handler takes `(params, ctx)` and returns a `Value` response.
 //! `HandlerCtx` bundles the session-scoped state that handlers need.
 
+pub(crate) mod external;
+pub(crate) mod messaging;
 pub(crate) mod query;
 
 use crate::agent::{AgentRegistry, ExternalRegistry};
