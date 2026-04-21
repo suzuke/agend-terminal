@@ -13,8 +13,10 @@ pub mod icon;
 pub mod terminal;
 
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 #[cfg(target_os = "macos")]
@@ -26,11 +28,37 @@ use tray_icon::{
 
 use crate::{api, bootstrap::daemon_spawn};
 
-/// Events forwarded from tray-icon's global callbacks into the tao
-/// event loop so the loop wakes on every menu click.
+/// Status polling cadence. PLAN §"Runtime flow" pins 2s; slower feels
+/// stale, faster is just wasted IPC.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Events forwarded from tray-icon's global callbacks and the status
+/// poller into the tao event loop so the loop wakes on every input.
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
+    /// Pre-formatted label text from the worker thread. Drained on the
+    /// main thread (tray-icon / muda require main-thread mutation on
+    /// macOS).
+    Status(String),
+}
+
+/// Render a LIST response into the menu label. First line is what the
+/// user scans: how many agents the daemon has, or "daemon offline" if
+/// the probe errors.
+fn format_status(resp: &Value) -> String {
+    let Some(agents) = resp
+        .get("result")
+        .and_then(|r| r.get("agents"))
+        .and_then(|a| a.as_array())
+    else {
+        return "daemon offline".to_string();
+    };
+    match agents.len() {
+        0 => "no agents".to_string(),
+        1 => "1 agent".to_string(),
+        n => format!("{n} agents"),
+    }
 }
 
 /// Build a 32x32 solid-color placeholder icon so the spike runs without
@@ -99,11 +127,33 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         let _ = proxy.send_event(UserEvent::Menu(event));
     }));
 
-    // Menu: just "Quit" for the spike.
+    // Menu: disabled status label at the top, then Quit. Open App /
+    // Launch-at-login land in follow-on commits — they slot above Quit.
     let menu = Menu::new();
+    let status_item = MenuItem::new("starting…", false, None);
     let quit_item = MenuItem::new("Quit agend-terminal", true, None);
+    menu.append(&status_item)?;
+    menu.append(&tray_icon::menu::PredefinedMenuItem::separator())?;
     menu.append(&quit_item)?;
     let quit_id = quit_item.id().clone();
+
+    // Status poller: every POLL_INTERVAL, probe the daemon and push a
+    // pre-formatted label through the event loop. Runs on a worker
+    // thread because tray-icon / muda menu mutation must stay on the
+    // main thread on macOS. The loop exits when `send_event` fails —
+    // which happens once the event loop has shut down (`Quit` clicked).
+    let poll_proxy = event_loop.create_proxy();
+    let poll_home = home.clone();
+    thread::spawn(move || loop {
+        let text = match api::call(&poll_home, &json!({"method": api::method::LIST})) {
+            Ok(resp) => format_status(&resp),
+            Err(_) => "daemon offline".to_string(),
+        };
+        if poll_proxy.send_event(UserEvent::Status(text)).is_err() {
+            break;
+        }
+        thread::sleep(POLL_INTERVAL);
+    });
 
     // tray-icon requires creation AFTER the event loop starts on macOS
     // (prevents fullscreen-app issues, per crate docs). Build inside
@@ -134,6 +184,9 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
             Event::UserEvent(UserEvent::Menu(ev)) if ev.id == quit_id => {
                 shutdown_daemon(&home);
                 *control_flow = ControlFlow::Exit;
+            }
+            Event::UserEvent(UserEvent::Status(text)) => {
+                status_item.set_text(text);
             }
             _ => {}
         }
