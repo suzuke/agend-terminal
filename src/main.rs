@@ -36,6 +36,8 @@ mod sync;
 mod tasks;
 mod teams;
 mod telegram;
+#[cfg(feature = "tray")]
+mod tray;
 mod tui;
 mod verify;
 mod vterm;
@@ -256,6 +258,12 @@ enum Commands {
     },
     /// Health check
     Doctor,
+    /// Menu-bar / system-tray resident app (requires `--features tray`).
+    ///
+    /// Scaffold only in this build — real event loop lands with
+    /// `docs/PLAN-tray-resident.md` task #4.
+    #[cfg(feature = "tray")]
+    Tray,
     /// Interactive demo — experience multi-agent orchestration in 30 seconds
     Demo,
     /// Interactive setup — detect backends, configure Telegram, generate fleet.yaml
@@ -587,6 +595,8 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Test { suite }) => cli::run_tests(&suite, &home)?,
         Some(Commands::Verify { json, backend }) => verify::run(&home, json, backend.as_deref())?,
         Some(Commands::Doctor) => cli::run_doctor(&home)?,
+        #[cfg(feature = "tray")]
+        Some(Commands::Tray) => tray::run(&home)?,
         Some(Commands::Demo) => cli::run_demo()?,
         Some(Commands::Quickstart) => quickstart::run(&home)?,
         Some(Commands::Bugreport) => bugreport::run(&home)?,

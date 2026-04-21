@@ -30,11 +30,21 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
+      # Tray feature gate (docs/PLAN-tray-resident.md). Release binaries
+      # still ship default-only until PLAN task #4 pulls in tray-icon/tao;
+      # this step just guarantees the feature code compiles on all three
+      # platforms so per-OS regressions surface before the event loop lands.
+      - name: Clippy (tray feature)
+        run: cargo clippy --all-targets --features tray -- -D warnings
+
       - name: Build
         run: cargo build --release
 
       - name: Unit tests
         run: cargo test --bin agend-terminal
+
+      - name: Unit tests (tray feature)
+        run: cargo test --bin agend-terminal --features tray
 
       - name: Integration tests
         run: cargo test --test integration
