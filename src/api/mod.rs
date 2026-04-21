@@ -1480,4 +1480,75 @@ mod tests {
     }
 
     // SPAWN happy path + dedup are disclosed known gaps — require real agent spawn
+
+    // -----------------------------------------------------------------------
+    // Slice C1 characterization: UPDATE_TEAM
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_update_team_missing_name() {
+        let (port, home, _n, shutdown) = start_test_server("ut-noname");
+        let resp = api_request(port, &home, &json!({"method": "update_team", "params": {}}));
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("missing")));
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_update_team_remove_member() {
+        let (port, home, notifier, shutdown) = start_test_server("ut-remove");
+        // Pre-create team with members
+        let store_path = home.join("teams.json");
+        std::fs::write(
+            &store_path,
+            r#"{"schema_version":1,"teams":[{"name":"t1","members":["m1","m2"],"created_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "update_team", "params": {"name": "t1", "remove": ["m2"]}}),
+        );
+        assert_eq!(resp["ok"], true);
+        let events = notifier.take();
+        assert_eq!(events.len(), 1);
+        let ApiEvent::TeamMembersChanged {
+            name,
+            added,
+            removed,
+        } = &events[0]
+        else {
+            panic!("expected TeamMembersChanged, got {:?}", events[0])
+        };
+        assert_eq!(name, "t1");
+        assert!(added.is_empty());
+        assert_eq!(removed, &["m2"]);
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_update_team_noop_no_event() {
+        let (port, home, notifier, shutdown) = start_test_server("ut-noop");
+        // Pre-create team
+        let store_path = home.join("teams.json");
+        std::fs::write(
+            &store_path,
+            r#"{"schema_version":1,"teams":[{"name":"t1","members":["m1"],"created_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        // Re-add existing member → noop diff → no event
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "update_team", "params": {"name": "t1", "add": ["m1"]}}),
+        );
+        assert_eq!(resp["ok"], true);
+        let events = notifier.take();
+        assert_eq!(events.len(), 0, "noop diff should not emit event");
+        stop_server(&shutdown, &home);
+    }
 }
