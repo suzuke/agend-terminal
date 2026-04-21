@@ -920,6 +920,51 @@ mod tests {
     }
 
     #[test]
+    fn codex_trust_dedupes_against_legacy_double_quoted_entry() {
+        // Upgrade-path guard: a pre-fix build wrote `[projects."<path>"]` with
+        // double-quoted TOML keys. When the user upgrades and re-runs, the new
+        // writer uses single-quoted `[projects.'<path>']`. Without legacy_key
+        // dedup, both forms would coexist for the same path — a third variant
+        // could even be added later. Assert the legacy form is detected and
+        // no new entry is appended.
+        let dir = tmp_dir("codex_trust_legacy_dedup");
+        let codex_dir = dir.join(".codex");
+        std::fs::create_dir_all(&codex_dir).expect("create .codex");
+        let config_path = codex_dir.join("config.toml");
+        let work_dir = dir.join("project");
+        std::fs::create_dir_all(&work_dir).expect("create project");
+
+        // Seed the file with a legacy double-quoted entry for the same path.
+        // Unix-shape paths contain no backslashes, so this is still valid TOML
+        // (the bug only triggered on Windows paths with `\U` etc.).
+        let legacy_entry = format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+            work_dir.display()
+        );
+        std::fs::write(&config_path, &legacy_entry).expect("seed legacy config");
+        let before = std::fs::read_to_string(&config_path).expect("read");
+
+        with_codex_home_override(&codex_dir, || {
+            codex_trust_directory(&work_dir);
+        });
+
+        let after = std::fs::read_to_string(&config_path).expect("read");
+        assert_eq!(
+            before, after,
+            "legacy entry must be detected — file must not be modified"
+        );
+        let legacy_key = format!("[projects.\"{}\"]", work_dir.display());
+        let new_key = format!("[projects.'{}']", work_dir.display());
+        assert_eq!(after.matches(&legacy_key).count(), 1);
+        assert_eq!(
+            after.matches(&new_key).count(),
+            0,
+            "new-form key must not be appended when legacy form is already present"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn gemini_concurrent_configure_keeps_json_valid_and_trusted() {
         // Stage 2 extended the per-path flock to Gemini/Kiro/Claude/OpenCode.
         // Race configure_gemini from 8 threads on the same working_dir and
