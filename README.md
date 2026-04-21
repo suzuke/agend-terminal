@@ -51,7 +51,7 @@ Worktree preserves all code changes.
 agend-terminal demo
 
 # Or start with your own agents
-cat > ~/.agend-terminal/fleet.yaml << 'YAML'
+cat > ~/.agend/fleet.yaml << 'YAML'
 defaults:
   backend: claude
 
@@ -70,16 +70,32 @@ agend-terminal start
 ## Commands
 
 ```
-agend-terminal demo                      30-second interactive demo
-agend-terminal start                     Start daemon + fleet
-agend-terminal daemon [name:cmd ...]     Start with explicit agents
-agend-terminal attach <name>             Attach to agent (Ctrl+B d)
-agend-terminal inject <name> <text>      Send input
-agend-terminal list / status             Show agents
-agend-terminal kill <name>               Kill agent
-agend-terminal stop                      Stop daemon
-agend-terminal doctor                    Check backends
-agend-terminal mcp                       MCP stdio server
+Get started
+  agend-terminal app                   Launch multi-tab/pane TUI
+  agend-terminal demo                  30-second interactive demo
+  agend-terminal quickstart            Interactive setup — detect backends, wire Telegram, generate fleet.yaml
+  agend-terminal doctor                Health check backends
+
+Run a fleet
+  agend-terminal start                 Start daemon with fleet.yaml
+  agend-terminal daemon [name:cmd …]   Start daemon with explicit agents
+  agend-terminal stop                  Stop daemon
+  agend-terminal upgrade --binary <path>
+                                       Hot-upgrade daemon via supervisor (Unix only)
+
+Interact
+  agend-terminal attach <name>         Attach to agent (Ctrl+B d to detach)
+  agend-terminal inject <name> <text>  Send input to agent's PTY
+  agend-terminal list                  List running agents
+  agend-terminal status                Detailed agent status (state, health)
+  agend-terminal kill <name>           Kill an agent
+  agend-terminal connect <name>        Register an external agent with the running daemon
+  agend-terminal fleet …               Fleet management subcommands
+
+Integration
+  agend-terminal mcp                   MCP stdio server (agent-to-agent coordination)
+  agend-terminal completions <shell>   Generate shell completions (bash/zsh/fish/elvish/powershell)
+  agend-terminal bugreport             One-file diagnostic export
 ```
 
 ## 35 MCP Tools
