@@ -905,41 +905,10 @@ mod tests {
         dir
     }
 
-    // validate_branch tests
-    #[test]
-    fn branch_valid_simple() {
-        assert!(validate_branch("main"));
-        assert!(validate_branch("feature/foo"));
-        assert!(validate_branch("v1.0.0"));
-        assert!(validate_branch("fix-123"));
-        assert!(validate_branch("release_2.0"));
-    }
-
-    #[test]
-    fn branch_rejects_empty() {
-        assert!(!validate_branch(""));
-    }
-
-    #[test]
-    fn branch_rejects_dotdot() {
-        assert!(!validate_branch(".."));
-        assert!(!validate_branch("foo/.."));
-        assert!(!validate_branch("../bar"));
-    }
-
-    #[test]
-    fn branch_rejects_leading_dash() {
-        assert!(!validate_branch("-main"));
-        assert!(!validate_branch("-"));
-    }
-
-    #[test]
-    fn branch_rejects_special_chars() {
-        assert!(!validate_branch("main branch"));
-        assert!(!validate_branch("foo;bar"));
-        assert!(!validate_branch("$(echo)"));
-        assert!(!validate_branch("main\ninjected"));
-    }
+    // `validate_branch` tests migrated to `src/agent_ops.rs` as part of
+    // Task #9 Option C (Commit 1). The inline definition in this file is
+    // still in use; Commit 2 deletes it and switches callers to
+    // `crate::agent_ops::validate_branch`.
 
     // merge_metadata tests
     #[test]
