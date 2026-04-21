@@ -125,6 +125,7 @@ pub struct StatePatterns {
 impl StatePatterns {
     /// Pattern sources: [実測] = verified from real capture, [文件] = from docs/source, [推測] = estimated
     /// Tested versions: Claude v2.1.89, Codex v0.118.0, OpenCode v1.4.0, Gemini v0.37.1
+    #[allow(clippy::unwrap_used)] // patterns are const — compile failure is a code bug
     pub fn for_backend(backend: &Backend) -> Self {
         let patterns = match backend {
             // Claude Code v2.1.89
@@ -380,12 +381,10 @@ impl StatePatterns {
 
         let compiled: Vec<_> = patterns
             .into_iter()
-            .filter_map(|(state, pat)| match Regex::new(pat) {
-                Ok(re) => Some((state, re)),
-                Err(err) => {
-                    tracing::warn!("invalid state pattern: {pat}: {err}");
-                    None
-                }
+            .map(|(state, pat)| {
+                let re = Regex::new(pat)
+                    .unwrap_or_else(|e| panic!("BUG: invalid state regex {pat:?}: {e}"));
+                (state, re)
             })
             .collect();
 
