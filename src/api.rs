@@ -65,13 +65,37 @@ pub fn validate_working_directory(
     }
     for root in &roots {
         if resolved.starts_with(root) {
-            return Ok(resolved);
+            return Ok(strip_verbatim_prefix(resolved));
         }
     }
     anyhow::bail!(
         "working_directory '{}' escapes allowed roots (set AGEND_ALLOWED_WORK_ROOTS to widen)",
         resolved.display()
     )
+}
+
+/// On Windows, `std::fs::canonicalize` returns `\\?\C:\...` (the Win32
+/// extended-length path form). PTY spawn hands this straight to `cmd.exe` as
+/// its cwd, and cmd bails with "UNC paths are not supported" before ever
+/// running — codex surfaces this as "default directory is Windows".
+/// Strip the verbatim prefix when it names a plain drive so the returned path
+/// is what cmd expects. UNC shares (`\\?\UNC\server\share`) are left alone —
+/// cmd can't cd into those regardless, and a caller that needs UNC semantics
+/// should see the failure explicitly rather than get a subtly-rewritten path.
+///
+/// No-op on Unix.
+fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            // `\\?\C:\...` → `C:\...`, but leave `\\?\UNC\...` alone.
+            if !rest.starts_with(r"UNC\") {
+                return std::path::PathBuf::from(rest.to_string());
+            }
+        }
+    }
+    path
 }
 
 /// API method name constants — single source of truth for the NDJSON protocol.
@@ -911,8 +935,68 @@ mod tests {
         let ok = home.join("workspace").join("agent");
         let resolved =
             validate_working_directory(&ok, &home).expect("path under home must validate");
-        assert!(resolved.starts_with(std::fs::canonicalize(&home).unwrap()));
+        // Returned path has any `\\?\` verbatim prefix stripped (see
+        // `strip_verbatim_prefix`), so compare against the stripped form
+        // of canonical home.
+        let home_simplified = strip_verbatim_prefix(std::fs::canonicalize(&home).unwrap());
+        assert!(
+            resolved.starts_with(&home_simplified),
+            "resolved {} should start with {}",
+            resolved.display(),
+            home_simplified.display()
+        );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Regression guard for the "cmd.exe: UNC paths are not supported" bug.
+    /// `std::fs::canonicalize` on Windows returns `\\?\C:\...` and handing
+    /// that to a PTY makes cmd.exe refuse to launch. `validate_working_directory`
+    /// must strip the verbatim prefix before returning so the resolved path
+    /// round-trips through a Command spawn.
+    #[test]
+    fn validate_work_dir_strips_verbatim_prefix_from_return() {
+        let home = tmp_home("validate_verbatim");
+        let ok = home.join("project");
+        let resolved = validate_working_directory(&ok, &home).expect("validate");
+        #[cfg(windows)]
+        {
+            let s = resolved.to_string_lossy();
+            assert!(
+                !s.starts_with(r"\\?\"),
+                "verbatim prefix must be stripped, got: {s}"
+            );
+        }
+        // On Unix strip_verbatim_prefix is a no-op — just sanity that the
+        // function still returns something that starts with home.
+        #[cfg(unix)]
+        {
+            let home_canon = std::fs::canonicalize(&home).unwrap();
+            assert!(resolved.starts_with(&home_canon));
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_handles_drive_and_leaves_unc() {
+        use std::path::PathBuf;
+        // `\\?\C:\...` → `C:\...`
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\alice")),
+            PathBuf::from(r"C:\Users\alice")
+        );
+        // `\\?\UNC\server\share` must be preserved — simplifying to
+        // `\\server\share` doesn't help cmd, and silently rewriting a share
+        // path would be surprising.
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\?\UNC\server\share\dir")
+        );
+        // Regular drive path unaffected.
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\plain\path")),
+            PathBuf::from(r"C:\plain\path")
+        );
     }
 
     #[test]
