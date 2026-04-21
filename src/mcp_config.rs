@@ -293,8 +293,15 @@ const CODEX_MCP_HEADER: &str = "[mcp_servers.agend-terminal]";
 const CODEX_MCP_ENV_HEADER: &str = "[mcp_servers.agend-terminal.env]";
 
 fn configure_codex(working_dir: &Path) -> Result<()> {
+    configure_codex_with_home(working_dir, &home_path())
+}
+
+/// Split out so tests can drive a scratch `home` without mutating
+/// process-wide `HOME` / `USERPROFILE`. `cargo test` runs tests in parallel
+/// inside one process, and `user_home_dir()` is read by many backends — env
+/// mutation here races with other tests.
+fn configure_codex_with_home(working_dir: &Path, home: &str) -> Result<()> {
     let bin = binary_path();
-    let home = home_path();
 
     let codex_dir = working_dir.join(".codex");
     std::fs::create_dir_all(&codex_dir)?;
@@ -326,7 +333,7 @@ fn configure_codex(working_dir: &Path) -> Result<()> {
     // happens to contain any of them. See `toml_string_value` for the
     // apostrophe fallback.
     let bin_lit = toml_string_value(&bin);
-    let home_lit = toml_string_value(&home);
+    let home_lit = toml_string_value(home);
     let body = format!(
         r#"{stripped}{separator}{CODEX_MCP_HEADER}
 command = {bin_lit}
@@ -828,39 +835,37 @@ mod tests {
     /// which mutated the user's global config — shipped two escape bugs into
     /// production, raced with the codex CLI's own writer, and left entries
     /// behind on uninstall. `agend must never touch user-global tool config`
-    /// is now the rule (see the module doc comment). This test asserts that
-    /// a fresh configure_codex against a *fresh* user HOME does not touch it.
+    /// is now the rule (see the module doc comment).
+    ///
+    /// The test drives `configure_codex_with_home` directly with a scratch
+    /// home path rather than mutating `$HOME` / `$USERPROFILE`. Env mutation
+    /// would race with parallel tests that read `user_home_dir()`.
     #[test]
-    fn configure_codex_never_writes_to_user_home() {
-        // Redirect HOME (Unix) and USERPROFILE (Windows) to a scratch dir.
-        // If configure_codex regresses and starts writing to `~/.codex/`
-        // again, it'll create `<scratch>/.codex/` and the test fails.
-        let scratch = tmp_dir("no_global_write");
-        let prev_home = std::env::var_os("HOME");
-        let prev_userprofile = std::env::var_os("USERPROFILE");
-        std::env::set_var("HOME", &scratch);
-        std::env::set_var("USERPROFILE", &scratch);
-
+    fn configure_codex_writes_nothing_under_home() {
+        let scratch = tmp_dir("no_home_write");
+        let fake_home = scratch.join("agend_home");
+        std::fs::create_dir_all(&fake_home).expect("mkdir fake_home");
         let work_dir = scratch.join("project");
         std::fs::create_dir_all(&work_dir).expect("mkdir project");
-        let result = configure_codex(&work_dir);
 
-        // Restore env before any assertion panics, so a failure doesn't
-        // poison subsequent tests in the same process.
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prev_userprofile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
+        configure_codex_with_home(&work_dir, &fake_home.display().to_string())
+            .expect("configure_codex");
 
-        result.expect("configure_codex");
-        let maybe_global = scratch.join(".codex");
+        // Sanity: per-project config must exist.
         assert!(
-            !maybe_global.exists(),
-            "configure_codex must not create ~/.codex — user-global config is off-limits"
+            work_dir.join(".codex/config.toml").exists(),
+            "per-project .codex/config.toml missing under working_dir"
+        );
+        // Guard: nothing may be written under the passed-in home. A regression
+        // that reintroduces `codex_trust_directory` (writing to `home/.codex/`)
+        // would land files here and fail the check.
+        let entries: Vec<_> = std::fs::read_dir(&fake_home)
+            .expect("read_dir fake_home")
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "configure_codex must not write under its home arg, found: {entries:?}"
         );
         std::fs::remove_dir_all(&scratch).ok();
     }
