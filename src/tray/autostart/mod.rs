@@ -3,7 +3,11 @@
 //! Each platform writes its own entry pointing at
 //! `std::env::current_exe()?.canonicalize()?` so `cargo install --force`
 //! upgrades are picked up on next login with no re-configuration.
-//! Implementations land with PLAN task #2.
+//!
+//! Construct via `Platform::new(home)`. `home` is required by macOS (the
+//! plist's `AGEND_HOME` env var + `StandardOutPath`); Linux and Windows
+//! ignore it, but the uniform signature spares the caller from `cfg`
+//! branches at the construction site.
 
 pub trait Autostart {
     /// Install the platform-specific autostart entry (idempotent).
