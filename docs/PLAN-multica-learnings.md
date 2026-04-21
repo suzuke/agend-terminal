@@ -52,7 +52,7 @@
 
 ### 1.5 持久化
 
-- **AgEnD**：全部 JSON/JSONL + fs2 exclusive lock。`snapshot.json`、`tasks.json`、`decisions/*.json`、`inbox/*.jsonl`、`sessions/*.sid`。
+- **AgEnD**：全部 JSON/JSONL + fs2 exclusive lock。`snapshot.json`、`tasks.json`、`decisions/*.json`、`inbox/*.jsonl`。
 - **Multica**：PostgreSQL + sqlc，47 migrations。關鍵表：`user / workspace / member / agent / issue / agent_task_queue / skill + skill_file + agent_skill / chat / projects / autopilot / activity_log`。
 - **pgvector**：Multica Docker image 用 `pgvector/pgvector:pg17`，但 schema 裡**沒有 `CREATE EXTENSION vector` 或 `embedding vector(...)` 欄位**。實際搜尋用 Postgres FTS 索引（migrations 032/033/036/039）。README 寫的是預留，目前等於沒用。
 

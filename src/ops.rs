@@ -668,14 +668,9 @@ pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
         }
     }
 
-    // Always clean up metadata + session (regardless of workspace vs user dir)
-    // Remove metadata
+    // Always clean up metadata (regardless of workspace vs user dir)
     let meta = home.join("metadata").join(format!("{name}.json"));
     let _ = std::fs::remove_file(&meta);
-
-    // Remove session ID
-    let sid = home.join("sessions").join(format!("{name}.sid"));
-    let _ = std::fs::remove_file(&sid);
 }
 
 /// Internal helper: send a message to a target instance via API, falling back to direct inbox delivery.
@@ -830,17 +825,14 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_metadata_and_session() {
+    fn cleanup_metadata() {
         let home = tmp_home("cms");
         let ws = home.join("workspace/a");
         std::fs::create_dir_all(&ws).ok();
         std::fs::create_dir_all(home.join("metadata")).ok();
         std::fs::write(home.join("metadata/a.json"), "{}").ok();
-        std::fs::create_dir_all(home.join("sessions")).ok();
-        std::fs::write(home.join("sessions/a.sid"), "x").ok();
         cleanup_working_dir(&home, "a", &ws);
         assert!(!home.join("metadata/a.json").exists());
-        assert!(!home.join("sessions/a.sid").exists());
         std::fs::remove_dir_all(&home).ok();
     }
 

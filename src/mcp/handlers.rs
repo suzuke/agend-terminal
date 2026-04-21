@@ -852,14 +852,9 @@ fn cleanup_working_dir(home: &std::path::Path, name: &str, working_dir: &std::pa
         }
     }
 
-    // Always clean up metadata + session (regardless of workspace vs user dir)
-    // Remove metadata
+    // Always clean up metadata (regardless of workspace vs user dir)
     let meta = home.join("metadata").join(format!("{name}.json"));
     let _ = std::fs::remove_file(&meta);
-
-    // Remove session ID
-    let sid = home.join("sessions").join(format!("{name}.sid"));
-    let _ = std::fs::remove_file(&sid);
 }
 
 /// Validate a git branch name. Only allows [a-zA-Z0-9/_.-], rejects ".." and leading "-".
@@ -1064,21 +1059,17 @@ instances:
     }
 
     #[test]
-    fn cleanup_removes_metadata_and_session() {
+    fn cleanup_removes_metadata() {
         let home = tmp_home("cleanup_meta");
         let ws = home.join("workspace").join("agent1");
         std::fs::create_dir_all(&ws).ok();
 
-        // Create metadata + session files
         std::fs::create_dir_all(home.join("metadata")).ok();
         std::fs::write(home.join("metadata/agent1.json"), "{}").ok();
-        std::fs::create_dir_all(home.join("sessions")).ok();
-        std::fs::write(home.join("sessions/agent1.sid"), "abc123").ok();
 
         cleanup_working_dir(&home, "agent1", &ws);
 
         assert!(!home.join("metadata/agent1.json").exists());
-        assert!(!home.join("sessions/agent1.sid").exists());
         std::fs::remove_dir_all(&home).ok();
     }
 

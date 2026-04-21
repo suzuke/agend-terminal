@@ -228,6 +228,13 @@ pub(super) fn attach_pane(
 }
 
 /// Create a pane from a fleet ResolvedInstance (full config: env, args, model, etc.).
+///
+/// `spawn_mode` reflects caller intent — system rehydrate (daemon restart, session
+/// restore, crash respawn) passes `Resume` to reattach the CLI's prior conversation
+/// in that cwd; user-initiated new creation (backend picker, `:spawn`) passes
+/// `Fresh` so the new instance does not inherit a leftover session. Callers that
+/// explicitly reattach an existing fleet instance (fleet-instance picker, `:restart`)
+/// also pass `Resume`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_pane_from_resolved(
     fleet_name: &str,
@@ -239,6 +246,7 @@ pub(super) fn create_pane_from_resolved(
     rows: u16,
     wakeup_tx: &crossbeam::channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
+    spawn_mode: crate::backend::SpawnMode,
 ) -> Result<Pane> {
     // Build fleet peer list for agent instructions
     let fleet_path = home.join("fleet.yaml");
@@ -263,9 +271,7 @@ pub(super) fn create_pane_from_resolved(
         fleet_name,
         &resolved.backend_command,
         &resolved.args,
-        // Fleet entries reattach to their prior CLI session — the working_dir
-        // persists across daemon restarts, so ask the backend to resume.
-        crate::backend::SpawnMode::Resume,
+        spawn_mode,
         resolved.working_directory.as_deref(),
         &resolved.env,
         &resolved.submit_key,

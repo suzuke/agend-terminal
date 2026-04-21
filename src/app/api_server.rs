@@ -112,6 +112,7 @@ pub(super) fn auto_start_fleet(
                 rows,
                 wakeup_tx,
                 name_counter,
+                crate::backend::SpawnMode::Resume,
             ) {
                 Ok(pane) => {
                     let tab_name = pane.agent_name.clone();
