@@ -145,9 +145,6 @@ fn strip_ansi(s: &str) -> String {
                     while let Some(&ch) = chars.peek() {
                         chars.next();
                         if ch.is_ascii_alphabetic() {
-                            if ch == 'C' || ch == 'D' {
-                                out.push(' ');
-                            }
                             break;
                         }
                     }
@@ -931,6 +928,15 @@ mod tests {
         assert_eq!(strip_ansi("hello"), "hello");
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
         assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[0m"), "bold green");
+    }
+
+    #[test]
+    fn strip_ansi_cursor_move_no_space() {
+        // CSI C (cursor forward) and D (cursor back) must not insert spaces
+        assert_eq!(strip_ansi("\x1b[5Chello"), "hello");
+        assert_eq!(strip_ansi("ab\x1b[2Dcd"), "abcd");
+        // Other CSI codes also produce nothing
+        assert_eq!(strip_ansi("\x1b[Hhome"), "home");
     }
 
     #[test]
