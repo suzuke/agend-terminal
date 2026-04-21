@@ -13,6 +13,8 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+mod handlers;
+
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
 // ---------------------------------------------------------------------------
@@ -296,29 +298,17 @@ fn handle_session(
         let method = req["method"].as_str().unwrap_or("");
         let params = &req["params"];
 
+        let ctx = handlers::HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier,
+            home,
+            shutdown,
+        };
+
         let response = match method {
-            method::LIST => {
-                let reg = agent::lock_registry(registry);
-                let mut agents: Vec<Value> = reg.iter()
-                    .map(|(name, handle)| {
-                        let (agent_state, health_state) = handle.core.lock()
-                            .map(|c| (c.state.get_state().display_name().to_string(), c.health.state.display_name().to_string()))
-                            .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
-                        json!({"name": name, "backend": handle.backend_command, "submit_key": handle.submit_key,
-                               "inject_prefix": handle.inject_prefix, "agent_state": agent_state, "health_state": health_state,
-                               "kind": "managed"})
-                    }).collect();
-                drop(reg);
-                let ext = agent::lock_external(externals);
-                for (name, handle) in ext.iter() {
-                    agents.push(json!({
-                        "name": name, "backend": handle.backend_command,
-                        "agent_state": "external", "health_state": "connected",
-                        "kind": "external", "pid": handle.pid
-                    }));
-                }
-                json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
-            }
+            method::LIST => handlers::query::handle_list(params, &ctx),
             method::INJECT => {
                 let name = params["name"].as_str().unwrap_or("");
                 if let Err(e) = agent::validate_name(name) {
@@ -577,26 +567,7 @@ fn handle_session(
                 // External agents receive messages via inbox only (no PTY injection)
                 json!({"ok": true})
             }
-            method::STATUS => match crate::snapshot::load(home) {
-                Some(snapshot) => {
-                    json!({"ok": true, "result": {
-                        "protocol_version": crate::framing::PROTOCOL_VERSION,
-                        "timestamp": snapshot.timestamp,
-                        "agents": snapshot.agents.iter().map(|a| {
-                            json!({
-                                "name": a.name,
-                                "backend": a.backend_command,
-                                "args": a.args,
-                                "working_dir": a.working_dir,
-                                "submit_key": a.submit_key,
-                                "health_state": a.health_state,
-                                "agent_state": a.agent_state,
-                            })
-                        }).collect::<Vec<_>>()
-                    }})
-                }
-                None => json!({"ok": true, "result": {"agents": [], "timestamp": null}}),
-            },
+            method::STATUS => handlers::query::handle_status(params, &ctx),
             method::REGISTER_EXTERNAL => {
                 let name = match params["name"].as_str() {
                     Some(n) => n,
