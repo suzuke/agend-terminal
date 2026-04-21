@@ -2,6 +2,7 @@
 //!
 //! Rule: if working_directory is set and is a git repo, create a worktree.
 
+use crate::agent_ops::validate_branch;
 use std::path::{Path, PathBuf};
 
 /// Info about a created worktree.
@@ -41,16 +42,6 @@ fn has_commits(repo_dir: &Path) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-/// Validate a git branch name. Only allows [a-zA-Z0-9/_.-], rejects ".." and leading "-".
-fn validate_branch(branch: &str) -> bool {
-    !branch.is_empty()
-        && !branch.contains("..")
-        && !branch.starts_with('-')
-        && branch
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
 }
 
 /// Create a worktree for an instance. Returns WorktreeInfo if created,
@@ -393,21 +384,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn test_validate_branch_valid() {
-        assert!(validate_branch("main"));
-        assert!(validate_branch("feature/my-branch"));
-        assert!(validate_branch("agend/agent-1"));
-        assert!(validate_branch("v1.0.0"));
-    }
-
-    #[test]
-    fn test_validate_branch_rejects() {
-        assert!(!validate_branch(""));
-        assert!(!validate_branch(".."));
-        assert!(!validate_branch("foo/../bar"));
-        assert!(!validate_branch("-starts-with-dash"));
-        assert!(!validate_branch("has spaces"));
-        assert!(!validate_branch("has;semicolon"));
-    }
+    // `test_validate_branch_valid` + `test_validate_branch_rejects` migrated
+    // to `src/agent_ops.rs::tests` as part of Task #9 Option C epilogue — the
+    // `validate_branch` fn itself lives in `agent_ops.rs` now, so tests are
+    // colocated with their subject.
 }
