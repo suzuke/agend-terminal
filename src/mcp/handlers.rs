@@ -375,53 +375,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             }
             json!({"name": name})
         }
-        "start_instance" => {
-            let name = match args["name"].as_str() {
-                Some(n) => n,
-                None => return json!({"error": "missing 'name'"}),
-            };
-            if let Err(e) = crate::agent::validate_name(name) {
-                return json!({"error": e});
-            }
-            let fleet_path = home.join("fleet.yaml");
-            if !fleet_path.exists() {
-                return json!({"error": "No fleet.yaml"});
-            }
-            let config = match crate::fleet::FleetConfig::load(&fleet_path) {
-                Ok(c) => c,
-                Err(e) => return json!({"error": format!("fleet.yaml: {e}")}),
-            };
-            match config.resolve_instance(name) {
-                Some(resolved) => {
-                    let mut cmd_args = resolved.args.join(" ");
-                    if let Some(ref b) =
-                        crate::backend::Backend::from_command(&resolved.backend_command)
-                    {
-                        let resume = b.preset().resume_mode.args_for();
-                        if !resume.is_empty() {
-                            if !cmd_args.is_empty() {
-                                cmd_args.push(' ');
-                            }
-                            cmd_args.push_str(&resume.join(" "));
-                        }
-                    }
-                    match crate::api::call(
-                        &home,
-                        &json!({"method": crate::api::method::SPAWN, "params": {
-                            "name": name, "backend": resolved.backend_command, "args": cmd_args,
-                            "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
-                        }}),
-                    ) {
-                        Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"name": name}),
-                        Ok(resp) => {
-                            json!({"error": resp["error"].as_str().unwrap_or("spawn failed")})
-                        }
-                        Err(e) => json!({"error": format!("API unavailable: {e}")}),
-                    }
-                }
-                None => json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
-            }
-        }
+        "start_instance" => crate::ops::start_instance(&home, args),
         "describe_instance" => {
             let name = args["name"].as_str().unwrap_or("");
             if let Err(e) = crate::agent::validate_name(name) {
@@ -667,27 +621,12 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
         .as_str()
         .or_else(|| args["command"].as_str())
         .unwrap_or("claude");
-    let mut cmd_args = crate::backend::Backend::from_command(command)
-        .map(|b| {
-            let p = b.preset();
-            p.fresh_args
-                .unwrap_or(p.args)
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
-    if let Some(extra) = args
+    let mut cmd_args = args
         .get("args")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-    {
-        if !cmd_args.is_empty() {
-            cmd_args.push(' ');
-        }
-        cmd_args.push_str(extra);
-    }
+        .map(String::from)
+        .unwrap_or_default();
     if let Some(model) = args
         .get("model")
         .and_then(|v| v.as_str())

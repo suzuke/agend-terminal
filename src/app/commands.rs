@@ -67,15 +67,15 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     ctx.name_counter,
                 )
             } else {
-                let (command, args, submit_key) =
-                    super::pane_factory::resolve_backend(backend_name, false);
+                let (command, submit_key) = super::pane_factory::resolve_backend(backend_name);
                 super::pane_factory::create_pane(
                     ctx.layout,
                     ctx.registry,
                     ctx.home,
                     &inst_name,
                     &command,
-                    &args,
+                    &[],
+                    crate::backend::SpawnMode::Fresh,
                     None,
                     &HashMap::new(),
                     &submit_key,
@@ -201,15 +201,18 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                                 ctx.name_counter,
                             )
                         } else {
-                            let (command, args, submit_key) =
-                                super::pane_factory::resolve_backend(&backend_cmd, true);
+                            let (command, submit_key) =
+                                super::pane_factory::resolve_backend(&backend_cmd);
                             super::pane_factory::create_pane(
                                 ctx.layout,
                                 ctx.registry,
                                 ctx.home,
                                 &name,
                                 &command,
-                                &args,
+                                &[],
+                                // Fleet resolve failed — no resume metadata,
+                                // so start fresh rather than guess.
+                                crate::backend::SpawnMode::Fresh,
                                 work_dir.as_deref(),
                                 &HashMap::new(),
                                 &submit_key,
@@ -220,16 +223,16 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                             )
                         }
                     } else {
-                        // Non-fleet pane — use backend preset directly
-                        let (command, args, submit_key) =
-                            super::pane_factory::resolve_backend(&backend_cmd, true);
+                        let (command, submit_key) =
+                            super::pane_factory::resolve_backend(&backend_cmd);
                         super::pane_factory::create_pane(
                             ctx.layout,
                             ctx.registry,
                             ctx.home,
                             &name,
                             &command,
-                            &args,
+                            &[],
+                            crate::backend::SpawnMode::Fresh,
                             work_dir.as_deref(),
                             &HashMap::new(),
                             &submit_key,

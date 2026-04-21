@@ -212,30 +212,12 @@ pub fn create_instance(home: &Path, args: &Value) -> Value {
     let command = crate::backend::Backend::from_command(raw_backend)
         .map(|b| b.preset().command)
         .unwrap_or(raw_backend);
-    // Start with backend fresh_args (no resume flags — this is a new instance).
-    // Falls back to preset args if fresh_args is not defined.
-    let mut cmd_args = crate::backend::Backend::from_command(command)
-        .map(|b| {
-            let p = b.preset();
-            p.fresh_args
-                .unwrap_or(p.args)
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
-    // Append user-specified args
-    if let Some(extra) = args
+    let mut cmd_args = args
         .get("args")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-    {
-        if !cmd_args.is_empty() {
-            cmd_args.push(' ');
-        }
-        cmd_args.push_str(extra);
-    }
+        .map(String::from)
+        .unwrap_or_default();
     if let Some(model) = args
         .get("model")
         .and_then(|v| v.as_str())
@@ -379,20 +361,12 @@ pub fn start_instance(home: &Path, args: &Value) -> Value {
     };
     match config.resolve_instance(name) {
         Some(resolved) => {
-            let mut cmd_args = resolved.args.join(" ");
-            if let Some(ref b) = crate::backend::Backend::from_command(&resolved.backend_command) {
-                let resume = b.preset().resume_mode.args_for();
-                if !resume.is_empty() {
-                    if !cmd_args.is_empty() {
-                        cmd_args.push(' ');
-                    }
-                    cmd_args.push_str(&resume.join(" "));
-                }
-            }
+            let cmd_args = resolved.args.join(" ");
             match crate::api::call(
                 home,
                 &json!({"method": crate::api::method::SPAWN, "params": {
                     "name": name, "backend": resolved.backend_command, "args": cmd_args,
+                    "mode": "resume",
                     "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
                 }}),
             ) {

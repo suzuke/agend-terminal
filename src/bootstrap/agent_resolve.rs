@@ -59,10 +59,6 @@ pub(crate) fn resolve_one(config: &FleetConfig, name: &str) -> Option<AgentDef> 
     }
 
     let mut args = resolved.args;
-    if let Some(ref b) = backend::Backend::from_command(&resolved.backend_command) {
-        let p = b.preset();
-        args.extend(p.resume_mode.args_for());
-    }
 
     if let Some(ref model) = resolved.model {
         let model_val = backend::Backend::from_command(&resolved.backend_command)
@@ -70,18 +66,6 @@ pub(crate) fn resolve_one(config: &FleetConfig, name: &str) -> Option<AgentDef> 
             .unwrap_or_else(|| model.clone());
         args.push("--model".to_string());
         args.push(model_val);
-    }
-
-    // Claude-specific flags: only append when the matching file exists in
-    // the working directory. `agent::spawn_agent` no-ops when already set.
-    if let Some(ref dir) = resolved.working_directory {
-        if resolved.backend_command.contains("claude") {
-            let mcp_config = dir.join("mcp-config.json");
-            if mcp_config.exists() {
-                args.push("--mcp-config".to_string());
-                args.push(mcp_config.display().to_string());
-            }
-        }
     }
 
     Some((

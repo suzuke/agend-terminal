@@ -229,6 +229,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 "shell",
                 &std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string()),
                 &[],
+                crate::backend::SpawnMode::Fresh,
                 None,
                 &HashMap::new(),
                 "\r",
@@ -586,6 +587,7 @@ fn pane_from_menu_item(
                 "shell",
                 &shell,
                 &[],
+                crate::backend::SpawnMode::Fresh,
                 None,
                 &HashMap::new(),
                 "\r",
@@ -624,14 +626,15 @@ fn pane_from_menu_item(
                     name_counter,
                 )
             } else {
-                let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
+                // Preset args are added by spawn_agent; no need to compose here.
                 pane_factory::create_pane(
                     layout,
                     registry,
                     home,
                     &inst_name,
                     preset.command,
-                    &args,
+                    &[],
+                    crate::backend::SpawnMode::Fresh,
                     None,
                     &HashMap::new(),
                     preset.submit_key,

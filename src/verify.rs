@@ -49,6 +49,7 @@ fn test_spawn_config<'a>(name: &'a str, home: Option<&'a Path>) -> agent::SpawnC
         name,
         backend_command: "/bin/bash",
         args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
         cols: 80,
         rows: 24,
         env: None,
@@ -458,15 +459,15 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
         "missing or invalid",
     ));
 
-    // 2. Spawn + ready detection
+    // 2. Spawn + ready detection.
     let registry = Arc::new(Mutex::new(HashMap::new()));
     let agent_name = format!("verify-{name}");
-    let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
     let spawn_result = agent::spawn_agent(
         &agent::SpawnConfig {
             name: &agent_name,
             backend_command: preset.command,
-            args: &args,
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
             cols: 120,
             rows: 40,
             env: None,
