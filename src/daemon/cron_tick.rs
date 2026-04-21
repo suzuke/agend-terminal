@@ -134,7 +134,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
     }
 
     if any_triggered || now_utc.signed_duration_since(last_check_utc).num_seconds() >= 10 {
-        let _ = std::fs::write(&last_check_path, now_utc.to_rfc3339());
+        let _ = crate::store::atomic_write(&last_check_path, now_utc.to_rfc3339().as_bytes());
     }
 }
 
