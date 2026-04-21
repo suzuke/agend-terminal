@@ -4,6 +4,15 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+/// Platform-default shell used as a dummy `command` in create_instance
+/// payloads. The daemon isn't running in these tests, so the shell is never
+/// actually spawned — but we still match real paths so any future validation
+/// layer doesn't reject Windows runs on a missing `/bin/bash`.
+#[cfg(windows)]
+const SHELL_CMD: &str = "cmd.exe";
+#[cfg(not(windows))]
+const SHELL_CMD: &str = "/bin/bash";
 fn binary() -> PathBuf {
     let mut path = std::env::current_exe().expect("current_exe");
     path.pop();
@@ -403,11 +412,15 @@ fn test_create_delete_instance_lifecycle() {
     // create_instance/delete_instance need a running daemon (they call API spawn/delete).
     // We use list_instances which falls back to scanning fleet.yaml when API is unavailable.
     // So we verify the fleet.yaml persistence side.
+    let create_call = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"create_instance","arguments":{{"name":"test-dynamic","command":"{}"}}}}}}"#,
+        SHELL_CMD
+    );
     let responses = mcp_session(&[
         // 1: initialize
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
         // 2: create_instance (will fail API call since no daemon, but tests the path)
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_instance","arguments":{"name":"test-dynamic","command":"/bin/bash"}}}"#,
+        &create_call,
         // 3: list_instances (will show from fleet.yaml fallback)
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_instances","arguments":{}}}"#,
         // 4: delete_instance
