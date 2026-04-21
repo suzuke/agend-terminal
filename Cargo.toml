@@ -30,7 +30,7 @@ unwrap_used = "deny"
 # `--features tray` is passed (release binaries ship with it).
 [features]
 default = []
-tray = ["dep:tray-icon", "dep:tao"]
+tray = ["dep:tray-icon", "dep:tao", "dep:toml"]
 
 [profile.release]
 strip = true
@@ -81,9 +81,12 @@ which = "6"
 getrandom = "0.2"
 iana-time-zone = "0.1.65"
 # Menu-bar / system-tray (feature = "tray"). tray-icon loads PNG via
-# Icon::from_rgba natively — do NOT pull the `image` crate.
+# Icon::from_rgba natively — do NOT pull the `image` crate. `toml` is
+# for `$AGEND_HOME/tray.toml`; dev-dependencies already list it, so the
+# runtime entry here only adds it to release graphs when `tray` is on.
 tray-icon = { version = "0.22", optional = true }
 tao = { version = "0.35", optional = true }
+toml = { version = "0.8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

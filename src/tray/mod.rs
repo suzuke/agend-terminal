@@ -28,6 +28,8 @@ use tray_icon::{
 
 use crate::{api, bootstrap::daemon_spawn};
 
+use self::terminal::{OpenInTerminal, Platform as TerminalPlatform};
+
 /// Status polling cadence. PLAN §"Runtime flow" pins 2s; slower feels
 /// stale, faster is just wasted IPC.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -127,14 +129,24 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         let _ = proxy.send_event(UserEvent::Menu(event));
     }));
 
-    // Menu: disabled status label at the top, then Quit. Open App /
-    // Launch-at-login land in follow-on commits — they slot above Quit.
+    // tray.toml is best-effort — absence / parse errors fall back to
+    // defaults (warn-and-default per PLAN). Build the terminal
+    // dispatcher from its `terminal` field so "Open App" clicks route
+    // through the user's chosen emulator.
+    let cfg = config::load(&home);
+    let opener = TerminalPlatform::new(cfg.terminal);
+
+    // Menu: disabled status label, separator, Open App, Quit.
+    // Launch-at-login toggle lands in the follow-on commit.
     let menu = Menu::new();
     let status_item = MenuItem::new("starting…", false, None);
+    let open_app_item = MenuItem::new("Open App", true, None);
     let quit_item = MenuItem::new("Quit agend-terminal", true, None);
     menu.append(&status_item)?;
     menu.append(&tray_icon::menu::PredefinedMenuItem::separator())?;
+    menu.append(&open_app_item)?;
     menu.append(&quit_item)?;
+    let open_app_id = open_app_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     // Status poller: every POLL_INTERVAL, probe the daemon and push a
@@ -181,9 +193,17 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
                     }
                 }
             }
-            Event::UserEvent(UserEvent::Menu(ev)) if ev.id == quit_id => {
-                shutdown_daemon(&home);
-                *control_flow = ControlFlow::Exit;
+            Event::UserEvent(UserEvent::Menu(ev)) => {
+                if ev.id == quit_id {
+                    shutdown_daemon(&home);
+                    *control_flow = ControlFlow::Exit;
+                } else if ev.id == open_app_id {
+                    // Best-effort: surface PATH / spawn errors on stderr but
+                    // keep the tray alive so the user can retry or Quit.
+                    if let Err(e) = opener.open(&["agend-terminal", "app"]) {
+                        eprintln!("tray: open app failed: {e}");
+                    }
+                }
             }
             Event::UserEvent(UserEvent::Status(text)) => {
                 status_item.set_text(text);
