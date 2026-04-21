@@ -173,6 +173,8 @@ impl FleetConfig {
 
         // Ready pattern: instance > defaults > preset (empty string for
         // Shell/Raw, which means "no ready detection").
+        // User-provided patterns are validated at resolve time to reject
+        // malformed regex early rather than at spawn/verify.
         let ready_pattern = inst
             .ready_pattern
             .clone()
@@ -184,6 +186,20 @@ impl FleetConfig {
                     Some(preset.ready_pattern.to_string())
                 }
             });
+        if let Some(ref pat) = ready_pattern {
+            if regex::RegexBuilder::new(pat)
+                .size_limit(1 << 20)
+                .build()
+                .is_err()
+            {
+                tracing::error!(
+                    instance = name,
+                    pattern = pat,
+                    "invalid ready_pattern regex, skipping instance"
+                );
+                return None;
+            }
+        }
 
         // Submit key comes straight from the backend's preset. Shell/Raw
         // default to `\r`.

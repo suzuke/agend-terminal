@@ -482,8 +482,10 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
 
     match spawn_result {
         Ok(()) => {
-            let re = regex::Regex::new(preset.ready_pattern)
-                .unwrap_or_else(|_| regex::Regex::new(".").unwrap());
+            let re = regex::RegexBuilder::new(preset.ready_pattern)
+                .size_limit(1 << 20)
+                .build()
+                .unwrap_or_else(|_| regex::Regex::new(".").expect("BUG: literal dot"));
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(preset.ready_timeout_secs);
             let ready = poll_until(deadline, || {
