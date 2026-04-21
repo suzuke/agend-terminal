@@ -14,7 +14,8 @@ pub enum Backend {
     OpenCode,
     Gemini,
     /// Generic shell (bash/zsh/sh). No preset wiring — inject/ready/resume are
-    /// all no-ops. Command defaults to `$SHELL` or `/bin/sh`.
+    /// all no-ops. Command defaults to `$SHELL` or the platform default
+    /// (`/bin/bash` on Unix, `cmd.exe` on Windows).
     Shell,
     /// Arbitrary executable path. No preset behavior; the stored string is the
     /// command to spawn verbatim.
@@ -54,8 +55,9 @@ impl Backend {
     }
 
     /// Actual command path to spawn. For [`Backend::Shell`] resolves to
-    /// `$SHELL` (with `/bin/sh` as fallback). For [`Backend::Raw`] returns the
-    /// literal stored path. For presets returns the static preset command.
+    /// `$SHELL` (falling back to the platform default — `/bin/bash` on Unix,
+    /// `cmd.exe` on Windows). For [`Backend::Raw`] returns the literal stored
+    /// path. For presets returns the static preset command.
     #[allow(dead_code)] // Call sites migrate in follow-up commits.
     pub fn command_string(&self) -> String {
         match self {
@@ -64,7 +66,9 @@ impl Backend {
             | Backend::Codex
             | Backend::OpenCode
             | Backend::Gemini => self.preset().command.to_string(),
-            Backend::Shell => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            Backend::Shell => {
+                std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string())
+            }
             Backend::Raw(path) => path.clone(),
         }
     }
