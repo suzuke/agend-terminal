@@ -31,15 +31,15 @@ pub fn start_with_fleet(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
 pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()> {
     let preset = b.preset();
     let name = format!("capture-{}", b.name());
-    let args: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
-    tracing::info!(backend = b.name(), command = preset.command, args = %args.join(" "), %seconds, "capture: spawning");
+    tracing::info!(backend = b.name(), command = preset.command, %seconds, "capture: spawning");
 
     let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: &name,
             backend_command: preset.command,
-            args: &args,
+            args: &[],
+            spawn_mode: backend::SpawnMode::Fresh,
             cols: 120,
             rows: 40,
             env: None,
@@ -120,6 +120,7 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
             name: "test-attach",
             backend_command: "/bin/bash",
             args: &args,
+            spawn_mode: backend::SpawnMode::Fresh,
             cols: 80,
             rows: 24,
             env: None,
@@ -331,6 +332,7 @@ pub fn run_demo() -> anyhow::Result<()> {
                 name,
                 backend_command: "/bin/bash",
                 args: &args,
+                spawn_mode: backend::SpawnMode::Fresh,
                 cols: 60,
                 rows: 8,
                 env: None,

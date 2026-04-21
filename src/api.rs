@@ -411,8 +411,14 @@ fn handle_session(
                     }
                 };
                 let size = crossterm::terminal::size().unwrap_or((120, 40));
+                let spawn_mode = match params["mode"].as_str() {
+                    Some("resume") => crate::backend::SpawnMode::Resume,
+                    _ => crate::backend::SpawnMode::Fresh,
+                };
 
-                match spawn_one(home, registry, name, command, &args, &work_dir, size) {
+                match spawn_one(
+                    home, registry, name, command, &args, spawn_mode, &work_dir, size,
+                ) {
                     Ok(()) => {
                         if let Some(tx) = tui_tx {
                             let layout_hint = crate::app::LayoutHint::parse_hint(
@@ -628,7 +634,16 @@ fn handle_session(
                         continue;
                     }
                     let work_dir = home.join("workspace").join(&inst_name);
-                    match spawn_one(home, registry, &inst_name, backend, &[], &work_dir, size) {
+                    match spawn_one(
+                        home,
+                        registry,
+                        &inst_name,
+                        backend,
+                        &[],
+                        crate::backend::SpawnMode::Fresh,
+                        &work_dir,
+                        size,
+                    ) {
                         Ok(()) => {
                             tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");
                             spawned.push((inst_name, backend.clone()));
@@ -786,12 +801,14 @@ fn handle_session(
 
 /// Spawn a single agent, register it, and start its TUI socket thread.
 /// Shared by the SPAWN and CREATE_TEAM API handlers.
+#[allow(clippy::too_many_arguments)]
 fn spawn_one(
     home: &Path,
     registry: &AgentRegistry,
     name: &str,
     backend: &str,
     args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
     work_dir: &Path,
     size: (u16, u16),
 ) -> anyhow::Result<()> {
@@ -801,6 +818,7 @@ fn spawn_one(
             name,
             backend_command: backend,
             args,
+            spawn_mode,
             cols: size.0,
             rows: size.1,
             env: None,

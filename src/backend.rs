@@ -83,6 +83,18 @@ impl<'de> Deserialize<'de> for Backend {
     }
 }
 
+/// Whether a spawn starts a fresh session or resumes the previous one.
+///
+/// Selects which preset args `preset_spawn_args` returns: `Fresh` uses
+/// `fresh_args` (falling back to `args`); `Resume` uses `args` plus
+/// `resume_mode.args_for()`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpawnMode {
+    #[default]
+    Fresh,
+    Resume,
+}
+
 /// How to resume a previous session.
 #[derive(Debug, Clone)]
 pub enum ResumeMode {
@@ -356,6 +368,25 @@ impl Backend {
             }
         }
         out
+    }
+
+    /// Preset args to prepend on spawn. See [`SpawnMode`] for the selection
+    /// rule. Shell/Raw variants return an empty vec.
+    pub fn preset_spawn_args(&self, mode: SpawnMode) -> Vec<String> {
+        let preset = self.preset();
+        match mode {
+            SpawnMode::Fresh => preset
+                .fresh_args
+                .unwrap_or(preset.args)
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            SpawnMode::Resume => {
+                let mut out: Vec<String> = preset.args.iter().map(|s| s.to_string()).collect();
+                out.extend(preset.resume_mode.args_for());
+                out
+            }
+        }
     }
 
     /// Check if the backend binary is in PATH.

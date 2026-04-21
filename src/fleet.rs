@@ -158,15 +158,12 @@ impl FleetConfig {
             .or_else(|| defaults.command.clone())
             .unwrap_or_else(|| backend.command_string());
 
-        // Args: instance > defaults > preset. No basename guessing —
-        // Shell/Raw variants return empty preset args, preset variants return
-        // their bundled args unconditionally.
+        // User-authored extras only. Preset args are prepended by
+        // `agent::spawn_agent` — including them here would double-apply.
         let args = if !inst.args.is_empty() {
             inst.args.clone()
-        } else if !defaults.args.is_empty() {
-            defaults.args.clone()
         } else {
-            preset.args.iter().map(|s| s.to_string()).collect()
+            defaults.args.clone()
         };
 
         // Merge env: defaults first, then instance overrides
@@ -434,7 +431,9 @@ instances:
     }
 
     #[test]
-    fn test_preset_args_applied_to_matching_command() {
+    fn test_resolved_args_exclude_preset() {
+        // resolve_instance returns user-only args; preset args are injected
+        // by agent::spawn_agent based on SpawnMode.
         let dir = std::env::temp_dir().join(format!("agend-fleet-test2-{}", std::process::id()));
         let path = write_fleet(
             &dir,
@@ -450,10 +449,11 @@ instances:
         let resolved = config.resolve_instance("test").expect("resolve");
 
         assert_eq!(resolved.backend_command, "claude");
-        assert!(!resolved.args.is_empty(), "preset args should be applied");
-        assert!(resolved
-            .args
-            .contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(
+            resolved.args.is_empty(),
+            "preset args must not appear in resolved.args, got: {:?}",
+            resolved.args
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -1129,12 +1129,10 @@ instances:
     }
 
     #[test]
-    fn explicit_backend_plus_command_override_keeps_preset_args() {
-        // Previously `command_matches_preset` basename-matched to decide
-        // whether preset args applied — a bug when the user pointed a preset
-        // at a custom-built binary (e.g. /opt/claude-v2/claude). After
-        // refactor, `backend:` is the contract; `command:` is purely the
-        // spawn path.
+    fn explicit_backend_plus_command_override_preserves_backend_contract() {
+        // `backend:` is the preset contract; `command:` is purely the spawn
+        // path. resolve_instance returns user-only args (empty here); the
+        // preset flags are injected at spawn time by agent::spawn_agent.
         let dir = std::env::temp_dir().join(format!("agend-fleet-override-{}", std::process::id()));
         let path = write_fleet(
             &dir,
@@ -1148,12 +1146,9 @@ instances:
         let config = FleetConfig::load(&path).expect("load");
         let resolved = config.resolve_instance("test").expect("resolve");
         assert_eq!(resolved.backend_command, "/opt/claude-v2/my-claude");
-        // Preset args ARE applied because backend is explicitly claude.
         assert!(
-            resolved
-                .args
-                .contains(&"--dangerously-skip-permissions".to_string()),
-            "expected claude preset args, got {:?}",
+            resolved.args.is_empty(),
+            "resolved.args must be user-only, got: {:?}",
             resolved.args
         );
         fs::remove_dir_all(&dir).ok();

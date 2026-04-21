@@ -500,35 +500,14 @@ fn run_core(
                                 return;
                             }
                             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-                            // After a crash, start fresh — use backend's fresh_args to avoid
-                            // crash loops from stale resume (--continue, --resume <id>, etc.)
-                            let mut respawn_args: Vec<String> = if let Some(b) = crate::backend::Backend::from_command(&config.backend_command) {
-                                let p = b.preset();
-                                p.fresh_args.unwrap_or(p.args)
-                                    .iter()
-                                    .map(|s| s.to_string())
-                                    .collect()
-                            } else {
-                                // Unknown backend: strip common resume flags as best effort
-                                strip_resume_args(&config.args)
-                            };
-                            // Preserve non-resume flags from original args (--mcp-config, --settings, etc.)
-                            let preserve = ["--mcp-config", "--settings"];
-                            let mut i = 0;
-                            while i < config.args.len() {
-                                if preserve.contains(&config.args[i].as_str())
-                                    && i + 1 < config.args.len()
-                                {
-                                    respawn_args.push(config.args[i].clone());
-                                    respawn_args.push(config.args[i + 1].clone());
-                                    i += 2;
-                                    continue;
-                                }
-                                i += 1;
-                            }
+                            // Respawn fresh: stale --resume after a crash tends
+                            // to loop on "conversation not found".
                             match agent::spawn_agent(
                                 &agent::SpawnConfig {
-                                    name: &config.name, backend_command: &config.backend_command, args: &respawn_args,
+                                    name: &config.name,
+                                    backend_command: &config.backend_command,
+                                    args: &config.args,
+                                    spawn_mode: crate::backend::SpawnMode::Fresh,
                                     cols, rows,
                                     env: config.env.as_ref(), working_dir: config.working_dir.as_deref(),
                                     submit_key: &config.submit_key, home: Some(&home), crash_tx: Some(tx),
@@ -780,6 +759,7 @@ fn spawn_and_register_agent(
             name,
             backend_command: command,
             args,
+            spawn_mode: crate::backend::SpawnMode::Resume,
             cols,
             rows,
             env: env.as_ref(),
@@ -802,46 +782,6 @@ fn spawn_and_register_agent(
         .name(format!("{n}_tui_server"))
         .spawn(move || serve_agent_tui(&n, &rdir, &reg))?;
     Ok(())
-}
-
-/// Strip resume-related arguments for fresh respawn.
-///
-/// Handles all backend resume patterns:
-/// - `--resume latest` (Gemini Fixed)
-/// - `--continue` (Claude/OpenCode ContinueInCwd)
-/// - `--resume` (Kiro ContinueInCwd)
-/// - `resume --last` (Codex positional subcommand in preset args)
-fn strip_resume_args(args: &[String]) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut skip_next = false;
-    let mut skip_codex_resume = false;
-
-    for arg in args {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-
-        // --resume <value> or --continue (flag + next arg)
-        if arg == "--resume" || arg == "--continue" {
-            skip_next = true;
-            continue;
-        }
-
-        // Codex: "resume" subcommand followed by "--last"
-        if arg == "resume" && !arg.starts_with('-') {
-            skip_codex_resume = true;
-            continue;
-        }
-        if skip_codex_resume && arg == "--last" {
-            skip_codex_resume = false;
-            continue;
-        }
-        skip_codex_resume = false;
-
-        result.push(arg.clone());
-    }
-    result
 }
 
 /// If `$AGEND_HOME/run/upgrade-marker` exists, we were just (re)launched by
@@ -1012,52 +952,6 @@ mod tests {
         assert!(found.is_none());
         assert!(!run.exists());
         std::fs::remove_dir_all(&home).ok();
-    }
-
-    // --- strip_resume_args ---
-
-    fn s(args: &[&str]) -> Vec<String> {
-        args.iter().map(|a| a.to_string()).collect()
-    }
-
-    #[test]
-    fn strip_resume_claude() {
-        let args = s(&["--dangerously-skip-permissions", "--resume", "abc-123"]);
-        let stripped = strip_resume_args(&args);
-        assert_eq!(stripped, s(&["--dangerously-skip-permissions"]));
-    }
-
-    #[test]
-    fn strip_resume_opencode_continue() {
-        let args = s(&["--continue"]);
-        let stripped = strip_resume_args(&args);
-        // --continue + its next arg (if any) stripped; here there's nothing after it
-        assert!(stripped.is_empty() || !stripped.contains(&"--continue".to_string()));
-    }
-
-    #[test]
-    fn strip_resume_gemini() {
-        let args = s(&["--yolo", "--resume", "latest"]);
-        let stripped = strip_resume_args(&args);
-        assert_eq!(stripped, s(&["--yolo"]));
-    }
-
-    #[test]
-    fn strip_resume_codex() {
-        let args = s(&[
-            "resume",
-            "--last",
-            "--dangerously-bypass-approvals-and-sandbox",
-        ]);
-        let stripped = strip_resume_args(&args);
-        assert_eq!(stripped, s(&["--dangerously-bypass-approvals-and-sandbox"]));
-    }
-
-    #[test]
-    fn strip_resume_no_resume_args() {
-        let args = s(&["--dangerously-skip-permissions"]);
-        let stripped = strip_resume_args(&args);
-        assert_eq!(stripped, args);
     }
 
     // --- fresh_args ---

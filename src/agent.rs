@@ -181,10 +181,17 @@ fn strip_ansi(s: &str) -> String {
 pub type CrashChannel = crossbeam::channel::Sender<String>;
 
 /// Configuration for spawning an agent.
+///
+/// `args` are **user-only**: the caller passes whatever they'd add on top of
+/// the backend's baseline (e.g. `--model foo`), and `spawn_agent` prepends the
+/// preset args dictated by `spawn_mode`. Callers should not compose
+/// `--trust-all-tools`, `--dangerously-skip-permissions`, etc. themselves —
+/// otherwise those flags get double-applied.
 pub struct SpawnConfig<'a> {
     pub name: &'a str,
     pub backend_command: &'a str,
     pub args: &'a [String],
+    pub spawn_mode: crate::backend::SpawnMode,
     pub cols: u16,
     pub rows: u16,
     pub env: Option<&'a HashMap<String, String>>,
@@ -200,6 +207,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         name,
         backend_command,
         args,
+        spawn_mode,
         cols,
         rows,
         env,
@@ -221,17 +229,23 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
 
     let detected_backend = Backend::from_command(backend_command);
 
-    // Enrich args with backend-specific flags (e.g. Claude's
-    // --append-system-prompt-file / --mcp-config / --settings) derived from
-    // files already written by instructions::generate. Flags are only emitted
-    // when the files exist, so callers that skip generate() get raw args.
+    // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
+    // Centralized here so callers don't double-apply preset args.
     let enriched_args: Vec<String> = {
-        let extra = detected_backend
+        let preset = detected_backend
+            .as_ref()
+            .map(|b| b.preset_spawn_args(*spawn_mode))
+            .unwrap_or_default();
+        let flags = detected_backend
             .as_ref()
             .zip(*working_dir)
             .map(|(b, wd)| b.spawn_flags(wd))
             .unwrap_or_default();
-        args.iter().cloned().chain(extra).collect()
+        preset
+            .into_iter()
+            .chain(args.iter().cloned())
+            .chain(flags)
+            .collect()
     };
 
     // Resolve bare command names to absolute paths via `which` before handing

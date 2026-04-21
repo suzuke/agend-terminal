@@ -6,7 +6,7 @@
 //! instruction generation on top. `attach_pane` skips spawn and only subscribes —
 //! used when the API server creates the agent out-of-band. `spawn_pane_tab` is the
 //! create_pane + add_tab convenience. `resolve_backend` maps a backend name to
-//! (command, args, submit_key). `unique_fleet_name` dedups a base name against
+//! (command, submit_key). `unique_fleet_name` dedups a base name against
 //! fleet.yaml.
 
 use crate::agent::{self, AgentRegistry};
@@ -30,6 +30,7 @@ pub(super) fn spawn_pane_tab(
     base_name: &str,
     command: &str,
     args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
     working_dir: Option<&Path>,
     env: &HashMap<String, String>,
     submit_key: &str,
@@ -45,6 +46,7 @@ pub(super) fn spawn_pane_tab(
         base_name,
         command,
         args,
+        spawn_mode,
         working_dir,
         env,
         submit_key,
@@ -67,6 +69,7 @@ pub(super) fn create_pane(
     base_name: &str,
     command: &str,
     args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
     working_dir: Option<&Path>,
     env: &HashMap<String, String>,
     submit_key: &str,
@@ -102,6 +105,7 @@ pub(super) fn create_pane(
             name: &name,
             backend_command: command,
             args,
+            spawn_mode,
             cols,
             rows,
             env: Some(env),
@@ -259,6 +263,9 @@ pub(super) fn create_pane_from_resolved(
         fleet_name,
         &resolved.backend_command,
         &resolved.args,
+        // Fleet entries reattach to their prior CLI session — the working_dir
+        // persists across daemon restarts, so ask the backend to resume.
+        crate::backend::SpawnMode::Resume,
         resolved.working_directory.as_deref(),
         &resolved.env,
         &resolved.submit_key,
@@ -346,23 +353,13 @@ pub(super) fn create_remote_pane(
     })
 }
 
-/// Resolve a backend command string into (command, args, submit_key).
-/// If `fresh` is true, uses fresh_args (no resume) when available.
-pub(super) fn resolve_backend(backend_name: &str, fresh: bool) -> (String, Vec<String>, String) {
+/// Map a backend name to its spawn command and submit key.
+pub(super) fn resolve_backend(backend_name: &str) -> (String, String) {
     if let Some(b) = Backend::from_command(backend_name) {
         let p = b.preset();
-        let args = if fresh {
-            p.fresh_args.unwrap_or(p.args)
-        } else {
-            p.args
-        };
-        (
-            p.command.to_string(),
-            args.iter().map(|s| s.to_string()).collect(),
-            p.submit_key.to_string(),
-        )
+        (p.command.to_string(), p.submit_key.to_string())
     } else {
-        (backend_name.to_string(), vec![], "\r".to_string())
+        (backend_name.to_string(), "\r".to_string())
     }
 }
 

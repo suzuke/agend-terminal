@@ -6,7 +6,6 @@
 //! but missing from fleet are dropped (their splits collapse to their sibling).
 
 use crate::agent::AgentRegistry;
-use crate::backend::Backend;
 use crate::fleet;
 use crate::layout::{Layout, PaneNode, SplitDir, Tab};
 
@@ -244,14 +243,7 @@ fn restore_node_reconciled(
         SessionNode::Leaf(sp) => {
             match &sp.fleet_instance_name {
                 Some(fleet_name) => {
-                    // Fleet agent — resolve from fleet.yaml, add resume args for session continuity.
-                    // Safe: preset.args should not contain resume flags (those live in resume_mode).
-                    let mut resolved = fleet?.resolve_instance(fleet_name)?;
-                    if let Some(backend) = Backend::from_command(&resolved.backend_command) {
-                        resolved
-                            .args
-                            .extend(backend.preset().resume_mode.args_for());
-                    }
+                    let resolved = fleet?.resolve_instance(fleet_name)?;
                     placed.insert(fleet_name.clone());
                     let mut pane = super::pane_factory::create_pane_from_resolved(
                         fleet_name,
@@ -279,6 +271,7 @@ fn restore_node_reconciled(
                         "shell",
                         &shell,
                         &[],
+                        crate::backend::SpawnMode::Fresh,
                         None,
                         &HashMap::new(),
                         "\r",
