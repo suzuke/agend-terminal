@@ -187,27 +187,13 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 /// Errors if the cookie file is missing — that would mean a running daemon
 /// without auth, which we refuse to silently join.
 ///
-/// Stale-run-dir handling: `find_active_run_dir`'s identity check only
-/// confirms the `.daemon` file's pid matches the dir name (trivially true).
-/// If the original daemon died and Windows recycled its PID for an unrelated
-/// process, `is_pid_alive` returns true and we'd attach to a dead daemon —
-/// every 2s port poll would then retry dead TCP sockets and stall input.
-/// Probe `api.port` to confirm a real daemon is listening.
-///
-/// Probe failure is NOT sufficient evidence to delete the run dir here:
-/// `try_attach` runs *before* the daemon lock is acquired, so a failing
-/// probe can mean either (a) the daemon is genuinely dead (PID reused) OR
-/// (b) a live daemon is still mid-bootstrap and hasn't bound the port yet.
-/// We can't tell the two apart without timing heuristics, and mis-treating
-/// (b) as dead would `remove_dir_all` a live daemon's state (issue #7).
-/// Return `None` on probe failure; the caller then attempts to acquire the
-/// exclusive daemon lock:
-///   - If a live daemon holds it, lock acquisition fails and we bail out
-///     with a clear "another daemon is running" error — the live daemon's
-///     run dir is untouched.
-///   - If the daemon is truly dead, lock acquisition succeeds and the
-///     caller runs `sweep_stale_run_dirs`, which *under the lock* can
-///     safely delete any run dir whose port is unreachable.
+/// Probe `api.port` to guard against PID reuse: `is_pid_alive` can't tell
+/// a live daemon from a recycled-PID impostor (#6, Windows input-lag bug).
+/// Probe failure alone is NOT enough to delete the run dir — `try_attach`
+/// runs before the daemon lock, and a failing probe can also mean a live
+/// daemon is mid-bootstrap and hasn't bound its port yet; deleting would
+/// clobber its state (#7). Return `None` on failure and let the caller's
+/// lock acquisition + `sweep_stale_run_dirs` distinguish dead from starting.
 fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
     let Some(run_dir) = crate::daemon::find_active_run_dir(home) else {
         return Ok(None);
