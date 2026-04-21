@@ -461,15 +461,6 @@ fn run_core(
         tracing::warn!(agent = %crashed_name, "crashed");
         crate::event_log::log(home, "crash", &crashed_name, "agent crashed");
 
-        // Clear stale session ID — if agent crashed with --resume, the session
-        // may no longer exist. Removing the .sid file ensures the next respawn
-        // starts fresh instead of crash-looping on "No conversation found".
-        let sid_file = home.join("sessions").join(format!("{crashed_name}.sid"));
-        if sid_file.exists() {
-            tracing::info!(agent = %crashed_name, "clearing stale session ID");
-            let _ = std::fs::remove_file(&sid_file);
-        }
-
         // Get config for respawn
         let config = crate::sync::lock_poisoned(&configs, "configs")
             .get(&crashed_name)
