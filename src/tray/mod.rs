@@ -131,11 +131,9 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
                     }
                 }
             }
-            Event::UserEvent(UserEvent::Menu(ev)) => {
-                if ev.id == quit_id {
-                    shutdown_daemon(&home);
-                    *control_flow = ControlFlow::Exit;
-                }
+            Event::UserEvent(UserEvent::Menu(ev)) if ev.id == quit_id => {
+                shutdown_daemon(&home);
+                *control_flow = ControlFlow::Exit;
             }
             _ => {}
         }
