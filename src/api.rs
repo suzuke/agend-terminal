@@ -1312,4 +1312,198 @@ mod tests {
         assert!(matches!(&events[0], ApiEvent::InstanceCreated { .. }));
         assert!(matches!(&events[1], ApiEvent::InstanceDeleted { .. }));
     }
+
+    // -----------------------------------------------------------------------
+    // Slice 4: Dispatch-Level Notifier Coverage
+    // -----------------------------------------------------------------------
+    // These tests exercise handle_session's actual notifier call sites by
+    // starting a real API server with a RecordingNotifier and sending NDJSON
+    // requests over TCP.
+
+    /// Start an API server on a background thread with a given notifier.
+    fn start_test_server_with(
+        label: &str,
+        notifier: Option<Arc<dyn ApiNotifier>>,
+    ) -> (u16, std::path::PathBuf, Arc<AtomicBool>) {
+        let home = tmp_home(label);
+        let run_dir = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        crate::auth_cookie::issue(&run_dir).unwrap();
+
+        let registry: AgentRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let configs: ConfigRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let externals: crate::agent::ExternalRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let h = home.clone();
+        let r = Arc::clone(&registry);
+        let s = Arc::clone(&shutdown);
+        let c = Arc::clone(&configs);
+        let e = Arc::clone(&externals);
+
+        std::thread::Builder::new()
+            .name(format!("test_api_{label}"))
+            .spawn(move || {
+                serve(&h, r, s, c, e, notifier);
+            })
+            .unwrap();
+
+        let mut port = 0u16;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(contents) = std::fs::read_to_string(run_dir.join("api.port")) {
+                if let Ok(p) = contents.trim().parse::<u16>() {
+                    port = p;
+                    break;
+                }
+            }
+        }
+        assert!(port > 0, "API server did not publish port");
+        (port, home, shutdown)
+    }
+
+    /// Start an API server with a RecordingNotifier.
+    fn start_test_server(
+        label: &str,
+    ) -> (
+        u16,
+        std::path::PathBuf,
+        Arc<RecordingNotifier>,
+        Arc<AtomicBool>,
+    ) {
+        let rec = Arc::new(RecordingNotifier::new());
+        let n: Arc<dyn ApiNotifier> = Arc::clone(&rec) as Arc<dyn ApiNotifier>;
+        let (port, home, shutdown) = start_test_server_with(label, Some(n));
+        (port, home, rec, shutdown)
+    }
+
+    /// Send an NDJSON request to the API server and read one response.
+    fn api_request(port: u16, home: &std::path::Path, request: &Value) -> Value {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let stream =
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = std::io::BufReader::new(stream);
+
+        // Auth handshake
+        let run_dir = crate::daemon::run_dir(home);
+        let cookie = crate::auth_cookie::read_cookie(&run_dir).unwrap();
+        crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &cookie).unwrap();
+
+        writeln!(writer, "{}", request).unwrap();
+        writer.flush().unwrap();
+
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(line.trim()).unwrap_or(json!({"error": "parse failed"}))
+    }
+
+    fn stop_server(shutdown: &Arc<AtomicBool>, home: &std::path::Path) {
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Connect to unblock the accept() loop
+        let run_dir = crate::daemon::run_dir(home);
+        if let Ok(contents) = std::fs::read_to_string(run_dir.join("api.port")) {
+            if let Ok(port) = contents.trim().parse::<u16>() {
+                let _ = std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                    std::time::Duration::from_millis(100),
+                );
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn dispatch_delete_emits_instance_deleted() {
+        let (port, home, notifier, shutdown) = start_test_server("dispatch-del");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "delete", "params": {"name": "agent-x"}}),
+        );
+        assert_eq!(resp["ok"], true);
+        let events = notifier.take();
+        assert_eq!(events.len(), 1, "expected 1 event, got {events:?}");
+        let ApiEvent::InstanceDeleted { name } = &events[0] else {
+            panic!("expected InstanceDeleted, got {:?}", events[0])
+        };
+        assert_eq!(name, "agent-x");
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_create_team_emits_team_created() {
+        let (port, home, notifier, shutdown) = start_test_server("dispatch-team");
+        // CREATE_TEAM with no spawnable agents → spawned is empty → no event
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "create_team",
+                "params": {"name": "test-team", "members": ["a", "b"]}
+            }),
+        );
+        assert_eq!(resp["ok"], true);
+        // CREATE_TEAM only emits TeamCreated when spawned is non-empty.
+        // With no fleet config and no backends, spawned will be empty.
+        let events = notifier.take();
+        assert_eq!(
+            events.len(),
+            0,
+            "no event expected when spawned is empty, got {events:?}"
+        );
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_update_team_emits_members_changed() {
+        let (port, home, notifier, shutdown) = start_test_server("dispatch-update-team");
+        // First create a team via the teams store
+        let store_path = home.join("teams.json");
+        std::fs::write(
+            &store_path,
+            r#"{"schema_version":1,"teams":[{"name":"t1","members":["m1"],"created_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "update_team",
+                "params": {"name": "t1", "add": ["m2"]}
+            }),
+        );
+        assert_eq!(resp["ok"], true);
+        let events = notifier.take();
+        assert_eq!(events.len(), 1, "expected 1 event, got {events:?}");
+        let ApiEvent::TeamMembersChanged {
+            name,
+            added,
+            removed,
+        } = &events[0]
+        else {
+            panic!("expected TeamMembersChanged, got {:?}", events[0])
+        };
+        assert_eq!(name, "t1");
+        assert_eq!(added, &["m2"]);
+        assert!(removed.is_empty());
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_delete_with_none_notifier_no_panic() {
+        let (port, home, shutdown) = start_test_server_with("dispatch-none", None);
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "delete", "params": {"name": "ghost"}}),
+        );
+        assert_eq!(resp["ok"], true);
+        stop_server(&shutdown, &home);
+    }
 }
