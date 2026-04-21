@@ -73,6 +73,39 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Remove every `~/.agend/run/<pid>/` whose daemon is not reachable.
+///
+/// `find_active_run_dir` cleans only the one entry it visits before returning
+/// the first alive-PID match, so a second (or third) stale dir whose PID has
+/// been recycled by an unrelated OS process survives indefinitely. On the next
+/// `agend-terminal app` launch the bootstrap probe might pick any of them; the
+/// losers stay on disk and keep accumulating. This runs once at the winning
+/// daemon's startup (after the exclusive lock) and clears the backlog.
+///
+/// An entry survives only if BOTH `is_pid_alive` returns true AND `probe_api`
+/// can reach its `api.port`. Missing/malformed `.daemon` or `api.port` counts
+/// as stale.
+pub fn sweep_stale_run_dirs(home: &Path) {
+    let run = home.join("run");
+    let Ok(entries) = std::fs::read_dir(&run) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let pid_str = entry.file_name().to_string_lossy().into_owned();
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let alive = crate::process::is_pid_alive(pid) && crate::ipc::probe_api(&entry.path());
+        if !alive {
+            tracing::info!(
+                path = %entry.path().display(),
+                "sweeping stale run dir"
+            );
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Write daemon identity file for PID reuse detection.
 pub(crate) fn write_daemon_id(run_dir: &Path) {
     let pid = std::process::id();

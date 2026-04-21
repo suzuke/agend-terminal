@@ -110,6 +110,24 @@ pub fn probe_agent(run: &Path, name: &str) -> bool {
     }
 }
 
+/// Probe whether a run_dir's daemon API is reachable. Used to distinguish a
+/// live daemon from a stale run_dir whose PID has been reused: `is_pid_alive`
+/// may say true, but only a real agend daemon answers on the api port.
+///
+/// 200ms timeout matches `probe_agent`. A refused connection on a loopback
+/// port returns much faster than the timeout, so this is cheap in the common
+/// "dead daemon" case.
+pub fn probe_api(run: &Path) -> bool {
+    match read_port(run, API_NAME) {
+        Some(port) => TcpStream::connect_timeout(
+            &SocketAddr::from((LOOPBACK, port)),
+            Duration::from_millis(200),
+        )
+        .is_ok(),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +185,32 @@ mod tests {
         write_port(&dir, "a", 1).expect("write");
         remove_port(&dir, "a");
         assert_eq!(read_port(&dir, "a"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn probe_api_matches_api_port_listener() {
+        // probe_api is the gatekeeper that distinguishes a live daemon from
+        // a stale run dir whose PID got recycled. It must return true when
+        // api.port points at an actual listener and false when the file is
+        // missing (stale daemon, port never written, or written but daemon
+        // exited so the OS released the port).
+        let dir = tmp_dir("probe_api");
+        let listener = bind_loopback().expect("bind");
+        let port = local_port(&listener);
+        write_port(&dir, API_NAME, port).expect("write api.port");
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        assert!(probe_api(&dir), "must succeed while listener is live");
+        handle.join().ok();
+
+        remove_port(&dir, API_NAME);
+        assert!(
+            !probe_api(&dir),
+            "must fail once api.port file is gone (stale run dir)"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
