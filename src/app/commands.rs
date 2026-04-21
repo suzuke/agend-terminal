@@ -65,6 +65,9 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     pr,
                     ctx.wakeup_tx,
                     ctx.name_counter,
+                    // User-initiated new instance — start fresh so the new pane
+                    // does not resume a prior session that happened to share cwd.
+                    crate::backend::SpawnMode::Fresh,
                 )
             } else {
                 let (command, submit_key) = super::pane_factory::resolve_backend(backend_name);
@@ -199,6 +202,9 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                                 pr,
                                 ctx.wakeup_tx,
                                 ctx.name_counter,
+                                // `:restart` preserves the conversation — reattach
+                                // the CLI's prior cwd-scoped session.
+                                crate::backend::SpawnMode::Resume,
                             )
                         } else {
                             let (command, submit_key) =

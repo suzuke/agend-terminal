@@ -187,6 +187,8 @@ pub(super) fn restore_with_reconciliation(
                         rows,
                         wakeup_tx,
                         name_counter,
+                        // Session restore — rehydrate prior conversation.
+                        crate::backend::SpawnMode::Resume,
                     ) {
                         let tab_name = pane.agent_name.clone();
                         layout.add_tab(Tab::new(tab_name, pane));
@@ -255,6 +257,8 @@ fn restore_node_reconciled(
                         rows,
                         wakeup_tx,
                         name_counter,
+                        // Session restore — rehydrate prior conversation.
+                        crate::backend::SpawnMode::Resume,
                     )
                     .ok()?;
                     pane.display_name = sp.display_name.clone();

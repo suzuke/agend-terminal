@@ -112,6 +112,8 @@ pub(super) fn auto_start_fleet(
                 rows,
                 wakeup_tx,
                 name_counter,
+                // Auto-start on daemon/app boot — rehydrate prior session.
+                crate::backend::SpawnMode::Resume,
             ) {
                 Ok(pane) => {
                     let tab_name = pane.agent_name.clone();

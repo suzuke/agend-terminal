@@ -624,6 +624,10 @@ fn pane_from_menu_item(
                     rows,
                     wakeup_tx,
                     name_counter,
+                    // User picked a backend from the menu — new instance, start
+                    // fresh so the CLI does not `--continue` into a stale session
+                    // that happens to share this cwd.
+                    crate::backend::SpawnMode::Fresh,
                 )
             } else {
                 // Preset args are added by spawn_agent; no need to compose here.
@@ -660,6 +664,9 @@ fn pane_from_menu_item(
                 rows,
                 wakeup_tx,
                 name_counter,
+                // User explicitly re-opened an existing fleet instance — resume
+                // its prior session.
+                crate::backend::SpawnMode::Resume,
             )
         }
     }
