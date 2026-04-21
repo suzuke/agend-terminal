@@ -7,6 +7,7 @@ pub(crate) mod external;
 pub(crate) mod instance;
 pub(crate) mod messaging;
 pub(crate) mod query;
+pub(crate) mod team;
 
 use crate::agent::{AgentRegistry, ExternalRegistry};
 use crate::api::{ApiNotifier, ConfigRegistry};

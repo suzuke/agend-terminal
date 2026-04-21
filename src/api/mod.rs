@@ -452,45 +452,7 @@ fn handle_session(
                 }
                 resp
             }
-            method::UPDATE_TEAM => {
-                let team_name = match params["name"].as_str() {
-                    Some(n) => n.to_string(),
-                    None => {
-                        let _ =
-                            writeln!(writer, "{}", json!({"ok": false, "error": "missing name"}));
-                        continue;
-                    }
-                };
-                // Snapshot the pre-mutation roster so the TUI event carries the
-                // *effective* diff (noop adds like re-adding an existing member
-                // must not trigger a pane move).
-                let before = crate::teams::get_members(home, &team_name);
-                let result = crate::teams::update(home, params);
-                let after = crate::teams::get_members(home, &team_name);
-                let before_set: std::collections::HashSet<&String> = before.iter().collect();
-                let after_set: std::collections::HashSet<&String> = after.iter().collect();
-                let added: Vec<String> = after
-                    .iter()
-                    .filter(|m| !before_set.contains(m))
-                    .cloned()
-                    .collect();
-                let removed: Vec<String> = before
-                    .iter()
-                    .filter(|m| !after_set.contains(m))
-                    .cloned()
-                    .collect();
-                if let Some(n) = notifier {
-                    if !added.is_empty() || !removed.is_empty() {
-                        tracing::info!(team = %team_name, added = ?added, removed = ?removed, "UPDATE_TEAM emitting TeamMembersChanged");
-                        n.notify(ApiEvent::TeamMembersChanged {
-                            name: team_name.clone(),
-                            added,
-                            removed,
-                        });
-                    }
-                }
-                json!({"ok": true, "result": result})
-            }
+            method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
             method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
