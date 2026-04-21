@@ -1492,10 +1492,8 @@ mod tests {
             result["protocol_version"].is_number(),
             "expected protocol_version number, got: {result}"
         );
-        assert!(
-            result["agents"].is_array(),
-            "expected agents array, got: {result}"
-        );
+        let agents = result["agents"].as_array().expect("agents array");
+        assert_eq!(agents.len(), 0, "empty registry should yield 0 agents");
         stop_server(&shutdown, &home);
     }
 
@@ -1505,11 +1503,142 @@ mod tests {
         let resp = api_request(port, &home, &json!({"method": "status"}));
         assert_eq!(resp["ok"], true);
         let result = &resp["result"];
-        // With no snapshot file, agents is empty and timestamp is null
-        assert!(
-            result["agents"].is_array(),
-            "expected agents array, got: {result}"
+        let agents = result["agents"].as_array().expect("agents array");
+        assert_eq!(agents.len(), 0, "no snapshot should yield 0 agents");
+        assert_eq!(result["timestamp"], serde_json::Value::Null);
+        stop_server(&shutdown, &home);
+    }
+
+    // -----------------------------------------------------------------------
+    // Slice D characterization: SEND + REGISTER/DEREGISTER_EXTERNAL
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_send_delivers_to_inbox() {
+        let (port, home, _notifier, shutdown) = start_test_server("send-char");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "send",
+                "params": {"from": "sender", "target": "receiver", "text": "hello"}
+            }),
         );
+        assert_eq!(resp["ok"], true);
+        // Verify message was enqueued to receiver's inbox
+        let inbox_file = home.join("inbox").join("receiver.jsonl");
+        assert!(
+            inbox_file.exists(),
+            "expected inbox file at {}",
+            inbox_file.display()
+        );
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_send_rejects_self_send() {
+        let (port, home, _notifier, shutdown) = start_test_server("send-self");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "send",
+                "params": {"from": "agent-x", "target": "agent-x", "text": "hi"}
+            }),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("cannot send to self")),);
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_register_and_deregister_external() {
+        let (port, home, _notifier, shutdown) = start_test_server("ext-reg");
+        // Register
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "register_external",
+                "params": {"name": "ext-agent", "backend": "custom", "pid": 12345}
+            }),
+        );
+        assert_eq!(resp["ok"], true);
+
+        // Verify it shows up in LIST
+        let list_resp = api_request(port, &home, &json!({"method": "list"}));
+        let agents = list_resp["result"]["agents"].as_array().expect("agents");
+        assert!(
+            agents
+                .iter()
+                .any(|a| a["name"] == "ext-agent" && a["kind"] == "external"),
+            "expected ext-agent in list, got: {agents:?}"
+        );
+
+        // Deregister
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "deregister_external", "params": {"name": "ext-agent"}}),
+        );
+        assert_eq!(resp["ok"], true);
+
+        // Verify it's gone from LIST
+        let list_resp = api_request(port, &home, &json!({"method": "list"}));
+        let agents = list_resp["result"]["agents"].as_array().expect("agents");
+        assert!(
+            !agents.iter().any(|a| a["name"] == "ext-agent"),
+            "ext-agent should be gone after deregister"
+        );
+
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_deregister_nonexistent_returns_error() {
+        let (port, home, _notifier, shutdown) = start_test_server("ext-dereg-miss");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "deregister_external", "params": {"name": "ghost"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not found")));
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_register_duplicate_returns_error() {
+        let (port, home, _notifier, shutdown) = start_test_server("ext-dup");
+        // Register first time
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "register_external",
+                "params": {"name": "dup-agent", "backend": "custom", "pid": 1}
+            }),
+        );
+        assert_eq!(resp["ok"], true);
+
+        // Register same name again
+        let resp = api_request(
+            port,
+            &home,
+            &json!({
+                "method": "register_external",
+                "params": {"name": "dup-agent", "backend": "custom", "pid": 2}
+            }),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("already exists")));
+
         stop_server(&shutdown, &home);
     }
 }
