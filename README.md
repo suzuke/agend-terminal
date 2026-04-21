@@ -144,7 +144,7 @@ is bidirectional:
 ## Testing
 
 ```bash
-cargo test         # 51 tests (unit + integration + MCP round-trip)
+cargo test         # 561 tests (unit + integration + MCP round-trip)
 cargo clippy       # 0 errors (deny unwrap_used)
 ```
 
