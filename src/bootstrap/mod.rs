@@ -187,23 +187,22 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 /// Errors if the cookie file is missing — that would mean a running daemon
 /// without auth, which we refuse to silently join.
 ///
-/// Stale-run-dir handling: `find_active_run_dir`'s identity check only
-/// confirms the `.daemon` file's pid matches the dir name (trivially true).
-/// If the original daemon died and Windows recycled its PID for an unrelated
-/// process, `is_pid_alive` returns true and we'd attach to a dead daemon —
-/// every 2s port poll would then retry dead TCP sockets and stall input.
-/// Probe `api.port` to confirm a real daemon is listening; on failure clean
-/// the run_dir so the outer `prepare` can own the fleet.
+/// Probe `api.port` to guard against PID reuse: `is_pid_alive` can't tell
+/// a live daemon from a recycled-PID impostor (#6, Windows input-lag bug).
+/// Probe failure alone is NOT enough to delete the run dir — `try_attach`
+/// runs before the daemon lock, and a failing probe can also mean a live
+/// daemon is mid-bootstrap and hasn't bound its port yet; deleting would
+/// clobber its state (#7). Return `None` on failure and let the caller's
+/// lock acquisition + `sweep_stale_run_dirs` distinguish dead from starting.
 fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
     let Some(run_dir) = crate::daemon::find_active_run_dir(home) else {
         return Ok(None);
     };
     if !crate::ipc::probe_api(&run_dir) {
-        tracing::info!(
+        tracing::debug!(
             path = %run_dir.display(),
-            "stale run dir: pid alive but api.port unreachable — cleaning"
+            "api.port unreachable — skipping attach (sweep will clean if truly stale)"
         );
-        let _ = std::fs::remove_dir_all(&run_dir);
         return Ok(None);
     }
     let cookie = crate::auth_cookie::read_cookie(&run_dir)
@@ -456,6 +455,50 @@ mod tests {
         assert!(
             non_pid.exists(),
             "non-pid-named sibling must be left intact"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Issue #7 regression: when a daemon is mid-bootstrap — `.daemon` and
+    /// `api.cookie` written but `api.port` not bound yet — `try_attach` must
+    /// NOT `remove_dir_all` the run dir. Prior to this fix a racing `app`
+    /// process could clobber a live daemon's state, because `probe_api` fails
+    /// during the bootstrap window and the old code treated that as "stale".
+    ///
+    /// Expectation: `try_attach` returns `None` (port not listening ⇒ not
+    /// ready to attach), but all files in the run dir survive untouched, so
+    /// the bootstrapping daemon can finish writing its state.
+    #[test]
+    fn try_attach_preserves_run_dir_when_port_unreachable() {
+        let home = tmp_home("mid_bootstrap");
+        let fleet = write_minimal_fleet(&home);
+        let run = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&run).expect("mkdir run");
+        crate::daemon::write_daemon_id(&run);
+        let planted_cookie =
+            crate::auth_cookie::issue(&run).expect("issue cookie to simulate bootstrap");
+        // Deliberately skip `fake_api_listener` / `write_port` — this is the
+        // exact state of a daemon between `auth_cookie::issue` and
+        // `api::serve` binding its loopback port.
+
+        let outcome = try_attach(&home, &fleet).expect("try_attach");
+        assert!(
+            outcome.is_none(),
+            "must not attach when api.port is unreachable"
+        );
+        assert!(
+            run.exists(),
+            "mid-bootstrap run dir must not be deleted by try_attach (issue #7)"
+        );
+        assert!(
+            run.join(".daemon").exists(),
+            ".daemon file must survive try_attach probe failure"
+        );
+        let surviving = crate::auth_cookie::read_cookie(&run)
+            .expect("cookie file must survive try_attach probe failure");
+        assert_eq!(
+            surviving, planted_cookie,
+            "cookie bytes must be unchanged — try_attach must not have rewritten"
         );
         std::fs::remove_dir_all(&home).ok();
     }
