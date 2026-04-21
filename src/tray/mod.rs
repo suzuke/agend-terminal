@@ -22,12 +22,13 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder};
 #[cfg(target_os = "macos")]
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem},
     Icon, TrayIcon, TrayIconBuilder,
 };
 
 use crate::{api, bootstrap::daemon_spawn};
 
+use self::autostart::{Autostart, Platform as AutostartPlatform};
 use self::terminal::{OpenInTerminal, Platform as TerminalPlatform};
 
 /// Status polling cadence. PLAN §"Runtime flow" pins 2s; slower feels
@@ -103,9 +104,10 @@ fn shutdown_daemon(home: &Path) {
 
 /// Entry point for `agend-terminal tray`.
 ///
-/// Probes/spawns the daemon, brings up the tray icon, and runs the
-/// event loop. Quit sends SHUTDOWN before exiting. Status polling,
-/// Open App, and Launch-at-login toggle land in follow-on commits.
+/// Probes/spawns the daemon, brings up the tray icon with status
+/// label / Open App / Launch-at-login / Quit, and runs the event
+/// loop. Quit sends SHUTDOWN before exiting. Status is refreshed
+/// every `POLL_INTERVAL` from a worker thread.
 ///
 /// The `unused_*` allows cover the `tray_icon` ownership slot inside
 /// the event loop: dropping a `TrayIcon` removes the icon from the
@@ -136,17 +138,29 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     let cfg = config::load(&home);
     let opener = TerminalPlatform::new(cfg.terminal);
 
-    // Menu: disabled status label, separator, Open App, Quit.
-    // Launch-at-login toggle lands in the follow-on commit.
+    // Autostart platform instance + current on-disk state. Probe
+    // failures (e.g. launchctl not in PATH on a minimal runner) are
+    // non-fatal: treat as disabled and keep the tray usable.
+    let autostart = AutostartPlatform::new(home.clone());
+    let autostart_on = autostart.is_enabled().unwrap_or_else(|e| {
+        eprintln!("tray: failed to probe autostart state: {e}");
+        false
+    });
+
+    // Menu: disabled status label, separator, Open App, Launch-at-login
+    // toggle, Quit.
     let menu = Menu::new();
     let status_item = MenuItem::new("starting…", false, None);
     let open_app_item = MenuItem::new("Open App", true, None);
+    let autostart_item = CheckMenuItem::new("Launch at login", true, autostart_on, None);
     let quit_item = MenuItem::new("Quit agend-terminal", true, None);
     menu.append(&status_item)?;
     menu.append(&tray_icon::menu::PredefinedMenuItem::separator())?;
     menu.append(&open_app_item)?;
+    menu.append(&autostart_item)?;
     menu.append(&quit_item)?;
     let open_app_id = open_app_item.id().clone();
+    let autostart_id = autostart_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     // Status poller: every POLL_INTERVAL, probe the daemon and push a
@@ -202,6 +216,23 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
                     // keep the tray alive so the user can retry or Quit.
                     if let Err(e) = opener.open(&["agend-terminal", "app"]) {
                         eprintln!("tray: open app failed: {e}");
+                    }
+                } else if ev.id == autostart_id {
+                    // CheckMenuItem flips its own check state before firing
+                    // the event; read that to learn the user's intent, then
+                    // persist via the Autostart trait. On failure, revert the
+                    // visual to the real on-disk state so the menu never
+                    // shows a lie.
+                    let desired = autostart_item.is_checked();
+                    let result = if desired {
+                        autostart.enable()
+                    } else {
+                        autostart.disable()
+                    };
+                    if let Err(e) = result {
+                        eprintln!("tray: autostart toggle failed: {e}");
+                        let actual = autostart.is_enabled().unwrap_or(!desired);
+                        autostart_item.set_checked(actual);
                     }
                 }
             }
