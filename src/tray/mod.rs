@@ -40,43 +40,81 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
-    /// Pre-formatted label text from the worker thread. Drained on the
+    /// Distilled daemon status from the worker thread. Drained on the
     /// main thread (tray-icon / muda require main-thread mutation on
-    /// macOS).
-    Status(String),
+    /// macOS); the handler derives label text + icon color from the
+    /// same variant so they can never desync.
+    Status(StatusKind),
 }
 
-/// Render a LIST response into the menu label. First line is what the
-/// user scans: how many agents the daemon has, or "daemon offline" if
-/// the probe errors.
-fn format_status(resp: &Value) -> String {
-    let Some(agents) = resp
-        .get("result")
-        .and_then(|r| r.get("agents"))
-        .and_then(|a| a.as_array())
-    else {
-        return "daemon offline".to_string();
-    };
-    match agents.len() {
-        0 => "no agents".to_string(),
-        1 => "1 agent".to_string(),
-        n => format!("{n} agents"),
+/// The three dial positions the tray icon can show. PLAN §"Layout"
+/// calls for `active / idle / error`; we reuse the same split but
+/// rename `error` → `offline` because the only actual failure mode
+/// today is an unreachable daemon. Real unhealthy-agent signal would
+/// need a sick state on the agent handle, which the current registry
+/// doesn't carry.
+#[derive(Debug, Clone, Copy)]
+enum StatusKind {
+    /// Daemon probe failed — no tray ↔ daemon IPC at all.
+    Offline,
+    /// Daemon up, zero agents registered. Rare outside a fresh
+    /// `$AGEND_HOME`.
+    Idle,
+    /// Daemon up with `N >= 1` agents in the registry.
+    Active(usize),
+}
+
+impl StatusKind {
+    /// Classify a LIST response. Missing / non-array `result.agents`
+    /// means the response shape drifted — treat as offline rather
+    /// than silently showing `Idle` with a misleading green icon.
+    fn from_response(resp: &Value) -> Self {
+        match resp
+            .get("result")
+            .and_then(|r| r.get("agents"))
+            .and_then(|a| a.as_array())
+        {
+            None => Self::Offline,
+            Some(arr) if arr.is_empty() => Self::Idle,
+            Some(arr) => Self::Active(arr.len()),
+        }
+    }
+
+    /// Disabled menu-item text for the status row.
+    fn label(&self) -> String {
+        match *self {
+            Self::Offline => "daemon offline".into(),
+            Self::Idle => "no agents".into(),
+            Self::Active(1) => "1 agent".into(),
+            Self::Active(n) => format!("{n} agents"),
+        }
+    }
+
+    /// 32x32 solid-color icon. Placeholder until designed PNG assets
+    /// are bundled — still useful for dogfooding because the color
+    /// alone is a glanceable daemon-up/down signal without opening
+    /// the menu. Colors picked for visibility in both light and dark
+    /// menu bars.
+    fn icon(&self) -> Icon {
+        let color = match *self {
+            Self::Offline => [0x88, 0x88, 0x88, 0xFF], // neutral gray
+            Self::Idle => [0xD8, 0xAA, 0x3A, 0xFF],    // amber
+            Self::Active(_) => [0x3A, 0xA8, 0x55, 0xFF], // brand green
+        };
+        solid_icon(color)
     }
 }
 
-/// Build a 32x32 solid-color placeholder icon so the spike runs without
-/// bundled PNG assets. Real icon variants (active / idle / error) land
-/// with follow-on polish — `Icon::from_rgba` accepts any RGBA buffer
-/// that satisfies `width * height * 4 == bytes.len()`.
-fn placeholder_icon() -> Icon {
+/// Fill an RGBA buffer with one color and wrap it in an `Icon`.
+/// Factored out so `StatusKind::icon` stays a table of colors.
+fn solid_icon(rgba: [u8; 4]) -> Icon {
     const W: u32 = 32;
     const H: u32 = 32;
-    let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+    let mut buf = Vec::with_capacity((W * H * 4) as usize);
     for _ in 0..(W * H) {
-        // Brand-ish green. Swap for real asset later.
-        rgba.extend_from_slice(&[0x3A, 0xA8, 0x55, 0xFF]);
+        buf.extend_from_slice(&rgba);
     }
-    Icon::from_rgba(rgba, W, H).expect("32x32 RGBA buffer is always valid")
+    Icon::from_rgba(buf, W, H).expect("32x32 RGBA buffer is always valid")
 }
 
 /// Probe the daemon via `api::call(LIST)`; if it's not up, spawn a
@@ -171,11 +209,11 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     let poll_proxy = event_loop.create_proxy();
     let poll_home = home.clone();
     thread::spawn(move || loop {
-        let text = match api::call(&poll_home, &json!({"method": api::method::LIST})) {
-            Ok(resp) => format_status(&resp),
-            Err(_) => "daemon offline".to_string(),
+        let kind = match api::call(&poll_home, &json!({"method": api::method::LIST})) {
+            Ok(resp) => StatusKind::from_response(&resp),
+            Err(_) => StatusKind::Offline,
         };
-        if poll_proxy.send_event(UserEvent::Status(text)).is_err() {
+        if poll_proxy.send_event(UserEvent::Status(kind)).is_err() {
             break;
         }
         thread::sleep(POLL_INTERVAL);
@@ -193,9 +231,13 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         match event {
             Event::NewEvents(StartCause::Init) => {
                 if let Some(menu) = menu_slot.take() {
+                    // Boot color is `Offline`'s gray. The poller replaces
+                    // it within `POLL_INTERVAL`; this just avoids leaking
+                    // an always-green look during the first 2s when the
+                    // daemon may or may not be up.
                     match TrayIconBuilder::new()
                         .with_tooltip("agend-terminal")
-                        .with_icon(placeholder_icon())
+                        .with_icon(StatusKind::Offline.icon())
                         .with_menu(Box::new(menu))
                         .build()
                     {
@@ -236,8 +278,15 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
                     }
                 }
             }
-            Event::UserEvent(UserEvent::Status(text)) => {
-                status_item.set_text(text);
+            Event::UserEvent(UserEvent::Status(kind)) => {
+                status_item.set_text(kind.label());
+                if let Some(tray) = tray_icon.as_ref() {
+                    // `set_icon(None)` would remove the tray slot entirely
+                    // on Linux; always pass `Some(...)` when swapping.
+                    if let Err(e) = tray.set_icon(Some(kind.icon())) {
+                        eprintln!("tray: failed to swap icon: {e}");
+                    }
+                }
             }
             _ => {}
         }
