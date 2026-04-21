@@ -131,8 +131,10 @@ fn notify_discord(
             if let Err(e) = rt.block_on(async {
                 let http = serenity::all::Http::new(&token);
                 let cid = serenity::all::ChannelId::new(channel_id);
-                cid.send_message(&http, serenity::all::CreateMessage::new().content(&text))
-                    .await?;
+                for chunk in crate::discord::split_message(&text, 2000) {
+                    cid.send_message(&http, serenity::all::CreateMessage::new().content(chunk))
+                        .await?;
+                }
                 Ok::<(), anyhow::Error>(())
             }) {
                 tracing::warn!(error = %e, "discord notify failed");

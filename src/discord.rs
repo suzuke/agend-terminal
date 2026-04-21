@@ -544,7 +544,7 @@ fn resolve_discord_channel() -> anyhow::Result<(DiscordChannel, crate::fleet::Fl
 }
 
 /// Split text at 2000-char Discord limit, preferring newline boundaries.
-fn split_message(text: &str, limit: usize) -> Vec<&str> {
+pub(crate) fn split_message(text: &str, limit: usize) -> Vec<&str> {
     if text.len() <= limit {
         return vec![text];
     }

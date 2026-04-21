@@ -271,6 +271,15 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                             for inst_name in &spawned {
                                 let h = &home;
                                 s.spawn(move || {
+                                    #[cfg(feature = "discord")]
+                                    {
+                                        if crate::ops::is_discord_channel(h) {
+                                            crate::discord::create_channel_for_instance(h, inst_name);
+                                        } else {
+                                            crate::telegram::create_topic_for_instance(h, inst_name);
+                                        }
+                                    }
+                                    #[cfg(not(feature = "discord"))]
                                     crate::telegram::create_topic_for_instance(h, inst_name);
                                 });
                             }
@@ -343,7 +352,22 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Err(e) = crate::fleet::remove_instance_from_yaml(&home, name) {
                 tracing::warn!(error = %e, "failed to remove from fleet.yaml");
             }
-            // Delete the Telegram topic if one exists
+            // Delete the channel/topic if one exists
+            #[cfg(feature = "discord")]
+            {
+                if crate::ops::is_discord_channel(&home) {
+                    if let Some(cid) = fleet.as_ref()
+                        .and_then(|c| c.instances.get(name))
+                        .and_then(|i| i.channel_id.as_ref())
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        crate::discord::delete_channel(&home, cid);
+                    }
+                } else if let Some(tid) = topic_id {
+                    crate::telegram::delete_topic(&home, tid);
+                }
+            }
+            #[cfg(not(feature = "discord"))]
             if let Some(tid) = topic_id {
                 crate::telegram::delete_topic(&home, tid);
             }
@@ -681,6 +705,13 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 tracing::warn!(error = %e, "failed to persist to fleet.yaml");
             }
+            #[cfg(feature = "discord")]
+            let (topic_id, _channel_id) = if crate::ops::is_discord_channel(home) {
+                (None, crate::discord::create_channel_for_instance(home, name))
+            } else {
+                (crate::telegram::create_topic_for_instance(home, name), None)
+            };
+            #[cfg(not(feature = "discord"))]
             let topic_id = crate::telegram::create_topic_for_instance(home, name);
             if let Some(task_text) = task {
                 let h = home.to_path_buf();

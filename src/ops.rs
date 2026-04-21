@@ -138,7 +138,7 @@ pub fn drain_inbox(home: &Path, instance_name: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Detect the active channel type from fleet.yaml.
-fn is_discord_channel(home: &Path) -> bool {
+pub(crate) fn is_discord_channel(home: &Path) -> bool {
     #[cfg(feature = "discord")]
     {
         let fleet_path = home.join("fleet.yaml");
