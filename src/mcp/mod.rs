@@ -284,7 +284,7 @@ fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
 mod tests {
     use super::*;
 
-    fn allow(tools: &[&str]) -> HashSet<String> {
+    fn tool_set(tools: &[&str]) -> HashSet<String> {
         tools.iter().map(|s| s.to_string()).collect()
     }
 
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn acl_deny_blocks_tool() {
         let empty = HashSet::new();
-        let deny = allow(&["delete_instance", "shutdown"]);
+        let deny = tool_set(&["delete_instance", "shutdown"]);
         assert!(!check_allowed("delete_instance", &empty, &deny));
         assert!(!check_allowed("shutdown", &empty, &deny));
         assert!(check_allowed("inbox", &empty, &deny));
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn acl_allow_restricts_to_list() {
         let empty = HashSet::new();
-        let allow_set = allow(&["inbox", "send_to_instance"]);
+        let allow_set = tool_set(&["inbox", "send_to_instance"]);
         assert!(check_allowed("inbox", &allow_set, &empty));
         assert!(check_allowed("send_to_instance", &allow_set, &empty));
         assert!(!check_allowed("delete_instance", &allow_set, &empty));
@@ -315,8 +315,8 @@ mod tests {
 
     #[test]
     fn acl_deny_overrides_allow() {
-        let allow_set = allow(&["inbox", "delete_instance"]);
-        let deny = allow(&["delete_instance"]);
+        let allow_set = tool_set(&["inbox", "delete_instance"]);
+        let deny = tool_set(&["delete_instance"]);
         assert!(check_allowed("inbox", &allow_set, &deny));
         assert!(!check_allowed("delete_instance", &allow_set, &deny));
     }

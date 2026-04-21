@@ -166,7 +166,7 @@ fn ratio_bounds(total: u16) -> (f32, f32) {
 }
 
 impl PaneNode {
-    /// Collect pane IDs into an existing buffer (avoids per-call allocation).
+    /// Collect pane IDs into an existing buffer, avoiding intermediate allocations during recursion.
     pub fn collect_pane_ids(&self, buf: &mut Vec<usize>) {
         match self {
             PaneNode::Leaf(p) => buf.push(p.id),
