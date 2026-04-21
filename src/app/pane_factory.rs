@@ -381,6 +381,14 @@ pub(super) fn resolve_backend(backend_name: &str) -> (String, String) {
 /// opening another never silently reuses `workspace/codex/` with its leftover
 /// `.codex/`, `AGENTS.md`, and git state.
 pub(super) fn unique_fleet_name(home: &Path, base: &str) -> String {
+    unique_fleet_name_with(home, base, std::iter::from_fn(|| Some(short_id())))
+}
+
+/// Testable core of [`unique_fleet_name`]: takes the suffix iterator as input
+/// so tests can inject a deterministic sequence and actually exercise the
+/// collision-skip path (a random `short_id()` lands in a pre-seeded collision
+/// bucket with probability ~10⁻⁷, so the tests would otherwise be vacuous).
+fn unique_fleet_name_with(home: &Path, base: &str, mut ids: impl Iterator<Item = u32>) -> String {
     let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
     let taken = |name: &str| -> bool {
         if fleet
@@ -398,12 +406,13 @@ pub(super) fn unique_fleet_name(home: &Path, base: &str) -> String {
         false
     };
     for _ in 0..100 {
-        let candidate = format!("{base}-{:06x}", short_id());
+        let id = ids.next().unwrap_or(0);
+        let candidate = format!("{base}-{id:06x}");
         if !taken(&candidate) {
             return candidate;
         }
     }
-    // Extremely unlikely fallback when 100 random suffixes all collide
+    // Extremely unlikely fallback when 100 suffixes all collide
     (2..)
         .map(|n| format!("{base}-{n}"))
         .find(|c| !taken(c))
@@ -462,25 +471,37 @@ mod tests {
     #[test]
     fn unique_name_skips_workspace_collision() {
         let home = tmp_home("ws");
-        // Pre-create a workspace whose name could plausibly be minted; since
-        // the suffix is random we just assert the returned name isn't that
-        // directory.
-        let blocked = "codex-000000";
-        std::fs::create_dir_all(home.join("workspace").join(blocked)).expect("create workspace");
-        let name = unique_fleet_name(&home, "codex");
-        assert_ne!(name, blocked);
+        std::fs::create_dir_all(home.join("workspace/codex-000001")).expect("seed 1");
+        std::fs::create_dir_all(home.join("workspace/codex-000002")).expect("seed 2");
+        // Feed id sequence that hits both collisions then succeeds on 3
+        let name = unique_fleet_name_with(&home, "codex", [0x1u32, 0x2, 0x3].into_iter());
+        assert_eq!(name, "codex-000003");
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn unique_name_skips_inbox_collision() {
         let home = tmp_home("ib");
-        let blocked = "codex-000000";
         std::fs::create_dir_all(home.join("inbox")).expect("create inbox");
-        std::fs::write(home.join("inbox").join(format!("{blocked}.jsonl")), "")
-            .expect("write inbox file");
-        let name = unique_fleet_name(&home, "codex");
-        assert_ne!(name, blocked);
+        std::fs::write(home.join("inbox/codex-000001.jsonl"), "").expect("seed 1");
+        std::fs::write(home.join("inbox/codex-000002.jsonl"), "").expect("seed 2");
+        let name = unique_fleet_name_with(&home, "codex", [0x1u32, 0x2, 0x3].into_iter());
+        assert_eq!(name, "codex-000003");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unique_name_falls_back_after_100_collisions() {
+        let home = tmp_home("fallback");
+        // Seed the exact 100 suffixes the iterator will produce
+        for n in 1..=100u32 {
+            std::fs::create_dir_all(home.join("workspace").join(format!("codex-{n:06x}")))
+                .expect("seed");
+        }
+        let name =
+            unique_fleet_name_with(&home, "codex", (1u32..=100).collect::<Vec<_>>().into_iter());
+        // Fallback path uses `-N` counter starting at 2
+        assert_eq!(name, "codex-2");
         std::fs::remove_dir_all(&home).ok();
     }
 }
