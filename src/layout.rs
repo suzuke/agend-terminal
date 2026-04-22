@@ -1323,7 +1323,6 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notification_queue::COMPOSE_IDLE_TIMEOUT;
     use unicode_width::UnicodeWidthStr;
 
     // --- ratio_bounds invariants (covers Round A #3 + #6) ---
