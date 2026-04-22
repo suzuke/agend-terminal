@@ -14,7 +14,7 @@ mod telegram_hooks;
 mod tui_events;
 
 pub use overlay::{MenuItem, MenuItemKind};
-pub(crate) use tui_events::{LayoutHint, TuiEvent, TuiEventSender};
+pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
 
 use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;

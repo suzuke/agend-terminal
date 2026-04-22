@@ -50,19 +50,54 @@ pub(crate) enum LayoutHint {
     SplitBelow,
 }
 
-impl LayoutHint {
-    /// Parse a layout-hint string into the enum.
-    /// Named `parse_hint` (not `from_str`) to avoid shadowing `std::str::FromStr::from_str`.
-    pub(crate) fn parse_hint(s: &str) -> Self {
-        match s {
-            "split-right" => Self::SplitRight,
-            "split-below" => Self::SplitBelow,
-            _ => Self::Tab,
+pub(crate) type TuiEventSender = crossbeam::channel::Sender<TuiEvent>;
+
+/// Adapter that converts [`crate::api::ApiEvent`] into [`TuiEvent`] and
+/// forwards it over the crossbeam channel to the TUI event loop.
+pub(crate) struct TuiNotifier {
+    pub tx: TuiEventSender,
+}
+
+impl crate::api::ApiNotifier for TuiNotifier {
+    fn notify(&self, event: crate::api::ApiEvent) {
+        let tui_event = match event {
+            crate::api::ApiEvent::InstanceCreated {
+                name,
+                layout,
+                spawner,
+                target_pane,
+            } => {
+                let hint = match layout {
+                    crate::api::LayoutHint::Tab => LayoutHint::Tab,
+                    crate::api::LayoutHint::SplitRight => LayoutHint::SplitRight,
+                    crate::api::LayoutHint::SplitBelow => LayoutHint::SplitBelow,
+                };
+                TuiEvent::InstanceCreated {
+                    name,
+                    layout: hint,
+                    spawner,
+                    target_pane,
+                }
+            }
+            crate::api::ApiEvent::InstanceDeleted { name } => TuiEvent::InstanceDeleted { name },
+            crate::api::ApiEvent::TeamCreated { name, members } => {
+                TuiEvent::TeamCreated { name, members }
+            }
+            crate::api::ApiEvent::TeamMembersChanged {
+                name,
+                added,
+                removed,
+            } => TuiEvent::TeamMembersChanged {
+                name,
+                added,
+                removed,
+            },
+        };
+        if let Err(e) = self.tx.try_send(tui_event) {
+            tracing::warn!(error = %e, "TUI event send failed");
         }
     }
 }
-
-pub(crate) type TuiEventSender = crossbeam::channel::Sender<TuiEvent>;
 
 /// Handle a TuiEvent from the API server (auto-create/remove tabs/panes).
 pub(super) fn handle_tui_event(

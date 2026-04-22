@@ -1,4 +1,5 @@
 mod agent;
+mod agent_ops;
 mod api;
 mod app;
 mod auth_cookie;
