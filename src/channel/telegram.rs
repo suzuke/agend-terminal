@@ -1108,19 +1108,33 @@ pub fn delete_topic(home: &std::path::Path, topic_id: i32) {
 }
 
 /// Download an attachment by file_id to a specific directory. Used by inbound handler.
+/// Download an attachment by file_id to a specific directory. Used by inbound handler.
+/// Spawns a dedicated thread to avoid nesting inside the polling thread's tokio runtime.
 fn try_download_attachment_to(file_id: &str, dest_dir: &std::path::Path) -> anyhow::Result<String> {
     let ch = resolve_channel_only()?;
-    telegram_runtime().block_on(async {
-        let bot = teloxide::Bot::new(&ch.token);
-        let file = bot.get_file(file_id).await?;
-        let filename = std::path::Path::new(&file.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("attachment");
-        let dest = dest_dir.join(filename);
-        let mut dst = tokio::fs::File::create(&dest).await?;
-        bot.download_file(&file.path, &mut dst).await?;
-        Ok(dest.display().to_string())
+    let fid = file_id.to_string();
+    let dir = dest_dir.to_path_buf();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| anyhow::anyhow!("runtime: {e}"))?;
+            rt.block_on(async {
+                let bot = teloxide::Bot::new(&ch.token);
+                let file = bot.get_file(&fid).await?;
+                let filename = std::path::Path::new(&file.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("attachment");
+                let dest = dir.join(filename);
+                let mut dst = tokio::fs::File::create(&dest).await?;
+                bot.download_file(&file.path, &mut dst).await?;
+                Ok::<String, anyhow::Error>(dest.display().to_string())
+            })
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("download thread panicked"))?
     })
 }
 
