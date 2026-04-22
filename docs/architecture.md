@@ -859,7 +859,7 @@ Agent A (blog-writer) runs: `agend-terminal send general "PR ready"`
 - [x] PTY spawn/attach/detach/inject/kill
 - [x] Output capture + ready detection
 - [x] Graceful daemon shutdown
-- [ ] `clap` CLI parsing (replace manual arg parsing)
+- [x] `clap` CLI parsing (`Commands` enum in `src/main.rs`)
 - [ ] Session token (`AGEND_SESSION_ID`)
 
 ### Phase 2: Fleet + Communication
@@ -920,3 +920,21 @@ reqwest = "0.12"             # HTTP client (for webhooks)
 # Phase 4
 rusqlite = "0.32"            # SQLite (schedules, logs)
 ```
+
+---
+
+## Source Layout (reference)
+
+The module design above is aspirational and largely file-agnostic; the table below is the current file-level mapping as of Task #9 Option C / Task #12 (2026-04). See `CONTRIBUTING.md` for the contribution-time style rules.
+
+| Responsibility | File(s) |
+|---|---|
+| Shared helpers (messaging, fleet mutation, branch validation, cleanup) called from both the daemon API and the MCP handler path | `src/agent_ops.rs` |
+| Daemon JSON control API (wire protocol + per-method handlers) over TCP loopback | `src/api/mod.rs`, `src/api/handlers/*.rs` |
+| MCP surface for agents. `start_instance` is handled inline here — no separate `ops.rs` module (deleted in Task #12) | `src/mcp/handlers.rs`, `src/mcp/tools.rs` |
+| Domain logic | `src/agent.rs`, `src/fleet.rs`, `src/telegram.rs`, `src/health.rs`, `src/schedules.rs`, `src/decisions.rs`, … |
+| Supervisor (hot upgrade; Unix only) | `src/supervisor/`, `src/bin/agend-supervisor.rs` |
+
+### Drift enforcement
+
+`tests/no_dual_track_drift.rs` extracts top-level fn bodies from `src/agent_ops.rs` and `src/mcp/handlers.rs` and asserts that any fn sharing a name has an identical body, preventing the kind of silent divergence between MCP and daemon paths that caused the `cleanup_working_dir` Kiro-cleanup gap (14-entry MCP copy vs 19-entry canonical) on main before Task #9 Option C. The detector is parser-hardened against raw-string literals and `extern "ABI" fn` (PR #31).

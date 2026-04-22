@@ -28,8 +28,10 @@ Keybinds: see `src/keybinds.rs`. Prefix `Ctrl+B`, then `c` new tab, `n`/`p` next
 Start the daemon using `fleet.yaml`.
 
 ```
-agend-terminal start
+agend-terminal start [--detached] [--fleet <path>]
 ```
+- `--detached` — background the daemon (stdio → `$AGEND_HOME/daemon.log`); the foreground process exits once the daemon has published its run dir.
+- `--fleet <path>` — override fleet file. Default: `$AGEND_HOME/fleet.yaml`.
 
 On startup: prunes stale git worktrees, auto-creates a `general` instance if a Telegram channel is configured, initializes Telegram, and respawns any crashed agents per `HealthTracker`.
 
@@ -161,6 +163,23 @@ Generate a single text file with diagnostics, recent logs, and redacted config. 
 agend-terminal bugreport
 ```
 
+### `upgrade` (Unix only)
+Hot-upgrade the daemon to a new binary via `agend-supervisor`. Flow: stage new binary → self-test → stop old daemon → start new → wait for ready ping → stabilise for N seconds → commit (or roll back).
+
+```
+agend-terminal upgrade --binary <path> [--to-version <label>] [--yes] \
+                       [--install-supervisor] \
+                       [--stability-secs <N>] [--ready-timeout-secs <N>]
+```
+- `--binary <path>` — path to the new daemon binary (required).
+- `--to-version <label>` — human-visible version label; defaults to the new binary's `--version` output.
+- `--yes` — skip interactive confirmation. Required with `--install-supervisor`.
+- `--install-supervisor` — idempotent bootstrap of the supervisor layout on first upgrade.
+- `--stability-secs <N>` — stability window after switchover, seconds. Default `60`, `0` disables.
+- `--ready-timeout-secs <N>` — ready-ping timeout, seconds. Default `60`, `0` disables.
+
+See `docs/architecture.md` Module 8 for the supervisor design; Windows is not supported (the socket-swap + symlink-rename trick is Unix-only).
+
 ### `completions`
 Print shell completion scripts to stdout.
 
@@ -196,9 +215,9 @@ $AGEND_HOME/
     workspace/<agent>/            # default working dir when none set
     run/<daemon-pid>/
         .daemon                   # pid:start_time
-        api.sock                  # daemon control socket
-        <agent>.sock              # per-agent TUI socket
-        ports.json                # (planned, Windows support)
+        api.port                  # daemon control API TCP port (loopback)
+        api.cookie                # 32-byte auth cookie for api.port (0600 on Unix)
+        <agent>.port              # per-agent TUI bridge TCP port (loopback, cookie-auth)
 ```
 
 Everything under `$AGEND_HOME` (including `fleet.yaml`, `session.json`) is locked via `fs2::FileExt` during mutations — safe against concurrent daemon / CLI usage.

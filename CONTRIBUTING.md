@@ -16,7 +16,7 @@ cargo clippy -- -D warnings          # must be warning-free
 
 `cargo clippy` enforces `unwrap_used = "deny"` (see `Cargo.toml`). Handle errors with `?` / `anyhow::Result`.
 
-CI mirrors these steps on Ubuntu + macOS (`.github/workflows/ci.yml`). Windows is not yet in the matrix — see `docs/PLAN-windows-support.md`.
+CI mirrors these steps on Ubuntu + macOS + Windows (`.github/workflows/ci.yml`).
 
 ## Workflow
 
@@ -57,13 +57,17 @@ CI mirrors these steps on Ubuntu + macOS (`.github/workflows/ci.yml`). Windows i
 - `cargo clippy -- -D warnings` — fix warnings, don't `#[allow]` them unless the check is genuinely wrong and you leave a one-line comment explaining why.
 - No `unwrap()` / `expect()` in non-test code. Use `?` with `anyhow::Context` for error annotation.
 - No `println!` / `eprintln!` in production code paths. Use `tracing::{info, warn, error, debug}`.
-- Keep module responsibilities tight — `ops.rs` for high-level operations, `api.rs` for wire protocol, `mcp/` for MCP surface, `src/<area>.rs` for domain logic.
+- Keep module responsibilities tight:
+  - `src/agent_ops.rs` — shared helpers (messaging, fleet mutation, branch validation) called by both the daemon API and the MCP handler path. Drop new duplication here rather than inlining it in two places; `tests/no_dual_track_drift.rs` enforces no drift between `src/agent_ops.rs` and `src/mcp/handlers.rs`.
+  - `src/api/` — daemon JSON control API (wire protocol + per-method handlers under `src/api/handlers/`).
+  - `src/mcp/` — MCP surface for agents. `handlers.rs` proxies most tool calls to the daemon API; `start_instance` is handled inline there (no separate `ops.rs` since Task #12).
+  - `src/<area>.rs` — domain logic (agent, fleet, telegram, health, schedules, …).
 
 ## Documentation
 
 - Architectural changes → update `docs/architecture.md`.
 - New CLI command → update `docs/CLI.md` and `README.md` command table.
-- New MCP tool → update `docs/MCP-TOOLS.md` and the "35 MCP Tools" table in `README.md`.
+- New MCP tool → update `docs/MCP-TOOLS.md` and the MCP Tools table in `README.md`.
 - Major user-facing change → add an entry to `CHANGELOG.md` under `## [Unreleased]`.
 - Plan / eval docs (`docs/PLAN-*.md`, `docs/EVAL-*.md`) represent intent at a point in time — when work ships, update status or fold the doc.
 
