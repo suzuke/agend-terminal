@@ -129,6 +129,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     Some(task) => {
                         task.status = "claimed".to_string();
                         task.assignee = Some(iname.clone());
+                        task.routed_to = None; // agent claims directly
                         task.updated_at = chrono::Utc::now().to_rfc3339();
                         Ok(true)
                     }
@@ -172,6 +173,15 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let new_status = args["status"].as_str().map(String::from);
             let new_priority = args["priority"].as_str().map(String::from);
             let new_assignee = args["assignee"].as_str().map(String::from);
+            // Resolve team routing for new assignee
+            let new_routed_to = if let Some(ref name) = new_assignee {
+                match crate::teams::resolve_team_orchestrator(home, name) {
+                    Ok(orch) => orch, // Some(orch) for team, None for agent
+                    Err(e) => return serde_json::json!({"error": e}),
+                }
+            } else {
+                None
+            };
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
@@ -183,6 +193,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         }
                         if let Some(ref a) = new_assignee {
                             task.assignee = Some(a.clone());
+                            task.routed_to = new_routed_to.clone();
                         }
                         task.updated_at = chrono::Utc::now().to_rfc3339();
                         Ok(true)
@@ -325,6 +336,65 @@ mod tests {
             t.routed_to.is_none(),
             "no routing for direct agent assignment"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn claim_clears_routed_to() {
+        let home = tmp_home("claim_clears_rt");
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        // Create task assigned to team
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix", "assignee": "devs"}),
+        );
+        let id = list_all(&home)[0].id.clone();
+        assert_eq!(list_all(&home)[0].routed_to.as_deref(), Some("lead"));
+
+        // Agent claims → routed_to cleared
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let t = &list_all(&home)[0];
+        assert_eq!(t.assignee.as_deref(), Some("worker"));
+        assert!(t.routed_to.is_none(), "claim should clear routed_to");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_assignee_re_resolves_routed_to() {
+        let home = tmp_home("update_re_resolve");
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "alpha", "members": ["a1"], "orchestrator": "a1"}),
+        );
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "beta", "members": ["b1"], "orchestrator": "b1"}),
+        );
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "task", "assignee": "alpha"}),
+        );
+        let id = list_all(&home)[0].id.clone();
+        assert_eq!(list_all(&home)[0].routed_to.as_deref(), Some("a1"));
+
+        // Reassign to different team
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "update", "id": id, "assignee": "beta"}),
+        );
+        let t = &list_all(&home)[0];
+        assert_eq!(t.assignee.as_deref(), Some("beta"));
+        assert_eq!(t.routed_to.as_deref(), Some("b1"));
         std::fs::remove_dir_all(&home).ok();
     }
 }
