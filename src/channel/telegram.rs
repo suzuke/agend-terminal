@@ -931,22 +931,26 @@ impl TelegramChannel {
             // Ref: https://core.telegram.org/bots/api#setmessagereaction
             react: true,
             // `editMessageText` / `editMessageCaption` / `editMessageMedia`
-            // are supported for bot-sent messages within the 48-hour
-            // Bot API edit window.
+            // are supported for bot-sent messages; Bot API imposes no
+            // general time limit on those edits (business-message edits
+            // have separate platform-specific constraints that do not
+            // apply here).
             // Ref: https://core.telegram.org/bots/api#editmessagetext
             edit: true,
             // `sendChatAction` with action="typing" shows the indicator
             // for ~5 s per call; UX renderer re-emits to keep alive.
             // Ref: https://core.telegram.org/bots/api#sendchataction
             typing_indicator: true,
-            // `getUpdates` delivers `edited_message` /
-            // `edited_channel_post` when those kinds are included in
-            // `allowed_updates`. The capability is a platform feature;
-            // this adapter does not yet surface the events through
-            // `poll_event` (legacy notify path). Kept true so the UX
-            // renderer treats Telegram as edit-capable once wiring lands.
-            // TODO(adapter): expose edited_message via poll_event.
-            receives_edit_events: true,
+            // Adapter does not yet ingest edited messages: the teloxide
+            // dispatcher only registers `Update::filter_message()`; wiring
+            // would need a `filter_edited_message` handler that routes
+            // into the same dispatch path. The underlying platform does
+            // push `edited_message` / `edited_channel_post` through
+            // `getUpdates`, but the field's contract (per
+            // `docs/PLAN-channel-ux-layer.md`) is "adapter currently
+            // emits this signal", not "platform is capable". Flip to
+            // true when the ingest path lands.
+            receives_edit_events: false,
             // Telegram tags users by `@username`; ID-only fallback
             // uses a `tg://user?id=N` URL, but the visible mention
             // syntax the UX renderer should emit is `@<username>`.
@@ -1235,8 +1239,8 @@ mod tests {
         assert!(caps.edit, "editMessageText/Caption/Media all supported");
         assert!(caps.typing_indicator, "sendChatAction action=typing");
         assert!(
-            caps.receives_edit_events,
-            "getUpdates delivers edited_message when allowed"
+            !caps.receives_edit_events,
+            "adapter does not yet ingest edited_message (platform supports, ingress missing)"
         );
         assert_eq!(caps.mention_parsing_hint, MentionStyle::AtUsername);
         assert!(
