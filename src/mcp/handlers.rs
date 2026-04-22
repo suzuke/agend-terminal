@@ -38,6 +38,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let sender: Option<Sender> = Sender::new(instance_name).or_else(Sender::from_env);
     let instance_name: &str = sender.as_ref().map(Sender::as_str).unwrap_or("");
 
+    // Implicit heartbeat: any MCP tool call = agent is alive.
+    if !instance_name.is_empty() {
+        save_metadata(
+            &home,
+            instance_name,
+            "last_heartbeat",
+            json!(chrono::Utc::now().to_rfc3339()),
+        );
+    }
+
     match tool {
         // --- Channel ---
         "reply" => {
@@ -575,6 +585,22 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             let desc = args["description"].as_str().unwrap_or("");
             save_metadata(&home, instance_name, "description", json!(desc));
             json!({"description": desc})
+        }
+        "set_waiting_on" => {
+            let Some(_) = sender.as_ref() else {
+                return err_needs_identity(tool);
+            };
+            let condition = args["condition"].as_str().unwrap_or("");
+            if condition.is_empty() {
+                save_metadata(&home, instance_name, "waiting_on", json!(null));
+                save_metadata(&home, instance_name, "waiting_on_since", json!(null));
+                json!({"cleared": true})
+            } else {
+                let now = chrono::Utc::now().to_rfc3339();
+                save_metadata(&home, instance_name, "waiting_on", json!(condition));
+                save_metadata(&home, instance_name, "waiting_on_since", json!(&now));
+                json!({"waiting_on": condition, "since": now})
+            }
         }
         "move_pane" => {
             // Route through the API so the running TUI receives a PaneMoved
@@ -1567,6 +1593,164 @@ instances:
             "DESIGN §4 Q4 warn record was not emitted",
         );
 
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // Track 1 PR-1 tests (design §7)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn set_waiting_on_persists_and_clears() {
+        let _g = fleet_test_guard();
+        let (_rec, home) = setup_recorder("waiting_on_set");
+
+        // Set waiting_on
+        let result = handle_tool(
+            "set_waiting_on",
+            &json!({"condition": "review from at-dev-4"}),
+            "sender",
+        );
+        assert!(
+            is_ok_result(&result),
+            "set_waiting_on should succeed: {result}"
+        );
+        assert_eq!(result["waiting_on"], "review from at-dev-4");
+
+        // Value-source pin: return value `since` must match metadata file
+        let returned_since = result["since"].as_str().expect("since in return");
+        let meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
+        )
+        .expect("parse meta");
+        assert_eq!(meta["waiting_on"], "review from at-dev-4");
+        assert_eq!(
+            meta["waiting_on_since"].as_str().expect("since in file"),
+            returned_since,
+            "return value since must match persisted timestamp (value-source pin)"
+        );
+
+        // Clear
+        let result = handle_tool("set_waiting_on", &json!({"condition": ""}), "sender");
+        assert_eq!(result["cleared"], true);
+        let meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
+        )
+        .expect("parse meta");
+        assert!(
+            meta["waiting_on"].is_null(),
+            "waiting_on must be null after clear"
+        );
+        assert!(
+            meta["waiting_on_since"].is_null(),
+            "waiting_on_since must be null after clear"
+        );
+
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn implicit_heartbeat_recorded_on_tool_call() {
+        let _g = fleet_test_guard();
+        let (_rec, home) = setup_recorder("heartbeat_rec");
+
+        // Before any tool call, no heartbeat
+        let meta_path = home.join("metadata/sender.json");
+        let prior: Option<String> = std::fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+            .and_then(|v| v["last_heartbeat"].as_str().map(String::from));
+
+        // Any tool call should record heartbeat
+        let _ = handle_tool("inbox", &json!({}), "sender");
+
+        let meta: Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).expect("read meta"))
+                .expect("parse meta — atomic write must produce valid JSON");
+        let hb = meta["last_heartbeat"]
+            .as_str()
+            .expect("last_heartbeat must be present after tool call");
+        // Must be a valid RFC3339 timestamp
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(hb).is_ok(),
+            "last_heartbeat must be valid RFC3339: {hb}"
+        );
+        // Must be newer than prior (or prior was None)
+        if let Some(prev) = prior {
+            assert_ne!(hb, prev, "heartbeat must be updated");
+        }
+
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn waiting_on_exposed_via_merge_metadata() {
+        let _g = fleet_test_guard();
+        let (_rec, home) = setup_recorder("waiting_on_merge");
+
+        // Set waiting_on
+        let _ = handle_tool(
+            "set_waiting_on",
+            &json!({"condition": "delegation result"}),
+            "sender",
+        );
+
+        // Simulate what list_instances does: merge_metadata into agent info
+        let mut info = json!({"name": "sender", "agent_state": "thinking"});
+        merge_metadata(&home, "sender", &mut info);
+        assert_eq!(
+            info["waiting_on"], "delegation result",
+            "merge_metadata must surface waiting_on"
+        );
+        assert!(
+            info["waiting_on_since"].as_str().is_some(),
+            "merge_metadata must surface waiting_on_since"
+        );
+        assert!(
+            info["last_heartbeat"].as_str().is_some(),
+            "merge_metadata must surface last_heartbeat"
+        );
+
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn atomic_save_metadata_no_tmp_residue() {
+        let home = tmp_home("atomic_no_tmp");
+        save_metadata(&home, "agent1", "key", json!("value"));
+        let meta_dir = home.join("metadata");
+        let tmp_files: Vec<_> = std::fs::read_dir(&meta_dir)
+            .expect("read metadata dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "tmp"))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "no .tmp residue after atomic write: {tmp_files:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn set_waiting_on_rejects_anonymous_caller() {
+        let _g = fleet_test_guard();
+        let (_rec, home) = setup_recorder("waiting_on_anon");
+        // Ensure no Sender resolves from env either
+        std::env::remove_var("AGEND_INSTANCE_NAME");
+        let result = handle_tool("set_waiting_on", &json!({"condition": "whatever"}), "");
+        assert!(
+            result["error"].is_string(),
+            "must err on anonymous caller: {result}"
+        );
+        // Must NOT have created metadata/.json
+        assert!(
+            !home.join("metadata/.json").exists(),
+            "no metadata written for anon caller"
+        );
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
