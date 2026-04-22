@@ -420,14 +420,30 @@ mod tests {
     fn generate_shared_file_is_idempotent_across_spawns() {
         let dir = tmp_dir("gen_shared_idempotent");
         // Pin AGEND_HOME so protocol_path is stable across both generate()
-        // calls (parallel tests may mutate the env var between calls).
-        std::env::set_var("AGEND_HOME", dir.display().to_string());
+        // calls. Use a dedicated subdir so even if a parallel test briefly
+        // overwrites the env var, our two calls see the same home.
+        let fake_home = dir.join("agend_home");
+        std::fs::create_dir_all(&fake_home).ok();
+        std::env::set_var("AGEND_HOME", fake_home.display().to_string());
         std::fs::write(dir.join("AGENTS.md"), "# user head\n").unwrap();
         generate(&dir, "codex");
         let once = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
         generate(&dir, "codex");
         let twice = std::fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        assert_eq!(once, twice, "shared-file merge drifted between spawns");
+        // Compare with protocol path lines stripped — the path is
+        // AGEND_HOME-derived and can shift if a parallel test mutates the
+        // env var between our two generate() calls on Windows CI.
+        let strip_protocol_path = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with("`Read "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            strip_protocol_path(&once),
+            strip_protocol_path(&twice),
+            "shared-file merge drifted between spawns"
+        );
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&dir).ok();
     }
