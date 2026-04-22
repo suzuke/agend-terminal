@@ -370,14 +370,17 @@ fn describe_instance_returns_error_when_daemon_down() {
 }
 
 #[test]
-fn delete_instance_succeeds_via_ops_when_daemon_down() {
+fn delete_instance_succeeds_via_mcp_handler_when_daemon_down() {
     let home = temp_home("del-no-daemon");
     let result = call_tool(&home, "delete_instance", &json!({"name": "nonexistent"}));
-    // delete_instance falls back to ops::delete_instance which touches files only
+    // The MCP `delete_instance` handler's `api::call(DELETE)` fails silently
+    // when the daemon is unreachable; the handler continues via direct disk
+    // operations (fleet.yaml removal + `cleanup_working_dir`) which succeed
+    // regardless of daemon state, so the call still reports success.
     assert_eq!(
         result["name"].as_str(),
         Some("nonexistent"),
-        "delete_instance should succeed via ops fallback, got: {result}"
+        "delete_instance should succeed via MCP handler disk fallback, got: {result}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

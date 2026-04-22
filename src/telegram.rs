@@ -350,7 +350,8 @@ pub(crate) fn is_topic_deleted_error(err: &anyhow::Error) -> bool {
 /// `state` is `None` for callers that lack access to `TelegramState` (daemon
 /// `notify_telegram`, `try_telegram_reply`). Those paths leave the in-memory
 /// maps stale until the next state-aware send or process restart — acceptable
-/// because `ops::delete_instance`-equivalent disk state is the source of truth.
+/// because the MCP `delete_instance` handler's disk mutation (fleet.yaml
+/// removal + `cleanup_working_dir`) is the source of truth.
 pub(crate) fn cleanup_deleted_topic(
     home: &Path,
     instance_name: &str,
