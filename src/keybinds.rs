@@ -44,6 +44,8 @@ pub enum Action {
     ShowTasks,
     Detach,
     ShowHelp,
+    /// Summon a floating scratch shell overlay (Ctrl+B ~). Esc closes & kills it.
+    ScratchShell,
     None,
 }
 
@@ -178,6 +180,7 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('T') => Action::ShowTasks,
         KeyCode::Char('d') => Action::Detach,
         KeyCode::Char('?') => Action::ShowHelp,
+        KeyCode::Char('~') => Action::ScratchShell,
 
         _ => Action::None,
     }

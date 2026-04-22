@@ -2,6 +2,7 @@
 //! layout/overlay/break side-effect. Extracted from `run_app` so the main
 //! loop is pure orchestration.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::agent::AgentRegistry;
@@ -12,12 +13,16 @@ use super::overlay::{CloseTarget, Overlay};
 
 /// Borrowed state dispatch needs. `last_tab` is `&mut usize` because tab-
 /// switch arms read the current active tab into it before moving away.
+/// `wakeup_tx` and `name_counter` are threaded in so actions that spawn
+/// ad-hoc panes (e.g. `ScratchShell`) can call `pane_factory::create_pane`.
 pub(super) struct DispatchCtx<'a> {
     pub layout: &'a mut Layout,
     pub registry: &'a AgentRegistry,
     pub home: &'a Path,
     pub fleet_path: &'a Path,
     pub last_tab: &'a mut usize,
+    pub wakeup_tx: &'a crossbeam::channel::Sender<usize>,
+    pub name_counter: &'a mut HashMap<String, usize>,
 }
 
 /// Signals back to `run_app`. Fields are applied independently — a single
@@ -228,6 +233,55 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 crate::layout::resize_focused(tab.root_mut(), area, focus, dir, 0.05);
             }
             out.needs_resize = true;
+        }
+        Action::ScratchShell => {
+            // Mirrors MenuItemKind::Shell (SHELL env → default_shell fallback,
+            // Fresh mode). Size matches render::scratch_shell_rect so the PTY
+            // we spawn here fits the overlay box the renderer will draw.
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+            let box_rect =
+                crate::render::scratch_shell_rect(ratatui::layout::Rect::new(0, 0, cols, rows));
+            let inner_w = box_rect.width.saturating_sub(2);
+            let inner_h = box_rect.height.saturating_sub(2);
+            let shell =
+                std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string());
+            // Open the scratch shell in the focused pane's working
+            // directory — typically where the user is already thinking /
+            // editing, so sibling commands (git status, ls, etc.) Just Work.
+            // Fall back to a shared `~/.agend-terminal/scratch/` when
+            // there's no focused pane with a cwd (remote-source pane, empty
+            // layout). Both paths stay under `home`, so the
+            // `validate_working_directory` check in agent::spawn_agent
+            // accepts them without needing AGEND_ALLOWED_WORK_ROOTS.
+            let cwd = ctx
+                .layout
+                .active_tab()
+                .and_then(|t| t.focused_pane())
+                .and_then(|p| p.working_dir.clone())
+                .unwrap_or_else(|| ctx.home.join("scratch"));
+            match super::pane_factory::create_pane(
+                ctx.layout,
+                ctx.registry,
+                ctx.home,
+                "scratch",
+                &shell,
+                &[],
+                crate::backend::SpawnMode::Fresh,
+                Some(&cwd),
+                &HashMap::new(),
+                "\r",
+                inner_w,
+                inner_h,
+                ctx.wakeup_tx,
+                ctx.name_counter,
+            ) {
+                Ok(pane) => {
+                    out.new_overlay = Some(Overlay::ScratchShell {
+                        pane: Box::new(pane),
+                    });
+                }
+                Err(e) => tracing::error!(error = %e, "scratch shell spawn failed"),
+            }
         }
         Action::None => {}
     }

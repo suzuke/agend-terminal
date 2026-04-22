@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::agent::AgentRegistry;
 use crate::backend::Backend;
-use crate::layout::{Layout, SplitDir, Tab};
+use crate::layout::{Layout, Pane, SplitDir, Tab};
 
 /// An item in the new-tab selection menu.
 pub struct MenuItem {
@@ -83,6 +83,11 @@ pub(super) enum Overlay {
     Tasks {
         items: Vec<crate::tasks::Task>,
         scroll: usize,
+    },
+    /// Floating scratch shell (Ctrl+B ~). Esc kills the shell and closes the
+    /// overlay. Pane is boxed because it's much larger than any other variant.
+    ScratchShell {
+        pane: Box<Pane>,
     },
 }
 
@@ -506,6 +511,24 @@ pub(super) fn handle_key(
                 *overlay = Overlay::None;
             }
         }
+        Overlay::ScratchShell { pane } => match key.code {
+            KeyCode::Esc => {
+                // Capture the agent name before dropping the pane so we can
+                // kill the shell process. The registry owns the PTY master;
+                // kill_agent drops it, the forwarder thread sees rx close,
+                // and exits. The pane (and its subscriber rx) drop with the
+                // overlay.
+                let name = pane.agent_name.clone();
+                *overlay = Overlay::None;
+                super::kill_agent(ctx.registry, &name);
+            }
+            _ => {
+                let bytes = crate::tui::key_to_bytes(key.code, key.modifiers);
+                if !bytes.is_empty() {
+                    pane.write_input(ctx.registry, &bytes);
+                }
+            }
+        },
         Overlay::None => {}
     }
     outcome
