@@ -30,6 +30,14 @@ pub(crate) fn lock_state(
 // so we can detect orphaned topics on daemon restart.
 // ---------------------------------------------------------------------------
 
+/// Reserved pseudo-instance name used in `topics.json` to pin the
+/// `fleet_binding` topic across daemon restarts. Not a real instance —
+/// chosen so it can never collide with a user-configured name
+/// (`fleet.yaml` keys are slugs; underscores-bracketing is reserved).
+/// See [`init_from_config`] orphan-cleanup filter and fleet-binding
+/// resolution.
+const FLEET_BINDING_SENTINEL: &str = "__fleet__";
+
 fn topic_registry_path(home: &Path) -> PathBuf {
     home.join("topics.json")
 }
@@ -98,6 +106,13 @@ pub struct TelegramState {
     /// Wired in post-bootstrap by [`attach_registry`]; lets inbound message
     /// routing read `agent_state` directly instead of via the `LIST` RPC.
     pub registry: Option<AgentRegistry>,
+    /// Resolved `fleet_binding` target for cross-instance fleet activity
+    /// rendering (Stage B-UX, `docs/DESIGN-stage-b-ux.md` §3/§5). `None`
+    /// means no mirror is configured — [`TelegramChannel::apply_fleet_action`]
+    /// returns early. Resolution happens in [`init_from_config`] from the
+    /// config's `fleet_binding` block plus the on-disk topic registry
+    /// sentinel `"__fleet__"`.
+    pub fleet_binding_topic_id: Option<i32>,
 }
 
 impl TelegramState {
@@ -122,6 +137,7 @@ impl TelegramState {
             submit_keys,
             user_allowlist,
             registry: None,
+            fleet_binding_topic_id: None,
         }
     }
 
@@ -154,6 +170,7 @@ impl TelegramState {
             submit_keys,
             user_allowlist,
             registry: None,
+            fleet_binding_topic_id: None,
         }
     }
 
@@ -420,6 +437,51 @@ pub(crate) fn cleanup_deleted_topic(
     unregister_topic(home, tid);
 }
 
+/// Cleanup path for a deleted `fleet_binding` topic. Unlike
+/// [`cleanup_deleted_topic`] — which is instance-oriented and tears down
+/// fleet.yaml / api::DELETE / per-instance state maps — the fleet binding
+/// has no instance to drop, just a sentinel registry row and the
+/// `fleet_binding_topic_id` field.
+///
+/// Only clears `fleet_binding_topic_id` when it still points at `tid`
+/// (defensive — avoids clobbering a fresh binding if a stale error
+/// somehow arrives after re-resolution).
+pub(crate) fn cleanup_fleet_binding(home: &Path, state: &Arc<Mutex<TelegramState>>, tid: i32) {
+    unregister_topic(home, tid);
+    let mut s = lock_state(state);
+    if s.fleet_binding_topic_id == Some(tid) {
+        s.fleet_binding_topic_id = None;
+    }
+}
+
+/// Classify a fleet-binding send error and run [`cleanup_fleet_binding`]
+/// if it matches a topic-deleted error. Returns `true` when the error
+/// was handled (topic gone); the renderer uses that to silence the outer
+/// "send failed" warn since self-heal is the expected outcome, not a
+/// surprise.
+///
+/// Reviewer context (at-dev-4 on PR #56): without this, deleting the
+/// fleet topic once would (a) silently drop every subsequent fleet
+/// emission, and (b) persist the stale `__fleet__` row in `topics.json`
+/// so the next daemon restart happily reused the dead thread id.
+/// Regression pin: [`tests::fleet_binding_self_heals_when_topic_deleted`].
+pub(crate) fn handle_fleet_send_failure(
+    err: &anyhow::Error,
+    home: &Path,
+    state: &Arc<Mutex<TelegramState>>,
+    tid: i32,
+) -> bool {
+    if !is_topic_deleted_error(err) {
+        return false;
+    }
+    tracing::info!(
+        topic_id = tid,
+        "fleet send hit topic_deleted — clearing binding + unregistering sentinel"
+    );
+    cleanup_fleet_binding(home, state, tid);
+    true
+}
+
 /// Classify a send error and run topic-delete cleanup if it matches.
 /// Returns `true` when the error was handled (topic gone); callers may then
 /// silence the outer "send failed" log since cleanup is the expected outcome.
@@ -511,6 +573,7 @@ pub fn init_from_config(
         bot_token_env,
         group_id,
         user_allowlist,
+        fleet_binding,
         ..
     } = config.channel.as_ref()?;
     let token = match std::env::var(bot_token_env) {
@@ -539,7 +602,9 @@ pub fn init_from_config(
     let instance_names: std::collections::HashSet<&String> = config.instances.keys().collect();
     let mut orphan_count = 0;
     for (tid, inst_name) in reg.clone() {
-        if tid != 1 && !instance_names.contains(&inst_name) {
+        // `FLEET_BINDING_SENTINEL` marks the `fleet_binding` topic so it
+        // survives orphan cleanup — it's not an instance name.
+        if tid != 1 && inst_name != FLEET_BINDING_SENTINEL && !instance_names.contains(&inst_name) {
             tracing::info!(topic_id = tid, instance = %inst_name, "orphaned topic, deleting");
             delete_topic(home, tid); // also removes from registry
             orphan_count += 1;
@@ -593,16 +658,87 @@ pub fn init_from_config(
         tracing::info!("updated fleet.yaml with topic_ids");
     }
 
-    let state = Arc::new(Mutex::new(TelegramState::new(
+    // Resolve `fleet_binding` → topic_id. See docs/DESIGN-stage-b-ux.md §3/§5.
+    // Persistence uses the `FLEET_BINDING_SENTINEL` row in `topics.json` so
+    // the same topic is reused across daemon restarts without touching
+    // fleet.yaml schema. Shorthand is warned + ignored (TG has no
+    // channel-tag primitive — only thread_id routing).
+    let fleet_binding_topic_id =
+        resolve_fleet_binding(&bot, chat_id, home, &mut reg, fleet_binding);
+
+    let mut raw_state = TelegramState::new(
         &token,
         *group_id,
         topic_map,
         home.to_path_buf(),
         submit_keys,
         allowlist,
-    )));
+    );
+    raw_state.fleet_binding_topic_id = fleet_binding_topic_id;
+    let state = Arc::new(Mutex::new(raw_state));
     start_polling(Arc::clone(&state));
     Some(state)
+}
+
+/// Resolve the `fleet_binding` block from `ChannelConfig::Telegram` to a
+/// concrete Telegram forum topic id. Returns `None` for "no mirror":
+///
+/// - Field absent in config → `None`.
+/// - `Shorthand("#name")` → warn + `None` (Telegram has no channel-tag
+///   primitive; topics route by `message_thread_id`, not by tag).
+/// - `Struct(Topic { name })` → look up existing tid in the topic
+///   registry under [`FLEET_BINDING_SENTINEL`]; create a new forum topic
+///   via `createForumTopic` if absent and persist the sentinel row.
+///
+/// Mutates `reg` (registry snapshot) + writes it back on create so the
+/// caller can pass a fresh `reg` clone into subsequent logic.
+fn resolve_fleet_binding(
+    bot: &teloxide::Bot,
+    chat_id: teloxide::types::ChatId,
+    home: &Path,
+    reg: &mut HashMap<i32, String>,
+    fleet_binding: &Option<crate::fleet::FleetBindingConfig>,
+) -> Option<i32> {
+    let name = match fleet_binding.as_ref()? {
+        crate::fleet::FleetBindingConfig::Struct(crate::fleet::FleetBindingStruct::Topic {
+            name,
+        }) => name.clone(),
+        crate::fleet::FleetBindingConfig::Shorthand(raw) => {
+            tracing::warn!(
+                shorthand = %raw,
+                "telegram channel.fleet_binding shorthand ignored — Telegram requires \
+                 `{{type: topic, name: ...}}` (shorthand is Discord/Slack only). \
+                 Fleet events will not be mirrored on this channel."
+            );
+            return None;
+        }
+    };
+
+    // Fast path: previously-resolved topic still present in registry.
+    for (tid, inst) in reg.iter() {
+        if inst == FLEET_BINDING_SENTINEL {
+            tracing::info!(topic_id = *tid, %name, "reusing existing fleet_binding topic");
+            return Some(*tid);
+        }
+    }
+
+    // Slow path: create the forum topic once and pin it into the registry.
+    tracing::info!(%name, "creating fleet_binding topic");
+    match telegram_runtime()
+        .block_on(async { bot.create_forum_topic(chat_id, &name, 0x6FB9F0, "").await })
+    {
+        Ok(topic) => {
+            let tid = topic.thread_id.0 .0;
+            tracing::info!(topic_id = tid, %name, "created fleet_binding topic");
+            reg.insert(tid, FLEET_BINDING_SENTINEL.to_string());
+            save_topic_registry(home, reg);
+            Some(tid)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %name, "failed to create fleet_binding topic");
+            None
+        }
+    }
 }
 
 /// Map emoji name to Unicode character.
@@ -1039,6 +1175,60 @@ impl TelegramChannel {
     ) -> Self {
         Self { state, caps }
     }
+
+    /// Lookup the fleet-binding send target under one lock. Returns
+    /// `(group_chat_id, fleet_topic_id)` iff the channel was booted with
+    /// a resolved `fleet_binding` (see [`init_from_config`]'s
+    /// [`resolve_fleet_binding`] call). Extracted so the
+    /// [`apply_fleet_action`](Self::apply_fleet_action) renderer can be
+    /// unit-tested without reaching the teloxide send path, and so tests
+    /// can pin *which* field feeds the topic id (regression contract v0.1
+    /// §4 — value-source pin).
+    pub(crate) fn fleet_send_target(&self) -> Option<(ChatId, i32)> {
+        let s = lock_state(&self.state);
+        s.fleet_binding_topic_id.map(|tid| (s.group_id, tid))
+    }
+
+    /// Render a cross-instance fleet event into the configured
+    /// `fleet_binding` topic. No-op when no binding was resolved at
+    /// bootstrap; errors never propagate (logged-only, matching the
+    /// `UxEventSink` contract).
+    ///
+    /// On a topic-deleted error the renderer self-heals by routing
+    /// through [`handle_fleet_send_failure`]: the stale
+    /// [`FLEET_BINDING_SENTINEL`] row is stripped from `topics.json` and
+    /// `fleet_binding_topic_id` is cleared to `None`, so subsequent
+    /// emits early-return cleanly and the next bootstrap re-resolves
+    /// (i.e. creates a fresh topic) instead of reusing a dead thread id.
+    pub(crate) fn apply_fleet_action(&self, fe: &crate::channel::ux_event::FleetEvent) {
+        let Some((chat_id, topic_id)) = self.fleet_send_target() else {
+            tracing::debug!(?fe, "fleet renderer: no fleet_binding configured (drop)");
+            return;
+        };
+        let (bot, home) = {
+            let s = lock_state(&self.state);
+            match s.bot.clone() {
+                Some(b) => (b, s.home.clone()),
+                None => {
+                    tracing::debug!(?fe, "fleet renderer: no bot (contract-test state, drop)");
+                    return;
+                }
+            }
+        };
+        let text = crate::channel::ux_event::format_fleet_oneliner(fe, self.caps.max_msg_bytes);
+        if let Err(e) = telegram_runtime()
+            .block_on(async { send_with_topic(&bot, chat_id, Some(topic_id), &text).await })
+        {
+            let handled = handle_fleet_send_failure(&e, &home, &self.state, topic_id);
+            if !handled {
+                tracing::warn!(
+                    %e,
+                    topic_id,
+                    "fleet renderer: send failed"
+                );
+            }
+        }
+    }
 }
 
 impl crate::channel::Channel for TelegramChannel {
@@ -1157,7 +1347,17 @@ impl crate::channel::Channel for TelegramChannel {
 // rationale (reviewer: at-dev-4 flagged this shape up-front).
 impl crate::channel::ux_event::UxEventSink for TelegramChannel {
     fn emit(&self, event: &crate::channel::ux_event::UxEvent) {
-        use crate::channel::ux_event::{select_action, UxAction};
+        use crate::channel::ux_event::{select_action, UxAction, UxEvent};
+        // Dispatch split per docs/DESIGN-stage-b-ux.md §4.4: Fleet events
+        // never flow through the Q1 `select_action` cap-degradation ladder —
+        // their target is the configured `fleet_binding`, not the origin
+        // user's thread, and rendering is a plain one-liner with no
+        // react/edit degradation. Q1 events (UserMsgReceived /
+        // AgentPickedUp / AgentReplied) keep the existing ladder path.
+        if let UxEvent::Fleet(fe) = event {
+            self.apply_fleet_action(fe);
+            return;
+        }
         let action = select_action(event, &self.caps);
         // All transport errors are logged, not propagated — a failed
         // reaction is never a reason to crash the daemon.
@@ -1388,6 +1588,242 @@ mod tests {
         };
         // Must not panic. Noop branch only logs via tracing::debug.
         (&channel as &dyn UxEventSink).emit(&ev);
+    }
+
+    // ─── Stage B-UX fleet renderer pins ────────────────────────────────
+    //
+    // These tests cover the wiring between `TelegramState.fleet_binding_topic_id`
+    // (set at bootstrap by `init_from_config::resolve_fleet_binding`) and
+    // `TelegramChannel::apply_fleet_action` (invoked via the UxEventSink
+    // dispatch split from docs/DESIGN-stage-b-ux.md §4.4).
+
+    /// Value-source pin per Reviewer Contract v0.1 §4.
+    ///
+    /// `fleet_send_target()` MUST read the topic id from the dedicated
+    /// `fleet_binding_topic_id` field — NOT from `instance_to_topic`
+    /// (which would make fleet events land in `general`'s topic or a
+    /// random instance topic) and NOT from some implicit default.
+    ///
+    /// This test constructs state where `instance_to_topic` holds an
+    /// entry (topic 1 = "general") *and* `fleet_binding_topic_id` holds
+    /// 42, then asserts the target is 42 — so a future refactor that
+    /// regresses to "whichever topic id the code saw first" trips here
+    /// instead of silently mis-routing every fleet event into the
+    /// `general` thread.
+    #[test]
+    fn fleet_send_target_reads_fleet_binding_topic_id_not_general() {
+        let mut topic_map = HashMap::new();
+        topic_map.insert("general".to_string(), 1);
+        topic_map.insert("at-dev-1".to_string(), 100);
+        let mut state = TelegramState::new(
+            "tok",
+            -12345,
+            topic_map,
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        state.fleet_binding_topic_id = Some(42);
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+
+        let (chat_id, topic_id) = channel
+            .fleet_send_target()
+            .expect("fleet_binding_topic_id=Some → Some(target)");
+        assert_eq!(
+            topic_id, 42,
+            "value must come from `fleet_binding_topic_id`, NOT `instance_to_topic[\"general\"]` (=1) or any instance topic"
+        );
+        assert_ne!(topic_id, 1, "regression: general topic leak");
+        assert_ne!(topic_id, 100, "regression: first-instance leak");
+        assert_eq!(chat_id, ChatId(-12345), "chat id must thread through");
+    }
+
+    /// Inverse pin: no fleet_binding configured → no target → renderer
+    /// early-returns and never hits the send path. Protects the
+    /// "absent block = no fleet sink" contract from PLAN §7.
+    #[test]
+    fn fleet_send_target_is_none_when_binding_unresolved() {
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        // Default: fleet_binding_topic_id = None.
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        assert!(
+            channel.fleet_send_target().is_none(),
+            "no fleet_binding → no target"
+        );
+    }
+
+    /// Dispatch-split pin per DESIGN §4.4: Fleet events take the fleet
+    /// renderer path, NOT `select_action`. Concretely:
+    ///
+    /// - Fleet variants with `fleet_binding_topic_id=None` → silent drop
+    ///   (apply_fleet_action early-returns; no panic, no Bot API call)
+    /// - Q1 variants with `caps.react=caps.edit=false` → `Noop` via the
+    ///   `select_action` ladder
+    ///
+    /// If a refactor regresses to routing Fleet through `select_action`,
+    /// Fleet events would silently be `Noop`'d inside select_action and
+    /// the renderer would never run — so this test also exercises the
+    /// "no panic" side-channel (contract-test state has `bot=None`, so
+    /// any accidental send would panic via `.expect`).
+    #[test]
+    fn emit_fleet_event_does_not_panic_without_binding_or_bot() {
+        use crate::channel::{
+            ux_event::{FleetEvent, UxEvent, UxEventSink},
+            ChannelCapabilities,
+        };
+        // Contract-test state: bot=None. If dispatch went through a path
+        // that calls `bot.as_ref().expect(..)`, this test would panic.
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        let channel =
+            TelegramChannel::with_caps(Arc::new(Mutex::new(state)), ChannelCapabilities::default());
+        let fleet_ev = UxEvent::Fleet(FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: "s".into(),
+            task_id: None,
+        });
+        (&channel as &dyn UxEventSink).emit(&fleet_ev);
+    }
+
+    /// Reviewer Contract v0.1 §4 value-source pin — **self-heal**.
+    ///
+    /// Reviewer at-dev-4 on PR #56 flagged: deleting the fleet topic in
+    /// Telegram once left us in a permanently broken state:
+    /// 1. `apply_fleet_action` only logged send failures — no cleanup,
+    ///    so subsequent emissions kept sending against the dead tid.
+    /// 2. `topics.json` still carried the `__fleet__` sentinel row → the
+    ///    next daemon restart happily reused the same dead thread id.
+    ///
+    /// This test seeds the *exact* broken state (stale sentinel row + a
+    /// `fleet_binding_topic_id` pointing at it), fires a topic-deleted
+    /// error through [`handle_fleet_send_failure`], and pins both sides
+    /// of the self-heal:
+    /// - `fleet_binding_topic_id` is cleared to `None` (no more send
+    ///   attempts against the dead tid).
+    /// - The sentinel row is stripped from `topics.json` (next boot's
+    ///   `resolve_fleet_binding` sees no sentinel and re-creates).
+    ///
+    /// Before the fix this test's `fleet_binding_topic_id` assertion
+    /// would fail — the renderer never touched the field. Running the
+    /// test at this commit should pass; reverting
+    /// [`handle_fleet_send_failure`] should reproduce the bug.
+    #[test]
+    fn fleet_binding_self_heals_when_topic_deleted() {
+        let home = tmp_home("fleet-self-heal");
+        // Pre-seed: topics.json has a stale `__fleet__` row pointing at a
+        // tid we assume was just deleted on the TG side.
+        let mut reg = HashMap::new();
+        reg.insert(42, FLEET_BINDING_SENTINEL.to_string());
+        // An unrelated instance row in the same file — self-heal must NOT
+        // touch unrelated rows.
+        reg.insert(100, "at-dev-1".to_string());
+        save_topic_registry(&home, &reg);
+
+        // State mirrors the "post-bootstrap, pre-first-send" shape: the
+        // binding was resolved from the sentinel row and cached in state.
+        let state = Arc::new(Mutex::new(TelegramState::new(
+            "tok",
+            -12345,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        )));
+        {
+            let mut s = lock_state(&state);
+            s.fleet_binding_topic_id = Some(42);
+        }
+
+        // Simulate the topic-deleted error teloxide returns after the
+        // user removes the fleet topic. This is the same marker string
+        // the other handlers key off — mirror of the existing
+        // `is_topic_deleted_error_matches_thread_not_found` pin.
+        let err = anyhow::anyhow!("Bad Request: message thread not found");
+        let handled = handle_fleet_send_failure(&err, &home, &state, 42);
+
+        assert!(
+            handled,
+            "topic-deleted classifier must match so renderer skips outer warn"
+        );
+
+        // Value-source pin: the cleared field MUST be
+        // `fleet_binding_topic_id` specifically — not `instance_to_topic`
+        // (which cleanup_deleted_topic drains for instances) and not the
+        // `topic_to_instance` reverse map. Pin ensures future refactors
+        // that repurpose the helper can't silently redirect the cleanup.
+        let post = lock_state(&state);
+        assert_eq!(
+            post.fleet_binding_topic_id, None,
+            "fleet_binding_topic_id must be cleared after topic-deleted"
+        );
+
+        let reg_after = load_topic_registry(&home);
+        assert!(
+            !reg_after.values().any(|v| v == FLEET_BINDING_SENTINEL),
+            "sentinel row must be unregistered so next boot re-resolves; reg={reg_after:?}"
+        );
+        // Unrelated instance row survives — cleanup is fleet-scoped.
+        assert_eq!(
+            reg_after.get(&100),
+            Some(&"at-dev-1".to_string()),
+            "unrelated instance rows must survive fleet self-heal"
+        );
+    }
+
+    /// Negative pin: non-topic-deleted errors (network, auth, rate-limit)
+    /// must NOT clear the binding. A transient failure is not grounds to
+    /// tear down the registry state.
+    #[test]
+    fn fleet_binding_self_heal_ignores_unrelated_errors() {
+        let home = tmp_home("fleet-self-heal-neg");
+        let mut reg = HashMap::new();
+        reg.insert(42, FLEET_BINDING_SENTINEL.to_string());
+        save_topic_registry(&home, &reg);
+
+        let state = Arc::new(Mutex::new(TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        )));
+        {
+            let mut s = lock_state(&state);
+            s.fleet_binding_topic_id = Some(42);
+        }
+
+        for msg in [
+            "network timeout",
+            "Too Many Requests: retry after 5",
+            "Forbidden: bot was blocked by the user",
+        ] {
+            let err = anyhow::anyhow!(msg.to_string());
+            assert!(
+                !handle_fleet_send_failure(&err, &home, &state, 42),
+                "classifier must not match unrelated error: {msg}"
+            );
+        }
+        // State untouched after the negative sweep.
+        assert_eq!(lock_state(&state).fleet_binding_topic_id, Some(42));
+        let reg_after = load_topic_registry(&home);
+        assert_eq!(
+            reg_after.get(&42),
+            Some(&FLEET_BINDING_SENTINEL.to_string())
+        );
     }
 
     /// Guards the UX-layer cap values shipped with the Telegram adapter.

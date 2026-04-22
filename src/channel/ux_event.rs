@@ -170,6 +170,148 @@ pub enum UxAction {
     Noop,
 }
 
+/// Render a [`FleetEvent`] into the one-liner log shape defined in
+/// `docs/DESIGN-stage-b-ux.md` §5.1 (which in turn mirrors the `S2c`
+/// exemplars in `docs/PLAN-channel-ux-layer.md` §6). Pure fn — no I/O,
+/// no time, snapshot-testable.
+///
+/// Format shape by variant:
+///
+/// ```text
+/// [from → to]         DELEGATE   <summary> (#<task_id>)
+/// [from → to]         REPORT     <summary> (#<task_id>)
+/// [by solo]           DECISION   <title> (D-<decision_id>)
+/// [from → *N]         BROADCAST  <summary>            // N recipients, compact
+/// [from → a,b,c]      BROADCAST  <summary>            // ≤3 recipients, named
+/// [from → a,b,…+N]    BROADCAST  <summary>            // >3 recipients, elided
+/// ```
+///
+/// - The prefix (everything up to and including the trailing double space
+///   before `<summary>`) is reserved for the bracket tag and verb column.
+///   Summary is truncated to `max_bytes - prefix_len` and an ellipsis
+///   `…` is appended; `max_bytes = 0` is treated as "no cap" because
+///   Telegram's actual cap (4096 bytes) is always plenty for a one-liner
+///   and the 0-case is easier for callers than `Option<usize>`.
+/// - `task_id` / `decision_id` suffixes are appended *after* truncation so
+///   provenance ids never get eaten by the summary cap; in practice the
+///   combined length is always far below `max_bytes`.
+pub fn format_fleet_oneliner(fe: &FleetEvent, max_bytes: usize) -> String {
+    // Render the `[from → to]` / `[by solo]` / `[from → recipients]`
+    // bracket tag. Kept inline (not a separate fn) because the verb +
+    // ID-suffix shape differs per variant and splitting would just push
+    // noise back up.
+    let (tag, verb, body, suffix) = match fe {
+        FleetEvent::DelegateTask {
+            from,
+            to,
+            summary,
+            task_id,
+        } => (
+            format!("[{from} → {to}]"),
+            "DELEGATE",
+            summary.clone(),
+            task_id
+                .as_deref()
+                .map(|id| format!(" (#{id})"))
+                .unwrap_or_default(),
+        ),
+        FleetEvent::ReportResult {
+            from,
+            to,
+            summary,
+            task_id,
+        } => (
+            format!("[{from} → {to}]"),
+            "REPORT",
+            summary.clone(),
+            task_id
+                .as_deref()
+                .map(|id| format!(" (#{id})"))
+                .unwrap_or_default(),
+        ),
+        FleetEvent::PostDecision {
+            by,
+            title,
+            decision_id,
+        } => (
+            format!("[{by} solo]"),
+            "DECISION",
+            title.clone(),
+            format!(" (D-{decision_id})"),
+        ),
+        FleetEvent::Broadcast {
+            from,
+            recipients,
+            summary,
+        } => {
+            let tag = format_broadcast_tag(from, recipients);
+            (tag, "BROADCAST", summary.clone(), String::new())
+        }
+    };
+
+    // `tag  VERB  <summary>`: verb column is separated by two spaces on
+    // each side to keep the §5.1 exemplars diff-visible.
+    let prefix = format!("{tag}  {verb}  ");
+    let prefix_len = prefix.len();
+    let available = if max_bytes == 0 {
+        usize::MAX
+    } else {
+        max_bytes.saturating_sub(prefix_len + suffix.len())
+    };
+    let body_rendered = truncate_with_ellipsis(&body, available);
+    format!("{prefix}{body_rendered}{suffix}")
+}
+
+/// Render the broadcast recipient tag. Extracted to keep the variant
+/// arm of [`format_fleet_oneliner`] focused on shape; the rules below
+/// map the §5.1 exemplar table:
+///
+/// - empty        → `[from → *]`  (matches the "DECISION solo" feel —
+///   nothing to fan out to; kept parallel to `[from → *N]` so no broadcast
+///   tag ever reads like a bare `[from → ]` with a dangling arrow)
+/// - ≤3 named     → `[from → a,b,c]`
+/// - >3 named     → `[from → a,b,…+N]`
+fn format_broadcast_tag(from: &str, recipients: &[String]) -> String {
+    match recipients.len() {
+        0 => format!("[{from} → *]"),
+        n if n <= 3 => format!("[{from} → {}]", recipients.join(",")),
+        n => {
+            let head = recipients[..2].join(",");
+            let rest = n - 2;
+            format!("[{from} → {head},…+{rest}]")
+        }
+    }
+}
+
+/// Truncate `body` to fit in `max_bytes`, appending a single `…` (which
+/// itself costs 3 bytes in UTF-8). Zero-cost when `body` already fits.
+/// `body` is sliced on a UTF-8 char boundary walked from the left to
+/// avoid ever producing invalid UTF-8 in the output.
+fn truncate_with_ellipsis(body: &str, max_bytes: usize) -> String {
+    if body.len() <= max_bytes {
+        return body.to_string();
+    }
+    const ELLIPSIS: &str = "…";
+    // Reserve space for the ellipsis suffix. If `max_bytes` is
+    // itself < 3 bytes (no room even for the ellipsis), just emit
+    // the ellipsis; prefix + suffix already consumed the budget and
+    // losing the body entirely is preferable to panicking.
+    if max_bytes < ELLIPSIS.len() {
+        return ELLIPSIS.to_string();
+    }
+    let budget = max_bytes - ELLIPSIS.len();
+    // Walk char boundaries from the left so we never split in the
+    // middle of a multi-byte codepoint.
+    let mut end = 0;
+    for (i, _) in body.char_indices() {
+        if i > budget {
+            break;
+        }
+        end = i;
+    }
+    format!("{}{ELLIPSIS}", &body[..end])
+}
+
 /// Sink trait any consumer of `UxEvent` implements. `TelegramChannel`
 /// is the only real impl in T3; the daemon-wide sink registry / merged
 /// stream of sinks is a follow-up PR once there's a real producer.
@@ -723,5 +865,186 @@ mod tests {
         ] {
             assert!(matches!(select_action(&fleet, &caps), UxAction::Noop));
         }
+    }
+
+    // ─── format_fleet_oneliner — snapshot / shape pins ───────────────
+    //
+    // These are structural pins on the §5.1 exemplars. They do not use
+    // an external snapshot tool (e.g. insta) — the substrings are small
+    // enough to inline-assert, which keeps the test file self-contained
+    // and diff-readable.
+
+    #[test]
+    fn format_fleet_oneliner_delegate_with_task_id() {
+        let fe = FleetEvent::DelegateTask {
+            from: "at-dev-1".into(),
+            to: "at-dev-2".into(),
+            summary: "task #9 Option C scoping".into(),
+            task_id: Some("AGD-7".into()),
+        };
+        let out = format_fleet_oneliner(&fe, 4096);
+        assert_eq!(
+            out,
+            "[at-dev-1 → at-dev-2]  DELEGATE  task #9 Option C scoping (#AGD-7)"
+        );
+    }
+
+    #[test]
+    fn format_fleet_oneliner_delegate_without_task_id_omits_suffix() {
+        let fe = FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: "pick up".into(),
+            task_id: None,
+        };
+        let out = format_fleet_oneliner(&fe, 4096);
+        assert_eq!(out, "[a → b]  DELEGATE  pick up");
+        assert!(!out.contains("(#"), "task_id=None must not emit (#…)");
+    }
+
+    #[test]
+    fn format_fleet_oneliner_report_with_task_id() {
+        let fe = FleetEvent::ReportResult {
+            from: "at-dev-2".into(),
+            to: "at-dev-1".into(),
+            summary: "DONE  src/utils.rs consolidation landed".into(),
+            task_id: Some("21".into()),
+        };
+        let out = format_fleet_oneliner(&fe, 4096);
+        assert_eq!(
+            out,
+            "[at-dev-2 → at-dev-1]  REPORT  DONE  src/utils.rs consolidation landed (#21)"
+        );
+    }
+
+    #[test]
+    fn format_fleet_oneliner_decision_appends_d_id() {
+        let fe = FleetEvent::PostDecision {
+            by: "at-dev-1".into(),
+            title: "task-board-ownership rules".into(),
+            decision_id: "42".into(),
+        };
+        let out = format_fleet_oneliner(&fe, 4096);
+        assert_eq!(
+            out,
+            "[at-dev-1 solo]  DECISION  task-board-ownership rules (D-42)"
+        );
+    }
+
+    #[test]
+    fn format_fleet_oneliner_broadcast_empty_recipients_uses_star() {
+        let fe = FleetEvent::Broadcast {
+            from: "at-dev-3".into(),
+            recipients: vec![],
+            summary: "CI green post-rebase".into(),
+        };
+        let out = format_fleet_oneliner(&fe, 4096);
+        assert_eq!(out, "[at-dev-3 → *]  BROADCAST  CI green post-rebase");
+    }
+
+    #[test]
+    fn format_fleet_oneliner_broadcast_one_recipient() {
+        let fe = FleetEvent::Broadcast {
+            from: "a".into(),
+            recipients: vec!["b".into()],
+            summary: "hi".into(),
+        };
+        let out = format_fleet_oneliner(&fe, 4096);
+        assert_eq!(out, "[a → b]  BROADCAST  hi");
+    }
+
+    #[test]
+    fn format_fleet_oneliner_broadcast_three_named() {
+        let fe = FleetEvent::Broadcast {
+            from: "a".into(),
+            recipients: vec!["b".into(), "c".into(), "d".into()],
+            summary: "s".into(),
+        };
+        let out = format_fleet_oneliner(&fe, 4096);
+        assert_eq!(out, "[a → b,c,d]  BROADCAST  s");
+    }
+
+    #[test]
+    fn format_fleet_oneliner_broadcast_five_elides_with_plus_n() {
+        let fe = FleetEvent::Broadcast {
+            from: "a".into(),
+            recipients: vec!["b".into(), "c".into(), "d".into(), "e".into(), "f".into()],
+            summary: "s".into(),
+        };
+        let out = format_fleet_oneliner(&fe, 4096);
+        // First 2 named, then "…+3" for the remaining 3.
+        assert_eq!(out, "[a → b,c,…+3]  BROADCAST  s");
+    }
+
+    /// Truncation pin: a summary longer than the available budget is
+    /// truncated on a char boundary with an ellipsis appended. Fixed
+    /// provenance suffix (`(#id)` / `(D-id)`) is preserved — the truncator
+    /// only eats into the summary.
+    #[test]
+    fn format_fleet_oneliner_truncates_long_summary_preserving_suffix() {
+        let long_summary = "x".repeat(500);
+        let fe = FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: long_summary,
+            task_id: Some("AGD-7".into()),
+        };
+        // Budget 80 bytes → total output must fit, suffix `(#AGD-7)` still present.
+        let out = format_fleet_oneliner(&fe, 80);
+        assert!(
+            out.len() <= 80,
+            "expected ≤80 bytes, got {}: {out}",
+            out.len()
+        );
+        assert!(
+            out.ends_with(" (#AGD-7)"),
+            "provenance suffix must survive truncation: {out}"
+        );
+        assert!(
+            out.contains('…'),
+            "truncated body must carry an ellipsis: {out}"
+        );
+    }
+
+    /// Zero `max_bytes` is treated as "no cap" so callers can skip the
+    /// cap when it's not meaningful (e.g. TUI renderer). The internal
+    /// `usize::MAX` branch is exercised here so any future refactor
+    /// that changes the zero-semantics trips this pin.
+    #[test]
+    fn format_fleet_oneliner_max_bytes_zero_means_no_cap() {
+        let fe = FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: "x".repeat(10_000),
+            task_id: None,
+        };
+        let out = format_fleet_oneliner(&fe, 0);
+        // 10k "x"s plus prefix, no ellipsis.
+        assert!(!out.contains('…'), "no cap → no truncation");
+        assert!(out.len() > 10_000);
+    }
+
+    /// Char-boundary pin: truncation walks `char_indices` from the left,
+    /// so a multi-byte codepoint that would straddle the byte budget is
+    /// dropped rather than split in half. Without this walk the output
+    /// would be invalid UTF-8 when the budget lands mid-codepoint.
+    #[test]
+    fn format_fleet_oneliner_truncates_on_char_boundary() {
+        // Summary contains a 3-byte '〇' glyph. Budget forces a boundary
+        // inside the glyph if we sliced by bytes.
+        let fe = FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: "x〇yz".into(),
+            task_id: None,
+        };
+        // Prefix is "[a → b]  DELEGATE  " — compute a small cap so body
+        // budget is only a few bytes, mid-codepoint.
+        let prefix_len = "[a → b]  DELEGATE  ".len();
+        let out = format_fleet_oneliner(&fe, prefix_len + 5);
+        assert!(
+            std::str::from_utf8(out.as_bytes()).is_ok(),
+            "output must remain valid UTF-8: {out:?}"
+        );
     }
 }
