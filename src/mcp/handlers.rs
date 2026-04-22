@@ -4,7 +4,7 @@ use crate::agent_ops::{
     cleanup_working_dir, get_submit_key, list_agents, merge_metadata, save_metadata, send_to,
     validate_branch,
 };
-use crate::telegram;
+use crate::channel::telegram;
 use serde_json::{json, Value};
 
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
@@ -759,7 +759,7 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 tracing::warn!(error = %e, "failed to persist to fleet.yaml");
             }
-            let topic_id = crate::telegram::create_topic_for_instance(home, name);
+            let topic_id = crate::channel::telegram::create_topic_for_instance(home, name);
             if let Some(task_text) = task {
                 let h = home.to_path_buf();
                 let n = name.to_string();

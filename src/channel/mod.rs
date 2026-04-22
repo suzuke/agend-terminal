@@ -33,6 +33,7 @@
 pub mod binding;
 pub mod caps;
 pub mod event;
+pub mod telegram;
 
 pub use binding::BindingRef;
 pub use caps::{ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint, RateBudget};

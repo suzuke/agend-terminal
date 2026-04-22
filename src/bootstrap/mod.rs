@@ -59,7 +59,7 @@ pub struct OwnedFleet {
     pub run_dir: PathBuf,
     #[allow(dead_code)]
     pub cookie: crate::auth_cookie::Cookie,
-    pub telegram: Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    pub telegram: Option<Arc<Mutex<crate::channel::telegram::TelegramState>>>,
     /// Flock guard — drop releases `.daemon.lock`. Kept last so the lock is
     /// released only after every other resource has been dropped.
     #[allow(dead_code)]

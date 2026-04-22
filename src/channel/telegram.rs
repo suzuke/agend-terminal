@@ -586,12 +586,12 @@ fn map_emoji_name(name: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Resolved Telegram channel credentials — avoids repeated fleet.yaml loads.
-struct TelegramChannel {
+struct TelegramCreds {
     token: String,
     group_id: i64,
 }
 
-fn resolve_channel() -> anyhow::Result<(TelegramChannel, crate::fleet::FleetConfig)> {
+fn resolve_channel() -> anyhow::Result<(TelegramCreds, crate::fleet::FleetConfig)> {
     let home = crate::home_dir();
     let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))?;
     match &config.channel {
@@ -603,7 +603,7 @@ fn resolve_channel() -> anyhow::Result<(TelegramChannel, crate::fleet::FleetConf
             let token = std::env::var(bot_token_env)
                 .map_err(|_| anyhow::anyhow!("bot token env '{bot_token_env}' not set"))?;
             Ok((
-                TelegramChannel {
+                TelegramCreds {
                     token,
                     group_id: *group_id,
                 },
@@ -614,7 +614,7 @@ fn resolve_channel() -> anyhow::Result<(TelegramChannel, crate::fleet::FleetConf
     }
 }
 
-fn resolve_channel_only() -> anyhow::Result<TelegramChannel> {
+fn resolve_channel_only() -> anyhow::Result<TelegramCreds> {
     resolve_channel().map(|(ch, _)| ch)
 }
 
@@ -772,6 +772,93 @@ pub fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Re
         bot.download_file(&file.path, &mut dst).await?;
         Ok(dest.display().to_string())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Channel trait adapter (T1b scaffold)
+//
+// `TelegramChannel` wraps the legacy `Arc<Mutex<TelegramState>>` so external
+// callers can hold `Arc<dyn Channel>` instead of the concrete type. Method
+// bodies land in T1d when call sites migrate — this commit only establishes
+// the type so later commits compile incrementally.
+// ---------------------------------------------------------------------------
+
+/// Telegram adapter implementing the platform-neutral `Channel` trait.
+pub struct TelegramChannel {
+    state: Arc<Mutex<TelegramState>>,
+    caps: crate::channel::ChannelCapabilities,
+}
+
+impl TelegramChannel {
+    pub fn new(state: Arc<Mutex<TelegramState>>) -> Self {
+        let caps = crate::channel::ChannelCapabilities {
+            emits_deletion_events: false,
+            threads: true,
+            buttons: false,
+            attachments: true,
+            react: true,
+            edit: true,
+            markdown: crate::channel::MarkdownDialect::MarkdownV2,
+            max_msg_bytes: 4096,
+            ..Default::default()
+        };
+        Self { state, caps }
+    }
+
+    /// Access the underlying legacy state. Kept `pub(crate)` so existing
+    /// free-function call sites can continue to operate on `TelegramState`
+    /// until T1d / T2 swap them to trait methods.
+    pub(crate) fn state(&self) -> &Arc<Mutex<TelegramState>> {
+        &self.state
+    }
+}
+
+impl crate::channel::Channel for TelegramChannel {
+    fn kind(&self) -> &'static str {
+        "telegram"
+    }
+
+    fn caps(&self) -> &crate::channel::ChannelCapabilities {
+        &self.caps
+    }
+
+    fn poll_event(&self) -> Option<crate::channel::ChannelEvent> {
+        // Legacy path pushes events via `attach_registry`; pull-style API
+        // lands in a later PR once the dispatcher is in place.
+        None
+    }
+
+    fn send(
+        &self,
+        _binding: &crate::channel::BindingRef,
+        _msg: crate::channel::OutMsg,
+    ) -> anyhow::Result<crate::channel::MsgRef> {
+        anyhow::bail!("TelegramChannel::send not wired until T1d consumer switch")
+    }
+
+    fn edit(
+        &self,
+        _msg: &crate::channel::MsgRef,
+        _payload: crate::channel::OutMsg,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("TelegramChannel::edit not wired until T1d consumer switch")
+    }
+
+    fn delete(&self, _msg: &crate::channel::MsgRef) -> anyhow::Result<()> {
+        anyhow::bail!("TelegramChannel::delete not wired until T1d consumer switch")
+    }
+
+    fn create_binding(
+        &self,
+        _name: &str,
+        _opts: crate::channel::BindingOpts,
+    ) -> anyhow::Result<crate::channel::BindingRef> {
+        anyhow::bail!("TelegramChannel::create_binding not wired until T1d consumer switch")
+    }
+
+    fn remove_binding(&self, _binding: &crate::channel::BindingRef) -> anyhow::Result<()> {
+        anyhow::bail!("TelegramChannel::remove_binding not wired until T1d consumer switch")
+    }
 }
 
 #[cfg(test)]

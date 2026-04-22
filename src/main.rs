@@ -35,7 +35,6 @@ mod store;
 mod sync;
 mod tasks;
 mod teams;
-mod telegram;
 #[cfg(feature = "tray")]
 mod tray;
 mod tui;

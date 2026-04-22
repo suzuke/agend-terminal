@@ -31,7 +31,7 @@ pub(super) fn telegram_status_from_config(
 /// Create a Telegram topic for a newly spawned fleet instance (non-blocking).
 /// Spawns a background thread for the Telegram API call to avoid freezing the TUI.
 pub(super) fn maybe_create_telegram_topic(
-    tg: &Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    tg: &Option<Arc<Mutex<crate::channel::telegram::TelegramState>>>,
     registry: &AgentRegistry,
     home: &Path,
     pane: &Pane,
@@ -41,7 +41,7 @@ pub(super) fn maybe_create_telegram_topic(
         return;
     };
     {
-        let s = crate::telegram::lock_state(tg);
+        let s = crate::channel::telegram::lock_state(tg);
         if s.instance_to_topic.contains_key(fleet_name) {
             return;
         }
@@ -56,9 +56,9 @@ pub(super) fn maybe_create_telegram_topic(
     let home = home.to_path_buf();
     let fleet_name = fleet_name.clone();
     std::thread::spawn(move || {
-        match crate::telegram::create_topic_for_instance(&home, &fleet_name) {
+        match crate::channel::telegram::create_topic_for_instance(&home, &fleet_name) {
             Some(tid) => {
-                let mut s = crate::telegram::lock_state(&tg);
+                let mut s = crate::channel::telegram::lock_state(&tg);
                 s.instance_to_topic.insert(fleet_name.clone(), tid);
                 s.topic_to_instance.insert(tid, fleet_name.clone());
                 s.submit_keys.insert(fleet_name, submit_key);
@@ -71,13 +71,13 @@ pub(super) fn maybe_create_telegram_topic(
 /// Delete Telegram topic for a fleet instance (non-blocking).
 /// State is updated immediately; the Telegram API call runs on a background thread.
 pub(super) fn maybe_delete_telegram_topic(
-    tg: &Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    tg: &Option<Arc<Mutex<crate::channel::telegram::TelegramState>>>,
     home: &Path,
     fleet_name: &str,
 ) {
     let Some(tg) = tg else { return };
     let tid = {
-        let mut s = crate::telegram::lock_state(tg);
+        let mut s = crate::channel::telegram::lock_state(tg);
         match s.instance_to_topic.remove(fleet_name) {
             Some(tid) => {
                 s.topic_to_instance.remove(&tid);
@@ -89,6 +89,6 @@ pub(super) fn maybe_delete_telegram_topic(
     };
     let home = home.to_path_buf();
     std::thread::spawn(move || {
-        crate::telegram::delete_topic(&home, tid);
+        crate::channel::telegram::delete_topic(&home, tid);
     });
 }

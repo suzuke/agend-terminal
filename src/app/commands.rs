@@ -20,7 +20,7 @@ pub(super) struct CommandCtx<'a> {
     pub home: &'a Path,
     pub wakeup_tx: &'a crossbeam::channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
-    pub telegram_state: &'a Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    pub telegram_state: &'a Option<Arc<Mutex<crate::channel::telegram::TelegramState>>>,
 }
 
 /// Execute a command palette command. Returns true if layout changed (needs resize).

@@ -1,9 +1,9 @@
-//! Telegram bootstrap — wraps [`crate::telegram::init_from_config`] with the
+//! Telegram bootstrap — wraps [`crate::channel::telegram::init_from_config`] with the
 //! submit-keys collection step that `cli::start_with_fleet` and `app::run`
 //! each duplicated.
 
+use crate::channel::telegram::TelegramState;
 use crate::fleet::FleetConfig;
-use crate::telegram::TelegramState;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -21,5 +21,5 @@ pub(super) fn init(config: &FleetConfig, home: &Path) -> Option<Arc<Mutex<Telegr
                 .map(|r| (name.clone(), r.submit_key))
         })
         .collect();
-    crate::telegram::init_from_config(config, home, submit_keys)
+    crate::channel::telegram::init_from_config(config, home, submit_keys)
 }

@@ -70,7 +70,7 @@ fn notify_telegram_inner(home: &Path, instance_name: &str, text: &str, disable_n
                 }
                 Ok::<(), anyhow::Error>(())
             }) {
-                let handled = crate::telegram::handle_send_failure(
+                let handled = crate::channel::telegram::handle_send_failure(
                     &e,
                     &home_owned,
                     &instance_owned,

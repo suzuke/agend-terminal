@@ -208,11 +208,11 @@ fn run_core(
     home: &Path,
     agents: Vec<AgentDef>,
     initial_digest: Option<HashMap<String, crate::bootstrap::reload::InstanceDigest>>,
-    telegram: Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    telegram: Option<Arc<Mutex<crate::channel::telegram::TelegramState>>>,
 ) -> anyhow::Result<()> {
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     if let Some(tg) = telegram.as_ref() {
-        crate::telegram::attach_registry(tg, Arc::clone(&registry));
+        crate::channel::telegram::attach_registry(tg, Arc::clone(&registry));
     }
 
     // External agents registry (connected via `agend-terminal connect`)
