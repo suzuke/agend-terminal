@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Agend Terminal
+GenericName=Agent Fleet Terminal
+Comment=Menu-bar resident terminal for agent fleet orchestration
+Exec=agend-terminal tray
+Icon=agend-terminal
+Categories=Utility;TerminalEmulator;Development;
+Terminal=false
+StartupNotify=false
+Keywords=terminal;agent;ai;fleet;

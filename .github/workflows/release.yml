@@ -90,9 +90,77 @@ jobs:
           name: agend-terminal-${{ matrix.target }}
           path: agend-terminal-${{ matrix.target }}.${{ matrix.archive }}
 
+  appimage:
+    name: Build AppImage (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # linuxdeploy + plugin-gtk need the same GTK dev libs the tray feature
+      # needs at build time. imagemagick resizes the 1024x1024 master icon to
+      # the 256x256 that the AppImage spec + FreeDesktop hicolor standard want.
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            imagemagick \
+            wget \
+            file \
+            desktop-file-utils
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: appimage-x86_64-tray
+
+      - name: Build (release, --features tray)
+        run: cargo build --release --features tray
+
+      - name: Stage AppDir
+        run: |
+          set -euo pipefail
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          cp target/release/agend-terminal AppDir/usr/bin/agend-terminal
+          cp assets/appimage/agend-terminal.desktop AppDir/usr/share/applications/agend-terminal.desktop
+          # Resize 1024x1024 master → 256x256 for hicolor + AppImage root
+          convert assets/appimage/agend-terminal.png -resize 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png
+          # linuxdeploy expects icon + .desktop at AppDir root too
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png AppDir/agend-terminal.png
+          cp AppDir/usr/share/applications/agend-terminal.desktop AppDir/agend-terminal.desktop
+
+      - name: Download linuxdeploy + plugin-gtk
+        run: |
+          set -euo pipefail
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
+
+      # APPIMAGE_EXTRACT_AND_RUN bypasses FUSE — GitHub runners don't ship it.
+      # OUTPUT pins the filename so the upload step + release files list match.
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          OUTPUT: agend-terminal-x86_64.AppImage
+        run: |
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --plugin gtk \
+            --output appimage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agend-terminal-x86_64-AppImage
+          path: agend-terminal-x86_64.AppImage
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, appimage]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -103,7 +171,7 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           cd artifacts
-          sha256sum agend-terminal-*.tar.gz agend-terminal-*.zip > SHA256SUMS
+          sha256sum agend-terminal-*.tar.gz agend-terminal-*.zip agend-terminal-*.AppImage > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub Release
@@ -113,4 +181,5 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip
+            artifacts/*.AppImage
             artifacts/SHA256SUMS
