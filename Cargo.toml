@@ -26,11 +26,11 @@ include = [
 unwrap_used = "deny"
 
 # Menu-bar / system-tray resident app (see docs/PLAN-tray-resident.md).
-# Scaffold only — `tray-icon` + `tao` land with PLAN task #4 (event loop).
-# Default build stays lean: no new deps unless `--features tray` is passed.
+# Default build stays lean: `tray-icon` + `tao` only pull in when
+# `--features tray` is passed (release binaries ship with it).
 [features]
 default = []
-tray = []
+tray = ["dep:tray-icon", "dep:tao", "dep:toml"]
 
 [profile.release]
 strip = true
@@ -80,6 +80,13 @@ which = "6"
 # Crypto-grade random for API-connection cookie (P1-10)
 getrandom = "0.2"
 iana-time-zone = "0.1.65"
+# Menu-bar / system-tray (feature = "tray"). tray-icon loads PNG via
+# Icon::from_rgba natively — do NOT pull the `image` crate. `toml` is
+# for `$AGEND_HOME/tray.toml`; dev-dependencies already list it, so the
+# runtime entry here only adds it to release graphs when `tray` is on.
+tray-icon = { version = "0.22", optional = true }
+tao = { version = "0.35", optional = true }
+toml = { version = "0.8", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

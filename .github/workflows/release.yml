@@ -21,24 +21,36 @@ jobs:
           # macOS — both targets build on macos-latest (arm64 host).
           # x86_64 is cross-compiled; deps are pure Rust / FFI-only so no
           # C toolchain needed. Avoids macos-13 Intel runner queue delays.
+          # `tray` feature ships by default on macOS — `tray-icon` + `tao`
+          # use Cocoa, no system-lib runtime surprises.
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            features: tray
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+            features: tray
           # Linux — use native arm64 runner to avoid cross-compile pain with
           # native deps (arboard/x11). Free for public repos since 2025-01.
+          # `tray` is NOT on the release tarball: tray-icon's Linux backend
+          # dynamically links against libgtk-3 + libayatana-appindicator3,
+          # so a GTK-on feature on a headless box would fail to load. Linux
+          # users who want the tray use `cargo install agend-terminal
+          # --features tray` (documented in the README).
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
+            features: ""
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             archive: tar.gz
-          # Windows x64.
+            features: ""
+          # Windows x64 — native shell APIs, `tray` on by default.
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
+            features: tray
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,10 +58,16 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}-${{ matrix.features }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release --target ${{ matrix.target }} --features ${{ matrix.features }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Package (Unix)
         if: matrix.archive == 'tar.gz'
