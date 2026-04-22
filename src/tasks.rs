@@ -482,4 +482,20 @@ mod tests {
         assert_eq!(total, 0, "cancelled task should not appear in any column");
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn task_board_shift_d_marks_done() {
+        let home = tmp_home("board_shift_d");
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "finish me", "priority": "low"}),
+        );
+        let id = list_all(&home)[0].id.clone();
+        // Task starts in backlog (low priority) — Shift+D should mark done from any column
+        let r = handle(&home, "user", &serde_json::json!({"action": "done", "id": id}));
+        assert_eq!(r["status"], "done");
+        assert_eq!(list_all(&home)[0].status, "done");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

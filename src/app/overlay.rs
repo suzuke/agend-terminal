@@ -634,6 +634,22 @@ pub(super) fn handle_key(
                                 *row = (*row).min(new_cols[*col].len().saturating_sub(1));
                             }
                         }
+                        // D (Shift+D) — mark task done from any column
+                        KeyCode::Char('D') if !columns[*col].is_empty() => {
+                            if let Some(task) = columns[*col].get(*row) {
+                                crate::tasks::handle(
+                                    ctx.home,
+                                    "user",
+                                    &serde_json::json!({
+                                        "action": "done",
+                                        "id": task.id,
+                                    }),
+                                );
+                                *items = crate::tasks::list_all(ctx.home);
+                                let new_cols = crate::render::task_board_columns(items);
+                                *row = (*row).min(new_cols[*col].len().saturating_sub(1));
+                            }
+                        }
                         // a — assign
                         KeyCode::Char('a') if !columns[*col].is_empty() => {
                             let mut choices: Vec<(String, String)> = Vec::new();
