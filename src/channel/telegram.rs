@@ -982,6 +982,18 @@ impl TelegramChannel {
     pub(crate) fn state(&self) -> &Arc<Mutex<TelegramState>> {
         &self.state
     }
+
+    /// Test-only constructor that lets unit tests exercise the
+    /// `UxEventSink` impl under arbitrary cap combinations (e.g.
+    /// caps-neither to hit the Noop branch without going to the
+    /// Bot API).
+    #[cfg(test)]
+    pub(crate) fn with_caps(
+        state: Arc<Mutex<TelegramState>>,
+        caps: crate::channel::ChannelCapabilities,
+    ) -> Self {
+        Self { state, caps }
+    }
 }
 
 impl crate::channel::Channel for TelegramChannel {
@@ -1081,6 +1093,92 @@ impl crate::channel::Channel for TelegramChannel {
     fn attach_registry(&self, registry: AgentRegistry) {
         let mut s = lock_state(&self.state);
         s.registry = Some(registry);
+    }
+}
+
+// ─── UxEventSink: capability-gated degradation ────────────────────────
+//
+// `TelegramChannel` consumes UxEvents and renders them via whichever
+// primitive its caps support. The pure decision lives in
+// `crate::channel::ux_event::select_action`; this impl just executes
+// the chosen action against the existing free-fn Bot API helpers
+// (`try_telegram_reply` / `try_telegram_edit` / `try_telegram_react`).
+//
+// Why free fns not `Channel::send/edit/delete`? Those trait methods are
+// still `bail!` stubs (lines above); the real dispatcher wiring lands
+// in a later PR. Keeping the UxEventSink path on free fns lets T3 ship
+// without blowing scope into the dispatcher cut-over. The two paths
+// collapse once the dispatcher arrives. See PR body for the full
+// rationale (reviewer: at-dev-4 flagged this shape up-front).
+impl crate::channel::ux_event::UxEventSink for TelegramChannel {
+    fn emit(&self, event: &crate::channel::ux_event::UxEvent) {
+        use crate::channel::ux_event::{select_action, UxAction};
+        let action = select_action(event, &self.caps);
+        // All transport errors are logged, not propagated — a failed
+        // reaction is never a reason to crash the daemon.
+        match action {
+            UxAction::React {
+                instance,
+                msg,
+                emoji,
+            } => {
+                // `instance` is the fleet instance name, sourced from
+                // the event's `agent` field by `select_action`. Today
+                // `try_telegram_react` only uses it as a metadata
+                // fallback when `message_id` is None (we always pass
+                // `Some`), but routing through the real instance name
+                // keeps the contract stable if that fallback ever runs.
+                if let Err(e) = try_telegram_react(&instance, emoji, Some(&msg.id)) {
+                    tracing::warn!(
+                        %e,
+                        instance = %instance,
+                        msg_id = %msg.id,
+                        emoji,
+                        "UxEventSink: react failed"
+                    );
+                }
+            }
+            UxAction::EditText {
+                instance,
+                msg,
+                text,
+            } => {
+                if let Err(e) = try_telegram_edit(&instance, &msg.id, &text) {
+                    tracing::warn!(
+                        %e,
+                        instance = %instance,
+                        msg_id = %msg.id,
+                        "UxEventSink: edit failed"
+                    );
+                }
+            }
+            UxAction::SendText {
+                instance,
+                binding: _binding,
+                text,
+            } => {
+                // `try_telegram_reply` calls `config.instances.get(instance_name)`
+                // to resolve the routing topic. `instance` MUST be the
+                // fleet key (agent name) — NOT `binding.display_tag()`,
+                // which is a human-readable label like "TG#229" and
+                // would silently bail the fleet lookup. See
+                // `ux_event::agent_replied_instance_comes_from_agent_not_display_tag`
+                // for the pin.
+                if let Err(e) = try_telegram_reply(&instance, &text) {
+                    tracing::warn!(
+                        %e,
+                        instance = %instance,
+                        "UxEventSink: send failed"
+                    );
+                }
+            }
+            UxAction::Noop => {
+                // Plan §6: silence is an acceptable fallback. Record
+                // that we intentionally dropped the event so future
+                // debugging knows it wasn't a bug.
+                tracing::debug!(?event, "UxEventSink: Noop (caps do not support)");
+            }
+        }
     }
 }
 
@@ -1205,6 +1303,46 @@ mod tests {
         assert_eq!(map_emoji_name("thumbs_down"), "👎");
         assert_eq!(map_emoji_name("tada"), "🎉");
         assert_eq!(map_emoji_name("party"), "🎉");
+    }
+
+    /// Exercises the `UxEventSink` impl down the Noop branch — the only
+    /// cap combo that does not touch the Bot API. Asserts the impl
+    /// compiles, is dyn-safe, and does not panic when the adapter's
+    /// caps reject the event. Full-path React / Edit / Send branches
+    /// need a live Bot API and are exercised via integration tests
+    /// (out of scope for T3).
+    #[test]
+    fn telegram_channel_emit_noop_when_caps_reject() {
+        use crate::channel::{
+            ux_event::{UxEvent, UxEventSink},
+            BindingRef, ChannelCapabilities, MsgRef,
+        };
+        // Caps-neither: no react, no edit → AgentPickedUp degrades to Noop.
+        let caps = ChannelCapabilities {
+            react: false,
+            edit: false,
+            ..Default::default()
+        };
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::with_caps(Arc::new(Mutex::new(state)), caps);
+
+        let origin = MsgRef {
+            binding: BindingRef::new("telegram", Some("test-agent".into()), ()),
+            id: "1".into(),
+        };
+        let ev = UxEvent::AgentPickedUp {
+            origin_msg: origin,
+            agent: "test-agent".into(),
+        };
+        // Must not panic. Noop branch only logs via tracing::debug.
+        (&channel as &dyn UxEventSink).emit(&ev);
     }
 
     /// Guards the UX-layer cap values shipped with the Telegram adapter.
