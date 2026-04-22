@@ -587,6 +587,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             json!({"description": desc})
         }
         "set_waiting_on" => {
+            let Some(_) = sender.as_ref() else {
+                return err_needs_identity(tool);
+            };
             let condition = args["condition"].as_str().unwrap_or("");
             if condition.is_empty() {
                 save_metadata(&home, instance_name, "waiting_on", json!(null));
@@ -1729,6 +1732,26 @@ instances:
             tmp_files.is_empty(),
             "no .tmp residue after atomic write: {tmp_files:?}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn set_waiting_on_rejects_anonymous_caller() {
+        let _g = fleet_test_guard();
+        let (_rec, home) = setup_recorder("waiting_on_anon");
+        // Ensure no Sender resolves from env either
+        std::env::remove_var("AGEND_INSTANCE_NAME");
+        let result = handle_tool("set_waiting_on", &json!({"condition": "whatever"}), "");
+        assert!(
+            result["error"].is_string(),
+            "must err on anonymous caller: {result}"
+        );
+        // Must NOT have created metadata/.json
+        assert!(
+            !home.join("metadata/.json").exists(),
+            "no metadata written for anon caller"
+        );
+        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 }
