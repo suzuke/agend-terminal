@@ -268,6 +268,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             tracing::info!("app: SIGTERM received, exiting main loop");
             break;
         }
+        // Auto-close the scratch shell overlay once its backing process
+        // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
+        // 50ms `default` arm of the main `select!` below guarantees this
+        // runs at least every 50ms even without new PTY output.
+        if let Overlay::ScratchShell { pane } = &overlay {
+            if !agent_is_alive(&registry, &pane.agent_name) {
+                let name = pane.agent_name.clone();
+                overlay = Overlay::None;
+                kill_agent(&registry, &name);
+            }
+        }
         if needs_resize {
             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
             let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
@@ -279,7 +290,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
 
         terminal.draw(|frame| {
             render::render(frame, &mut layout, repeat_mode, &registry, telegram_status);
-            match &overlay {
+            // &mut because ScratchShell needs to drain output and maybe
+            // resize its pane's VTerm/PTY during render.
+            match &mut overlay {
                 Overlay::NewTabMenu { items, selected }
                 | Overlay::SplitMenu {
                     items, selected, ..
@@ -326,6 +339,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 Overlay::Tasks { ref items, scroll } => {
                     render::render_tasks(frame, items, *scroll);
                 }
+                Overlay::ScratchShell { pane } => {
+                    render::render_scratch_shell(frame, pane, &registry);
+                }
                 Overlay::None => {}
             }
         })?;
@@ -367,6 +383,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             home: &home,
                             fleet_path: &fleet_path,
                             last_tab: &mut last_tab,
+                            wakeup_tx: &wakeup_tx,
+                            name_counter: &mut name_counter,
                         };
                         let out = dispatch::dispatch(action, &mut dctx);
                         if out.needs_resize {
@@ -408,6 +426,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             | Overlay::RenamePane { ref mut input }
                             | Overlay::Command { ref mut input } => {
                                 input.push_str(&text);
+                            }
+                            Overlay::ScratchShell { pane } => {
+                                pane.write_input(&registry, text.as_bytes());
                             }
                             Overlay::None => {
                                 write_to_focused(&layout, &registry, text.as_bytes());
@@ -704,4 +725,26 @@ fn kill_agent(registry: &AgentRegistry, name: &str) {
         let _ = child.kill();
     }
     reg.remove(name);
+}
+
+/// Whether the agent's child process is still running.
+///
+/// Used by the scratch shell overlay to self-close when the user exits the
+/// shell naturally (`exit`, Ctrl+D) or the process crashes. Returns `false`
+/// if the name is no longer registered (already reaped) or `try_wait`
+/// reports the child has exited. A poisoned child mutex is treated as alive
+/// so a spurious poison doesn't auto-dismiss the overlay — Esc still works.
+fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
+    let reg = agent::lock_registry(registry);
+    let Some(handle) = reg.get(name) else {
+        return false;
+    };
+    // Bind to a local so the child-lock's temporary MutexGuard drops
+    // before `reg` does — returning the match expression directly trips
+    // the borrow checker because temporaries outlive the registry lock.
+    let alive = match handle.child.lock() {
+        Ok(mut child) => !matches!(child.try_wait(), Ok(Some(_))),
+        Err(_) => true,
+    };
+    alive
 }
