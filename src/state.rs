@@ -523,7 +523,7 @@ impl StateTracker {
         }
     }
 
-    fn is_heartbeat_fresh(&self) -> bool {
+    pub(crate) fn is_heartbeat_fresh(&self) -> bool {
         self.last_heartbeat
             .is_some_and(|t| t.elapsed() < Self::HEARTBEAT_FRESH_WINDOW)
     }

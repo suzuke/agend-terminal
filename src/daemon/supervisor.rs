@@ -68,6 +68,9 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
                 core.state.update_heartbeat(age);
             }
 
+            // §4.4 stale decay: clear waiting_on when heartbeat is stale.
+            clear_waiting_on_if_stale(home, &name, !core.state.is_heartbeat_fresh());
+
             let agent_state = core.state.current;
             let silent = core.state.last_output.elapsed();
             if core.health.check_awaiting_operator(agent_state, silent) {
@@ -173,4 +176,99 @@ fn read_heartbeat_age(home: &std::path::Path, name: &str) -> Option<Duration> {
     let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
     let elapsed = chrono::Utc::now().signed_duration_since(dt);
     elapsed.to_std().ok()
+}
+
+/// Clear `waiting_on` metadata when the heartbeat is stale (design §4.4).
+/// Extracted as a standalone fn for testability.
+fn clear_waiting_on_if_stale(home: &std::path::Path, name: &str, is_stale: bool) {
+    if !is_stale {
+        return;
+    }
+    let meta_path = home.join("metadata").join(format!("{name}.json"));
+    let meta: serde_json::Value = match std::fs::read_to_string(&meta_path)
+        .and_then(|c| serde_json::from_str(&c).map_err(std::io::Error::other))
+    {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if meta
+        .get("waiting_on")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        crate::agent_ops::save_metadata(home, name, "waiting_on", serde_json::json!(null));
+        crate::agent_ops::save_metadata(home, name, "waiting_on_since", serde_json::json!(null));
+        tracing::info!(%name, "waiting_on cleared — heartbeat stale");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-supervisor-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id,
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn waiting_on_cleared_when_heartbeat_stale() {
+        let home = tmp_home("stale_decay");
+        let meta_dir = home.join("metadata");
+        std::fs::create_dir_all(&meta_dir).ok();
+        let meta = serde_json::json!({
+            "waiting_on": "review from at-dev-4",
+            "waiting_on_since": "2026-04-22T10:00:00Z",
+            "last_heartbeat": "2026-04-22T09:00:00Z",
+        });
+        std::fs::write(
+            meta_dir.join("agent1.json"),
+            serde_json::to_string_pretty(&meta).expect("serialize"),
+        )
+        .ok();
+
+        // Stale → must clear
+        clear_waiting_on_if_stale(&home, "agent1", true);
+
+        let content =
+            std::fs::read_to_string(meta_dir.join("agent1.json")).expect("read after clear");
+        let result: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert!(
+            result["waiting_on"].is_null(),
+            "waiting_on must be null after stale decay"
+        );
+        assert!(
+            result["waiting_on_since"].is_null(),
+            "waiting_on_since must be null after stale decay"
+        );
+
+        // Fresh → must NOT clear
+        let meta2 = serde_json::json!({
+            "waiting_on": "still waiting",
+            "waiting_on_since": "2026-04-22T10:00:00Z",
+        });
+        std::fs::write(
+            meta_dir.join("agent2.json"),
+            serde_json::to_string_pretty(&meta2).expect("serialize"),
+        )
+        .ok();
+        clear_waiting_on_if_stale(&home, "agent2", false);
+        let content2 = std::fs::read_to_string(meta_dir.join("agent2.json")).expect("read agent2");
+        let result2: serde_json::Value = serde_json::from_str(&content2).expect("parse");
+        assert_eq!(
+            result2["waiting_on"], "still waiting",
+            "fresh heartbeat must NOT clear waiting_on"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
