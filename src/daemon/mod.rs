@@ -4,13 +4,12 @@
 mod ci_watch;
 mod cron_tick;
 pub(crate) mod supervisor;
-mod telegram;
 mod tui_bridge;
 
 use crate::agent::{self, AgentRegistry};
+use crate::channel::telegram::notify_telegram;
 use ci_watch::check_ci_watches;
 use cron_tick::check_schedules;
-use telegram::notify_telegram;
 pub use tui_bridge::serve_agent_tui;
 
 use std::collections::HashMap;
@@ -208,11 +207,11 @@ fn run_core(
     home: &Path,
     agents: Vec<AgentDef>,
     initial_digest: Option<HashMap<String, crate::bootstrap::reload::InstanceDigest>>,
-    telegram: Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    telegram: Option<Arc<dyn crate::channel::Channel>>,
 ) -> anyhow::Result<()> {
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     if let Some(tg) = telegram.as_ref() {
-        crate::telegram::attach_registry(tg, Arc::clone(&registry));
+        tg.attach_registry(Arc::clone(&registry));
     }
 
     // External agents registry (connected via `agend-terminal connect`)

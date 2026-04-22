@@ -586,12 +586,12 @@ fn map_emoji_name(name: &str) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Resolved Telegram channel credentials — avoids repeated fleet.yaml loads.
-struct TelegramChannel {
+struct TelegramCreds {
     token: String,
     group_id: i64,
 }
 
-fn resolve_channel() -> anyhow::Result<(TelegramChannel, crate::fleet::FleetConfig)> {
+fn resolve_channel() -> anyhow::Result<(TelegramCreds, crate::fleet::FleetConfig)> {
     let home = crate::home_dir();
     let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))?;
     match &config.channel {
@@ -603,7 +603,7 @@ fn resolve_channel() -> anyhow::Result<(TelegramChannel, crate::fleet::FleetConf
             let token = std::env::var(bot_token_env)
                 .map_err(|_| anyhow::anyhow!("bot token env '{bot_token_env}' not set"))?;
             Ok((
-                TelegramChannel {
+                TelegramCreds {
                     token,
                     group_id: *group_id,
                 },
@@ -614,7 +614,7 @@ fn resolve_channel() -> anyhow::Result<(TelegramChannel, crate::fleet::FleetConf
     }
 }
 
-fn resolve_channel_only() -> anyhow::Result<TelegramChannel> {
+fn resolve_channel_only() -> anyhow::Result<TelegramCreds> {
     resolve_channel().map(|(ch, _)| ch)
 }
 
@@ -772,6 +772,250 @@ pub fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Re
         bot.download_file(&file.path, &mut dst).await?;
         Ok(dest.display().to_string())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor / daemon notify helpers (folded from src/daemon/telegram.rs
+// during T1c — single-file-per-channel convention).
+// ---------------------------------------------------------------------------
+
+/// Send a notification to Telegram (instance topic or general).
+pub fn notify_telegram(home: &std::path::Path, instance_name: &str, text: &str) {
+    notify_telegram_inner(home, instance_name, text, false);
+}
+
+/// Send a notification with Telegram's `disable_notification` flag set — the
+/// message still appears in the topic but does not push/vibrate the operator.
+/// Use for state-recovery pings that should not compete with real alerts.
+pub fn notify_telegram_silent(home: &std::path::Path, instance_name: &str, text: &str) {
+    notify_telegram_inner(home, instance_name, text, true);
+}
+
+fn notify_telegram_inner(
+    home: &std::path::Path,
+    instance_name: &str,
+    text: &str,
+    disable_notification: bool,
+) {
+    let config = match crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let (token, group_id, topic_id) = match &config.channel {
+        Some(crate::fleet::ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            ..
+        }) => match std::env::var(bot_token_env) {
+            Ok(t) => (
+                t,
+                *group_id,
+                config.instances.get(instance_name).and_then(|i| i.topic_id),
+            ),
+            Err(_) => return,
+        },
+        None => return,
+    };
+
+    let text = text.to_string();
+    let home_owned = home.to_path_buf();
+    let instance_owned = instance_name.to_string();
+    std::thread::Builder::new()
+        .name("tg_notify".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            if let Err(e) = rt.block_on(async {
+                use teloxide::payloads::SendMessageSetters;
+                use teloxide::prelude::Requester;
+                let bot = teloxide::Bot::new(&token);
+                let chat_id = teloxide::types::ChatId(group_id);
+                match topic_id {
+                    Some(tid) if tid != 1 => {
+                        let mut req = bot.send_message(chat_id, &text).message_thread_id(
+                            teloxide::types::ThreadId(teloxide::types::MessageId(tid)),
+                        );
+                        if disable_notification {
+                            req = req.disable_notification(true);
+                        }
+                        req.await?;
+                    }
+                    _ => {
+                        let mut req = bot.send_message(chat_id, &text);
+                        if disable_notification {
+                            req = req.disable_notification(true);
+                        }
+                        req.await?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            }) {
+                let handled = handle_send_failure(&e, &home_owned, &instance_owned, topic_id, None);
+                if !handled {
+                    tracing::warn!(error = %e, "telegram notify failed");
+                }
+            }
+        })
+        .ok();
+}
+
+// ---------------------------------------------------------------------------
+// Channel trait adapter (T1d)
+//
+// `TelegramChannel` wraps `Arc<Mutex<TelegramState>>` and implements the
+// platform-neutral `Channel` trait. Registry-side bookkeeping
+// (has/record/take/attach) delegates to the wrapped state; binding
+// create/remove delegate to the existing free fns so the teloxide runtime
+// invocations stay in one place during this atomic cut-over.
+// ---------------------------------------------------------------------------
+
+/// Platform payload carried inside a [`BindingRef`] for Telegram.
+/// Opaque to core code — only `TelegramChannel` downcasts to this shape.
+#[derive(Debug, Clone)]
+pub(crate) struct TelegramBindingPayload {
+    pub topic_id: i32,
+}
+
+impl TelegramBindingPayload {
+    fn into_binding(self) -> crate::channel::BindingRef {
+        let tag = format!("TG#{}", self.topic_id);
+        crate::channel::BindingRef::new("telegram", Some(tag), self)
+    }
+}
+
+/// Telegram adapter implementing the platform-neutral `Channel` trait.
+pub struct TelegramChannel {
+    state: Arc<Mutex<TelegramState>>,
+    caps: crate::channel::ChannelCapabilities,
+}
+
+impl TelegramChannel {
+    pub fn new(state: Arc<Mutex<TelegramState>>) -> Self {
+        let caps = crate::channel::ChannelCapabilities {
+            emits_deletion_events: false,
+            threads: true,
+            buttons: false,
+            attachments: true,
+            react: true,
+            edit: true,
+            markdown: crate::channel::MarkdownDialect::MarkdownV2,
+            max_msg_bytes: 4096,
+            ..Default::default()
+        };
+        Self { state, caps }
+    }
+
+    /// Access the underlying legacy state. Kept `pub(crate)` so existing
+    /// free-function call sites (e.g. `start_polling`, `init_from_config`
+    /// consumers in bootstrap) can continue to operate on `TelegramState`
+    /// directly until T2 generalizes them.
+    pub(crate) fn state(&self) -> &Arc<Mutex<TelegramState>> {
+        &self.state
+    }
+}
+
+impl crate::channel::Channel for TelegramChannel {
+    fn kind(&self) -> &'static str {
+        "telegram"
+    }
+
+    fn caps(&self) -> &crate::channel::ChannelCapabilities {
+        &self.caps
+    }
+
+    fn poll_event(&self) -> Option<crate::channel::ChannelEvent> {
+        // Legacy path pushes events via `attach_registry`; pull-style API
+        // lands in a later PR once the dispatcher is in place.
+        None
+    }
+
+    fn send(
+        &self,
+        _binding: &crate::channel::BindingRef,
+        _msg: crate::channel::OutMsg,
+    ) -> anyhow::Result<crate::channel::MsgRef> {
+        // Current call sites still use the `try_telegram_reply` free fn.
+        // The trait-based send path lands with the dispatcher in T2.
+        anyhow::bail!("TelegramChannel::send not wired yet — use try_telegram_reply")
+    }
+
+    fn edit(
+        &self,
+        _msg: &crate::channel::MsgRef,
+        _payload: crate::channel::OutMsg,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("TelegramChannel::edit not wired yet — use try_telegram_edit")
+    }
+
+    fn delete(&self, _msg: &crate::channel::MsgRef) -> anyhow::Result<()> {
+        anyhow::bail!("TelegramChannel::delete not wired yet")
+    }
+
+    fn create_binding(
+        &self,
+        name: &str,
+        _opts: crate::channel::BindingOpts,
+    ) -> anyhow::Result<crate::channel::BindingRef> {
+        let home = lock_state(&self.state).home.clone();
+        match create_topic_for_instance(&home, name) {
+            Some(tid) => Ok(TelegramBindingPayload { topic_id: tid }.into_binding()),
+            None => anyhow::bail!("create_topic_for_instance returned None for {name}"),
+        }
+    }
+
+    fn remove_binding(&self, binding: &crate::channel::BindingRef) -> anyhow::Result<()> {
+        let payload = binding
+            .downcast::<TelegramBindingPayload>()
+            .ok_or_else(|| anyhow::anyhow!("non-telegram binding passed to remove_binding"))?;
+        let home = lock_state(&self.state).home.clone();
+        delete_topic(&home, payload.topic_id);
+        Ok(())
+    }
+
+    fn has_binding(&self, instance: &str) -> bool {
+        lock_state(&self.state)
+            .instance_to_topic
+            .contains_key(instance)
+    }
+
+    fn record_binding(
+        &self,
+        instance: &str,
+        binding: crate::channel::BindingRef,
+        submit_key: String,
+    ) {
+        let Some(payload) = binding.downcast::<TelegramBindingPayload>() else {
+            tracing::warn!(
+                kind = binding.kind(),
+                instance,
+                "record_binding received non-telegram binding — dropping"
+            );
+            return;
+        };
+        let tid = payload.topic_id;
+        let mut s = lock_state(&self.state);
+        s.instance_to_topic.insert(instance.to_string(), tid);
+        s.topic_to_instance.insert(tid, instance.to_string());
+        s.submit_keys.insert(instance.to_string(), submit_key);
+    }
+
+    fn take_binding(&self, instance: &str) -> Option<crate::channel::BindingRef> {
+        let mut s = lock_state(&self.state);
+        let tid = s.instance_to_topic.remove(instance)?;
+        s.topic_to_instance.remove(&tid);
+        s.submit_keys.remove(instance);
+        drop(s);
+        Some(TelegramBindingPayload { topic_id: tid }.into_binding())
+    }
+
+    fn attach_registry(&self, registry: AgentRegistry) {
+        let mut s = lock_state(&self.state);
+        s.registry = Some(registry);
+    }
 }
 
 #[cfg(test)]

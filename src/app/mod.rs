@@ -153,7 +153,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
         if let Some(tg) = telegram_state.as_ref() {
-            crate::telegram::attach_registry(tg, Arc::clone(&registry));
+            tg.attach_registry(Arc::clone(&registry));
         }
     }
 

@@ -5,7 +5,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::agent::AgentRegistry;
 use crate::backend::Backend;
@@ -122,7 +122,7 @@ pub(super) struct OverlayCtx<'a> {
     pub fleet_path: &'a Path,
     pub wakeup_tx: &'a crossbeam::channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
-    pub telegram_state: &'a Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    pub telegram_state: &'a Option<Arc<dyn crate::channel::Channel>>,
 }
 
 #[derive(Default)]

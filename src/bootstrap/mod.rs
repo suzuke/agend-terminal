@@ -24,7 +24,7 @@ pub use agent_resolve::AgentDef;
 
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// RAII guard for the daemon-exclusive `.daemon.lock` flock.
 ///
@@ -59,7 +59,7 @@ pub struct OwnedFleet {
     pub run_dir: PathBuf,
     #[allow(dead_code)]
     pub cookie: crate::auth_cookie::Cookie,
-    pub telegram: Option<Arc<Mutex<crate::telegram::TelegramState>>>,
+    pub telegram: Option<Arc<dyn crate::channel::Channel>>,
     /// Flock guard — drop releases `.daemon.lock`. Kept last so the lock is
     /// released only after every other resource has been dropped.
     #[allow(dead_code)]
