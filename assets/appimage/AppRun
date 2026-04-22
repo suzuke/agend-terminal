@@ -1,0 +1,26 @@
+#!/bin/sh
+# Custom AppRun for agend-terminal AppImage.
+#
+# Why: linuxdeploy's default AppRun execs $APPDIR/usr/bin/agend-terminal with
+# the caller's argv verbatim and ignores the `Exec=` line in the .desktop
+# file. Double-click or bare invocation would fall into interactive CLI mode
+# (print help and exit), so the tray icon would never appear. We force the
+# `tray` subcommand here; explicit args from the CLI still win via "$@"
+# fallthrough for power users who want `agend-terminal-x86_64.AppImage list`.
+#
+# apprun-hooks/ is the directory linuxdeploy plugins drop env-setup snippets
+# into (e.g., linuxdeploy-plugin-gtk's GDK_BACKEND / GI_TYPELIB_PATH exports).
+# The default AppRun sources these; we must too, otherwise the bundled GTK3
+# libs won't be found at runtime.
+
+HERE="$(dirname "$(readlink -f "$0")")"
+
+for hook in "$HERE"/apprun-hooks/*.sh; do
+    [ -e "$hook" ] && . "$hook"
+done
+
+if [ "$#" -eq 0 ]; then
+    exec "$HERE/usr/bin/agend-terminal" tray
+else
+    exec "$HERE/usr/bin/agend-terminal" "$@"
+fi
