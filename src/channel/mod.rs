@@ -39,6 +39,7 @@ pub use binding::BindingRef;
 pub use caps::{ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint, RateBudget};
 pub use event::{ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason, User};
 
+use crate::agent::AgentRegistry;
 use anyhow::Result;
 
 /// Platform-neutral channel trait. Implementations live next to their
@@ -79,6 +80,35 @@ pub trait Channel: Send + Sync {
 
     /// Tear down a binding. Core code should also drop any references.
     fn remove_binding(&self, binding: &BindingRef) -> Result<()>;
+
+    // -----------------------------------------------------------------
+    // Registry-side helpers
+    //
+    // These let core code (`app::telegram_hooks`, `daemon::supervisor`)
+    // ask "is this instance bound?" / "remember this binding" without
+    // poking the adapter's private state. The in-memory map of
+    // instance → binding lives next to the concrete adapter so its
+    // locking / lifetime rules are a single-adapter concern.
+    // -----------------------------------------------------------------
+
+    /// Does the adapter already have a recorded binding for `instance`?
+    fn has_binding(&self, instance: &str) -> bool;
+
+    /// Remember a binding for `instance`. `submit_key` is PTY metadata
+    /// that later inbound events carry through to the registry (e.g.
+    /// the keystroke used to submit a message to a running agent).
+    fn record_binding(&self, instance: &str, binding: BindingRef, submit_key: String);
+
+    /// Remove and return the recorded binding for `instance`, if any.
+    /// Call sites typically follow up with [`Channel::remove_binding`]
+    /// to also tear down the platform resource.
+    fn take_binding(&self, instance: &str) -> Option<BindingRef>;
+
+    /// Register the in-process agent registry with the adapter so
+    /// inbound events can route to the right agent without a
+    /// cross-thread round-trip. Two-phase because adapters initialize
+    /// during bootstrap (before the registry exists).
+    fn attach_registry(&self, registry: AgentRegistry);
 }
 
 /// Options passed to `Channel::create_binding`. Platform-specific hints live

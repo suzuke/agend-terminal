@@ -864,13 +864,28 @@ fn notify_telegram_inner(
 }
 
 // ---------------------------------------------------------------------------
-// Channel trait adapter (T1b scaffold)
+// Channel trait adapter (T1d)
 //
-// `TelegramChannel` wraps the legacy `Arc<Mutex<TelegramState>>` so external
-// callers can hold `Arc<dyn Channel>` instead of the concrete type. Method
-// bodies land in T1d when call sites migrate — this commit only establishes
-// the type so later commits compile incrementally.
+// `TelegramChannel` wraps `Arc<Mutex<TelegramState>>` and implements the
+// platform-neutral `Channel` trait. Registry-side bookkeeping
+// (has/record/take/attach) delegates to the wrapped state; binding
+// create/remove delegate to the existing free fns so the teloxide runtime
+// invocations stay in one place during this atomic cut-over.
 // ---------------------------------------------------------------------------
+
+/// Platform payload carried inside a [`BindingRef`] for Telegram.
+/// Opaque to core code — only `TelegramChannel` downcasts to this shape.
+#[derive(Debug, Clone)]
+pub(crate) struct TelegramBindingPayload {
+    pub topic_id: i32,
+}
+
+impl TelegramBindingPayload {
+    fn into_binding(self) -> crate::channel::BindingRef {
+        let tag = format!("TG#{}", self.topic_id);
+        crate::channel::BindingRef::new("telegram", Some(tag), self)
+    }
+}
 
 /// Telegram adapter implementing the platform-neutral `Channel` trait.
 pub struct TelegramChannel {
@@ -895,8 +910,9 @@ impl TelegramChannel {
     }
 
     /// Access the underlying legacy state. Kept `pub(crate)` so existing
-    /// free-function call sites can continue to operate on `TelegramState`
-    /// until T1d / T2 swap them to trait methods.
+    /// free-function call sites (e.g. `start_polling`, `init_from_config`
+    /// consumers in bootstrap) can continue to operate on `TelegramState`
+    /// directly until T2 generalizes them.
     pub(crate) fn state(&self) -> &Arc<Mutex<TelegramState>> {
         &self.state
     }
@@ -922,7 +938,9 @@ impl crate::channel::Channel for TelegramChannel {
         _binding: &crate::channel::BindingRef,
         _msg: crate::channel::OutMsg,
     ) -> anyhow::Result<crate::channel::MsgRef> {
-        anyhow::bail!("TelegramChannel::send not wired until T1d consumer switch")
+        // Current call sites still use the `try_telegram_reply` free fn.
+        // The trait-based send path lands with the dispatcher in T2.
+        anyhow::bail!("TelegramChannel::send not wired yet — use try_telegram_reply")
     }
 
     fn edit(
@@ -930,23 +948,73 @@ impl crate::channel::Channel for TelegramChannel {
         _msg: &crate::channel::MsgRef,
         _payload: crate::channel::OutMsg,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("TelegramChannel::edit not wired until T1d consumer switch")
+        anyhow::bail!("TelegramChannel::edit not wired yet — use try_telegram_edit")
     }
 
     fn delete(&self, _msg: &crate::channel::MsgRef) -> anyhow::Result<()> {
-        anyhow::bail!("TelegramChannel::delete not wired until T1d consumer switch")
+        anyhow::bail!("TelegramChannel::delete not wired yet")
     }
 
     fn create_binding(
         &self,
-        _name: &str,
+        name: &str,
         _opts: crate::channel::BindingOpts,
     ) -> anyhow::Result<crate::channel::BindingRef> {
-        anyhow::bail!("TelegramChannel::create_binding not wired until T1d consumer switch")
+        let home = lock_state(&self.state).home.clone();
+        match create_topic_for_instance(&home, name) {
+            Some(tid) => Ok(TelegramBindingPayload { topic_id: tid }.into_binding()),
+            None => anyhow::bail!("create_topic_for_instance returned None for {name}"),
+        }
     }
 
-    fn remove_binding(&self, _binding: &crate::channel::BindingRef) -> anyhow::Result<()> {
-        anyhow::bail!("TelegramChannel::remove_binding not wired until T1d consumer switch")
+    fn remove_binding(&self, binding: &crate::channel::BindingRef) -> anyhow::Result<()> {
+        let payload = binding
+            .downcast::<TelegramBindingPayload>()
+            .ok_or_else(|| anyhow::anyhow!("non-telegram binding passed to remove_binding"))?;
+        let home = lock_state(&self.state).home.clone();
+        delete_topic(&home, payload.topic_id);
+        Ok(())
+    }
+
+    fn has_binding(&self, instance: &str) -> bool {
+        lock_state(&self.state)
+            .instance_to_topic
+            .contains_key(instance)
+    }
+
+    fn record_binding(
+        &self,
+        instance: &str,
+        binding: crate::channel::BindingRef,
+        submit_key: String,
+    ) {
+        let Some(payload) = binding.downcast::<TelegramBindingPayload>() else {
+            tracing::warn!(
+                kind = binding.kind(),
+                instance,
+                "record_binding received non-telegram binding — dropping"
+            );
+            return;
+        };
+        let tid = payload.topic_id;
+        let mut s = lock_state(&self.state);
+        s.instance_to_topic.insert(instance.to_string(), tid);
+        s.topic_to_instance.insert(tid, instance.to_string());
+        s.submit_keys.insert(instance.to_string(), submit_key);
+    }
+
+    fn take_binding(&self, instance: &str) -> Option<crate::channel::BindingRef> {
+        let mut s = lock_state(&self.state);
+        let tid = s.instance_to_topic.remove(instance)?;
+        s.topic_to_instance.remove(&tid);
+        s.submit_keys.remove(instance);
+        drop(s);
+        Some(TelegramBindingPayload { topic_id: tid }.into_binding())
+    }
+
+    fn attach_registry(&self, registry: AgentRegistry) {
+        let mut s = lock_state(&self.state);
+        s.registry = Some(registry);
     }
 }
 

@@ -10,7 +10,7 @@ use crate::layout::{Layout, SplitDir, Tab};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Bundle of mutable references the command handler needs to affect the
 /// running TUI state. Constructed by the caller for each invocation.
@@ -20,7 +20,7 @@ pub(super) struct CommandCtx<'a> {
     pub home: &'a Path,
     pub wakeup_tx: &'a crossbeam::channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
-    pub telegram_state: &'a Option<Arc<Mutex<crate::channel::telegram::TelegramState>>>,
+    pub telegram_state: &'a Option<Arc<dyn crate::channel::Channel>>,
 }
 
 /// Execute a command palette command. Returns true if layout changed (needs resize).
