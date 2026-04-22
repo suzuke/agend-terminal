@@ -18,6 +18,7 @@ mod event_log;
 mod fleet;
 mod framing;
 mod health;
+mod identity;
 mod inbox;
 mod instructions;
 mod ipc;

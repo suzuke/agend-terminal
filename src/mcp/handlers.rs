@@ -5,15 +5,26 @@ use crate::agent_ops::{
     validate_branch,
 };
 use crate::channel::telegram;
+use crate::identity::Sender;
 use serde_json::{json, Value};
+
+/// Error payload for cross-instance tools invoked without a resolvable
+/// `AGEND_INSTANCE_NAME`. Without this guard the message would land at the
+/// receiver as `[from:]` with no originator.
+fn err_needs_identity(tool: &str) -> Value {
+    json!({
+        "error": format!(
+            "{tool} requires AGEND_INSTANCE_NAME to be set — cross-instance messaging needs a named sender"
+        )
+    })
+}
 
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let home = crate::home_dir();
-    let instance_name = if instance_name.is_empty() {
-        std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default()
-    } else {
-        instance_name.to_string()
-    };
+    // Explicit arg beats env var. Cross-instance arms require `Some`;
+    // anonymous/standalone arms tolerate the empty `&str` view.
+    let sender: Option<Sender> = Sender::new(instance_name).or_else(Sender::from_env);
+    let instance_name: &str = sender.as_ref().map(Sender::as_str).unwrap_or("");
 
     match tool {
         // --- Channel ---
@@ -22,7 +33,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             tracing::info!(from = %instance_name, %text, "reply");
             let fleet_path = home.join("fleet.yaml");
             if fleet_path.exists() {
-                match telegram::try_telegram_reply(&instance_name, text) {
+                match telegram::try_telegram_reply(instance_name, text) {
                     Ok((msg_id, chat_id)) => json!({
                         "message_id": msg_id.to_string(),
                         "chat_id": chat_id.to_string(),
@@ -36,7 +47,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "react" => {
             let emoji = args["emoji"].as_str().unwrap_or("");
             let message_id = args["message_id"].as_str();
-            match telegram::try_telegram_react(&instance_name, emoji, message_id) {
+            match telegram::try_telegram_react(instance_name, emoji, message_id) {
                 Ok(()) => json!({"emoji": emoji}),
                 Err(e) => json!({"error": format!("{e}")}),
             }
@@ -50,7 +61,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(t) => t,
                 None => return json!({"error": "missing 'text'"}),
             };
-            match telegram::try_telegram_edit(&instance_name, message_id, text) {
+            match telegram::try_telegram_edit(instance_name, message_id, text) {
                 Ok(()) => json!({"message_id": message_id}),
                 Err(e) => json!({"error": format!("{e}")}),
             }
@@ -60,7 +71,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(f) => f,
                 None => return json!({"error": "missing 'file_id'"}),
             };
-            match telegram::try_download_attachment(&instance_name, file_id) {
+            match telegram::try_download_attachment(instance_name, file_id) {
                 Ok(path) => json!({"path": path}),
                 Err(e) => json!({"error": format!("{e}")}),
             }
@@ -68,6 +79,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 
         // --- Cross-instance communication ---
         "send_to_instance" | "send" => {
+            let Some(sender) = sender.as_ref() else {
+                return err_needs_identity(tool);
+            };
             let target = args["instance_name"]
                 .as_str()
                 .or_else(|| args["target"].as_str());
@@ -78,7 +92,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Err(e) = crate::agent::validate_name(target) {
                 return json!({"error": e});
             }
-            if target == instance_name {
+            if *sender == target {
                 return json!({"error": "cannot send to self — use a different instance_name"});
             }
             let text = args["message"]
@@ -93,7 +107,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 &home,
                 &json!({
                     "method": crate::api::method::SEND,
-                    "params": { "from": instance_name, "target": target, "text": text, "kind": kind }
+                    "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind }
                 }),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -105,7 +119,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     crate::inbox::deliver(
                         &home,
                         target,
-                        &crate::inbox::NotifySource::Agent(&instance_name),
+                        &crate::inbox::NotifySource::Agent(sender.as_str()),
                         text,
                         &submit_key,
                         None,
@@ -115,6 +129,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             }
         }
         "delegate_task" => {
+            let Some(sender) = sender.as_ref() else {
+                return err_needs_identity(tool);
+            };
             let target = match args["target_instance"].as_str() {
                 Some(t) => t,
                 None => return json!({"error": "missing 'target_instance'"}),
@@ -133,9 +150,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Some(ctx) = args["context"].as_str() {
                 msg.push_str(&format!("\n\nContext: {ctx}"));
             }
-            send_to(&home, &instance_name, target, &msg, "task")
+            send_to(&home, sender, target, &msg, "task")
         }
         "report_result" => {
+            let Some(sender) = sender.as_ref() else {
+                return err_needs_identity(tool);
+            };
             let target = match args["target_instance"].as_str() {
                 Some(t) => t,
                 None => return json!({"error": "missing 'target_instance'"}),
@@ -154,9 +174,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Some(artifacts) = args["artifacts"].as_str() {
                 msg.push_str(&format!("\nArtifacts: {artifacts}"));
             }
-            send_to(&home, &instance_name, target, &msg, "report")
+            send_to(&home, sender, target, &msg, "report")
         }
         "request_information" => {
+            let Some(sender) = sender.as_ref() else {
+                return err_needs_identity(tool);
+            };
             let target = match args["target_instance"].as_str() {
                 Some(t) => t,
                 None => return json!({"error": "missing 'target_instance'"}),
@@ -172,9 +195,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Some(ctx) = args["context"].as_str() {
                 msg.push_str(&format!("\n\nContext: {ctx}"));
             }
-            send_to(&home, &instance_name, target, &msg, "query")
+            send_to(&home, sender, target, &msg, "query")
         }
         "broadcast" => {
+            let Some(sender) = sender.as_ref() else {
+                return err_needs_identity(tool);
+            };
             let message = match args["message"].as_str() {
                 Some(m) => m,
                 None => return json!({"error": "missing 'message'"}),
@@ -191,18 +217,18 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             };
             let targets: Vec<String> = targets
                 .into_iter()
-                .filter(|t| *t != instance_name)
+                .filter(|t| *sender != t.as_str())
                 .collect();
             let kind = args["request_kind"].as_str().unwrap_or("update");
             let mut sent = Vec::new();
             for target in &targets {
-                let _ = send_to(&home, &instance_name, target, message, kind);
+                let _ = send_to(&home, sender, target, message, kind);
                 sent.push(target.clone());
             }
             json!({"sent_to": sent, "count": sent.len()})
         }
         "inbox" => {
-            let messages = crate::inbox::drain(&home, &instance_name);
+            let messages = crate::inbox::drain(&home, instance_name);
             json!({"messages": messages})
         }
 
@@ -335,7 +361,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     Err(e) => json!({"error": format!("API unavailable: {e}")}),
                 }
             } else {
-                spawn_single_instance(&home, &instance_name, args)
+                spawn_single_instance(&home, instance_name, args)
             }
         }
         "delete_instance" => {
@@ -473,12 +499,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
         "set_display_name" => {
             let display_name = args["name"].as_str().unwrap_or("");
-            save_metadata(&home, &instance_name, "display_name", json!(display_name));
+            save_metadata(&home, instance_name, "display_name", json!(display_name));
             json!({"display_name": display_name})
         }
         "set_description" => {
             let desc = args["description"].as_str().unwrap_or("");
-            save_metadata(&home, &instance_name, "description", json!(desc));
+            save_metadata(&home, instance_name, "description", json!(desc));
             json!({"description": desc})
         }
         "move_pane" => {
@@ -499,12 +525,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
 
         // --- Decisions ---
-        "post_decision" => crate::decisions::post(&home, &instance_name, args),
+        "post_decision" => crate::decisions::post(&home, instance_name, args),
         "list_decisions" => crate::decisions::list(&home, args),
         "update_decision" => crate::decisions::update(&home, args),
 
         // --- Task board ---
-        "task" => crate::tasks::handle(&home, &instance_name, args),
+        "task" => crate::tasks::handle(&home, instance_name, args),
 
         // --- Teams ---
         "delete_team" => crate::teams::delete(&home, args),
@@ -528,13 +554,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
 
         // --- Scheduling ---
-        "create_schedule" => crate::schedules::create(&home, &instance_name, args),
+        "create_schedule" => crate::schedules::create(&home, instance_name, args),
         "list_schedules" => crate::schedules::list(&home, args),
         "update_schedule" => crate::schedules::update(&home, args),
         "delete_schedule" => crate::schedules::delete(&home, args),
 
         // --- Deployments ---
-        "deploy_template" => crate::deployments::deploy(&home, &instance_name, args),
+        "deploy_template" => crate::deployments::deploy(&home, instance_name, args),
         "teardown_deployment" => crate::deployments::teardown(&home, args),
         "list_deployments" => crate::deployments::list(&home),
 

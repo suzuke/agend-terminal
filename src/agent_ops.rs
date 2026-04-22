@@ -10,6 +10,7 @@
 //! (Commit 2) will delete the duplicates and switch imports, at which
 //! point the drift is automatically fixed for MCP callers.
 
+use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -19,12 +20,16 @@ use std::path::Path;
 
 /// Send a message to a target instance via API, falling back to direct
 /// inbox delivery when the daemon is unreachable.
-pub fn send_to(home: &Path, from: &str, target: &str, text: &str, kind: &str) -> Value {
+///
+/// `from: &Sender` guarantees a non-empty originator; callers cannot
+/// accidentally stamp messages with `[from:]` (see `src/identity.rs`).
+pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str) -> Value {
+    let from_str = from.as_str();
     match crate::api::call(
         home,
         &json!({
             "method": crate::api::method::SEND,
-            "params": { "from": from, "target": target, "text": text, "kind": kind }
+            "params": { "from": from_str, "target": target, "text": text, "kind": kind }
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
@@ -34,7 +39,7 @@ pub fn send_to(home: &Path, from: &str, target: &str, text: &str, kind: &str) ->
             crate::inbox::deliver(
                 home,
                 target,
-                &crate::inbox::NotifySource::Agent(from),
+                &crate::inbox::NotifySource::Agent(from_str),
                 text,
                 &submit_key,
                 None,

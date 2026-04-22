@@ -557,3 +557,38 @@ fn broadcast_with_tags_falls_through_to_all() {
     assert!(!names.contains(&"sender"), "self should be excluded");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// Regression: cross-instance tools must refuse to run without a resolvable
+// sender identity, else receivers see `[from:]` with no originator.
+#[test]
+fn cross_instance_tools_reject_empty_sender() {
+    let home = temp_home("no-sender");
+    let cases: &[(&str, Value)] = &[
+        (
+            "send_to_instance",
+            json!({"instance_name": "peer", "message": "hi"}),
+        ),
+        (
+            "delegate_task",
+            json!({"target_instance": "peer", "task": "x"}),
+        ),
+        (
+            "report_result",
+            json!({"target_instance": "peer", "summary": "done"}),
+        ),
+        (
+            "request_information",
+            json!({"target_instance": "peer", "question": "why"}),
+        ),
+        ("broadcast", json!({"message": "hi"})),
+    ];
+    for (tool, args) in cases {
+        let result = call_tool_as(&home, "", tool, args);
+        let err = result["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("AGEND_INSTANCE_NAME"),
+            "tool={tool}: expected sender-identity error, got: {result}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
