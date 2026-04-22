@@ -28,6 +28,18 @@ pub(super) enum CloseTarget {
     Tab,
 }
 
+pub enum TaskBoardMode {
+    Board,
+    Detail,
+    NewTask {
+        input: String,
+    },
+    Assign {
+        choices: Vec<String>,
+        selected: usize,
+    },
+}
+
 pub(super) enum Overlay {
     None,
     /// New tab selection menu.
@@ -79,15 +91,15 @@ pub(super) enum Overlay {
         items: Vec<crate::decisions::Decision>,
         scroll: usize,
     },
-    /// Task board overlay — 4-column kanban view.
+    /// Task board overlay — 4-column kanban view with CRUD.
     Tasks {
         items: Vec<crate::tasks::Task>,
         /// Currently focused column (0=Backlog, 1=Open, 2=InProgress, 3=Done).
         col: usize,
         /// Currently focused row within the column.
         row: usize,
-        /// Whether detail view is expanded for the selected task.
-        detail: bool,
+        /// Sub-mode: None=board, Detail, NewTask(input), Assign(selected).
+        mode: TaskBoardMode,
     },
     /// Floating scratch shell (Ctrl+B ~). Esc kills the shell and closes the
     /// overlay. Pane is boxed because it's much larger than any other variant.
@@ -509,45 +521,195 @@ pub(super) fn handle_key(
             }
         }
         Overlay::Tasks {
-            ref items,
+            ref mut items,
             ref mut col,
             ref mut row,
-            ref mut detail,
+            ref mut mode,
         } => {
-            if *detail {
-                // In detail view, Esc goes back to board
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    *detail = false;
-                } else {
-                    // ignore other keys in detail view
+            match mode {
+                TaskBoardMode::Detail => {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                        *mode = TaskBoardMode::Board;
+                    }
                 }
-            } else {
-                let columns = crate::render::task_board_columns(items);
-                match key.code {
-                    KeyCode::Left | KeyCode::Char('h') if *col > 0 => {
-                        *col -= 1;
-                        *row = (*row).min(columns[*col].len().saturating_sub(1));
+                TaskBoardMode::NewTask { ref mut input } => match key.code {
+                    KeyCode::Enter if !input.is_empty() => {
+                        crate::tasks::handle(
+                            ctx.home,
+                            "user",
+                            &serde_json::json!({
+                                "action": "create",
+                                "title": input.as_str(),
+                                "priority": "normal",
+                            }),
+                        );
+                        *items = crate::tasks::list_all(ctx.home);
+                        *mode = TaskBoardMode::Board;
                     }
-                    KeyCode::Right | KeyCode::Char('l') if *col < 3 => {
-                        *col += 1;
-                        *row = (*row).min(columns[*col].len().saturating_sub(1));
+                    KeyCode::Char(c) => input.push(c),
+                    KeyCode::Backspace => {
+                        input.pop();
                     }
-                    KeyCode::Up | KeyCode::Char('k') if *row > 0 => {
-                        *row -= 1;
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        let col_len = columns[*col].len();
-                        if *row + 1 < col_len {
-                            *row += 1;
-                        }
-                    }
-                    KeyCode::Enter if !columns[*col].is_empty() => {
-                        *detail = true;
-                    }
-                    KeyCode::Esc | KeyCode::Char('q') => {
-                        *overlay = Overlay::None;
+                    KeyCode::Esc => {
+                        *mode = TaskBoardMode::Board;
                     }
                     _ => {}
+                },
+                TaskBoardMode::Assign {
+                    ref choices,
+                    ref mut selected,
+                } => match key.code {
+                    KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
+                        *selected -= 1;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if *selected + 1 < choices.len() => {
+                        *selected += 1;
+                    }
+                    KeyCode::Enter if !choices.is_empty() => {
+                        let columns = crate::render::task_board_columns(items);
+                        if let Some(task) = columns[*col].get(*row) {
+                            let assignee = &choices[*selected];
+                            crate::tasks::handle(
+                                ctx.home,
+                                "user",
+                                &serde_json::json!({
+                                    "action": "update",
+                                    "id": task.id,
+                                    "assignee": assignee,
+                                }),
+                            );
+                            *items = crate::tasks::list_all(ctx.home);
+                        }
+                        *mode = TaskBoardMode::Board;
+                    }
+                    KeyCode::Esc => {
+                        *mode = TaskBoardMode::Board;
+                    }
+                    _ => {}
+                },
+                TaskBoardMode::Board => {
+                    let columns = crate::render::task_board_columns(items);
+                    match key.code {
+                        KeyCode::Left | KeyCode::Char('h') if *col > 0 => {
+                            *col -= 1;
+                            *row = (*row).min(columns[*col].len().saturating_sub(1));
+                        }
+                        KeyCode::Right | KeyCode::Char('l') if *col < 3 => {
+                            *col += 1;
+                            *row = (*row).min(columns[*col].len().saturating_sub(1));
+                        }
+                        KeyCode::Up | KeyCode::Char('k') if *row > 0 => {
+                            *row -= 1;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let col_len = columns[*col].len();
+                            if *row + 1 < col_len {
+                                *row += 1;
+                            }
+                        }
+                        KeyCode::Enter if !columns[*col].is_empty() => {
+                            *mode = TaskBoardMode::Detail;
+                        }
+                        // n — new task
+                        KeyCode::Char('n') => {
+                            *mode = TaskBoardMode::NewTask {
+                                input: String::new(),
+                            };
+                        }
+                        // d — cancel task
+                        KeyCode::Char('d') if !columns[*col].is_empty() => {
+                            if let Some(task) = columns[*col].get(*row) {
+                                crate::tasks::handle(
+                                    ctx.home,
+                                    "user",
+                                    &serde_json::json!({
+                                        "action": "update",
+                                        "id": task.id,
+                                        "status": "cancelled",
+                                    }),
+                                );
+                                *items = crate::tasks::list_all(ctx.home);
+                                let new_cols = crate::render::task_board_columns(items);
+                                *row = (*row).min(new_cols[*col].len().saturating_sub(1));
+                            }
+                        }
+                        // a — assign
+                        KeyCode::Char('a') if !columns[*col].is_empty() => {
+                            // Build choices: teams + agents from teams.json members
+                            let team_list = crate::teams::list(ctx.home);
+                            let mut choices: Vec<String> = Vec::new();
+                            if let Some(teams) = team_list["teams"].as_array() {
+                                for t in teams {
+                                    if let Some(name) = t["name"].as_str() {
+                                        choices.push(format!("🏷 {name}"));
+                                    }
+                                    if let Some(members) = t["members"].as_array() {
+                                        for m in members {
+                                            if let Some(n) = m.as_str() {
+                                                if !choices.contains(&n.to_string()) {
+                                                    choices.push(n.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if choices.is_empty() {
+                                choices.push("(no agents/teams)".to_string());
+                            }
+                            *mode = TaskBoardMode::Assign {
+                                choices,
+                                selected: 0,
+                            };
+                        }
+                        // Shift+← / Shift+→ — move task status
+                        KeyCode::Char('H') if !columns[*col].is_empty() && *col > 0 => {
+                            if let Some(task) = columns[*col].get(*row) {
+                                let update = match *col {
+                                    1 => Some(("priority", "low")),   // Open → Backlog
+                                    2 => Some(("status", "open")),    // InProgress → Open
+                                    3 => Some(("status", "claimed")), // Done → InProgress
+                                    _ => None,
+                                };
+                                if let Some((field, val)) = update {
+                                    crate::tasks::handle(
+                                        ctx.home,
+                                        "user",
+                                        &serde_json::json!({"action": "update", "id": task.id, field: val}),
+                                    );
+                                    *items = crate::tasks::list_all(ctx.home);
+                                    *col -= 1;
+                                    let new_cols = crate::render::task_board_columns(items);
+                                    *row = (*row).min(new_cols[*col].len().saturating_sub(1));
+                                }
+                            }
+                        }
+                        KeyCode::Char('L') if !columns[*col].is_empty() && *col < 3 => {
+                            if let Some(task) = columns[*col].get(*row) {
+                                let update = match *col {
+                                    0 => Some(("priority", "normal")), // Backlog → Open
+                                    1 => Some(("status", "claimed")),  // Open → InProgress
+                                    2 => Some(("status", "done")),     // InProgress → Done
+                                    _ => None,
+                                };
+                                if let Some((field, val)) = update {
+                                    crate::tasks::handle(
+                                        ctx.home,
+                                        "user",
+                                        &serde_json::json!({"action": "update", "id": task.id, field: val}),
+                                    );
+                                    *items = crate::tasks::list_all(ctx.home);
+                                    *col += 1;
+                                    let new_cols = crate::render::task_board_columns(items);
+                                    *row = (*row).min(new_cols[*col].len().saturating_sub(1));
+                                }
+                            }
+                        }
+                        KeyCode::Esc | KeyCode::Char('q') => {
+                            *overlay = Overlay::None;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
