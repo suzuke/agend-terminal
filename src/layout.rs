@@ -3,7 +3,6 @@
 use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
 use crate::bridge_client::BridgeClient;
-use crate::notification_queue::COMPOSE_IDLE_TIMEOUT;
 use crate::vterm::VTerm;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -1323,6 +1322,7 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notification_queue::COMPOSE_IDLE_TIMEOUT;
     use unicode_width::UnicodeWidthStr;
 
     // --- ratio_bounds invariants (covers Round A #3 + #6) ---
