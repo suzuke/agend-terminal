@@ -168,6 +168,9 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to issue API auth cookie: {e}"))?;
     tracing::info!(path = %run.display(), "run dir");
 
+    // Extract embedded fleet protocol to AGEND_HOME/protocol/.default/
+    crate::protocol::extract_default(home);
+
     // Check for previous snapshot if fleet.yaml doesn't exist
     if !home.join("fleet.yaml").exists() {
         if let Some(snapshot) = crate::snapshot::load(home) {

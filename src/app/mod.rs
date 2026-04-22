@@ -35,6 +35,10 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     // Redirect tracing to log file BEFORE ratatui takes over stderr.
     // Must happen before main.rs's tracing init — caller should skip init for App.
     let home = crate::home_dir();
+
+    // Extract embedded fleet protocol to AGEND_HOME/protocol/.default/
+    crate::protocol::extract_default(&home);
+
     let log_path = home.join("app.log");
     let log_file = std::fs::OpenOptions::new()
         .create(true)
