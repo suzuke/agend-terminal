@@ -6,6 +6,7 @@ use crate::bridge_client::BridgeClient;
 use crate::vterm::VTerm;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// How a pane's input/resize is delivered to the underlying process.
 ///
@@ -36,6 +37,10 @@ pub struct Pane {
     pub has_notification: bool,
     /// Fleet instance name (key in fleet.yaml). None for shell panes.
     pub fleet_instance_name: Option<String>,
+    /// Last time the user typed into this pane from the TUI.
+    pub last_input_at: Option<Instant>,
+    /// Count of pending queued notifications for this pane.
+    pub pending_notification_count: usize,
     /// Active text selection (grid coordinates within this pane's VTerm).
     pub selection: Option<Selection>,
     /// Whether input/resize go to a local PTY (via registry) or a remote
@@ -58,6 +63,17 @@ impl Pane {
         self.display_name.as_deref().unwrap_or(&self.agent_name)
     }
 
+    pub fn mark_input_activity(&mut self) {
+        self.last_input_at = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    pub fn is_composing(&self) -> bool {
+        self.last_input_at.is_some_and(|instant| {
+            instant.elapsed() < crate::notification_queue::COMPOSE_IDLE_TIMEOUT
+        })
+    }
+
     /// Drain pending output into the local VTerm.
     pub fn drain_output(&mut self) {
         while let Ok(data) = self.rx.try_recv() {
@@ -78,7 +94,8 @@ impl Pane {
     /// through the pane's BridgeClient. Errors are swallowed — a broken pane
     /// surfaces via its output channel closing, which the app handles at the
     /// next drain.
-    pub fn write_input(&self, registry: &AgentRegistry, bytes: &[u8]) {
+    pub fn write_input(&mut self, registry: &AgentRegistry, bytes: &[u8]) {
+        self.mark_input_activity();
         match &self.source {
             PaneSource::Local => {
                 let reg = agent::lock_registry(registry);
@@ -865,6 +882,11 @@ impl Tab {
         self.root().find_pane(self.focus_id)
     }
 
+    pub fn focused_pane_mut(&mut self) -> Option<&mut Pane> {
+        let focus_id = self.focus_id;
+        self.root_mut().find_pane_mut(focus_id)
+    }
+
     pub fn cycle_focus(&mut self) {
         let ids = self.root().pane_ids();
         if let Some(pos) = ids.iter().position(|&id| id == self.focus_id) {
@@ -1411,6 +1433,8 @@ mod tests {
                 scroll_offset: 0,
                 has_notification: false,
                 fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
                 selection: None,
                 source: PaneSource::Local,
             }))),
@@ -1425,6 +1449,8 @@ mod tests {
                 scroll_offset: 0,
                 has_notification: false,
                 fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
                 selection: None,
                 source: PaneSource::Local,
             }))),
@@ -1458,6 +1484,8 @@ mod tests {
                 scroll_offset: 0,
                 has_notification: false,
                 fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
                 selection: None,
                 source: PaneSource::Local,
             }))),
@@ -1472,6 +1500,8 @@ mod tests {
                 scroll_offset: 0,
                 has_notification: false,
                 fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
                 selection: None,
                 source: PaneSource::Local,
             }))),
@@ -1532,6 +1562,8 @@ mod tests {
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
         }
@@ -1541,6 +1573,24 @@ mod tests {
         let mut p = leaf(id, name);
         p.backend = Some(Backend::ClaudeCode);
         p
+    }
+
+    #[test]
+    fn pane_composing_after_input() {
+        let mut pane = leaf(1, "agent");
+        pane.mark_input_activity();
+        assert!(pane.is_composing());
+    }
+
+    #[test]
+    fn pane_not_composing_after_idle() {
+        let mut pane = leaf(1, "agent");
+        pane.last_input_at = Some(
+            Instant::now()
+                - crate::notification_queue::COMPOSE_IDLE_TIMEOUT
+                - std::time::Duration::from_millis(1),
+        );
+        assert!(!pane.is_composing());
     }
 
     #[test]

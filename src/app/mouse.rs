@@ -455,6 +455,8 @@ mod tests {
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
         }

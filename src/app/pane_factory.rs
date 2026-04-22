@@ -163,6 +163,8 @@ pub(super) fn create_pane(
         scroll_offset: 0,
         has_notification: false,
         fleet_instance_name: None,
+        last_input_at: None,
+        pending_notification_count: 0,
         selection: None,
         source: crate::layout::PaneSource::Local,
     })
@@ -222,6 +224,8 @@ pub(super) fn attach_pane(
         scroll_offset: 0,
         has_notification: false,
         fleet_instance_name: Some(name.to_string()),
+        last_input_at: None,
+        pending_notification_count: 0,
         selection: None,
         source: crate::layout::PaneSource::Local,
     })
@@ -354,6 +358,8 @@ pub(super) fn create_remote_pane(
         scroll_offset: 0,
         has_notification: false,
         fleet_instance_name: Some(name.to_string()),
+        last_input_at: None,
+        pending_notification_count: 0,
         selection: None,
         source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client))),
     })

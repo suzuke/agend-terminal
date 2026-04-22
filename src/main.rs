@@ -26,6 +26,7 @@ mod keybinds;
 mod layout;
 mod mcp;
 mod mcp_config;
+mod notification_queue;
 mod process;
 mod protocol;
 mod quickstart;
