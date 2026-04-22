@@ -147,6 +147,11 @@ fn task_tools() -> Vec<Value> {
 
 fn team_tools() -> Vec<Value> {
     vec![
+        json!({"name": "create_team", "description": "Create a named team from existing instances.",
+            "inputSchema": {"type": "object", "properties": {
+                "name": {"type": "string"}, "members": {"type": "array", "items": {"type": "string"}},
+                "description": {"type": "string"}
+            }, "required": ["name", "members"]}}),
         json!({"name": "delete_team", "description": "Delete a team.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
         json!({"name": "list_teams", "description": "List all teams.",

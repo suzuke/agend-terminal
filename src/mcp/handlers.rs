@@ -697,6 +697,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "task" => crate::tasks::handle(&home, instance_name, args),
 
         // --- Teams ---
+        "create_team" => crate::teams::create(&home, args),
         "delete_team" => crate::teams::delete(&home, args),
         "list_teams" => crate::teams::list(&home),
         "update_team" => {
