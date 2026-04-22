@@ -12,6 +12,9 @@ pub struct Task {
     pub status: String,   // open, claimed, done, blocked, cancelled
     pub priority: String, // low, normal, high, urgent
     pub assignee: Option<String>,
+    /// When assignee is a team name, this holds the resolved orchestrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_to: Option<String>,
     pub created_by: String,
     pub depends_on: Vec<String>,
     pub result: Option<String>,
@@ -63,13 +66,25 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             let now = chrono::Utc::now().to_rfc3339();
             let id = format!("t-{}", &now[..19].replace([':', '-', 'T'], ""));
+            let assignee = args["assignee"].as_str().map(String::from);
+            // Resolve team → orchestrator routing
+            let routed_to = if let Some(ref name) = assignee {
+                match crate::teams::resolve_team_orchestrator(home, name) {
+                    Ok(Some(orch)) => Some(orch),
+                    Ok(None) => None, // not a team, direct assignment
+                    Err(e) => return serde_json::json!({"error": e}),
+                }
+            } else {
+                None
+            };
             let task = Task {
                 id: id.clone(),
                 title: title.to_string(),
                 description: args["description"].as_str().unwrap_or("").to_string(),
                 status: "open".to_string(),
                 priority: args["priority"].as_str().unwrap_or("normal").to_string(),
-                assignee: args["assignee"].as_str().map(String::from),
+                assignee,
+                routed_to,
                 created_by: instance_name.to_string(),
                 depends_on: args["depends_on"]
                     .as_array()
@@ -251,6 +266,65 @@ mod tests {
             &serde_json::json!({"action": "claim", "id": "nope"}),
         );
         assert!(r["error"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_assign_to_team_routes_to_orchestrator() {
+        let home = tmp_home("team_route");
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        let r = handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix bug", "assignee": "devs"}),
+        );
+        assert_eq!(r["status"], "created");
+        let tasks = list_all(&home);
+        let t = tasks.iter().find(|t| t.title == "fix bug").expect("task");
+        assert_eq!(t.assignee.as_deref(), Some("devs"));
+        assert_eq!(t.routed_to.as_deref(), Some("lead"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_assign_to_degraded_team_rejects() {
+        let home = tmp_home("degraded_reject");
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        crate::teams::remove_member_from_all(&home, "lead");
+        let r = handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix bug", "assignee": "devs"}),
+        );
+        assert!(
+            r["error"].as_str().expect("err").contains("degraded"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_assign_to_agent_unchanged() {
+        let home = tmp_home("agent_direct");
+        let r = handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix bug", "assignee": "at-dev-2"}),
+        );
+        assert_eq!(r["status"], "created");
+        let tasks = list_all(&home);
+        let t = tasks.iter().find(|t| t.title == "fix bug").expect("task");
+        assert_eq!(t.assignee.as_deref(), Some("at-dev-2"));
+        assert!(
+            t.routed_to.is_none(),
+            "no routing for direct agent assignment"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

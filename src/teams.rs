@@ -307,6 +307,22 @@ pub fn reconcile_teams(home: &Path, fleet: &crate::fleet::FleetConfig) {
     }
 }
 
+/// Resolve an assignee name: if it's a team, return the orchestrator.
+/// Returns Ok(Some(orchestrator)) if team found, Ok(None) if not a team,
+/// Err if team is degraded.
+pub fn resolve_team_orchestrator(home: &Path, name: &str) -> Result<Option<String>, String> {
+    let store = load(home);
+    match store.teams.iter().find(|t| t.name == name) {
+        Some(team) => match &team.orchestrator {
+            Some(orch) => Ok(Some(orch.clone())),
+            None => Err(format!(
+                "team '{name}' is degraded (no orchestrator), cannot route task"
+            )),
+        },
+        None => Ok(None), // not a team name
+    }
+}
+
 /// Get members of a team.
 pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
     let store = load(home);
