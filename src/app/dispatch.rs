@@ -43,7 +43,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         Action::Forward(key) => {
             let bytes = crate::tui::key_to_bytes(key.code, key.modifiers);
             if !bytes.is_empty() {
-                super::write_to_focused(ctx.layout, ctx.registry, &bytes);
+                super::write_to_focused(ctx.home, ctx.layout, ctx.registry, &bytes);
             }
         }
         Action::NewTab => {

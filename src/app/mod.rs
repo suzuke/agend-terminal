@@ -20,6 +20,7 @@ use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
 use crate::keybinds::KeyHandler;
 use crate::layout::{Layout, Pane};
+use crate::notification_queue;
 use crate::render;
 use overlay::{CloseTarget, Overlay, OverlayCtx};
 
@@ -309,6 +310,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             render::resize_panes(pane_area, &mut layout, &registry);
             needs_resize = false;
         }
+        sync_notification_state(&home, &mut layout);
+        flush_idle_notifications(&home, &mut layout);
 
         let repeat_mode = key_handler.in_repeat();
 
@@ -460,7 +463,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                                 pane.write_input(&registry, text.as_bytes());
                             }
                             Overlay::None => {
-                                write_to_focused(&layout, &registry, text.as_bytes());
+                                write_to_focused(&home, &mut layout, &registry, text.as_bytes());
                             }
                             _ => {} // ignore paste in non-input overlays
                         }
@@ -725,10 +728,64 @@ fn pane_from_menu_item(
 }
 
 /// Write bytes to the focused pane's PTY (Local) or remote bridge (Remote).
-fn write_to_focused(layout: &Layout, registry: &AgentRegistry, bytes: &[u8]) {
-    if let Some(pane) = layout.active_tab().and_then(|t| t.focused_pane()) {
+fn write_to_focused(home: &Path, layout: &mut Layout, registry: &AgentRegistry, bytes: &[u8]) {
+    if let Some(pane) = layout.active_tab_mut().and_then(|t| t.focused_pane_mut()) {
+        notification_queue::record_input_activity(home, &pane.agent_name);
         pane.write_input(registry, bytes);
     }
+}
+
+fn sync_notification_state(home: &Path, layout: &mut Layout) {
+    for tab in &mut layout.tabs {
+        let pane_ids = tab.root().pane_ids();
+        for pane_id in pane_ids {
+            if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
+                pane.pending_notification_count =
+                    notification_queue::pending_count(home, &pane.agent_name);
+            }
+        }
+    }
+}
+
+fn flush_idle_notifications(home: &Path, layout: &mut Layout) {
+    for tab in &mut layout.tabs {
+        let pane_ids = tab.root().pane_ids();
+        for pane_id in pane_ids {
+            let Some(pane) = tab.root_mut().find_pane_mut(pane_id) else {
+                continue;
+            };
+            let agent_name = pane.agent_name.clone();
+            flush_notifications_for_pane(home, pane, |text| {
+                crate::inbox::inject_notification(home, &agent_name, text)
+            });
+        }
+    }
+}
+
+fn flush_notifications_for_pane<F>(home: &Path, pane: &mut Pane, mut injector: F)
+where
+    F: FnMut(&str) -> anyhow::Result<()>,
+{
+    if pane.pending_notification_count == 0 || pane.is_composing() {
+        return;
+    }
+    let queued = notification_queue::drain(home, &pane.agent_name);
+    if queued.is_empty() {
+        pane.pending_notification_count = 0;
+        return;
+    }
+
+    let mut failed_at = None;
+    for (idx, notification) in queued.iter().enumerate() {
+        if injector(&notification.text).is_err() {
+            failed_at = Some(idx);
+            break;
+        }
+    }
+    if let Some(idx) = failed_at {
+        notification_queue::requeue_all(home, &pane.agent_name, &queued[idx..]);
+    }
+    pane.pending_notification_count = notification_queue::pending_count(home, &pane.agent_name);
 }
 
 /// Adjust scroll offset of the focused pane by `delta` lines (positive = up, negative = down).
@@ -776,4 +833,56 @@ fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
         Err(_) => true,
     };
     alive
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::PaneSource;
+    use crate::vterm::VTerm;
+
+    fn tmp_home(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-app-phase2-{}-{}",
+            suffix,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn pane(name: &str) -> Pane {
+        Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam::channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    #[test]
+    fn flush_drains_queue_on_idle() {
+        let home = tmp_home("flush");
+        let mut pane = pane("agent1");
+        notification_queue::enqueue(&home, "agent1", "queued").expect("queue notification");
+        pane.pending_notification_count = notification_queue::pending_count(&home, "agent1");
+        let mut flushed = Vec::new();
+        flush_notifications_for_pane(&home, &mut pane, |text| {
+            flushed.push(text.to_string());
+            Ok(())
+        });
+        assert_eq!(flushed, vec!["queued".to_string()]);
+        assert_eq!(pane.pending_notification_count, 0);
+        std::fs::remove_dir_all(home).ok();
+    }
 }

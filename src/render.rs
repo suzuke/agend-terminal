@@ -398,8 +398,7 @@ fn render_node(
 struct PaneBorderInfo {
     area: Rect,
     border_style: Style,
-    title: String,
-    title_style: Style,
+    title_segments: Vec<(String, Style)>,
     priority: u8,
 }
 
@@ -468,11 +467,7 @@ fn render_pane(
         (s, s, 1u8)
     };
 
-    let title = if pane.backend.is_some() {
-        format!(" {} [{}] ", pane.label(), state.display_name())
-    } else {
-        format!(" {} ", pane.label())
-    };
+    let title_segments = pane_title_segments(pane, state, title_style);
 
     // Inner (content) area = outer shrunk 1 cell on every side, matching the
     // former Block::ALL inner. Borders are drawn later in `render_border_grid`
@@ -489,8 +484,7 @@ fn render_pane(
         return PaneBorderInfo {
             area,
             border_style,
-            title,
-            title_style,
+            title_segments,
             priority,
         };
     }
@@ -535,10 +529,34 @@ fn render_pane(
     PaneBorderInfo {
         area,
         border_style,
-        title,
-        title_style,
+        title_segments,
         priority,
     }
+}
+
+fn pane_title_segments(
+    pane: &crate::layout::Pane,
+    state: AgentState,
+    title_style: Style,
+) -> Vec<(String, Style)> {
+    let mut segments = Vec::new();
+    let base = if pane.backend.is_some() {
+        format!(" {} [{}]", pane.label(), state.display_name())
+    } else {
+        format!(" {}", pane.label())
+    };
+    segments.push((base, title_style));
+    if pane.pending_notification_count > 0 {
+        segments.push((
+            format!(" [{}]", pane.pending_notification_count),
+            Style::default()
+                .bg(Color::Yellow)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    segments.push((" ".to_string(), title_style));
+    segments
 }
 
 // --- Pane border grid (joined box-drawing across shared edges) ---
@@ -686,34 +704,36 @@ fn render_pane_titles(frame: &mut Frame, infos: &[PaneBorderInfo]) {
         let buf_right = buf_area.x.saturating_add(buf_area.width);
         let buf_bottom = buf_area.y.saturating_add(buf_area.height);
         let mut x = area.x.saturating_add(1);
-        for g in info.title.chars() {
-            // Unicode width fits in a `u8` in practice; clamp to u16 so a
-            // future width > 65535 would still terminate the loop safely.
-            let w = u16::try_from(UnicodeWidthChar::width(g).unwrap_or(0)).unwrap_or(u16::MAX);
-            if w == 0 {
-                continue;
-            }
-            if x.saturating_add(w) > last_usable_x {
-                break;
-            }
-            if x >= buf_right || y >= buf_bottom {
-                break;
-            }
-            let cell = &mut buf[(x, y)];
-            cell.set_char(g);
-            cell.set_style(info.title_style);
-            // For wide chars, blank out the trailing cells so residual border
-            // glyphs don't peek through.
-            for off in 1..w {
-                let tx = x.saturating_add(off);
-                if tx >= buf_right {
+        for (segment, style) in &info.title_segments {
+            for g in segment.chars() {
+                // Unicode width fits in a `u8` in practice; clamp to u16 so a
+                // future width > 65535 would still terminate the loop safely.
+                let w = u16::try_from(UnicodeWidthChar::width(g).unwrap_or(0)).unwrap_or(u16::MAX);
+                if w == 0 {
+                    continue;
+                }
+                if x.saturating_add(w) > last_usable_x {
                     break;
                 }
-                let trail = &mut buf[(tx, y)];
-                trail.set_char(' ');
-                trail.set_style(info.title_style);
+                if x >= buf_right || y >= buf_bottom {
+                    break;
+                }
+                let cell = &mut buf[(x, y)];
+                cell.set_char(g);
+                cell.set_style(*style);
+                // For wide chars, blank out the trailing cells so residual border
+                // glyphs don't peek through.
+                for off in 1..w {
+                    let tx = x.saturating_add(off);
+                    if tx >= buf_right {
+                        break;
+                    }
+                    let trail = &mut buf[(tx, y)];
+                    trail.set_char(' ');
+                    trail.set_style(*style);
+                }
+                x = x.saturating_add(w);
             }
-            x = x.saturating_add(w);
         }
     }
 }
@@ -1516,14 +1536,15 @@ pub fn render_scratch_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{Pane, PaneSource};
+    use crate::vterm::VTerm;
     use std::collections::HashMap;
 
     fn info(x: u16, y: u16, w: u16, h: u16) -> PaneBorderInfo {
         PaneBorderInfo {
             area: Rect::new(x, y, w, h),
             border_style: Style::default(),
-            title: String::new(),
-            title_style: Style::default(),
+            title_segments: Vec::new(),
             priority: 1,
         }
     }
@@ -1675,5 +1696,31 @@ mod tests {
         assert_eq!(open[1].title, "high-old", "high second");
         assert_eq!(open[2].title, "normal-old", "normal oldest third");
         assert_eq!(open[3].title, "normal-new", "normal newest last");
+    }
+
+    #[test]
+    fn badge_shows_pending_count() {
+        let pane = Pane {
+            agent_name: "agent".to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam::channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 3,
+            selection: None,
+            source: PaneSource::Local,
+        };
+        let segments = pane_title_segments(&pane, AgentState::Idle, Style::default());
+        let joined = segments
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect::<String>();
+        assert!(joined.contains("[3]"));
     }
 }

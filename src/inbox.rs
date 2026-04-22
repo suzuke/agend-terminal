@@ -158,15 +158,49 @@ pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, te
         text.to_string()
     };
     let notification = format!("[{source}] {display_text}{}", source.reply_hint());
+    let _ = route_notification(home, agent_name, &notification, |msg| {
+        inject_notification(home, agent_name, msg)
+    });
+}
 
-    // Use API socket to inject (doesn't kick attach clients)
-    let _ = crate::api::call(
+pub fn inject_notification(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+) -> anyhow::Result<()> {
+    let resp = crate::api::call(
         home,
         &serde_json::json!({
             "method": crate::api::method::INJECT,
-            "params": {"name": agent_name, "data": notification}
+            "params": {"name": agent_name, "data": notification, "raw": true}
         }),
-    );
+    )?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{}",
+            resp["error"]
+                .as_str()
+                .unwrap_or("notification inject failed")
+        );
+    }
+}
+
+fn route_notification<F>(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+    mut injector: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&str) -> anyhow::Result<()>,
+{
+    if crate::notification_queue::is_composing(home, agent_name) {
+        crate::notification_queue::enqueue(home, agent_name, notification)?;
+        return Ok(());
+    }
+    injector(notification)
 }
 
 #[cfg(test)]
@@ -188,6 +222,18 @@ mod tests {
             kind: None,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
         }
+    }
+
+    fn mark_composing(home: &Path, agent: &str) {
+        std::fs::create_dir_all(home.join("metadata")).ok();
+        std::fs::write(
+            home.join("metadata").join(format!("{agent}.json")),
+            format!(
+                "{{\"last_input_epoch_ms\":{}}}",
+                chrono::Utc::now().timestamp_millis()
+            ),
+        )
+        .ok();
     }
 
     #[test]
@@ -254,6 +300,35 @@ mod tests {
             assert_eq!(msgs[0].from, format!("t{i}"));
         }
 
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn notify_queues_when_composing() {
+        let home = tmp_home("notify-queue");
+        mark_composing(&home, "agent1");
+        let mut injected = false;
+        route_notification(&home, "agent1", "queued", |_| {
+            injected = true;
+            Ok(())
+        })
+        .expect("route should queue");
+        assert!(!injected);
+        assert_eq!(crate::notification_queue::pending_count(&home, "agent1"), 1);
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn notify_injects_when_idle() {
+        let home = tmp_home("notify-idle");
+        let mut injected = Vec::new();
+        route_notification(&home, "agent1", "sent", |msg| {
+            injected.push(msg.to_string());
+            Ok(())
+        })
+        .expect("route should inject");
+        assert_eq!(injected, vec!["sent".to_string()]);
+        assert_eq!(crate::notification_queue::pending_count(&home, "agent1"), 0);
         fs::remove_dir_all(&home).ok();
     }
 
