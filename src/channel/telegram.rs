@@ -85,6 +85,26 @@ fn telegram_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// Run a future on the Telegram runtime. If already inside an async context
+/// (e.g. Telegram polling → emit path), spawns a fire-and-forget task on the
+/// current runtime to avoid `block_on`-inside-runtime panic. Returns `Ok(())`
+/// for the spawned path since the result is not awaited.
+fn spawn_or_block_on<F>(fut: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if let Err(e) = fut.await {
+                tracing::warn!(%e, "telegram spawn task failed");
+            }
+        });
+        Ok(())
+    } else {
+        telegram_runtime().block_on(fut)
+    }
+}
+
 pub struct TelegramState {
     /// `None` only inside the contract-test harness — production `new`
     /// always populates it via `Bot::new`. Transport methods unwrap with
@@ -874,6 +894,33 @@ fn telegram_reply_send_inner(
     if let Some(err) = tests::take_forced_send_error() {
         return Err(err);
     }
+    // If already inside an async runtime, block_on would panic. Spawn
+    // fire-and-forget instead and return a sentinel msg_id. Callers from
+    // the emit path log-and-discard errors, so this is safe.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let token = ch.token.clone();
+        let group_id = ch.group_id;
+        let text = text.to_string();
+        let instance_name = instance_name.to_string();
+        handle.spawn(async move {
+            let bot = teloxide::Bot::new(&token);
+            let chat_id = teloxide::types::ChatId(group_id);
+            let res = match topic_id {
+                Some(1) | None => bot.send_message(chat_id, &text).await,
+                Some(tid) => {
+                    bot.send_message(chat_id, &text)
+                        .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(
+                            tid,
+                        )))
+                        .await
+                }
+            };
+            if let Err(e) = res {
+                tracing::warn!(%e, %instance_name, "reply spawn failed");
+            }
+        });
+        return Ok(0);
+    }
     telegram_runtime().block_on(async {
         let bot = teloxide::Bot::new(&ch.token);
         let chat_id = teloxide::types::ChatId(ch.group_id);
@@ -995,14 +1042,12 @@ pub fn try_telegram_react(
     if mid == 0 {
         anyhow::bail!("No message_id to react to");
     }
-    let emoji_char = map_emoji_name(emoji);
-    telegram_runtime().block_on(async {
+    let emoji_char = map_emoji_name(emoji).to_string();
+    spawn_or_block_on(async move {
         let bot = teloxide::Bot::new(&ch.token);
         let chat_id = teloxide::types::ChatId(ch.group_id);
         let msg_id = teloxide::types::MessageId(mid);
-        let reaction = teloxide::types::ReactionType::Emoji {
-            emoji: emoji_char.to_string(),
-        };
+        let reaction = teloxide::types::ReactionType::Emoji { emoji: emoji_char };
         bot.set_message_reaction(chat_id, msg_id)
             .reaction(vec![reaction])
             .await?;
@@ -1016,12 +1061,13 @@ pub fn try_telegram_edit(_instance_name: &str, message_id: &str, text: &str) -> 
     let mid: i32 = message_id
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid message_id: {message_id}"))?;
-    telegram_runtime().block_on(async {
+    let text = text.to_string();
+    spawn_or_block_on(async move {
         let bot = teloxide::Bot::new(&ch.token);
         bot.edit_message_text(
             teloxide::types::ChatId(ch.group_id),
             teloxide::types::MessageId(mid),
-            text,
+            &text,
         )
         .await?;
         Ok::<(), anyhow::Error>(())
