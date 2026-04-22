@@ -124,9 +124,6 @@ jobs:
       - name: Build (release, --features tray)
         run: cargo build --release --features tray
 
-      - name: Validate .desktop
-        run: desktop-file-validate assets/appimage/agend-terminal.desktop
-
       - name: Stage AppDir
         run: |
           set -euo pipefail
@@ -141,10 +138,22 @@ jobs:
           cp AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png AppDir/agend-terminal.png
           cp AppDir/usr/share/applications/agend-terminal.desktop AppDir/agend-terminal.desktop
 
+      # Validate the staged copy — the one that actually goes into the
+      # AppImage, not just the source file in assets/.
+      - name: Validate .desktop
+        run: desktop-file-validate AppDir/agend-terminal.desktop
+
       # Pin both tools + verify sha256. A release pipeline's trust boundary is
       # tighter than CI's — `continuous` + `master` are moving targets and any
       # upstream push (benign or not) lands directly in tagged artifacts.
       # Bump deliberately when upstream ships something we want.
+      #
+      # Linuxdeploy doesn't do proper semver releases; current tag convention
+      # is `1-alpha-<YYYYMMDD>-N`. To bump:
+      #   - latest tag: https://github.com/linuxdeploy/linuxdeploy/releases
+      #   - asset digest: gh api repos/linuxdeploy/linuxdeploy/releases/tags/<tag>
+      # plugin-gtk has no releases; pin by commit SHA from master history:
+      #   https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/commits/master
       - name: Download + verify linuxdeploy + plugin-gtk
         env:
           LINUXDEPLOY_TAG: "1-alpha-20251107-1"
