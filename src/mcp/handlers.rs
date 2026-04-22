@@ -174,6 +174,24 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     summary: task.to_string(),
                     task_id: None,
                 }));
+                // S2d provenance injection (DESIGN §6). Only DELEGATE
+                // triggers this: the receiving agent's topic gets a
+                // "who sent this to you" tag alongside the task body.
+                // Non-propagating: `send_to` already succeeded, so even
+                // if the provenance side-channel fails we keep the
+                // main result untouched. `warn!` (not silent debug) per
+                // DESIGN §4 Q4 — provenance failure may signal a real
+                // routing bug worth an operator's attention.
+                if let Err(e) =
+                    crate::channel::telegram::inject_provenance(target, sender.as_str(), task)
+                {
+                    tracing::warn!(
+                        %e,
+                        target = %target,
+                        from = %sender.as_str(),
+                        "S2d provenance injection failed — routing may be broken"
+                    );
+                }
             }
             result
         }
@@ -1440,6 +1458,113 @@ instances:
         assert!(
             events.is_empty(),
             "request_information must NOT emit FleetEvent (design §8 exclusion): {events:?}"
+        );
+
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ---------------------------------------------------------------------
+    // S2d provenance injection tests (Stage B-UX PR-C, design §6 + §4 Q4)
+    //
+    // In test env, no Telegram bot is configured, so
+    // `inject_provenance` hits `resolve_channel()` and bails with
+    // `no_channel_configured`. That's exactly the failure mode these
+    // pins exercise: we want the handler to stay clean when provenance
+    // can't be delivered (main `send_to` result untouched, fleet event
+    // still emitted), AND we want the `tracing::warn!` to actually fire
+    // so operators have a signal that routing might be broken.
+    // ---------------------------------------------------------------------
+
+    /// Negative pin (main-path isolation): when `inject_provenance`
+    /// fails, the handler's returned JSON must NOT carry any provenance
+    /// text, and the FleetEvent::DelegateTask must STILL emit.
+    ///
+    /// Why this pin: a naive refactor that threaded `inject_provenance`
+    /// into `send_to`'s pipeline (rather than fanning it out as a
+    /// side-channel) could pollute the caller's response or suppress
+    /// the fleet event on provenance failure — this pin catches both.
+    #[test]
+    fn delegate_task_main_response_clean_when_provenance_fails() {
+        let _g = fleet_test_guard();
+        let (rec, home) = setup_recorder("fleet_prov_main_clean");
+
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "do the thing"}),
+            "sender",
+        );
+
+        // Main path untouched: the handler still returns an ok result.
+        assert!(
+            is_ok_result(&result),
+            "delegate_task must succeed even when provenance fails: {result}"
+        );
+
+        // Main response clean: no provenance-failure bleed into the
+        // caller-visible JSON. Check both the rendered text and raw
+        // JSON so a future refactor that tucks the error into a nested
+        // field still trips the pin.
+        let rendered = result.to_string();
+        assert!(
+            !rendered.to_lowercase().contains("provenance"),
+            "main response leaked provenance text: {rendered}"
+        );
+        assert!(
+            !rendered.contains("⬅️"),
+            "main response leaked provenance tag glyph: {rendered}"
+        );
+
+        // Fleet visibility preserved: DelegateTask still reaches the sink.
+        let events = rec.snapshot();
+        assert_eq!(
+            events.len(),
+            1,
+            "FleetEvent must still emit when provenance fails: {events:?}"
+        );
+        assert!(
+            matches!(&events[0], UxEvent::Fleet(FleetEvent::DelegateTask { .. })),
+            "unexpected event variant: {:?}",
+            events[0]
+        );
+
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Failure-visibility pin (DESIGN §4 Q4): `inject_provenance` failure
+    /// MUST produce a `tracing::warn!` record, not a silent drop.
+    ///
+    /// Why this pin: Q4 explicitly overrode the initial silent-log bias
+    /// with warn-level because provenance failures can indicate real
+    /// routing bugs (wrong topic_id for target) that otherwise decay
+    /// silently. A future edit that downgrades to `debug!` or removes
+    /// the `tracing::warn!` call entirely would lose that signal; this
+    /// pin asserts the warn record is actually emitted.
+    ///
+    /// `tracing-test`'s `#[traced_test]` attaches a capturing subscriber
+    /// for the duration of this test; `logs_contain` scans captured
+    /// records for a substring match.
+    #[test]
+    #[tracing_test::traced_test]
+    fn delegate_task_provenance_failure_logs_tracing_warn() {
+        let _g = fleet_test_guard();
+        let (_rec, home) = setup_recorder("fleet_prov_warn");
+
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "do the thing"}),
+            "sender",
+        );
+        assert!(is_ok_result(&result), "handler must succeed: {result}");
+
+        // The warn carries the DESIGN §6 signature phrase. Pinning the
+        // exact message substring (not just "warn level fired") keeps
+        // the pin from passing on an unrelated warn that happened to
+        // fire during the handler run.
+        assert!(
+            logs_contain("S2d provenance injection failed"),
+            "DESIGN §4 Q4 warn record was not emitted",
         );
 
         std::env::remove_var("AGEND_HOME");

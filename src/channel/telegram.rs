@@ -799,14 +799,28 @@ fn resolve_channel_only() -> anyhow::Result<TelegramCreds> {
     resolve_channel().map(|(ch, _)| ch)
 }
 
-/// Send a reply from an instance to its Telegram topic. Returns (message_id, chat_id).
-pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
-    let (ch, config) = resolve_channel()?;
-    let topic_id = config
-        .instances
-        .get(instance_name)
-        .and_then(|inst| inst.topic_id);
-    let result = telegram_runtime().block_on(async {
+/// Core bot-send primitive shared by [`try_telegram_reply`] and
+/// [`try_telegram_reply_no_cleanup`]. Performs the actual teloxide
+/// call and returns the message id; does NOT classify errors, run
+/// cleanup, or touch fleet state. Both public wrappers own the
+/// error-branch policy (cleanup or not) so the shared core stays
+/// non-authoritative.
+///
+/// `#[cfg(test)]` gate: pinning side-channel isolation (the PR #57
+/// round-2 finding) requires forcing the post-send branch to hit a
+/// topic-deleted error without a live Bot. Prod builds skip the gate
+/// entirely.
+fn telegram_reply_send_inner(
+    ch: &TelegramCreds,
+    instance_name: &str,
+    topic_id: Option<i32>,
+    text: &str,
+) -> anyhow::Result<i32> {
+    #[cfg(test)]
+    if let Some(err) = tests::take_forced_send_error() {
+        return Err(err);
+    }
+    telegram_runtime().block_on(async {
         let bot = teloxide::Bot::new(&ch.token);
         let chat_id = teloxide::types::ChatId(ch.group_id);
         let sent = match topic_id {
@@ -823,14 +837,89 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
             }
         };
         Ok::<i32, anyhow::Error>(sent.id.0)
-    });
-    match result {
+    })
+}
+
+/// Send a reply from an instance to its Telegram topic. Returns (message_id, chat_id).
+///
+/// On topic-deleted errors, runs the cleanup path
+/// ([`handle_send_failure`] → [`cleanup_deleted_topic`]) — appropriate
+/// for the main send pathway where a deleted topic means the instance
+/// is gone from the operator's side. Side-channels that MUST NOT have
+/// this authority (e.g. S2d provenance per DESIGN §6) use
+/// [`try_telegram_reply_no_cleanup`] instead.
+pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
+    let (ch, config) = resolve_channel()?;
+    let topic_id = config
+        .instances
+        .get(instance_name)
+        .and_then(|inst| inst.topic_id);
+    match telegram_reply_send_inner(&ch, instance_name, topic_id, text) {
         Ok(msg_id) => Ok((msg_id, ch.group_id)),
         Err(e) => {
             handle_send_failure(&e, &crate::home_dir(), instance_name, topic_id, None);
             Err(e)
         }
     }
+}
+
+/// Like [`try_telegram_reply`] but the error branch does NOT run
+/// [`handle_send_failure`] / [`cleanup_deleted_topic`] — reserved for
+/// orthogonal side-channels that must not be authoritative over fleet
+/// membership.
+///
+/// Reviewer context (at-dev-4 on PR #57 round 2): without this, the
+/// S2d provenance side-channel inherited `try_telegram_reply`'s
+/// cleanup authority. If the target's main topic was deleted and
+/// `inject_provenance` happened to fire afterwards, the cleanup path
+/// would rip the target instance out of fleet.yaml / topic registry —
+/// a destructive side effect that violates DESIGN §6 ("pure
+/// side-channel, no mutation of main state"). This variant closes
+/// that hole: the caller gets the error to `warn!` on, the shared
+/// fleet state stays untouched.
+pub fn try_telegram_reply_no_cleanup(
+    instance_name: &str,
+    text: &str,
+) -> anyhow::Result<(i32, i64)> {
+    let (ch, config) = resolve_channel()?;
+    let topic_id = config
+        .instances
+        .get(instance_name)
+        .and_then(|inst| inst.topic_id);
+    telegram_reply_send_inner(&ch, instance_name, topic_id, text)
+        .map(|msg_id| (msg_id, ch.group_id))
+}
+
+/// Format the S2d provenance tag body per DESIGN-stage-b-ux.md §6.
+///
+/// Shape: `⬅️ from {from} — DELEGATE\n   (brief: "{brief}")`.
+///
+/// Extracted as a pure fn (not inlined into [`inject_provenance`]) so
+/// the §4 value-source regression pin can lock the rendered text
+/// without needing a live Bot / env config.
+pub(crate) fn format_provenance(from: &str, brief: &str) -> String {
+    format!("⬅️ from {from} — DELEGATE\n   (brief: \"{brief}\")")
+}
+
+/// S2d provenance injection (Stage B-UX PR-C, DESIGN §6).
+///
+/// When `delegate_task` succeeds, the daemon calls this to send a
+/// short "who sent this to you" tag into `target_instance`'s primary
+/// topic. The injection is orthogonal to the actual delegated message
+/// — it's a side-channel hint so the recipient's operator (watching
+/// the topic in Telegram) can tell at a glance which agent the task
+/// came from.
+///
+/// Routes through [`try_telegram_reply_no_cleanup`] so a failed send
+/// never mutates fleet membership (see reviewer context on that fn).
+/// The returned error is passed back unchanged so the caller can
+/// `tracing::warn!` per §4 Q4 (chosen over silent drop: provenance
+/// failure may signal a real routing bug — topic_id pointing at the
+/// wrong instance — that deserves log visibility, even though it
+/// doesn't block the main path).
+pub fn inject_provenance(target_instance: &str, from: &str, brief: &str) -> anyhow::Result<()> {
+    let text = format_provenance(from, brief);
+    try_telegram_reply_no_cleanup(target_instance, &text).map(|_| ())
 }
 
 /// React to a message with an emoji.
@@ -1430,6 +1519,23 @@ impl crate::channel::ux_event::UxEventSink for TelegramChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Test-only error injector for `telegram_reply_send_inner` — lets
+    // regression pins force the post-send branch to hit a specific
+    // error (e.g. "message thread not found") without a live Bot /
+    // network. Serialized through `fleet_test_guard` via the caller,
+    // so the plain `Mutex<Option<_>>` is sufficient.
+    // -----------------------------------------------------------------
+    static FORCED_SEND_ERROR: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+
+    pub(super) fn take_forced_send_error() -> Option<anyhow::Error> {
+        crate::sync::lock_poisoned(&FORCED_SEND_ERROR, "forced_send_error").take()
+    }
+
+    fn set_forced_send_error(err: anyhow::Error) {
+        *crate::sync::lock_poisoned(&FORCED_SEND_ERROR, "forced_send_error") = Some(err);
+    }
 
     #[test]
     fn telegram_state_new_builds_reverse_map() {
@@ -2142,5 +2248,178 @@ instances:
         assert!(!handle_send_failure(&gone, &home, "any", None, None));
         // Topic-deleted + topic_id → fires.
         assert!(handle_send_failure(&gone, &home, "any", Some(42), None));
+    }
+
+    /// Value-source pin (Reviewer Contract v0.1 §4) for S2d provenance.
+    ///
+    /// DESIGN-stage-b-ux.md §6 fixes the exact wire-shape of the
+    /// provenance tag: `⬅️ from {from} — DELEGATE\n   (brief: "{brief}")`.
+    /// Any field mixing (e.g., rendering `brief` where `from` belongs, or
+    /// losing the em-dash / arrow glyph) would silently reshape the
+    /// recipient-side UX. Lock the exact bytes for a known input.
+    #[test]
+    fn format_provenance_matches_design_s6_shape() {
+        // Known distinct values so a swapped-argument bug would fail.
+        let rendered = format_provenance("at-dev-1", "refactor auth middleware");
+        assert_eq!(
+            rendered,
+            "⬅️ from at-dev-1 — DELEGATE\n   (brief: \"refactor auth middleware\")"
+        );
+    }
+
+    /// Source-of-fields pin: swapping `from` and `brief` must produce a
+    /// visibly different string (i.e. we're not symmetric on the two
+    /// inputs — the shape distinguishes who-sent from what-they-sent).
+    /// Catches a refactor that accidentally passes args in the wrong
+    /// order at the inject_provenance call site.
+    #[test]
+    fn format_provenance_distinguishes_from_and_brief_slots() {
+        let normal = format_provenance("a", "b");
+        let swapped = format_provenance("b", "a");
+        assert_ne!(normal, swapped, "from/brief slots must not be symmetric");
+        assert!(normal.contains("from a"));
+        assert!(normal.contains("(brief: \"b\")"));
+    }
+
+    /// Shared lock for tests that mutate `AGEND_HOME` / bot-token env
+    /// and the `FORCED_SEND_ERROR` injector. Tests run in parallel by
+    /// default; these env-touching tests must serialize.
+    fn channel_env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        crate::sync::lock_poisoned(&GUARD, "channel_env_test_guard")
+    }
+
+    /// Round-2 reviewer finding on PR #57 (at-dev-4, blocking):
+    /// `inject_provenance` used to route through `try_telegram_reply`,
+    /// whose error branch runs `handle_send_failure` →
+    /// `cleanup_deleted_topic`. If the target's main topic was ever
+    /// deleted, a provenance side-call would then rip the target
+    /// instance out of `fleet.yaml` and the topic registry — a
+    /// cleanup authority that DESIGN §6 explicitly denies the
+    /// side-channel ("pure side-channel, no mutation of main state").
+    ///
+    /// Pin setup:
+    /// - Write a fleet.yaml with channel block + target instance "B"
+    ///   (topic_id 42).
+    /// - Write a topics.json registering "B" → 42.
+    /// - Force `telegram_reply_send_inner` to return the exact
+    ///   topic-deleted error (`"Bad Request: message thread not
+    ///   found"`) that would trigger cleanup in `try_telegram_reply`.
+    /// - Call `inject_provenance("B", ...)`.
+    ///
+    /// Assertions (all must hold):
+    /// - inject_provenance propagates the error (caller's `warn!` fires).
+    /// - `fleet.yaml` still contains instance "B" (no rewrite).
+    /// - `topics.json` still contains "B" → 42 (no unregister).
+    ///
+    /// Validated against the pre-fix wiring (inject_provenance using
+    /// `try_telegram_reply` with cleanup) — pin FAILS there because
+    /// `remove_instance_from_yaml` strips "B". Restored to
+    /// `try_telegram_reply_no_cleanup` → PASSES.
+    #[test]
+    fn inject_provenance_failure_does_not_mutate_fleet_or_topic_registry() {
+        let _g = channel_env_test_guard();
+        let home = tmp_home("inject_prov_no_cleanup");
+
+        // Full fleet.yaml with channel block + target instance "B".
+        // Using a distinct bot_token_env name so concurrent suites
+        // don't accidentally satisfy `resolve_channel`.
+        let yaml = "\
+channel:
+  type: telegram
+  bot_token_env: PR57_ROUND2_FAKE_TOKEN
+  group_id: -100999999
+  mode: topic
+instances:
+  B:
+    command: /bin/true
+    topic_id: 42
+";
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+
+        // Seed topic registry: "B" → 42.
+        std::fs::create_dir_all(home.join("channel")).ok();
+        std::fs::write(home.join("channel").join("topics.json"), "{\"B\":42}")
+            .expect("write topics.json");
+
+        // Point the home resolver + satisfy the env-token check.
+        std::env::set_var("AGEND_HOME", &home);
+        std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
+
+        // Inject the exact topic-deleted error shape
+        // `is_topic_deleted_error` matches on.
+        set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
+
+        let res = inject_provenance("B", "sender", "do the thing");
+        assert!(
+            res.is_err(),
+            "inject_provenance should bubble the forced error"
+        );
+
+        // Fleet membership pin: fleet.yaml must still contain "B".
+        let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        assert!(
+            fleet_yaml.contains("B:"),
+            "provenance failure mutated fleet.yaml (removed B): {fleet_yaml}"
+        );
+
+        // Topic registry pin: "B" → 42 must still be there.
+        let topics_json =
+            std::fs::read_to_string(home.join("channel").join("topics.json")).unwrap_or_default();
+        assert!(
+            topics_json.contains("\"B\""),
+            "provenance failure unregistered target's topic: {topics_json}"
+        );
+
+        // Cleanup env to avoid bleeding into other tests.
+        std::env::remove_var("AGEND_HOME");
+        std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Sibling pin (baseline): confirms the cleanup path ACTUALLY
+    /// fires in the variant that still owns cleanup authority. Without
+    /// this, the no-cleanup pin above could pass vacuously if
+    /// `cleanup_deleted_topic` happened to be a no-op in the test
+    /// harness. Seeding the same state and calling the cleanup-variant
+    /// establishes the "bug shape" the no-cleanup pin is absent.
+    #[test]
+    fn try_telegram_reply_cleanup_variant_mutates_fleet_on_topic_deleted() {
+        let _g = channel_env_test_guard();
+        let home = tmp_home("cleanup_variant_baseline");
+
+        let yaml = "\
+channel:
+  type: telegram
+  bot_token_env: PR57_ROUND2_FAKE_TOKEN
+  group_id: -100999999
+  mode: topic
+instances:
+  B:
+    command: /bin/true
+    topic_id: 42
+";
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::create_dir_all(home.join("channel")).ok();
+        std::fs::write(home.join("channel").join("topics.json"), "{\"B\":42}")
+            .expect("write topics.json");
+
+        std::env::set_var("AGEND_HOME", &home);
+        std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
+        set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
+
+        // With cleanup: expect the fleet entry to be stripped.
+        let res = try_telegram_reply("B", "main-path send");
+        assert!(res.is_err());
+
+        let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        assert!(
+            !fleet_yaml.contains("B:"),
+            "baseline: cleanup-variant must strip B on topic-deleted; yaml was:\n{fleet_yaml}"
+        );
+
+        std::env::remove_var("AGEND_HOME");
+        std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
