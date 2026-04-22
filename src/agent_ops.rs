@@ -68,6 +68,9 @@ pub fn merge_metadata(home: &Path, name: &str, info: &mut Value) {
 }
 
 /// Persist a single metadata key/value for an instance.
+///
+/// Uses atomic write (temp file + rename) so concurrent readers
+/// (e.g. supervisor tick) never see a half-written file.
 pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) {
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
@@ -76,10 +79,11 @@ pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) 
         .map(|c| serde_json::from_str(&c).unwrap_or(json!({})))
         .unwrap_or(json!({}));
     meta[key] = value;
-    let _ = std::fs::write(
-        &meta_path,
-        serde_json::to_string_pretty(&meta).unwrap_or_default(),
-    );
+    let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
+    let tmp_path = meta_path.with_extension("json.tmp");
+    if std::fs::write(&tmp_path, &content).is_ok() {
+        let _ = std::fs::rename(&tmp_path, &meta_path);
+    }
 }
 
 // ---------------------------------------------------------------------------

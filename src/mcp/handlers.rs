@@ -38,6 +38,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let sender: Option<Sender> = Sender::new(instance_name).or_else(Sender::from_env);
     let instance_name: &str = sender.as_ref().map(Sender::as_str).unwrap_or("");
 
+    // Implicit heartbeat: any MCP tool call = agent is alive.
+    if !instance_name.is_empty() {
+        save_metadata(
+            &home,
+            instance_name,
+            "last_heartbeat",
+            json!(chrono::Utc::now().to_rfc3339()),
+        );
+    }
+
     match tool {
         // --- Channel ---
         "reply" => {
@@ -575,6 +585,19 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             let desc = args["description"].as_str().unwrap_or("");
             save_metadata(&home, instance_name, "description", json!(desc));
             json!({"description": desc})
+        }
+        "set_waiting_on" => {
+            let condition = args["condition"].as_str().unwrap_or("");
+            if condition.is_empty() {
+                save_metadata(&home, instance_name, "waiting_on", json!(null));
+                save_metadata(&home, instance_name, "waiting_on_since", json!(null));
+                json!({"cleared": true})
+            } else {
+                let now = chrono::Utc::now().to_rfc3339();
+                save_metadata(&home, instance_name, "waiting_on", json!(condition));
+                save_metadata(&home, instance_name, "waiting_on_since", json!(&now));
+                json!({"waiting_on": condition, "since": now})
+            }
         }
         "move_pane" => {
             // Route through the API so the running TUI receives a PaneMoved
