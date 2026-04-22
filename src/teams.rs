@@ -130,6 +130,17 @@ pub fn update(home: &Path, args: &Value) -> Value {
     }
 }
 
+/// Remove an instance from ALL teams. Auto-delete teams that become empty.
+pub fn remove_member_from_all(home: &Path, instance_name: &str) {
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut TeamStore| {
+        for team in &mut store.teams {
+            team.members.retain(|m| m != instance_name);
+        }
+        store.teams.retain(|t| !t.members.is_empty());
+        Ok(true)
+    });
+}
+
 /// Get members of a team.
 pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
     let store = load(home);
