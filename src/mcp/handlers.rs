@@ -763,10 +763,8 @@ mod tests {
         dir
     }
 
-    // `validate_branch` tests migrated to `src/agent_ops.rs` as part of
-    // Task #9 Option C (Commit 1). The inline definition in this file is
-    // still in use; Commit 2 deletes it and switches callers to
-    // `crate::agent_ops::validate_branch`.
+    // `validate_branch` tests live in `src/agent_ops.rs` — migrated there
+    // as part of Task #9 Option C.
 
     // merge_metadata tests
     #[test]

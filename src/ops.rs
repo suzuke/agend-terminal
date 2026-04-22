@@ -579,10 +579,8 @@ mod tests {
     }
 
     // Utility-fn tests (validate_branch, merge_metadata, save_metadata,
-    // get_submit_key, cleanup_working_dir) migrated to `src/agent_ops.rs`
-    // as part of Task #9 Option C (Commit 1). The inline definitions in
-    // this file are still in use; Commit 2 deletes them and switches
-    // callers to `crate::agent_ops::*`.
+    // get_submit_key, cleanup_working_dir) live in `src/agent_ops.rs` —
+    // migrated there as part of Task #9 Option C.
 
     #[test]
     fn no_mcp_prefix_in_ops() {

@@ -12,8 +12,6 @@ pub(crate) mod team;
 use crate::agent::{AgentRegistry, ExternalRegistry};
 use crate::api::{ApiNotifier, ConfigRegistry};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 /// Shared context passed to extracted handler functions.
 ///
@@ -24,12 +22,14 @@ use std::sync::Arc;
 /// - Handler signature: `pub(crate) fn handle_X(params: &Value, ctx: &HandlerCtx) -> Value`
 /// - Handlers return the full JSON response (including `{"ok": true, ...}`)
 /// - Handlers must not write to the TCP stream directly
-#[allow(dead_code)] // Fields used by future slices (B/C1/C2/D)
+///
+/// Note: the `SHUTDOWN` method is handled inline in `handle_session` and
+/// does not go through a `HandlerCtx`-based handler, so the shutdown flag
+/// is intentionally absent here.
 pub(crate) struct HandlerCtx<'a> {
     pub registry: &'a AgentRegistry,
     pub configs: &'a ConfigRegistry,
     pub externals: &'a ExternalRegistry,
     pub notifier: Option<&'a dyn ApiNotifier>,
     pub home: &'a Path,
-    pub shutdown: &'a Arc<AtomicBool>,
 }

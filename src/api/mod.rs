@@ -304,7 +304,6 @@ fn handle_session(
             externals,
             notifier,
             home,
-            shutdown,
         };
 
         let response = match method {
