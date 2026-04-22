@@ -1,6 +1,6 @@
 //! Bisect tool for the Windows 11 Insider Dev 26200 ConPTY regression.
 //!
-//! See `docs/HANDOVER-windows-conpty-nested.md`. `pty_smoke v1` (baseline, no
+//! See `docs/archived/HANDOVER-windows-conpty-nested.md`. `pty_smoke v1` (baseline, no
 //! glue) gets 20 bytes of cmd.exe banner on 26200. `agend-terminal daemon`
 //! gets 0 bytes. This binary incrementally adds the structural pieces of
 //! `src/agent.rs::spawn_agent` until the output drops to 0 — the step that

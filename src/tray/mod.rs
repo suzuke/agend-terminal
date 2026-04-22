@@ -1,7 +1,7 @@
 //! Menu-bar / system-tray resident app.
 //!
 //! Gated behind the `tray` Cargo feature. See
-//! `docs/PLAN-tray-resident.md` for the full design.
+//! `docs/archived/PLAN-tray-resident.md` for the full design.
 
 // Autostart / terminal modules are wired up incrementally across follow-on
 // tasks; keep the scaffold exports alive without warnings in the meantime.

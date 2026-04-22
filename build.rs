@@ -6,7 +6,7 @@ fn main() {
         // binary as a legacy app and applies ConPTY/console compatibility
         // shims — which on Insider Dev builds (>=26200) silently break child
         // output from `CreatePseudoConsole`. WezTerm and conhost-derived tools
-        // ship an equivalent manifest. See docs/HANDOVER-windows-conpty-nested.md.
+        // ship an equivalent manifest. See docs/archived/HANDOVER-windows-conpty-nested.md.
         println!("cargo:rerun-if-changed=assets/windows/agend-terminal.rc");
         println!("cargo:rerun-if-changed=assets/windows/agend-terminal.manifest");
         embed_resource::compile("assets/windows/agend-terminal.rc", embed_resource::NONE);

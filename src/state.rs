@@ -161,7 +161,7 @@ impl StatePatterns {
                 // [measured] Completion glyph `⏺` (U+23FA RECORD) prefixes
                 // tool-name banners like `⏺ Write(...)` in 2.1.98. Previously
                 // only `●` (U+25CF) was in the class, so `⏺ Write(...)` lines
-                // never matched — see docs/FOLLOWUP-tooluse-pattern-gaps.md.
+                // never matched — see docs/archived/FOLLOWUP-tooluse-pattern-gaps.md.
                 // In-flight banners use -ing verbs (`⏺ Listing ...`,
                 // `⏺ Reading ...`) rather than the bare tool name shown on
                 // the completion banner — covered by the alternation below.

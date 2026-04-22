@@ -2,7 +2,7 @@
 //!
 //! MVP: single `terminal` key. Missing file → defaults. Malformed →
 //! warn-and-default (the tray must never crash on parse). See
-//! `docs/PLAN-tray-resident.md` §"tray.toml (MVP schema)".
+//! `docs/archived/PLAN-tray-resident.md` §"tray.toml (MVP schema)".
 
 use std::path::Path;
 

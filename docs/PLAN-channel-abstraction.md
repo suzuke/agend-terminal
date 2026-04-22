@@ -2,7 +2,7 @@
 
 **Branch:** `feat/channel-abstraction` (to be created when implementation starts)
 **Date:** 2026-04-20
-**Related:** `docs/PLAN-telegram-topic-delete-sync.md` (can be folded into this plan's Stage A if implemented together)
+**Related:** `docs/archived/PLAN-telegram-topic-delete-sync.md` (SHIPPED; would have been folded into this plan's Stage A)
 
 ---
 

@@ -25,7 +25,7 @@ include = [
 [lints.clippy]
 unwrap_used = "deny"
 
-# Menu-bar / system-tray resident app (see docs/PLAN-tray-resident.md).
+# Menu-bar / system-tray resident app (see docs/archived/PLAN-tray-resident.md).
 # Default build stays lean: `tray-icon` + `tao` only pull in when
 # `--features tray` is passed (release binaries ship with it).
 [features]
