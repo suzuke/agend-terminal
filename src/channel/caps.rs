@@ -47,8 +47,12 @@ pub struct ChannelCapabilities {
     pub edit: bool,
     /// Does the channel support "typing…" indicators?
     pub typing_indicator: bool,
-    /// Does the transport push `MessageEdited` events (Discord yes,
-    /// Telegram no)?
+    /// Does the transport push `MessageEdited` events? Discord pushes
+    /// `messageUpdate`; Telegram delivers `edited_message` /
+    /// `edited_channel_post` through `getUpdates` when the bot includes
+    /// those kinds in `allowed_updates`. Set `true` when the capability
+    /// exists at the platform level, even if the adapter has not yet
+    /// surfaced them through its `poll_event` implementation.
     pub receives_edit_events: bool,
     /// Mention syntax the UX renderer should use when referencing
     /// another user.

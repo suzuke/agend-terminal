@@ -895,16 +895,78 @@ pub struct TelegramChannel {
 
 impl TelegramChannel {
     pub fn new(state: Arc<Mutex<TelegramState>>) -> Self {
-        let caps = crate::channel::ChannelCapabilities {
+        use crate::channel::{
+            ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint,
+        };
+        let caps = ChannelCapabilities {
+            // ── Transport-layer ──────────────────────────────────────
+            // Telegram sends no native topic-delete event; removals are
+            // detected on the next API call into the topic.
             emits_deletion_events: false,
+            // Forum groups expose native topics via `message_thread_id`.
             threads: true,
+            // Inline keyboards exist at the Bot API level, but this
+            // adapter does not render them. Flip when the UX layer wires
+            // `InlineKeyboardMarkup` through `OutMsg`.
             buttons: false,
+            // sendDocument / sendPhoto / sendVideo / sendAudio all
+            // supported via Bot API.
             attachments: true,
-            react: true,
-            edit: true,
-            markdown: crate::channel::MarkdownDialect::MarkdownV2,
+            // MarkdownV2 is the dialect the outbound formatter targets
+            // (see `escape_markdown_v2`); HTML is also available but we
+            // commit to one dialect per adapter.
+            markdown: MarkdownDialect::MarkdownV2,
+            // Bot API hard cap on a single text message.
+            // Ref: https://core.telegram.org/bots/api#sendmessage
             max_msg_bytes: 4096,
-            ..Default::default()
+            // Telegram's documented bulk-send rate guidance is ≤1 msg/s
+            // per chat and ≤20 msgs/min per group, which happens to
+            // match RateBudget's default. If this diverges (e.g. we
+            // raise the default), pin the values explicitly here.
+            rate_budget: crate::channel::RateBudget::default(),
+
+            // ── UX-layer ─────────────────────────────────────────────
+            // `setMessageReaction` (Bot API 7.0+, Jan 2024) lets bots
+            // react with emoji on messages in groups they are in.
+            // Ref: https://core.telegram.org/bots/api#setmessagereaction
+            react: true,
+            // `editMessageText` / `editMessageCaption` / `editMessageMedia`
+            // are supported for bot-sent messages within the 48-hour
+            // Bot API edit window.
+            // Ref: https://core.telegram.org/bots/api#editmessagetext
+            edit: true,
+            // `sendChatAction` with action="typing" shows the indicator
+            // for ~5 s per call; UX renderer re-emits to keep alive.
+            // Ref: https://core.telegram.org/bots/api#sendchataction
+            typing_indicator: true,
+            // `getUpdates` delivers `edited_message` /
+            // `edited_channel_post` when those kinds are included in
+            // `allowed_updates`. The capability is a platform feature;
+            // this adapter does not yet surface the events through
+            // `poll_event` (legacy notify path). Kept true so the UX
+            // renderer treats Telegram as edit-capable once wiring lands.
+            // TODO(adapter): expose edited_message via poll_event.
+            receives_edit_events: true,
+            // Telegram tags users by `@username`; ID-only fallback
+            // uses a `tg://user?id=N` URL, but the visible mention
+            // syntax the UX renderer should emit is `@<username>`.
+            mention_parsing_hint: MentionStyle::AtUsername,
+            // The Bot API Update schema does not deliver read receipts
+            // to bots on any chat type; private chats optionally expose
+            // them to users, not to bots. Conservative `false`.
+            // TODO: re-verify if Telegram adds bot-visible read
+            // receipts in a future Bot API revision.
+            bot_sees_read_receipts: false,
+            // Forum (topic) groups expose a "View as Messages" toggle
+            // that flattens all topics into one chronological feed;
+            // UX renderer can point users at this native affordance
+            // instead of synthesising an in-TUI view.
+            has_native_multi_thread_view: Some(NativeSeeAllHint {
+                label: "View as Messages".to_string(),
+            }),
+            // Telegram messages persist on the server until explicitly
+            // deleted; this platform is not ephemeral by design.
+            ephemeral: false,
         };
         Self { state, caps }
     }
@@ -1139,6 +1201,54 @@ mod tests {
         assert_eq!(map_emoji_name("thumbs_down"), "👎");
         assert_eq!(map_emoji_name("tada"), "🎉");
         assert_eq!(map_emoji_name("party"), "🎉");
+    }
+
+    /// Guards the UX-layer cap values shipped with the Telegram adapter.
+    /// Values are justified inline at `TelegramChannel::new` against the
+    /// Bot API; if any of these assertions start failing, update the
+    /// rationale comment there at the same time so reviewers can diff
+    /// claim vs. evidence.
+    #[test]
+    fn telegram_channel_caps_are_populated() {
+        use crate::channel::{Channel, MarkdownDialect, MentionStyle};
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        let caps = channel.caps();
+
+        // Transport-layer claims.
+        assert!(!caps.emits_deletion_events);
+        assert!(caps.threads);
+        assert!(!caps.buttons, "adapter does not yet render keyboards");
+        assert!(caps.attachments);
+        assert_eq!(caps.markdown, MarkdownDialect::MarkdownV2);
+        assert_eq!(caps.max_msg_bytes, 4096);
+
+        // UX-layer claims.
+        assert!(caps.react, "setMessageReaction exists on Bot API 7.0+");
+        assert!(caps.edit, "editMessageText/Caption/Media all supported");
+        assert!(caps.typing_indicator, "sendChatAction action=typing");
+        assert!(
+            caps.receives_edit_events,
+            "getUpdates delivers edited_message when allowed"
+        );
+        assert_eq!(caps.mention_parsing_hint, MentionStyle::AtUsername);
+        assert!(
+            !caps.bot_sees_read_receipts,
+            "bots do not see read receipts"
+        );
+        let hint = caps
+            .has_native_multi_thread_view
+            .as_ref()
+            .expect("forum groups expose a native see-all view");
+        assert_eq!(hint.label, "View as Messages");
+        assert!(!caps.ephemeral, "Telegram messages persist until deleted");
     }
 
     fn tmp_home(name: &str) -> PathBuf {
