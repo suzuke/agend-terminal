@@ -68,6 +68,7 @@ impl Pane {
         self.last_input_at = Some(Instant::now());
     }
 
+    #[cfg(test)]
     pub fn is_composing(&self) -> bool {
         self.last_input_at
             .is_some_and(|instant| instant.elapsed() < COMPOSE_IDLE_TIMEOUT)

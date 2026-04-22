@@ -766,7 +766,9 @@ fn flush_notifications_for_pane<F>(home: &Path, pane: &mut Pane, mut injector: F
 where
     F: FnMut(&str) -> anyhow::Result<()>,
 {
-    if pane.pending_notification_count == 0 || pane.is_composing() {
+    if pane.pending_notification_count == 0
+        || notification_queue::is_composing(home, &pane.agent_name)
+    {
         return;
     }
     let queued = notification_queue::drain(home, &pane.agent_name);
@@ -883,6 +885,28 @@ mod tests {
         });
         assert_eq!(flushed, vec!["queued".to_string()]);
         assert_eq!(pane.pending_notification_count, 0);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn flush_respects_disk_compose_state_for_fresh_pane() {
+        let home = tmp_home("flush-compose-disk");
+        let mut pane = pane("agent1");
+        notification_queue::record_input_activity(&home, "agent1");
+        notification_queue::enqueue(&home, "agent1", "queued").expect("queue notification");
+        pane.pending_notification_count = notification_queue::pending_count(&home, "agent1");
+
+        let mut flushed = Vec::new();
+        flush_notifications_for_pane(&home, &mut pane, |text| {
+            flushed.push(text.to_string());
+            Ok(())
+        });
+
+        assert!(
+            flushed.is_empty(),
+            "fresh pane must respect disk compose state"
+        );
+        assert_eq!(pane.pending_notification_count, 1);
         std::fs::remove_dir_all(home).ok();
     }
 }
