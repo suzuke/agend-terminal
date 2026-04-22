@@ -450,6 +450,10 @@ pub struct StateTracker {
     /// "ready again" notice. Pairs with `interactive_prompt_pending_notice`
     /// so operators get symmetrical enter/exit signals.
     interactive_recovery_pending_notice: bool,
+    /// Last MCP heartbeat instant. Updated by supervisor tick from metadata.
+    /// `None` before first heartbeat. Used by `gate_on_heartbeat` to suppress
+    /// false-positive `PermissionPrompt` when the agent is alive (A5 fix).
+    last_heartbeat: Option<Instant>,
 }
 
 fn hash_screen(text: &str) -> u64 {
@@ -464,6 +468,10 @@ impl StateTracker {
     /// See `maybe_expire_latched_state` for rationale.
     const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);
 
+    /// If the last MCP heartbeat is within this window, the agent is
+    /// considered alive and `PermissionPrompt` detection is suppressed.
+    const HEARTBEAT_FRESH_WINDOW: Duration = Duration::from_secs(120);
+
     pub fn new(backend: Option<&Backend>) -> Self {
         Self {
             current: AgentState::Starting,
@@ -473,6 +481,7 @@ impl StateTracker {
             patterns: backend.map(StatePatterns::for_backend),
             interactive_prompt_pending_notice: false,
             interactive_recovery_pending_notice: false,
+            last_heartbeat: None,
         }
     }
 
@@ -503,6 +512,28 @@ impl StateTracker {
         }
     }
 
+    /// If detected state is `PermissionPrompt` but a fresh heartbeat exists,
+    /// override to `Thinking` — the agent is alive and the PTY pattern is a
+    /// false positive (A5 fix, design §4.3).
+    fn gate_on_heartbeat(&self, detected: AgentState) -> AgentState {
+        if detected == AgentState::PermissionPrompt && self.is_heartbeat_fresh() {
+            AgentState::Thinking
+        } else {
+            detected
+        }
+    }
+
+    fn is_heartbeat_fresh(&self) -> bool {
+        self.last_heartbeat
+            .is_some_and(|t| t.elapsed() < Self::HEARTBEAT_FRESH_WINDOW)
+    }
+
+    /// Update heartbeat from an externally computed age (supervisor tick
+    /// reads metadata file timestamp, computes duration since).
+    pub fn update_heartbeat(&mut self, age: Duration) {
+        self.last_heartbeat = Some(Instant::now().checked_sub(age).unwrap_or_else(Instant::now));
+    }
+
     /// Feed the current vterm screen text (ANSI already resolved by the
     /// terminal emulator — caller passes plain text rows).
     ///
@@ -520,6 +551,11 @@ impl StateTracker {
     /// `maybe_expire_latched_state`, which drops long-held active states back
     /// to Ready so the tracker cannot get stuck if a marker pattern briefly
     /// disappears without the Ready pattern re-matching.
+    ///
+    /// Heartbeat gate (A5 fix): after pattern detection, if the detected
+    /// state is `PermissionPrompt` but a fresh MCP heartbeat exists, the
+    /// detection is overridden to `Thinking` — the agent is alive and the
+    /// PTY pattern is a false positive.
     pub fn feed(&mut self, screen_text: &str) {
         let hash = hash_screen(screen_text);
         if self.last_screen_hash == Some(hash) {
@@ -530,7 +566,10 @@ impl StateTracker {
 
         if let Some(ref patterns) = self.patterns {
             match patterns.detect(screen_text) {
-                Some(detected) => self.transition(detected),
+                Some(detected) => {
+                    let gated = self.gate_on_heartbeat(detected);
+                    self.transition(gated);
+                }
                 None => {
                     // Starting-only structural fallback: if the pattern
                     // catalog didn't recognize anything but the screen
@@ -1982,5 +2021,43 @@ mod tests {
                 detect_result, expected_detect
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Track 1 PR-2: Heartbeat gate regression pins (design §7)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn heartbeat_fresh_overrides_permission_prompt() {
+        // Pin 1 — A5 incident scenario: agent has fresh heartbeat, PTY
+        // shows permission pattern → must NOT latch PermissionPrompt.
+        let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+        t.update_heartbeat(Duration::from_secs(10)); // 10s ago = fresh
+        t.feed("Allow this action y/n/t");
+        assert_ne!(
+            t.get_state(),
+            AgentState::PermissionPrompt,
+            "fresh heartbeat must suppress PermissionPrompt"
+        );
+        assert_eq!(t.get_state(), AgentState::Thinking);
+    }
+
+    #[test]
+    fn stale_heartbeat_allows_permission_prompt() {
+        // Pin 2 — stale heartbeat: agent silent for 200s, PTY shows
+        // permission pattern → must latch PermissionPrompt normally.
+        let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+        t.update_heartbeat(Duration::from_secs(200)); // 200s ago > 120s
+        t.feed("Allow this action y/n/t");
+        assert_eq!(t.get_state(), AgentState::PermissionPrompt);
+    }
+
+    #[test]
+    fn no_heartbeat_allows_permission_prompt() {
+        // Pin 3 — no heartbeat ever: default behavior preserved.
+        let mut t = tracker_at(&Backend::KiroCli, AgentState::Thinking, 5);
+        // last_heartbeat is None by default
+        t.feed("Allow this action y/n/t");
+        assert_eq!(t.get_state(), AgentState::PermissionPrompt);
     }
 }

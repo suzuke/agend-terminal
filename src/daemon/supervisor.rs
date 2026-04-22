@@ -60,6 +60,14 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
+
+            // Heartbeat: read last_heartbeat from metadata file and update
+            // StateTracker so gate_on_heartbeat can suppress false-positive
+            // PermissionPrompt when the agent is alive (A5 fix).
+            if let Some(age) = read_heartbeat_age(home, &name) {
+                core.state.update_heartbeat(age);
+            }
+
             let agent_state = core.state.current;
             let silent = core.state.last_output.elapsed();
             if core.health.check_awaiting_operator(agent_state, silent) {
@@ -152,4 +160,17 @@ fn format_stall_notice(name: &str, tail: &str, silent_secs: Option<u64>) -> Stri
 /// conversation again.
 fn format_recovery_notice(name: &str) -> String {
     format!("✅ {name} 已就緒，可以繼續對話")
+}
+
+/// Read `last_heartbeat` from the agent's metadata file and return the age
+/// as a `Duration`. Returns `None` if the file is missing, unparseable, or
+/// the timestamp is in the future.
+fn read_heartbeat_age(home: &std::path::Path, name: &str) -> Option<Duration> {
+    let meta_path = home.join("metadata").join(format!("{name}.json"));
+    let content = std::fs::read_to_string(meta_path).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let ts = meta["last_heartbeat"].as_str()?;
+    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    let elapsed = chrono::Utc::now().signed_duration_since(dt);
+    elapsed.to_std().ok()
 }
