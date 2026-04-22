@@ -170,14 +170,21 @@ jobs:
 
       # APPIMAGE_EXTRACT_AND_RUN bypasses FUSE — GitHub runners don't ship it.
       # OUTPUT pins the filename so the upload step + release files list match.
+      # --custom-apprun installs our own AppRun that forces `tray` subcommand
+      # when no args are passed (default AppRun ignores the .desktop `Exec=`,
+      # so double-click would fall into help-and-exit interactive CLI mode).
+      # Our AppRun still sources apprun-hooks/*.sh so GTK env from plugin-gtk
+      # stays effective.
       - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
           OUTPUT: agend-terminal-x86_64.AppImage
         run: |
+          chmod +x assets/appimage/AppRun
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --plugin gtk \
+            --custom-apprun assets/appimage/AppRun \
             --output appimage
 
       - name: Upload artifact
