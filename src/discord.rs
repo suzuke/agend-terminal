@@ -361,6 +361,21 @@ impl EventHandler for Handler {
 
         tracing::info!(from = %username, to = %instance_name, %text, "discord inbound");
 
+        // Save inbound message ID + channel_id for status reactions and react eyes
+        let inbound_msg_id = msg.id.to_string();
+        crate::ops::save_metadata(&home, &instance_name, "last_inbound_message_id", serde_json::json!(inbound_msg_id));
+        crate::ops::save_metadata(&home, &instance_name, "last_inbound_channel_id", serde_json::json!(channel_id.to_string()));
+        {
+            let http = {
+                let s = lock_state(&self.state);
+                Arc::clone(&s.http)
+            };
+            let cid = serenity::all::ChannelId::new(channel_id);
+            let mid = msg.id;
+            let reaction = serenity::all::ReactionType::Unicode("\u{1f440}".to_string());
+            let _ = cid.create_reaction(&http, mid, reaction).await;
+        }
+
         // Handle attachments — download immediately (Discord CDN URLs expire)
         let mut full_text = text;
         for att in &msg.attachments {

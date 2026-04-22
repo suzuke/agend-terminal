@@ -295,6 +295,20 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
     tracing::info!(from = username, to = %instance_name, %text, "inbound message");
 
+    // Save inbound message ID for status reactions and react eyes
+    let inbound_msg_id = msg.id.0.to_string();
+    crate::ops::save_metadata(&home, &instance_name, "last_inbound_message_id", serde_json::json!(inbound_msg_id));
+    {
+        let name2 = instance_name.clone();
+        let mid = inbound_msg_id.clone();
+        std::thread::Builder::new()
+            .name("tg_react_eyes".into())
+            .spawn(move || {
+                let _ = crate::telegram::try_telegram_react(&name2, "\u{1f440}", Some(&mid));
+            })
+            .ok();
+    }
+
     // Download attachment if present
     let mut full_text = text.clone();
     if let Some(ref fid) = attachment {

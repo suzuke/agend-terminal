@@ -450,6 +450,10 @@ pub struct StateTracker {
     /// "ready again" notice. Pairs with `interactive_prompt_pending_notice`
     /// so operators get symmetrical enter/exit signals.
     interactive_recovery_pending_notice: bool,
+    /// Armed on Idle/Ready/Starting → Thinking/ToolUse; consumed by supervisor to react ⏳.
+    working_pending_notice: bool,
+    /// Armed on Thinking/ToolUse → Idle/Ready; consumed by supervisor to react ✅.
+    done_pending_notice: bool,
 }
 
 fn hash_screen(text: &str) -> u64 {
@@ -473,6 +477,8 @@ impl StateTracker {
             patterns: backend.map(StatePatterns::for_backend),
             interactive_prompt_pending_notice: false,
             interactive_recovery_pending_notice: false,
+            working_pending_notice: false,
+            done_pending_notice: false,
         }
     }
 
@@ -497,6 +503,28 @@ impl StateTracker {
     pub fn take_recovery_notice(&mut self) -> bool {
         if self.interactive_recovery_pending_notice {
             self.interactive_recovery_pending_notice = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns true at most once per transition into Thinking/ToolUse from
+    /// a passive state. The supervisor reacts ⏳ to the last inbound message.
+    pub fn take_working_notice(&mut self) -> bool {
+        if self.working_pending_notice {
+            self.working_pending_notice = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns true at most once per transition from Thinking/ToolUse back to
+    /// Idle/Ready. The supervisor reacts ✅ to the last inbound message.
+    pub fn take_done_notice(&mut self) -> bool {
+        if self.done_pending_notice {
+            self.done_pending_notice = false;
             true
         } else {
             false
@@ -648,6 +676,19 @@ impl StateTracker {
             && prev != self.current
         {
             self.interactive_recovery_pending_notice = true;
+        }
+
+        // Arm "working" when entering an active state from a passive one.
+        if matches!(self.current, AgentState::Thinking | AgentState::ToolUse)
+            && matches!(prev, AgentState::Idle | AgentState::Ready | AgentState::Starting)
+        {
+            self.working_pending_notice = true;
+        }
+        // Arm "done" when returning to passive from an active state.
+        if matches!(self.current, AgentState::Idle | AgentState::Ready)
+            && matches!(prev, AgentState::Thinking | AgentState::ToolUse)
+        {
+            self.done_pending_notice = true;
         }
     }
 }

@@ -625,6 +625,48 @@ pub fn release_repo(path: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Channel reactions (fire-and-forget)
+// ---------------------------------------------------------------------------
+
+/// React to the last inbound message for an instance.
+/// Reads message_id from metadata, dispatches to the active channel.
+/// Fire-and-forget: spawns a thread, logs errors, never blocks.
+pub fn react_to_last_inbound(home: &std::path::Path, instance_name: &str, emoji: &str) {
+    let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
+    let meta: serde_json::Value = match std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+    {
+        Some(v) => v,
+        None => return,
+    };
+    let msg_id = match meta["last_inbound_message_id"].as_str() {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return,
+    };
+
+    let home = home.to_path_buf();
+    let name = instance_name.to_string();
+    let emoji = emoji.to_string();
+    std::thread::Builder::new()
+        .name("react_inbound".into())
+        .spawn(move || {
+            #[cfg(feature = "discord")]
+            if is_discord_channel(&home) {
+                if let Err(e) = crate::discord::try_discord_react(&name, &emoji, Some(&msg_id)) {
+                    tracing::debug!(error = %e, "react_to_last_inbound discord failed");
+                }
+                return;
+            }
+            if let Err(e) = crate::telegram::try_telegram_react(&name, &emoji, Some(&msg_id)) {
+                tracing::debug!(error = %e, "react_to_last_inbound telegram failed");
+            }
+            let _ = &home;
+        })
+        .ok();
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (pub for handlers.rs to use too)
 // ---------------------------------------------------------------------------
 
