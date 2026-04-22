@@ -351,7 +351,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
     let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
 
-    let (instance_name, home, submit_key, registry) = {
+    let (instance_name, home, _submit_key, registry) = {
         let mut s = lock_state(state);
         let name = resolve_topic(&mut s, thread_id);
         let sk = s
@@ -447,7 +447,6 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         &instance_name,
         &inbox::NotifySource::Telegram(username),
         text,
-        &submit_key,
     );
 
     // Emit UxEvent::UserMsgReceived so the channel adapter can react 👀.
