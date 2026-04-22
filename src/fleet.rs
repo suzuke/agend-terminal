@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetConfig {
     #[serde(default)]
     pub defaults: InstanceDefaults,
@@ -150,6 +150,8 @@ pub struct InstanceConfig {
 pub struct TeamConfig {
     #[serde(default)]
     pub members: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl FleetConfig {

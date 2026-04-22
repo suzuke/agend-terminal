@@ -202,6 +202,8 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     // avoids re-reading + re-parsing fleet.yaml inside run_core.
     let initial_digest = crate::bootstrap::reload::digest_from_config(&prepared.config);
     let telegram = prepared.telegram.clone();
+    // Reconcile fleet.yaml teams: section → teams.json (additive only)
+    crate::teams::reconcile_teams(&home, &prepared.config);
     let _owned = prepared;
     run_core(&home, agents, Some(initial_digest), telegram)
 }
