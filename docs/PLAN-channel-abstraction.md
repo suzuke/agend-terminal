@@ -98,6 +98,7 @@ triggered cleanup.
 
 ```rust
 struct ChannelCapabilities {
+    // Transport-layer capabilities
     emits_deletion_events: bool,     // TG=false, Discord=true
     threads: bool,
     buttons: bool,
@@ -105,6 +106,17 @@ struct ChannelCapabilities {
     markdown: MarkdownDialect,       // MarkdownV2 / DiscordMd / SlackMrkdwn / None
     max_msg_bytes: usize,
     rate_budget: RateBudget,
+
+    // UX-layer capabilities (added by PLAN-channel-ux-layer.md §5 —
+    // consumed by the UX renderer, not the transport path)
+    react: bool,                           // TG ✓ / Slack ✓ / SMS ✗
+    edit: bool,                            // most IMs ✓, SMS/IRC ✗
+    typing_indicator: bool,                // TG sendChatAction, Slack presence, etc.
+    receives_edit_events: bool,            // Discord MESSAGE_UPDATE — TG no
+    mention_parsing_hint: MentionStyle,    // @username (Slack), <@uid> (Discord), none
+    bot_sees_read_receipts: bool,          // TG private yes, TG group no, Slack no
+    has_native_multi_thread_view: Option<NativeSeeAllHint>, // e.g. TG View as Messages
+    ephemeral: bool,                       // TUI adapter is ephemeral-by-nature
 }
 ```
 
@@ -115,6 +127,10 @@ Core queries caps when deciding:
 - `markdown` → format outbound message with the right dialect before calling
   `send`.
 - `max_msg_bytes` → split long messages into chunks.
+
+UX renderer queries the UX-layer caps when rendering events — see
+`PLAN-channel-ux-layer.md` §6 for the event × capability degradation table.
+Transport path never branches on UX caps directly.
 
 This replaces platform if-else branches in core with capability predicates.
 
