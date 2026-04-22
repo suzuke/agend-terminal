@@ -12,8 +12,21 @@ pub struct FleetConfig {
     pub instances: HashMap<String, InstanceConfig>,
     #[serde(default)]
     pub teams: HashMap<String, TeamConfig>,
-    /// Channel configuration (e.g., Telegram).
+    /// Channel configuration (e.g., Telegram). Legacy singular form.
+    ///
+    /// Prefer [`FleetConfig::channels`] (plural) going forward — per
+    /// `docs/PLAN-channel-abstraction.md` §3.6. When both are omitted,
+    /// Telegram stays off. When only `channels:` is set, `normalize()`
+    /// collapses the first entry into this field so existing call sites
+    /// (which read `self.channel` directly) keep working unchanged.
     pub channel: Option<ChannelConfig>,
+    /// Named channel configurations. Each key is a user-chosen name
+    /// (e.g. `tg-main`, `discord-ops`) and the value follows the same
+    /// tagged `type: telegram` shape as the singular form. Multi-channel
+    /// routing is wired in a later PR; for now, this is a parser-level
+    /// extension that normalizes back into [`FleetConfig::channel`].
+    #[serde(default)]
+    pub channels: Option<HashMap<String, ChannelConfig>>,
     /// Template definitions for batch deployment.
     #[serde(default)]
     pub templates: Option<HashMap<String, serde_yaml::Value>>,
@@ -125,6 +138,35 @@ impl FleetConfig {
             if inst.backend.is_none() {
                 if let Some(cmd) = &inst.command {
                     inst.backend = Some(Backend::parse_str(cmd));
+                }
+            }
+        }
+
+        // Channel dual-accept: if the user wrote only `channels:` (plural
+        // map), collapse the first entry — sorted by name for determinism
+        // — into the legacy `channel:` field so existing call sites keep
+        // working unchanged. Multi-channel routing is wired in a later PR;
+        // until then, we pick one and log a warning when more than one is
+        // declared. When `channel:` is already set, plural is a no-op and
+        // runtime behavior is byte-identical to today.
+        if self.channel.is_none() {
+            if let Some(map) = self.channels.as_ref() {
+                let mut names: Vec<&String> = map.keys().collect();
+                names.sort();
+                if let Some(first) = names.first().copied() {
+                    if names.len() > 1 {
+                        tracing::warn!(
+                            count = names.len(),
+                            picked = %first,
+                            "fleet.yaml declares {} channels but multi-channel routing \
+                             is not yet wired; using first entry by name. Follow-up PR \
+                             in T1 will merge inbound streams across all channels.",
+                            names.len(),
+                        );
+                    }
+                    if let Some(cfg) = map.get(first) {
+                        self.channel = Some(cfg.clone());
+                    }
                 }
             }
         }
@@ -633,6 +675,136 @@ instances:
             None => panic!("channel should be Some"),
         }
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_channels_plural_single_entry_collapses_to_singular() {
+        // `channels:` (plural) with one entry normalizes into `channel:`
+        // so downstream readers that only know the singular field keep
+        // working unchanged.
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-chan-plural-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channels:
+  tg-main:
+    type: telegram
+    bot_token_env: MY_BOT_TOKEN
+    group_id: -100999
+    mode: topic
+instances: {}
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        match config.channel {
+            Some(ChannelConfig::Telegram {
+                ref bot_token_env,
+                group_id,
+                ..
+            }) => {
+                assert_eq!(bot_token_env, "MY_BOT_TOKEN");
+                assert_eq!(group_id, -100999);
+            }
+            None => panic!("plural channels: should populate singular channel field"),
+        }
+        // Plural is still preserved on the struct for later consumers.
+        assert!(config.channels.is_some());
+        assert_eq!(config.channels.as_ref().unwrap().len(), 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_channels_plural_multi_entry_picks_first_by_name() {
+        // Multi-channel routing is not yet wired; normalize must pick a
+        // deterministic entry (first by sorted key) so runtime behavior
+        // does not depend on HashMap iteration order.
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-chan-multi-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channels:
+  zeta:
+    type: telegram
+    bot_token_env: ZETA_TOKEN
+    group_id: -3
+  alpha:
+    type: telegram
+    bot_token_env: ALPHA_TOKEN
+    group_id: -1
+  mid:
+    type: telegram
+    bot_token_env: MID_TOKEN
+    group_id: -2
+instances: {}
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        match config.channel {
+            Some(ChannelConfig::Telegram {
+                ref bot_token_env, ..
+            }) => {
+                assert_eq!(
+                    bot_token_env, "ALPHA_TOKEN",
+                    "must pick first entry by sorted name"
+                );
+            }
+            None => panic!("channel should be populated"),
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_channel_singular_wins_when_both_set() {
+        // Byte-identical runtime for inputs that already wrote `channel:`:
+        // even if `channels:` is also present, the singular form wins and
+        // `normalize()` leaves it alone.
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-chan-both-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channel:
+  type: telegram
+  bot_token_env: SINGULAR_TOKEN
+  group_id: -111
+channels:
+  plural-entry:
+    type: telegram
+    bot_token_env: PLURAL_TOKEN
+    group_id: -222
+instances: {}
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        match config.channel {
+            Some(ChannelConfig::Telegram {
+                ref bot_token_env, ..
+            }) => assert_eq!(bot_token_env, "SINGULAR_TOKEN"),
+            None => panic!("singular channel field must be preserved"),
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_channel_absent_when_neither_form_set() {
+        // Zero-config case: no channel wiring, no warnings, no panics.
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-chan-none-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  a:
+    backend: claude
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        assert!(config.channel.is_none());
+        assert!(config.channels.is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
