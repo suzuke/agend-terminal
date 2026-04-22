@@ -12,6 +12,9 @@ pub struct Task {
     pub status: String,   // open, claimed, done, blocked, cancelled
     pub priority: String, // low, normal, high, urgent
     pub assignee: Option<String>,
+    /// When assignee is a team name, this holds the resolved orchestrator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_to: Option<String>,
     pub created_by: String,
     pub depends_on: Vec<String>,
     pub result: Option<String>,
@@ -63,13 +66,25 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             let now = chrono::Utc::now().to_rfc3339();
             let id = format!("t-{}", &now[..19].replace([':', '-', 'T'], ""));
+            let assignee = args["assignee"].as_str().map(String::from);
+            // Resolve team → orchestrator routing
+            let routed_to = if let Some(ref name) = assignee {
+                match crate::teams::resolve_team_orchestrator(home, name) {
+                    Ok(Some(orch)) => Some(orch),
+                    Ok(None) => None, // not a team, direct assignment
+                    Err(e) => return serde_json::json!({"error": e}),
+                }
+            } else {
+                None
+            };
             let task = Task {
                 id: id.clone(),
                 title: title.to_string(),
                 description: args["description"].as_str().unwrap_or("").to_string(),
                 status: "open".to_string(),
                 priority: args["priority"].as_str().unwrap_or("normal").to_string(),
-                assignee: args["assignee"].as_str().map(String::from),
+                assignee,
+                routed_to,
                 created_by: instance_name.to_string(),
                 depends_on: args["depends_on"]
                     .as_array()
@@ -114,6 +129,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     Some(task) => {
                         task.status = "claimed".to_string();
                         task.assignee = Some(iname.clone());
+                        task.routed_to = None; // agent claims directly
                         task.updated_at = chrono::Utc::now().to_rfc3339();
                         Ok(true)
                     }
@@ -157,6 +173,15 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let new_status = args["status"].as_str().map(String::from);
             let new_priority = args["priority"].as_str().map(String::from);
             let new_assignee = args["assignee"].as_str().map(String::from);
+            // Resolve team routing for new assignee
+            let new_routed_to = if let Some(ref name) = new_assignee {
+                match crate::teams::resolve_team_orchestrator(home, name) {
+                    Ok(orch) => orch, // Some(orch) for team, None for agent
+                    Err(e) => return serde_json::json!({"error": e}),
+                }
+            } else {
+                None
+            };
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
@@ -168,6 +193,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         }
                         if let Some(ref a) = new_assignee {
                             task.assignee = Some(a.clone());
+                            task.routed_to = new_routed_to.clone();
                         }
                         task.updated_at = chrono::Utc::now().to_rfc3339();
                         Ok(true)
@@ -251,6 +277,124 @@ mod tests {
             &serde_json::json!({"action": "claim", "id": "nope"}),
         );
         assert!(r["error"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_assign_to_team_routes_to_orchestrator() {
+        let home = tmp_home("team_route");
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        let r = handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix bug", "assignee": "devs"}),
+        );
+        assert_eq!(r["status"], "created");
+        let tasks = list_all(&home);
+        let t = tasks.iter().find(|t| t.title == "fix bug").expect("task");
+        assert_eq!(t.assignee.as_deref(), Some("devs"));
+        assert_eq!(t.routed_to.as_deref(), Some("lead"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_assign_to_degraded_team_rejects() {
+        let home = tmp_home("degraded_reject");
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        crate::teams::remove_member_from_all(&home, "lead");
+        let r = handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix bug", "assignee": "devs"}),
+        );
+        assert!(
+            r["error"].as_str().expect("err").contains("degraded"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_assign_to_agent_unchanged() {
+        let home = tmp_home("agent_direct");
+        let r = handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix bug", "assignee": "at-dev-2"}),
+        );
+        assert_eq!(r["status"], "created");
+        let tasks = list_all(&home);
+        let t = tasks.iter().find(|t| t.title == "fix bug").expect("task");
+        assert_eq!(t.assignee.as_deref(), Some("at-dev-2"));
+        assert!(
+            t.routed_to.is_none(),
+            "no routing for direct agent assignment"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn claim_clears_routed_to() {
+        let home = tmp_home("claim_clears_rt");
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        // Create task assigned to team
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix", "assignee": "devs"}),
+        );
+        let id = list_all(&home)[0].id.clone();
+        assert_eq!(list_all(&home)[0].routed_to.as_deref(), Some("lead"));
+
+        // Agent claims → routed_to cleared
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let t = &list_all(&home)[0];
+        assert_eq!(t.assignee.as_deref(), Some("worker"));
+        assert!(t.routed_to.is_none(), "claim should clear routed_to");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_assignee_re_resolves_routed_to() {
+        let home = tmp_home("update_re_resolve");
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "alpha", "members": ["a1"], "orchestrator": "a1"}),
+        );
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "beta", "members": ["b1"], "orchestrator": "b1"}),
+        );
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "task", "assignee": "alpha"}),
+        );
+        let id = list_all(&home)[0].id.clone();
+        assert_eq!(list_all(&home)[0].routed_to.as_deref(), Some("a1"));
+
+        // Reassign to different team
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "update", "id": id, "assignee": "beta"}),
+        );
+        let t = &list_all(&home)[0];
+        assert_eq!(t.assignee.as_deref(), Some("beta"));
+        assert_eq!(t.routed_to.as_deref(), Some("b1"));
         std::fs::remove_dir_all(&home).ok();
     }
 }

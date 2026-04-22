@@ -1568,6 +1568,7 @@ mod tests {
             status: status.to_string(),
             priority: priority.to_string(),
             assignee: None,
+            routed_to: None,
             created_by: String::new(),
             depends_on: Vec::new(),
             result: None,
