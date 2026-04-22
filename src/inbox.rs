@@ -133,11 +133,11 @@ pub fn deliver(
     agent_name: &str,
     source: &NotifySource<'_>,
     text: &str,
-    submit_key: &str,
+    _submit_key: &str,
     kind: Option<String>,
 ) {
     if text.chars().count() <= INLINE_THRESHOLD {
-        notify_agent(home, agent_name, source, text, submit_key);
+        notify_agent(home, agent_name, source, text);
     } else {
         let msg = InboxMessage {
             from: source.to_string(),
@@ -146,27 +146,18 @@ pub fn deliver(
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
         let _ = enqueue(home, agent_name, msg);
-        notify_agent(home, agent_name, source, text, submit_key);
+        notify_agent(home, agent_name, source, text);
     }
 }
 
-pub fn notify_agent(
-    home: &Path,
-    agent_name: &str,
-    source: &NotifySource<'_>,
-    text: &str,
-    submit_key: &str,
-) {
+pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
     let display_text = if text.chars().count() > 200 {
         let truncated: String = text.chars().take(200).collect();
         format!("{truncated}... (run: agend-terminal agent inbox)")
     } else {
         text.to_string()
     };
-    let notification = format!(
-        "[{source}] {display_text}{}{submit_key}",
-        source.reply_hint()
-    );
+    let notification = format!("[{source}] {display_text}{}", source.reply_hint());
 
     // Use API socket to inject (doesn't kick attach clients)
     let _ = crate::api::call(
@@ -484,5 +475,18 @@ mod tests {
             ".draining must be retained after read failure for next retry"
         );
         fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn notify_agent_does_not_append_submit_key() {
+        // Verify the notification format doesn't contain \r (submit_key).
+        let source = NotifySource::Agent("peer");
+        let text = "hello world";
+        let display_text = text.to_string();
+        let notification = format!("[{source}] {display_text}{}", source.reply_hint());
+        assert!(
+            !notification.contains('\r'),
+            "notification must not contain submit_key (\\r): {notification:?}"
+        );
     }
 }
