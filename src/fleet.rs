@@ -151,6 +151,8 @@ pub struct TeamConfig {
     #[serde(default)]
     pub members: Vec<String>,
     #[serde(default)]
+    pub orchestrator: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
 }
 
