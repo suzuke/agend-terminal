@@ -638,3 +638,62 @@ fn create_team_duplicate_rejects() {
     assert_error_contains(&result, "already exists");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// delete_instance team cleanup + replace_instance preservation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delete_instance_removes_from_team() {
+    let home = temp_home("del_team_member");
+    setup_team(&home, "devs", &["alice", "bob"]);
+    call_tool(&home, "delete_instance", &json!({"name": "alice"}));
+    let listed = call_tool(&home, "list_teams", &json!({}));
+    let teams = listed["teams"].as_array().expect("teams");
+    assert_eq!(teams.len(), 1);
+    let members: Vec<&str> = teams[0]["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(members, vec!["bob"]);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn delete_last_member_auto_deletes_team() {
+    let home = temp_home("del_last_member");
+    setup_team(&home, "solo", &["only-one"]);
+    call_tool(&home, "delete_instance", &json!({"name": "only-one"}));
+    let listed = call_tool(&home, "list_teams", &json!({}));
+    let teams = listed["teams"].as_array().expect("teams");
+    assert!(teams.is_empty(), "empty team should be auto-deleted");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn replace_instance_preserves_team_membership() {
+    let home = temp_home("replace_team");
+    setup_team(&home, "devs", &["alice"]);
+    // replace_instance kills + respawns same name — team membership stays
+    // because teams.json references by name, not by process identity.
+    // The API call will fail (no daemon), but that's fine — we just verify
+    // teams.json is untouched.
+    call_tool(
+        &home,
+        "replace_instance",
+        &json!({"name": "alice", "reason": "test"}),
+    );
+    let listed = call_tool(&home, "list_teams", &json!({}));
+    let teams = listed["teams"].as_array().expect("teams");
+    assert_eq!(teams.len(), 1);
+    let members: Vec<&str> = teams[0]["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(members, vec!["alice"]);
+    std::fs::remove_dir_all(&home).ok();
+}

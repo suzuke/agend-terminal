@@ -528,6 +528,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Some(ref wd) = working_dir {
                 cleanup_working_dir(&home, name, wd);
             }
+            // Remove from all teams; auto-delete empty teams
+            crate::teams::remove_member_from_all(&home, name);
             json!({"name": name})
         }
         "start_instance" => {
