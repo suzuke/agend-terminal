@@ -592,3 +592,49 @@ fn cross_instance_tools_reject_empty_sender() {
     }
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// create_team MCP tool
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_team_with_existing_instances() {
+    let home = temp_home("create_team_ok");
+    let result = call_tool(
+        &home,
+        "create_team",
+        &json!({"name": "devs", "members": ["alice", "bob"]}),
+    );
+    assert_eq!(result["status"], "created");
+    assert_eq!(result["name"], "devs");
+
+    let listed = call_tool(&home, "list_teams", &json!({}));
+    let teams = listed["teams"].as_array().expect("teams array");
+    assert_eq!(teams.len(), 1);
+    assert_eq!(teams[0]["name"], "devs");
+    let members: Vec<&str> = teams[0]["members"]
+        .as_array()
+        .expect("members")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(members, vec!["alice", "bob"]);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_team_duplicate_rejects() {
+    let home = temp_home("create_team_dup");
+    call_tool(
+        &home,
+        "create_team",
+        &json!({"name": "t", "members": ["a"]}),
+    );
+    let result = call_tool(
+        &home,
+        "create_team",
+        &json!({"name": "t", "members": ["b"]}),
+    );
+    assert_error_contains(&result, "already exists");
+    std::fs::remove_dir_all(&home).ok();
+}
