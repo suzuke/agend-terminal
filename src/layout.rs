@@ -6,7 +6,6 @@ use crate::bridge_client::BridgeClient;
 use crate::vterm::VTerm;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use unicode_width::UnicodeWidthStr;
 
 /// How a pane's input/resize is delivered to the underlying process.
 ///
@@ -1010,15 +1009,12 @@ impl Tab {
             if row != py {
                 continue;
             }
-            let Some(pane) = self.root().find_pane(id) else {
+            if self.root().find_pane(id).is_none() {
                 continue;
-            };
-            // Rendered title is ` {label} ` — measure with terminal cell
-            // width (not char count) so CJK / emoji labels hit correctly.
-            let title_width = UnicodeWidthStr::width(pane.label()) as u16 + 2;
-            let start = px + 1;
-            let end = (start + title_width).min(px + pw);
-            if col >= start && col < end {
+            }
+            // Hit area covers the full pane-width title bar row (not just
+            // the text label) so the entire colored region is draggable.
+            if col >= px && col < px + pw {
                 return Some(id);
             }
         }
@@ -1299,6 +1295,7 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
 
     // --- ratio_bounds invariants (covers Round A #3 + #6) ---
 

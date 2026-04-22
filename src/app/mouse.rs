@@ -25,6 +25,10 @@ pub(super) struct MouseState {
     /// reusing it keeps drag math stable even if the terminal is resized
     /// mid-gesture.
     pub border_drag: Option<(SplitBorderHit, Rect)>,
+    /// Active tab drag for reorder. `Some(idx)` = dragging tab at index.
+    pub dragging_tab: Option<usize>,
+    /// Drop target tab index during tab drag.
+    pub tab_drop_target: Option<usize>,
 }
 
 /// Signals from mouse handling back to `run_app`. Fields are `Option` /
@@ -80,6 +84,9 @@ fn handle_down(
                 out.new_last_tab = Some(layout.active);
                 layout.goto_tab(idx);
                 out.needs_resize = true;
+                // Start tab drag for reorder
+                state.dragging_tab = Some(idx);
+                state.tab_drop_target = None;
             }
             Some(TabBarClick::NewTab) => {
                 out.new_overlay = Some(Overlay::NewTabMenu {
@@ -111,12 +118,10 @@ fn handle_down(
     if let Some(pane_id) = title_hit {
         if let Some(tab) = layout.active_tab_mut() {
             tab.focus_id = pane_id;
-            // Only start a drag when there's a possible swap target;
-            // otherwise the source pane briefly flashes magenta for a no-op.
-            if tab.root().pane_count() > 1 {
-                tab.dragging_pane = Some(pane_id);
-                tab.drag_target = None;
-            }
+            // Allow drag even for single-pane tabs — the user can
+            // cross-tab drag to move the pane to another tab.
+            tab.dragging_pane = Some(pane_id);
+            tab.drag_target = None;
         }
     } else if !zoomed {
         let hit = layout.active_tab().and_then(|tab| {
@@ -158,6 +163,12 @@ fn handle_drag(mouse: MouseEvent, layout: &mut Layout, state: &mut MouseState) {
         // but resizing the PTY every mouse cell triggers the backend
         // (Claude/etc.) to reflow its entire UI and floods us with redraw
         // data. Defer the single PTY resize to mouse-up.
+    } else if state.dragging_tab.is_some() && mouse.row == 0 {
+        // Tab reorder drag: update drop target
+        state.tab_drop_target = match tab_bar_hit_test(layout, mouse.column) {
+            Some(TabBarClick::Tab(idx)) => Some(idx),
+            _ => None,
+        };
     } else if layout
         .active_tab()
         .is_some_and(|t| t.dragging_pane.is_some())
@@ -205,6 +216,17 @@ fn handle_up(
     state: &mut MouseState,
     out: &mut MouseOutcome,
 ) {
+    // Tab reorder: complete drag-to-reorder on mouse up
+    if let Some(from) = state.dragging_tab.take() {
+        if let Some(to) = state.tab_drop_target.take() {
+            if from != to && from < layout.tabs.len() && to < layout.tabs.len() {
+                let tab = layout.tabs.remove(from);
+                layout.tabs.insert(to, tab);
+                layout.active = to;
+                out.needs_resize = true;
+            }
+        }
+    }
     if state.border_drag.is_some() {
         state.border_drag = None;
         // Ratio was updated live during drag but PTY resizes were deferred
