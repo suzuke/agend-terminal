@@ -55,7 +55,50 @@ pub enum ChannelConfig {
         ///   dropped with a warn log.
         #[serde(default)]
         user_allowlist: Option<Vec<i64>>,
+        /// Optional fleet-activity binding — where cross-instance
+        /// `FleetEvent`s (delegate / report / decision / broadcast) are
+        /// mirrored as one-liner log rows. Omitted = no fleet sink for
+        /// this channel; the producer registry in `src/mcp/handlers.rs`
+        /// still emits events, but nothing routes them to Telegram.
+        ///
+        /// PR-A lands the schema only; resolution into a concrete
+        /// `BindingRef` and the rendering pipeline land with PR-B (see
+        /// `docs/DESIGN-stage-b-ux.md` §3 and §5).
+        #[serde(default)]
+        fleet_binding: Option<FleetBindingConfig>,
     },
+}
+
+/// Where fleet activity gets mirrored on a channel. Accepts two YAML
+/// forms for operator ergonomics:
+///
+/// - **Struct** — `{ type: topic, name: "fleet-activity" }`. Canonical
+///   form. `type` picks the platform primitive (Telegram forum topic,
+///   Discord channel, Slack thread, …) and `name` is the
+///   human-readable identifier.
+/// - **String shorthand** — `"#agend-ops"`. Convenience form for
+///   Discord / Slack where the binding is simply "this named channel".
+///   Telegram does not use the shorthand today (topics are created by
+///   name, not by `#tag`), so the Telegram adapter will warn and
+///   ignore string-form bindings when it tries to resolve them in
+///   PR-B.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FleetBindingConfig {
+    /// Canonical struct form — platform-tagged binding descriptor.
+    Struct(FleetBindingStruct),
+    /// Shorthand: a bare channel / tag string. Non-Telegram adapters
+    /// (Discord, Slack) interpret this as the target channel name.
+    Shorthand(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FleetBindingStruct {
+    /// Telegram forum topic / Discord channel-equivalent. `name` is the
+    /// display name used to find or create the topic; resolution (map
+    /// name → topic_id) happens at bootstrap, not at parse time.
+    Topic { name: String },
 }
 
 fn default_mode() -> String {

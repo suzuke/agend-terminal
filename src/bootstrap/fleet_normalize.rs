@@ -121,6 +121,7 @@ mod tests {
                 group_id: -1,
                 mode: "topic".into(),
                 user_allowlist: None,
+                fleet_binding: None,
             }),
             channels: None,
             templates: None,

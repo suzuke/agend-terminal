@@ -964,13 +964,21 @@ mod tests {
     fn codex_config_idempotent_across_reruns() {
         // Re-running configure twice must leave the file byte-identical —
         // no duplicated headers, no drifting whitespace.
+        //
+        // Use `_with_home(scratch)` rather than `configure_codex` so the
+        // emitted `AGEND_HOME = ...` value is fixed for both runs.
+        // `configure_codex` reads `home_path()` (global `AGEND_HOME` env
+        // var), which races with any other test in the process that
+        // mutates that env — e.g. the `mcp::handlers::tests` Fleet
+        // emission tests — and caused this test to drift across reruns.
         let dir = tmp_dir("codex_cfg_idem");
         std::fs::create_dir_all(dir.join(".codex")).expect("create .codex");
+        let scratch_home = "/tmp/agend-test-home-codex-idem";
 
-        configure_codex(&dir).expect("first");
+        configure_codex_with_home(&dir, scratch_home).expect("first");
         let after_first =
             std::fs::read_to_string(dir.join(".codex/config.toml")).expect("read first");
-        configure_codex(&dir).expect("second");
+        configure_codex_with_home(&dir, scratch_home).expect("second");
         let after_second =
             std::fs::read_to_string(dir.join(".codex/config.toml")).expect("read second");
 
