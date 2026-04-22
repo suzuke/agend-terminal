@@ -27,6 +27,7 @@ mod layout;
 mod mcp;
 mod mcp_config;
 mod process;
+mod protocol;
 mod quickstart;
 mod render;
 mod schedules;
