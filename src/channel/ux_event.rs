@@ -76,11 +76,35 @@ pub enum UxEvent {
 #[derive(Debug, Clone)]
 pub enum UxAction {
     /// Apply a reaction emoji on an existing message.
-    React { msg: MsgRef, emoji: &'static str },
-    /// Edit an existing message to a new text body.
-    EditText { msg: MsgRef, text: String },
-    /// Send a new text message to a binding.
-    SendText { binding: BindingRef, text: String },
+    ///
+    /// `instance` is the receiving agent's name — the key used by
+    /// `try_telegram_*` helpers to resolve the routing topic. It is
+    /// copied from the originating `UxEvent`'s `agent` field, NOT
+    /// derived from `BindingRef::display_tag` (which is a
+    /// human-readable label like "TG#229", not a lookup key — see
+    /// `config.instances.get(instance_name)` in
+    /// `channel::telegram::try_telegram_reply`).
+    React {
+        instance: String,
+        msg: MsgRef,
+        emoji: &'static str,
+    },
+    /// Edit an existing message to a new text body. See `React` for
+    /// `instance` semantics.
+    EditText {
+        instance: String,
+        msg: MsgRef,
+        text: String,
+    },
+    /// Send a new text message to a binding. See `React` for
+    /// `instance` semantics — this is the variant where getting it
+    /// wrong matters: `try_telegram_reply` bails if the instance
+    /// name does not match a fleet entry.
+    SendText {
+        instance: String,
+        binding: BindingRef,
+        text: String,
+    },
     /// Do nothing — the adapter's capability matrix has no way to
     /// express this event without resorting to a noisier fallback the
     /// plan explicitly forbids (plan §6 anti-feature on status text).
@@ -119,14 +143,16 @@ impl UxEventSink for NoopUxSink {
 /// (`PLAN-channel-ux-layer.md` §6) against the code 1-to-1.
 pub fn select_action(event: &UxEvent, caps: &ChannelCapabilities) -> UxAction {
     match event {
-        UxEvent::UserMsgReceived { origin_msg, .. } => {
+        UxEvent::UserMsgReceived { origin_msg, agent } => {
             if caps.react {
                 UxAction::React {
+                    instance: agent.clone(),
                     msg: origin_msg.clone(),
                     emoji: "👀",
                 }
             } else if caps.edit {
                 UxAction::EditText {
+                    instance: agent.clone(),
                     msg: origin_msg.clone(),
                     text: "[delivered]".to_string(),
                 }
@@ -135,20 +161,23 @@ pub fn select_action(event: &UxEvent, caps: &ChannelCapabilities) -> UxAction {
                 // binding. `origin_msg.binding` is the right target
                 // because the ack is a reply into the user's thread.
                 UxAction::SendText {
+                    instance: agent.clone(),
                     binding: origin_msg.binding.clone(),
                     text: "✓ delivered".to_string(),
                 }
             }
         }
-        UxEvent::AgentPickedUp { origin_msg, .. } => {
+        UxEvent::AgentPickedUp { origin_msg, agent } => {
             if caps.react {
                 UxAction::React {
+                    instance: agent.clone(),
                     msg: origin_msg.clone(),
                     // Plan §6: "stack ✅ on origin" alongside the earlier 👀.
                     emoji: "✅",
                 }
             } else if caps.edit {
                 UxAction::EditText {
+                    instance: agent.clone(),
                     msg: origin_msg.clone(),
                     text: "[read]".to_string(),
                 }
@@ -159,12 +188,22 @@ pub fn select_action(event: &UxEvent, caps: &ChannelCapabilities) -> UxAction {
                 UxAction::Noop
             }
         }
-        UxEvent::AgentReplied { binding, text, .. } => {
+        UxEvent::AgentReplied {
+            agent,
+            binding,
+            text,
+        } => {
             // No degradation: the reply text *is* the primitive, and
             // every capability combination renders it as a send. This
             // arm exists explicitly so the outer match is exhaustive
             // and reviewers can see the "never degraded" decision.
+            //
+            // `instance` comes from `agent` (the fleet instance key),
+            // NOT from `binding.display_tag()` — the latter is a
+            // human-readable label and will miss the `config.instances`
+            // lookup in `try_telegram_reply`.
             UxAction::SendText {
+                instance: agent.clone(),
                 binding: binding.clone(),
                 text: text.clone(),
             }
@@ -220,10 +259,20 @@ mod tests {
         ChannelCapabilities::default() // both false.
     }
 
-    // Helper: assert React action with expected message-id + emoji.
-    fn assert_react(action: &UxAction, expected_msg_id: &str, expected_emoji: &str) {
+    // Helper: assert React action with expected instance + message-id + emoji.
+    fn assert_react(
+        action: &UxAction,
+        expected_instance: &str,
+        expected_msg_id: &str,
+        expected_emoji: &str,
+    ) {
         match action {
-            UxAction::React { msg, emoji } => {
+            UxAction::React {
+                instance,
+                msg,
+                emoji,
+            } => {
+                assert_eq!(instance, expected_instance, "instance");
                 assert_eq!(msg.id, expected_msg_id, "msg id");
                 assert_eq!(*emoji, expected_emoji, "emoji");
             }
@@ -231,10 +280,20 @@ mod tests {
         }
     }
 
-    // Helper: assert EditText action with expected message-id + body.
-    fn assert_edit(action: &UxAction, expected_msg_id: &str, expected_text: &str) {
+    // Helper: assert EditText action with expected instance + message-id + body.
+    fn assert_edit(
+        action: &UxAction,
+        expected_instance: &str,
+        expected_msg_id: &str,
+        expected_text: &str,
+    ) {
         match action {
-            UxAction::EditText { msg, text } => {
+            UxAction::EditText {
+                instance,
+                msg,
+                text,
+            } => {
+                assert_eq!(instance, expected_instance, "instance");
                 assert_eq!(msg.id, expected_msg_id, "msg id");
                 assert_eq!(text, expected_text, "edit text");
             }
@@ -242,10 +301,20 @@ mod tests {
         }
     }
 
-    // Helper: assert SendText action with expected binding-tag + text.
-    fn assert_send(action: &UxAction, expected_tag: &str, expected_text: &str) {
+    // Helper: assert SendText action with expected instance + binding-tag + text.
+    fn assert_send(
+        action: &UxAction,
+        expected_instance: &str,
+        expected_tag: &str,
+        expected_text: &str,
+    ) {
         match action {
-            UxAction::SendText { binding, text } => {
+            UxAction::SendText {
+                instance,
+                binding,
+                text,
+            } => {
+                assert_eq!(instance, expected_instance, "instance");
                 assert_eq!(binding.display_tag(), Some(expected_tag), "binding tag");
                 assert_eq!(text, expected_text, "send text");
             }
@@ -261,7 +330,12 @@ mod tests {
             origin_msg: msg("tg#1", "42"),
             agent: "agent-a".into(),
         };
-        assert_react(&select_action(&ev, &caps_react_only()), "42", "👀");
+        assert_react(
+            &select_action(&ev, &caps_react_only()),
+            "agent-a",
+            "42",
+            "👀",
+        );
     }
 
     #[test]
@@ -270,7 +344,12 @@ mod tests {
             origin_msg: msg("tg#1", "42"),
             agent: "agent-a".into(),
         };
-        assert_edit(&select_action(&ev, &caps_edit_only()), "42", "[delivered]");
+        assert_edit(
+            &select_action(&ev, &caps_edit_only()),
+            "agent-a",
+            "42",
+            "[delivered]",
+        );
     }
 
     #[test]
@@ -279,7 +358,12 @@ mod tests {
             origin_msg: msg("tg#1", "42"),
             agent: "agent-a".into(),
         };
-        assert_send(&select_action(&ev, &caps_neither()), "tg#1", "✓ delivered");
+        assert_send(
+            &select_action(&ev, &caps_neither()),
+            "agent-a",
+            "tg#1",
+            "✓ delivered",
+        );
     }
 
     #[test]
@@ -302,7 +386,12 @@ mod tests {
             origin_msg: msg("tg#1", "42"),
             agent: "agent-a".into(),
         };
-        assert_react(&select_action(&ev, &caps_react_only()), "42", "✅");
+        assert_react(
+            &select_action(&ev, &caps_react_only()),
+            "agent-a",
+            "42",
+            "✅",
+        );
     }
 
     #[test]
@@ -311,7 +400,12 @@ mod tests {
             origin_msg: msg("tg#1", "42"),
             agent: "agent-a".into(),
         };
-        assert_edit(&select_action(&ev, &caps_edit_only()), "42", "[read]");
+        assert_edit(
+            &select_action(&ev, &caps_edit_only()),
+            "agent-a",
+            "42",
+            "[read]",
+        );
     }
 
     #[test]
@@ -354,7 +448,76 @@ mod tests {
             caps_edit_only(),
             caps_react_and_edit(),
         ] {
-            assert_send(&select_action(&ev, &caps), "tg#1", "hello");
+            assert_send(&select_action(&ev, &caps), "agent-a", "tg#1", "hello");
+        }
+    }
+
+    /// Regression for the PR #49 review finding: `UxAction::SendText`
+    /// was sourcing `instance` from `binding.display_tag()`, which is
+    /// a human-readable label like "TG#42" and will fail the
+    /// `config.instances.get(instance_name)` lookup in
+    /// `try_telegram_reply`. This test pins that `instance` MUST come
+    /// from the event's `agent` field regardless of what the binding
+    /// renders as.
+    #[test]
+    fn agent_replied_instance_comes_from_agent_not_display_tag() {
+        let ev = UxEvent::AgentReplied {
+            agent: "instance-a".into(),
+            // display_tag deliberately does NOT match `agent` — a
+            // legacy render string that would fail a fleet lookup.
+            binding: binding("TG#42"),
+            text: "hi".into(),
+        };
+        match select_action(&ev, &ChannelCapabilities::default()) {
+            UxAction::SendText {
+                instance, binding, ..
+            } => {
+                assert_eq!(instance, "instance-a", "instance must be the agent name");
+                assert_ne!(
+                    instance,
+                    binding.display_tag().unwrap_or_default(),
+                    "instance must NOT equal display_tag — that was the bug"
+                );
+            }
+            other => panic!("expected SendText, got {other:?}"),
+        }
+    }
+
+    /// Same pin for the degradation paths: when UserMsgReceived falls
+    /// through to the SendText ack column, `instance` must still be
+    /// the agent name, not a display-tag scrape.
+    #[test]
+    fn user_msg_received_send_ack_instance_comes_from_agent() {
+        let ev = UxEvent::UserMsgReceived {
+            origin_msg: msg("TG#42", "100"),
+            agent: "instance-a".into(),
+        };
+        match select_action(&ev, &caps_neither()) {
+            UxAction::SendText { instance, .. } => {
+                assert_eq!(instance, "instance-a");
+            }
+            other => panic!("expected SendText, got {other:?}"),
+        }
+    }
+
+    /// And for react/edit — even though today's `try_telegram_react`
+    /// uses `instance_name` only as a metadata fallback when
+    /// `message_id` is None (we always pass Some), the field should
+    /// still carry the agent name so future call sites that DO rely
+    /// on the lookup don't regress.
+    #[test]
+    fn react_and_edit_instance_comes_from_agent() {
+        let ev = UxEvent::UserMsgReceived {
+            origin_msg: msg("TG#42", "100"),
+            agent: "instance-a".into(),
+        };
+        match select_action(&ev, &caps_react_only()) {
+            UxAction::React { instance, .. } => assert_eq!(instance, "instance-a"),
+            other => panic!("expected React, got {other:?}"),
+        }
+        match select_action(&ev, &caps_edit_only()) {
+            UxAction::EditText { instance, .. } => assert_eq!(instance, "instance-a"),
+            other => panic!("expected EditText, got {other:?}"),
         }
     }
 

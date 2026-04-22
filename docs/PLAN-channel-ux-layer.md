@@ -168,6 +168,15 @@ message when no typing-indicator capability exists. Signalling status via
 text messages turns every turn into two-plus messages and creates more noise
 than it relieves. Silence is an acceptable fallback.
 
+**T3 scope narrowing.** The shipped `UxAction` enum covers only
+`React | EditText | SendText | Noop`. The `typing_indicator` column of
+the Q1 table — plus the `AgentThinking` / `AgentRateLimited` rows that
+lean on it — are **deferred to T12** (typing-indicator action + the
+daemon-side dispatcher that ticks `sendChatAction` on a timer). T3 also
+only wires `UserMsgReceived` / `AgentPickedUp` / `AgentReplied`; the
+other rows come online when their producers (inbox dequeue, rate-limit
+gate) land.
+
 ### Q2 — A2A fleet visibility
 
 Split into the two concrete scenarios confirmed as real pain:

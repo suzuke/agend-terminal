@@ -1117,46 +1117,57 @@ impl crate::channel::ux_event::UxEventSink for TelegramChannel {
         // All transport errors are logged, not propagated — a failed
         // reaction is never a reason to crash the daemon.
         match action {
-            UxAction::React { msg, emoji } => {
-                // `try_telegram_react` takes `instance_name` so it can
-                // resolve the origin msg from on-disk metadata when
-                // `message_id` is None. We always supply the id from
-                // `MsgRef`, so the instance name is only used for the
-                // log context / fallback — pass the binding's display
-                // tag as best-effort identification.
-                let instance = msg.binding.display_tag().unwrap_or("(unknown)");
-                if let Err(e) = try_telegram_react(instance, emoji, Some(&msg.id)) {
+            UxAction::React {
+                instance,
+                msg,
+                emoji,
+            } => {
+                // `instance` is the fleet instance name, sourced from
+                // the event's `agent` field by `select_action`. Today
+                // `try_telegram_react` only uses it as a metadata
+                // fallback when `message_id` is None (we always pass
+                // `Some`), but routing through the real instance name
+                // keeps the contract stable if that fallback ever runs.
+                if let Err(e) = try_telegram_react(&instance, emoji, Some(&msg.id)) {
                     tracing::warn!(
                         %e,
+                        instance = %instance,
                         msg_id = %msg.id,
                         emoji,
                         "UxEventSink: react failed"
                     );
                 }
             }
-            UxAction::EditText { msg, text } => {
-                let instance = msg.binding.display_tag().unwrap_or("(unknown)");
-                if let Err(e) = try_telegram_edit(instance, &msg.id, &text) {
+            UxAction::EditText {
+                instance,
+                msg,
+                text,
+            } => {
+                if let Err(e) = try_telegram_edit(&instance, &msg.id, &text) {
                     tracing::warn!(
                         %e,
+                        instance = %instance,
                         msg_id = %msg.id,
                         "UxEventSink: edit failed"
                     );
                 }
             }
-            UxAction::SendText { binding, text } => {
-                // `try_telegram_reply` keys on instance name to look up
-                // the topic id. The binding's `display_tag` carries
-                // e.g. "TG#229"; we extract the instance name from
-                // whatever the daemon recorded on record_binding. For
-                // T3 we keep the fallback path simple — the instance
-                // name is the display tag. Future dispatcher PR will
-                // route through a proper instance-resolution step.
-                let instance = binding.display_tag().unwrap_or("(unknown)");
-                if let Err(e) = try_telegram_reply(instance, &text) {
+            UxAction::SendText {
+                instance,
+                binding: _binding,
+                text,
+            } => {
+                // `try_telegram_reply` calls `config.instances.get(instance_name)`
+                // to resolve the routing topic. `instance` MUST be the
+                // fleet key (agent name) — NOT `binding.display_tag()`,
+                // which is a human-readable label like "TG#229" and
+                // would silently bail the fleet lookup. See
+                // `ux_event::agent_replied_instance_comes_from_agent_not_display_tag`
+                // for the pin.
+                if let Err(e) = try_telegram_reply(&instance, &text) {
                     tracing::warn!(
                         %e,
-                        instance,
+                        instance = %instance,
                         "UxEventSink: send failed"
                     );
                 }
