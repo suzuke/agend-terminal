@@ -69,8 +69,9 @@ impl Pane {
 
     #[cfg(test)]
     pub fn is_composing(&self) -> bool {
-        self.last_input_at
-            .is_some_and(|instant| instant.elapsed() < COMPOSE_IDLE_TIMEOUT)
+        self.last_input_at.is_some_and(|instant| {
+            instant.elapsed() < crate::notification_queue::COMPOSE_IDLE_TIMEOUT
+        })
     }
 
     /// Drain pending output into the local VTerm.
@@ -1585,8 +1586,11 @@ mod tests {
     #[test]
     fn pane_not_composing_after_idle() {
         let mut pane = leaf(1, "agent");
-        pane.last_input_at =
-            Some(Instant::now() - COMPOSE_IDLE_TIMEOUT - std::time::Duration::from_millis(1));
+        pane.last_input_at = Some(
+            Instant::now()
+                - crate::notification_queue::COMPOSE_IDLE_TIMEOUT
+                - std::time::Duration::from_millis(1),
+        );
         assert!(!pane.is_composing());
     }
 
