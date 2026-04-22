@@ -1,5 +1,7 @@
 # PLAN: Telegram topic delete → App pane sync
 
+> **Status: SHIPPED** — `cleanup_deleted_topic` live in `src/telegram.rs`. Doc retained for historical/provenance.
+
 **Branch:** `feat/telegram-topic-delete-sync` (to be created when implementation starts)
 **Date:** 2026-04-20
 

@@ -1,5 +1,7 @@
 # FOLLOWUP: PermissionPrompt pattern coverage gaps (Stage 2b finding)
 
+> **Status: SHIPPED** — implementation landed on `main` (commits `de2b197 ⇢ 4aa1dbf`, rebased to `5c95982 ⇢ 24ff0e0`). Doc retained for historical/provenance.
+
 **Filed**: 2026-04-20
 **Status**: Closed 2026-04-20 — claude + codex PermissionPrompt patterns fixed on `main` (commits `de2b197 ⇢ 4aa1dbf`, rebased to `5c95982 ⇢ 24ff0e0`)
 **Origin**: `docs/PLAN-state-replay-fixture-expansion.md` Stage 2b recording run

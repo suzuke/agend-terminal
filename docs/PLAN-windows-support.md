@@ -1,5 +1,7 @@
 # Windows Support — Implementation Plan
 
+> **Status: SHIPPED** — Phase A/B/C all landed on `main`. Doc retained for historical/provenance.
+
 > Date: 2026-04-17 (rev. 2026-04-20 — all phases folded into `main`; the 26200 "ConPTY regression" was re-diagnosed as agend-side and fixed in Session 4).
 > Prereq: Read `docs/EVAL-cross-platform.md` for the state-of-play.
 > Remaining effort: **none** — Phase A/B/C are all on `main`. The 26200 nested-ConPTY symptom turned out to be the CPR-reply + ignore-Ctrl+C bugs documented in `docs/HANDOVER-windows-conpty-nested.md` (see "Session 4 correction" section). Both fixes landed.

@@ -1,5 +1,7 @@
 # Code Review: Auto Tab/Pane for MCP-Spawned Instances
 
+> **Status: SHIPPED** — review cycle closed, feature live on `main` (commit `36dc537`). Doc retained for historical/provenance.
+
 **Commit:** `36dc537` feat: auto tab/pane for MCP-spawned instances and teams
 **Date:** 2026-04-17
 **Scope:** 18 files, +864/-307

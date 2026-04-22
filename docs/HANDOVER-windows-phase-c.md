@@ -1,5 +1,7 @@
 # Handover: Windows Port — Phase C
 
+> **Status: SHIPPED** — Windows Phase C landed on `main`. Doc retained for historical/provenance.
+
 > Date: 2026-04-17
 > Prereq: Read `docs/PLAN-windows-support.md` and `docs/EVAL-cross-platform.md`.
 

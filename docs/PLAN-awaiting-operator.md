@@ -1,5 +1,7 @@
 # PLAN: AwaitingOperator — 啟動卡住的泛用救援機制
 
+> **Status: SHIPPED** — `AwaitingOperator` state live in `src/telegram.rs`, `src/health.rs`, `src/app/mod.rs`, `src/vterm.rs`. Doc retained for historical/provenance.
+
 **Branch:** `feat/awaiting-operator`
 **Worktree:** `/Users/suzuke/Documents/Hack/agend-terminal-awaiting-op`
 **Date:** 2026-04-19

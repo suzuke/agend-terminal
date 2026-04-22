@@ -1,5 +1,7 @@
 # Schedule — Cross-platform Timezone + One-shot Support
 
+> **Status: SHIPPED** — `Trigger` enum live in `src/schedules.rs`, `iana-time-zone` in `Cargo.toml`. Doc retained for historical/provenance.
+
 > Date: 2026-04-20
 > Branch: `worktree-schedule-xplatform-oneshot`
 > Status: in progress
