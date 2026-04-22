@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual trigger for pre-tag validation — release pipeline otherwise only
+  # runs when a tag is cut, so bugs in this workflow surface late and loud.
+  # Dispatched runs still upload artifacts but skip the `release` job because
+  # softprops/action-gh-release only fires on tag refs.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -119,6 +124,9 @@ jobs:
       - name: Build (release, --features tray)
         run: cargo build --release --features tray
 
+      - name: Validate .desktop
+        run: desktop-file-validate assets/appimage/agend-terminal.desktop
+
       - name: Stage AppDir
         run: |
           set -euo pipefail
@@ -133,11 +141,22 @@ jobs:
           cp AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png AppDir/agend-terminal.png
           cp AppDir/usr/share/applications/agend-terminal.desktop AppDir/agend-terminal.desktop
 
-      - name: Download linuxdeploy + plugin-gtk
+      # Pin both tools + verify sha256. A release pipeline's trust boundary is
+      # tighter than CI's — `continuous` + `master` are moving targets and any
+      # upstream push (benign or not) lands directly in tagged artifacts.
+      # Bump deliberately when upstream ships something we want.
+      - name: Download + verify linuxdeploy + plugin-gtk
+        env:
+          LINUXDEPLOY_TAG: "1-alpha-20251107-1"
+          LINUXDEPLOY_SHA256: "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"
+          PLUGIN_GTK_SHA: "3b67a1d1c1b0c8268f57f2bce40fe2d33d409cea"
+          PLUGIN_GTK_SHA256: "b0f4cbc684a0103a9651f0955b635eaea0096b3a66c0f5a2c2aa337960375171"
         run: |
           set -euo pipefail
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          wget -q https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_TAG}/linuxdeploy-x86_64.AppImage"
+          wget -q "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/${PLUGIN_GTK_SHA}/linuxdeploy-plugin-gtk.sh"
+          echo "${LINUXDEPLOY_SHA256}  linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          echo "${PLUGIN_GTK_SHA256}  linuxdeploy-plugin-gtk.sh" | sha256sum -c -
           chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
 
       # APPIMAGE_EXTRACT_AND_RUN bypasses FUSE — GitHub runners don't ship it.
@@ -162,6 +181,9 @@ jobs:
     name: Create Release
     needs: [build, appimage]
     runs-on: ubuntu-latest
+    # Only publish on tag pushes. workflow_dispatch runs still produce
+    # artifacts (for pre-tag validation) but must not touch the release page.
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
