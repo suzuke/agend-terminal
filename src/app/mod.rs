@@ -61,21 +61,37 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste,
+    )
+    .ok();
+
+    let mut terminal = ratatui::init();
+
+    // Push keyboard enhancement AFTER entering alternate screen — Kitty
+    // protocol push/pop stack is per-screen, so pushing on the main screen
+    // is lost when ratatui::init() switches to the alternate screen.
+    crossterm::execute!(
+        std::io::stdout(),
         crossterm::event::PushKeyboardEnhancementFlags(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         ),
     )
     .ok();
 
-    let mut terminal = ratatui::init();
     let result = run_app(&mut terminal, fleet_path.as_deref());
+
+    // Pop before leaving alternate screen (symmetric with push).
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::PopKeyboardEnhancementFlags,
+    )
+    .ok();
+
     ratatui::restore();
 
     crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
-        crossterm::event::PopKeyboardEnhancementFlags,
     )
     .ok();
     result
