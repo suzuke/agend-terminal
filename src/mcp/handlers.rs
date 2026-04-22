@@ -308,43 +308,51 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
         "inbox" => {
             let messages = crate::inbox::drain(&home, instance_name);
-            // Emit AgentPickedUp so channel adapters can confirm pickup
-            // (e.g. Telegram ✅ reaction). Channel-agnostic: reads the
-            // origin msg coordinates from metadata written by whichever
-            // adapter delivered the inbound message.
+            // Emit AgentPickedUp for each pending inbound message so channel
+            // adapters can confirm pickup (e.g. Telegram ✅ reaction on each).
+            // F2 fix: iterate pending_pickup_ids array, not a single scalar.
             if !messages.is_empty() {
                 let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
                 if let Some(meta) = std::fs::read_to_string(&meta_path)
                     .ok()
                     .and_then(|c| serde_json::from_str::<Value>(&c).ok())
                 {
-                    let kind_str = meta["last_channel_kind"].as_str().unwrap_or("");
-                    let msg_id = meta["last_channel_msg_id"].as_str().unwrap_or("");
-                    // Map to &'static str for BindingRef::new.
-                    let kind: &'static str = match kind_str {
-                        "telegram" => "telegram",
-                        "discord" => "discord",
-                        "slack" => "slack",
-                        _ => "",
-                    };
-                    if !kind.is_empty() && !msg_id.is_empty() {
+                    if let Some(arr) = meta["pending_pickup_ids"].as_array() {
                         use crate::channel::binding::BindingRef;
                         use crate::channel::event::MsgRef;
                         use crate::channel::ux_event::UxEvent;
-                        let origin_msg = MsgRef {
-                            binding: BindingRef::new(
-                                kind,
-                                Some(instance_name.to_string()),
-                                (),
-                            ),
-                            id: msg_id.to_string(),
-                        };
-                        crate::channel::sink_registry::registry().emit(&UxEvent::AgentPickedUp {
-                            origin_msg,
-                            agent: instance_name.to_string(),
-                        });
+                        for entry in arr {
+                            let kind_str = entry["kind"].as_str().unwrap_or("");
+                            let msg_id = entry["msg_id"].as_str().unwrap_or("");
+                            let kind: &'static str = match kind_str {
+                                "telegram" => "telegram",
+                                "discord" => "discord",
+                                "slack" => "slack",
+                                _ => continue,
+                            };
+                            if msg_id.is_empty() {
+                                continue;
+                            }
+                            let origin_msg = MsgRef {
+                                binding: BindingRef::new(kind, Some(instance_name.to_string()), ()),
+                                id: msg_id.to_string(),
+                            };
+                            crate::channel::sink_registry::registry().emit(
+                                &UxEvent::AgentPickedUp {
+                                    origin_msg,
+                                    agent: instance_name.to_string(),
+                                },
+                            );
+                        }
                     }
                 }
+                // Clear pending_pickup_ids after emitting
+                crate::agent_ops::save_metadata(
+                    &home,
+                    instance_name,
+                    "pending_pickup_ids",
+                    json!(null),
+                );
             }
             json!({"messages": messages})
         }
@@ -1789,6 +1797,148 @@ instances:
             !home.join("metadata/.json").exists(),
             "no metadata written for anon caller"
         );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // PR #66 follow-up: F1 tests + F2 multi-message regression pin
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn metadata_persisted_on_pending_pickup() {
+        let _g = fleet_test_guard();
+        let (_rec, home) = setup_recorder("meta_pickup");
+
+        // Simulate what handle_message does: write pending_pickup_ids
+        save_metadata(
+            &home,
+            "sender",
+            "pending_pickup_ids",
+            json!([{"kind": "telegram", "msg_id": "42"}]),
+        );
+
+        let meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read"),
+        )
+        .expect("parse");
+        let arr = meta["pending_pickup_ids"]
+            .as_array()
+            .expect("must be array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["kind"], "telegram");
+        assert_eq!(arr[0]["msg_id"], "42");
+
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn agent_picked_up_emitted_on_inbox_drain() {
+        let _g = fleet_test_guard();
+        let (rec, home) = setup_recorder("pickup_emit");
+
+        // Seed pending_pickup_ids in metadata
+        save_metadata(
+            &home,
+            "sender",
+            "pending_pickup_ids",
+            json!([{"kind": "telegram", "msg_id": "99"}]),
+        );
+
+        // Seed an inbox message so drain is non-empty
+        let _ = crate::inbox::enqueue(
+            &home,
+            "sender",
+            crate::inbox::InboxMessage {
+                from: "user:test".to_string(),
+                text: "hello".to_string(),
+                kind: Some("telegram".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+
+        let _ = handle_tool("inbox", &json!({}), "sender");
+
+        let events = rec.snapshot();
+        let pickups: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, UxEvent::AgentPickedUp { .. }))
+            .collect();
+        assert_eq!(pickups.len(), 1, "expected 1 AgentPickedUp: {events:?}");
+        if let UxEvent::AgentPickedUp { origin_msg, agent } = &pickups[0] {
+            assert_eq!(origin_msg.id, "99");
+            assert_eq!(agent, "sender");
+        }
+
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn agent_picked_up_fires_for_all_pending_messages() {
+        let _g = fleet_test_guard();
+        let (rec, home) = setup_recorder("pickup_multi");
+
+        // Seed 3 pending pickup IDs (simulating 3 rapid user messages)
+        save_metadata(
+            &home,
+            "sender",
+            "pending_pickup_ids",
+            json!([
+                {"kind": "telegram", "msg_id": "10"},
+                {"kind": "telegram", "msg_id": "11"},
+                {"kind": "telegram", "msg_id": "12"},
+            ]),
+        );
+
+        // Seed inbox message so drain is non-empty
+        let _ = crate::inbox::enqueue(
+            &home,
+            "sender",
+            crate::inbox::InboxMessage {
+                from: "user:test".to_string(),
+                text: "burst".to_string(),
+                kind: Some("telegram".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+
+        let _ = handle_tool("inbox", &json!({}), "sender");
+
+        let events = rec.snapshot();
+        let pickups: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, UxEvent::AgentPickedUp { .. }))
+            .collect();
+        assert_eq!(
+            pickups.len(),
+            3,
+            "F2 pin: must emit AgentPickedUp for ALL pending messages, not just last: {events:?}"
+        );
+        // Verify IDs match
+        let ids: Vec<&str> = pickups
+            .iter()
+            .filter_map(|e| {
+                if let UxEvent::AgentPickedUp { origin_msg, .. } = e {
+                    Some(origin_msg.id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(ids, vec!["10", "11", "12"]);
+
+        // Verify pending_pickup_ids cleared after drain
+        let meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read"),
+        )
+        .expect("parse");
+        assert!(
+            meta["pending_pickup_ids"].is_null(),
+            "pending_pickup_ids must be cleared after drain"
+        );
+
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
