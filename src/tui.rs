@@ -127,6 +127,7 @@ pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
             let mut b = [0u8; 4];
             c.encode_utf8(&mut b).as_bytes().to_vec()
         }
+        KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => b"\x1b[13;2u".to_vec(),
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],
