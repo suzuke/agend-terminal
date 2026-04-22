@@ -281,9 +281,3 @@ Clean up immediately. Don't accumulate stale worktrees.
 | Schedule check-in | `create_schedule` (one-shot `--run_at`) | Backend-specific ScheduleWakeup |
 | Timeout escalation | `replace_instance` (after ping fails) | Silently waiting forever |
 
-## 10. Protocol changelog
-
-| Version | Date | Changes |
-|---|---|---|
-| v1.1 | 2026-04-22 | Added §7 Waiting and timeout: `set_waiting_on` usage, `create_schedule` for cross-backend check-ins, timeout policy (20min threshold), liveness check procedure, escalation rules. Added `create_schedule` + `replace_instance` to tool reference. |
-| v1.0 | 2026-04-22 | Initial protocol. Integrates Reviewer Contract v0.1 → v1.1, adds task board + decisions panel usage, hop reduction, CI integration. |
