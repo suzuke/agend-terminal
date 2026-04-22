@@ -246,10 +246,10 @@ Mount another repo as a read-only worktree in your working directory.
 
 ## How the Tools Are Wired
 
-1. `agend-terminal` daemon exposes a UDS API (`~/.agend/run/{PID}/api.sock`).
+1. `agend-terminal` daemon exposes a JSON control API on TCP loopback; the bound port is published to `~/.agend/run/{PID}/api.port` and authenticated by a 32-byte cookie at `~/.agend/run/{PID}/api.cookie` (0600 on Unix).
 2. For each backend, `src/mcp_config.rs` generates the backend's MCP config file pointing at `agend-terminal mcp` (stdio transport).
-3. `src/mcp/mod.rs` spawns a stdio server per agent, `src/mcp/tools.rs` serves schemas, `src/mcp/handlers.rs` proxies each call to the daemon API.
-4. All tool calls flow: **agent → MCP stdio server → daemon UDS API → `ops.rs` → registry / inbox / fleet**.
+3. `src/mcp/mod.rs` spawns a stdio server per agent, `src/mcp/tools.rs` serves schemas, `src/mcp/handlers.rs` proxies each call to the daemon API. Shared helpers (messaging, fleet mutation, branch validation) live in `src/agent_ops.rs` and are called from both sides; `tests/no_dual_track_drift.rs` enforces no drift between `agent_ops.rs` and `mcp/handlers.rs`.
+4. All tool calls flow: **agent → MCP stdio server → daemon loopback API → `src/api/handlers/*` → registry / inbox / fleet**. `start_instance` is handled inline by `src/mcp/handlers.rs` (no daemon round-trip) since Task #12.
 
 ## Schemas in Code
 
