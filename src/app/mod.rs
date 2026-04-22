@@ -360,8 +360,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 Overlay::Decisions { ref items, scroll } => {
                     render::render_decisions(frame, items, *scroll);
                 }
-                Overlay::Tasks { ref items, scroll } => {
-                    render::render_tasks(frame, items, *scroll);
+                Overlay::Tasks {
+                    ref items,
+                    col,
+                    row,
+                    detail,
+                } => {
+                    render::render_tasks(frame, items, *col, *row, *detail);
                 }
                 Overlay::ScratchShell { pane } => {
                     render::render_scratch_shell(frame, pane, &registry);
