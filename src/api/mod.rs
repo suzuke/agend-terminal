@@ -43,6 +43,36 @@ pub enum ApiEvent {
         added: Vec<String>,
         removed: Vec<String>,
     },
+    /// A `move_pane` MCP call asked for the pane displaying `agent` to be
+    /// relocated into `target_tab`. If the target tab exists the pane is
+    /// grouped with it; otherwise a new tab with that name is created. Lets
+    /// agents orchestrate team composition without the user dragging panes
+    /// by hand — e.g. a supervisor adding a freshly-spawned reviewer into
+    /// the existing team's tab.
+    PaneMoved {
+        agent: String,
+        target_tab: String,
+        split_dir: PaneMoveSplitDir,
+    },
+}
+
+/// Direction to split the destination tab's focused pane when the target tab
+/// already exists. Ignored when a new tab is created (the moved pane becomes
+/// the tab's root either way).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PaneMoveSplitDir {
+    #[default]
+    Horizontal,
+    Vertical,
+}
+
+impl PaneMoveSplitDir {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "vertical" | "v" => Self::Vertical,
+            _ => Self::Horizontal,
+        }
+    }
 }
 
 /// Layout hint for newly created instances. Parsed at the API boundary so
@@ -168,6 +198,7 @@ pub mod method {
     pub const DEREGISTER_EXTERNAL: &str = "deregister_external";
     pub const CREATE_TEAM: &str = "create_team";
     pub const UPDATE_TEAM: &str = "update_team";
+    pub const MOVE_PANE: &str = "move_pane";
     pub const SHUTDOWN: &str = "shutdown";
 }
 
@@ -320,6 +351,7 @@ fn handle_session(
             }
             method::CREATE_TEAM => handlers::team::handle_create_team(params, &ctx),
             method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
+            method::MOVE_PANE => handlers::instance::handle_move_pane(params, &ctx),
             method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1510,6 +1542,87 @@ mod tests {
         // No spawns → no TeamCreated event
         let events = notifier.take();
         assert_eq!(events.len(), 0, "no spawns should not emit TeamCreated");
+        stop_server(&shutdown, &home);
+    }
+
+    // -----------------------------------------------------------------------
+    // MOVE_PANE dispatch coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_move_pane_missing_agent() {
+        let (port, home, _n, shutdown) = start_test_server("mp-noagent");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "move_pane", "params": {"target_tab": "t"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("missing agent")));
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_move_pane_missing_target_tab() {
+        let (port, home, _n, shutdown) = start_test_server("mp-notab");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "move_pane", "params": {"agent": "a"}}),
+        );
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("missing target_tab")));
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_move_pane_emits_pane_moved_default_horizontal() {
+        let (port, home, notifier, shutdown) = start_test_server("mp-emit-h");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "move_pane", "params": {"agent": "a1", "target_tab": "team-x"}}),
+        );
+        assert_eq!(resp["ok"], true);
+        let events = notifier.take();
+        assert_eq!(events.len(), 1, "expected 1 event, got {events:?}");
+        let ApiEvent::PaneMoved {
+            agent,
+            target_tab,
+            split_dir,
+        } = &events[0]
+        else {
+            panic!("expected PaneMoved, got {:?}", events[0])
+        };
+        assert_eq!(agent, "a1");
+        assert_eq!(target_tab, "team-x");
+        assert_eq!(*split_dir, PaneMoveSplitDir::Horizontal);
+        stop_server(&shutdown, &home);
+    }
+
+    #[test]
+    fn dispatch_move_pane_parses_vertical_split() {
+        let (port, home, notifier, shutdown) = start_test_server("mp-emit-v");
+        let resp = api_request(
+            port,
+            &home,
+            &json!({"method": "move_pane", "params": {
+                "agent": "a2",
+                "target_tab": "team-y",
+                "split_dir": "vertical"
+            }}),
+        );
+        assert_eq!(resp["ok"], true);
+        let events = notifier.take();
+        assert_eq!(events.len(), 1);
+        let ApiEvent::PaneMoved { split_dir, .. } = &events[0] else {
+            panic!("expected PaneMoved");
+        };
+        assert_eq!(*split_dir, PaneMoveSplitDir::Vertical);
         stop_server(&shutdown, &home);
     }
 }

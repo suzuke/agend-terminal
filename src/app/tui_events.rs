@@ -5,7 +5,7 @@
 //! the layout accordingly — auto-creating or removing tabs/panes.
 
 use crate::agent::{self, AgentRegistry};
-use crate::layout::{Layout, SplitDir, Tab};
+use crate::layout::{Layout, MovePlacement, SplitDir, Tab};
 
 /// Events sent from the API server to the TUI event loop when agents or teams
 /// are created/deleted via MCP tools. The TUI reacts by auto-creating or
@@ -39,6 +39,15 @@ pub(crate) enum TuiEvent {
         name: String,
         added: Vec<String>,
         removed: Vec<String>,
+    },
+    /// Emitted by the `move_pane` MCP tool. Relocates the pane currently
+    /// displaying `agent` into `target_tab`: if the tab exists, the pane
+    /// splits its focused pane along `split_dir`; otherwise a new tab named
+    /// `target_tab` is created with the moved pane as root (split_dir ignored).
+    PaneMoved {
+        agent: String,
+        target_tab: String,
+        split_dir: SplitDir,
     },
 }
 
@@ -92,6 +101,21 @@ impl crate::api::ApiNotifier for TuiNotifier {
                 added,
                 removed,
             },
+            crate::api::ApiEvent::PaneMoved {
+                agent,
+                target_tab,
+                split_dir,
+            } => {
+                let dir = match split_dir {
+                    crate::api::PaneMoveSplitDir::Horizontal => SplitDir::Horizontal,
+                    crate::api::PaneMoveSplitDir::Vertical => SplitDir::Vertical,
+                };
+                TuiEvent::PaneMoved {
+                    agent,
+                    target_tab,
+                    split_dir: dir,
+                }
+            }
         };
         if let Err(e) = self.tx.try_send(tui_event) {
             tracing::warn!(error = %e, "TUI event send failed");
@@ -137,6 +161,54 @@ pub(super) fn handle_tui_event(
         } => {
             handle_team_members_changed(&name, &added, &removed, layout, registry, wakeup_tx);
         }
+        TuiEvent::PaneMoved {
+            agent,
+            target_tab,
+            split_dir,
+        } => {
+            handle_pane_moved(&agent, &target_tab, split_dir, layout);
+        }
+    }
+}
+
+/// Apply a `PaneMoved` event — find the pane displaying `agent` and relocate
+/// it into `target_tab`. If the target tab exists the moved pane splits its
+/// focused pane along `split_dir`; otherwise a new tab named `target_tab` is
+/// created and the moved pane becomes its root.
+///
+/// No-op if the agent is not displayed anywhere, the source is the only pane
+/// in the only tab (detach would leave layout empty), or the target tab is the
+/// same as the source tab and contains only this pane.
+fn handle_pane_moved(agent: &str, target_tab: &str, split_dir: SplitDir, layout: &mut Layout) {
+    tracing::debug!(
+        agent,
+        target_tab,
+        dir = ?split_dir,
+        "handle_pane_moved"
+    );
+    let (from_idx, pane_id) = match layout.find_agent_pane(agent) {
+        Some(s) => s,
+        None => {
+            tracing::warn!(agent, "handle_pane_moved: agent not displayed, ignored");
+            return;
+        }
+    };
+
+    let placement = match layout.tabs.iter().position(|t| t.name == target_tab) {
+        Some(to_idx) if to_idx == from_idx => return,
+        Some(to_idx) => MovePlacement::SplitFocused {
+            to_tab: to_idx,
+            dir: split_dir,
+        },
+        None => MovePlacement::NewTab {
+            name: target_tab.to_string(),
+        },
+    };
+    if layout
+        .move_pane_across_tabs(from_idx, pane_id, placement)
+        .is_none()
+    {
+        tracing::warn!(agent, target_tab, "handle_pane_moved: move refused");
     }
 }
 
@@ -422,56 +494,32 @@ fn handle_team_members_changed(
         return;
     }
 
-    // Strip each incoming member from any other tab first — a pane can only
-    // live in one place, and split_focused would otherwise leave the old pane
-    // subscribed. Skip the team tab itself to preserve an already-grouped pane.
-    for member in &to_attach {
-        let already_in_team = layout
-            .tabs
-            .iter()
-            .any(|tab| tab.name == team_name && tab.root().has_agent(member));
-        if already_in_team {
-            continue;
-        }
-        // Remove from every other tab (there should be at most one, but loop
-        // to stay safe if dedup ever slips).
-        loop {
-            let target = layout.tabs.iter().enumerate().find_map(|(tab_idx, tab)| {
-                if tab.name == team_name {
-                    None
-                } else {
-                    tab.root()
-                        .find_pane_id_by_agent(member)
-                        .map(|pane_id| (tab_idx, pane_id))
-                }
-            });
-            let (tab_idx, pane_id) = match target {
-                Some(t) => t,
-                None => break,
-            };
-            if layout.tabs[tab_idx].root().pane_count() <= 1 {
-                layout.close_tab(tab_idx);
-            } else {
-                layout.tabs[tab_idx].close_pane_by_id(pane_id);
-            }
-        }
-    }
-
-    // Attach each new member to the team tab. If the team tab doesn't exist
-    // yet (e.g. add into a freshly-created empty team), build it from the
-    // first member.
+    // Add phase: move each incoming member into the team tab. Prefer MOVING
+    // an existing pane (preserves VTerm scrollback and PTY subscription) over
+    // rebuilding via attach_pane. The team tab may not exist yet — establish
+    // it lazily from the first successful incoming member.
     let mut team_tab_idx = layout.tabs.iter().position(|tab| tab.name == team_name);
     let mut iter = to_attach.iter();
     if team_tab_idx.is_none() {
-        // Find first member we can actually attach. `by_ref` keeps the
-        // remaining members available for the split loop below.
         for member in iter.by_ref() {
+            if let Some((from_idx, pane_id)) = layout.find_agent_pane(member) {
+                if let Some(new_idx) = layout.move_pane_across_tabs(
+                    from_idx,
+                    pane_id,
+                    MovePlacement::NewTab {
+                        name: team_name.to_string(),
+                    },
+                ) {
+                    team_tab_idx = Some(new_idx);
+                    break;
+                }
+            }
+            // Member is registered but not displayed — synthesize a fresh pane.
             match super::pane_factory::attach_pane(
                 member, registry, cols, pane_rows, wakeup_tx, layout,
             ) {
                 Ok(pane) => {
-                    let tab = Tab::new(team_name.to_string(), pane);
-                    layout.add_tab(tab);
+                    layout.add_tab(Tab::new(team_name.to_string(), pane));
                     team_tab_idx = Some(layout.tabs.len() - 1);
                     break;
                 }
@@ -481,7 +529,7 @@ fn handle_team_members_changed(
             }
         }
     }
-    let tab_idx = match team_tab_idx {
+    let mut tab_idx = match team_tab_idx {
         Some(i) => i,
         None => {
             tracing::warn!(
@@ -496,6 +544,26 @@ fn handle_team_members_changed(
         if layout.tabs[tab_idx].root().has_agent(member) {
             continue;
         }
+        // Source must live in a different tab; otherwise `has_agent` above
+        // would have caught it.
+        let source = layout.tabs.iter().enumerate().find_map(|(i, t)| {
+            (i != tab_idx)
+                .then(|| t.root().find_pane_id_by_agent(member).map(|p| (i, p)))
+                .flatten()
+        });
+        if let Some((from_idx, pane_id)) = source {
+            if let Some(new_idx) = layout.move_pane_across_tabs(
+                from_idx,
+                pane_id,
+                MovePlacement::SplitFocused {
+                    to_tab: tab_idx,
+                    dir: SplitDir::Horizontal,
+                },
+            ) {
+                tab_idx = new_idx;
+            }
+            continue;
+        }
         match super::pane_factory::attach_pane(member, registry, cols, pane_rows, wakeup_tx, layout)
         {
             Ok(pane) => {
@@ -506,12 +574,6 @@ fn handle_team_members_changed(
             }
         }
     }
-
-    tracing::info!(
-        team = team_name,
-        tabs_after = layout.tabs.len(),
-        "handle_team_members_changed end"
-    );
 }
 
 /// Remove ALL panes for the given agent from every tab. Cleans up empty tabs.

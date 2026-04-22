@@ -2,7 +2,7 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::app::MenuItem;
-use crate::layout::{Layout, PaneNode, SplitDir};
+use crate::layout::{DragTabTarget, Layout, PaneNode, SplitDir};
 use crate::state::AgentState;
 use ratatui::layout::{Constraint, Direction, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -87,13 +87,29 @@ fn highest_priority_state(tab: &crate::layout::Tab, registry: &AgentRegistry) ->
 fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &AgentRegistry) {
     let mut spans = Vec::new();
 
+    // Cross-tab drag drop target (if the active tab is currently dragging a
+    // pane over the tab bar). Used to highlight the hovered tab / `[+]`.
+    let drag_tab_target = layout
+        .active_tab()
+        .and_then(|t| t.dragging_pane.and(t.drag_target_tab));
+
     for (i, tab) in layout.tabs.iter().enumerate() {
         let is_active = i == layout.active;
+        let is_drag_drop =
+            matches!(drag_tab_target, Some(DragTabTarget::ExistingTab(idx)) if idx == i);
         // Show the highest-priority state across all panes in this tab
         let state = highest_priority_state(tab, registry);
         let sc = state_color(state);
 
-        let style = if is_active {
+        let style = if is_drag_drop {
+            // Drop-target highlight wins over active styling so the user sees
+            // where the pane will land. Magenta matches the intra-tab
+            // drag-swap highlight (see is_drag_target below).
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else if is_active {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::White)
@@ -131,9 +147,20 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         spans.push(Span::styled(label, style));
     }
 
-    // fg must differ from the tab bar's bg (also DarkGray) — use Gray to match
-    // the unselected-tab label color.
-    spans.push(Span::styled(" [+] ", Style::default().fg(Color::Gray)));
+    // `[+]` doubles as the "drop here to spawn a new tab" zone during a
+    // cross-tab drag. Highlight it so the user sees that releasing here is
+    // a meaningful action, not a miss.
+    let new_tab_style = if matches!(drag_tab_target, Some(DragTabTarget::NewTab)) {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        // fg must differ from the tab bar's bg (also DarkGray) — use Gray to match
+        // the unselected-tab label color.
+        Style::default().fg(Color::Gray)
+    };
+    spans.push(Span::styled(" [+] ", new_tab_style));
     let tabs = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(tabs, area);
 }
@@ -869,6 +896,81 @@ pub fn render_tab_list(frame: &mut Frame, layout: &Layout, selected: usize) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Render the move-pane destination picker. Lists all tabs plus a trailing
+/// "[+] New tab" option. `selected == layout.tabs.len()` corresponds to the
+/// new-tab slot; `source_tab_idx` is dimmed as an invalid target so the user
+/// knows releasing Enter there is a no-op.
+pub fn render_move_pane_target(
+    frame: &mut Frame,
+    layout: &Layout,
+    selected: usize,
+    source_tab_idx: usize,
+) {
+    let area = frame.area();
+    let list_len = layout.tabs.len() + 1; // tabs + "New tab"
+    let h = (list_len as u16 + 4).min(area.height - 2);
+    let w = 54u16.min(area.width - 4);
+    let x = (area.width.saturating_sub(w)) / 2;
+    let y = (area.height.saturating_sub(h)) / 2;
+    let la = Rect::new(x, y, w, h);
+    frame.render_widget(Clear, la);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(Span::styled(
+            " Move pane to... (Enter, Esc) ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(la);
+    frame.render_widget(block, la);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(list_len);
+    for (i, tab) in layout.tabs.iter().enumerate() {
+        let is_sel = i == selected;
+        let is_source = i == source_tab_idx;
+        let style = if is_sel {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else if is_source {
+            // Source tab is not a meaningful target — dim it so selection
+            // visually skips past without needing a hard-disable.
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let marker = if is_source { "(source)" } else { "" };
+        let pc = tab.root().pane_count();
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {i}: "), style),
+            Span::styled(tab.name.as_str(), style),
+            Span::styled(
+                format!(
+                    "  ({pc} pane{s}) {marker}",
+                    s = if pc > 1 { "s" } else { "" }
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    // Trailing "New tab" slot.
+    let new_sel = selected == layout.tabs.len();
+    let style = if new_sel {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    lines.push(Line::from(vec![Span::styled(" [+] New tab", style)]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 pub fn render_confirm(frame: &mut Frame, message: &str) {
     let area = frame.area();
     let w = (message.len() as u16 + 4).min(area.width - 4);
@@ -911,10 +1013,12 @@ pub fn render_help(frame: &mut Frame) {
         "    Ctrl+B H/J/K/L Resize pane (portable)",
         "    Drag border    Resize pane",
         "    Drag title     Swap pane position",
+        "    Drag → tab bar Move pane across tabs (drop on tab or [+])",
         "    Ctrl+B x       Close pane",
         "    Ctrl+B z       Toggle zoom",
         "    Ctrl+B Space   Next layout preset",
         "    Ctrl+B .       Rename pane",
+        "    Ctrl+B !       Move pane to another tab (menu)",
         "",
         "  Scroll",
         "    Mouse wheel    Scroll focused pane",

@@ -92,6 +92,34 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 selected: ctx.layout.active,
             });
         }
+        Action::MovePaneMenu => {
+            // Anchor the menu to the currently focused pane. Opening the
+            // menu with no focused pane (e.g. empty layout) is a no-op.
+            let source = ctx
+                .layout
+                .active_tab()
+                .and_then(|t| t.focused_pane().map(|p| (t, p.id)));
+            if let Some((_tab, pane_id)) = source {
+                let active = ctx.layout.active;
+                out.new_overlay = Some(Overlay::MovePaneTarget {
+                    // Default selection: first tab that isn't the source, so
+                    // Enter immediately does something useful. Fall back to
+                    // the "New tab" slot (at index == tabs.len()) when the
+                    // source is the only tab.
+                    selected: if ctx.layout.tabs.len() > 1 {
+                        if active == 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    } else {
+                        ctx.layout.tabs.len()
+                    },
+                    source_pane_id: pane_id,
+                    source_tab_idx: active,
+                });
+            }
+        }
         Action::SplitVertical => {
             out.new_overlay = Some(Overlay::SplitMenu {
                 items: super::build_menu_items(ctx.fleet_path, ctx.registry),
