@@ -67,6 +67,21 @@ pub enum ChannelConfig {
         #[serde(default)]
         fleet_binding: Option<FleetBindingConfig>,
     },
+
+    #[cfg(feature = "discord")]
+    #[serde(rename = "discord")]
+    Discord {
+        /// Env var name containing the Discord bot token.
+        bot_token_env: String,
+        /// Discord Guild (server) ID -- string to avoid YAML f64 precision loss.
+        guild_id: String,
+        /// Category name to auto-create/find.
+        #[serde(default = "default_category_name")]
+        category_name: String,
+        /// Optional allowlist of Discord user IDs (snowflake strings).
+        #[serde(default)]
+        user_allowlist: Option<Vec<String>>,
+    },
 }
 
 /// Where fleet activity gets mirrored on a channel. Accepts two YAML
@@ -105,6 +120,11 @@ fn default_mode() -> String {
     "topic".to_string()
 }
 
+#[cfg(feature = "discord")]
+fn default_category_name() -> String {
+    "AgEnD Agents".to_string()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceDefaults {
     /// Backend preset name (e.g., "claude", "kiro-cli").
@@ -137,6 +157,9 @@ pub struct InstanceConfig {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
+    /// Discord channel ID -- snowflake as string.
+    #[cfg(feature = "discord")]
+    pub channel_id: Option<String>,
     /// Custom git branch name for worktree. TS version uses "worktree_source".
     #[serde(alias = "worktree_source")]
     pub git_branch: Option<String>,
@@ -322,6 +345,8 @@ impl FleetConfig {
             cols,
             rows,
             topic_id: inst.topic_id,
+            #[cfg(feature = "discord")]
+            channel_id: inst.channel_id.clone(),
             git_branch: inst.git_branch.clone(),
             model,
         })
@@ -347,6 +372,8 @@ pub struct ResolvedInstance {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub topic_id: Option<i32>,
+    #[cfg(feature = "discord")]
+    pub channel_id: Option<String>,
     pub git_branch: Option<String>,
     pub model: Option<String>,
 }
@@ -715,7 +742,7 @@ instances:
                 assert_eq!(group_id, -100123456);
                 assert_eq!(mode, "topic");
             }
-            None => panic!("channel should be Some"),
+            _ => panic!("unexpected channel variant"),
         }
 
         fs::remove_dir_all(&dir).ok();
@@ -750,7 +777,7 @@ instances: {}
                 assert_eq!(bot_token_env, "MY_BOT_TOKEN");
                 assert_eq!(group_id, -100999);
             }
-            None => panic!("plural channels: should populate singular channel field"),
+            _ => panic!("plural channels: should populate singular channel field"),
         }
         // Plural is still preserved on the struct for later consumers.
         assert!(config.channels.is_some());
@@ -795,7 +822,7 @@ instances: {}
                     "must pick first entry by sorted name"
                 );
             }
-            None => panic!("channel should be populated"),
+            _ => panic!("channel should be populated"),
         }
         fs::remove_dir_all(&dir).ok();
     }
@@ -827,7 +854,7 @@ instances: {}
             Some(ChannelConfig::Telegram {
                 ref bot_token_env, ..
             }) => assert_eq!(bot_token_env, "SINGULAR_TOKEN"),
-            None => panic!("singular channel field must be preserved"),
+            _ => panic!("singular channel field must be preserved"),
         }
         fs::remove_dir_all(&dir).ok();
     }
@@ -869,7 +896,7 @@ instances: {}
             Some(ChannelConfig::Telegram { ref mode, .. }) => {
                 assert_eq!(mode, "topic", "default mode should be 'topic'");
             }
-            None => panic!("channel should be Some"),
+            _ => panic!("unexpected channel variant"),
         }
 
         fs::remove_dir_all(&dir).ok();

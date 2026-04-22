@@ -18,6 +18,8 @@ mod fleet_normalize;
 pub mod reload;
 pub mod signals;
 mod telegram_init;
+#[cfg(feature = "discord")]
+mod discord_init;
 
 pub(crate) use agent_resolve::resolve_one;
 pub use agent_resolve::AgentDef;
@@ -60,6 +62,9 @@ pub struct OwnedFleet {
     #[allow(dead_code)]
     pub cookie: crate::auth_cookie::Cookie,
     pub telegram: Option<Arc<dyn crate::channel::Channel>>,
+    #[cfg(feature = "discord")]
+    #[allow(dead_code)]
+    pub discord: Option<Arc<dyn crate::channel::Channel>>,
     /// Flock guard — drop releases `.daemon.lock`. Kept last so the lock is
     /// released only after every other resource has been dropped.
     #[allow(dead_code)]
@@ -171,6 +176,13 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
         None
     };
 
+    #[cfg(feature = "discord")]
+    let discord = if opts.init_telegram {
+        discord_init::init(&config, home)
+    } else {
+        None
+    };
+
     Ok(BootstrapOutcome::Owned(Box::new(OwnedFleet {
         home: home.to_path_buf(),
         fleet_path: fleet_path.to_path_buf(),
@@ -179,6 +191,8 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
         run_dir,
         cookie,
         telegram,
+        #[cfg(feature = "discord")]
+        discord,
         lock,
     })))
 }

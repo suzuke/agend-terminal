@@ -29,7 +29,8 @@ unwrap_used = "deny"
 # Default build stays lean: `tray-icon` + `tao` only pull in when
 # `--features tray` is passed (release binaries ship with it).
 [features]
-default = []
+default = ["discord"]
+discord = ["dep:serenity"]
 tray = ["dep:tray-icon", "dep:tao", "dep:toml"]
 
 [profile.release]
@@ -58,6 +59,9 @@ serde_yaml = "0.9"
 
 # Telegram — rustls backend avoids macOS SecureTransport/Keychain/OCSP flakiness
 teloxide = { version = "0.13", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
+
+# Discord — included by default; opt out with --no-default-features
+serenity = { version = "0.12", optional = true, default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 
 # Utilities
 anyhow = "1"
