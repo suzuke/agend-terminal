@@ -13,26 +13,12 @@ agend-terminal demo    # Try it in 30 seconds
 
 ## What It Does
 
-**Run 3 Claude agents working on the same repo in parallel:**
-```bash
-agend-terminal start    # reads fleet.yaml, spawns agents with git worktree isolation
-agend-terminal status   # see all agents and their health
-agend-terminal attach dev  # watch one agent work (Ctrl+B d to detach)
-```
-
-**Agents talk to each other — no glue code:**
-```
-Agent A finds a bug outside its scope → delegates to Agent B via MCP tool.
-Agent B fixes it → reports back with commit hash.
-Agent A continues with the fix applied.
-```
-
-**Survive crashes without losing context:**
-```
-Agent crashes → auto-respawned with exponential backoff.
-System message tells the new agent what happened.
-Worktree preserves all code changes.
-```
+Spawns AI coding agents (Claude Code, Codex, Kiro, OpenCode, Gemini) as
+long-lived PTY processes, each in its own git worktree. A built-in MCP
+server lets agents talk to each other — delegate work, request info,
+broadcast updates — without glue code. Crashes are survived by auto-
+respawn with context handover. Drive the fleet through a multi-tab /
+multi-pane TUI, a Telegram channel, or an optional system tray.
 
 ## Why Not tmux?
 
@@ -47,14 +33,16 @@ Worktree preserves all code changes.
 ## Quick Start
 
 ```bash
-# Try the demo (no config needed)
+# Demo (no config)
 agend-terminal demo
 
-# Or start with your own agents
+# Interactive setup — detects backends, wires Telegram, writes fleet.yaml
+agend-terminal quickstart
+
+# Or hand-write:
 cat > ~/.agend/fleet.yaml << 'YAML'
 defaults:
   backend: claude
-
 instances:
   dev:
     role: "Developer"
@@ -63,89 +51,8 @@ instances:
     role: "Code reviewer"
     working_directory: ~/my-project
 YAML
-
 agend-terminal start
 ```
-
-## Commands
-
-```
-Get started
-  agend-terminal app                   Launch multi-tab/pane TUI
-  agend-terminal demo                  30-second interactive demo
-  agend-terminal quickstart            Interactive setup — detect backends, wire Telegram, generate fleet.yaml
-  agend-terminal doctor                Health check backends
-
-Run a fleet
-  agend-terminal start                 Start daemon with fleet.yaml
-  agend-terminal daemon [name:cmd …]   Start daemon with explicit agents
-  agend-terminal stop                  Stop daemon
-  agend-terminal upgrade --binary <path>
-                                       Hot-upgrade daemon via supervisor (Unix only)
-
-Interact
-  agend-terminal attach <name>         Attach to agent (Ctrl+B d to detach)
-  agend-terminal inject <name> <text>  Send input to agent's PTY
-  agend-terminal list                  List running agents
-  agend-terminal status                Detailed agent status (state, health)
-  agend-terminal kill <name>           Kill an agent
-  agend-terminal connect <name>        Register an external agent with the running daemon
-  agend-terminal fleet …               Fleet management subcommands
-
-Integration
-  agend-terminal mcp                   MCP stdio server (agent-to-agent coordination)
-  agend-terminal completions <shell>   Generate shell completions (bash/zsh/fish/elvish/powershell)
-  agend-terminal bugreport             One-file diagnostic export
-```
-
-## 35 MCP Tools
-
-Agents get these tools automatically via MCP:
-
-| Category | Tools |
-|----------|-------|
-| Talk to users | reply, react, edit_message, download_attachment |
-| Talk to agents | send_to_instance, delegate_task, report_result, request_information, broadcast, inbox |
-| Manage agents | list/create/delete/start/describe/replace_instance, set_display_name, set_description |
-| Track decisions | post_decision, list_decisions, update_decision |
-| Track tasks | task (create/list/claim/done/update) |
-| Organize teams | create/delete/list/update_team |
-| Schedule work | create/list/update/delete_schedule |
-| Deploy fleets | deploy_template, teardown_deployment, list_deployments |
-| Share code | checkout_repo, release_repo |
-
-## Git Worktree Isolation
-
-Agents pointing to git repos automatically get isolated worktrees:
-
-```
-~/my-project/               ← original repo (untouched)
-~/my-project/.worktrees/
-  dev/                       ← agent "dev" works here (branch agend/dev)
-  reviewer/                  ← agent "reviewer" works here (branch agend/reviewer)
-```
-
-No configuration needed. `.worktrees` auto-added to `.gitignore`.
-
-## Health Monitoring
-
-- Auto-respawn with exponential backoff (5s → 300s)
-- State detection: Idle, Thinking, ToolUse, RateLimit, Crashed, Restarting
-- Crash notifications via Telegram
-- 30-minute stability window prevents permanent failure from occasional crashes
-
-## Telegram Integration
-
-Each agent gets its own forum topic; messages route by topic. Topic lifecycle
-is bidirectional:
-
-- **Delete a pane in app → topic is deleted in Telegram** (immediate).
-- **Close topic in Telegram → pane is removed in app** (immediate, via the
-  `forum_topic_closed` service message).
-- **Delete topic in Telegram → pane is removed in app** (lazy, on the next
-  agent send to that topic). Telegram Bot API does not emit a deletion event,
-  so the cleanup fires the first time a send returns
-  `message thread not found`. Prefer Close if you want immediate cleanup.
 
 ## Backends
 
@@ -157,12 +64,13 @@ is bidirectional:
 | OpenCode | `opencode` | Tested |
 | Gemini CLI | `gemini` | Tested |
 
-## Testing
+## Learn More
 
-```bash
-cargo test         # 561 tests (unit + integration + MCP round-trip)
-cargo clippy       # 0 errors (deny unwrap_used)
-```
+- **Commands** — [`docs/CLI.md`](docs/CLI.md) for the full subcommand reference.
+- **MCP tools** — [`docs/MCP-TOOLS.md`](docs/MCP-TOOLS.md) for the 35 agent-to-agent coordination tools.
+- **Architecture** — [`docs/architecture.md`](docs/architecture.md) covers git worktree isolation, health monitoring + auto-respawn, Telegram topic lifecycle, and daemon-resident design.
+- **Contributing** — [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- **Release history** — [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 

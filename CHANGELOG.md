@@ -5,6 +5,32 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+Post-`0.3.1` work on `main`. 48 commits over the tray-resident arc,
+Task #9 Option C dual-track elimination, codebase-review correctness
+fixes, and performance hotspots.
+
+### Added
+
+- **System tray integration (`agend-terminal tray`, Cargo `--features tray`)** — native menu-bar / system-tray support on all three platforms. Status-keyed icon color (offline / idle / active), 2s status polling, disabled status label at top of menu, "Open App" launches the configured terminal emulator, Autostart (launch-at-login) toggle. Linux ships as an AppImage bundling GTK + AppIndicator libs with a custom AppRun that forces the tray subcommand on launch; macOS + Windows release tarballs include the feature by default.
+- **Dual-track fn drift detector** (`tests/no_dual_track_drift.rs`) — integration test scans top-level fn definitions in `src/ops.rs` and `src/mcp/handlers.rs`, panics on body divergence and warns on byte-identical duplicates. Hardened (#31) against raw string literals inside top-level fn bodies (fail-loud; guard scoped to extracted bodies so tests/impl blocks do not false-fail), `extern "C" fn` / `extern "Rust" fn` prefix handling, and silent-drop panic when `match_balanced_brace` cannot close a detected fn.
+- **Positive-pin CREATE_TEAM dispatch test** — `RecordingNotifier`-based in-process assertion that `spawn_one` success emits exactly one `ApiEvent::TeamCreated` with the expected payload, completing the three-piece equivalence bracket from C2 and closing a LESSONS-04-21 open item.
+
+### Changed
+
+- **Task #9 Option C — dual-track elimination** — shared helpers consolidated into `src/agent_ops.rs`; `src/api.rs` decomposed into per-tool handler modules (`handlers/instance.rs`, `handlers/team.rs`, `handlers/*`); `src/ops.rs` reduced to a single `start_instance` wrapper (Task #12 then deleted it entirely, inlining into the MCP dispatcher); 21 dead CLI-wrapper fns pruned and the crate-level `#![allow(dead_code)]` attribute removed. `validate_branch` also migrated out of `src/worktree.rs` into `agent_ops`.
+- **MCP tool ACL cached via `OnceLock`** — parsed once at startup instead of on every tool call.
+- **Layout pane-id enumeration** — new `collect_pane_ids()` avoids recursive allocation in the layout traversal hotspot.
+- **`spawn_agent` decomposed** — `build_command()` extracted for clarity and unit-testability.
+
+### Fixed
+
+- **Invalid state regex now panics** instead of silently degrading state detection.
+- **`strip_ansi` no longer inserts a phantom space on cursor-move sequences**, which was corrupting captured output.
+- **MCP stdio framing** returns `None` on EOF during `Content-Length` error recovery instead of hanging the loop.
+- **Cron schedule robustness** — `parse_run_at` rejects invalid timezones (previously fell back to UTC); schedule skipped instead of mis-fired on bad tz; `.schedule_last_check` written atomically.
+- **Fleet `ready_pattern` hardening** — regex validated at resolve time with a size ceiling, closing a ReDoS surface.
+- **Tray "Open App" no longer freezes the tray** — terminal launches are detached.
+
 ## [0.3.1] — 2026-04-21
 
 Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area.
