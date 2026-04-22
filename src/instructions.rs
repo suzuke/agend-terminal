@@ -223,7 +223,7 @@ pub fn generate_with_context(working_dir: &Path, command: &str, ctx: Option<&Age
     }
 
     // MCP config for all backends
-    crate::mcp_config::configure(working_dir, command);
+    crate::mcp_config::configure(working_dir, command, ctx.map(|c| c.name));
 
     // Agent instructions (identity, role, communication guide)
     generate_agent_instructions(working_dir, command, ctx);

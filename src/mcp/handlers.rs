@@ -378,7 +378,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     let wd = home.join("workspace").join(&inst_name);
                     std::fs::create_dir_all(&wd).ok();
                     crate::instructions::generate(&wd, be);
-                    crate::mcp_config::configure(&wd, be);
+                    crate::mcp_config::configure(&wd, be, Some(&inst_name));
                 }
                 match crate::api::call(
                     &home,
@@ -867,7 +867,7 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
     let wd = std::path::PathBuf::from(&work_dir);
     std::fs::create_dir_all(&wd).ok();
     crate::instructions::generate(&wd, command);
-    crate::mcp_config::configure(&wd, command);
+    crate::mcp_config::configure(&wd, command, Some(name));
 
     let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
     let role = args.get("role").and_then(|v| v.as_str()).map(String::from);
