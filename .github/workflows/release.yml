@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual trigger for pre-tag validation — release pipeline otherwise only
+  # runs when a tag is cut, so bugs in this workflow surface late and loud.
+  # Dispatched runs still upload artifacts but skip the `release` job because
+  # softprops/action-gh-release only fires on tag refs.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -90,10 +95,104 @@ jobs:
           name: agend-terminal-${{ matrix.target }}
           path: agend-terminal-${{ matrix.target }}.${{ matrix.archive }}
 
+  appimage:
+    name: Build AppImage (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # linuxdeploy + plugin-gtk need the same GTK dev libs the tray feature
+      # needs at build time. imagemagick resizes the 1024x1024 master icon to
+      # the 256x256 that the AppImage spec + FreeDesktop hicolor standard want.
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            imagemagick \
+            wget \
+            file \
+            desktop-file-utils
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: appimage-x86_64-tray
+
+      - name: Build (release, --features tray)
+        run: cargo build --release --features tray
+
+      - name: Stage AppDir
+        run: |
+          set -euo pipefail
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
+          cp target/release/agend-terminal AppDir/usr/bin/agend-terminal
+          cp assets/appimage/agend-terminal.desktop AppDir/usr/share/applications/agend-terminal.desktop
+          # Resize 1024x1024 master → 256x256 for hicolor + AppImage root
+          convert assets/appimage/agend-terminal.png -resize 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png
+          # linuxdeploy expects icon + .desktop at AppDir root too
+          cp AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png AppDir/agend-terminal.png
+          cp AppDir/usr/share/applications/agend-terminal.desktop AppDir/agend-terminal.desktop
+
+      # Validate the staged copy — the one that actually goes into the
+      # AppImage, not just the source file in assets/.
+      - name: Validate .desktop
+        run: desktop-file-validate AppDir/agend-terminal.desktop
+
+      # Pin both tools + verify sha256. A release pipeline's trust boundary is
+      # tighter than CI's — `continuous` + `master` are moving targets and any
+      # upstream push (benign or not) lands directly in tagged artifacts.
+      # Bump deliberately when upstream ships something we want.
+      #
+      # Linuxdeploy doesn't do proper semver releases; current tag convention
+      # is `1-alpha-<YYYYMMDD>-N`. To bump:
+      #   - latest tag: https://github.com/linuxdeploy/linuxdeploy/releases
+      #   - asset digest: gh api repos/linuxdeploy/linuxdeploy/releases/tags/<tag>
+      # plugin-gtk has no releases; pin by commit SHA from master history:
+      #   https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/commits/master
+      - name: Download + verify linuxdeploy + plugin-gtk
+        env:
+          LINUXDEPLOY_TAG: "1-alpha-20251107-1"
+          LINUXDEPLOY_SHA256: "c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d"
+          PLUGIN_GTK_SHA: "3b67a1d1c1b0c8268f57f2bce40fe2d33d409cea"
+          PLUGIN_GTK_SHA256: "b0f4cbc684a0103a9651f0955b635eaea0096b3a66c0f5a2c2aa337960375171"
+        run: |
+          set -euo pipefail
+          wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_TAG}/linuxdeploy-x86_64.AppImage"
+          wget -q "https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/${PLUGIN_GTK_SHA}/linuxdeploy-plugin-gtk.sh"
+          echo "${LINUXDEPLOY_SHA256}  linuxdeploy-x86_64.AppImage" | sha256sum -c -
+          echo "${PLUGIN_GTK_SHA256}  linuxdeploy-plugin-gtk.sh" | sha256sum -c -
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
+
+      # APPIMAGE_EXTRACT_AND_RUN bypasses FUSE — GitHub runners don't ship it.
+      # OUTPUT pins the filename so the upload step + release files list match.
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          OUTPUT: agend-terminal-x86_64.AppImage
+        run: |
+          ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --plugin gtk \
+            --output appimage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agend-terminal-x86_64-AppImage
+          path: agend-terminal-x86_64.AppImage
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, appimage]
     runs-on: ubuntu-latest
+    # Only publish on tag pushes. workflow_dispatch runs still produce
+    # artifacts (for pre-tag validation) but must not touch the release page.
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -103,7 +202,7 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           cd artifacts
-          sha256sum agend-terminal-*.tar.gz agend-terminal-*.zip > SHA256SUMS
+          sha256sum agend-terminal-*.tar.gz agend-terminal-*.zip agend-terminal-*.AppImage > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create GitHub Release
@@ -113,4 +212,5 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.zip
+            artifacts/*.AppImage
             artifacts/SHA256SUMS
