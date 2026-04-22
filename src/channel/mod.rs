@@ -34,13 +34,15 @@ pub mod binding;
 pub mod caps;
 pub mod contract;
 pub mod event;
+pub mod sink_registry;
 pub mod telegram;
 pub mod ux_event;
 
 pub use binding::BindingRef;
 pub use caps::{ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint, RateBudget};
 pub use event::{ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason, User};
-pub use ux_event::{select_action, NoopUxSink, UxAction, UxEvent, UxEventSink};
+pub use sink_registry::{registry, UxSinkRegistry};
+pub use ux_event::{select_action, FleetEvent, NoopUxSink, UxAction, UxEvent, UxEventSink};
 
 use crate::agent::AgentRegistry;
 use anyhow::Result;

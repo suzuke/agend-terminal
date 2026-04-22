@@ -9,14 +9,18 @@
 //! trait and, via [`select_action`], pick the strongest primitive their
 //! capabilities support: react > edit > send > noop.
 //!
-//! ## Scope of this file (T3 narrow scope)
+//! ## Scope of this file
 //!
-//! Only the Q1 delivery-confirmation subset is defined here:
-//! [`UxEvent::UserMsgReceived`], [`UxEvent::AgentPickedUp`], and
-//! [`UxEvent::AgentReplied`]. `AgentThinking` / `AgentIdle` /
-//! `AgentRateLimited` / `AgentCrashed` / `AgentRestarted` and the
-//! `Fleet(FleetEvent)` variant are deferred to a follow-up PR — they do
-//! not touch the Telegram send / edit / react paths in Q1, so landing
+//! Q1 delivery-confirmation subset: [`UxEvent::UserMsgReceived`],
+//! [`UxEvent::AgentPickedUp`], and [`UxEvent::AgentReplied`] (T3).
+//! Q2 fleet-visibility subset: [`UxEvent::Fleet`] wrapping a
+//! [`FleetEvent`] — routed by `sink_registry` to any registered sink,
+//! rendered per adapter (PR-B lands the Telegram renderer). Stage B-UX
+//! design: `docs/DESIGN-stage-b-ux.md` §4.
+//!
+//! `AgentThinking` / `AgentIdle` / `AgentRateLimited` / `AgentCrashed` /
+//! `AgentRestarted` (remaining Q1 events) are deferred — they do not
+//! touch the Telegram send / edit / react paths in Q1, so landing
 //! them here would be speculative dead code.
 //!
 //! ## Plan reference
@@ -63,6 +67,61 @@ pub enum UxEvent {
         /// event, so there is no degradation ladder — every capability
         /// combination renders via `send`.
         text: String,
+    },
+    /// Cross-instance fleet activity — delegations, result reports,
+    /// decisions, and broadcasts observed on the daemon's MCP surface.
+    /// Rendered into a separate `fleet_binding` (see plan §6 S2c),
+    /// NOT into the origin user's thread. See [`FleetEvent`] and
+    /// `docs/DESIGN-stage-b-ux.md` §4 for the producer hook table.
+    Fleet(FleetEvent),
+}
+
+/// Cross-instance activity events. These travel from MCP handlers to
+/// `sink_registry::registry()`, which fans them out to every registered
+/// sink. Unlike Q1 events, they have no capability-degradation ladder —
+/// the target is always the configured `fleet_binding`, and rendering is
+/// pure format (see [`select_action`] Fleet arm for why).
+///
+/// The enum shape is locked by `docs/PLAN-channel-ux-layer.md` §4 with
+/// one deviation: `task_id` is `Option<String>` rather than a newtype
+/// `TaskId`. Rationale: the `correlation_id` arg on `report_result` is
+/// an ad-hoc caller-chosen string (e.g. `"AGD-42"`); making it required
+/// with a typed wrapper overstates what the MCP surface actually
+/// guarantees. Renderers display the id when present and omit it
+/// otherwise. Decision: `docs/DESIGN-stage-b-ux.md` §9 Q1, by general.
+#[derive(Debug, Clone)]
+pub enum FleetEvent {
+    /// `delegate_task` MCP call landed.
+    DelegateTask {
+        from: String,
+        to: String,
+        summary: String,
+        task_id: Option<String>,
+    },
+    /// `report_result` MCP call landed. `task_id` mirrors the caller's
+    /// `correlation_id` arg when it was supplied.
+    ReportResult {
+        from: String,
+        to: String,
+        summary: String,
+        task_id: Option<String>,
+    },
+    /// `post_decision` MCP call succeeded. Anonymous posts (no
+    /// `AGEND_INSTANCE_NAME` / explicit `instance_name`) are
+    /// deliberately NOT emitted — fleet provenance requires an
+    /// identified author (see `docs/DESIGN-stage-b-ux.md` §4.3).
+    PostDecision {
+        by: String,
+        title: String,
+        decision_id: String,
+    },
+    /// `broadcast` MCP call completed its fan-out. `recipients` lists
+    /// every instance the broadcast was actually sent to (after
+    /// self-filter).
+    Broadcast {
+        from: String,
+        recipients: Vec<String>,
+        summary: String,
     },
 }
 
@@ -207,6 +266,19 @@ pub fn select_action(event: &UxEvent, caps: &ChannelCapabilities) -> UxAction {
                 binding: binding.clone(),
                 text: text.clone(),
             }
+        }
+        UxEvent::Fleet(_) => {
+            // Fleet events do NOT participate in the Q1 cap-degradation
+            // ladder. They target a configured `fleet_binding`, not the
+            // originating user's thread, and their rendering is a plain
+            // one-liner format (no react / edit option). Adapters that
+            // want to consume Fleet events dispatch on the `UxEvent`
+            // variant *before* calling this function (see
+            // `docs/DESIGN-stage-b-ux.md` §4.4 dispatch-split). Adapters
+            // that ignore Fleet events — or haven't wired a renderer
+            // yet (e.g. PR-A Telegram, where the renderer lands in
+            // PR-B) — correctly no-op via this arm.
+            UxAction::Noop
         }
     }
 }
@@ -539,5 +611,117 @@ mod tests {
             binding: binding("tg#1"),
             text: "x".into(),
         });
+        sink.emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: "s".into(),
+            task_id: None,
+        }));
+    }
+
+    // ─── FleetEvent ──────────────────────────────────────────────────
+
+    /// Fleet variants construct and carry data correctly. This is a
+    /// smoke test — the producer wiring that fills these fields lives
+    /// in `src/mcp/handlers.rs` and is tested there against a
+    /// `RecordingSink`.
+    #[test]
+    fn fleet_event_variants_construct() {
+        let delegate = FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: "pick this up".into(),
+            task_id: Some("AGD-7".into()),
+        };
+        match delegate {
+            FleetEvent::DelegateTask {
+                from,
+                to,
+                summary,
+                task_id,
+            } => {
+                assert_eq!(from, "a");
+                assert_eq!(to, "b");
+                assert_eq!(summary, "pick this up");
+                assert_eq!(task_id.as_deref(), Some("AGD-7"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // `task_id: None` is the default reflecting the MCP handlers'
+        // actual contract — correlation_id is optional on delegate_task.
+        let delegate_anon = FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: "anon".into(),
+            task_id: None,
+        };
+        assert!(matches!(
+            delegate_anon,
+            FleetEvent::DelegateTask { task_id: None, .. }
+        ));
+
+        let report = FleetEvent::ReportResult {
+            from: "b".into(),
+            to: "a".into(),
+            summary: "done".into(),
+            task_id: Some("AGD-7".into()),
+        };
+        assert!(matches!(report, FleetEvent::ReportResult { .. }));
+
+        let decision = FleetEvent::PostDecision {
+            by: "a".into(),
+            title: "use X".into(),
+            decision_id: "d-123".into(),
+        };
+        if let FleetEvent::PostDecision {
+            by,
+            title,
+            decision_id,
+        } = decision
+        {
+            assert_eq!(by, "a");
+            assert_eq!(title, "use X");
+            assert_eq!(decision_id, "d-123");
+        } else {
+            panic!();
+        }
+
+        let broadcast = FleetEvent::Broadcast {
+            from: "a".into(),
+            recipients: vec!["b".into(), "c".into()],
+            summary: "ship it".into(),
+        };
+        if let FleetEvent::Broadcast { recipients, .. } = broadcast {
+            assert_eq!(recipients.len(), 2);
+        } else {
+            panic!();
+        }
+    }
+
+    /// Pin Fleet events out of the Q1 cap-degradation ladder:
+    /// [`select_action`] must return [`UxAction::Noop`] for any Fleet
+    /// payload, regardless of caps. Dispatch-split callers (see
+    /// `DESIGN-stage-b-ux.md` §4.4) steer Fleet events to a separate
+    /// renderer before reaching this function; this arm guarantees
+    /// naive callers that forget to dispatch-split don't accidentally
+    /// render a Fleet event into the origin user's thread as a react /
+    /// edit / send.
+    #[test]
+    fn select_action_fleet_is_always_noop_regardless_of_caps() {
+        let fleet = UxEvent::Fleet(FleetEvent::DelegateTask {
+            from: "a".into(),
+            to: "b".into(),
+            summary: "x".into(),
+            task_id: None,
+        });
+        for caps in [
+            caps_neither(),
+            caps_react_only(),
+            caps_edit_only(),
+            caps_react_and_edit(),
+        ] {
+            assert!(matches!(select_action(&fleet, &caps), UxAction::Noop));
+        }
     }
 }
