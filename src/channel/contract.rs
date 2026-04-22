@@ -227,10 +227,13 @@ mod tests {
 
     #[test]
     fn telegram_channel_satisfies_contract() {
-        // Dummy token + empty instance map. None of the invariants run
-        // here touch the teloxide HTTP runtime, so no network is needed.
-        let state = TelegramState::new(
-            "dummy_contract_token",
+        // Bot-free constructor: `TelegramState::new` eagerly runs
+        // `Bot::new`, which initializes reqwest + `system-configuration`
+        // and panics on some macOS setups. None of the contract invariants
+        // touch the `bot` field (see module-level "Scope" doc), so we use
+        // the `#[cfg(test)]` `new_for_contract_test` path to keep this
+        // portable across developer machines and CI.
+        let state = TelegramState::new_for_contract_test(
             -100_1234567890,
             HashMap::new(),
             PathBuf::from("/tmp/agend-contract-home"),

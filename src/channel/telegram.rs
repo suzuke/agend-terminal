@@ -78,7 +78,11 @@ fn telegram_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 pub struct TelegramState {
-    pub bot: Bot,
+    /// `None` only inside the contract-test harness — production `new`
+    /// always populates it via `Bot::new`. Transport methods unwrap with
+    /// `.expect("telegram bot not initialized")`; contract tests never
+    /// reach those paths (see `src/channel/contract.rs` scope comment).
+    pub bot: Option<Bot>,
     #[allow(dead_code)]
     pub group_id: ChatId,
     pub topic_to_instance: HashMap<i32, String>,
@@ -110,7 +114,39 @@ impl TelegramState {
             .map(|(name, &tid)| (tid, name.clone()))
             .collect();
         Self {
-            bot: Bot::new(token),
+            bot: Some(Bot::new(token)),
+            group_id: ChatId(group_id),
+            topic_to_instance,
+            instance_to_topic: topic_map,
+            home,
+            submit_keys,
+            user_allowlist,
+            registry: None,
+        }
+    }
+
+    /// Build a `TelegramState` without constructing a `teloxide::Bot` —
+    /// used by the `src/channel/contract.rs` harness, which only exercises
+    /// registry-side methods (`kind`, `has_binding`, `take_binding`,
+    /// `record_binding`, `attach_registry`). `Bot::new` eagerly initializes
+    /// reqwest + `system-configuration` proxy state and panics on some
+    /// macOS setups, so the harness must not go through it. If a test
+    /// triggers a transport path (`send_to_topic`, `send_reply`, polling),
+    /// the `.expect("telegram bot not initialized")` unwrap will fire.
+    #[cfg(test)]
+    pub(crate) fn new_for_contract_test(
+        group_id: i64,
+        topic_map: HashMap<String, i32>,
+        home: PathBuf,
+        submit_keys: HashMap<String, String>,
+        user_allowlist: Option<Vec<i64>>,
+    ) -> Self {
+        let topic_to_instance: HashMap<i32, String> = topic_map
+            .iter()
+            .map(|(name, &tid)| (tid, name.clone()))
+            .collect();
+        Self {
+            bot: None,
             group_id: ChatId(group_id),
             topic_to_instance,
             instance_to_topic: topic_map,
@@ -137,7 +173,11 @@ impl TelegramState {
             .instance_to_topic
             .get(instance_name)
             .ok_or_else(|| anyhow::anyhow!("No topic for '{instance_name}'"))?;
-        send_with_topic(&self.bot, self.group_id, Some(*topic_id), text).await
+        let bot = self
+            .bot
+            .as_ref()
+            .expect("telegram bot not initialized (contract-test construction?)");
+        send_with_topic(bot, self.group_id, Some(*topic_id), text).await
     }
 }
 
@@ -176,7 +216,10 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
                 return;
             };
             rt.block_on(async {
-                let bot = lock_state(&state).bot.clone();
+                let bot = lock_state(&state)
+                    .bot
+                    .clone()
+                    .expect("telegram bot not initialized (polling thread)");
                 let state2 = Arc::clone(&state);
                 let handler = Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
                     let state = Arc::clone(&state2);
@@ -434,7 +477,9 @@ pub fn send_reply(
 ) -> anyhow::Result<()> {
     let s = lock_state(state);
     let (bot, group_id, topic_id, home) = (
-        s.bot.clone(),
+        s.bot
+            .clone()
+            .expect("telegram bot not initialized (send_reply)"),
         s.group_id,
         s.instance_to_topic.get(instance_name).copied(),
         s.home.clone(),
