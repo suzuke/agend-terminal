@@ -35,6 +35,8 @@ pub enum Action {
     NextLayout,
     RenameTab,
     RenamePane,
+    /// Open the move-pane target menu (cross-tab relocation of the focused pane).
+    MovePaneMenu,
     ListTabs,
     ScrollMode,
     CommandPalette,
@@ -147,6 +149,10 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('z') => Action::ToggleZoom,
         KeyCode::Char(' ') => Action::NextLayout,
         KeyCode::Char('.') => Action::RenamePane,
+        // tmux uses `!` for break-pane (split pane to new window). We reuse
+        // the same key, but open a menu that lets the user pick an EXISTING
+        // tab OR spawn a new one — covering both move-pane and break-pane.
+        KeyCode::Char('!') => Action::MovePaneMenu,
 
         // Directional pane focus (plain arrows) / resize (Alt+arrows).
         // Alt+Arrow encoding depends on the terminal (macOS Terminal, Ghostty,

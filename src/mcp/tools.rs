@@ -97,6 +97,12 @@ fn instance_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
         json!({"name": "set_description", "description": "Set a description for this instance.",
             "inputSchema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}}),
+        json!({"name": "move_pane", "description": "Move an instance's pane into a different tab in the TUI. If `target_tab` names an existing tab, the pane splits that tab's focused pane; otherwise a new tab with that name is created and the pane becomes its root. Preserves scrollback and PTY state (unlike delete + create).",
+            "inputSchema": {"type": "object", "properties": {
+                "agent": {"type": "string", "description": "Instance name whose pane should be moved."},
+                "target_tab": {"type": "string", "description": "Destination tab name. Created if not present."},
+                "split_dir": {"type": "string", "enum": ["horizontal", "vertical"], "description": "Split direction when the destination tab already exists. Default: horizontal. Ignored when a new tab is created."}
+            }, "required": ["agent", "target_tab"]}}),
     ]
 }
 

@@ -10,7 +10,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::agent::AgentRegistry;
-use crate::layout::{Layout, SplitBorderHit, SplitDir};
+use crate::layout::{DragTabTarget, Layout, MovePlacement, SplitBorderHit, SplitDir};
 
 use super::overlay::Overlay;
 
@@ -162,13 +162,37 @@ fn handle_drag(mouse: MouseEvent, layout: &mut Layout, state: &mut MouseState) {
         .active_tab()
         .is_some_and(|t| t.dragging_pane.is_some())
     {
-        let target = layout.active_tab().and_then(|tab| {
-            let source = tab.dragging_pane?;
-            tab.pane_at(mouse.column, mouse.row)
-                .filter(|&id| id != source)
-        });
-        if let Some(tab) = layout.active_tab_mut() {
-            tab.drag_target = target;
+        // Pointer on the tab bar (row 0) is a cross-tab drop intent; pointer
+        // inside the pane area is an intra-tab swap intent. Set exactly one
+        // of `drag_target_tab` / `drag_target` per mouse position so that
+        // render + mouse-up dispatch unambiguously.
+        if mouse.row == 0 {
+            let hit = tab_bar_hit_test(layout, mouse.column);
+            let active_idx = layout.active;
+            let tab_target = match hit {
+                // Hovering over the source's own tab is not a move target —
+                // release on own tab is a no-op, matching Chrome's tab reorder UX.
+                Some(TabBarClick::Tab(idx)) if idx != active_idx => {
+                    Some(DragTabTarget::ExistingTab(idx))
+                }
+                Some(TabBarClick::Tab(_)) => None,
+                Some(TabBarClick::NewTab) => Some(DragTabTarget::NewTab),
+                None => None,
+            };
+            if let Some(tab) = layout.active_tab_mut() {
+                tab.drag_target_tab = tab_target;
+                tab.drag_target = None;
+            }
+        } else {
+            let target = layout.active_tab().and_then(|tab| {
+                let source = tab.dragging_pane?;
+                tab.pane_at(mouse.column, mouse.row)
+                    .filter(|&id| id != source)
+            });
+            if let Some(tab) = layout.active_tab_mut() {
+                tab.drag_target = target;
+                tab.drag_target_tab = None;
+            }
         }
     } else {
         handle_selection(layout, &mouse);
@@ -191,13 +215,58 @@ fn handle_up(
         .is_some_and(|t| t.dragging_pane.is_some())
     {
         let source_id = layout.active_tab().and_then(|t| t.dragging_pane);
-        let target_id = layout.active_tab().and_then(|t| t.drag_target);
-        if let (Some(src), Some(tgt)) = (source_id, target_id) {
+        let target_pane = layout.active_tab().and_then(|t| t.drag_target);
+        let target_tab = layout.active_tab().and_then(|t| t.drag_target_tab);
+        let from_tab_idx = layout.active;
+
+        // Cross-tab drop takes precedence over intra-tab swap — the two are
+        // populated mutually exclusively by `handle_drag`, but check in order
+        // anyway so a stale field can't misfire.
+        if let (Some(src), Some(tab_target)) = (source_id, target_tab) {
+            match tab_target {
+                DragTabTarget::ExistingTab(to_idx) => {
+                    if let Some(new_idx) = layout.move_pane_across_tabs(
+                        from_tab_idx,
+                        src,
+                        MovePlacement::SplitFocused {
+                            to_tab: to_idx,
+                            dir: SplitDir::Horizontal,
+                        },
+                    ) {
+                        out.new_last_tab = Some(from_tab_idx);
+                        // Follow the moved pane: the user's attention is on
+                        // what they just dropped, so jump to its new tab.
+                        layout.goto_tab(new_idx);
+                        out.needs_resize = true;
+                    }
+                }
+                DragTabTarget::NewTab => {
+                    // Name the new tab after the pane's agent for a sensible
+                    // default. User can rename later via `:rename-tab` etc.
+                    let name = layout
+                        .active_tab()
+                        .and_then(|t| t.root().find_pane(src))
+                        .map(|p| p.agent_name.clone())
+                        .unwrap_or_else(|| "new".to_string());
+                    if layout
+                        .move_pane_across_tabs(from_tab_idx, src, MovePlacement::NewTab { name })
+                        .is_some()
+                    {
+                        out.new_last_tab = Some(from_tab_idx);
+                        out.needs_resize = true;
+                    }
+                }
+            }
+        } else if let (Some(src), Some(tgt)) = (source_id, target_pane) {
             if let Some(tab) = layout.active_tab_mut() {
                 crate::layout::swap_panes(tab.root_mut(), src, tgt);
             }
             out.needs_resize = true;
         }
+        // Clear drag state on the *current* active tab — the source tab may
+        // have been removed (single-pane cross-tab move) so we can't clear by
+        // from_tab_idx. No-target and intra-tab branches share this tail;
+        // the cross-tab branch also lands here for the same reason.
         if let Some(tab) = layout.active_tab_mut() {
             tab.clear_drag();
         }
@@ -345,5 +414,91 @@ fn copy_to_clipboard(text: &str) {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
         Ok(()) => {}
         Err(e) => tracing::warn!(error = %e, "clipboard copy failed"),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::layout::{Pane, PaneSource, Tab};
+    use crate::vterm::VTerm;
+    use crossterm::event::KeyModifiers;
+
+    fn leaf(id: usize, agent: &str) -> Pane {
+        Pane {
+            agent_name: agent.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam::channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    fn up_event() -> MouseEvent {
+        // handle_up ignores `mouse` in the dragging_pane branch, so column/row
+        // are placeholders. The Up(Left) kind is what routes the event.
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// Pins the dispatch order in `handle_up`: when both intra-tab swap and
+    /// cross-tab drop targets are populated, cross-tab wins. `handle_drag`
+    /// sets them mutually exclusively today, but this test is the belt to
+    /// that suspender — a future refactor that re-introduces both fields
+    /// simultaneously must not silently downgrade a tab-bar drop into an
+    /// in-place swap.
+    #[test]
+    fn handle_up_cross_tab_drop_wins_over_intra_tab_swap() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        layout.add_tab(Tab::new("dst".to_string(), leaf(3, "c")));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 2;
+        layout.tabs[0].dragging_pane = Some(2);
+        // Stale intra-tab target — pane 1 lives in the same tab.
+        layout.tabs[0].drag_target = Some(1);
+        // Fresh cross-tab target — release over the "dst" tab label.
+        layout.tabs[0].drag_target_tab = Some(DragTabTarget::ExistingTab(1));
+
+        let mut state = MouseState::default();
+        let mut out = MouseOutcome::default();
+        handle_up(up_event(), &mut layout, &mut state, &mut out);
+
+        // Pane 2 ("b") must have moved into "dst", NOT swapped with pane 1.
+        assert_eq!(layout.tabs.len(), 2);
+        assert_eq!(layout.tabs[0].root().pane_count(), 1);
+        assert!(
+            !layout.tabs[0].root().has_agent("b"),
+            "pane b must leave src tab"
+        );
+        assert!(
+            layout.tabs[0].root().has_agent("a"),
+            "pane a must stay in src (not swapped)"
+        );
+        assert_eq!(layout.tabs[1].root().pane_count(), 2);
+        assert!(
+            layout.tabs[1].root().has_agent("b"),
+            "pane b must land in dst"
+        );
+        // Focus follows the moved pane's new tab.
+        assert_eq!(layout.active, 1);
+        assert!(out.needs_resize);
+        // Drag state cleared on the (now active) dest tab.
+        assert!(layout.tabs[1].dragging_pane.is_none());
+        assert!(layout.tabs[1].drag_target.is_none());
+        assert!(layout.tabs[1].drag_target_tab.is_none());
     }
 }

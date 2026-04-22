@@ -119,7 +119,7 @@ impl Pane {
 }
 
 /// Split direction.
-#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SplitDir {
     Horizontal,
     Vertical,
@@ -786,6 +786,19 @@ pub enum Direction {
     Right,
 }
 
+/// Where a title-bar drag is currently hovering on the tab bar. Distinct from
+/// `drag_target` (which names a pane in the *current* tab for intra-tab swap):
+/// this field represents a cross-tab drop intent that will be realized on
+/// mouse-up via `Layout::move_pane_across_tabs`.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DragTabTarget {
+    /// Pointer is over the tab at this index. On drop, move the pane into that tab.
+    ExistingTab(usize),
+    /// Pointer is past the last tab / over the `[+]` button area. On drop,
+    /// create a new tab named after the pane's agent.
+    NewTab,
+}
+
 /// A tab containing a tree of panes.
 pub struct Tab {
     pub name: String,
@@ -799,8 +812,12 @@ pub struct Tab {
     pub last_layout: Option<LayoutPreset>,
     /// Pane currently being dragged by title bar (drag-to-swap).
     pub dragging_pane: Option<usize>,
-    /// Drop target pane during title bar drag.
+    /// Drop target pane during title bar drag (intra-tab swap).
     pub drag_target: Option<usize>,
+    /// Cross-tab drop target during title bar drag. Set when the pointer is
+    /// over the tab bar while a pane is being dragged; mutually exclusive with
+    /// `drag_target` (each mouse move picks one based on pointer position).
+    pub drag_target_tab: Option<DragTabTarget>,
 }
 
 impl Tab {
@@ -816,6 +833,7 @@ impl Tab {
             last_layout: None,
             dragging_pane: None,
             drag_target: None,
+            drag_target_tab: None,
         }
     }
 
@@ -832,6 +850,7 @@ impl Tab {
             last_layout: None,
             dragging_pane: None,
             drag_target: None,
+            drag_target_tab: None,
         }
     }
 
@@ -1006,10 +1025,11 @@ impl Tab {
         None
     }
 
-    /// Reset both drag fields after a title-bar drag completes or aborts.
+    /// Reset all drag fields after a title-bar drag completes or aborts.
     pub fn clear_drag(&mut self) {
         self.dragging_pane = None;
         self.drag_target = None;
+        self.drag_target_tab = None;
     }
 
     /// Clear all in-progress UI state (selection tracking + drag tracking).
@@ -1019,6 +1039,7 @@ impl Tab {
         self.selecting_pane = None;
         self.dragging_pane = None;
         self.drag_target = None;
+        self.drag_target_tab = None;
     }
 
     /// Close the focused pane. Returns the removed pane's agent_name.
@@ -1047,6 +1068,58 @@ impl Tab {
         }
         removed.map(|p| p.agent_name)
     }
+
+    /// Detach a pane from this tab's tree without destroying its VTerm or PTY
+    /// subscription, returning the full `Pane` so the caller can reinsert it
+    /// into another tab. Returns `None` when `pane_id` is not in this tab, or
+    /// when it is the sole pane (the tab would be left empty — callers moving
+    /// the last pane must consume the whole tab via `Layout::move_pane_across_tabs`
+    /// which handles source-tab removal).
+    pub fn detach_pane(&mut self, pane_id: usize) -> Option<Pane> {
+        if self.root().pane_count() <= 1 {
+            return None;
+        }
+        self.root().find_pane(pane_id)?;
+        let ids = self.root().pane_ids();
+        let next_id = ids
+            .iter()
+            .find(|&&id| id != pane_id)
+            .copied()
+            .unwrap_or(pane_id);
+
+        let root = self.root.take().expect("root is always Some");
+        let (new_root, removed) = remove_from_tree(root, pane_id);
+        self.root = Some(new_root);
+        if self.focus_id == pane_id {
+            self.focus_id = next_id;
+        }
+        // Clear transient UI state referencing the departing pane so a
+        // half-finished drag/select doesn't resume against a pane that
+        // no longer lives here. `drag_target_tab` is cleared alongside
+        // `dragging_pane` because a cross-tab drop intent without a source
+        // pane is meaningless.
+        if self.dragging_pane == Some(pane_id) {
+            self.dragging_pane = None;
+            self.drag_target_tab = None;
+        }
+        if self.drag_target == Some(pane_id) {
+            self.drag_target = None;
+        }
+        if self.selecting_pane == Some(pane_id) {
+            self.selecting_pane = None;
+        }
+        removed
+    }
+}
+
+/// Where a moved pane should land in its new tab.
+pub enum MovePlacement {
+    /// Split the destination tab's focused pane in the given direction.
+    /// Used by team-update auto-grouping and the keyboard move-pane command.
+    SplitFocused { to_tab: usize, dir: SplitDir },
+    /// Create a brand-new tab whose sole pane is the moved pane. Used when
+    /// dragging a pane onto the tab bar's empty trailing area.
+    NewTab { name: String },
 }
 
 /// Top-level layout.
@@ -1128,6 +1201,98 @@ impl Layout {
             self.switch_active(self.tabs.len() - 1);
         }
         Some(tab)
+    }
+
+    /// Move a pane from one tab to another, preserving its VTerm, scrollback,
+    /// and PTY subscription (unlike close + attach, which rebuilds state).
+    ///
+    /// Behavior:
+    ///   - If `from_tab` has a single pane, the whole tab is removed and its
+    ///     lone pane is inserted into the destination (index-adjusted).
+    ///   - Otherwise the pane is detached in place via `Tab::detach_pane`.
+    ///   - `focus_id` of the destination tab is set to the moved pane. The
+    ///     active tab index is NOT changed — callers drive focus-switching
+    ///     explicitly.
+    ///
+    /// Returns `Some(new_dest_idx)` on success — the final index of the
+    /// destination tab after any source-tab removal. Returns `None` (and
+    /// leaves layout unchanged) for invalid indices, when source == dest,
+    /// or when the pane is missing from the source tab.
+    pub fn move_pane_across_tabs(
+        &mut self,
+        from_tab: usize,
+        pane_id: usize,
+        placement: MovePlacement,
+    ) -> Option<usize> {
+        if from_tab >= self.tabs.len() {
+            return None;
+        }
+        let split_target = match &placement {
+            MovePlacement::SplitFocused { to_tab, .. } => {
+                if *to_tab >= self.tabs.len() || *to_tab == from_tab {
+                    return None;
+                }
+                Some(*to_tab)
+            }
+            MovePlacement::NewTab { .. } => None,
+        };
+        self.tabs[from_tab].root().find_pane(pane_id)?;
+
+        let source_count = self.tabs[from_tab].root().pane_count();
+        let (pane, adjusted_to_tab) = if source_count == 1 {
+            let mut src = self.tabs.remove(from_tab);
+            let root = src.root.take().expect("root is always Some");
+            let pane = match root {
+                PaneNode::Leaf(boxed) => *boxed,
+                PaneNode::Split { .. } => {
+                    unreachable!("pane_count == 1 must be a Leaf root")
+                }
+            };
+            let adjusted_to = split_target.map(|t| if t > from_tab { t - 1 } else { t });
+            // Keep `active` pointing somewhere sensible after the removal.
+            // NewTab branch (adjusted_to == None): this clamp is a transient
+            // stop-gap — `add_tab` below will reset `active` to the new tab,
+            // overriding whatever we put here. The clamp exists only so the
+            // layout is never in an invalid state between `remove` and
+            // `add_tab` (e.g. if future code adds fallible steps in between).
+            if self.active == from_tab {
+                self.active = adjusted_to
+                    .unwrap_or(self.tabs.len())
+                    .min(self.tabs.len().saturating_sub(1));
+            } else if self.active > from_tab {
+                self.active -= 1;
+            }
+            (pane, adjusted_to)
+        } else {
+            let pane = self.tabs[from_tab]
+                .detach_pane(pane_id)
+                .expect("pre-checked find_pane + pane_count > 1");
+            (pane, split_target)
+        };
+
+        let moved_id = pane.id;
+        match placement {
+            MovePlacement::SplitFocused { dir, .. } => {
+                let dest = adjusted_to_tab.expect("SplitFocused always yields a dest index");
+                self.tabs[dest].split_focused(dir, pane);
+                self.tabs[dest].focus_id = moved_id;
+                Some(dest)
+            }
+            MovePlacement::NewTab { name } => {
+                self.add_tab(Tab::new(name, pane));
+                Some(self.tabs.len() - 1)
+            }
+        }
+    }
+
+    /// Find the `(tab_idx, pane_id)` hosting `agent`, if any. First match wins
+    /// — duplicates are a bug elsewhere (agent-name uniqueness is enforced by
+    /// the registry).
+    pub fn find_agent_pane(&self, agent: &str) -> Option<(usize, usize)> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| t.root().find_pane_id_by_agent(agent).map(|p| (i, p)))
     }
 }
 
@@ -1507,5 +1672,158 @@ mod tests {
             first_id,
             "last slot now holds the first pane"
         );
+    }
+
+    // --- detach_pane / move_pane_across_tabs ---
+
+    #[test]
+    fn detach_pane_refuses_sole_pane() {
+        // A lone pane can't be detached in-place because it would leave the
+        // tab with an empty root. Callers must consume the whole tab via
+        // Layout::move_pane_across_tabs instead.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.detach_pane(1).is_none());
+        assert_eq!(tab.root().pane_count(), 1);
+    }
+
+    #[test]
+    fn detach_pane_missing_id_returns_none() {
+        // Unknown pane id leaves the tree untouched.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert!(tab.detach_pane(999).is_none());
+        assert_eq!(tab.root().pane_count(), 2);
+    }
+
+    #[test]
+    fn detach_pane_returns_pane_and_moves_focus() {
+        // Detaching the focused pane hands it back to the caller and moves
+        // focus to the sibling so subsequent input isn't orphaned.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        tab.focus_id = 1;
+        let detached = tab.detach_pane(1).expect("pane 1 should detach");
+        assert_eq!(detached.agent_name, "a");
+        assert_eq!(tab.root().pane_count(), 1);
+        assert_eq!(tab.focus_id, 2, "focus must move to the sibling pane");
+    }
+
+    #[test]
+    fn detach_pane_clears_transient_state() {
+        // Drag/selection state that names the departing pane must be reset
+        // so a half-finished interaction doesn't resume against a gone pane.
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        tab.dragging_pane = Some(1);
+        tab.drag_target = Some(1);
+        tab.selecting_pane = Some(1);
+        let _ = tab.detach_pane(1).expect("detaches");
+        assert!(tab.dragging_pane.is_none());
+        assert!(tab.drag_target.is_none());
+        assert!(tab.selecting_pane.is_none());
+    }
+
+    #[test]
+    fn move_pane_across_tabs_same_tab_rejected() {
+        // from == to would collapse into an in-place move; swap_panes covers
+        // intra-tab reorder, so the cross-tab API refuses.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t0".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        assert!(layout
+            .move_pane_across_tabs(
+                0,
+                1,
+                MovePlacement::SplitFocused {
+                    to_tab: 0,
+                    dir: SplitDir::Vertical
+                }
+            )
+            .is_none());
+        assert_eq!(layout.tabs[0].root().pane_count(), 2);
+    }
+
+    #[test]
+    fn move_pane_across_tabs_split_focused_preserves_both_tabs() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        layout.add_tab(Tab::new("dst".to_string(), leaf(3, "c")));
+
+        let dest = layout
+            .move_pane_across_tabs(
+                0,
+                2,
+                MovePlacement::SplitFocused {
+                    to_tab: 1,
+                    dir: SplitDir::Horizontal,
+                },
+            )
+            .expect("move succeeds");
+        assert_eq!(dest, 1);
+        assert_eq!(layout.tabs.len(), 2);
+        assert_eq!(layout.tabs[0].root().pane_count(), 1);
+        assert!(!layout.tabs[0].root().has_agent("b"));
+        assert_eq!(layout.tabs[1].root().pane_count(), 2);
+        assert!(layout.tabs[1].root().has_agent("b"));
+        assert_eq!(layout.tabs[1].focus_id, 2);
+    }
+
+    #[test]
+    fn move_pane_across_tabs_single_pane_source_removes_tab() {
+        // Source tab disappears; returned dest index reflects the shift.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("solo".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("dst".to_string(), leaf(2, "b")));
+        let dest = layout
+            .move_pane_across_tabs(
+                0,
+                1,
+                MovePlacement::SplitFocused {
+                    to_tab: 1,
+                    dir: SplitDir::Horizontal,
+                },
+            )
+            .expect("move succeeds");
+        assert_eq!(dest, 0, "destination shifted left after source removed");
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(layout.tabs[0].name, "dst");
+        assert_eq!(layout.tabs[0].root().pane_count(), 2);
+        assert!(layout.tabs[0].root().has_agent("a"));
+    }
+
+    #[test]
+    fn move_pane_across_tabs_new_tab_placement() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+
+        let dest = layout
+            .move_pane_across_tabs(
+                0,
+                2,
+                MovePlacement::NewTab {
+                    name: "popped".to_string(),
+                },
+            )
+            .expect("move succeeds");
+        assert_eq!(dest, 1);
+        assert_eq!(layout.tabs.len(), 2);
+        assert_eq!(layout.tabs[1].name, "popped");
+        assert_eq!(layout.tabs[1].root().pane_count(), 1);
+        assert!(layout.tabs[1].root().has_agent("b"));
+        assert_eq!(layout.active, 1);
+    }
+
+    #[test]
+    fn find_agent_pane_returns_location() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t0".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("t1".to_string(), leaf(2, "b")));
+        layout.tabs[1].split_focused(SplitDir::Vertical, leaf(3, "c"));
+
+        assert_eq!(layout.find_agent_pane("a"), Some((0, 1)));
+        assert_eq!(layout.find_agent_pane("c"), Some((1, 3)));
+        assert_eq!(layout.find_agent_pane("ghost"), None);
     }
 }

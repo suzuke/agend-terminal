@@ -299,6 +299,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 Overlay::TabList { selected } => {
                     render::render_tab_list(frame, &layout, *selected);
                 }
+                Overlay::MovePaneTarget {
+                    selected,
+                    source_tab_idx,
+                    ..
+                } => {
+                    render::render_move_pane_target(frame, &layout, *selected, *source_tab_idx);
+                }
                 Overlay::Help => {
                     render::render_help(frame);
                 }

@@ -481,6 +481,22 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             save_metadata(&home, &instance_name, "description", json!(desc));
             json!({"description": desc})
         }
+        "move_pane" => {
+            // Route through the API so the running TUI receives a PaneMoved
+            // event and relocates the pane. If no daemon is reachable there's
+            // no TUI to notify, so returning the API error directly matches
+            // behaviour of other TUI-visible tools like `update_team`.
+            match crate::api::call(
+                &home,
+                &json!({"method": crate::api::method::MOVE_PANE, "params": args}),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    json!({"ok": true, "agent": args["agent"], "target_tab": args["target_tab"]})
+                }
+                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("move_pane failed")}),
+                Err(e) => json!({"error": format!("move_pane: {e}")}),
+            }
+        }
 
         // --- Decisions ---
         "post_decision" => crate::decisions::post(&home, &instance_name, args),

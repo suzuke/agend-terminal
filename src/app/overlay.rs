@@ -53,6 +53,20 @@ pub(super) enum Overlay {
     TabList {
         selected: usize,
     },
+    /// Move-pane destination picker. Lists all tabs plus a trailing
+    /// "[+] New tab" slot. Enter applies `Layout::move_pane_across_tabs`
+    /// with the focused pane as source.
+    MovePaneTarget {
+        /// 0..tabs.len() → move into that tab. == tabs.len() → new tab.
+        selected: usize,
+        /// Source pane to move. Captured on overlay open so a subsequent
+        /// mouse click that changes focus (while the overlay is modal,
+        /// this shouldn't happen, but be defensive) can't retarget the move.
+        source_pane_id: usize,
+        /// Source tab index at overlay-open time. Same defensive capture as
+        /// `source_pane_id`; `move_pane_across_tabs` re-verifies existence.
+        source_tab_idx: usize,
+    },
     Help,
     /// Keyboard scroll mode (j/k/PgUp/PgDn). Pane's scroll_offset is used directly.
     Scroll,
@@ -372,6 +386,70 @@ pub(super) fn handle_key(
             }
             _ => {}
         },
+        Overlay::MovePaneTarget {
+            ref mut selected,
+            source_pane_id,
+            source_tab_idx,
+        } => {
+            // List length = tabs.len() + 1 (trailing "New tab" entry). The
+            // "New tab" slot is always valid; tab slots other than source
+            // are valid move targets. `selected` can legally equal tabs.len().
+            let list_len = ctx.layout.tabs.len() + 1;
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
+                    *selected -= 1;
+                }
+                KeyCode::Down | KeyCode::Char('j') if *selected + 1 < list_len => {
+                    *selected += 1;
+                }
+                KeyCode::Enter => {
+                    let src_pane = *source_pane_id;
+                    let src_tab = *source_tab_idx;
+                    let sel = *selected;
+                    let tabs_count = ctx.layout.tabs.len();
+                    *overlay = Overlay::None;
+                    if sel == tabs_count {
+                        // New tab: name after the pane's agent for a sensible default.
+                        let name = ctx
+                            .layout
+                            .tabs
+                            .get(src_tab)
+                            .and_then(|t| t.root().find_pane(src_pane))
+                            .map(|p| p.agent_name.clone())
+                            .unwrap_or_else(|| "new".to_string());
+                        if ctx
+                            .layout
+                            .move_pane_across_tabs(
+                                src_tab,
+                                src_pane,
+                                crate::layout::MovePlacement::NewTab { name },
+                            )
+                            .is_some()
+                        {
+                            outcome.needs_resize = true;
+                        }
+                    } else if sel != src_tab {
+                        if let Some(new_idx) = ctx.layout.move_pane_across_tabs(
+                            src_tab,
+                            src_pane,
+                            crate::layout::MovePlacement::SplitFocused {
+                                to_tab: sel,
+                                dir: crate::layout::SplitDir::Horizontal,
+                            },
+                        ) {
+                            // Follow the pane — the user just pointed at this tab.
+                            ctx.layout.goto_tab(new_idx);
+                            outcome.needs_resize = true;
+                        }
+                    }
+                    // sel == src_tab: no-op (already in that tab).
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    *overlay = Overlay::None;
+                }
+                _ => {}
+            }
+        }
         Overlay::Help => {
             *overlay = Overlay::None;
         }

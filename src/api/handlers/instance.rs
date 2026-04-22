@@ -2,7 +2,7 @@
 
 use super::HandlerCtx;
 use crate::agent;
-use crate::api::{ApiEvent, LayoutHint};
+use crate::api::{ApiEvent, LayoutHint, PaneMoveSplitDir};
 use serde_json::{json, Value};
 
 pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
@@ -188,4 +188,45 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         }
         Err(e) => json!({"ok": false, "error": format!("{e}")}),
     }
+}
+
+/// Relocate the pane currently hosting `agent` into `target_tab`.
+///
+/// If the target tab exists, the moved pane splits the target tab's focused
+/// pane along `split_dir` (default: horizontal). If the target tab does not
+/// exist, a new tab named `target_tab` is created with the moved pane as its
+/// root. `split_dir` is ignored in the new-tab case.
+///
+/// The actual layout mutation happens in the TUI event loop — this handler
+/// only validates inputs and emits `ApiEvent::PaneMoved`. Daemon mode (no
+/// notifier) is a no-op and still returns `{"ok": true}`, matching the
+/// semantics of other layout-affecting MCP methods.
+pub(crate) fn handle_move_pane(params: &Value, ctx: &HandlerCtx) -> Value {
+    let agent_name = match params["agent"].as_str() {
+        Some(n) => n,
+        None => return json!({"ok": false, "error": "missing agent"}),
+    };
+    if let Err(e) = agent::validate_name(agent_name) {
+        return json!({"ok": false, "error": e});
+    }
+    let target_tab = match params["target_tab"].as_str() {
+        Some(t) if !t.is_empty() => t,
+        _ => return json!({"ok": false, "error": "missing target_tab"}),
+    };
+    let split_dir = PaneMoveSplitDir::parse(params["split_dir"].as_str().unwrap_or("horizontal"));
+
+    if let Some(n) = ctx.notifier {
+        n.notify(ApiEvent::PaneMoved {
+            agent: agent_name.to_string(),
+            target_tab: target_tab.to_string(),
+            split_dir,
+        });
+    }
+    crate::event_log::log(
+        ctx.home,
+        "move_pane",
+        agent_name,
+        &format!("target_tab={target_tab} split={split_dir:?}"),
+    );
+    json!({"ok": true})
 }
