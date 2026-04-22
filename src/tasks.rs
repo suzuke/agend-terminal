@@ -501,7 +501,7 @@ mod tests {
             let mut id = String::new();
             for (_, json_str) in &setup {
                 let json_str = json_str.replace("__ID__", &id);
-                let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&json_str).expect("test JSON literal");
                 let r = handle(&home, "user", &v);
                 if let Some(i) = r["id"].as_str() {
                     id = i.to_string();
