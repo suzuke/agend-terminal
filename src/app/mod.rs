@@ -13,7 +13,7 @@ mod session;
 mod telegram_hooks;
 mod tui_events;
 
-pub use overlay::{MenuItem, MenuItemKind};
+pub use overlay::{MenuItem, MenuItemKind, TaskBoardMode};
 pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
 
 use crate::agent::{self, AgentRegistry};
@@ -364,9 +364,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     ref items,
                     col,
                     row,
-                    detail,
+                    ref mode,
                 } => {
-                    render::render_tasks(frame, items, *col, *row, *detail);
+                    render::render_tasks(frame, items, *col, *row, mode);
                 }
                 Overlay::ScratchShell { pane } => {
                     render::render_scratch_shell(frame, pane, &registry);
