@@ -15,6 +15,12 @@ pub struct Team {
     pub created_at: String,
 }
 
+impl Team {
+    pub fn is_degraded(&self) -> bool {
+        self.orchestrator.is_none()
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct TeamStore {
     #[serde(default)]
@@ -129,7 +135,16 @@ pub fn delete(home: &Path, args: &Value) -> Value {
 
 pub fn list(home: &Path) -> Value {
     let store = load(home);
-    serde_json::json!({"teams": store.teams})
+    let teams: Vec<Value> = store
+        .teams
+        .iter()
+        .map(|t| {
+            let mut v = serde_json::to_value(t).unwrap_or_default();
+            v["degraded"] = serde_json::json!(t.is_degraded());
+            v
+        })
+        .collect();
+    serde_json::json!({"teams": teams})
 }
 
 pub fn update(home: &Path, args: &Value) -> Value {
@@ -226,16 +241,30 @@ pub fn update(home: &Path, args: &Value) -> Value {
 
 /// Remove an instance from ALL teams. Auto-delete teams that become empty.
 pub fn remove_member_from_all(home: &Path, instance_name: &str) {
+    let mut degraded_teams: Vec<String> = Vec::new();
     let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut TeamStore| {
         for team in &mut store.teams {
             team.members.retain(|m| m != instance_name);
             if team.orchestrator.as_deref() == Some(instance_name) {
                 team.orchestrator = None;
+                degraded_teams.push(team.name.clone());
             }
         }
         store.teams.retain(|t| !t.members.is_empty());
         Ok(true)
     });
+    // Create urgent task for each newly degraded team
+    for team_name in &degraded_teams {
+        crate::tasks::handle(
+            home,
+            "system",
+            &serde_json::json!({
+                "action": "create",
+                "title": format!("Team '{team_name}' needs new orchestrator ('{instance_name}' was deleted)"),
+                "priority": "urgent",
+            }),
+        );
+    }
 }
 
 /// Reconcile teams from fleet.yaml seed config. Additive only — runtime-added
@@ -542,6 +571,48 @@ mod tests {
             teams[0]["orchestrator"]
         );
         assert_eq!(teams[0]["members"].as_array().expect("m").len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn delete_orchestrator_creates_urgent_task() {
+        let home = tmp_home("del_orch_task");
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        remove_member_from_all(&home, "lead");
+        let tasks = crate::tasks::list_all(&home);
+        let urgent: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.priority == "urgent" && t.title.contains("needs new orchestrator"))
+            .collect();
+        assert_eq!(urgent.len(), 1, "should create exactly one urgent task");
+        assert!(
+            urgent[0].title.contains("devs"),
+            "task should mention team name"
+        );
+        assert!(
+            urgent[0].title.contains("lead"),
+            "task should mention removed orchestrator"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn degraded_team_shows_in_list() {
+        let home = tmp_home("degraded_list");
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        // Before removal: not degraded
+        let listed = list(&home);
+        assert_eq!(listed["teams"][0]["degraded"], false);
+
+        remove_member_from_all(&home, "lead");
+        let listed = list(&home);
+        assert_eq!(listed["teams"][0]["degraded"], true);
         std::fs::remove_dir_all(&home).ok();
     }
 }
