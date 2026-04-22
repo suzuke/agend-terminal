@@ -122,6 +122,7 @@ mod tests {
                 mode: "topic".into(),
                 user_allowlist: None,
             }),
+            channels: None,
             templates: None,
         };
         c.instances.insert(

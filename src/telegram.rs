@@ -560,66 +560,6 @@ pub fn init_from_config(
     Some(state)
 }
 
-/// ChannelAdapter implementation for Telegram.
-impl crate::channel::ChannelAdapter for Arc<Mutex<TelegramState>> {
-    fn name(&self) -> &str {
-        "telegram"
-    }
-
-    fn send_reply(&self, instance_name: &str, text: &str) -> crate::channel::SendResult {
-        let s = lock_state(self);
-        let (bot, group_id, topic_id, home) = (
-            s.bot.clone(),
-            s.group_id,
-            s.instance_to_topic.get(instance_name).copied(),
-            s.home.clone(),
-        );
-        drop(s);
-        match telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text)) {
-            Ok(()) => crate::channel::SendResult::Sent,
-            Err(e) => {
-                handle_send_failure(&e, &home, instance_name, topic_id, Some(self));
-                crate::channel::SendResult::Failed(format!("{e}"))
-            }
-        }
-    }
-
-    fn react(&self, _instance_name: &str, _emoji: &str) -> crate::channel::SendResult {
-        // React requires message_id which we don't have in this context
-        crate::channel::SendResult::Failed("react via adapter needs message_id context".into())
-    }
-
-    fn edit_message(
-        &self,
-        _instance_name: &str,
-        message_id: &str,
-        text: &str,
-    ) -> crate::channel::SendResult {
-        let s = lock_state(self);
-        let (bot, group_id) = (s.bot.clone(), s.group_id);
-        drop(s);
-        let Ok(mid) = message_id.parse::<i32>() else {
-            return crate::channel::SendResult::Failed(format!("invalid message_id: {message_id}"));
-        };
-        match telegram_runtime().block_on(async {
-            bot.edit_message_text(group_id, MessageId(mid), text)
-                .await
-                .map(|_| ())
-        }) {
-            Ok(()) => crate::channel::SendResult::Sent,
-            Err(e) => crate::channel::SendResult::Failed(format!("{e}")),
-        }
-    }
-
-    fn start_polling(&self, _home: &std::path::Path) {
-        // Already started via init_from_config
-    }
-
-    fn stop(&self) {
-        // Polling thread exits when daemon exits
-    }
-}
-
 /// Map emoji name to Unicode character.
 #[allow(dead_code)]
 fn map_emoji_name(name: &str) -> &str {
