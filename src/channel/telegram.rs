@@ -373,6 +373,28 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         return;
     }
 
+    // Persist the inbound message ID so the UX layer can resolve the
+    // origin message when emitting AgentPickedUp (channel-agnostic).
+    crate::agent_ops::save_metadata(
+        &home,
+        &instance_name,
+        "last_channel_msg_id",
+        serde_json::json!(msg.id.0.to_string()),
+    );
+    crate::agent_ops::save_metadata(
+        &home,
+        &instance_name,
+        "last_channel_kind",
+        serde_json::json!("telegram"),
+    );
+    // Also store as last_message_id for the `react` MCP tool's fallback.
+    crate::agent_ops::save_metadata(
+        &home,
+        &instance_name,
+        "last_message_id",
+        serde_json::json!(msg.id.0),
+    );
+
     // Enqueue in inbox
     let msg_obj = InboxMessage {
         from: format!("user:{username}"),
@@ -390,6 +412,21 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         text,
         &submit_key,
     );
+
+    // Emit UxEvent::UserMsgReceived so the channel adapter can react 👀.
+    {
+        use crate::channel::binding::BindingRef;
+        use crate::channel::event::MsgRef;
+        use crate::channel::ux_event::UxEvent;
+        let origin_msg = MsgRef {
+            binding: BindingRef::new("telegram", Some(instance_name.clone()), ()),
+            id: msg.id.0.to_string(),
+        };
+        crate::channel::sink_registry::registry().emit(&UxEvent::UserMsgReceived {
+            origin_msg,
+            agent: instance_name,
+        });
+    }
 }
 
 /// Classify a send error as "the bound topic was deleted out from under us".

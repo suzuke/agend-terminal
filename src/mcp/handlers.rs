@@ -308,6 +308,44 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
         "inbox" => {
             let messages = crate::inbox::drain(&home, instance_name);
+            // Emit AgentPickedUp so channel adapters can confirm pickup
+            // (e.g. Telegram ✅ reaction). Channel-agnostic: reads the
+            // origin msg coordinates from metadata written by whichever
+            // adapter delivered the inbound message.
+            if !messages.is_empty() {
+                let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
+                if let Some(meta) = std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+                {
+                    let kind_str = meta["last_channel_kind"].as_str().unwrap_or("");
+                    let msg_id = meta["last_channel_msg_id"].as_str().unwrap_or("");
+                    // Map to &'static str for BindingRef::new.
+                    let kind: &'static str = match kind_str {
+                        "telegram" => "telegram",
+                        "discord" => "discord",
+                        "slack" => "slack",
+                        _ => "",
+                    };
+                    if !kind.is_empty() && !msg_id.is_empty() {
+                        use crate::channel::binding::BindingRef;
+                        use crate::channel::event::MsgRef;
+                        use crate::channel::ux_event::UxEvent;
+                        let origin_msg = MsgRef {
+                            binding: BindingRef::new(
+                                kind,
+                                Some(instance_name.to_string()),
+                                (),
+                            ),
+                            id: msg_id.to_string(),
+                        };
+                        crate::channel::sink_registry::registry().emit(&UxEvent::AgentPickedUp {
+                            origin_msg,
+                            agent: instance_name.to_string(),
+                        });
+                    }
+                }
+            }
             json!({"messages": messages})
         }
 
