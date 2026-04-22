@@ -32,6 +32,7 @@
 
 pub mod binding;
 pub mod caps;
+pub mod contract;
 pub mod event;
 pub mod telegram;
 
