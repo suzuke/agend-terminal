@@ -57,7 +57,7 @@ jobs:
             archive: zip
             features: tray
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -90,7 +90,7 @@ jobs:
             -DestinationPath agend-terminal-${{ matrix.target }}.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: agend-terminal-${{ matrix.target }}
           path: agend-terminal-${{ matrix.target }}.${{ matrix.archive }}
@@ -99,7 +99,7 @@ jobs:
     name: Build AppImage (x86_64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
 
       # linuxdeploy + plugin-gtk need the same GTK dev libs the tray feature
@@ -188,7 +188,7 @@ jobs:
             --output appimage
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: agend-terminal-x86_64-AppImage
           path: agend-terminal-x86_64.AppImage
@@ -201,7 +201,7 @@ jobs:
     # artifacts (for pre-tag validation) but must not touch the release page.
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
