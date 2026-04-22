@@ -1250,6 +1250,11 @@ impl Layout {
             };
             let adjusted_to = split_target.map(|t| if t > from_tab { t - 1 } else { t });
             // Keep `active` pointing somewhere sensible after the removal.
+            // NewTab branch (adjusted_to == None): this clamp is a transient
+            // stop-gap — `add_tab` below will reset `active` to the new tab,
+            // overriding whatever we put here. The clamp exists only so the
+            // layout is never in an invalid state between `remove` and
+            // `add_tab` (e.g. if future code adds fallible steps in between).
             if self.active == from_tab {
                 self.active = adjusted_to
                     .unwrap_or(self.tabs.len())
