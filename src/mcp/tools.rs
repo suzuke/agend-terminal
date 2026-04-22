@@ -150,6 +150,7 @@ fn team_tools() -> Vec<Value> {
         json!({"name": "create_team", "description": "Create a named team from existing instances.",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string"}, "members": {"type": "array", "items": {"type": "string"}},
+                "orchestrator": {"type": "string", "description": "Team orchestrator — must be a member. Receives team-level task routing."},
                 "description": {"type": "string"}
             }, "required": ["name", "members"]}}),
         json!({"name": "delete_team", "description": "Delete a team.",
@@ -159,7 +160,8 @@ fn team_tools() -> Vec<Value> {
         json!({"name": "update_team", "description": "Add or remove team members.",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string"}, "add": {"type": "array", "items": {"type": "string"}},
-                "remove": {"type": "array", "items": {"type": "string"}}
+                "remove": {"type": "array", "items": {"type": "string"}},
+                "orchestrator": {"type": "string", "description": "Change team orchestrator — must be a current member."}
             }, "required": ["name"]}}),
     ]
 }

@@ -8,6 +8,9 @@ use std::path::Path;
 pub struct Team {
     pub name: String,
     pub members: Vec<String>,
+    /// Required orchestrator — must be ∈ members.
+    #[serde(default)]
+    pub orchestrator: Option<String>,
     pub description: Option<String>,
     pub created_at: String,
 }
@@ -37,6 +40,15 @@ fn load(home: &Path) -> TeamStore {
     )
 }
 
+/// Find which team a member belongs to (one-agent-one-team).
+fn find_team_for_member(store: &TeamStore, name: &str) -> Option<String> {
+    store
+        .teams
+        .iter()
+        .find(|t| t.members.contains(&name.to_string()))
+        .map(|t| t.name.clone())
+}
+
 pub fn create(home: &Path, args: &Value) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n.to_string(),
@@ -49,21 +61,52 @@ pub fn create(home: &Path, args: &Value) -> Value {
             .collect(),
         None => return serde_json::json!({"error": "missing 'members'"}),
     };
+    let orchestrator = args["orchestrator"].as_str().map(String::from);
     let description = args["description"].as_str().map(String::from);
+
+    // Validate orchestrator
+    if let Some(ref orch) = orchestrator {
+        if !members.contains(orch) {
+            return serde_json::json!({"error": format!("orchestrator '{orch}' must be a member")});
+        }
+    }
+
+    let mut warnings: Vec<String> = Vec::new();
+
     match crate::store::mutate_versioned(&store_path(home), |store: &mut TeamStore| {
         if store.teams.iter().any(|t| t.name == name) {
             return Ok(false);
         }
+        // One-agent-one-team check
+        for m in &members {
+            if let Some(existing_team) = find_team_for_member(store, m) {
+                warnings.push(format!("member '{m}' already in team '{existing_team}'"));
+                return Ok(false);
+            }
+        }
         store.teams.push(Team {
             name: name.clone(),
             members,
+            orchestrator,
             description,
             created_at: chrono::Utc::now().to_rfc3339(),
         });
         Ok(true)
     }) {
-        Ok(true) => serde_json::json!({"status": "created", "name": name}),
-        Ok(false) => serde_json::json!({"error": format!("team '{name}' already exists")}),
+        Ok(true) => {
+            let mut result = serde_json::json!({"status": "created", "name": name});
+            if !warnings.is_empty() {
+                result["warnings"] = serde_json::json!(warnings);
+            }
+            result
+        }
+        Ok(false) => {
+            if !warnings.is_empty() {
+                serde_json::json!({"error": warnings[0]})
+            } else {
+                serde_json::json!({"error": format!("team '{name}' already exists")})
+            }
+        }
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
@@ -110,22 +153,73 @@ pub fn update(home: &Path, args: &Value) -> Value {
                 .collect()
         })
         .unwrap_or_default();
+    let new_orchestrator = args["orchestrator"].as_str().map(String::from);
+
+    // Pre-check: cannot remove orchestrator
+    // (done inside mutate to see current state)
+
     match crate::store::mutate_versioned(&store_path(home), |store: &mut TeamStore| {
-        match store.teams.iter_mut().find(|t| t.name == name) {
-            Some(team) => {
-                for m in &to_add {
-                    if !team.members.contains(m) {
-                        team.members.push(m.clone());
-                    }
-                }
-                team.members.retain(|m| !to_remove.contains(m));
-                Ok(true)
+        let team_idx = match store.teams.iter().position(|t| t.name == name) {
+            Some(i) => i,
+            None => return Ok(false),
+        };
+        // Block removing the orchestrator
+        if let Some(ref orch) = store.teams[team_idx].orchestrator {
+            if to_remove.contains(orch) {
+                return Ok(false);
             }
-            None => Ok(false),
         }
+        // One-agent-one-team check on adds
+        for m in &to_add {
+            if let Some(existing) = find_team_for_member(store, m) {
+                if existing != name {
+                    return Ok(false);
+                }
+            }
+        }
+        let team = &mut store.teams[team_idx];
+        for m in &to_add {
+            if !team.members.contains(m) {
+                team.members.push(m.clone());
+            }
+        }
+        team.members.retain(|m| !to_remove.contains(m));
+        // Change orchestrator
+        if let Some(ref new_orch) = new_orchestrator {
+            if !team.members.contains(new_orch) {
+                return Ok(false);
+            }
+            team.orchestrator = Some(new_orch.clone());
+        }
+        Ok(true)
     }) {
         Ok(true) => serde_json::json!({"status": "updated", "name": name}),
-        Ok(false) => serde_json::json!({"error": format!("team '{name}' not found")}),
+        Ok(false) => {
+            // Determine specific error
+            let store = load(home);
+            let team = match store.teams.iter().find(|t| t.name == name) {
+                Some(t) => t,
+                None => return serde_json::json!({"error": format!("team '{name}' not found")}),
+            };
+            if let Some(ref orch) = team.orchestrator {
+                if to_remove.contains(orch) {
+                    return serde_json::json!({"error": format!("cannot remove orchestrator '{orch}'; use update_team --orchestrator to reassign first")});
+                }
+            }
+            for m in &to_add {
+                if let Some(existing) = find_team_for_member(&store, m) {
+                    if existing != name {
+                        return serde_json::json!({"error": format!("member '{m}' already in team '{existing}'")});
+                    }
+                }
+            }
+            if let Some(ref new_orch) = new_orchestrator {
+                if !team.members.contains(new_orch) {
+                    return serde_json::json!({"error": format!("new orchestrator '{new_orch}' must be a current member")});
+                }
+            }
+            serde_json::json!({"error": "update failed"})
+        }
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
 }
@@ -152,6 +246,7 @@ pub fn reconcile_teams(home: &Path, fleet: &crate::fleet::FleetConfig) {
                 &serde_json::json!({
                     "name": name,
                     "members": seed.members,
+                    "orchestrator": seed.orchestrator,
                     "description": seed.description,
                 }),
             );
@@ -163,6 +258,18 @@ pub fn reconcile_teams(home: &Path, fleet: &crate::fleet::FleetConfig) {
                 .collect();
             if !missing.is_empty() {
                 update(home, &serde_json::json!({ "name": name, "add": missing }));
+            }
+            // Reconcile orchestrator if set in fleet.yaml but not in store
+            if let Some(ref orch) = seed.orchestrator {
+                let store = load(home);
+                if let Some(team) = store.teams.iter().find(|t| t.name == *name) {
+                    if team.orchestrator.is_none() {
+                        update(
+                            home,
+                            &serde_json::json!({ "name": name, "orchestrator": orch }),
+                        );
+                    }
+                }
             }
         }
     }
@@ -202,7 +309,7 @@ mod tests {
         let home = tmp_home("crud");
         let r = create(
             &home,
-            &serde_json::json!({"name": "devs", "members": ["a", "b"]}),
+            &serde_json::json!({"name": "devs", "members": ["a", "b"], "orchestrator": "a"}),
         );
         assert_eq!(r["status"], "created");
 
@@ -212,21 +319,22 @@ mod tests {
             listed["teams"][0]["members"].as_array().expect("m").len(),
             2
         );
+        assert_eq!(listed["teams"][0]["orchestrator"], "a");
 
         // Add member
         update(&home, &serde_json::json!({"name": "devs", "add": ["c"]}));
         let members = get_members(&home, "devs");
         assert_eq!(members, vec!["a", "b", "c"]);
 
-        // Remove member
-        update(&home, &serde_json::json!({"name": "devs", "remove": ["a"]}));
+        // Remove non-orchestrator member
+        update(&home, &serde_json::json!({"name": "devs", "remove": ["b"]}));
         let members = get_members(&home, "devs");
-        assert_eq!(members, vec!["b", "c"]);
+        assert_eq!(members, vec!["a", "c"]);
 
         // Duplicate add ignored
-        update(&home, &serde_json::json!({"name": "devs", "add": ["b"]}));
+        update(&home, &serde_json::json!({"name": "devs", "add": ["a"]}));
         let members = get_members(&home, "devs");
-        assert_eq!(members, vec!["b", "c"]);
+        assert_eq!(members, vec!["a", "c"]);
 
         // Delete
         let r = delete(&home, &serde_json::json!({"name": "devs"}));
@@ -239,8 +347,14 @@ mod tests {
     #[test]
     fn test_duplicate_create() {
         let home = tmp_home("dup_create");
-        create(&home, &serde_json::json!({"name": "t", "members": ["a"]}));
-        let r = create(&home, &serde_json::json!({"name": "t", "members": ["b"]}));
+        create(
+            &home,
+            &serde_json::json!({"name": "t", "members": ["a"], "orchestrator": "a"}),
+        );
+        let r = create(
+            &home,
+            &serde_json::json!({"name": "t", "members": ["b"], "orchestrator": "b"}),
+        );
         assert!(r["error"].as_str().expect("err").contains("already exists"));
         std::fs::remove_dir_all(&home).ok();
     }
@@ -253,13 +367,89 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    fn make_fleet(teams: &[(&str, &[&str])]) -> crate::fleet::FleetConfig {
+    #[test]
+    fn create_team_requires_orchestrator_in_members() {
+        let home = tmp_home("orch_not_member");
+        let r = create(
+            &home,
+            &serde_json::json!({"name": "t", "members": ["a", "b"], "orchestrator": "c"}),
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .expect("err")
+                .contains("must be a member"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn one_agent_one_team_rejects_duplicate() {
+        let home = tmp_home("one_agent_one_team");
+        create(
+            &home,
+            &serde_json::json!({"name": "alpha", "members": ["alice"], "orchestrator": "alice"}),
+        );
+        let r = create(
+            &home,
+            &serde_json::json!({"name": "beta", "members": ["alice", "bob"], "orchestrator": "bob"}),
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .expect("err")
+                .contains("already in team"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_team_change_orchestrator() {
+        let home = tmp_home("change_orch");
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["a", "b"], "orchestrator": "a"}),
+        );
+        let r = update(
+            &home,
+            &serde_json::json!({"name": "devs", "orchestrator": "b"}),
+        );
+        assert_eq!(r["status"], "updated");
+        let listed = list(&home);
+        assert_eq!(listed["teams"][0]["orchestrator"], "b");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_team_cannot_remove_orchestrator() {
+        let home = tmp_home("remove_orch");
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["a", "b"], "orchestrator": "a"}),
+        );
+        let r = update(&home, &serde_json::json!({"name": "devs", "remove": ["a"]}));
+        assert!(
+            r["error"]
+                .as_str()
+                .expect("err")
+                .contains("cannot remove orchestrator"),
+            "got: {r}"
+        );
+        // Verify member still there
+        assert!(get_members(&home, "devs").contains(&"a".to_string()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn make_fleet(teams: &[(&str, &[&str], Option<&str>)]) -> crate::fleet::FleetConfig {
         let mut map = std::collections::HashMap::new();
-        for (name, members) in teams {
+        for (name, members, orch) in teams {
             map.insert(
                 name.to_string(),
                 crate::fleet::TeamConfig {
                     members: members.iter().map(|s| s.to_string()).collect(),
+                    orchestrator: orch.map(|s| s.to_string()),
                     description: None,
                 },
             );
@@ -273,25 +463,25 @@ mod tests {
     #[test]
     fn fleet_yaml_teams_creates_on_startup() {
         let home = tmp_home("reconcile_create");
-        let fleet = make_fleet(&[("devs", &["alice", "bob"])]);
+        let fleet = make_fleet(&[("devs", &["alice", "bob"], Some("alice"))]);
         reconcile_teams(&home, &fleet);
         let members = get_members(&home, "devs");
         assert_eq!(members, vec!["alice", "bob"]);
+        let listed = list(&home);
+        assert_eq!(listed["teams"][0]["orchestrator"], "alice");
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn fleet_yaml_teams_additive_reconcile() {
         let home = tmp_home("reconcile_additive");
-        // Pre-create team with an extra runtime member
         create(
             &home,
-            &serde_json::json!({"name": "devs", "members": ["alice", "runtime-extra"]}),
+            &serde_json::json!({"name": "devs", "members": ["alice", "runtime-extra"], "orchestrator": "alice"}),
         );
-        let fleet = make_fleet(&[("devs", &["alice", "bob"])]);
+        let fleet = make_fleet(&[("devs", &["alice", "bob"], Some("alice"))]);
         reconcile_teams(&home, &fleet);
         let members = get_members(&home, "devs");
-        // runtime-extra preserved, bob added
         assert!(members.contains(&"alice".to_string()));
         assert!(members.contains(&"bob".to_string()));
         assert!(members.contains(&"runtime-extra".to_string()));
@@ -301,13 +491,34 @@ mod tests {
     #[test]
     fn fleet_yaml_teams_idempotent() {
         let home = tmp_home("reconcile_idempotent");
-        let fleet = make_fleet(&[("devs", &["alice"])]);
+        let fleet = make_fleet(&[("devs", &["alice"], Some("alice"))]);
         reconcile_teams(&home, &fleet);
         reconcile_teams(&home, &fleet);
         let listed = list(&home);
         let teams = listed["teams"].as_array().expect("teams");
         assert_eq!(teams.len(), 1, "should not duplicate team");
         assert_eq!(get_members(&home, "devs"), vec!["alice"]);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fleet_yaml_reconcile_with_orchestrator() {
+        let home = tmp_home("reconcile_orch");
+        let fleet = make_fleet(&[("ops", &["lead", "worker"], Some("lead"))]);
+        reconcile_teams(&home, &fleet);
+        let listed = list(&home);
+        assert_eq!(listed["teams"][0]["orchestrator"], "lead");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn create_without_orchestrator_still_works() {
+        // Backward compat: orchestrator is optional at data level
+        let home = tmp_home("no_orch");
+        let r = create(&home, &serde_json::json!({"name": "t", "members": ["a"]}));
+        assert_eq!(r["status"], "created");
+        let listed = list(&home);
+        assert!(listed["teams"][0]["orchestrator"].is_null());
         std::fs::remove_dir_all(&home).ok();
     }
 }
