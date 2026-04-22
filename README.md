@@ -45,6 +45,47 @@ Worktree preserves all code changes.
 | Git isolation | Manual worktrees | Auto per-agent worktree |
 
 ## Quick Start
+## Installation
+
+### Windows
+
+**Prerequisites:**
+- [Rust toolchain](https://rustup.rs/) (includes `cargo`)
+- [Git for Windows](https://git-scm.com/download/win)
+- One of the supported AI coding CLIs (installed and authenticated)
+
+```powershell
+# 1. Clone and build
+git clone https://github.com/songsid/agend-terminal.git
+cd agend-terminal
+cargo build --release
+
+# 2. (Optional) Build with Discord support
+cargo build --release --features discord
+
+# 3. Add to PATH (PowerShell)
+$env:PATH += ";$(Get-Location)\target\release"
+
+# 4. Verify
+agend-terminal --version
+```
+
+> **Note:** On Windows, `agend-terminal` uses ConPTY instead of tmux.
+> WSL is not required.
+
+### Linux / macOS
+
+```bash
+# From source
+git clone https://github.com/songsid/agend-terminal.git
+cd agend-terminal
+cargo install --path .
+
+# Or via cargo
+cargo install agend-terminal
+```
+
+
 
 ```bash
 # Try the demo (no config needed)
