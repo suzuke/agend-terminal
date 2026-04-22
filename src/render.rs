@@ -1208,10 +1208,11 @@ pub fn render_tasks(
     items: &[crate::tasks::Task],
     sel_col: usize,
     sel_row: usize,
-    detail: bool,
+    mode: &crate::app::TaskBoardMode,
 ) {
+    use crate::app::TaskBoardMode;
     let count = items.len();
-    let title = format!(" Task Board ({count}) | ←→ column | ↑↓ select | Enter detail | q close ");
+    let title = format!(" Task Board ({count}) | ←→ move | n new | a assign | d cancel | q close ");
     let inner = render_overlay_frame(frame, Color::Blue, &title);
 
     if items.is_empty() {
@@ -1225,7 +1226,7 @@ pub fn render_tasks(
     let columns = task_board_columns(items);
 
     // Detail view for selected task
-    if detail {
+    if matches!(mode, TaskBoardMode::Detail) {
         if let Some(task) = columns[sel_col].get(sel_row) {
             let mut lines = vec![
                 Line::from(Span::styled(
@@ -1336,6 +1337,72 @@ pub fn render_tasks(
             lines.push(Line::from(Span::styled(text, style)));
         }
         frame.render_widget(Paragraph::new(lines), block_inner);
+    }
+
+    // Overlay sub-modes rendered on top of the kanban
+    match mode {
+        TaskBoardMode::NewTask { input } => {
+            let w = 50u16.min(inner.width.saturating_sub(4));
+            let popup = Rect::new(
+                inner.x + (inner.width.saturating_sub(w)) / 2,
+                inner.y + inner.height / 3,
+                w,
+                3,
+            );
+            frame.render_widget(Clear, popup);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green))
+                .title(Span::styled(
+                    " New Task ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let inner_popup = block.inner(popup);
+            frame.render_widget(block, popup);
+            let cursor = format!("{input}▏");
+            frame.render_widget(
+                Paragraph::new(cursor).style(Style::default().fg(Color::White)),
+                inner_popup,
+            );
+        }
+        TaskBoardMode::Assign { choices, selected } => {
+            let h = (choices.len() as u16 + 2).min(inner.height.saturating_sub(2));
+            let w = 40u16.min(inner.width.saturating_sub(4));
+            let popup = Rect::new(
+                inner.x + (inner.width.saturating_sub(w)) / 2,
+                inner.y + (inner.height.saturating_sub(h)) / 2,
+                w,
+                h,
+            );
+            frame.render_widget(Clear, popup);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(
+                    " Assign to ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let inner_popup = block.inner(popup);
+            frame.render_widget(block, popup);
+            let mut lines: Vec<Line> = Vec::new();
+            for (i, (display, _value)) in choices.iter().enumerate() {
+                let style = if i == *selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(Span::styled(display.as_str(), style)));
+            }
+            frame.render_widget(Paragraph::new(lines), inner_popup);
+        }
+        _ => {}
     }
 }
 

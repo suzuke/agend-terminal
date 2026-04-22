@@ -346,7 +346,6 @@ mod tests {
             &home,
             &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
         );
-        // Create task assigned to team
         handle(
             &home,
             "user",
@@ -354,8 +353,6 @@ mod tests {
         );
         let id = list_all(&home)[0].id.clone();
         assert_eq!(list_all(&home)[0].routed_to.as_deref(), Some("lead"));
-
-        // Agent claims → routed_to cleared
         handle(
             &home,
             "worker",
@@ -385,8 +382,6 @@ mod tests {
         );
         let id = list_all(&home)[0].id.clone();
         assert_eq!(list_all(&home)[0].routed_to.as_deref(), Some("a1"));
-
-        // Reassign to different team
         handle(
             &home,
             "user",
@@ -395,6 +390,96 @@ mod tests {
         let t = &list_all(&home)[0];
         assert_eq!(t.assignee.as_deref(), Some("beta"));
         assert_eq!(t.routed_to.as_deref(), Some("b1"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_board_create_via_handle() {
+        let home = tmp_home("board_create");
+        let r = handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "new feature", "priority": "normal"}),
+        );
+        assert_eq!(r["status"], "created");
+        let tasks = list_all(&home);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "new feature");
+        assert_eq!(tasks[0].status, "open");
+        assert_eq!(tasks[0].priority, "normal");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_board_move_status() {
+        let home = tmp_home("board_move");
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "item", "priority": "low"}),
+        );
+        let tasks = list_all(&home);
+        let id = &tasks[0].id;
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "update", "id": id, "priority": "normal"}),
+        );
+        let t = &list_all(&home)[0];
+        assert_eq!(t.priority, "normal");
+        assert_eq!(t.status, "open");
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "update", "id": id, "status": "claimed"}),
+        );
+        assert_eq!(list_all(&home)[0].status, "claimed");
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "update", "id": id, "status": "done"}),
+        );
+        assert_eq!(list_all(&home)[0].status, "done");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_board_assign_agent() {
+        let home = tmp_home("board_assign");
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "fix bug"}),
+        );
+        let id = &list_all(&home)[0].id.clone();
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "update", "id": id, "assignee": "at-dev-2"}),
+        );
+        assert_eq!(list_all(&home)[0].assignee.as_deref(), Some("at-dev-2"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_board_cancel() {
+        let home = tmp_home("board_cancel");
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "remove me"}),
+        );
+        let id = &list_all(&home)[0].id.clone();
+        handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "update", "id": id, "status": "cancelled"}),
+        );
+        assert_eq!(list_all(&home)[0].status, "cancelled");
+        let all = list_all(&home);
+        let columns = crate::render::task_board_columns(&all);
+        let total: usize = columns.iter().map(|c| c.len()).sum();
+        assert_eq!(total, 0, "cancelled task should not appear in any column");
         std::fs::remove_dir_all(&home).ok();
     }
 }
