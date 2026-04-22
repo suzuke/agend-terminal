@@ -1,24 +1,41 @@
-//! Channel trait contract harness.
+//! Channel registry + caps + binding contract harness.
 //!
-//! Call [`run_contract`] against any `impl Channel` to verify it satisfies
-//! the trait's behavioural invariants. Telegram is the only adapter today
+//! Call [`run_registry_contract`] against any `impl Channel` to verify it
+//! satisfies the subset of the trait's behavioural invariants that are
+//! observable **without** hitting a real backend: the in-memory instance →
+//! binding registry, `ChannelCapabilities::default()` conservatism, and
+//! `BindingRef` / `kind()` stability. Telegram is the only adapter today
 //! (see `#[cfg(test)] mod tests` below); future Discord / Slack adapters
 //! add their own call site without duplicating invariant logic.
 //!
-//! Hosted here rather than `tests/` because `src/lib.rs` is intentionally
-//! minimal (the supervisor binary must compile without teloxide/ratatui/
-//! tokio) — see the PR body for full rationale.
+//! ## Scope (what this harness does NOT cover)
+//!
+//! The transport methods on `Channel` — `send`, `edit`, `delete`,
+//! `poll_event`, `create_binding`, `remove_binding`, and any non-default
+//! `caps()` shape — talk to real servers and are out of scope here. For
+//! full adapter verification, those must be exercised via integration
+//! tests against the actual backend; this harness only covers the
+//! registry-side trait surface plus default capabilities.
+//!
+//! Hosted in-crate rather than `tests/` because `src/lib.rs` is
+//! intentionally minimal (the supervisor binary must compile without
+//! teloxide/ratatui/tokio) — see the PR body for full rationale.
 //!
 //! ## Invariants checked (one `assert_*` helper each below)
 //!
 //! - `record → has → take` round-trip, preserving `kind()`
 //! - `has_binding` / `take_binding` on an unknown instance are total
 //!   (false / None, never panic)
-//! - Duplicate `record_binding`: last write wins, `has_binding` stays true
+//! - Duplicate `record_binding`: `has_binding` stays true, and — when the
+//!   adapter produces distinguishable `display_tag`s — the later write
+//!   is the one returned by `take_binding` (last write wins)
 //! - Double `take_binding`: second call returns `None`
 //! - `ChannelCapabilities::default()` is fully conservative
 //! - `BindingRef::display_tag()` is stable and side-effect-free
-//! - `attach_registry`: last write wins, repeat calls do not panic
+//! - `attach_registry`: repeat calls do not panic. Write order is NOT
+//!   observable through the `Channel` trait (no registry getter), so
+//!   last-write-wins cannot be asserted at the contract level — only
+//!   tested where the adapter exposes a concrete accessor
 //! - `kind()` is stable and non-empty across calls
 
 use crate::channel::{BindingRef, Channel, ChannelCapabilities, MarkdownDialect, MentionStyle};
@@ -30,7 +47,7 @@ use crate::channel::{BindingRef, Channel, ChannelCapabilities, MarkdownDialect, 
 /// without invoking platform side effects (no network / API calls).
 /// Each call site in the test module below wires this closure to its
 /// adapter's internal payload type.
-pub fn run_contract<C: Channel>(ch: C, make_binding: impl Fn(&str) -> BindingRef) {
+pub fn run_registry_contract<C: Channel>(ch: C, make_binding: impl Fn(&str) -> BindingRef) {
     assert_default_capabilities_are_conservative();
     assert_kind_is_stable_and_non_empty(&ch);
     assert_has_is_false_for_unknown(&ch);
@@ -117,17 +134,44 @@ fn assert_duplicate_record_keeps_bound<C: Channel>(
     ch: &C,
     make_binding: &impl Fn(&str) -> BindingRef,
 ) {
-    let name = "__contract_duplicate_record__";
-    ch.record_binding(name, make_binding(name), "\r".to_string());
-    assert!(ch.has_binding(name));
+    let instance = "__contract_duplicate_record__";
+    // Build two *distinguishable* bindings by seeding `make_binding` with
+    // two different strings. Adapters whose `display_tag` is derived from
+    // the seed (Telegram: "TG#<topic_id>") will return different tags;
+    // adapters that return `None` degrade gracefully below.
+    let first = make_binding("__contract_dup_first__");
+    let second = make_binding("__contract_dup_second__");
+    let first_tag = first.display_tag().map(str::to_string);
+    let second_tag = second.display_tag().map(str::to_string);
+
+    ch.record_binding(instance, first, "\r".to_string());
+    assert!(ch.has_binding(instance));
     // Second record for the same instance: contract is "last write wins".
-    ch.record_binding(name, make_binding(name), "\x03".to_string());
+    ch.record_binding(instance, second, "\x03".to_string());
     assert!(
-        ch.has_binding(name),
+        ch.has_binding(instance),
         "has_binding still true after duplicate record"
     );
-    // Clean up so later runs don't inherit this state.
-    let _ = ch.take_binding(name);
+
+    // If the adapter's `display_tag`s distinguish the two bindings, the
+    // last-write-wins claim is observable: the `take_binding` return
+    // must match the *second* recorded binding, not the first.
+    let taken = ch
+        .take_binding(instance)
+        .expect("take after duplicate record");
+    if let (Some(a), Some(b)) = (&first_tag, &second_tag) {
+        if a != b {
+            assert_eq!(
+                taken.display_tag().map(str::to_string),
+                second_tag,
+                "duplicate record: last write must win (taken tag != second)"
+            );
+        }
+    }
+    // Else: tags are None or identical → adapter gives us no signal to
+    // distinguish writes at the contract level. has_binding / take round
+    // trip is all we can check; leave the stronger assertion to adapter-
+    // specific tests that can see the underlying payload.
 }
 
 fn assert_display_tag_is_stable(make_binding: &impl Fn(&str) -> BindingRef) {
@@ -147,7 +191,11 @@ fn assert_attach_registry_is_repeatable<C: Channel>(ch: &C) {
     let r1: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let r2: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     ch.attach_registry(r1);
-    // Second attach: contract is "last write wins". Must not panic.
+    // Second attach: the `Channel` trait exposes no registry getter, so
+    // write order is NOT observable at the contract level. All we can
+    // enforce here is that repeated calls do not panic; the actual
+    // "last write wins" guarantee is checked in adapter-specific tests
+    // that can read the private registry field directly.
     ch.attach_registry(r2);
 }
 
@@ -190,6 +238,6 @@ mod tests {
             None,
         );
         let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
-        run_contract(channel, telegram_make_binding);
+        run_registry_contract(channel, telegram_make_binding);
     }
 }
