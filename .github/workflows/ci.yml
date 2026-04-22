@@ -42,7 +42,7 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
-      # Tray feature gate (docs/PLAN-tray-resident.md). Release binaries
+      # Tray feature gate (docs/archived/PLAN-tray-resident.md). Release binaries
       # still ship default-only until PLAN task #4 pulls in tray-icon/tao;
       # this step just guarantees the feature code compiles on all three
       # platforms so per-OS regressions surface before the event loop lands.

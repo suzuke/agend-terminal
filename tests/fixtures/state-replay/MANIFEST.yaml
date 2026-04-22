@@ -97,7 +97,7 @@ fixtures:
   # outside its workspace-write sandbox. Neither observed transition
   # sequence contains AgentState::PermissionPrompt: each backend's
   # permission pattern fails to match the actual dialog wording. Gap is
-  # tracked in docs/FOLLOWUP-permission-pattern-gaps.md; treat these as
+  # tracked in docs/archived/FOLLOWUP-permission-pattern-gaps.md; treat these as
   # regression anchors per Stage 2a convention.
 
   - file: claude-perm.raw
@@ -146,7 +146,7 @@ fixtures:
   # final-screen tool banners / session summaries), yet none of the
   # observed transition sequences contain AgentState::ToolUse. Each
   # fixture therefore documents a *pattern coverage gap*, tracked in
-  # docs/FOLLOWUP-tooluse-pattern-gaps.md. Treat these as regression
+  # docs/archived/FOLLOWUP-tooluse-pattern-gaps.md. Treat these as regression
   # anchors: if a future pattern change starts firing ToolUse on one
   # of these fixtures the transitions array will diverge and this
   # test will flag it for manual review.
