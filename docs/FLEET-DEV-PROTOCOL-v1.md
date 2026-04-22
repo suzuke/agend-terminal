@@ -191,7 +191,71 @@ Level **(a) task state changes** (per at-dev-2/at-dev-4 consensus):
 - "進度？" → orchestrator runs `task list` + `list_decisions --tags current-track` and summarizes.
 - Active task count + blocked count + done count gives instant pulse.
 
-## 7. Git workflow
+## 7. Waiting and timeout
+
+### Declaring wait state
+
+When blocked on another agent, CI, or external event:
+
+```
+set_waiting_on --condition "review from at-dev-4 on PR #63"
+```
+
+- Automatically cleared after 120s of no MCP activity (stale decay).
+- Visible via `describe_instance` and `list_instances` to all agents and operator.
+- Orchestrator can query `list_instances` to see who's waiting on what.
+
+### Scheduling check-ins (cross-backend)
+
+**Do NOT rely on backend-specific mechanisms** (e.g., Claude Code `ScheduleWakeup`).
+Use daemon-level scheduling, which works for all backends:
+
+```
+create_schedule --target general
+  --message "Check inbox: at-dev-2 should have finished PR-1 by now"
+  --run_at "2026-04-22T21:00:00+08:00"
+  --label "pr1-check"
+```
+
+One-shot schedules auto-disable after firing. Use for:
+- Timeout checks on delegated tasks
+- Periodic progress polling during long operations
+- Reminder to follow up on review verdicts
+
+### Timeout policy
+
+| Elapsed since dispatch | Action |
+|---|---|
+| < 20 min | Normal. Check `describe_instance` — `last_heartbeat` fresh = agent active. |
+| 20 min, agent `last_heartbeat` fresh | Agent is working. Extend wait. |
+| 20 min, agent `last_heartbeat` stale (> 120s) | **Ping to verify liveness.** `send_to_instance` with a direct question. |
+| 20 min, no response to ping | **Escalate.** `replace_instance` and re-dispatch task. |
+| Agent state `permission` + heartbeat fresh | Heartbeat gate suppresses false positive (A5 fix). Trust heartbeat. |
+| Agent state `permission` + heartbeat stale | May be genuinely stuck. Ping first, then escalate. |
+
+### Liveness check procedure
+
+```
+# Step 1: check heartbeat
+describe_instance --name at-dev-2
+# → last_heartbeat: "2026-04-22T12:55:00Z" (< 120s ago = fresh)
+
+# Step 2: if stale, ping
+send_to_instance --instance_name at-dev-2
+  --message "Status check: are you still working on task t-xxx?"
+  --requires_reply true
+
+# Step 3: if no reply within 5 min → replace
+replace_instance --name at-dev-2 --reason "unresponsive after timeout"
+```
+
+### After task completion
+
+1. Implementer: `report_result` → `task done --result "PR #N merged"`
+2. Orchestrator: picks up from inbox (or scheduled check-in fires)
+3. Clean up: `delete_schedule --id <check-in-schedule-id>` if one was set
+
+## 8. Git workflow
 
 ### Worktree rules (from CLAUDE.md, reinforced)
 
@@ -203,7 +267,7 @@ Level **(a) task state changes** (per at-dev-2/at-dev-4 consensus):
 
 Clean up immediately. Don't accumulate stale worktrees.
 
-## 8. Tool usage quick reference
+## 9. Tool usage quick reference
 
 | Need | Tool | NOT this |
 |---|---|---|
@@ -214,9 +278,12 @@ Clean up immediately. Don't accumulate stale worktrees.
 | Watch CI | `watch_ci` | Manual `gh pr checks` |
 | Declare wait state | `set_waiting_on` | Prose in messages |
 | Check agent health | `describe_instance` (has `last_heartbeat`) | Guessing from pane |
+| Schedule check-in | `create_schedule` (one-shot `--run_at`) | Backend-specific ScheduleWakeup |
+| Timeout escalation | `replace_instance` (after ping fails) | Silently waiting forever |
 
-## 9. Protocol changelog
+## 10. Protocol changelog
 
 | Version | Date | Changes |
 |---|---|---|
+| v1.1 | 2026-04-22 | Added §7 Waiting and timeout: `set_waiting_on` usage, `create_schedule` for cross-backend check-ins, timeout policy (20min threshold), liveness check procedure, escalation rules. Added `create_schedule` + `replace_instance` to tool reference. |
 | v1.0 | 2026-04-22 | Initial protocol. Integrates Reviewer Contract v0.1 → v1.1, adds task board + decisions panel usage, hop reduction, CI integration. |
