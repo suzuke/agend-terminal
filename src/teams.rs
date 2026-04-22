@@ -141,6 +141,33 @@ pub fn remove_member_from_all(home: &Path, instance_name: &str) {
     });
 }
 
+/// Reconcile teams from fleet.yaml seed config. Additive only — runtime-added
+/// members are preserved; only missing seed members are added.
+pub fn reconcile_teams(home: &Path, fleet: &crate::fleet::FleetConfig) {
+    for (name, seed) in &fleet.teams {
+        let existing = get_members(home, name);
+        if existing.is_empty() {
+            create(
+                home,
+                &serde_json::json!({
+                    "name": name,
+                    "members": seed.members,
+                    "description": seed.description,
+                }),
+            );
+        } else {
+            let missing: Vec<&String> = seed
+                .members
+                .iter()
+                .filter(|m| !existing.contains(m))
+                .collect();
+            if !missing.is_empty() {
+                update(home, &serde_json::json!({ "name": name, "add": missing }));
+            }
+        }
+    }
+}
+
 /// Get members of a team.
 pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
     let store = load(home);
@@ -223,6 +250,64 @@ mod tests {
         let home = tmp_home("del_nonexistent");
         let r = delete(&home, &serde_json::json!({"name": "nope"}));
         assert!(r["error"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn make_fleet(teams: &[(&str, &[&str])]) -> crate::fleet::FleetConfig {
+        let mut map = std::collections::HashMap::new();
+        for (name, members) in teams {
+            map.insert(
+                name.to_string(),
+                crate::fleet::TeamConfig {
+                    members: members.iter().map(|s| s.to_string()).collect(),
+                    description: None,
+                },
+            );
+        }
+        crate::fleet::FleetConfig {
+            teams: map,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fleet_yaml_teams_creates_on_startup() {
+        let home = tmp_home("reconcile_create");
+        let fleet = make_fleet(&[("devs", &["alice", "bob"])]);
+        reconcile_teams(&home, &fleet);
+        let members = get_members(&home, "devs");
+        assert_eq!(members, vec!["alice", "bob"]);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fleet_yaml_teams_additive_reconcile() {
+        let home = tmp_home("reconcile_additive");
+        // Pre-create team with an extra runtime member
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["alice", "runtime-extra"]}),
+        );
+        let fleet = make_fleet(&[("devs", &["alice", "bob"])]);
+        reconcile_teams(&home, &fleet);
+        let members = get_members(&home, "devs");
+        // runtime-extra preserved, bob added
+        assert!(members.contains(&"alice".to_string()));
+        assert!(members.contains(&"bob".to_string()));
+        assert!(members.contains(&"runtime-extra".to_string()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fleet_yaml_teams_idempotent() {
+        let home = tmp_home("reconcile_idempotent");
+        let fleet = make_fleet(&[("devs", &["alice"])]);
+        reconcile_teams(&home, &fleet);
+        reconcile_teams(&home, &fleet);
+        let listed = list(&home);
+        let teams = listed["teams"].as_array().expect("teams");
+        assert_eq!(teams.len(), 1, "should not duplicate team");
+        assert_eq!(get_members(&home, "devs"), vec!["alice"]);
         std::fs::remove_dir_all(&home).ok();
     }
 }

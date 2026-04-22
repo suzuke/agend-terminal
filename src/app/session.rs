@@ -139,6 +139,10 @@ pub(super) fn restore_with_reconciliation(
     rows: u16,
 ) -> bool {
     let fleet = fleet::FleetConfig::load(fleet_path).ok();
+    // Reconcile fleet.yaml teams: section → teams.json (additive only)
+    if let Some(ref f) = fleet {
+        crate::teams::reconcile_teams(home, f);
+    }
     let fleet_names: HashSet<String> = fleet
         .as_ref()
         .map(|f| f.instance_names().into_iter().collect())
