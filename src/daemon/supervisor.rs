@@ -11,8 +11,8 @@
 //! and the transition in `state::StateTracker::set_awaiting_operator`. This
 //! module is the plumbing that glues them to Telegram notifications.
 
-use super::telegram::{notify_telegram, notify_telegram_silent};
 use crate::agent::{self, AgentRegistry};
+use crate::channel::telegram::{notify_telegram, notify_telegram_silent};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;

@@ -4,13 +4,12 @@
 mod ci_watch;
 mod cron_tick;
 pub(crate) mod supervisor;
-mod telegram;
 mod tui_bridge;
 
 use crate::agent::{self, AgentRegistry};
+use crate::channel::telegram::notify_telegram;
 use ci_watch::check_ci_watches;
 use cron_tick::check_schedules;
-use telegram::notify_telegram;
 pub use tui_bridge::serve_agent_tui;
 
 use std::collections::HashMap;
