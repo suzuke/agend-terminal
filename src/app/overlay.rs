@@ -516,7 +516,7 @@ pub(super) fn handle_key(
         } => {
             if *detail {
                 // In detail view, Esc goes back to board
-                if matches!(key.code, KeyCode::Esc) {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     *detail = false;
                 } else {
                     // ignore other keys in detail view
