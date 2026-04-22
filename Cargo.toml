@@ -101,3 +101,7 @@ embed-resource = "2"
 # Used only for asserting that codex_trust_directory writes syntactically
 # valid TOML — the prod code appends raw text, it doesn't depend on this crate.
 toml = "0.8"
+# Log-capture for failure-visibility regression pins (DESIGN-stage-b-ux.md
+# §7 PR-C names `tracing-test` as the sanctioned approach for asserting
+# `tracing::warn!` records are actually emitted).
+tracing-test = "0.2"

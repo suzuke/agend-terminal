@@ -833,6 +833,36 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
     }
 }
 
+/// Format the S2d provenance tag body per DESIGN-stage-b-ux.md §6.
+///
+/// Shape: `⬅️ from {from} — DELEGATE\n   (brief: "{brief}")`.
+///
+/// Extracted as a pure fn (not inlined into [`inject_provenance`]) so
+/// the §4 value-source regression pin can lock the rendered text
+/// without needing a live Bot / env config.
+pub(crate) fn format_provenance(from: &str, brief: &str) -> String {
+    format!("⬅️ from {from} — DELEGATE\n   (brief: \"{brief}\")")
+}
+
+/// S2d provenance injection (Stage B-UX PR-C, DESIGN §6).
+///
+/// When `delegate_task` succeeds, the daemon calls this to send a
+/// short "who sent this to you" tag into `target_instance`'s primary
+/// topic. The injection is orthogonal to the actual delegated message
+/// — it's a side-channel hint so the recipient's operator (watching
+/// the topic in Telegram) can tell at a glance which agent the task
+/// came from.
+///
+/// Returns the `try_telegram_reply` error unchanged so the caller can
+/// `tracing::warn!` per §4 Q4 (chosen over silent drop: provenance
+/// failure may signal a real routing bug — topic_id pointing at the
+/// wrong instance — that deserves log visibility, even though it
+/// doesn't block the main path).
+pub fn inject_provenance(target_instance: &str, from: &str, brief: &str) -> anyhow::Result<()> {
+    let text = format_provenance(from, brief);
+    try_telegram_reply(target_instance, &text).map(|_| ())
+}
+
 /// React to a message with an emoji.
 pub fn try_telegram_react(
     instance_name: &str,
@@ -2142,5 +2172,36 @@ instances:
         assert!(!handle_send_failure(&gone, &home, "any", None, None));
         // Topic-deleted + topic_id → fires.
         assert!(handle_send_failure(&gone, &home, "any", Some(42), None));
+    }
+
+    /// Value-source pin (Reviewer Contract v0.1 §4) for S2d provenance.
+    ///
+    /// DESIGN-stage-b-ux.md §6 fixes the exact wire-shape of the
+    /// provenance tag: `⬅️ from {from} — DELEGATE\n   (brief: "{brief}")`.
+    /// Any field mixing (e.g., rendering `brief` where `from` belongs, or
+    /// losing the em-dash / arrow glyph) would silently reshape the
+    /// recipient-side UX. Lock the exact bytes for a known input.
+    #[test]
+    fn format_provenance_matches_design_s6_shape() {
+        // Known distinct values so a swapped-argument bug would fail.
+        let rendered = format_provenance("at-dev-1", "refactor auth middleware");
+        assert_eq!(
+            rendered,
+            "⬅️ from at-dev-1 — DELEGATE\n   (brief: \"refactor auth middleware\")"
+        );
+    }
+
+    /// Source-of-fields pin: swapping `from` and `brief` must produce a
+    /// visibly different string (i.e. we're not symmetric on the two
+    /// inputs — the shape distinguishes who-sent from what-they-sent).
+    /// Catches a refactor that accidentally passes args in the wrong
+    /// order at the inject_provenance call site.
+    #[test]
+    fn format_provenance_distinguishes_from_and_brief_slots() {
+        let normal = format_provenance("a", "b");
+        let swapped = format_provenance("b", "a");
+        assert_ne!(normal, swapped, "from/brief slots must not be symmetric");
+        assert!(normal.contains("from a"));
+        assert!(normal.contains("(brief: \"b\")"));
     }
 }
