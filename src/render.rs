@@ -1049,7 +1049,8 @@ pub fn render_help(frame: &mut Frame) {
     ];
     let area = frame.area();
     let h = (help.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let w = 48u16.min(area.width.saturating_sub(4));
+    let content_w = help.iter().map(|l| l.len() as u16).max().unwrap_or(48) + 2;
+    let w = content_w.min(area.width.saturating_sub(4));
     let x = (area.width.saturating_sub(w)) / 2;
     let y = (area.height.saturating_sub(h)) / 2;
     let ha = Rect::new(x, y, w, h);

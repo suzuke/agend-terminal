@@ -105,7 +105,9 @@ impl KeyHandler {
             }
             PrefixState::Repeat { since } => {
                 // Enter or Esc exits repeat mode immediately
-                if key.code == KeyCode::Enter || key.code == KeyCode::Esc {
+                if (key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT))
+                    || key.code == KeyCode::Esc
+                {
                     self.state = PrefixState::Normal;
                     return Action::None;
                 }
