@@ -197,7 +197,12 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         }
         Action::ShowTasks => {
             let items = crate::tasks::list_all(ctx.home);
-            out.new_overlay = Some(Overlay::Tasks { items, scroll: 0 });
+            out.new_overlay = Some(Overlay::Tasks {
+                items,
+                col: 0,
+                row: 0,
+                detail: false,
+            });
         }
         Action::ShowHelp => {
             out.new_overlay = Some(Overlay::Help);

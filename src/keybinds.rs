@@ -179,7 +179,7 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('[') => Action::ScrollMode,
         KeyCode::Char(':') => Action::CommandPalette,
         KeyCode::Char('D') => Action::ShowDecisions,
-        KeyCode::Char('T') => Action::ShowTasks,
+        KeyCode::Char('T') | KeyCode::Char('t') => Action::ShowTasks,
         KeyCode::Char('d') => Action::Detach,
         KeyCode::Char('?') => Action::ShowHelp,
         KeyCode::Char('~') => Action::ScratchShell,

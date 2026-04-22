@@ -79,10 +79,15 @@ pub(super) enum Overlay {
         items: Vec<crate::decisions::Decision>,
         scroll: usize,
     },
-    /// Task board overlay panel (read-only, scrollable).
+    /// Task board overlay — 4-column kanban view.
     Tasks {
         items: Vec<crate::tasks::Task>,
-        scroll: usize,
+        /// Currently focused column (0=Backlog, 1=Open, 2=InProgress, 3=Done).
+        col: usize,
+        /// Currently focused row within the column.
+        row: usize,
+        /// Whether detail view is expanded for the selected task.
+        detail: bool,
     },
     /// Floating scratch shell (Ctrl+B ~). Esc kills the shell and closes the
     /// overlay. Pane is boxed because it's much larger than any other variant.
@@ -504,11 +509,46 @@ pub(super) fn handle_key(
             }
         }
         Overlay::Tasks {
-            items,
-            ref mut scroll,
+            ref items,
+            ref mut col,
+            ref mut row,
+            ref mut detail,
         } => {
-            if !handle_list_scroll(key.code, scroll, items.len()) {
-                *overlay = Overlay::None;
+            if *detail {
+                // In detail view, Esc goes back to board
+                if matches!(key.code, KeyCode::Esc) {
+                    *detail = false;
+                } else {
+                    // ignore other keys in detail view
+                }
+            } else {
+                let columns = crate::render::task_board_columns(items);
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') if *col > 0 => {
+                        *col -= 1;
+                        *row = (*row).min(columns[*col].len().saturating_sub(1));
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if *col < 3 => {
+                        *col += 1;
+                        *row = (*row).min(columns[*col].len().saturating_sub(1));
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if *row > 0 => {
+                        *row -= 1;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let col_len = columns[*col].len();
+                        if *row + 1 < col_len {
+                            *row += 1;
+                        }
+                    }
+                    KeyCode::Enter if !columns[*col].is_empty() => {
+                        *detail = true;
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        *overlay = Overlay::None;
+                    }
+                    _ => {}
+                }
             }
         }
         Overlay::ScratchShell { pane } => match key.code {

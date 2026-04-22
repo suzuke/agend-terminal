@@ -1203,9 +1203,15 @@ pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision],
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-pub fn render_tasks(frame: &mut Frame, items: &[crate::tasks::Task], scroll: usize) {
+pub fn render_tasks(
+    frame: &mut Frame,
+    items: &[crate::tasks::Task],
+    sel_col: usize,
+    sel_row: usize,
+    detail: bool,
+) {
     let count = items.len();
-    let title = format!(" Tasks ({count}) | j/k scroll | q close ");
+    let title = format!(" Task Board ({count}) | ←→ column | ↑↓ select | Enter detail | q close ");
     let inner = render_overlay_frame(frame, Color::Blue, &title);
 
     if items.is_empty() {
@@ -1216,74 +1222,166 @@ pub fn render_tasks(frame: &mut Frame, items: &[crate::tasks::Task], scroll: usi
         return;
     }
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, t) in items.iter().enumerate() {
-        let marker = if i == scroll { "> " } else { "  " };
-        let status_color = match t.status.as_str() {
-            "open" => Color::Green,
-            "claimed" => Color::Yellow,
-            "done" => Color::DarkGray,
-            "blocked" => Color::Red,
-            _ => Color::White,
-        };
-        let pri_color = match t.priority.as_str() {
-            "urgent" => Color::Red,
-            "high" => Color::Yellow,
-            _ => Color::White,
-        };
-        let style = if i == scroll {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let assignee = t.assignee.as_deref().unwrap_or("-");
-        lines.push(Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(
-                format!("[{}] ", t.status),
-                Style::default().fg(status_color),
-            ),
-            Span::styled(
-                &t.title,
-                if i == scroll {
-                    style
-                } else {
-                    Style::default().fg(Color::White)
-                },
-            ),
-            Span::styled(
-                format!("  ({}) @{assignee}", t.priority),
-                Style::default().fg(pri_color),
-            ),
-        ]));
-        if i == scroll {
-            if !t.description.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", t.description),
+    let columns = task_board_columns(items);
+
+    // Detail view for selected task
+    if detail {
+        if let Some(task) = columns[sel_col].get(sel_row) {
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    &task.title,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "Status: {}  Priority: {}  Assignee: {}",
+                        task.status,
+                        task.priority,
+                        task.assignee.as_deref().unwrap_or("-")
+                    ),
                     Style::default().fg(Color::Gray),
+                )),
+                Line::from(""),
+            ];
+            if !task.description.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    &task.description,
+                    Style::default().fg(Color::White),
+                )));
+                lines.push(Line::from(""));
+            }
+            if !task.depends_on.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("Depends on: {}", task.depends_on.join(", ")),
+                    Style::default().fg(Color::Yellow),
                 )));
             }
-            if let Some(ref result) = t.result {
+            if let Some(ref result) = task.result {
                 lines.push(Line::from(Span::styled(
-                    format!("    result: {result}"),
+                    format!("Result: {result}"),
                     Style::default().fg(Color::Green),
                 )));
             }
+            lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
-                format!(
-                    "    by {} | {}",
-                    t.created_by,
-                    &t.created_at.get(..10).unwrap_or(&t.created_at)
-                ),
+                "Esc to go back",
                 Style::default().fg(Color::DarkGray),
             )));
-            lines.push(Line::from(""));
+            frame.render_widget(Paragraph::new(lines), inner);
+            return;
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+
+    // 4-column kanban layout
+    let col_areas = ratatui::layout::Layout::horizontal([
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+    ])
+    .split(inner);
+
+    let col_titles = ["Backlog", "Open", "In Progress", "Done"];
+    let col_colors = [Color::Gray, Color::Green, Color::Yellow, Color::DarkGray];
+
+    for (ci, (tasks, area)) in columns.iter().zip(col_areas.iter()).enumerate() {
+        let is_active = ci == sel_col;
+        let border_color = if is_active {
+            Color::Blue
+        } else {
+            col_colors[ci]
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(Span::styled(
+                format!(" {} ({}) ", col_titles[ci], tasks.len()),
+                Style::default()
+                    .fg(if is_active {
+                        Color::Blue
+                    } else {
+                        col_colors[ci]
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let block_inner = block.inner(*area);
+        frame.render_widget(block, *area);
+
+        let mut lines: Vec<Line> = Vec::new();
+        for (ri, t) in tasks.iter().enumerate() {
+            let is_selected = is_active && ri == sel_row;
+            let pri_badge = match t.priority.as_str() {
+                "urgent" => "🔴",
+                "high" => "🟠",
+                "normal" => "🔵",
+                _ => "⚪",
+            };
+            let blocked = if t.status == "blocked" { " 🔴" } else { "" };
+            let assignee = t
+                .assignee
+                .as_deref()
+                .map(|a| format!(" @{a}"))
+                .unwrap_or_default();
+            let text = format!("{pri_badge} {}{blocked}{assignee}", t.title);
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+        frame.render_widget(Paragraph::new(lines), block_inner);
+    }
+}
+
+/// Group tasks into 4 kanban columns: Backlog, Open, In Progress, Done.
+/// Sorted by priority desc then created_at asc within each column.
+/// Cancelled tasks are excluded.
+pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::Task>; 4] {
+    let mut backlog: Vec<&crate::tasks::Task> = Vec::new();
+    let mut open: Vec<&crate::tasks::Task> = Vec::new();
+    let mut in_progress: Vec<&crate::tasks::Task> = Vec::new();
+    let mut done: Vec<&crate::tasks::Task> = Vec::new();
+
+    for t in items {
+        match t.status.as_str() {
+            "cancelled" => {} // excluded
+            "open" | "blocked" if t.priority == "low" => backlog.push(t),
+            "open" | "blocked" => open.push(t),
+            "claimed" => in_progress.push(t),
+            "done" => done.push(t),
+            _ => open.push(t),
+        }
+    }
+
+    fn sort_col(col: &mut Vec<&crate::tasks::Task>) {
+        col.sort_by(|a, b| {
+            let pri_ord = |p: &str| -> u8 {
+                match p {
+                    "urgent" => 0,
+                    "high" => 1,
+                    "normal" => 2,
+                    "low" => 3,
+                    _ => 4,
+                }
+            };
+            pri_ord(&a.priority)
+                .cmp(&pri_ord(&b.priority))
+                .then(a.created_at.cmp(&b.created_at))
+        });
+    }
+
+    sort_col(&mut backlog);
+    sort_col(&mut open);
+    sort_col(&mut in_progress);
+    sort_col(&mut done);
+
+    [backlog, open, in_progress, done]
 }
 
 /// Centered box sized to 60% of `area`, clamped so a tiny window still gets
@@ -1455,5 +1553,59 @@ mod tests {
         let shared = cells[&(9, 2)];
         assert_eq!(shared.priority, 5);
         assert_eq!(shared.style.fg, Some(Color::Magenta));
+    }
+
+    fn make_task(
+        title: &str,
+        status: &str,
+        priority: &str,
+        created_at: &str,
+    ) -> crate::tasks::Task {
+        crate::tasks::Task {
+            id: title.to_string(),
+            title: title.to_string(),
+            description: String::new(),
+            status: status.to_string(),
+            priority: priority.to_string(),
+            assignee: None,
+            created_by: String::new(),
+            depends_on: Vec::new(),
+            result: None,
+            created_at: created_at.to_string(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn task_board_groups_by_status() {
+        let tasks = vec![
+            make_task("backlog-item", "open", "low", "2026-01-01"),
+            make_task("open-item", "open", "high", "2026-01-02"),
+            make_task("wip", "claimed", "normal", "2026-01-03"),
+            make_task("finished", "done", "normal", "2026-01-04"),
+            make_task("cancelled-item", "cancelled", "normal", "2026-01-05"),
+            make_task("blocked-low", "blocked", "low", "2026-01-06"),
+        ];
+        let [backlog, open, in_progress, done] = task_board_columns(&tasks);
+        assert_eq!(backlog.len(), 2, "open+low and blocked+low → backlog");
+        assert_eq!(open.len(), 1, "open+high → open");
+        assert_eq!(in_progress.len(), 1, "claimed → in progress");
+        assert_eq!(done.len(), 1, "done → done");
+        // cancelled excluded from all columns
+    }
+
+    #[test]
+    fn task_board_sorts_by_priority_then_created() {
+        let tasks = vec![
+            make_task("normal-old", "open", "normal", "2026-01-01"),
+            make_task("urgent-new", "open", "urgent", "2026-01-03"),
+            make_task("normal-new", "open", "normal", "2026-01-02"),
+            make_task("high-old", "open", "high", "2026-01-01"),
+        ];
+        let [_, open, _, _] = task_board_columns(&tasks);
+        assert_eq!(open[0].title, "urgent-new", "urgent first");
+        assert_eq!(open[1].title, "high-old", "high second");
+        assert_eq!(open[2].title, "normal-old", "normal oldest third");
+        assert_eq!(open[3].title, "normal-new", "normal newest last");
     }
 }
