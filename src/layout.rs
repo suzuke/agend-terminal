@@ -8,7 +8,6 @@ use crate::vterm::VTerm;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use unicode_width::UnicodeWidthStr;
 
 /// How a pane's input/resize is delivered to the underlying process.
 ///
