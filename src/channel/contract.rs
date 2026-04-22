@@ -227,10 +227,13 @@ mod tests {
 
     #[test]
     fn telegram_channel_satisfies_contract() {
-        // Dummy token + empty instance map. None of the invariants run
-        // here touch the teloxide HTTP runtime, so no network is needed.
-        let state = TelegramState::new(
-            "dummy_contract_token",
+        // Bot-free constructor: `TelegramState::new` eagerly runs
+        // `Bot::new`, which initializes reqwest + `system-configuration`
+        // and panics on some macOS setups. None of the contract invariants
+        // touch the `bot` field (see module-level "Scope" doc), so we use
+        // the `#[cfg(test)]` `new_for_contract_test` path to keep this
+        // portable across developer machines and CI.
+        let state = TelegramState::new_for_contract_test(
             -100_1234567890,
             HashMap::new(),
             PathBuf::from("/tmp/agend-contract-home"),
@@ -239,5 +242,26 @@ mod tests {
         );
         let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
         run_registry_contract(channel, telegram_make_binding);
+    }
+
+    /// Locks in the scope boundary of `new_for_contract_test`: if a future
+    /// contract assertion reaches a transport path (here: `send_reply`),
+    /// the `.expect("telegram bot not initialized")` unwrap must fire
+    /// loudly instead of being silently routed past. This guarantees the
+    /// bot-free constructor cannot be abused to paper over a transport
+    /// call sneaking into the harness.
+    #[test]
+    #[should_panic(expected = "telegram bot not initialized")]
+    fn contract_state_panics_if_transport_reached() {
+        let state = Arc::new(Mutex::new(TelegramState::new_for_contract_test(
+            -100_1234567890,
+            HashMap::new(),
+            PathBuf::from("/tmp/agend-contract-home"),
+            HashMap::new(),
+            None,
+        )));
+        // `send_reply` unwraps `bot` before hitting the tokio runtime, so
+        // this panics without needing a live reactor.
+        let _ = crate::channel::telegram::send_reply(&state, "unknown-instance", "hi");
     }
 }
