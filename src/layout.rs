@@ -1123,6 +1123,10 @@ pub struct Layout {
     pub tabs: Vec<Tab>,
     pub active: usize,
     next_pane_id: usize,
+    /// Tab being dragged for reorder (index). Set by mouse handler.
+    pub tab_reorder_source: Option<usize>,
+    /// Drop target tab index during tab reorder drag.
+    pub tab_reorder_target: Option<usize>,
 }
 
 impl Layout {
@@ -1131,6 +1135,8 @@ impl Layout {
             tabs: Vec::new(),
             active: 0,
             next_pane_id: 0,
+            tab_reorder_source: None,
+            tab_reorder_target: None,
         }
     }
 
