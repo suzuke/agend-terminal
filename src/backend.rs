@@ -472,6 +472,14 @@ mod tests {
             Backend::from_command("/usr/bin/claude"),
             Some(Backend::ClaudeCode)
         );
+        // Alias: the bare "kiro" input (without the `-cli` suffix) must also
+        // resolve to `KiroCli` and round-trip through `preset().command` to
+        // the canonical `"kiro-cli"` executable name. Previously covered by
+        // the `backend_resolves_to_preset_command` test removed in PR #22.
+        assert_eq!(
+            Backend::from_command("kiro").map(|b| b.preset().command),
+            Some("kiro-cli")
+        );
     }
 
     #[test]
