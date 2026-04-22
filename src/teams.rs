@@ -229,6 +229,9 @@ pub fn remove_member_from_all(home: &Path, instance_name: &str) {
     let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut TeamStore| {
         for team in &mut store.teams {
             team.members.retain(|m| m != instance_name);
+            if team.orchestrator.as_deref() == Some(instance_name) {
+                team.orchestrator = None;
+            }
         }
         store.teams.retain(|t| !t.members.is_empty());
         Ok(true)
@@ -519,6 +522,26 @@ mod tests {
         assert_eq!(r["status"], "created");
         let listed = list(&home);
         assert!(listed["teams"][0]["orchestrator"].is_null());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn delete_orchestrator_clears_team_orchestrator() {
+        let home = tmp_home("del_orch_clears");
+        create(
+            &home,
+            &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        remove_member_from_all(&home, "lead");
+        let listed = list(&home);
+        let teams = listed["teams"].as_array().expect("teams");
+        assert_eq!(teams.len(), 1, "team should survive (worker remains)");
+        assert!(
+            teams[0]["orchestrator"].is_null(),
+            "orchestrator must be cleared when removed: got {:?}",
+            teams[0]["orchestrator"]
+        );
+        assert_eq!(teams[0]["members"].as_array().expect("m").len(), 1);
         std::fs::remove_dir_all(&home).ok();
     }
 }
