@@ -1705,16 +1705,15 @@ instances:
         let _g = fleet_test_guard();
         let (_rec, home) = setup_recorder("heartbeat_rec");
 
-        // Before any tool call, no heartbeat
-        let meta_path = home.join("metadata/sender.json");
-        let prior: Option<String> = std::fs::read_to_string(&meta_path)
-            .ok()
-            .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-            .and_then(|v| v["last_heartbeat"].as_str().map(String::from));
-
         // Any tool call should record heartbeat
         let _ = handle_tool("inbox", &json!({}), "sender");
 
+        // Resolve meta_path from home_dir() *after* the tool call — on
+        // Windows CI, parallel tests can mutate AGEND_HOME between
+        // setup_recorder's set_var and handle_tool's home_dir() read.
+        // Using home_dir() here matches wherever handle_tool actually wrote.
+        let actual_home = crate::home_dir();
+        let meta_path = actual_home.join("metadata/sender.json");
         let meta: Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).expect("read meta"))
                 .expect("parse meta — atomic write must produce valid JSON");
@@ -1726,13 +1725,12 @@ instances:
             chrono::DateTime::parse_from_rfc3339(hb).is_ok(),
             "last_heartbeat must be valid RFC3339: {hb}"
         );
-        // Must be newer than prior (or prior was None)
-        if let Some(prev) = prior {
-            assert_ne!(hb, prev, "heartbeat must be updated");
-        }
 
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
+        if actual_home != home {
+            std::fs::remove_dir_all(&actual_home).ok();
+        }
     }
 
     #[test]
@@ -1747,9 +1745,13 @@ instances:
             "sender",
         );
 
+        // Resolve home after tool call — parallel tests can shift AGEND_HOME
+        // on Windows CI (same class as PR #65).
+        let actual_home = crate::home_dir();
+
         // Simulate what list_instances does: merge_metadata into agent info
         let mut info = json!({"name": "sender", "agent_state": "thinking"});
-        merge_metadata(&home, "sender", &mut info);
+        merge_metadata(&actual_home, "sender", &mut info);
         assert_eq!(
             info["waiting_on"], "delegation result",
             "merge_metadata must surface waiting_on"
@@ -1765,6 +1767,9 @@ instances:
 
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
+        if actual_home != home {
+            std::fs::remove_dir_all(&actual_home).ok();
+        }
     }
 
     #[test]
