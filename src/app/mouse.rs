@@ -25,10 +25,6 @@ pub(super) struct MouseState {
     /// reusing it keeps drag math stable even if the terminal is resized
     /// mid-gesture.
     pub border_drag: Option<(SplitBorderHit, Rect)>,
-    /// Active tab drag for reorder. `Some(idx)` = dragging tab at index.
-    pub dragging_tab: Option<usize>,
-    /// Drop target tab index during tab drag.
-    pub tab_drop_target: Option<usize>,
 }
 
 /// Signals from mouse handling back to `run_app`. Fields are `Option` /
@@ -85,8 +81,8 @@ fn handle_down(
                 layout.goto_tab(idx);
                 out.needs_resize = true;
                 // Start tab drag for reorder
-                state.dragging_tab = Some(idx);
-                state.tab_drop_target = None;
+                layout.tab_reorder_source = Some(idx);
+                layout.tab_reorder_target = None;
             }
             Some(TabBarClick::NewTab) => {
                 out.new_overlay = Some(Overlay::NewTabMenu {
@@ -163,9 +159,9 @@ fn handle_drag(mouse: MouseEvent, layout: &mut Layout, state: &mut MouseState) {
         // but resizing the PTY every mouse cell triggers the backend
         // (Claude/etc.) to reflow its entire UI and floods us with redraw
         // data. Defer the single PTY resize to mouse-up.
-    } else if state.dragging_tab.is_some() && mouse.row == 0 {
+    } else if layout.tab_reorder_source.is_some() && mouse.row == 0 {
         // Tab reorder drag: update drop target
-        state.tab_drop_target = match tab_bar_hit_test(layout, mouse.column) {
+        layout.tab_reorder_target = match tab_bar_hit_test(layout, mouse.column) {
             Some(TabBarClick::Tab(idx)) => Some(idx),
             _ => None,
         };
@@ -217,8 +213,8 @@ fn handle_up(
     out: &mut MouseOutcome,
 ) {
     // Tab reorder: complete drag-to-reorder on mouse up
-    if let Some(from) = state.dragging_tab.take() {
-        if let Some(to) = state.tab_drop_target.take() {
+    if let Some(from) = layout.tab_reorder_source.take() {
+        if let Some(to) = layout.tab_reorder_target.take() {
             if from != to && from < layout.tabs.len() && to < layout.tabs.len() {
                 let tab = layout.tabs.remove(from);
                 layout.tabs.insert(to, tab);
@@ -419,7 +415,7 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
                         copy_to_clipboard(&text);
                     }
                 }
-                pane.selection = None;
+                // Keep selection visible — cleared on next mouse down or keypress.
                 true
             }
             _ => false,

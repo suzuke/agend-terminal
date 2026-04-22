@@ -97,11 +97,15 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         let is_active = i == layout.active;
         let is_drag_drop =
             matches!(drag_tab_target, Some(DragTabTarget::ExistingTab(idx)) if idx == i);
+        // Tab reorder: highlight the drop target during tab-to-tab drag
+        let is_reorder_target = layout
+            .tab_reorder_target
+            .is_some_and(|t| t == i && layout.tab_reorder_source.is_some_and(|s| s != i));
         // Show the highest-priority state across all panes in this tab
         let state = highest_priority_state(tab, registry);
         let sc = state_color(state);
 
-        let style = if is_drag_drop {
+        let style = if is_drag_drop || is_reorder_target {
             // Drop-target highlight wins over active styling so the user sees
             // where the pane will land. Magenta matches the intra-tab
             // drag-swap highlight (see is_drag_target below).
@@ -1040,6 +1044,8 @@ pub fn render_help(frame: &mut Frame) {
         "    Ctrl+B T       Task board",
         "",
         "  Other",
+        "    Ctrl+J         Newline (no submit, works everywhere)",
+        "    Shift+Enter    Newline (requires modern terminal)",
         "    Ctrl+B Ctrl+B  Send Ctrl+B to pane",
         "    Ctrl+B ~       Scratch shell (Esc to close)",
         "    Ctrl+B d       Detach (exit)",
