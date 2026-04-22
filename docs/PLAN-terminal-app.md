@@ -1,5 +1,7 @@
 # AgEnD Terminal — Terminal Emulator 實作計劃
 
+> **Status: SHIPPED** — all phases landed on `main`. Doc retained for historical/provenance.
+
 > Status: **DONE** — all phases shipped to `main`. Kept as historical / design reference.
 > For the post-merge review and follow-up punch list, see `docs/REVIEW-auto-pane.md`.
 >

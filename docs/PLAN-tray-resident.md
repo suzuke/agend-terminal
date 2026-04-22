@@ -1,6 +1,8 @@
 # Plan: tray-resident (menu-bar icon + autostart)
 
-Status: not started (2026-04-21).
+> **Status: SHIPPED** — tray implementation on `main` (commits `ea7f036`, `fe51bcb`, `306010e`, `d75b95c`, `c3acb7f`, `23b40f8`). Doc retained for historical/provenance.
+
+Status: SHIPPED on `main` (commits `ea7f036`, `fe51bcb`, `306010e`, `d75b95c`, `c3acb7f`, `23b40f8`; earlier header incorrectly said "not started").
 Prereq: `docs/PLAN-daemon-resident.md` §3.4 — Attached app opens one
 `PaneSource::Remote` per agent. That is what makes tray "Open App" work
 against a live daemon.

@@ -1,5 +1,7 @@
 # Handover — Windows ConPTY nested spawn silent hang
 
+> **Status: SHIPPED** — implementation landed on `main` (Session 4, 2026-04-19). Doc retained for historical/provenance.
+
 **Status**: **resolved (Session 4, 2026-04-19)**. The symptom was real, but the root causes were agend-side, not an OS/ConPTY regression. Two fixes landed on `main`:
 - `src/vterm.rs` — replace `NoopListener` with `PtyWriteListener` so the DSR-CPR `\x1b[6n` reply that ConPTY blocks on actually reaches the child.
 - `src/daemon.rs` — call `SetConsoleCtrlHandler(None, 0)` before `ctrlc::set_handler` so the daemon doesn't inherit an ignore-CTRL+C flag.

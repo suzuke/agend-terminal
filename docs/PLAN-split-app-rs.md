@@ -1,5 +1,7 @@
 # Plan: decompose src/app.rs and backfill layout.rs / state.rs tests
 
+> **Status: SHIPPED** — landed on `main` (commits `726562e`, `88a0d74`, 2026-04-18). Doc retained for historical/provenance.
+
 > **Status: DONE 2026-04-18** — landed on `main` via commits `726562e` (PRs 1-4 + layout tests) and `88a0d74` (PRs 5-9). All 9 planned submodules exist under `src/app/` (mod.rs + session.rs + commands.rs + dispatch.rs + mouse.rs + overlay.rs + pane_factory.rs + telegram_hooks.rs + tui_events.rs + api_server.rs); `src/app/mod.rs` is ~700 LOC (down from 2,552). Kept below as historical design record.
 
 Worktree: `/Users/suzuke/Documents/Hack/agend-refactor-split-app`

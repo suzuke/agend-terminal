@@ -1,5 +1,7 @@
 # Follow-up: Telegram routing efficiency + type safety — RESOLVED
 
+> **Status: SHIPPED** — implementation landed on `main` (branch `feature/telegram-efficiency-followups`, 2026-04-20). Doc retained for historical/provenance.
+
 Status: **all three items closed 2026-04-20** on branch
 `feature/telegram-efficiency-followups`.
 

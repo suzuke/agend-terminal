@@ -1,5 +1,7 @@
 # Plan: daemon-resident bootstrap (tmux-style)
 
+> **Status: SHIPPED** — Stages 1/2/3 + hot-reload Phase A/B/C/D all landed on `main`. Doc retained for historical/provenance.
+
 Status: Stages 1 & 2 shipped on main (commits `8a1107e..ece0933`, 2026-04-20,
 pushed). Stage 3 complete through §3.6 — see §3.
 

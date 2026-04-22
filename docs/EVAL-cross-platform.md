@@ -1,5 +1,7 @@
 # Cross-Platform Compatibility Evaluation
 
+> **Status update (2026-04-22):** Windows Phase A/B/C all shipped on `main`; IPC blocker in §2.1 resolved. Sections below are kept as the original evaluation-time snapshot — see `PLAN-windows-support.md` and `HANDOVER-windows-conpty-nested.md` for the current state.
+
 > Date: 2026-04-17 (rev. — reflects current Cargo.toml and src/ tree)
 > Status: Unix-only (macOS + Linux) at runtime. Compiles on Windows for everything except IPC (UDS) — that remaining blocker is tracked in `PLAN-windows-support.md`.
 

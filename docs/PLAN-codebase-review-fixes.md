@@ -1,5 +1,7 @@
 # Codebase Review Fix Plan — COMPLETE
 
+> **Status: SHIPPED** — all 8 stages merged + pushed to `origin/main` (2026-04-21). Doc retained for historical/provenance.
+
 **Date:** 2026-04-21
 **Completed:** 2026-04-21
 **Scope:** Full codebase review → 17 findings, 11 actionable items across 3 phases
