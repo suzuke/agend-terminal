@@ -259,9 +259,6 @@ enum Commands {
     /// Health check
     Doctor,
     /// Menu-bar / system-tray resident app (requires `--features tray`).
-    ///
-    /// Scaffold only in this build — real event loop lands with
-    /// `docs/archived/PLAN-tray-resident.md` task #4.
     #[cfg(feature = "tray")]
     Tray,
     /// Interactive demo — experience multi-agent orchestration in 30 seconds
