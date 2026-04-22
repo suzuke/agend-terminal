@@ -61,6 +61,9 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
         std::io::stdout(),
         crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        ),
     )
     .ok();
 
@@ -72,6 +75,7 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
+        crossterm::event::PopKeyboardEnhancementFlags,
     )
     .ok();
     result

@@ -15,6 +15,11 @@ use std::path::Path;
 struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags,
+        )
+        .ok();
         terminal::disable_raw_mode().ok();
     }
 }
@@ -25,6 +30,13 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
     let mut bridge = BridgeClient::connect(home, name, cols, rows)?;
 
     terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        ),
+    )
+    .ok();
     let _guard = RawModeGuard;
 
     let reader = bridge
@@ -127,7 +139,9 @@ pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
             let mut b = [0u8; 4];
             c.encode_utf8(&mut b).as_bytes().to_vec()
         }
-        KeyCode::Enter if modifiers.contains(KeyModifiers::SHIFT) => vec![b'\n'],
+        KeyCode::Enter if modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            vec![b'\n']
+        }
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],
