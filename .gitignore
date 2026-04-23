@@ -25,3 +25,4 @@ claude-settings.json
 statusline.json
 statusline.sh
 mcp-config.json
+*.json.lock
