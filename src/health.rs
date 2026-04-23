@@ -303,6 +303,7 @@ impl HealthTracker {
         self.crash_times.clear();
         self.total_crashes = 0;
         self.error_events.clear();
+        self.current_reason = None;
     }
 }
 
