@@ -123,6 +123,12 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
 pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let alt = modifiers.contains(KeyModifiers::ALT);
+    // SUPER (Cmd on macOS) keys are OS-level shortcuts, never forwarded to
+    // the child process. Cmd+C is handled separately in dispatch for
+    // clipboard copy; all other SUPER combos are silently swallowed.
+    if modifiers.contains(KeyModifiers::SUPER) {
+        return vec![];
+    }
     match code {
         KeyCode::Char(c) if ctrl => {
             vec![(c.to_ascii_lowercase() as u8)
@@ -172,5 +178,36 @@ pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
             _ => vec![],
         },
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn super_modifier_does_not_forward_to_pty() {
+        // Any SUPER+key must return empty bytes (not forwarded to PTY).
+        for c in ['c', 'v', 'a', 'x', 'z', 'f'] {
+            let bytes = key_to_bytes(KeyCode::Char(c), KeyModifiers::SUPER);
+            assert!(
+                bytes.is_empty(),
+                "SUPER+{c} must not produce PTY bytes, got {bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_still_sends_sigint_0x03() {
+        // Ctrl+C must still produce 0x03 (SIGINT) — not swallowed by SUPER guard.
+        let bytes = key_to_bytes(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(bytes, vec![0x03], "Ctrl+C must send 0x03");
+    }
+
+    #[test]
+    fn plain_char_forwards_normally() {
+        let bytes = key_to_bytes(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(bytes, vec![b'c']);
     }
 }
