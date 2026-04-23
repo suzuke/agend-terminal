@@ -848,9 +848,19 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             let interval = args["interval_secs"].as_u64().unwrap_or(60);
             let ci_dir = home.join("ci-watches");
             std::fs::create_dir_all(&ci_dir).ok();
+            // `last_polled_at: null` signals "never polled" to
+            // check_ci_watches, which fires on the next daemon tick
+            // (≤10 s) instead of waiting `interval_secs`. Throttle state
+            // lives in the schema, not on the filesystem — this is the
+            // elegant replacement for PR #119's mtime-backdate kludge.
             let watch = json!({
-                "repo": repo, "branch": branch, "interval_secs": interval,
-                "instance": instance_name, "last_run_id": null, "head_sha": null
+                "repo": repo,
+                "branch": branch,
+                "interval_secs": interval,
+                "instance": instance_name,
+                "last_run_id": null,
+                "head_sha": null,
+                "last_polled_at": null,
             });
             let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
             let watch_path = ci_dir.join(&filename);
@@ -858,18 +868,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 &watch_path,
                 serde_json::to_string_pretty(&watch).unwrap_or_default(),
             );
-            // Backdate the mtime past the throttle window so the next
-            // daemon tick (≤10 s later) actually polls GitHub, instead of
-            // waiting the full `interval_secs` before the first check —
-            // the lag the operator observed with PR #115's watch, where
-            // the ci-pass notification didn't arrive until long after CI
-            // had finished. The +1 buys a margin over clock-skew between
-            // the write call and the subsequent `elapsed()` read.
-            let backdate =
-                std::time::SystemTime::now() - std::time::Duration::from_secs(interval + 1);
-            if let Ok(f) = std::fs::File::options().write(true).open(&watch_path) {
-                let _ = f.set_modified(backdate);
-            }
             json!({"repo": repo, "watching": true})
         }
         "unwatch_ci" => {
