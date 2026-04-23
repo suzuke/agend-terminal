@@ -29,12 +29,7 @@ pub fn run_watchdog_pass(
         None => return,
     };
     if dry_run {
-        crate::event_log::log(
-            home,
-            "watchdog_dry_run",
-            agent_name,
-            &format!("{reason:?}"),
-        );
+        crate::event_log::log(home, "watchdog_dry_run", agent_name, &format!("{reason:?}"));
     } else {
         health.set_blocked_reason(reason);
     }
@@ -83,9 +78,15 @@ mod tests {
             "dry-run must not set current_reason"
         );
         let log = read_event_log(&home);
-        assert!(log.contains("watchdog_dry_run"), "must log dry-run entry, got: {log}");
+        assert!(
+            log.contains("watchdog_dry_run"),
+            "must log dry-run entry, got: {log}"
+        );
         assert!(log.contains("RateLimit"), "must log reason, got: {log}");
-        assert!(log.contains("test-agent"), "must log agent name, got: {log}");
+        assert!(
+            log.contains("test-agent"),
+            "must log agent name, got: {log}"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -139,7 +140,10 @@ mod tests {
             "healthy output must not set reason"
         );
         let log = read_event_log(&home);
-        assert!(!log.contains("watchdog"), "healthy output must not write watchdog log");
+        assert!(
+            !log.contains("watchdog"),
+            "healthy output must not write watchdog log"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
