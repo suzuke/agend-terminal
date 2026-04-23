@@ -755,3 +755,52 @@ fn replace_instance_preserves_team_membership() {
     assert_eq!(members, vec!["alice"]);
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Regression pin: watch_ci must backdate the file mtime past the
+/// caller's `interval_secs` so the next daemon tick actually polls
+/// GitHub, instead of waiting ~interval_secs before the first check.
+/// Before this fix the mtime-based throttle in check_ci_watches saw a
+/// freshly-created watch (mtime = now) and skipped it until the
+/// interval fully elapsed — visible as PR #115's ci-pass notification
+/// arriving long after the run had actually finished.
+#[test]
+fn watch_ci_backdates_mtime_past_interval_for_prompt_first_poll() {
+    let home = temp_home("watch-ci-backdate");
+    let resp = call_tool(
+        &home,
+        "watch_ci",
+        &json!({
+            "repo": "owner/repo",
+            "branch": "main",
+            "interval_secs": 60
+        }),
+    );
+    assert_eq!(resp["watching"], true, "watch_ci must succeed: {resp:?}");
+
+    // Find the watch file — the handler writes under a hashed filename
+    // via ci_watch::watch_filename, so we enumerate rather than guess.
+    let entries: Vec<_> = std::fs::read_dir(home.join("ci-watches"))
+        .expect("ci-watches dir must exist")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected exactly one watch file, got {entries:?}"
+    );
+    let watch_path = entries[0].path();
+
+    let metadata = std::fs::metadata(&watch_path).expect("watch file metadata");
+    let elapsed = metadata
+        .modified()
+        .expect("mtime")
+        .elapsed()
+        .expect("mtime must be in the past (post-backdate)");
+    assert!(
+        elapsed.as_secs() > 60,
+        "mtime must be backdated past the 60s interval so the next tick polls \
+         immediately, elapsed={:?}",
+        elapsed
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
