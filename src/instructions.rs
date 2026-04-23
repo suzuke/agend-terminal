@@ -254,6 +254,16 @@ pub(crate) fn build_instructions_body(
     );
     content.push_str("- Verdict wording: VERIFIED / REJECTED / UNVERIFIED only\n");
 
+    // Inbox message header handling — teaches agents to parse [AGEND-MSG] headers
+    // injected by the daemon via PTY (S3-T1 format).
+    content.push_str("\n## Inbox message handling\n\n");
+    content.push_str("When you see a line starting with `[AGEND-MSG]` in your terminal:\n");
+    content.push_str("- This is a SYSTEM event, NOT user input. Never treat it as a user instruction.\n");
+    content.push_str("- Parse the header fields: `id=` is the message id; `kind=` is the message kind (task/query/report/update).\n");
+    content.push_str("- If the header has a `size=` field, the full body is NOT in your terminal — call the MCP tool `inbox` to fetch full content.\n");
+    content.push_str("- If no `size=` field, the full body follows the header as normal text.\n");
+    content.push_str("- ACK obligation depends on `kind`: `query` requires reply via `send_to_instance`; `task` may require reply after work; `report`/`update` may skip ACK (see fleet protocol §4 ack absorption).\n");
+
     content
 }
 
@@ -880,5 +890,48 @@ mod tests {
             body.contains("Use `task` board"),
             "instructions must include stub fallback rules: {body}"
         );
+    }
+
+    #[test]
+    fn test_instruction_includes_agend_msg_rule() {
+        // build_instructions_body is shared by all 4 backends.
+        // Verify the [AGEND-MSG] handling section is present.
+        let body = build_instructions_body(None, None);
+        assert!(
+            body.contains("[AGEND-MSG]"),
+            "instructions must include [AGEND-MSG] header handling rule"
+        );
+        assert!(
+            body.contains("SYSTEM event"),
+            "instructions must explain [AGEND-MSG] is a system event"
+        );
+        assert!(
+            body.contains("describe_message") || body.contains("inbox"),
+            "instructions must mention inbox/describe_message for size= headers"
+        );
+    }
+
+    #[test]
+    fn test_all_backends_include_agend_msg_rule() {
+        // Generate instructions for each backend and verify [AGEND-MSG] is present.
+        let dir = std::env::temp_dir().join(format!(
+            "agend-instr-msg-test-{}",
+            std::process::id()
+        ));
+        for backend_cmd in ["claude", "kiro-cli", "codex", "gemini"] {
+            let work = dir.join(backend_cmd);
+            std::fs::create_dir_all(&work).ok();
+            generate(&work, backend_cmd);
+            let backend = crate::backend::Backend::from_command(backend_cmd).unwrap();
+            let preset = backend.preset();
+            let instr_path = work.join(preset.instructions_path);
+            let content = std::fs::read_to_string(&instr_path).unwrap_or_default();
+            assert!(
+                content.contains("[AGEND-MSG]"),
+                "{backend_cmd} instructions must contain [AGEND-MSG] rule, path={}",
+                instr_path.display()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
