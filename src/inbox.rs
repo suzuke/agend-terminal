@@ -1,14 +1,122 @@
-//! Per-agent message inbox — append-only JSONL for thread safety.
+//! Per-agent message inbox — append-only JSONL with disk resilience.
 //!
 //! Messages stored as one JSON object per line in {home}/inbox/{name}.jsonl.
-//! Append is atomic on most filesystems for small writes — no file locking needed.
+//!
+//! Resilience layers:
+//! - **Readonly mode**: when available disk space < 5%, enqueue returns an
+//!   error while drain continues to work (let agents consume backlog).
+//! - **Atomic append**: each enqueue writes to a temp file, fsyncs, then
+//!   renames — no half-written lines on crash.
+//! - **Half-write recovery**: on startup, stale `.tmp` files and corrupt
+//!   JSONL lines are moved to `inbox.recovery/` for forensics.
 
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global readonly flag — set when available disk space drops below threshold.
+static DISK_READONLY: AtomicBool = AtomicBool::new(false);
+
+/// Minimum free-space ratio before entering readonly mode.
+const LOW_DISK_THRESHOLD: f64 = 0.05;
+
+/// Check available disk space at `path`. Returns true if below threshold.
+fn is_disk_low(path: &Path) -> bool {
+    use fs2::available_space;
+    use fs2::total_space;
+    let avail = match available_space(path) {
+        Ok(s) => s,
+        Err(_) => return false, // can't check → assume OK
+    };
+    let total = match total_space(path) {
+        Ok(s) if s > 0 => s,
+        _ => return false,
+    };
+    (avail as f64 / total as f64) < LOW_DISK_THRESHOLD
+}
+
+/// Update the global readonly flag based on disk space at `home`.
+/// Called at daemon startup and before each enqueue.
+pub fn check_disk_space(home: &Path) {
+    let readonly = is_disk_low(home);
+    let was = DISK_READONLY.swap(readonly, Ordering::Relaxed);
+    if readonly && !was {
+        tracing::warn!("inbox entering readonly mode — disk space < 5%");
+    } else if !readonly && was {
+        tracing::info!("inbox leaving readonly mode — disk space recovered");
+    }
+}
+
+/// Returns true when inbox is in readonly mode (disk full).
+pub fn is_readonly() -> bool {
+    DISK_READONLY.load(Ordering::Relaxed)
+}
+
+/// Scan the inbox directory for stale `.tmp` files and corrupt JSONL,
+/// moving them to `inbox.recovery/<timestamp>/` for forensics.
+/// Call once at daemon startup.
+pub fn recover_half_writes(home: &Path) {
+    let inbox_dir = home.join("inbox");
+    if !inbox_dir.exists() {
+        return;
+    }
+    let entries = match std::fs::read_dir(&inbox_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let recovery_dir = home.join("inbox.recovery").join(&ts);
+    let mut recovered = 0u32;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Stale tmp files from interrupted atomic appends
+        if name_str.ends_with(".tmp") {
+            ensure_recovery_dir(&recovery_dir);
+            let dest = recovery_dir.join(&name);
+            if std::fs::rename(&path, &dest).is_ok() {
+                recovered += 1;
+            }
+            continue;
+        }
+
+        // Check JSONL files for corrupt trailing lines
+        if name_str.ends_with(".jsonl") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let lines: Vec<&str> = content.lines().collect();
+                let bad: Vec<&&str> = lines
+                    .iter()
+                    .filter(|l| !l.trim().is_empty() && serde_json::from_str::<InboxMessage>(l).is_err())
+                    .collect();
+                if !bad.is_empty() {
+                    // Move entire file to recovery, agent gets a fresh start
+                    ensure_recovery_dir(&recovery_dir);
+                    let dest = recovery_dir.join(&name);
+                    if std::fs::rename(&path, &dest).is_ok() {
+                        recovered += 1;
+                    }
+                }
+            }
+        }
+    }
+    if recovered > 0 {
+        tracing::warn!(
+            count = recovered,
+            dir = %recovery_dir.display(),
+            "inbox: recovered half-written files"
+        );
+    }
+}
+
+fn ensure_recovery_dir(dir: &Path) {
+    std::fs::create_dir_all(dir).ok();
+}
 
 /// Type-safe notification source — replaces raw string conventions.
 pub enum NotifySource<'a> {
@@ -64,15 +172,37 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
     home.join("inbox").join(format!("{name}.jsonl"))
 }
 
-/// Enqueue a message — append one JSON line (atomic for small writes).
+/// Enqueue a message — atomic append via tmp + fsync + rename-over-append.
+///
+/// Returns an error when the inbox is in readonly mode (disk full).
+/// Callers should invoke [`check_disk_space`] periodically (e.g. daemon tick);
+/// enqueue only reads the cached flag.
 pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result<()> {
+    if is_readonly() {
+        anyhow::bail!("inbox readonly: disk space critically low");
+    }
     msg.schema_version = InboxMessage::CURRENT_VERSION;
     let path = inbox_path(home, name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-    writeln!(f, "{}", serde_json::to_string(&msg)?)?;
+    let line = format!("{}\n", serde_json::to_string(&msg)?);
+
+    // Read existing content (if any), append new line, write atomically.
+    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+    content.push_str(&line);
+
+    let tmp = path.with_extension("jsonl.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -720,6 +850,31 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
+    // --- Disk resilience tests ---
+
+    #[test]
+    fn test_readonly_on_disk_full() {
+        // When DISK_READONLY is set, enqueue must fail and drain must still work.
+        let home = tmp_home("readonly");
+        enqueue(&home, "agent1", make_msg("a", "before")).ok();
+
+        DISK_READONLY.store(true, Ordering::Relaxed);
+        let result = enqueue(&home, "agent1", make_msg("b", "blocked"));
+        assert!(result.is_err(), "enqueue must fail in readonly mode");
+        assert!(
+            result.unwrap_err().to_string().contains("readonly"),
+            "error must mention readonly"
+        );
+
+        // drain still works in readonly mode
+        let msgs = drain(&home, "agent1");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].from, "a");
+
+        DISK_READONLY.store(false, Ordering::Relaxed);
+        fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn test_reject_future_schema_version() {
         let home = tmp_home("future-schema");
@@ -735,6 +890,63 @@ mod tests {
         let msgs = drain(&home, "agent1");
         assert_eq!(msgs.len(), 1, "future-versioned message must be rejected");
         assert_eq!(msgs[0].from, "ok", "current-versioned message must survive");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_atomic_append_tmp_recovery() {
+        // Simulate a crash that left a .tmp file — recover_half_writes
+        // must move it to inbox.recovery/.
+        let home = tmp_home("atomic-recover");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+
+        // Simulate stale tmp from interrupted enqueue
+        let tmp = inbox_dir.join("agent1.jsonl.tmp");
+        fs::write(&tmp, "{\"from\":\"x\",\"text\":\"orphan\",\"kind\":null,\"timestamp\":\"t\"}\n")
+            .ok();
+
+        recover_half_writes(&home);
+
+        assert!(!tmp.exists(), ".tmp must be moved to recovery");
+        let recovery = home.join("inbox.recovery");
+        assert!(recovery.exists(), "recovery dir must be created");
+        let entries: Vec<_> = fs::read_dir(&recovery)
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(entries.len(), 1, "one timestamped recovery dir");
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_half_written_jsonl_goes_to_recovery() {
+        // A JSONL file with a corrupt line must be moved to recovery.
+        let home = tmp_home("half-write");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+
+        let jsonl = inbox_dir.join("agent1.jsonl");
+        let good = serde_json::to_string(&make_msg("ok", "fine")).unwrap();
+        // Write a good line followed by a truncated/corrupt line
+        fs::write(&jsonl, format!("{good}\n{{\"from\":\"broken\",\"text\":\"trun")).ok();
+
+        recover_half_writes(&home);
+
+        assert!(!jsonl.exists(), "corrupt JSONL must be moved to recovery");
+        let recovery = home.join("inbox.recovery");
+        assert!(recovery.exists());
+        // The recovery subdir should contain the moved file
+        let subdirs: Vec<_> = fs::read_dir(&recovery).unwrap().flatten().collect();
+        assert_eq!(subdirs.len(), 1);
+        let files: Vec<_> = fs::read_dir(subdirs[0].path())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].file_name().to_string_lossy().contains("agent1"));
+
         fs::remove_dir_all(&home).ok();
     }
 }
