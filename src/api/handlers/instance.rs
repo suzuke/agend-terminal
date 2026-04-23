@@ -326,12 +326,14 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
     match reg.get(name) {
         Some(handle) => {
             if let Ok(mut core) = handle.core.lock() {
-                let was = core.health.current_reason.as_ref().map(|r| {
-                    serde_json::to_value(r).unwrap_or_default()
-                });
+                let was = core
+                    .health
+                    .current_reason
+                    .as_ref()
+                    .map(|r| serde_json::to_value(r).unwrap_or_default());
                 // If a reason filter is specified, only clear if it matches
                 if let Some(filter) = filter_reason {
-                    let matches = core.health.current_reason.as_ref().map_or(false, |r| {
+                    let matches = core.health.current_reason.as_ref().is_some_and(|r| {
                         let kind = match r {
                             crate::health::BlockedReason::RateLimit { .. } => "rate_limit",
                             crate::health::BlockedReason::QuotaExceeded => "quota_exceeded",
@@ -365,9 +367,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn test_ctx_with_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
-        let home = Box::new(
-            std::env::temp_dir().join(format!("agend-api-inst-test-{}-{}", name, std::process::id())),
-        );
+        let home = Box::new(std::env::temp_dir().join(format!(
+            "agend-api-inst-test-{}-{}",
+            name,
+            std::process::id()
+        )));
         std::fs::create_dir_all(home.as_ref()).ok();
 
         // Leak the registries so they live for 'static — acceptable in tests.
@@ -456,10 +460,7 @@ mod tests {
         assert_eq!(set_result["ok"], true);
 
         // Clear it
-        let clear_result = handle_clear_blocked_reason(
-            &json!({"name": "health-clear"}),
-            &ctx,
-        );
+        let clear_result = handle_clear_blocked_reason(&json!({"name": "health-clear"}), &ctx);
         assert_eq!(clear_result["ok"], true);
         assert_eq!(clear_result["status"], "cleared");
         assert_eq!(clear_result["instance"], "health-clear");
