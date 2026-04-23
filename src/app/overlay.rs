@@ -39,6 +39,7 @@ pub enum TaskBoardMode {
         choices: Vec<(String, String)>,
         selected: usize,
     },
+    Help,
 }
 
 pub(super) enum Overlay {
@@ -588,6 +589,12 @@ pub(super) fn handle_key(
                     }
                     _ => {}
                 },
+                TaskBoardMode::Help => match key.code {
+                    KeyCode::Esc | KeyCode::Char('?') => {
+                        *mode = TaskBoardMode::Board;
+                    }
+                    _ => {}
+                },
                 TaskBoardMode::Board => {
                     let columns = crate::render::task_board_columns(items);
                     match key.code {
@@ -729,6 +736,9 @@ pub(super) fn handle_key(
                                 }
                             }
                         }
+                        KeyCode::Char('?') => {
+                            *mode = TaskBoardMode::Help;
+                        }
                         KeyCode::Esc | KeyCode::Char('q') => {
                             *overlay = Overlay::None;
                         }
@@ -758,4 +768,114 @@ pub(super) fn handle_key(
         Overlay::None => {}
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn task_overlay() -> Overlay {
+        Overlay::Tasks {
+            items: Vec::new(),
+            col: 0,
+            row: 0,
+            mode: TaskBoardMode::Board,
+        }
+    }
+
+    fn get_mode(overlay: &Overlay) -> &TaskBoardMode {
+        match overlay {
+            Overlay::Tasks { mode, .. } => mode,
+            _ => panic!("expected Tasks overlay"),
+        }
+    }
+
+    #[test]
+    fn task_board_question_mark_shows_help() {
+        let home = std::env::temp_dir().join("overlay_test_help_show");
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+        let mut layout = crate::layout::Layout::new();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &tx,
+            name_counter: &mut name_counter,
+            telegram_state: &tg,
+        };
+        let mut overlay = task_overlay();
+        handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
+        assert!(matches!(get_mode(&overlay), TaskBoardMode::Help));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_board_help_esc_returns_to_board() {
+        let home = std::env::temp_dir().join("overlay_test_help_esc");
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+        let mut layout = crate::layout::Layout::new();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &tx,
+            name_counter: &mut name_counter,
+            telegram_state: &tg,
+        };
+        let mut overlay = Overlay::Tasks {
+            items: Vec::new(),
+            col: 0,
+            row: 0,
+            mode: TaskBoardMode::Help,
+        };
+        handle_key(&mut overlay, press(KeyCode::Esc), &mut ctx);
+        assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_board_help_question_mark_toggles() {
+        let home = std::env::temp_dir().join("overlay_test_help_toggle");
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+        let mut layout = crate::layout::Layout::new();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &tx,
+            name_counter: &mut name_counter,
+            telegram_state: &tg,
+        };
+        let mut overlay = Overlay::Tasks {
+            items: Vec::new(),
+            col: 0,
+            row: 0,
+            mode: TaskBoardMode::Help,
+        };
+        handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
+        assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
