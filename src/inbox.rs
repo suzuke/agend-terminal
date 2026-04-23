@@ -163,12 +163,42 @@ pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, te
 
 /// Compose-aware notification delivery: checks `is_composing` and enqueues
 /// if the target agent is mid-typing, otherwise injects directly via the API.
-/// Used by both `notify_agent` (Telegram/system path) and `handle_send`
-/// (agent-to-agent MCP path) to ensure a single source of truth.
+/// Used by `notify_agent` (Telegram/system path) for passive notifications
+/// that should NOT auto-submit (raw write, no submit_key).
 pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     let _ = route_notification(home, agent_name, notification, |msg| {
         inject_notification(home, agent_name, msg)
     });
+}
+
+/// Compose-aware message delivery with auto-submit: checks `is_composing`
+/// and enqueues if mid-typing, otherwise injects via `inject_to_agent` which
+/// appends `submit_key`. Used by `handle_send` (agent-to-agent MCP path)
+/// for explicit messages that must be submitted to the target's CLI.
+pub fn compose_aware_send(home: &Path, agent_name: &str, message: &str) {
+    let _ = route_notification(home, agent_name, message, |msg| {
+        inject_with_submit(home, agent_name, msg)
+    });
+}
+
+fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::Result<()> {
+    let resp = crate::api::call(
+        home,
+        &serde_json::json!({
+            "method": crate::api::method::INJECT,
+            "params": {"name": agent_name, "data": message}
+        }),
+    )?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{}",
+            resp["error"]
+                .as_str()
+                .unwrap_or("inject with submit failed")
+        );
+    }
 }
 
 pub fn inject_notification(

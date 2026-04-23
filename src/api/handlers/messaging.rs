@@ -56,7 +56,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     let reg = agent::lock_registry(ctx.registry);
     if reg.contains_key(target) {
         drop(reg);
-        crate::inbox::compose_aware_inject(ctx.home, target, &inject_msg);
+        crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
     }
     json!({"ok": true})
 }
