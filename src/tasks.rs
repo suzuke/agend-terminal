@@ -566,7 +566,11 @@ mod tests {
             })
             .collect();
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
-        assert_eq!(unique.len(), 20, "all 20 task IDs must be unique, got: {ids:?}");
+        assert_eq!(
+            unique.len(),
+            20,
+            "all 20 task IDs must be unique, got: {ids:?}"
+        );
         let tasks = list_all(&home);
         assert_eq!(tasks.len(), 20);
         std::fs::remove_dir_all(&home).ok();
