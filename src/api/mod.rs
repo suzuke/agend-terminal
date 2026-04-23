@@ -379,6 +379,9 @@ fn spawn_one(
     size: (u16, u16),
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(work_dir).ok();
+    let preset_submit_key = crate::backend::Backend::from_command(backend)
+        .map(|b| b.preset().submit_key)
+        .unwrap_or("\r");
     agent::spawn_agent(
         &agent::SpawnConfig {
             name,
@@ -389,7 +392,7 @@ fn spawn_one(
             rows: size.1,
             env: None,
             working_dir: Some(work_dir),
-            submit_key: "\r",
+            submit_key: preset_submit_key,
             home: Some(home),
             crash_tx: None,
             shutdown: None,
@@ -1638,5 +1641,37 @@ mod tests {
         };
         assert_eq!(*split_dir, PaneMoveSplitDir::Vertical);
         stop_server(&shutdown, &home);
+    }
+
+    // -----------------------------------------------------------------------
+    // spawn_one preset resolution — regression pin for gemini submit_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn spawn_one_resolves_preset_submit_key() {
+        // Verify that Backend::from_command returns the correct preset
+        // submit_key for each known backend. spawn_one uses this to avoid
+        // hardcoding "\r" (which broke gemini's "\n\r" requirement).
+        use crate::backend::Backend;
+        let cases = [
+            ("claude", "\r"),
+            ("kiro-cli", "\r"),
+            ("codex", "\r"),
+            ("gemini", "\n\r"),
+        ];
+        for (cmd, expected) in cases {
+            let key = Backend::from_command(cmd)
+                .map(|b| b.preset().submit_key)
+                .unwrap_or("\r");
+            assert_eq!(
+                key, expected,
+                "backend '{cmd}' should have submit_key {expected:?}, got {key:?}"
+            );
+        }
+        // Unknown backend falls back to "\r"
+        let unknown = Backend::from_command("unknown-backend")
+            .map(|b| b.preset().submit_key)
+            .unwrap_or("\r");
+        assert_eq!(unknown, "\r");
     }
 }
