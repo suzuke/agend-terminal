@@ -95,13 +95,13 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         None => return serde_json::json!({"error": "Template has no instances"}),
     };
 
-    let mut created = Vec::new();
-    // Buffered fleet.yaml entries — written in one `add_instances_to_yaml`
-    // call after the loop so we take the fleet lock once, not N times.
-    // Persisting these is what lets `pane_factory::create_pane_from_resolved`
-    // find the instance in fleet.yaml and emit a full Identity + Role + Peers
-    // block into the backend's agend.md; without it, template-deployed agents
-    // boot with a nameless/roleless instructions file.
+    // Phase 1 — validate every template entry, compute worktrees, and
+    // collect the fleet.yaml records. No SPAWN happens here: handle_spawn
+    // reads fleet.yaml to build the AgentContext (name + role + peers),
+    // which means every instance's entry must exist before any member
+    // spawns, otherwise early spawns would see a stale peer list and ship
+    // an incomplete Identity block into the backend's agend.md.
+    let mut created: Vec<String> = Vec::new();
     let mut yaml_entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = Vec::new();
     let dir = std::path::PathBuf::from(directory);
 
@@ -149,7 +149,6 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             .filter(|s| !s.is_empty())
             .map(String::from);
 
-        // Create worktree if branch specified
         let work_dir = if let Some(br) = branch {
             let wt = dir.join(&inst_name);
             let branch_name = format!("{deploy_name}/{inst_suffix}");
@@ -180,18 +179,6 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             directory.to_string()
         };
 
-        // Spawn via API
-        let _ = crate::api::call(
-            home,
-            &serde_json::json!({
-                "method": crate::api::method::SPAWN,
-                "params": {
-                    "name": inst_name,
-                    "backend": command,
-                    "working_directory": work_dir,
-                }
-            }),
-        );
         yaml_entries.push((
             inst_name.clone(),
             crate::fleet::InstanceYamlEntry {
@@ -203,9 +190,10 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         created.push(inst_name);
     }
 
-    // Persist to fleet.yaml. Keep this outside the loop so the fleet lock is
-    // taken once. Symmetrical with the cleanup in `teardown` — if we left
-    // entries after teardown, daemon restart would auto-spawn ghost instances.
+    // Phase 2 — persist to fleet.yaml. Must happen before any SPAWN so
+    // handle_spawn can read this instance's role and the full peer list
+    // when building the AgentContext for its agend.md. Single lock take
+    // for the whole batch.
     if !yaml_entries.is_empty() {
         let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> = yaml_entries
             .iter()
@@ -216,17 +204,41 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         }
     }
 
-    // Create team if multiple instances. The template may nominate an
-    // orchestrator by instance *suffix* (e.g. `orchestrator: lead` for a
-    // member called `dev-lead`) — deploy rewrites it to the fully prefixed
-    // name before handing off. Silently drop the field when the suffix is
-    // unknown or its instance failed to spawn; a warn log lets operators
-    // catch the typo without aborting the whole deployment.
+    // Phase 3 — SPAWN each instance. handle_spawn now reads fleet.yaml,
+    // writes a full Identity/Role/Peers agend.md (or GEMINI.md for gemini),
+    // then spawns the child so the backend's --append-system-prompt-file
+    // flag resolves to an existing file.
+    for (inst_name, entry) in &yaml_entries {
+        let backend_name = entry.backend.as_deref().unwrap_or("claude");
+        let work_dir = entry.working_directory.as_deref().unwrap_or(directory);
+        let _ = crate::api::call(
+            home,
+            &serde_json::json!({
+                "method": crate::api::method::SPAWN,
+                "params": {
+                    "name": inst_name,
+                    "backend": backend_name,
+                    "working_directory": work_dir,
+                }
+            }),
+        );
+    }
+
+    // Phase 4 — create the team. Route through the CREATE_TEAM API (not a
+    // direct teams::create call) so the handler emits the TeamCreated event
+    // and the TUI moves all member panes into a single tab, matching the
+    // behavior of `create_instance(team:...)`. Passing empty backends/count
+    // tells handle_create_team to skip its own spawn phase — our members
+    // already exist from Phase 3.
+    //
+    // Orchestrator can be nominated by *suffix* (`orchestrator: lead` →
+    // `dev-lead`). Unknown or unspawned suffixes get dropped with a warn,
+    // leaving the team orchestrator-less rather than failing deploy.
     if created.len() > 1 {
         let mut team_args = serde_json::json!({
             "name": deploy_name,
-            "members": created,
-            "description": format!("Template deployment: {template}")
+            "members": &created,
+            "description": format!("Template deployment: {template}"),
         });
         if let Some(suffix) = template_def.get("orchestrator").and_then(|v| v.as_str()) {
             let full = format!("{deploy_name}-{suffix}");
@@ -240,7 +252,23 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 );
             }
         }
-        let _ = crate::teams::create(home, &team_args);
+        // Route through API so the daemon can emit TeamCreated and the TUI
+        // consolidates member panes into one tab. Fall back to a direct
+        // teams::create when the daemon is unreachable (unit tests, or a
+        // pre-daemon bootstrap) — no TUI means no consolidation anyway, so
+        // just persist the record.
+        match crate::api::call(
+            home,
+            &serde_json::json!({
+                "method": crate::api::method::CREATE_TEAM,
+                "params": &team_args,
+            }),
+        ) {
+            Ok(_) => {}
+            Err(_) => {
+                let _ = crate::teams::create(home, &team_args);
+            }
+        }
     }
 
     // Track deployment

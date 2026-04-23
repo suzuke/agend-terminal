@@ -414,18 +414,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     return json!({"error": "count must be >= 1 (or backends must be non-empty)"});
                 }
                 let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
-                // Pre-generate instructions/mcp_config for all predicted team member
-                // names before the API call. Team names are deterministic
-                // ({team_name}-{i}) and the PTY starts immediately on spawn; generating
-                // after the API call creates a race where the agent can read configs
-                // before they exist. Matches the single-instance ordering above.
-                for (i, be) in per_member_backends.iter().enumerate() {
-                    let inst_name = format!("{team_name}-{}", i + 1);
-                    let wd = home.join("workspace").join(&inst_name);
-                    std::fs::create_dir_all(&wd).ok();
-                    crate::instructions::generate(&wd, be);
-                    crate::mcp_config::configure(&wd, be, Some(&inst_name));
-                }
+                // handle_create_team now writes fleet.yaml up front and
+                // calls prepare_instructions for each member, so no
+                // pre-generation loop is needed here.
                 match crate::api::call(
                     &home,
                     &json!({"method": crate::api::method::CREATE_TEAM, "params": {
@@ -699,7 +690,25 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "task" => crate::tasks::handle(&home, instance_name, args),
 
         // --- Teams ---
-        "create_team" => crate::teams::create(&home, args),
+        "create_team" => {
+            // Route through the API so the handler emits a TeamCreated TUI
+            // event and panes for the listed members get moved into a single
+            // team tab. Mirrors the update_team handling below. Fall back to
+            // the direct call when the daemon is unreachable — no TUI means
+            // there's nothing to migrate anyway.
+            match crate::api::call(
+                &home,
+                &json!({"method": crate::api::method::CREATE_TEAM, "params": args}),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    resp.get("result").cloned().unwrap_or_default()
+                }
+                Ok(resp) => {
+                    json!({"error": resp["error"].as_str().unwrap_or("create_team failed")})
+                }
+                Err(_) => crate::teams::create(&home, args),
+            }
+        }
         "delete_team" => crate::teams::delete(&home, args),
         "list_teams" => crate::teams::list(&home),
         "update_team" => {
@@ -913,10 +922,11 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
         }
     }
 
-    let wd = std::path::PathBuf::from(&work_dir);
-    std::fs::create_dir_all(&wd).ok();
-    crate::instructions::generate(&wd, command);
-    crate::mcp_config::configure(&wd, command, Some(name));
+    // handle_spawn calls prepare_instructions, which handles both
+    // `--mcp-config` and agend.md generation. No pre-gen needed here — but
+    // the workspace dir must exist before the worktree helper above can
+    // decide whether to promote it into a checkout, so we still ensure it.
+    std::fs::create_dir_all(&work_dir).ok();
 
     let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
     let role = args.get("role").and_then(|v| v.as_str()).map(String::from);
@@ -936,7 +946,8 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
             "name": name, "backend": command, "args": &cmd_args,
             "working_directory": work_dir,
             "layout": layout, "spawner": instance_name,
-            "target_pane": target_pane
+            "target_pane": target_pane,
+            "role": role,
         }}),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {

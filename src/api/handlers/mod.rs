@@ -13,6 +13,65 @@ use crate::agent::{AgentRegistry, ExternalRegistry};
 use crate::api::{ApiNotifier, ConfigRegistry};
 use std::path::Path;
 
+/// Write `agend.md` / `GEMINI.md` and the MCP config into `work_dir` before
+/// the child process is spawned. Centralises the fleet-aware instruction
+/// generation that every API-level spawn should perform.
+///
+/// Role resolution order:
+///   1. `explicit_role` — caller passes it directly (SPAWN/CREATE_TEAM
+///      params). Used when the caller has the role in-hand and doesn't
+///      want to depend on fleet.yaml read order.
+///   2. `fleet.yaml` entry under `name` — used by deploy_template which
+///      persists the entry before calling SPAWN.
+///   3. None — ad-hoc spawn (verify, shell pane). Identity block still
+///      emits name + peers, just no Role line.
+///
+/// Peers always come from `fleet.yaml`, so any combination of spawn
+/// callers produces a coherent peer list.
+///
+/// Must be called *before* the backend process starts: `backend::spawn_flags`
+/// checks the file's presence at flag-build time and silently drops
+/// `--append-system-prompt-file` when the instructions file is missing.
+pub(crate) fn prepare_instructions(
+    home: &Path,
+    name: &str,
+    command: &str,
+    work_dir: &Path,
+    explicit_role: Option<&str>,
+) {
+    std::fs::create_dir_all(work_dir).ok();
+    let fleet_path = home.join("fleet.yaml");
+    match crate::fleet::FleetConfig::load(&fleet_path) {
+        Ok(fleet) => {
+            let peers: Vec<(String, Option<String>)> = fleet
+                .instances
+                .iter()
+                .map(|(n, c)| (n.clone(), c.role.clone()))
+                .collect();
+            let role = explicit_role
+                .map(str::to_string)
+                .or_else(|| fleet.instances.get(name).and_then(|c| c.role.clone()));
+            let ctx = crate::instructions::AgentContext {
+                name,
+                role: role.as_deref(),
+                fleet_peers: &peers,
+            };
+            crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
+        }
+        Err(_) if explicit_role.is_some() => {
+            let ctx = crate::instructions::AgentContext {
+                name,
+                role: explicit_role,
+                fleet_peers: &[],
+            };
+            crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
+        }
+        Err(_) => {
+            crate::instructions::generate(work_dir, command);
+        }
+    }
+}
+
 /// Shared context passed to extracted handler functions.
 ///
 /// Bundles the session-scoped references that `handle_session` holds.

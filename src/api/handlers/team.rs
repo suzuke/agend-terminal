@@ -65,33 +65,67 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         "CREATE_TEAM begin"
     );
 
-    let mut spawned: Vec<(String, String)> = Vec::new(); // (name, backend)
+    // Phase 1 — plan every member's fleet.yaml entry (name, backend, dir)
+    // before any spawn happens. The full list is written to fleet.yaml
+    // before Phase 2 so prepare_instructions sees the complete peer set
+    // when generating each member's agend.md.
+    let mut planned: Vec<(String, String, std::path::PathBuf)> = Vec::new(); // (name, backend, work_dir)
     let mut failed: Vec<String> = Vec::new();
-    let size = crossterm::terminal::size().unwrap_or((120, 40));
     for (i, backend) in per_member_backends.iter().enumerate() {
         let inst_name = format!("{team_name}-{}", i + 1);
-        // Dedup: see SPAWN handler note. Re-creating a team with an
-        // existing name would otherwise overwrite the registry entry
-        // and orphan the previous tab's PTY subscription.
+        // Dedup: re-creating a team with an existing name would otherwise
+        // overwrite the registry entry and orphan the previous tab's PTY
+        // subscription.
         if crate::agent::lock_registry(ctx.registry).contains_key(&inst_name) {
             tracing::warn!(team = team_name, member = %inst_name, "CREATE_TEAM skip: name already exists");
             failed.push(format!("{inst_name}: agent already exists"));
             continue;
         }
         let work_dir = ctx.home.join("workspace").join(&inst_name);
+        planned.push((inst_name, backend.clone(), work_dir));
+    }
+
+    if !planned.is_empty() {
+        let entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = planned
+            .iter()
+            .map(|(name, be, wd)| {
+                (
+                    name.clone(),
+                    crate::fleet::InstanceYamlEntry {
+                        backend: Some(be.clone()),
+                        working_directory: Some(wd.display().to_string()),
+                        role: None,
+                    },
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
+            entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
+        if let Err(e) = crate::fleet::add_instances_to_yaml(ctx.home, &refs) {
+            tracing::warn!(error = %e, "failed to persist team to fleet.yaml");
+        }
+    }
+
+    // Phase 2 — generate instructions and spawn each planned member. The
+    // helper reads fleet.yaml (now complete) for the peer list, so every
+    // member boots with a full Identity/Peers block in its agend.md.
+    let mut spawned: Vec<(String, String)> = Vec::new();
+    let size = crossterm::terminal::size().unwrap_or((120, 40));
+    for (inst_name, backend, work_dir) in &planned {
+        super::prepare_instructions(ctx.home, inst_name, backend, work_dir, None);
         match crate::api::spawn_one(
             ctx.home,
             ctx.registry,
-            &inst_name,
+            inst_name,
             backend,
             &[],
             crate::backend::SpawnMode::Fresh,
-            &work_dir,
+            work_dir,
             size,
         ) {
             Ok(()) => {
                 tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");
-                spawned.push((inst_name, backend.clone()));
+                spawned.push((inst_name.clone(), backend.clone()));
             }
             Err(e) => {
                 tracing::warn!(team = team_name, member = %inst_name, backend = %backend, error = %e, "CREATE_TEAM spawn failed");
@@ -123,31 +157,18 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         .chain(spawned_names.iter().cloned())
         .collect();
 
-    if !spawned.is_empty() {
-        let entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = spawned
-            .iter()
-            .map(|(name, be)| {
-                (
-                    name.clone(),
-                    crate::fleet::InstanceYamlEntry {
-                        backend: Some(be.clone()),
-                        working_directory: Some(
-                            ctx.home.join("workspace").join(name).display().to_string(),
-                        ),
-                        role: None,
-                    },
-                )
-            })
-            .collect();
-        let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
-            entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
-        if let Err(e) = crate::fleet::add_instances_to_yaml(ctx.home, &refs) {
-            tracing::warn!(error = %e, "failed to persist team to fleet.yaml");
-        }
+    // Preserve orchestrator from the caller. Without this, routing
+    // deploy_template / MCP create_team through CREATE_TEAM would silently
+    // drop the orchestrator designation — teams::create accepts it but
+    // this handler never forwarded the field.
+    let mut team_params = json!({
+        "name": team_name,
+        "members": all_members,
+        "description": params["description"],
+    });
+    if let Some(orch) = params.get("orchestrator").and_then(|v| v.as_str()) {
+        team_params["orchestrator"] = json!(orch);
     }
-
-    let team_params =
-        json!({"name": team_name, "members": all_members, "description": params["description"]});
     let result = crate::teams::create(ctx.home, &team_params);
 
     if let Some(n) = ctx.notifier {

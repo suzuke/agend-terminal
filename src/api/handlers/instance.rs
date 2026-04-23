@@ -149,6 +149,15 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         _ => crate::backend::SpawnMode::Fresh,
     };
 
+    // Generate instructions before spawn — see api::handlers::prepare_instructions
+    // for why ordering matters (backend flag-build time file presence check).
+    let explicit_role = params
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role);
+
     match crate::api::spawn_one(
         ctx.home,
         ctx.registry,
