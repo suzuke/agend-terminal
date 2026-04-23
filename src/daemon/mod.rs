@@ -302,6 +302,9 @@ fn run_core(
 
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
 
+    // Recover any half-written inbox files from a previous crash.
+    crate::inbox::recover_half_writes(home);
+
     // Replay missed one-shot schedules from before daemon was down.
     // Must run once at startup, before the tick loop, so missed one-shots
     // fire exactly once. The tick loop's check_schedules handles future
@@ -441,12 +444,13 @@ fn run_core(
         check_schedules(home, &registry);
         check_ci_watches(home, &registry);
 
-        // Periodic inbox TTL sweep — every 60 ticks (≈1 hour at 1 tick/min)
+        // Periodic inbox maintenance — every 60 ticks (≈10 min at 10s/tick)
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static SWEEP_COUNTER: AtomicU64 = AtomicU64::new(0);
             if SWEEP_COUNTER.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
                 crate::inbox::sweep_expired(home);
+                crate::inbox::check_disk_space(home);
             }
         }
 
