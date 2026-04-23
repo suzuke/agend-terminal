@@ -1786,13 +1786,14 @@ mod tests {
     #[test]
     fn main_tui_footer_shows_help_hint() {
         let backend = ratatui::backend::TestBackend::new(100, 3);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
         let layout = crate::layout::Layout::new();
         terminal
             .draw(|frame| {
                 render_status_bar(frame, frame.area(), &layout, TelegramStatus::NotConfigured);
             })
-            .unwrap();
+            .expect("test terminal draw should succeed");
         let buf = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buf.area.height {
@@ -1808,7 +1809,8 @@ mod tests {
 
     fn render_task_board_to_string(mode: &crate::app::TaskBoardMode) -> String {
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
         let tasks = vec![crate::tasks::Task {
             id: "t-1".into(),
             title: "test task".into(),
@@ -1825,7 +1827,7 @@ mod tests {
         }];
         terminal
             .draw(|frame| render_tasks(frame, &tasks, 0, 0, mode))
-            .unwrap();
+            .expect("test terminal draw should succeed");
         let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..buf.area.height {
