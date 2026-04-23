@@ -69,7 +69,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "react" => {
             let emoji = args["emoji"].as_str().unwrap_or("");
             let message_id = args["message_id"].as_str();
-            match telegram::try_telegram_react(instance_name, emoji, message_id) {
+            match telegram::try_telegram_react(&home, instance_name, emoji, message_id) {
                 Ok(()) => json!({"emoji": emoji}),
                 Err(e) => json!({"error": format!("{e}")}),
             }
@@ -83,7 +83,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(t) => t,
                 None => return json!({"error": "missing 'text'"}),
             };
-            match telegram::try_telegram_edit(instance_name, message_id, text) {
+            match telegram::try_telegram_edit(&home, instance_name, message_id, text) {
                 Ok(()) => json!({"message_id": message_id}),
                 Err(e) => json!({"error": format!("{e}")}),
             }
@@ -93,7 +93,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(f) => f,
                 None => return json!({"error": "missing 'file_id'"}),
             };
-            match telegram::try_download_attachment(instance_name, file_id) {
+            match telegram::try_download_attachment(&home, instance_name, file_id) {
                 Ok(path) => json!({"path": path}),
                 Err(e) => json!({"error": format!("{e}")}),
             }

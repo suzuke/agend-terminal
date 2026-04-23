@@ -1071,13 +1071,18 @@ fn inject_provenance_from(
 }
 
 /// React to a message with an emoji.
+///
+/// `home` scopes the `fleet.yaml` + metadata lookups so callers on
+/// alternate homes (tests, multi-tenant daemons) can't accidentally
+/// leak into the operator's real Telegram channel — same class of fix
+/// as `create_topic_for_instance`.
 pub fn try_telegram_react(
+    home: &std::path::Path,
     instance_name: &str,
     emoji: &str,
     message_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let ch = resolve_channel_only()?;
-    let home = crate::home_dir();
+    let ch = resolve_channel_only_from(home)?;
     let mid: i32 = message_id.and_then(|m| m.parse().ok()).unwrap_or_else(|| {
         let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
         std::fs::read_to_string(&meta_path)
@@ -1102,9 +1107,16 @@ pub fn try_telegram_react(
     })
 }
 
-/// Edit a previously sent message.
-pub fn try_telegram_edit(_instance_name: &str, message_id: &str, text: &str) -> anyhow::Result<()> {
-    let ch = resolve_channel_only()?;
+/// Edit a previously sent message. `home` scopes credential resolution
+/// so this helper can't silently reach the operator's real channel
+/// from a test or alt-home context.
+pub fn try_telegram_edit(
+    home: &std::path::Path,
+    _instance_name: &str,
+    message_id: &str,
+    text: &str,
+) -> anyhow::Result<()> {
+    let ch = resolve_channel_only_from(home)?;
     let mid: i32 = message_id
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid message_id: {message_id}"))?;
@@ -1171,10 +1183,15 @@ pub fn delete_topic(home: &std::path::Path, topic_id: i32) {
     tracing::info!(topic_id, "deleted topic");
 }
 
-/// Download an attachment by file_id.
-pub fn try_download_attachment(instance_name: &str, file_id: &str) -> anyhow::Result<String> {
-    let ch = resolve_channel_only()?;
-    let home = crate::home_dir();
+/// Download an attachment by file_id. `home` scopes credential +
+/// download-directory lookups so test runs don't drop files into the
+/// operator's real `~/.agend-terminal/downloads/`.
+pub fn try_download_attachment(
+    home: &std::path::Path,
+    instance_name: &str,
+    file_id: &str,
+) -> anyhow::Result<String> {
+    let ch = resolve_channel_only_from(home)?;
     telegram_runtime().block_on(async {
         let bot = teloxide::Bot::new(&ch.token);
         let file = bot.get_file(file_id).await?;
@@ -1594,6 +1611,10 @@ impl crate::channel::ux_event::UxEventSink for TelegramChannel {
             self.apply_fleet_action(fe);
             return;
         }
+        // Snapshot home from state for the scoped helper calls below —
+        // cloning the PathBuf is cheap and avoids holding the mutex
+        // across the network calls inside the match.
+        let home = lock_state(&self.state).home.clone();
         let action = select_action(event, &self.caps);
         // All transport errors are logged, not propagated — a failed
         // reaction is never a reason to crash the daemon.
@@ -1609,7 +1630,7 @@ impl crate::channel::ux_event::UxEventSink for TelegramChannel {
                 // fallback when `message_id` is None (we always pass
                 // `Some`), but routing through the real instance name
                 // keeps the contract stable if that fallback ever runs.
-                if let Err(e) = try_telegram_react(&instance, emoji, Some(&msg.id)) {
+                if let Err(e) = try_telegram_react(&home, &instance, emoji, Some(&msg.id)) {
                     tracing::warn!(
                         %e,
                         instance = %instance,
@@ -1624,7 +1645,7 @@ impl crate::channel::ux_event::UxEventSink for TelegramChannel {
                 msg,
                 text,
             } => {
-                if let Err(e) = try_telegram_edit(&instance, &msg.id, &text) {
+                if let Err(e) = try_telegram_edit(&home, &instance, &msg.id, &text) {
                     tracing::warn!(
                         %e,
                         instance = %instance,
