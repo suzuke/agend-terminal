@@ -157,15 +157,30 @@ impl NotifySource<'_> {
 pub struct InboxMessage {
     #[serde(default)]
     pub schema_version: u32,
+    #[serde(default)]
+    pub id: Option<String>,
     pub from: String,
     pub text: String,
     pub kind: Option<String>,
     pub timestamp: String,
+    #[serde(default)]
+    pub read_at: Option<String>,
 }
 
 impl InboxMessage {
     /// Latest schema version this binary can read and write.
     pub const CURRENT_VERSION: u32 = 1;
+}
+
+/// Status of a specific inbox message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageStatus {
+    /// Message was read at the given timestamp.
+    ReadAt(String),
+    /// Message exists but has not been read and has expired (>30d).
+    UnreadExpired,
+    /// Message not found.
+    NotFound,
 }
 
 pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
@@ -182,6 +197,13 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
         anyhow::bail!("inbox readonly: disk space critically low");
     }
     msg.schema_version = InboxMessage::CURRENT_VERSION;
+    if msg.id.is_none() {
+        use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
+        static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
+        let seq = MSG_SEQ.fetch_add(1, AtOrd::Relaxed);
+        msg.id = Some(format!("m-{ts}-{seq}"));
+    }
     let path = inbox_path(home, name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -206,21 +228,17 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
     Ok(())
 }
 
-/// Drain all messages atomically (rename + read to avoid race with concurrent append).
+/// Drain unread messages: mark them with `read_at` and write back.
+/// Returns only the messages that were previously unread.
 ///
-/// Recovery: if a previous drain crashed between `rename()` and `remove_file()`
-/// (or the read_to_string failed), the messages would live on in
-/// `{name}.draining` forever, AND would be silently lost the next time drain
-/// renamed over it. We now treat a leftover `.draining` as the authoritative
-/// pending batch: read and consume it first. New arrivals in `{name}.jsonl`
-/// are picked up on the next drain call — delaying them by one cycle is
-/// acceptable; dropping them is not.
+/// Soft-delete semantics: messages stay in the JSONL file with `read_at`
+/// set; [`sweep_expired`] removes them later based on TTL rules.
+/// Uses atomic tmp+fsync+rename for crash safety.
 pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     let path = inbox_path(home, name);
     let tmp = path.with_extension("draining");
 
-    // Leftover from a crashed predecessor — consume it first, leave the
-    // live file untouched so no pending batch is overwritten.
+    // Leftover from a crashed predecessor — consume it first.
     if tmp.exists() {
         return read_drain_file(&tmp);
     }
@@ -228,10 +246,61 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     if !path.exists() {
         return Vec::new();
     }
-    if std::fs::rename(&path, &tmp).is_err() {
-        return Vec::new(); // File may have been drained by another caller
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut unread = Vec::new();
+    let mut all_messages: Vec<InboxMessage> = Vec::new();
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut msg: InboxMessage = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if msg.schema_version > InboxMessage::CURRENT_VERSION {
+            tracing::error!(
+                found = msg.schema_version,
+                supported = InboxMessage::CURRENT_VERSION,
+                "dropping inbox message written by newer schema version"
+            );
+            continue;
+        }
+        if msg.read_at.is_none() {
+            msg.read_at = Some(now.clone());
+            unread.push(msg.clone());
+        }
+        all_messages.push(msg);
     }
-    read_drain_file(&tmp)
+
+    if !unread.is_empty() {
+        // Write back atomically with read_at stamps
+        let write_tmp = path.with_extension("jsonl.tmp");
+        let result = (|| -> anyhow::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&write_tmp)?;
+            for m in &all_messages {
+                writeln!(f, "{}", serde_json::to_string(m)?)?;
+            }
+            f.sync_all()?;
+            std::fs::rename(&write_tmp, &path)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "inbox drain write-back failed");
+        }
+    }
+
+    unread
 }
 
 fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
@@ -275,6 +344,119 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
 
 pub const INLINE_THRESHOLD: usize = 500;
 
+/// Sweep expired messages from all inbox files.
+/// - read_at.is_some() && elapsed > 7 days → delete
+/// - read_at.is_none() && elapsed > 30 days → delete
+pub fn sweep_expired(home: &Path) {
+    let inbox_dir = home.join("inbox");
+    let entries = match std::fs::read_dir(&inbox_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let now = chrono::Utc::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut kept: Vec<String> = Vec::new();
+        let mut changed = false;
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let msg: InboxMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(now);
+            let age = now.signed_duration_since(ts);
+            let expired = match &msg.read_at {
+                Some(_) => age > chrono::Duration::days(7),
+                None => age > chrono::Duration::days(30),
+            };
+            if expired {
+                changed = true;
+            } else {
+                kept.push(line.to_string());
+            }
+        }
+        if changed {
+            if kept.is_empty() {
+                let _ = std::fs::remove_file(&path);
+            } else {
+                let tmp = path.with_extension("jsonl.tmp");
+                let result = (|| -> anyhow::Result<()> {
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&tmp)?;
+                    for l in &kept {
+                        writeln!(f, "{l}")?;
+                    }
+                    f.sync_all()?;
+                    std::fs::rename(&tmp, &path)?;
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "inbox sweep write-back failed");
+                }
+            }
+        }
+    }
+}
+
+/// Look up a message by ID across all inbox files.
+pub fn describe_message(home: &Path, msg_id: &str) -> MessageStatus {
+    let inbox_dir = home.join("inbox");
+    let entries = match std::fs::read_dir(&inbox_dir) {
+        Ok(e) => e,
+        Err(_) => return MessageStatus::NotFound,
+    };
+    let now = chrono::Utc::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            let msg: InboxMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if msg.id.as_deref() != Some(msg_id) {
+                continue;
+            }
+            // Found the message
+            if let Some(ref read_at) = msg.read_at {
+                return MessageStatus::ReadAt(read_at.clone());
+            }
+            // Unread — check if expired
+            let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or(now);
+            if now.signed_duration_since(ts) > chrono::Duration::days(30) {
+                return MessageStatus::UnreadExpired;
+            }
+            // Unread and not expired — still "not found" in the read sense
+            // (message exists but hasn't been consumed yet)
+            return MessageStatus::NotFound;
+        }
+    }
+    MessageStatus::NotFound
+}
+
 /// Deliver a message: short messages (≤500 chars) inject directly to PTY,
 /// long messages store to inbox + inject truncated notification.
 pub fn deliver(
@@ -289,7 +471,7 @@ pub fn deliver(
         notify_agent(home, agent_name, source, text);
     } else {
         let msg = InboxMessage {
-            schema_version: 0,
+            schema_version: 0, id: None, read_at: None,
             from: source.to_string(),
             text: text.to_string(),
             kind,
@@ -408,7 +590,7 @@ mod tests {
 
     fn make_msg(from: &str, text: &str) -> InboxMessage {
         InboxMessage {
-            schema_version: 0,
+            schema_version: 0, id: None, read_at: None,
             from: from.to_string(),
             text: text.to_string(),
             kind: None,
@@ -528,7 +710,7 @@ mod tests {
     fn inbox_message_fields_preserved() {
         let home = tmp_home("fields");
         let msg = InboxMessage {
-            schema_version: 0,
+            schema_version: 0, id: None, read_at: None,
             from: "sender".to_string(),
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
@@ -615,7 +797,7 @@ mod tests {
     #[test]
     fn inbox_message_serialization() {
         let msg = InboxMessage {
-            schema_version: 0,
+            schema_version: 0, id: None, read_at: None,
             from: "test".to_string(),
             text: "hello \"world\"".to_string(),
             kind: None,
@@ -631,7 +813,7 @@ mod tests {
     fn inbox_message_with_special_chars() {
         let home = tmp_home("special");
         let msg = InboxMessage {
-            schema_version: 0,
+            schema_version: 0, id: None, read_at: None,
             from: "user".to_string(),
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
@@ -946,6 +1128,135 @@ mod tests {
             .collect();
         assert_eq!(files.len(), 1);
         assert!(files[0].file_name().to_string_lossy().contains("agent1"));
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_drain_marks_read_at_but_keeps_message() {
+        let home = tmp_home("drain-read-at");
+        enqueue(&home, "agent1", make_msg("alice", "hello")).ok();
+        enqueue(&home, "agent1", make_msg("bob", "world")).ok();
+
+        // First drain returns both messages with read_at set
+        let msgs = drain(&home, "agent1");
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].read_at.is_some(), "drain must stamp read_at");
+        assert!(msgs[1].read_at.is_some());
+
+        // Second drain returns empty (already read)
+        let msgs2 = drain(&home, "agent1");
+        assert!(msgs2.is_empty(), "already-read messages must not be returned");
+
+        // But the file still exists with the messages
+        let path = inbox_path(&home, "agent1");
+        let content = fs::read_to_string(&path).expect("file must still exist");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "messages must be kept in file");
+        // Verify read_at is persisted
+        let m: InboxMessage = serde_json::from_str(lines[0]).expect("parse");
+        assert!(m.read_at.is_some(), "read_at must be persisted to disk");
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_sweep_expired_read_7d() {
+        let home = tmp_home("sweep-read-7d");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+
+        let old_ts = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        let fresh_ts = chrono::Utc::now().to_rfc3339();
+        let read_old = format!(
+            r#"{{"schema_version":1,"id":"m-old","from":"a","text":"old read","kind":null,"timestamp":"{old_ts}","read_at":"{old_ts}"}}"#
+        );
+        let read_fresh = format!(
+            r#"{{"schema_version":1,"id":"m-fresh","from":"b","text":"fresh read","kind":null,"timestamp":"{fresh_ts}","read_at":"{fresh_ts}"}}"#
+        );
+        fs::write(
+            inbox_dir.join("agent1.jsonl"),
+            format!("{read_old}\n{read_fresh}\n"),
+        ).ok();
+
+        sweep_expired(&home);
+
+        let content = fs::read_to_string(inbox_dir.join("agent1.jsonl")).expect("file");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "read message >7d must be swept");
+        assert!(lines[0].contains("m-fresh"), "fresh read message must survive");
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_sweep_unread_30d() {
+        let home = tmp_home("sweep-unread-30d");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+
+        let old_ts = (chrono::Utc::now() - chrono::Duration::days(35)).to_rfc3339();
+        let recent_ts = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+        let unread_old = format!(
+            r#"{{"schema_version":1,"id":"m-unread-old","from":"a","text":"ancient","kind":null,"timestamp":"{old_ts}"}}"#
+        );
+        let unread_recent = format!(
+            r#"{{"schema_version":1,"id":"m-unread-recent","from":"b","text":"recent","kind":null,"timestamp":"{recent_ts}"}}"#
+        );
+        fs::write(
+            inbox_dir.join("agent1.jsonl"),
+            format!("{unread_old}\n{unread_recent}\n"),
+        ).ok();
+
+        sweep_expired(&home);
+
+        let content = fs::read_to_string(inbox_dir.join("agent1.jsonl")).expect("file");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "unread message >30d must be swept");
+        assert!(lines[0].contains("m-unread-recent"), "recent unread must survive");
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_describe_message_status_three_states() {
+        let home = tmp_home("describe-msg");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let old_ts = (chrono::Utc::now() - chrono::Duration::days(35)).to_rfc3339();
+
+        // State 1: read message
+        let read_msg = format!(
+            r#"{{"schema_version":1,"id":"m-read","from":"a","text":"read","kind":null,"timestamp":"{now}","read_at":"{now}"}}"#
+        );
+        // State 2: unread expired (>30d)
+        let expired_msg = format!(
+            r#"{{"schema_version":1,"id":"m-expired","from":"b","text":"expired","kind":null,"timestamp":"{old_ts}"}}"#
+        );
+        fs::write(
+            inbox_dir.join("agent1.jsonl"),
+            format!("{read_msg}\n{expired_msg}\n"),
+        ).ok();
+
+        // ReadAt
+        match describe_message(&home, "m-read") {
+            MessageStatus::ReadAt(t) => assert_eq!(t, now),
+            other => panic!("expected ReadAt, got: {other:?}"),
+        }
+
+        // UnreadExpired
+        assert_eq!(
+            describe_message(&home, "m-expired"),
+            MessageStatus::UnreadExpired
+        );
+
+        // NotFound
+        assert_eq!(
+            describe_message(&home, "m-nonexistent"),
+            MessageStatus::NotFound
+        );
 
         fs::remove_dir_all(&home).ok();
     }
