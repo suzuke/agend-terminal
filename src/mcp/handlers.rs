@@ -488,10 +488,19 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Err(e) = crate::agent::validate_name(name) {
                 return json!({"error": e});
             }
-            // Prevent deleting the last instance when a channel is configured
+            // Prevent deleting the last fleet.yaml-tracked instance when a
+            // channel is configured — a channel needs at least one instance
+            // to receive messages. Only applies when the target itself is in
+            // fleet.yaml; runtime-only zombies (torn-down deployment members
+            // that linger in the registry with no fleet entry) are not
+            // protected, otherwise they become un-deletable as soon as
+            // fleet.yaml is down to a single real instance.
             let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
             if let Some(ref config) = fleet {
-                if config.channel.is_some() && config.instances.len() <= 1 {
+                if config.channel.is_some()
+                    && config.instances.contains_key(name)
+                    && config.instances.len() <= 1
+                {
                     return json!({"error": "cannot delete the last instance — channel needs at least one instance to receive messages"});
                 }
             }

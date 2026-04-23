@@ -672,6 +672,64 @@ fn delete_last_member_auto_deletes_team() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Regression: zombie instances (in the runtime registry but absent from
+/// fleet.yaml) must be deletable even when fleet.yaml is down to a single
+/// real instance under a configured channel. The original guard blocked
+/// all deletes in that state, making torn-down deployment members
+/// un-cleanable without a daemon restart.
+#[test]
+fn delete_zombie_succeeds_when_fleet_has_only_one_survivor() {
+    let home = temp_home("del_zombie_with_channel");
+    let fleet_yaml = r#"
+channel:
+  type: telegram
+  bot_token_env: TOKEN
+  group_id: -1
+instances:
+  survivor:
+    backend: claude
+"#;
+    std::fs::write(home.join("fleet.yaml"), fleet_yaml).unwrap();
+
+    let result = call_tool(&home, "delete_instance", &json!({"name": "zombie"}));
+    assert!(
+        result.get("error").is_none(),
+        "zombie (not in fleet.yaml) must be deletable, got: {result}"
+    );
+    assert_eq!(
+        result["name"].as_str(),
+        Some("zombie"),
+        "handler must return the deleted name, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The guard still protects real fleet members: deleting the last
+/// fleet.yaml-tracked instance when a channel is configured must be
+/// rejected, otherwise there's nothing left to receive channel traffic.
+#[test]
+fn delete_blocks_last_real_instance_when_channel_configured() {
+    let home = temp_home("del_last_real");
+    let fleet_yaml = r#"
+channel:
+  type: telegram
+  bot_token_env: TOKEN
+  group_id: -1
+instances:
+  survivor:
+    backend: claude
+"#;
+    std::fs::write(home.join("fleet.yaml"), fleet_yaml).unwrap();
+
+    let result = call_tool(&home, "delete_instance", &json!({"name": "survivor"}));
+    let err = result["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("last instance"),
+        "guard must reject, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn replace_instance_preserves_team_membership() {
     let home = temp_home("replace_team");
