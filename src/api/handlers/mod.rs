@@ -41,6 +41,17 @@ pub(crate) fn prepare_instructions(
 ) {
     std::fs::create_dir_all(work_dir).ok();
     let fleet_path = home.join("fleet.yaml");
+    // Look up team membership so agend.md can split collaborators (team
+    // members) from the rest of the fleet. Owned here so we can hand out
+    // borrowed TeamContexts into each match arm without moves.
+    let team_record = crate::teams::find_team_for(home, name);
+    let team_ctx = team_record
+        .as_ref()
+        .map(|t| crate::instructions::TeamContext {
+            name: t.name.as_str(),
+            orchestrator: t.orchestrator.as_deref(),
+            members: t.members.as_slice(),
+        });
     match crate::fleet::FleetConfig::load(&fleet_path) {
         Ok(fleet) => {
             let peers: Vec<(String, Option<String>)> = fleet
@@ -55,6 +66,7 @@ pub(crate) fn prepare_instructions(
                 name,
                 role: role.as_deref(),
                 fleet_peers: &peers,
+                team: team_ctx.as_ref(),
             };
             crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
         }
@@ -63,6 +75,7 @@ pub(crate) fn prepare_instructions(
                 name,
                 role: explicit_role,
                 fleet_peers: &[],
+                team: team_ctx.as_ref(),
             };
             crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
         }

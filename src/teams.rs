@@ -55,6 +55,18 @@ fn find_team_for_member(store: &TeamStore, name: &str) -> Option<String> {
         .map(|t| t.name.clone())
 }
 
+/// Return the full [`Team`] record for the team `member` belongs to,
+/// or `None` when `member` isn't on any team. Used by
+/// `api::handlers::prepare_instructions` to split agend.md's peer list
+/// into team members vs other fleet agents.
+pub fn find_team_for(home: &Path, member: &str) -> Option<Team> {
+    let store = load(home);
+    store
+        .teams
+        .into_iter()
+        .find(|t| t.members.iter().any(|m| m == member))
+}
+
 pub fn create(home: &Path, args: &Value) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n.to_string(),

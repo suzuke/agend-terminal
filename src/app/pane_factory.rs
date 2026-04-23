@@ -262,10 +262,22 @@ pub(super) fn create_pane_from_resolved(
                 .collect()
         })
         .unwrap_or_default();
+    // Team context drives the two-section peer rendering in agend.md
+    // (team members vs other fleet agents). Owned here, borrowed into
+    // AgentContext.
+    let team_record = crate::teams::find_team_for(home, fleet_name);
+    let team_ctx = team_record
+        .as_ref()
+        .map(|t| crate::instructions::TeamContext {
+            name: t.name.as_str(),
+            orchestrator: t.orchestrator.as_deref(),
+            members: t.members.as_slice(),
+        });
     let ctx = crate::instructions::AgentContext {
         name: fleet_name,
         role: resolved.role.as_deref(),
         fleet_peers: &peers,
+        team: team_ctx.as_ref(),
     };
 
     let mut pane = create_pane(
