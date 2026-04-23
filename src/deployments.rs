@@ -149,8 +149,13 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             .filter(|s| !s.is_empty())
             .map(String::from);
 
+        // Every member gets its own `<directory>/<inst_name>` subdir —
+        // same-backend teammates would otherwise clobber each other's
+        // agend.md (and mcp-config.json) when writing into a shared dir.
+        // `directory` is therefore treated as the parent for all members,
+        // matching branch-mode behavior.
+        let inst_dir = dir.join(&inst_name);
         let work_dir = if let Some(br) = branch {
-            let wt = dir.join(&inst_name);
             let branch_name = format!("{deploy_name}/{inst_suffix}");
             match std::process::Command::new("git")
                 .args([
@@ -158,7 +163,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                     "add",
                     "-b",
                     &branch_name,
-                    &wt.display().to_string(),
+                    &inst_dir.display().to_string(),
                     br,
                 ])
                 .current_dir(&dir)
@@ -174,9 +179,14 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                     tracing::warn!(error = %e, "git not available");
                 }
             }
-            wt.display().to_string()
+            inst_dir.display().to_string()
         } else {
-            directory.to_string()
+            // create_dir_all is a no-op if it already exists; safe to call
+            // unconditionally. handle_spawn also runs one — this pre-create
+            // is defensive for tests that inspect the path without going
+            // through the daemon.
+            std::fs::create_dir_all(&inst_dir).ok();
+            inst_dir.display().to_string()
         };
 
         yaml_entries.push((
@@ -618,6 +628,63 @@ templates:
             "unknown orchestrator suffix must leave team with no orchestrator, got {}",
             team["orchestrator"]
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[test]
+    fn deploy_gives_each_member_its_own_workdir() {
+        // Regression: same-backend teammates used to share `directory` when
+        // no `branch:` was given, which made them clobber each other's
+        // `.kiro/steering/agend.md` (and `.claude/mcp-config.json`) on
+        // every respawn. Each member must land in `<directory>/<inst_name>`.
+        let home = tmp_home("workdir_isolate");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+      impl-1:
+        backend: kiro-cli
+      impl-2:
+        backend: kiro-cli
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let workdirs: std::collections::HashSet<String> = ["dev-lead", "dev-impl-1", "dev-impl-2"]
+            .iter()
+            .filter_map(|name| {
+                reloaded
+                    .instances
+                    .get(*name)
+                    .and_then(|i| i.working_directory.clone())
+            })
+            .collect();
+
+        assert_eq!(
+            workdirs.len(),
+            3,
+            "every member must get a unique working_directory, got {workdirs:?}"
+        );
+        for name in ["dev-lead", "dev-impl-1", "dev-impl-2"] {
+            let wd = reloaded
+                .instances
+                .get(name)
+                .and_then(|i| i.working_directory.clone())
+                .unwrap_or_default();
+            assert!(
+                wd.ends_with(name),
+                "{name}'s working_directory must end with its own name, got {wd}"
+            );
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 
