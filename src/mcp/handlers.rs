@@ -898,7 +898,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         "current_state": resp["current_state"]
                     })
                 }
-                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("set_blocked_reason failed")}),
+                Ok(resp) => {
+                    json!({"error": resp["error"].as_str().unwrap_or("set_blocked_reason failed")})
+                }
                 Err(e) => json!({"error": format!("{e}")}),
             }
         }
@@ -925,7 +927,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         "was": resp["was"]
                     })
                 }
-                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("clear_blocked_reason failed")}),
+                Ok(resp) => {
+                    json!({"error": resp["error"].as_str().unwrap_or("clear_blocked_reason failed")})
+                }
                 Err(e) => json!({"error": format!("{e}")}),
             }
         }

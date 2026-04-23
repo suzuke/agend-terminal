@@ -354,8 +354,12 @@ fn handle_session(
             method::CREATE_TEAM => handlers::team::handle_create_team(params, &ctx),
             method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
             method::MOVE_PANE => handlers::instance::handle_move_pane(params, &ctx),
-            method::SET_BLOCKED_REASON => handlers::instance::handle_set_blocked_reason(params, &ctx),
-            method::CLEAR_BLOCKED_REASON => handlers::instance::handle_clear_blocked_reason(params, &ctx),
+            method::SET_BLOCKED_REASON => {
+                handlers::instance::handle_set_blocked_reason(params, &ctx)
+            }
+            method::CLEAR_BLOCKED_REASON => {
+                handlers::instance::handle_clear_blocked_reason(params, &ctx)
+            }
             method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
