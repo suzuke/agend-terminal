@@ -42,7 +42,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     };
     let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
 
-    let inject_msg = if text.len() > crate::inbox::HEADER_SIZE_THRESHOLD {
+    let inject_msg = if text.chars().count() > crate::inbox::HEADER_SIZE_THRESHOLD {
         format!("{} (use inbox tool)", crate::inbox::format_header(&msg))
     } else {
         let display_text = if text.chars().count() > 200 {
