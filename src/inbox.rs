@@ -1724,7 +1724,10 @@ mod tests {
     #[test]
     fn test_format_event_header_sanitizes_fields() {
         let h = format_event_header("evil\nkind", &[("key", "val\r\nue")]);
-        assert!(!h.contains('\n'), "newlines in kind must be sanitized: {h:?}");
+        assert!(
+            !h.contains('\n'),
+            "newlines in kind must be sanitized: {h:?}"
+        );
         assert!(!h.contains('\r'), "CR in value must be sanitized: {h:?}");
         assert!(h.contains("kind=evil kind"));
         assert!(h.contains("key=val  ue"));
