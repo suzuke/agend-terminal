@@ -604,6 +604,12 @@ where
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    /// Serializes tests that touch the global DISK_READONLY flag or rely on
+    /// enqueue not being blocked by it. Without this, `test_readonly_on_disk_full`
+    /// can set readonly=true and a concurrently-running enqueue test panics.
+    static READONLY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmp_home(suffix: &str) -> PathBuf {
         let dir =
@@ -1068,6 +1074,7 @@ mod tests {
 
     #[test]
     fn test_readonly_on_disk_full() {
+        let _guard = READONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // When DISK_READONLY is set, enqueue must fail and drain must still work.
         let home = tmp_home("readonly");
         enqueue(&home, "agent1", make_msg("a", "before")).ok();
@@ -1308,6 +1315,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_concurrent_same_agent() {
+        let _guard = READONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("concurrent-same");
         let home_arc = std::sync::Arc::new(home.clone());
         let mut handles = vec![];
@@ -1336,6 +1344,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_vs_drain_no_lost_msg() {
+        let _guard = READONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Thread A enqueues 10 messages; thread B drains after each.
         // Total drained must equal 10 — no lost messages.
         let home = tmp_home("enqueue-vs-drain");
@@ -1381,6 +1390,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_drain_no_duplicate_recovery() {
+        let _guard = READONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Pre-write a stale .draining file with 3 messages.
         // Spawn 2 threads that both call drain simultaneously.
         // Total recovered messages must be exactly 3 (no duplicates).
