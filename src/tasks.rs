@@ -65,7 +65,11 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 None => return serde_json::json!({"error": "missing 'title'"}),
             };
             let now = chrono::Utc::now().to_rfc3339();
-            let id = format!("t-{}", &now[..19].replace([':', '-', 'T'], ""));
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static ID_SEQ: AtomicU64 = AtomicU64::new(0);
+            let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
+            let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
+            let id = format!("t-{ts}-{seq}");
             let assignee = args["assignee"].as_str().map(String::from);
             // Resolve team → orchestrator routing
             let routed_to = if let Some(ref name) = assignee {
@@ -535,5 +539,36 @@ mod tests {
             assert_eq!(list_all(&home)[0].status, "done", "failed for {label}");
             std::fs::remove_dir_all(&home).ok();
         }
+    }
+
+    #[test]
+    fn test_concurrent_creates_unique_ids() {
+        let home = tmp_home("concurrent_ids");
+        let home_arc = std::sync::Arc::new(home.clone());
+        let threads: Vec<_> = (0..20)
+            .map(|i| {
+                let h = home_arc.clone();
+                std::thread::spawn(move || {
+                    handle(
+                        &h,
+                        &format!("agent-{i}"),
+                        &serde_json::json!({"action": "create", "title": format!("task-{i}")}),
+                    )
+                })
+            })
+            .collect();
+        let ids: Vec<String> = threads
+            .into_iter()
+            .map(|h| {
+                let r = h.join().expect("thread");
+                assert_eq!(r["status"], "created");
+                r["id"].as_str().expect("id").to_string()
+            })
+            .collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), 20, "all 20 task IDs must be unique, got: {ids:?}");
+        let tasks = list_all(&home);
+        assert_eq!(tasks.len(), 20);
+        std::fs::remove_dir_all(&home).ok();
     }
 }
