@@ -288,6 +288,29 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         })
         .ok();
 
+    // Periodic maintenance tick (10s) — mirrors daemon tick cadence.
+    // Only active in owned (non-attached) mode; when attached, the daemon
+    // process handles schedules, CI watches, and health decay.
+    let tick_rx = if !attached_mode {
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        std::thread::Builder::new()
+            .name("app_tick".into())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                if tx.send(()).is_err() {
+                    break;
+                }
+            })
+            .ok();
+        Some(rx)
+    } else {
+        None
+    };
+    // Never-ready channel used when attached_mode — select! needs a
+    // concrete Receiver but this arm will never fire.
+    let never_rx = crossbeam::channel::never::<()>();
+    let tick_rx_ref = tick_rx.as_ref().unwrap_or(&never_rx);
+
     loop {
         if crate::bootstrap::signals::term_requested() {
             tracing::info!("app: SIGTERM received, exiting main loop");
@@ -487,6 +510,23 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                         &wakeup_tx,
                     );
                     needs_resize = true;
+                }
+            }
+            recv(tick_rx_ref) -> _ => {
+                // Periodic maintenance — mirrors daemon tick consumers.
+                // Gated to owned mode via tick_rx (None in attached mode).
+                crate::daemon::cron_tick::check_schedules(&home, &registry);
+                crate::daemon::ci_watch::check_ci_watches(&home, &registry);
+                {
+                    let reg = crate::agent::lock_registry(&registry);
+                    for (_name, handle) in reg.iter() {
+                        if let Ok(mut core) = handle.core.lock() {
+                            core.health.maybe_decay();
+                            let agent_state = core.state.current;
+                            let silent = core.state.last_output.elapsed();
+                            core.health.check_hang(agent_state, silent);
+                        }
+                    }
                 }
             }
             default(std::time::Duration::from_millis(50)) => {
@@ -908,5 +948,68 @@ mod tests {
         );
         assert_eq!(pane.pending_notification_count, 1);
         std::fs::remove_dir_all(home).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression pins: app mode tick consumers (t-20260423022134)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn app_mode_fires_one_shot_schedule() {
+        // Write a one-shot schedule with past run_at directly to disk,
+        // call check_schedules, verify it fires (auto-disabled).
+        let home = tmp_home("sched-fire");
+        let registry: crate::agent::AgentRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
+        let store_json = serde_json::json!({
+            "schema_version": 2,
+            "schedules": [{
+                "id": "s-test-oneshot",
+                "message": "ping",
+                "target": "nonexistent-agent",
+                "trigger": {"kind": "once", "at": past},
+                "enabled": true,
+                "timezone": "UTC",
+                "label": "test-oneshot",
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339(),
+                "run_history": []
+            }]
+        });
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::write(
+            home.join("schedules.json"),
+            serde_json::to_string_pretty(&store_json).expect("serialize"),
+        )
+        .expect("write schedule file");
+
+        // Fire the tick — schedule is past due, should trigger.
+        crate::daemon::cron_tick::check_schedules(&home, &registry);
+
+        // Verify: schedule should now be disabled (one-shot auto-disable).
+        let store = crate::schedules::load(&home);
+        let sched = store.schedules.iter().find(|s| s.id == "s-test-oneshot");
+        assert!(
+            sched.is_some_and(|s| !s.enabled),
+            "one-shot schedule must be auto-disabled after firing"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn app_mode_health_decay_runs() {
+        // Verify health.maybe_decay() is callable on an agent handle —
+        // binding test that the tick consumer code path compiles and
+        // exercises the health decay method.
+        use crate::health::HealthTracker;
+        let mut health = HealthTracker::new();
+        // maybe_decay on a fresh tracker should not panic or change state.
+        health.maybe_decay();
+        assert_eq!(
+            health.state.display_name(),
+            "healthy",
+            "fresh tracker should remain healthy after decay tick"
+        );
     }
 }
