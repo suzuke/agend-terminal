@@ -344,9 +344,7 @@ fn run_core(
     };
 
     // Watchdog dry-run mode: log classifications without mutating health state.
-    let watchdog_dry_run = std::env::var("AGEND_WATCHDOG_DRY_RUN")
-        .map(|v| matches!(v.as_str(), "1" | "true"))
-        .unwrap_or(false);
+    let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
 
     // Main loop: event-driven via select on crash channel + periodic tick
     loop {

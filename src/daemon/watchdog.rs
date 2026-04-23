@@ -4,6 +4,13 @@ use crate::backend::Backend;
 use crate::health::HealthTracker;
 use std::path::Path;
 
+/// Parse `AGEND_WATCHDOG_DRY_RUN` env var. Returns true for "1"/"true"/"TRUE"/"True".
+pub fn watchdog_dry_run_from_env() -> bool {
+    std::env::var("AGEND_WATCHDOG_DRY_RUN")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false)
+}
+
 /// Run one watchdog pass for a single agent. Called from the daemon tick loop.
 ///
 /// - Classifies `screen` text against backend-specific error patterns.
@@ -135,5 +142,43 @@ mod tests {
         assert!(!log.contains("watchdog"), "healthy output must not write watchdog log");
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_watchdog_env_true_returns_true() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for val in ["1", "true", "TRUE", "True"] {
+            std::env::set_var("AGEND_WATCHDOG_DRY_RUN", val);
+            assert!(
+                super::watchdog_dry_run_from_env(),
+                "AGEND_WATCHDOG_DRY_RUN={val} should return true"
+            );
+        }
+        std::env::remove_var("AGEND_WATCHDOG_DRY_RUN");
+    }
+
+    #[test]
+    fn test_watchdog_env_false_returns_false() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for val in ["0", "false", "FALSE", "no", ""] {
+            std::env::set_var("AGEND_WATCHDOG_DRY_RUN", val);
+            assert!(
+                !super::watchdog_dry_run_from_env(),
+                "AGEND_WATCHDOG_DRY_RUN={val} should return false"
+            );
+        }
+        std::env::remove_var("AGEND_WATCHDOG_DRY_RUN");
+    }
+
+    #[test]
+    fn test_watchdog_env_unset_returns_false() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AGEND_WATCHDOG_DRY_RUN");
+        assert!(
+            !super::watchdog_dry_run_from_env(),
+            "unset AGEND_WATCHDOG_DRY_RUN should return false"
+        );
     }
 }
