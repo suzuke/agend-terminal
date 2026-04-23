@@ -85,12 +85,8 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agend-poll-{}-{}-{}",
-            std::process::id(),
-            tag,
-            id
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agend-poll-{}-{}-{}", std::process::id(), tag, id));
         std::fs::create_dir_all(&dir).ok();
         dir
     }
@@ -119,9 +115,17 @@ mod tests {
         use portable_pty::{CommandBuilder, PtySize};
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .expect("openpty");
-        let child = pair.slave.spawn_command(CommandBuilder::new("true")).expect("spawn");
+        let child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("true"))
+            .expect("spawn");
         let writer = pair.master.take_writer().expect("writer");
         let mut st = StateTracker::new(None);
         st.current = state;
@@ -185,7 +189,10 @@ mod tests {
         assert_eq!(v1.len(), 1);
 
         let v2 = collect_poll_reminders(&home, &registry);
-        assert!(v2.is_empty(), "second call with same count must be suppressed by dedup");
+        assert!(
+            v2.is_empty(),
+            "second call with same count must be suppressed by dedup"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -206,7 +213,11 @@ mod tests {
         seed_unread(&home, agent, 2);
         let v2 = collect_poll_reminders(&home, &registry);
         assert_eq!(v2.len(), 1, "count changed → should re-notify");
-        assert!(v2[0].1.contains("unread=5"), "must reflect new count, got: {}", v2[0].1);
+        assert!(
+            v2[0].1.contains("unread=5"),
+            "must reflect new count, got: {}",
+            v2[0].1
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
