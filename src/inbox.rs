@@ -1340,8 +1340,12 @@ mod tests {
 
         let writer = std::thread::spawn(move || {
             for i in 0..10 {
-                enqueue(&home_a, "agent1", make_msg(&format!("w{i}"), &format!("msg{i}")))
-                    .expect("enqueue");
+                enqueue(
+                    &home_a,
+                    "agent1",
+                    make_msg(&format!("w{i}"), &format!("msg{i}")),
+                )
+                .expect("enqueue");
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
