@@ -116,6 +116,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                 home,
                 target,
                 crate::inbox::InboxMessage {
+                    schema_version: 0,
                     from: "system:schedule".to_string(),
                     text: message.to_string(),
                     kind: Some("schedule".to_string()),
