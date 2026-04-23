@@ -189,11 +189,14 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
     home.join("inbox").join(format!("{name}.jsonl"))
 }
 
-/// Enqueue a message — atomic append via tmp + fsync + rename-over-append.
+/// Enqueue a message — atomic append via flock + tmp + fsync + rename.
 ///
 /// Returns an error when the inbox is in readonly mode (disk full).
 /// Callers should invoke [`check_disk_space`] periodically (e.g. daemon tick);
 /// enqueue only reads the cached flag.
+///
+/// Concurrent safety: a per-file flock on `{name}.jsonl.lock` serialises
+/// concurrent writers to the same agent inbox (cross-process safe).
 pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result<()> {
     if is_readonly() {
         anyhow::bail!("inbox readonly: disk space critically low");
@@ -211,6 +214,10 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
         std::fs::create_dir_all(parent)?;
     }
     let line = format!("{}\n", serde_json::to_string(&msg)?);
+
+    // Per-file flock serialises concurrent writers to the same agent inbox.
+    let lock_path = path.with_extension("jsonl.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)?;
 
     // Read existing content (if any), append new line, write atomically.
     let mut content = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1281,6 +1288,34 @@ mod tests {
         assert_eq!(
             describe_message(&home, "m-nonexistent"),
             MessageStatus::NotFound
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_enqueue_concurrent_same_agent() {
+        let home = tmp_home("concurrent-same");
+        let home_arc = std::sync::Arc::new(home.clone());
+        let mut handles = vec![];
+
+        for i in 0..20 {
+            let h = home_arc.clone();
+            handles.push(std::thread::spawn(move || {
+                enqueue(&h, "agent1", make_msg(&format!("t{i}"), &format!("msg{i}")))
+                    .expect("enqueue should succeed");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread should not panic");
+        }
+
+        let msgs = drain(&home, "agent1");
+        assert_eq!(
+            msgs.len(),
+            20,
+            "all 20 concurrent enqueues must survive, got {}",
+            msgs.len()
         );
 
         fs::remove_dir_all(&home).ok();
