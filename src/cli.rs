@@ -194,7 +194,9 @@ fn test_inbox(home: &Path) -> anyhow::Result<()> {
             inbox::InboxMessage {
                 schema_version: 0,
                 id: None,
-                read_at: None, thread_id: None, parent_id: None,
+                read_at: None,
+                thread_id: None,
+                parent_id: None,
                 from: format!("tester-{i}"),
                 text: format!("Message {i}"),
                 kind: None,
