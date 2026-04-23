@@ -2,7 +2,7 @@
 //! command palette, etc.). Key input flows through `handle_key` which mutates
 //! the overlay and surrounding state via `OverlayCtx`.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -598,11 +598,15 @@ pub(super) fn handle_key(
                 TaskBoardMode::Board => {
                     let columns = crate::render::task_board_columns(items);
                     match key.code {
-                        KeyCode::Left | KeyCode::Char('h') if *col > 0 => {
+                        KeyCode::Left | KeyCode::Char('h')
+                            if !key.modifiers.contains(KeyModifiers::SHIFT) && *col > 0 =>
+                        {
                             *col -= 1;
                             *row = (*row).min(columns[*col].len().saturating_sub(1));
                         }
-                        KeyCode::Right | KeyCode::Char('l') if *col < 3 => {
+                        KeyCode::Right | KeyCode::Char('l')
+                            if !key.modifiers.contains(KeyModifiers::SHIFT) && *col < 3 =>
+                        {
                             *col += 1;
                             *row = (*row).min(columns[*col].len().saturating_sub(1));
                         }
@@ -625,7 +629,10 @@ pub(super) fn handle_key(
                             };
                         }
                         // d — cancel task
-                        KeyCode::Char('d') if !columns[*col].is_empty() => {
+                        KeyCode::Char('d')
+                            if !key.modifiers.contains(KeyModifiers::SHIFT)
+                                && !columns[*col].is_empty() =>
+                        {
                             if let Some(task) = columns[*col].get(*row) {
                                 crate::tasks::handle(
                                     ctx.home,
@@ -642,7 +649,8 @@ pub(super) fn handle_key(
                             }
                         }
                         // D (Shift+D) — mark task done from any column
-                        KeyCode::Char('D') if !columns[*col].is_empty() => {
+                        // Match 'D' (legacy terminals) and 'd'+SHIFT (Kitty protocol)
+                        KeyCode::Char('D') | KeyCode::Char('d') if !columns[*col].is_empty() => {
                             if let Some(task) = columns[*col].get(*row) {
                                 crate::tasks::handle(
                                     ctx.home,
@@ -694,7 +702,10 @@ pub(super) fn handle_key(
                             };
                         }
                         // Shift+← / Shift+→ — move task status
-                        KeyCode::Char('H') if !columns[*col].is_empty() && *col > 0 => {
+                        // Match 'H' (legacy) and 'h'+SHIFT (Kitty protocol)
+                        KeyCode::Char('H') | KeyCode::Char('h')
+                            if !columns[*col].is_empty() && *col > 0 =>
+                        {
                             if let Some(task) = columns[*col].get(*row) {
                                 let update = match *col {
                                     1 => Some(("priority", "low")),   // Open → Backlog
@@ -715,7 +726,10 @@ pub(super) fn handle_key(
                                 }
                             }
                         }
-                        KeyCode::Char('L') if !columns[*col].is_empty() && *col < 3 => {
+                        // Match 'L' (legacy) and 'l'+SHIFT (Kitty protocol)
+                        KeyCode::Char('L') | KeyCode::Char('l')
+                            if !columns[*col].is_empty() && *col < 3 =>
+                        {
                             if let Some(task) = columns[*col].get(*row) {
                                 let update = match *col {
                                     0 => Some(("priority", "normal")), // Backlog → Open
@@ -876,6 +890,186 @@ mod tests {
         };
         handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
         assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn tmp_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-overlay-test-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn make_ctx<'a>(
+        home: &'a std::path::Path,
+        layout: &'a mut crate::layout::Layout,
+        registry: &'a crate::agent::AgentRegistry,
+        tx: &'a crossbeam::channel::Sender<usize>,
+        name_counter: &'a mut HashMap<String, usize>,
+        tg: &'a Option<Arc<dyn crate::channel::Channel>>,
+    ) -> OverlayCtx<'a> {
+        OverlayCtx {
+            layout,
+            registry,
+            home,
+            fleet_path: home,
+            wakeup_tx: tx,
+            name_counter,
+            telegram_state: tg,
+        }
+    }
+
+    /// Regression: Shift+L (Kitty protocol: 'l'+SHIFT) must update task
+    /// status and persist to tasks.json.
+    #[test]
+    fn task_board_l_updates_task_status_and_persists() {
+        let home = tmp_home("l_persist");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+        let mut layout = crate::layout::Layout::new();
+
+        // Create a task in Open column (priority=normal, status=open)
+        crate::tasks::handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "test", "priority": "normal"}),
+        );
+        let items = crate::tasks::list_all(&home);
+        let task_id = items[0].id.clone();
+
+        let mut overlay = Overlay::Tasks {
+            items,
+            col: 1,
+            row: 0,
+            mode: TaskBoardMode::Board,
+        };
+
+        // Kitty protocol: Shift+L → KeyCode::Char('l') + SHIFT
+        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);
+        handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
+
+        // Reload from disk — must be persisted
+        let reloaded = crate::tasks::list_all(&home);
+        let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
+        assert_eq!(task.status, "claimed", "L must persist status change");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Regression: Shift+D must mark task done from any column.
+    /// Tests both Kitty protocol ('d'+SHIFT) and legacy ('D') key events.
+    #[test]
+    fn task_board_shift_d_marks_done_from_any_column() {
+        for (label, key_event) in [
+            ("kitty", shift(KeyCode::Char('d'))),
+            ("legacy", press(KeyCode::Char('D'))),
+        ] {
+            let home = tmp_home(&format!("shift_d_{label}"));
+            let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+            let (tx, _rx) = crossbeam::channel::unbounded();
+            let mut name_counter = HashMap::new();
+            let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+            let mut layout = crate::layout::Layout::new();
+
+            crate::tasks::handle(
+                &home,
+                "user",
+                &serde_json::json!({"action": "create", "title": "t", "priority": "normal"}),
+            );
+            let items = crate::tasks::list_all(&home);
+            let task_id = items[0].id.clone();
+
+            let mut overlay = Overlay::Tasks {
+                items,
+                col: 1,
+                row: 0,
+                mode: TaskBoardMode::Board,
+            };
+
+            let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);
+            handle_key(&mut overlay, key_event, &mut ctx);
+
+            let reloaded = crate::tasks::list_all(&home);
+            let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
+            assert_eq!(task.status, "done", "Shift+D ({label}) must mark done");
+
+            std::fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    /// Regression: cursor index must resolve the correct task after
+    /// filter/sort. Shift+L on row N must move the Nth task in the
+    /// column, not a different one.
+    #[test]
+    fn task_board_cursor_resolves_correct_task_index() {
+        let home = tmp_home("cursor_resolve");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+        let mut layout = crate::layout::Layout::new();
+
+        // Create two tasks in Open column with different priorities
+        crate::tasks::handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "low-pri", "priority": "normal"}),
+        );
+        // Sleep >1s to guarantee distinct task IDs (second-level precision)
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        crate::tasks::handle(
+            &home,
+            "user",
+            &serde_json::json!({"action": "create", "title": "high-pri", "priority": "high"}),
+        );
+
+        let items = crate::tasks::list_all(&home);
+        assert_eq!(items.len(), 2);
+
+        // After sort: high-pri is row 0, low-pri is row 1
+        let cols = crate::render::task_board_columns(&items);
+        assert_eq!(cols[1][0].title, "high-pri");
+        assert_eq!(cols[1][1].title, "low-pri");
+        let high_id = cols[1][0].id.clone();
+
+        // Move cursor to row 0 (high-pri), press Shift+L
+        let mut overlay = Overlay::Tasks {
+            items,
+            col: 1,
+            row: 0,
+            mode: TaskBoardMode::Board,
+        };
+
+        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);
+        handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
+
+        // high-pri must have moved, low-pri must stay
+        let reloaded = crate::tasks::list_all(&home);
+        let high = reloaded.iter().find(|t| t.id == high_id).expect("high-pri");
+        assert_eq!(
+            high.status, "claimed",
+            "cursor row 0 must move high-pri task"
+        );
+        let low = reloaded
+            .iter()
+            .find(|t| t.title == "low-pri")
+            .expect("low-pri");
+        assert_eq!(low.status, "open", "low-pri must remain in Open");
+
         std::fs::remove_dir_all(&home).ok();
     }
 }
