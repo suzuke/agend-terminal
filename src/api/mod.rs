@@ -953,7 +953,8 @@ mod tests {
     #[test]
     fn dispatch_create_team_emits_team_created() {
         let (port, home, notifier, shutdown) = start_test_server("dispatch-team");
-        // CREATE_TEAM with no spawnable agents → spawned is empty → no event
+        // CREATE_TEAM with existing members (no spawns) now emits TeamCreated
+        // with the full member roster.
         let resp = api_request(
             port,
             &home,
@@ -963,14 +964,17 @@ mod tests {
             }),
         );
         assert_eq!(resp["ok"], true);
-        // CREATE_TEAM only emits TeamCreated when spawned is non-empty.
-        // With no fleet config and no backends, spawned will be empty.
         let events = notifier.take();
         assert_eq!(
             events.len(),
-            0,
-            "no event expected when spawned is empty, got {events:?}"
+            1,
+            "expected TeamCreated for existing members, got {events:?}"
         );
+        let ApiEvent::TeamCreated { name, members } = &events[0] else {
+            panic!("expected TeamCreated, got {:?}", events[0])
+        };
+        assert_eq!(name, "test-team");
+        assert_eq!(members, &["a", "b"]);
         stop_server(&shutdown, &home);
     }
 
@@ -978,8 +982,9 @@ mod tests {
     /// uses `true` (resolved via PATH — `/usr/bin/true` on macOS,
     /// `/bin/true` or `/usr/bin/true` on Linux) as a harmless real
     /// backend so `spawn_one` actually succeeds, exercising the
-    /// non-empty `spawned` branch of `handle_create_team` and proving
-    /// the `TeamCreated` emission path end-to-end.
+    /// spawn + emit path of `handle_create_team` end-to-end.
+    /// `TeamCreated.members` now carries the full roster (all_members),
+    /// not just spawned names.
     ///
     /// Context (see `LESSONS-04-21.md` open items): headless daemon mode
     /// passes `notifier = None`, so the emission block in
@@ -1520,9 +1525,9 @@ mod tests {
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["spawned"], json!([]));
         assert!(resp.get("failed").is_none(), "no failed field expected");
-        // No spawns → no TeamCreated event
+        // Empty team (no members) → no TeamCreated event
         let events = notifier.take();
-        assert_eq!(events.len(), 0, "zero-count should not emit TeamCreated");
+        assert_eq!(events.len(), 0, "empty team should not emit TeamCreated");
         stop_server(&shutdown, &home);
     }
 
@@ -1539,9 +1544,18 @@ mod tests {
         );
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["spawned"], json!([]));
-        // No spawns → no TeamCreated event
+        // Existing members now emit TeamCreated with full roster.
         let events = notifier.take();
-        assert_eq!(events.len(), 0, "no spawns should not emit TeamCreated");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected TeamCreated for existing members, got {events:?}"
+        );
+        let ApiEvent::TeamCreated { name, members } = &events[0] else {
+            panic!("expected TeamCreated, got {:?}", events[0])
+        };
+        assert_eq!(name, "ref-team");
+        assert_eq!(members, &["a", "b"]);
         stop_server(&shutdown, &home);
     }
 

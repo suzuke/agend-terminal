@@ -151,11 +151,11 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
     let result = crate::teams::create(ctx.home, &team_params);
 
     if let Some(n) = ctx.notifier {
-        if !spawned.is_empty() {
-            tracing::info!(team = team_name, members = ?spawned_names, "CREATE_TEAM emitting TeamCreated");
+        if !all_members.is_empty() {
+            tracing::info!(team = team_name, members = ?all_members, "CREATE_TEAM emitting TeamCreated");
             n.notify(ApiEvent::TeamCreated {
                 name: team_name.to_string(),
-                members: spawned_names.clone(),
+                members: all_members.clone(),
             });
         }
     }

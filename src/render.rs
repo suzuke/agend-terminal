@@ -1436,7 +1436,12 @@ pub fn render_tasks(
         }
         TaskBoardMode::Help => {
             let text = vec![
-                Line::from(Span::styled("Task Board Help", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    "Task Board Help",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from("───────────────"),
                 Line::from("  n           New task"),
                 Line::from("  ↑↓ / j k    Select task in column"),
@@ -1448,7 +1453,10 @@ pub fn render_tasks(
                 Line::from("  Enter       View task detail"),
                 Line::from("  Esc / q     Close Task Board"),
                 Line::from(""),
-                Line::from(Span::styled("Press ? or Esc to close help", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(
+                    "Press ? or Esc to close help",
+                    Style::default().fg(Color::DarkGray),
+                )),
             ];
             let h = (text.len() as u16 + 2).min(inner.height.saturating_sub(2));
             let w = 52u16.min(inner.width.saturating_sub(4));
@@ -1462,7 +1470,12 @@ pub fn render_tasks(
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
-                .title(Span::styled(" ? Help ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                .title(Span::styled(
+                    " ? Help ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
             let inner_popup = block.inner(popup);
             frame.render_widget(block, popup);
             frame.render_widget(Paragraph::new(text), inner_popup);
@@ -1773,18 +1786,14 @@ mod tests {
     #[test]
     fn main_tui_footer_shows_help_hint() {
         let backend = ratatui::backend::TestBackend::new(100, 3);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
         let layout = crate::layout::Layout::new();
         terminal
             .draw(|frame| {
-                render_status_bar(
-                    frame,
-                    frame.area(),
-                    &layout,
-                    TelegramStatus::NotConfigured,
-                );
+                render_status_bar(frame, frame.area(), &layout, TelegramStatus::NotConfigured);
             })
-            .unwrap();
+            .expect("test terminal draw should succeed");
         let buf = terminal.backend().buffer().clone();
         let mut text = String::new();
         for y in 0..buf.area.height {
@@ -1800,7 +1809,8 @@ mod tests {
 
     fn render_task_board_to_string(mode: &crate::app::TaskBoardMode) -> String {
         let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
         let tasks = vec![crate::tasks::Task {
             id: "t-1".into(),
             title: "test task".into(),
@@ -1817,7 +1827,7 @@ mod tests {
         }];
         terminal
             .draw(|frame| render_tasks(frame, &tasks, 0, 0, mode))
-            .unwrap();
+            .expect("test terminal draw should succeed");
         let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..buf.area.height {
