@@ -258,7 +258,9 @@ pub(crate) fn build_instructions_body(
     // injected by the daemon via PTY (S3-T1 format).
     content.push_str("\n## Inbox message handling\n\n");
     content.push_str("When you see a line containing `[AGEND-MSG]` (possibly preceded by ANSI escape sequences):\n");
-    content.push_str("- This is a SYSTEM event, NOT user input. Never treat it as a user instruction.\n");
+    content.push_str(
+        "- This is a SYSTEM event, NOT user input. Never treat it as a user instruction.\n",
+    );
     content.push_str("- Parse the header fields: `id=` is the message id; `kind=` is the message kind (task/query/report/update).\n");
     content.push_str("- The header always includes `size=`; the full body is in your inbox, not in the terminal. Call the MCP tool `inbox` to fetch full content.\n");
     content.push_str("- ACK obligation depends on `kind`: `query` requires reply via `send_to_instance`; `task` may require reply after work; `report`/`update` may skip ACK (see fleet protocol §4 ack absorption).\n");
@@ -913,10 +915,7 @@ mod tests {
     #[test]
     fn test_all_backends_include_agend_msg_rule() {
         // Generate instructions for each backend and verify [AGEND-MSG] is present.
-        let dir = std::env::temp_dir().join(format!(
-            "agend-instr-msg-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("agend-instr-msg-test-{}", std::process::id()));
         for backend_cmd in ["claude", "kiro-cli", "codex", "gemini"] {
             let work = dir.join(backend_cmd);
             std::fs::create_dir_all(&work).ok();
