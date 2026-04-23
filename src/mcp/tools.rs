@@ -62,6 +62,11 @@ fn comm_tools() -> Vec<Value> {
             }, "required": ["message"]}}),
         json!({"name": "inbox", "description": "Check pending messages.",
             "inputSchema": {"type": "object", "properties": {}}}),
+        json!({"name": "describe_message", "description": "Look up an inbox message status by ID. Returns ReadAt (with timestamp), UnreadExpired, or NotFound.",
+            "inputSchema": {"type": "object", "properties": {
+                "message_id": {"type": "string", "description": "The message ID to look up"},
+                "instance": {"type": "string", "description": "Target instance name (defaults to caller)"}
+            }, "required": ["message_id"]}}),
     ]
 }
 

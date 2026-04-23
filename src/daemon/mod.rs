@@ -441,6 +441,15 @@ fn run_core(
         check_schedules(home, &registry);
         check_ci_watches(home, &registry);
 
+        // Periodic inbox TTL sweep — every 60 ticks (≈1 hour at 1 tick/min)
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SWEEP_COUNTER: AtomicU64 = AtomicU64::new(0);
+            if SWEEP_COUNTER.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
+                crate::inbox::sweep_expired(home);
+            }
+        }
+
         // Hot-reload: poll fleet.yaml; spawn newly-added instances, warn on
         // changes we can't safely apply in-flight.
         if let Some(new_cfg) = fleet_watcher.check() {

@@ -357,6 +357,27 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             json!({"messages": messages})
         }
 
+        "describe_message" => {
+            let msg_id = match args["message_id"].as_str() {
+                Some(id) => id,
+                None => return json!({"error": "missing 'message_id'"}),
+            };
+            let target = args["instance"].as_str().unwrap_or(instance_name);
+            let _ = target; // describe_message scans all inbox files
+            let status = crate::inbox::describe_message(&home, msg_id);
+            match status {
+                crate::inbox::MessageStatus::ReadAt(t) => {
+                    json!({"status": "read", "read_at": t})
+                }
+                crate::inbox::MessageStatus::UnreadExpired => {
+                    json!({"status": "unread_expired"})
+                }
+                crate::inbox::MessageStatus::NotFound => {
+                    json!({"status": "not_found"})
+                }
+            }
+        }
+
         // --- Instance management ---
         "list_instances" => {
             match crate::api::call(&home, &json!({"method": crate::api::method::LIST})) {
