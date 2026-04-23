@@ -215,7 +215,7 @@ fn deploy_tools() -> Vec<Value> {
 
 fn ci_tools() -> Vec<Value> {
     vec![
-        json!({"name": "watch_ci", "description": "Watch GitHub Actions CI for a repo. When CI fails, the error log is automatically injected to this agent.",
+        json!({"name": "watch_ci", "description": "Watch GitHub Actions CI for a repo. When CI completes (success, failure, or any terminal state), a notification is automatically injected to this agent.",
             "inputSchema": {"type": "object", "properties": {
                 "repo": {"type": "string", "description": "GitHub repo (owner/repo)"},
                 "branch": {"type": "string", "description": "Branch to watch (default: main)"},

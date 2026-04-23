@@ -70,7 +70,28 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
     }
 }
 
-/// Fetch latest GitHub Actions run and inject failure info if new failure detected.
+/// Build the notification message for a CI run conclusion.
+/// Returns `None` for non-terminal states (in-progress / null conclusion).
+fn ci_notification_message(
+    repo: &str,
+    branch: &str,
+    conclusion: Option<&str>,
+    failure_detail: Option<&str>,
+) -> Option<String> {
+    let conclusion = conclusion?;
+    let msg = match conclusion {
+        "failure" => {
+            let detail = failure_detail.unwrap_or("unknown step");
+            format!("[ci-fail] {repo}@{branch}: {detail}\r")
+        }
+        "success" => format!("[ci-pass] {repo}@{branch}: passed ✓\r"),
+        other => format!("[ci-ended] {repo}@{branch}: {other}\r"),
+    };
+    Some(msg)
+}
+
+/// Fetch latest GitHub Actions run and notify the watching agent on any
+/// terminal conclusion (success, failure, cancelled, timed_out, etc.).
 async fn ci_check_repo(
     home: &Path,
     watch_path: &Path,
@@ -106,18 +127,76 @@ async fn ci_check_repo(
         None => return Ok(()),
     };
     let run_id = run["id"].as_u64().unwrap_or(0);
-    if run["conclusion"].as_str() != Some("failure") || Some(run_id) == last_run_id {
+
+    // Skip duplicate notifications for the same run.
+    if Some(run_id) == last_run_id {
         return Ok(());
     }
 
-    let jobs_resp: serde_json::Value = gh_get(&format!(
+    // conclusion is null while the run is in-progress; skip non-terminal states.
+    let conclusion = run["conclusion"].as_str();
+
+    // For failures, fetch job-level detail before building the message.
+    let failure_detail = if conclusion == Some("failure") {
+        Some(fetch_failure_summary(&gh_get, repo, run_id).await)
+    } else {
+        None
+    };
+
+    let msg = match ci_notification_message(repo, branch, conclusion, failure_detail.as_deref()) {
+        Some(m) => m,
+        None => return Ok(()), // in-progress
+    };
+
+    let reg = agent::lock_registry(registry);
+    if let Some(handle) = reg.get(instance) {
+        let _ = agent::inject_to_agent(handle, msg.as_bytes());
+    } else {
+        drop(reg);
+        let _ = crate::inbox::enqueue(
+            home,
+            instance,
+            crate::inbox::InboxMessage {
+                from: "system:ci".to_string(),
+                text: msg,
+                kind: Some("ci-watch".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+    }
+
+    // Update last_run_id for any terminal state to prevent re-notification.
+    if let Ok(content) = std::fs::read_to_string(watch_path) {
+        if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
+            watch["last_run_id"] = serde_json::json!(run_id);
+            let _ = std::fs::write(
+                watch_path,
+                serde_json::to_string_pretty(&watch).unwrap_or_default(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Fetch the first failed job+step name from a GitHub Actions run.
+async fn fetch_failure_summary(
+    gh_get: &impl Fn(&str) -> reqwest::RequestBuilder,
+    repo: &str,
+    run_id: u64,
+) -> String {
+    let jobs_resp: serde_json::Value = match gh_get(&format!(
         "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
     ))
     .send()
-    .await?
-    .json()
-    .await?;
-    let failure_summary = jobs_resp["jobs"]
+    .await
+    {
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(_) => return "unknown step".to_string(),
+        },
+        Err(_) => return "unknown step".to_string(),
+    };
+    jobs_resp["jobs"]
         .as_array()
         .and_then(|jobs| {
             jobs.iter().find_map(|job| {
@@ -134,35 +213,65 @@ async fn ci_check_repo(
                 })
             })
         })
-        .unwrap_or_else(|| "unknown step".to_string());
+        .unwrap_or_else(|| "unknown step".to_string())
+}
 
-    let msg = format!("[ci-fail] {repo} branch {branch}: {failure_summary}\r");
-    let reg = agent::lock_registry(registry);
-    if let Some(handle) = reg.get(instance) {
-        let _ = agent::inject_to_agent(handle, msg.as_bytes());
-    } else {
-        drop(reg);
-        let _ = crate::inbox::enqueue(
-            home,
-            instance,
-            crate::inbox::InboxMessage {
-                from: "system:ci".to_string(),
-                text: msg,
-                kind: Some("ci-fail".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            },
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ci_watch_success_notifies() {
+        let msg = ci_notification_message("owner/repo", "main", Some("success"), None);
+        assert_eq!(
+            msg.as_deref(),
+            Some("[ci-pass] owner/repo@main: passed ✓\r")
         );
     }
 
-    // Update last_run_id
-    if let Ok(content) = std::fs::read_to_string(watch_path) {
-        if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
-            watch["last_run_id"] = serde_json::json!(run_id);
-            let _ = std::fs::write(
-                watch_path,
-                serde_json::to_string_pretty(&watch).unwrap_or_default(),
-            );
-        }
+    #[test]
+    fn ci_watch_failure_includes_detail() {
+        let msg =
+            ci_notification_message("owner/repo", "main", Some("failure"), Some("Build / Test"));
+        assert_eq!(
+            msg.as_deref(),
+            Some("[ci-fail] owner/repo@main: Build / Test\r")
+        );
     }
-    Ok(())
+
+    #[test]
+    fn ci_watch_failure_without_detail_falls_back() {
+        let msg = ci_notification_message("owner/repo", "main", Some("failure"), None);
+        assert_eq!(
+            msg.as_deref(),
+            Some("[ci-fail] owner/repo@main: unknown step\r")
+        );
+    }
+
+    #[test]
+    fn ci_watch_in_progress_skipped() {
+        let msg = ci_notification_message("owner/repo", "main", None, None);
+        assert!(
+            msg.is_none(),
+            "in-progress (null conclusion) must be skipped"
+        );
+    }
+
+    #[test]
+    fn ci_watch_cancelled_notifies() {
+        let msg = ci_notification_message("owner/repo", "feat", Some("cancelled"), None);
+        assert_eq!(
+            msg.as_deref(),
+            Some("[ci-ended] owner/repo@feat: cancelled\r")
+        );
+    }
+
+    #[test]
+    fn ci_watch_timed_out_notifies() {
+        let msg = ci_notification_message("owner/repo", "main", Some("timed_out"), None);
+        assert_eq!(
+            msg.as_deref(),
+            Some("[ci-ended] owner/repo@main: timed_out\r")
+        );
+    }
 }
