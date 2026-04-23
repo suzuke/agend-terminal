@@ -47,10 +47,17 @@ impl NotifySource<'_> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxMessage {
+    #[serde(default)]
+    pub schema_version: u32,
     pub from: String,
     pub text: String,
     pub kind: Option<String>,
     pub timestamp: String,
+}
+
+impl InboxMessage {
+    /// Latest schema version this binary can read and write.
+    pub const CURRENT_VERSION: u32 = 1;
 }
 
 pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
@@ -58,7 +65,8 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
 }
 
 /// Enqueue a message — append one JSON line (atomic for small writes).
-pub fn enqueue(home: &Path, name: &str, msg: InboxMessage) -> anyhow::Result<()> {
+pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result<()> {
+    msg.schema_version = InboxMessage::CURRENT_VERSION;
     let path = inbox_path(home, name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -114,7 +122,18 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
     };
     let messages: Vec<InboxMessage> = content
         .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| {
+            let msg: InboxMessage = serde_json::from_str(l).ok()?;
+            if msg.schema_version > InboxMessage::CURRENT_VERSION {
+                tracing::error!(
+                    found = msg.schema_version,
+                    supported = InboxMessage::CURRENT_VERSION,
+                    "dropping inbox message written by newer schema version"
+                );
+                return None;
+            }
+            Some(msg)
+        })
         .collect();
     // Remove only AFTER a successful read+parse so crashes between read and
     // remove still leave the data on disk for the next drain to recover.
@@ -140,6 +159,7 @@ pub fn deliver(
         notify_agent(home, agent_name, source, text);
     } else {
         let msg = InboxMessage {
+            schema_version: 0,
             from: source.to_string(),
             text: text.to_string(),
             kind,
@@ -258,6 +278,7 @@ mod tests {
 
     fn make_msg(from: &str, text: &str) -> InboxMessage {
         InboxMessage {
+            schema_version: 0,
             from: from.to_string(),
             text: text.to_string(),
             kind: None,
@@ -377,6 +398,7 @@ mod tests {
     fn inbox_message_fields_preserved() {
         let home = tmp_home("fields");
         let msg = InboxMessage {
+            schema_version: 0,
             from: "sender".to_string(),
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
@@ -463,6 +485,7 @@ mod tests {
     #[test]
     fn inbox_message_serialization() {
         let msg = InboxMessage {
+            schema_version: 0,
             from: "test".to_string(),
             text: "hello \"world\"".to_string(),
             kind: None,
@@ -478,6 +501,7 @@ mod tests {
     fn inbox_message_with_special_chars() {
         let home = tmp_home("special");
         let msg = InboxMessage {
+            schema_version: 0,
             from: "user".to_string(),
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
@@ -679,5 +703,38 @@ mod tests {
             send_json["params"]["raw"].is_null(),
             "inject_with_submit path must NOT set raw (defaults to false → inject_to_agent)"
         );
+    }
+
+    #[test]
+    fn test_load_legacy_without_schema_version() {
+        let home = tmp_home("legacy-schema");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+        // Write a legacy JSONL line without schema_version field
+        let legacy_line = r#"{"from":"old-agent","text":"legacy msg","kind":null,"timestamp":"2025-01-01T00:00:00Z"}"#;
+        fs::write(inbox_dir.join("agent1.jsonl"), format!("{legacy_line}\n")).ok();
+        let msgs = drain(&home, "agent1");
+        assert_eq!(msgs.len(), 1, "legacy message must load successfully");
+        assert_eq!(msgs[0].schema_version, 0, "missing field defaults to 0");
+        assert_eq!(msgs[0].from, "old-agent");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_reject_future_schema_version() {
+        let home = tmp_home("future-schema");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+        let future_line = r#"{"schema_version":999,"from":"future","text":"nope","kind":null,"timestamp":"2099-01-01T00:00:00Z"}"#;
+        let current_line = r#"{"schema_version":1,"from":"ok","text":"yes","kind":null,"timestamp":"2025-01-01T00:00:00Z"}"#;
+        fs::write(
+            inbox_dir.join("agent1.jsonl"),
+            format!("{future_line}\n{current_line}\n"),
+        )
+        .ok();
+        let msgs = drain(&home, "agent1");
+        assert_eq!(msgs.len(), 1, "future-versioned message must be rejected");
+        assert_eq!(msgs[0].from, "ok", "current-versioned message must survive");
+        fs::remove_dir_all(&home).ok();
     }
 }

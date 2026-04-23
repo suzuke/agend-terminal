@@ -609,6 +609,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 &home,
                 name,
                 crate::inbox::InboxMessage {
+                    schema_version: 0,
                     from: "system:replace".to_string(),
                     text: format!("[handover] {handover}"),
                     kind: Some("handover".to_string()),
@@ -1880,6 +1881,7 @@ instances:
             &home,
             "sender",
             crate::inbox::InboxMessage {
+                schema_version: 0,
                 from: "user:test".to_string(),
                 text: "hello".to_string(),
                 kind: Some("telegram".to_string()),
@@ -1926,6 +1928,7 @@ instances:
             &home,
             "sender",
             crate::inbox::InboxMessage {
+                schema_version: 0,
                 from: "user:test".to_string(),
                 text: "burst".to_string(),
                 kind: Some("telegram".to_string()),

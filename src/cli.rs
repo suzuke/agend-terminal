@@ -192,6 +192,7 @@ fn test_inbox(home: &Path) -> anyhow::Result<()> {
             home,
             test_name,
             inbox::InboxMessage {
+                schema_version: 0,
                 from: format!("tester-{i}"),
                 text: format!("Message {i}"),
                 kind: None,
