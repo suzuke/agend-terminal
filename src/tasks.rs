@@ -81,8 +81,8 @@ pub fn evaluate_dependency_status(tasks: &[Task], task: &Task) -> String {
 
 /// Apply dependency evaluation to all tasks in a store, mutating statuses.
 /// Returns true if any status changed.
-fn apply_dependency_eval(tasks: &mut Vec<Task>) -> bool {
-    let snapshot: Vec<Task> = tasks.clone();
+fn apply_dependency_eval(tasks: &mut [Task]) -> bool {
+    let snapshot: Vec<Task> = tasks.to_vec();
     let mut changed = false;
     for task in tasks.iter_mut() {
         let effective = evaluate_dependency_status(&snapshot, task);
