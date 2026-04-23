@@ -689,7 +689,7 @@ instances:
   survivor:
     backend: claude
 "#;
-    std::fs::write(home.join("fleet.yaml"), fleet_yaml).unwrap();
+    std::fs::write(home.join("fleet.yaml"), fleet_yaml).expect("write fleet.yaml");
 
     let result = call_tool(&home, "delete_instance", &json!({"name": "zombie"}));
     assert!(
@@ -719,7 +719,7 @@ instances:
   survivor:
     backend: claude
 "#;
-    std::fs::write(home.join("fleet.yaml"), fleet_yaml).unwrap();
+    std::fs::write(home.join("fleet.yaml"), fleet_yaml).expect("write fleet.yaml");
 
     let result = call_tool(&home, "delete_instance", &json!({"name": "survivor"}));
     let err = result["error"].as_str().unwrap_or_default();
