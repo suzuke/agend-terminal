@@ -846,7 +846,12 @@ struct TelegramCreds {
 }
 
 fn resolve_channel() -> anyhow::Result<(TelegramCreds, crate::fleet::FleetConfig)> {
-    let home = crate::home_dir();
+    resolve_channel_from(&crate::home_dir())
+}
+
+fn resolve_channel_from(
+    home: &std::path::Path,
+) -> anyhow::Result<(TelegramCreds, crate::fleet::FleetConfig)> {
     let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))?;
     match &config.channel {
         Some(crate::fleet::ChannelConfig::Telegram {
@@ -949,7 +954,15 @@ fn telegram_reply_send_inner(
 /// this authority (e.g. S2d provenance per DESIGN §6) use
 /// [`try_telegram_reply_no_cleanup`] instead.
 pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
-    let (ch, config) = resolve_channel()?;
+    try_telegram_reply_from(&crate::home_dir(), instance_name, text)
+}
+
+fn try_telegram_reply_from(
+    home: &std::path::Path,
+    instance_name: &str,
+    text: &str,
+) -> anyhow::Result<(i32, i64)> {
+    let (ch, config) = resolve_channel_from(home)?;
     let topic_id = config
         .instances
         .get(instance_name)
@@ -957,7 +970,7 @@ pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i3
     match telegram_reply_send_inner(&ch, instance_name, topic_id, text) {
         Ok(msg_id) => Ok((msg_id, ch.group_id)),
         Err(e) => {
-            handle_send_failure(&e, &crate::home_dir(), instance_name, topic_id, None);
+            handle_send_failure(&e, home, instance_name, topic_id, None);
             Err(e)
         }
     }
@@ -981,7 +994,15 @@ pub fn try_telegram_reply_no_cleanup(
     instance_name: &str,
     text: &str,
 ) -> anyhow::Result<(i32, i64)> {
-    let (ch, config) = resolve_channel()?;
+    try_telegram_reply_no_cleanup_from(&crate::home_dir(), instance_name, text)
+}
+
+fn try_telegram_reply_no_cleanup_from(
+    home: &std::path::Path,
+    instance_name: &str,
+    text: &str,
+) -> anyhow::Result<(i32, i64)> {
+    let (ch, config) = resolve_channel_from(home)?;
     let topic_id = config
         .instances
         .get(instance_name)
@@ -1020,6 +1041,17 @@ pub(crate) fn format_provenance(from: &str, brief: &str) -> String {
 pub fn inject_provenance(target_instance: &str, from: &str, brief: &str) -> anyhow::Result<()> {
     let text = format_provenance(from, brief);
     try_telegram_reply_no_cleanup(target_instance, &text).map(|_| ())
+}
+
+#[cfg(test)]
+fn inject_provenance_from(
+    home: &std::path::Path,
+    target_instance: &str,
+    from: &str,
+    brief: &str,
+) -> anyhow::Result<()> {
+    let text = format_provenance(from, brief);
+    try_telegram_reply_no_cleanup_from(home, target_instance, &text).map(|_| ())
 }
 
 /// React to a message with an emoji.
@@ -2442,14 +2474,13 @@ instances:
             .expect("write topics.json");
 
         // Point the home resolver + satisfy the env-token check.
-        std::env::set_var("AGEND_HOME", &home);
         std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
 
         // Inject the exact topic-deleted error shape
         // `is_topic_deleted_error` matches on.
         set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
 
-        let res = inject_provenance("B", "sender", "do the thing");
+        let res = inject_provenance_from(&home, "B", "sender", "do the thing");
         assert!(
             res.is_err(),
             "inject_provenance should bubble the forced error"
@@ -2470,8 +2501,7 @@ instances:
             "provenance failure unregistered target's topic: {topics_json}"
         );
 
-        // Cleanup env to avoid bleeding into other tests.
-        std::env::remove_var("AGEND_HOME");
+        // Cleanup.
         std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2503,12 +2533,11 @@ instances:
         std::fs::write(home.join("channel").join("topics.json"), "{\"B\":42}")
             .expect("write topics.json");
 
-        std::env::set_var("AGEND_HOME", &home);
         std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
         set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
 
         // With cleanup: expect the fleet entry to be stripped.
-        let res = try_telegram_reply("B", "main-path send");
+        let res = try_telegram_reply_from(&home, "B", "main-path send");
         assert!(res.is_err());
 
         let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
@@ -2517,7 +2546,6 @@ instances:
             "baseline: cleanup-variant must strip B on topic-deleted; yaml was:\n{fleet_yaml}"
         );
 
-        std::env::remove_var("AGEND_HOME");
         std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
         std::fs::remove_dir_all(&home).ok();
     }
