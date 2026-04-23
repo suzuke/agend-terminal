@@ -435,14 +435,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                             })
                             .unwrap_or_default();
 
-                        std::thread::scope(|s| {
-                            for inst_name in &spawned {
-                                let h = &home;
-                                s.spawn(move || {
-                                    telegram::create_topic_for_instance(h, inst_name);
-                                });
-                            }
-                        });
+                        // Topic creation moved into handle_create_team so every
+                        // API-level team spawn covers it — no redundant call here.
 
                         // Background task injection (don't block MCP response)
                         if let Some(task_text) = task {
@@ -972,7 +966,10 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 tracing::warn!(error = %e, "failed to persist to fleet.yaml");
             }
-            let topic_id = crate::channel::telegram::create_topic_for_instance(home, name);
+            // handle_spawn now creates the topic and surfaces the id in
+            // its result; just pass it through. Keeps a single topic per
+            // spawn and removes the MCP-layer redundant call.
+            let topic_id = resp["result"]["topic_id"].as_i64();
             if let Some(task_text) = task {
                 let h = home.to_path_buf();
                 let n = name.to_string();

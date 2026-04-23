@@ -169,6 +169,13 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         size,
     ) {
         Ok(()) => {
+            // Every API-level spawn gets a Telegram forum topic (no-op
+            // when the channel isn't configured — resolve_channel_only
+            // returns Err and the helper returns None). Previously only
+            // the MCP `create_instance` wrappers called this, so
+            // deploy_template-spawned agents silently lacked topics.
+            let topic_id =
+                crate::channel::telegram::create_topic_for_instance(ctx.home, name);
             if let Some(n) = ctx.notifier {
                 let layout_hint = LayoutHint::parse(params["layout"].as_str().unwrap_or("tab"));
                 let spawner = params["spawner"]
@@ -193,7 +200,11 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
                     target_pane,
                 });
             }
-            json!({"ok": true, "result": {"name": name}})
+            let mut result = json!({"name": name});
+            if let Some(tid) = topic_id {
+                result["topic_id"] = json!(tid);
+            }
+            json!({"ok": true, "result": result})
         }
         Err(e) => json!({"ok": false, "error": format!("{e}")}),
     }
