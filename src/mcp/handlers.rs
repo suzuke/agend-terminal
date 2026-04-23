@@ -816,11 +816,11 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             std::fs::create_dir_all(&ci_dir).ok();
             let watch = json!({
                 "repo": repo, "branch": branch, "interval_secs": interval,
-                "instance": instance_name, "last_run_id": null
+                "instance": instance_name, "last_run_id": null, "head_sha": null
             });
-            let safe_name = repo.replace('/', "_");
+            let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
             let _ = std::fs::write(
-                ci_dir.join(format!("{safe_name}.json")),
+                ci_dir.join(&filename),
                 serde_json::to_string_pretty(&watch).unwrap_or_default(),
             );
             json!({"repo": repo, "watching": true})
@@ -830,8 +830,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(r) => r,
                 None => return json!({"error": "missing 'repo'"}),
             };
-            let safe_name = repo.replace('/', "_");
-            let path = home.join("ci-watches").join(format!("{safe_name}.json"));
+            let branch = args["branch"].as_str().unwrap_or("main");
+            let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
+            let path = home.join("ci-watches").join(&filename);
             let _ = std::fs::remove_file(&path);
             json!({"repo": repo, "watching": false})
         }
