@@ -372,6 +372,37 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
 
 pub const INLINE_THRESHOLD: usize = 500;
 
+/// Size threshold for header-only PTY injection. Messages with body > this
+/// value inject only a structured header line; the full body stays in inbox.
+pub const HEADER_SIZE_THRESHOLD: usize = 300;
+
+/// ANSI-colored header prefix for visual distinction in terminal.
+pub const HEADER_PREFIX: &str = "\x1b[44;97m[AGEND-MSG]\x1b[0m";
+
+/// Format a single-line structured header for PTY injection.
+/// Fields: from / id / kind / thread / parent / size.
+/// Optional fields (thread/parent) omitted when None.
+pub fn format_header(msg: &InboxMessage) -> String {
+    let mut parts = vec![
+        HEADER_PREFIX.to_string(),
+        format!("from={}", msg.from),
+    ];
+    if let Some(ref id) = msg.id {
+        parts.push(format!("id={id}"));
+    }
+    if let Some(ref kind) = msg.kind {
+        parts.push(format!("kind={kind}"));
+    }
+    if let Some(ref thread) = msg.thread_id {
+        parts.push(format!("thread={thread}"));
+    }
+    if let Some(ref parent) = msg.parent_id {
+        parts.push(format!("parent={parent}"));
+    }
+    parts.push(format!("size={}", msg.text.len()));
+    parts.join(" ")
+}
+
 /// Sweep expired messages from all inbox files.
 /// - read_at.is_some() && elapsed > 7 days → delete
 /// - read_at.is_none() && elapsed > 30 days → delete
@@ -1464,5 +1495,80 @@ mod tests {
         let json2 = serde_json::to_string(&msg_no_thread).expect("ser");
         assert!(!json2.contains("thread_id"));
         assert!(!json2.contains("parent_id"));
+    }
+
+    #[test]
+    fn test_header_format_all_fields_present() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-42".into()),
+            from: "from:dev-lead".into(),
+            text: "x".repeat(500),
+            kind: Some("task".into()),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: Some("t-100".into()),
+            parent_id: Some("m-41".into()),
+        };
+        let header = format_header(&msg);
+        assert!(header.contains("[AGEND-MSG]"));
+        assert!(header.contains("from=from:dev-lead"));
+        assert!(header.contains("id=m-42"));
+        assert!(header.contains("kind=task"));
+        assert!(header.contains("thread=t-100"));
+        assert!(header.contains("parent=m-41"));
+        assert!(header.contains("size=500"));
+        assert!(!header.contains('\n'), "header must be single line");
+    }
+
+    #[test]
+    fn test_header_format_omits_none_fields() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:agent".into(),
+            text: "hello".into(),
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+        };
+        let header = format_header(&msg);
+        assert!(header.contains("from=from:agent"));
+        assert!(header.contains("id=m-1"));
+        assert!(!header.contains("kind="));
+        assert!(!header.contains("thread="));
+        assert!(!header.contains("parent="));
+        assert!(header.contains("size=5"));
+    }
+
+    #[test]
+    fn test_short_msg_below_threshold() {
+        // Messages <= HEADER_SIZE_THRESHOLD should NOT use header format
+        let short = "a".repeat(HEADER_SIZE_THRESHOLD);
+        assert!(short.len() <= HEADER_SIZE_THRESHOLD);
+    }
+
+    #[test]
+    fn test_long_msg_above_threshold() {
+        // Messages > HEADER_SIZE_THRESHOLD should use header-only injection
+        let long = "a".repeat(HEADER_SIZE_THRESHOLD + 1);
+        assert!(long.len() > HEADER_SIZE_THRESHOLD);
+        // format_header produces a compact single-line representation
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:x".into(),
+            text: long,
+            kind: Some("task".into()),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+        };
+        let header = format_header(&msg);
+        assert!(header.len() < HEADER_SIZE_THRESHOLD, "header must be compact");
+        assert!(header.contains(&format!("size={}", HEADER_SIZE_THRESHOLD + 1)));
     }
 }

@@ -28,33 +28,35 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     if from == target {
         return json!({"ok": false, "error": "cannot send to self"});
     }
-    let _ = crate::inbox::enqueue(
-        ctx.home,
-        target,
-        crate::inbox::InboxMessage {
-            schema_version: 0,
-            id: None,
-            read_at: None, thread_id: None, parent_id: None,
-            from: format!("from:{from}"),
-            text: text.to_string(),
-            kind: params
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-        },
-    );
-    let display_text = if text.chars().count() > 200 {
-        format!(
-            "{}... (use inbox tool)",
-            text.chars().take(200).collect::<String>()
-        )
-    } else {
-        text.to_string()
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 0,
+        id: None,
+        read_at: None, thread_id: None, parent_id: None,
+        from: format!("from:{from}"),
+        text: text.to_string(),
+        kind: params
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        timestamp: chrono::Utc::now().to_rfc3339(),
     };
-    let inject_msg = format!(
-        "[from:{from}] {display_text} (Reply using send_to_instance MCP tool, NOT direct text)"
-    );
+    let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
+
+    let inject_msg = if text.len() > crate::inbox::HEADER_SIZE_THRESHOLD {
+        format!("{} (use inbox tool)", crate::inbox::format_header(&msg))
+    } else {
+        let display_text = if text.chars().count() > 200 {
+            format!(
+                "{}... (use inbox tool)",
+                text.chars().take(200).collect::<String>()
+            )
+        } else {
+            text.to_string()
+        };
+        format!(
+            "[from:{from}] {display_text} (Reply using send_to_instance MCP tool, NOT direct text)"
+        )
+    };
 
     let reg = agent::lock_registry(ctx.registry);
     if reg.contains_key(target) {
