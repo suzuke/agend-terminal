@@ -32,7 +32,19 @@ fn err_needs_identity(tool: &str) -> Value {
 }
 
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
-    let home = crate::home_dir();
+    handle_tool_with_home(tool, args, instance_name, &crate::home_dir())
+}
+
+/// Core implementation with explicit `home` path. Tests call this directly
+/// to avoid mutating the process-global `AGEND_HOME` env var, which races
+/// across parallel test threads on Windows.
+pub fn handle_tool_with_home(
+    tool: &str,
+    args: &Value,
+    instance_name: &str,
+    home: &std::path::Path,
+) -> Value {
+    let home = home.to_path_buf();
     // Explicit arg beats env var. Cross-instance arms require `Some`;
     // anonymous/standalone arms tolerate the empty `&str` view.
     let sender: Option<Sender> = Sender::new(instance_name).or_else(Sender::from_env);
@@ -1206,7 +1218,6 @@ instances:
     /// and the temp-home path so callers can clean up.
     fn setup_recorder(tag: &str) -> (Arc<Recorder>, std::path::PathBuf) {
         let home = tmp_home(tag);
-        std::env::set_var("AGEND_HOME", &home);
         // Minimal fleet so send_to's `get_submit_key` lookup resolves
         // (fallback path on unreachable daemon still needs submit_key).
         let yaml = "defaults:\n  backend: claude\ninstances:\n  target:\n    role: Test\n  sender:\n    role: Test\n";
@@ -1217,12 +1228,19 @@ instances:
         (rec, home)
     }
 
+    /// Test-local wrapper: calls `handle_tool_with_home` with explicit path,
+    /// avoiding the process-global `AGEND_HOME` env var race on Windows CI.
+    fn handle_tool_test(home: &std::path::Path, tool: &str, args: &Value, instance: &str) -> Value {
+        super::handle_tool_with_home(tool, args, instance, home)
+    }
+
     #[test]
     fn delegate_task_emits_fleet_event() {
         let _g = fleet_test_guard();
         let (rec, home) = setup_recorder("fleet_delegate");
 
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "delegate_task",
             &json!({"target_instance": "target", "task": "do the thing"}),
             "sender",
@@ -1251,8 +1269,6 @@ instances:
             }
             other => panic!("expected DelegateTask, got {other:?}"),
         }
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1264,7 +1280,8 @@ instances:
         // Pin: task_id must source from the `correlation_id` arg, not
         // any other string field. Use a distinctive value so a stray
         // field aliasing bug would fail the assert below.
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "report_result",
             &json!({
                 "target_instance": "target",
@@ -1298,8 +1315,6 @@ instances:
             }
             other => panic!("expected ReportResult, got {other:?}"),
         }
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1311,7 +1326,8 @@ instances:
         // Pin: empty `correlation_id` must collapse to None so the
         // renderer omits the id rather than showing "()" — filter-empty
         // is the specified normalization.
-        let _ = handle_tool(
+        let _ = handle_tool_test(
+            &home,
             "report_result",
             &json!({
                 "target_instance": "target",
@@ -1332,8 +1348,6 @@ instances:
             }
             other => panic!("expected ReportResult, got {other:?}"),
         }
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1342,7 +1356,8 @@ instances:
         let _g = fleet_test_guard();
         let (rec, home) = setup_recorder("fleet_decision");
 
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "post_decision",
             &json!({"title": "use X over Y", "content": "because Z"}),
             "sender",
@@ -1372,8 +1387,6 @@ instances:
             }
             other => panic!("expected PostDecision, got {other:?}"),
         }
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1388,7 +1401,8 @@ instances:
         // Anonymous call — `instance_name` empty, no env fallback.
         // Decisions module itself must still succeed (anonymous contract),
         // only fleet mirroring is suppressed. Pin: absence of emission.
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "post_decision",
             &json!({"title": "anon call", "content": "no author"}),
             "",
@@ -1403,8 +1417,6 @@ instances:
             events.is_empty(),
             "anonymous post_decision must NOT emit: {events:?}"
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1417,7 +1429,8 @@ instances:
         // `sender` out before computing the recipient set. Pin: the
         // emitted `recipients` field comes from the filtered `sent`
         // vec, NOT from the raw `args["targets"]`.
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "broadcast",
             &json!({
                 "message": "heads up",
@@ -1446,8 +1459,6 @@ instances:
             }
             other => panic!("expected Broadcast, got {other:?}"),
         }
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1459,7 +1470,8 @@ instances:
         // `targets: ["sender"]` — all recipients are the sender itself,
         // so the self-filter leaves `sent` empty. Pin: skip-emit on
         // empty fan-out so fleet_binding isn't spammed with "a → *0".
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "broadcast",
             &json!({
                 "message": "alone",
@@ -1474,8 +1486,6 @@ instances:
             events.is_empty(),
             "empty-recipient broadcast must NOT emit: {events:?}"
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1491,7 +1501,8 @@ instances:
         // send_to_instance takes `instance_name` (or `target`), not
         // `target_instance` — use the real arg shape so the negative
         // pin actually exercises the success path.
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "send_to_instance",
             &json!({"instance_name": "target", "message": "hi"}),
             "sender",
@@ -1506,8 +1517,6 @@ instances:
             events.is_empty(),
             "send_to_instance must NOT emit FleetEvent (design §8 exclusion): {events:?}"
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1519,7 +1528,8 @@ instances:
         let _g = fleet_test_guard();
         let (rec, home) = setup_recorder("fleet_request_info_excluded");
 
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "request_information",
             &json!({"target_instance": "target", "question": "what is X?"}),
             "sender",
@@ -1534,8 +1544,6 @@ instances:
             events.is_empty(),
             "request_information must NOT emit FleetEvent (design §8 exclusion): {events:?}"
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1564,7 +1572,8 @@ instances:
         let _g = fleet_test_guard();
         let (rec, home) = setup_recorder("fleet_prov_main_clean");
 
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "delegate_task",
             &json!({"target_instance": "target", "task": "do the thing"}),
             "sender",
@@ -1602,8 +1611,6 @@ instances:
             "unexpected event variant: {:?}",
             events[0]
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1626,7 +1633,8 @@ instances:
         let _g = fleet_test_guard();
         let (_rec, home) = setup_recorder("fleet_prov_warn");
 
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "delegate_task",
             &json!({"target_instance": "target", "task": "do the thing"}),
             "sender",
@@ -1641,8 +1649,6 @@ instances:
             logs_contain("S2d provenance injection failed"),
             "DESIGN §4 Q4 warn record was not emitted",
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1656,7 +1662,8 @@ instances:
         let (_rec, home) = setup_recorder("waiting_on_set");
 
         // Set waiting_on
-        let result = handle_tool(
+        let result = handle_tool_test(
+            &home,
             "set_waiting_on",
             &json!({"condition": "review from at-dev-4"}),
             "sender",
@@ -1681,7 +1688,7 @@ instances:
         );
 
         // Clear
-        let result = handle_tool("set_waiting_on", &json!({"condition": ""}), "sender");
+        let result = handle_tool_test(&home, "set_waiting_on", &json!({"condition": ""}), "sender");
         assert_eq!(result["cleared"], true);
         let meta: Value = serde_json::from_str(
             &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
@@ -1695,8 +1702,6 @@ instances:
             meta["waiting_on_since"].is_null(),
             "waiting_on_since must be null after clear"
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1706,14 +1711,10 @@ instances:
         let (_rec, home) = setup_recorder("heartbeat_rec");
 
         // Any tool call should record heartbeat
-        let _ = handle_tool("inbox", &json!({}), "sender");
+        let _ = handle_tool_test(&home, "inbox", &json!({}), "sender");
 
-        // Resolve meta_path from home_dir() *after* the tool call — on
-        // Windows CI, parallel tests can mutate AGEND_HOME between
-        // setup_recorder's set_var and handle_tool's home_dir() read.
-        // Using home_dir() here matches wherever handle_tool actually wrote.
-        let actual_home = crate::home_dir();
-        let meta_path = actual_home.join("metadata/sender.json");
+        // Metadata written to explicit test home by handle_tool_test.
+        let meta_path = home.join("metadata/sender.json");
         let meta: Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).expect("read meta"))
                 .expect("parse meta — atomic write must produce valid JSON");
@@ -1725,12 +1726,7 @@ instances:
             chrono::DateTime::parse_from_rfc3339(hb).is_ok(),
             "last_heartbeat must be valid RFC3339: {hb}"
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
-        if actual_home != home {
-            std::fs::remove_dir_all(&actual_home).ok();
-        }
     }
 
     #[test]
@@ -1739,19 +1735,16 @@ instances:
         let (_rec, home) = setup_recorder("waiting_on_merge");
 
         // Set waiting_on
-        let _ = handle_tool(
+        let _ = handle_tool_test(
+            &home,
             "set_waiting_on",
             &json!({"condition": "delegation result"}),
             "sender",
         );
 
-        // Resolve home after tool call — parallel tests can shift AGEND_HOME
-        // on Windows CI (same class as PR #65).
-        let actual_home = crate::home_dir();
-
-        // Simulate what list_instances does: merge_metadata into agent info
+        // Use the explicit test home — no env var dependency.
         let mut info = json!({"name": "sender", "agent_state": "thinking"});
-        merge_metadata(&actual_home, "sender", &mut info);
+        merge_metadata(&home, "sender", &mut info);
         assert_eq!(
             info["waiting_on"], "delegation result",
             "merge_metadata must surface waiting_on"
@@ -1764,12 +1757,7 @@ instances:
             info["last_heartbeat"].as_str().is_some(),
             "merge_metadata must surface last_heartbeat"
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
-        if actual_home != home {
-            std::fs::remove_dir_all(&actual_home).ok();
-        }
     }
 
     #[test]
@@ -1795,7 +1783,12 @@ instances:
         let (_rec, home) = setup_recorder("waiting_on_anon");
         // Ensure no Sender resolves from env either
         std::env::remove_var("AGEND_INSTANCE_NAME");
-        let result = handle_tool("set_waiting_on", &json!({"condition": "whatever"}), "");
+        let result = handle_tool_test(
+            &home,
+            "set_waiting_on",
+            &json!({"condition": "whatever"}),
+            "",
+        );
         assert!(
             result["error"].is_string(),
             "must err on anonymous caller: {result}"
@@ -1805,7 +1798,6 @@ instances:
             !home.join("metadata/.json").exists(),
             "no metadata written for anon caller"
         );
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1836,8 +1828,6 @@ instances:
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["kind"], "telegram");
         assert_eq!(arr[0]["msg_id"], "42");
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1866,7 +1856,7 @@ instances:
             },
         );
 
-        let _ = handle_tool("inbox", &json!({}), "sender");
+        let _ = handle_tool_test(&home, "inbox", &json!({}), "sender");
 
         let events = rec.snapshot();
         let pickups: Vec<_> = events
@@ -1878,8 +1868,6 @@ instances:
             assert_eq!(origin_msg.id, "99");
             assert_eq!(agent, "sender");
         }
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1912,7 +1900,7 @@ instances:
             },
         );
 
-        let _ = handle_tool("inbox", &json!({}), "sender");
+        let _ = handle_tool_test(&home, "inbox", &json!({}), "sender");
 
         let events = rec.snapshot();
         let pickups: Vec<_> = events
@@ -1946,8 +1934,6 @@ instances:
             meta["pending_pickup_ids"].is_null(),
             "pending_pickup_ids must be cleared after drain"
         );
-
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 }
