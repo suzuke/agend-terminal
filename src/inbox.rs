@@ -435,6 +435,19 @@ pub fn format_header(msg: &InboxMessage) -> String {
     parts.join(" ")
 }
 
+/// Format a single-line event header (non-message events like poll-reminder).
+/// Uses the same ANSI prefix as [`format_header`] for visual consistency.
+pub fn format_event_header(kind: &str, fields: &[(&str, &str)]) -> String {
+    let mut parts = vec![
+        HEADER_PREFIX.to_string(),
+        format!("kind={}", sanitize_header_value(kind)),
+    ];
+    for (k, v) in fields {
+        parts.push(format!("{}={}", k, sanitize_header_value(v)));
+    }
+    parts.join(" ")
+}
+
 /// Sweep expired messages from all inbox files.
 /// - read_at.is_some() && elapsed > 7 days → delete
 /// - read_at.is_none() && elapsed > 30 days → delete
