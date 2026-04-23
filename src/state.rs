@@ -410,6 +410,7 @@ impl StatePatterns {
 /// in [`StatePatterns::for_backend`].
 ///
 /// Stacking dep: production caller wired in S2-T4 (daemon watchdog).
+#[allow(dead_code, clippy::collapsible_match)]
 pub fn classify_pty_output(
     backend: &crate::backend::Backend,
     output: &str,
@@ -2190,7 +2191,9 @@ mod tests {
             (
                 "claude_429.txt",
                 &Backend::ClaudeCode,
-                Some(BlockedReason::RateLimit { retry_after_secs: None }),
+                Some(BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                }),
             ),
             (
                 "claude_quota.txt",
@@ -2200,7 +2203,9 @@ mod tests {
             (
                 "kiro_throttle.txt",
                 &Backend::KiroCli,
-                Some(BlockedReason::RateLimit { retry_after_secs: None }),
+                Some(BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                }),
             ),
             (
                 "kiro_quota.txt",
@@ -2224,8 +2229,8 @@ mod tests {
             ),
         ];
 
-        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/backend_error_fixtures");
+        let fixture_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/backend_error_fixtures");
 
         for (file, backend, expected) in fixtures {
             let path = fixture_dir.join(file);
