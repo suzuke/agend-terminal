@@ -890,6 +890,8 @@ mod tests {
                     kind: Some("schedule_replay".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     read_at: None,
+                    thread_id: None,
+                    parent_id: None,
                 },
             );
         }

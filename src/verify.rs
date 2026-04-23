@@ -287,7 +287,7 @@ fn test_inbox(home: &Path) -> TestResult {
             inbox::InboxMessage {
                 schema_version: 0,
                 id: None,
-                read_at: None,
+                read_at: None, thread_id: None, parent_id: None,
                 from: format!("test-{i}"),
                 text: format!("msg {i}"),
                 kind: None,
