@@ -31,6 +31,18 @@ fn err_needs_identity(tool: &str) -> Value {
     })
 }
 
+#[allow(dead_code)]
+fn is_discord(home: &std::path::Path) -> bool {
+    #[cfg(feature = "discord")]
+    {
+        if let Ok(config) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
+            return matches!(config.channel, Some(crate::fleet::ChannelConfig::Discord { .. }));
+        }
+    }
+    let _ = home;
+    false
+}
+
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let home = crate::home_dir();
     // Explicit arg beats env var. Cross-instance arms require `Some`;
@@ -55,6 +67,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             tracing::info!(from = %instance_name, %text, "reply");
             let fleet_path = home.join("fleet.yaml");
             if fleet_path.exists() {
+                #[cfg(feature = "discord")]
+                if is_discord(&home) {
+                    return match crate::channel::discord::try_discord_reply(instance_name, text) {
+                        Ok((msg_id, ch_id)) => json!({"message_id": msg_id, "chat_id": ch_id}),
+                        Err(e) => json!({"error": format!("{e}")}),
+                    };
+                }
                 match telegram::try_telegram_reply(instance_name, text) {
                     Ok((msg_id, chat_id)) => json!({
                         "message_id": msg_id.to_string(),
@@ -69,6 +88,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "react" => {
             let emoji = args["emoji"].as_str().unwrap_or("");
             let message_id = args["message_id"].as_str();
+            #[cfg(feature = "discord")]
+            if is_discord(&home) {
+                return match crate::channel::discord::try_discord_react(instance_name, emoji, message_id) {
+                    Ok(()) => json!({"emoji": emoji}),
+                    Err(e) => json!({"error": format!("{e}")}),
+                };
+            }
             match telegram::try_telegram_react(instance_name, emoji, message_id) {
                 Ok(()) => json!({"emoji": emoji}),
                 Err(e) => json!({"error": format!("{e}")}),
@@ -83,6 +109,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(t) => t,
                 None => return json!({"error": "missing 'text'"}),
             };
+            #[cfg(feature = "discord")]
+            if is_discord(&home) {
+                return match crate::channel::discord::try_discord_edit(instance_name, message_id, text) {
+                    Ok(()) => json!({"message_id": message_id}),
+                    Err(e) => json!({"error": format!("{e}")}),
+                };
+            }
             match telegram::try_telegram_edit(instance_name, message_id, text) {
                 Ok(()) => json!({"message_id": message_id}),
                 Err(e) => json!({"error": format!("{e}")}),
@@ -93,6 +126,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(f) => f,
                 None => return json!({"error": "missing 'file_id'"}),
             };
+            #[cfg(feature = "discord")]
+            if is_discord(&home) {
+                return match crate::channel::discord::try_discord_download(instance_name, file_id) {
+                    Ok(path) => json!({"path": path}),
+                    Err(e) => json!({"error": format!("{e}")}),
+                };
+            }
             match telegram::try_download_attachment(instance_name, file_id) {
                 Ok(path) => json!({"path": path}),
                 Err(e) => json!({"error": format!("{e}")}),

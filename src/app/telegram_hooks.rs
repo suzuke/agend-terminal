@@ -25,7 +25,17 @@ pub(super) fn telegram_status_from_config(
                 render::TelegramStatus::NoToken
             }
         }
-        None => render::TelegramStatus::NotConfigured,
+        #[cfg(feature = "discord")]
+        Some(crate::fleet::ChannelConfig::Discord {
+            ref bot_token_env, ..
+        }) => {
+            if std::env::var(bot_token_env).is_ok() {
+                render::TelegramStatus::Connected
+            } else {
+                render::TelegramStatus::NoToken
+            }
+        }
+        _ => render::TelegramStatus::NotConfigured,
     }
 }
 
@@ -78,3 +88,5 @@ pub(super) fn maybe_delete_telegram_topic(
         }
     });
 }
+
+

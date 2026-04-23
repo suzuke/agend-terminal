@@ -37,6 +37,8 @@ pub mod event;
 pub mod sink_registry;
 pub mod telegram;
 pub mod ux_event;
+#[cfg(feature = "discord")]
+pub mod discord;
 
 pub use binding::BindingRef;
 pub use caps::{ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint, RateBudget};

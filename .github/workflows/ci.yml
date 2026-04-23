@@ -52,6 +52,9 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Check without discord
+        run: cargo check --no-default-features
+
       - name: Unit tests
         run: cargo test --bin agend-terminal
 

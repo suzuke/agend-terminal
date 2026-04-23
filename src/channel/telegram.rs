@@ -320,7 +320,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
     let text = match msg.text() {
         Some(t) => t,
-        None => return,
+        _ => return,
     };
 
     let sender_id: Option<i64> = msg.from.as_ref().map(|u| u.id.0 as i64);
@@ -642,13 +642,16 @@ pub fn init_from_config(
     home: &Path,
     submit_keys: HashMap<String, String>,
 ) -> Option<Arc<Mutex<TelegramState>>> {
-    let ChannelConfig::Telegram {
+    let Some(ChannelConfig::Telegram {
         bot_token_env,
         group_id,
         user_allowlist,
         fleet_binding,
         ..
-    } = config.channel.as_ref()?;
+    }) = config.channel.as_ref()
+    else {
+        return None;
+    };
     let token = match std::env::var(bot_token_env) {
         Ok(t) => t,
         Err(_) => {
@@ -864,7 +867,7 @@ fn resolve_channel() -> anyhow::Result<(TelegramCreds, crate::fleet::FleetConfig
                 config,
             ))
         }
-        None => anyhow::bail!("No Telegram channel configured"),
+        _ => anyhow::bail!("No Telegram channel configured"),
     }
 }
 
@@ -1183,7 +1186,7 @@ fn notify_telegram_inner(
             ),
             Err(_) => return,
         },
-        None => return,
+        _ => return,
     };
 
     let text = text.to_string();
@@ -1464,7 +1467,7 @@ impl crate::channel::Channel for TelegramChannel {
         let home = lock_state(&self.state).home.clone();
         match create_topic_for_instance(&home, name) {
             Some(tid) => Ok(TelegramBindingPayload { topic_id: tid }.into_binding()),
-            None => anyhow::bail!("create_topic_for_instance returned None for {name}"),
+            _ => anyhow::bail!("create_topic_for_instance returned None for {name}"),
         }
     }
 
