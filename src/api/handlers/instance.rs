@@ -280,3 +280,200 @@ pub(crate) fn handle_move_pane(params: &Value, ctx: &HandlerCtx) -> Value {
     );
     json!({"ok": true})
 }
+
+pub(crate) fn handle_set_blocked_reason(params: &Value, ctx: &HandlerCtx) -> Value {
+    let name = match params["name"].as_str() {
+        Some(n) => n,
+        None => return json!({"ok": false, "error": "missing 'name'"}),
+    };
+    let reason_str = match params["reason"].as_str() {
+        Some(r) => r,
+        None => return json!({"ok": false, "error": "missing 'reason'"}),
+    };
+    let reason = match reason_str {
+        "rate_limit" => crate::health::BlockedReason::RateLimit {
+            retry_after_secs: params["retry_after_secs"].as_u64(),
+        },
+        "quota_exceeded" => crate::health::BlockedReason::QuotaExceeded,
+        "awaiting_operator" => crate::health::BlockedReason::AwaitingOperator,
+        "permission_prompt" => crate::health::BlockedReason::PermissionPrompt,
+        "hang" => crate::health::BlockedReason::Hang,
+        "crash" => crate::health::BlockedReason::Crash,
+        _ => return json!({"ok": false, "error": format!("unknown reason: {reason_str}")}),
+    };
+    let reg = agent::lock_registry(ctx.registry);
+    match reg.get(name) {
+        Some(handle) => {
+            if let Ok(mut core) = handle.core.lock() {
+                let state = core.state.get_state().display_name().to_string();
+                core.health.set_blocked_reason(reason);
+                json!({"ok": true, "status": "reason_set", "reason": reason_str, "current_state": state})
+            } else {
+                json!({"ok": false, "error": "agent core lock failed"})
+            }
+        }
+        None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
+    }
+}
+
+pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> Value {
+    let name = match params["name"].as_str() {
+        Some(n) => n,
+        None => return json!({"ok": false, "error": "missing 'name'"}),
+    };
+    let filter_reason = params["reason"].as_str();
+    let reg = agent::lock_registry(ctx.registry);
+    match reg.get(name) {
+        Some(handle) => {
+            if let Ok(mut core) = handle.core.lock() {
+                let was = core.health.current_reason.as_ref().map(|r| {
+                    serde_json::to_value(r).unwrap_or_default()
+                });
+                // If a reason filter is specified, only clear if it matches
+                if let Some(filter) = filter_reason {
+                    let matches = core.health.current_reason.as_ref().map_or(false, |r| {
+                        let kind = match r {
+                            crate::health::BlockedReason::RateLimit { .. } => "rate_limit",
+                            crate::health::BlockedReason::QuotaExceeded => "quota_exceeded",
+                            crate::health::BlockedReason::AwaitingOperator => "awaiting_operator",
+                            crate::health::BlockedReason::PermissionPrompt => "permission_prompt",
+                            crate::health::BlockedReason::Hang => "hang",
+                            crate::health::BlockedReason::Crash => "crash",
+                        };
+                        kind == filter
+                    });
+                    if !matches {
+                        return json!({"ok": false, "error": "reason mismatch", "current": was});
+                    }
+                }
+                core.health.clear_blocked_reason();
+                json!({"ok": true, "status": "cleared", "instance": name, "was": was})
+            } else {
+                json!({"ok": false, "error": "agent core lock failed"})
+            }
+        }
+        None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn test_ctx_with_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
+        let home = Box::new(
+            std::env::temp_dir().join(format!("agend-api-inst-test-{}-{}", name, std::process::id())),
+        );
+        std::fs::create_dir_all(home.as_ref()).ok();
+
+        // Leak the registries so they live for 'static — acceptable in tests.
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+
+        // Spawn a real shell agent so the registry has an entry with a HealthTracker.
+        let spawn_cfg = agent::SpawnConfig {
+            name,
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        agent::spawn_agent(&spawn_cfg, registry).expect("spawn test agent");
+
+        let home_ref: &'static std::path::Path = Box::leak(home.clone());
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        (ctx, home)
+    }
+
+    fn cleanup_agent(ctx: &HandlerCtx, name: &str) {
+        let reg = agent::lock_registry(ctx.registry);
+        if let Some(h) = reg.get(name) {
+            let _ = crate::sync::lock_poisoned(&h.child, "test_child").kill();
+        }
+    }
+
+    #[test]
+    fn test_report_health_sets_reason_on_caller() {
+        let (ctx, _home) = test_ctx_with_agent("health-set");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let result = handle_set_blocked_reason(
+            &json!({"name": "health-set", "reason": "rate_limit", "retry_after_secs": 60}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["status"], "reason_set");
+        assert_eq!(result["reason"], "rate_limit");
+
+        // Verify the reason is actually set on the HealthTracker
+        let reg = agent::lock_registry(ctx.registry);
+        let handle = reg.get("health-set").expect("agent exists");
+        let core = handle.core.lock().expect("lock");
+        assert!(core.health.current_reason.is_some());
+        match &core.health.current_reason {
+            Some(crate::health::BlockedReason::RateLimit { retry_after_secs }) => {
+                assert_eq!(*retry_after_secs, Some(60));
+            }
+            other => panic!("expected RateLimit, got {:?}", other),
+        }
+        drop(core);
+        drop(reg);
+
+        cleanup_agent(&ctx, "health-set");
+    }
+
+    #[test]
+    fn test_clear_blocked_reason_by_operator() {
+        let (ctx, _home) = test_ctx_with_agent("health-clear");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // First set a reason
+        let set_result = handle_set_blocked_reason(
+            &json!({"name": "health-clear", "reason": "quota_exceeded"}),
+            &ctx,
+        );
+        assert_eq!(set_result["ok"], true);
+
+        // Clear it
+        let clear_result = handle_clear_blocked_reason(
+            &json!({"name": "health-clear"}),
+            &ctx,
+        );
+        assert_eq!(clear_result["ok"], true);
+        assert_eq!(clear_result["status"], "cleared");
+        assert_eq!(clear_result["instance"], "health-clear");
+        // "was" should contain the previous reason
+        assert!(clear_result["was"].is_object());
+
+        // Verify it's actually cleared
+        let reg = agent::lock_registry(ctx.registry);
+        let handle = reg.get("health-clear").expect("agent exists");
+        let core = handle.core.lock().expect("lock");
+        assert!(core.health.current_reason.is_none());
+        drop(core);
+        drop(reg);
+
+        cleanup_agent(&ctx, "health-clear");
+    }
+}

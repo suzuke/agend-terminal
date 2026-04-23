@@ -14,6 +14,7 @@ pub fn tool_definitions() -> Value {
     tools.extend(repo_tools());
     tools.extend(deploy_tools());
     tools.extend(ci_tools());
+    tools.extend(health_tools());
     json!({"tools": tools})
 }
 
@@ -230,6 +231,22 @@ fn ci_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "repo": {"type": "string"}
             }, "required": ["repo"]}}),
+    ]
+}
+
+fn health_tools() -> Vec<Value> {
+    vec![
+        json!({"name": "report_health", "description": "Report a health condition (rate limit, quota exceeded, etc.) on the calling agent. Prevents false hang detection.",
+            "inputSchema": {"type": "object", "properties": {
+                "reason": {"type": "string", "enum": ["rate_limit", "quota_exceeded", "awaiting_operator"], "description": "Blocked reason kind"},
+                "retry_after_secs": {"type": "integer", "description": "Seconds until retry (for rate_limit)"},
+                "note": {"type": "string", "description": "Optional human-readable note"}
+            }, "required": ["reason"]}}),
+        json!({"name": "clear_blocked_reason", "description": "Clear a blocked reason on a specific instance. Used by operators to resume after quota refill etc.",
+            "inputSchema": {"type": "object", "properties": {
+                "instance": {"type": "string", "description": "Target instance name"},
+                "reason": {"type": "string", "description": "Only clear if current reason matches (optional)"}
+            }, "required": ["instance"]}}),
     ]
 }
 
