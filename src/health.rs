@@ -540,7 +540,10 @@ mod tests {
 
         // Dry-run: do NOT call set_blocked_reason
         // (in production, daemon checks AGEND_WATCHDOG_DRY_RUN)
-        assert!(h.current_reason.is_none(), "dry-run must not mutate health state");
+        assert!(
+            h.current_reason.is_none(),
+            "dry-run must not mutate health state"
+        );
 
         // check_hang should still fire (no reason set)
         assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
@@ -583,6 +586,9 @@ mod tests {
         h.set_blocked_reason(BlockedReason::QuotaExceeded);
         assert!(h.current_reason.is_some());
         h.reset();
-        assert!(h.current_reason.is_none(), "reset must clear current_reason");
+        assert!(
+            h.current_reason.is_none(),
+            "reset must clear current_reason"
+        );
     }
 }
