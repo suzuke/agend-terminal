@@ -169,6 +169,55 @@ pub(crate) fn load(home: &Path) -> ScheduleStore {
     )
 }
 
+/// Scan for enabled one-shot schedules whose `run_at` is in the past.
+/// Schedules missed by ≤24h are returned for replay; older ones are
+/// discarded with a warn log. All matched schedules are disabled.
+pub fn replay_missed_oneshots(home: &Path) -> Vec<Schedule> {
+    let now = chrono::Utc::now();
+    let cutoff = now - chrono::Duration::hours(24);
+    let mut to_replay = Vec::new();
+
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
+        for sched in store.schedules.iter_mut() {
+            if !sched.enabled {
+                continue;
+            }
+            let at = match &sched.trigger {
+                Trigger::Once { at } => at.clone(),
+                Trigger::Cron { .. } => continue,
+            };
+            let at_utc = match chrono::DateTime::parse_from_rfc3339(&at) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            };
+            if at_utc >= now {
+                continue; // not missed yet
+            }
+            sched.enabled = false;
+            sched.updated_at = now.to_rfc3339();
+            if at_utc < cutoff {
+                tracing::warn!(
+                    id = %sched.id,
+                    run_at = %at,
+                    "dropping stale one-shot schedule (>24h past)"
+                );
+                sched.run_history.push(ScheduleRun {
+                    triggered_at: now.to_rfc3339(),
+                    status: "stale_dropped".to_string(),
+                });
+            } else {
+                sched.run_history.push(ScheduleRun {
+                    triggered_at: now.to_rfc3339(),
+                    status: "replayed".to_string(),
+                });
+                to_replay.push(sched.clone());
+            }
+        }
+        Ok(())
+    });
+    to_replay
+}
+
 /// Flip a schedule's `enabled` to false. Used by the daemon after a
 /// one-shot fires so the row stays in the store for audit but will not
 /// retrigger.
@@ -688,6 +737,105 @@ mod tests {
         // And the `cron` field must be gone / `trigger` present.
         assert!(on_disk.contains("\"trigger\""), "post-save: {on_disk}");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_replay_missed_oneshot_on_load() {
+        let home = tmp_home("replay_missed");
+        // Seed a one-shot that fired 1 hour ago (within 24h window)
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let store = serde_json::json!({
+            "schema_version": 2,
+            "schedules": [{
+                "id": "s-missed",
+                "trigger": {"kind": "once", "at": past},
+                "message": "replay me",
+                "target": "agent1",
+                "label": "test",
+                "timezone": "UTC",
+                "enabled": true,
+                "created_by": "test",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "run_history": []
+            }]
+        });
+        std::fs::write(home.join("schedules.json"), store.to_string()).ok();
+
+        let replayed = replay_missed_oneshots(&home);
+        assert_eq!(replayed.len(), 1, "missed one-shot within 24h must be replayed");
+        assert_eq!(replayed[0].id, "s-missed");
+        assert_eq!(replayed[0].message, "replay me");
+
+        // Schedule must be disabled after replay
+        let listed = list(&home, &serde_json::json!({}));
+        assert_eq!(listed["schedules"][0]["enabled"], false);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_drop_stale_oneshot() {
+        let home = tmp_home("stale_drop");
+        // Seed a one-shot that fired 48 hours ago (beyond 24h cutoff)
+        let stale = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        let store = serde_json::json!({
+            "schema_version": 2,
+            "schedules": [{
+                "id": "s-stale",
+                "trigger": {"kind": "once", "at": stale},
+                "message": "too old",
+                "target": "agent1",
+                "label": null,
+                "timezone": "UTC",
+                "enabled": true,
+                "created_by": "test",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "run_history": []
+            }]
+        });
+        std::fs::write(home.join("schedules.json"), store.to_string()).ok();
+
+        let replayed = replay_missed_oneshots(&home);
+        assert!(replayed.is_empty(), "stale one-shot (>24h) must NOT be replayed");
+
+        // Schedule must still be disabled
+        let listed = list(&home, &serde_json::json!({}));
+        assert_eq!(listed["schedules"][0]["enabled"], false);
+        // run_history should record stale_dropped
+        let history = listed["schedules"][0]["run_history"].as_array().expect("arr");
+        assert_eq!(history[0]["status"], "stale_dropped");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_cron_not_replayed() {
+        let home = tmp_home("cron_skip");
+        let store = serde_json::json!({
+            "schema_version": 2,
+            "schedules": [{
+                "id": "s-cron",
+                "trigger": {"kind": "cron", "expr": "0 9 * * *"},
+                "message": "daily",
+                "target": "agent1",
+                "label": null,
+                "timezone": "UTC",
+                "enabled": true,
+                "created_by": "test",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "run_history": []
+            }]
+        });
+        std::fs::write(home.join("schedules.json"), store.to_string()).ok();
+
+        let replayed = replay_missed_oneshots(&home);
+        assert!(replayed.is_empty(), "cron schedules must NOT be replayed");
+
+        // Cron schedule must remain enabled
+        let listed = list(&home, &serde_json::json!({}));
+        assert_eq!(listed["schedules"][0]["enabled"], true);
         std::fs::remove_dir_all(&home).ok();
     }
 }
