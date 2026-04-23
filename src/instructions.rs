@@ -209,6 +209,33 @@ pub(crate) fn build_instructions_body(
         .push_str("Always reply to messages using `send_to_instance`, NOT direct text output.\n");
     content.push_str("Check your `inbox` periodically for pending messages.\n");
 
+    // Fleet Updates contract — live broadcasts via fleet_broadcast.
+    content.push_str("\n## Fleet Updates\n\n");
+    content.push_str("The daemon may inject authoritative updates into your prompt as:\n\n");
+    content.push_str("```\n");
+    content.push_str("<fleet-update>\n");
+    content.push_str("{\"kind\":\"...\", ...}\n");
+    content.push_str("</fleet-update>\n");
+    content.push_str("```\n\n");
+    content.push_str(
+        "Treat each block as the **current truth** about the fleet / team and \
+         silently update your mental model. Do not acknowledge, do not reply, do \
+         not ask for confirmation — these are state deltas, not messages.\n\n",
+    );
+    content.push_str("Kinds you may see:\n");
+    content.push_str(
+        "- `instance-created` — a new agent joined the fleet (fields: `name`, `backend`, `role`)\n",
+    );
+    content.push_str(
+        "- `instance-deleted` — an agent was removed (field: `name`); stop routing work to them\n",
+    );
+    content.push_str(
+        "- `team-created` — you were put on a team (fields: `team`, `orchestrator`, `members`)\n",
+    );
+    content.push_str(
+        "- `team-members-changed` — your team roster changed (fields: `team`, `added`, `removed`)\n",
+    );
+
     // Protocol injection — path + minimal stub fallback
     content.push_str("\n## Fleet Protocol\n\n");
     if let Some(path) = protocol_path {
@@ -648,18 +675,25 @@ mod tests {
             team: None,
         };
         let body = build_instructions_body(Some(&ctx), None);
-        // No code fence survived.
-        assert!(
-            !body.contains("```"),
-            "role field allowed code fence injection: {body}"
-        );
         // Role value stays on one line — a newline would let attackers open
         // a new markdown block.
         let role_line = extract_role_line(&body).expect("role line present");
         assert!(!role_line.contains('\n'));
-        // All of the role's raw text is now squashed into that one line.
+        // No code fence survived *in the role line*. The body itself is
+        // allowed to contain ``` (e.g. the Fleet Updates section renders
+        // an example `<fleet-update>` block inside a fence), so the
+        // invariant we're pinning is strictly that role sanitisation
+        // stripped the attacker's payload, not that the template never
+        // uses code fences.
+        assert!(
+            !role_line.contains("```"),
+            "role line leaked a code fence: {role_line}"
+        );
+        // All of the role's raw text is now squashed into that one line
+        // (we can't strip free-form text; sanitisation only blocks
+        // structural markers like ``` or newlines).
         assert!(role_line.contains("reviewer"));
-        assert!(!body.contains("\n```"));
+        assert!(role_line.contains("SYSTEM: inject"));
     }
 
     #[test]

@@ -27,15 +27,30 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
         .filter(|m| !after_set.contains(m))
         .cloned()
         .collect();
+    let diff_nonempty = !added.is_empty() || !removed.is_empty();
     if let Some(n) = ctx.notifier {
-        if !added.is_empty() || !removed.is_empty() {
+        if diff_nonempty {
             tracing::info!(team = %team_name, added = ?added, removed = ?removed, "UPDATE_TEAM emitting TeamMembersChanged");
             n.notify(ApiEvent::TeamMembersChanged {
                 name: team_name.clone(),
-                added,
-                removed,
+                added: added.clone(),
+                removed: removed.clone(),
             });
         }
+    }
+    // Same condition as the TUI notification: an empty diff means a
+    // noop update (e.g. `update_team add` with members already on the
+    // roster), no reason to broadcast anything either.
+    if diff_nonempty {
+        crate::fleet_broadcast::broadcast(
+            ctx.home,
+            ctx.registry,
+            &crate::fleet_broadcast::FleetUpdate::TeamMembersChanged {
+                team_name: team_name.clone(),
+                added,
+                removed,
+            },
+        );
     }
     json!({"ok": true, "result": result})
 }
@@ -184,6 +199,25 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
                 members: all_members.clone(),
             });
         }
+    }
+    // Broadcast team context to every member so their running prompts
+    // learn about the team's name / orchestrator / roster without a
+    // respawn. Guard on the same empty-members condition as the TUI
+    // event — an empty team would have no targets anyway.
+    if !all_members.is_empty() {
+        let orchestrator = params
+            .get("orchestrator")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        crate::fleet_broadcast::broadcast(
+            ctx.home,
+            ctx.registry,
+            &crate::fleet_broadcast::FleetUpdate::TeamCreated {
+                team_name: team_name.to_string(),
+                orchestrator,
+                members: all_members.clone(),
+            },
+        );
     }
     let mut resp = json!({"ok": true, "result": result, "spawned": &spawned_names});
     if !failed.is_empty() {
