@@ -792,10 +792,12 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                 target,
                 crate::inbox::InboxMessage {
                     schema_version: 0,
+                    id: None,
                     from: "system:schedule".to_string(),
                     text: message.to_string(),
                     kind: Some("schedule_replay".to_string()),
                     timestamp: now.to_rfc3339(),
+                    read_at: None,
                 },
             );
         }
