@@ -342,6 +342,11 @@ fn run_core(
         rx
     };
 
+    // Watchdog dry-run mode: log classifications without mutating health state.
+    let watchdog_dry_run = std::env::var("AGEND_WATCHDOG_DRY_RUN")
+        .map(|v| matches!(v.as_str(), "1" | "true"))
+        .unwrap_or(false);
+
     // Main loop: event-driven via select on crash channel + periodic tick
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -382,6 +387,33 @@ fn run_core(
                             silent = ?silent,
                             "hang detected"
                         );
+                    }
+                }
+            }
+        }
+
+        // Watchdog: classify PTY output → BlockedReason
+        {
+            let reg = agent::lock_registry(&registry);
+            for (name, handle) in reg.iter() {
+                let backend = match crate::backend::Backend::from_command(&handle.backend_command) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                if let Ok(mut core) = handle.core.lock() {
+                    let rows = core.vterm.rows() as usize;
+                    let screen = core.vterm.tail_lines(rows);
+                    if let Some(reason) = crate::state::classify_pty_output(&backend, &screen) {
+                        if watchdog_dry_run {
+                            crate::event_log::log(
+                                home,
+                                "watchdog_dry_run",
+                                name,
+                                &format!("{reason:?}"),
+                            );
+                        } else {
+                            core.health.set_blocked_reason(reason);
+                        }
                     }
                 }
             }

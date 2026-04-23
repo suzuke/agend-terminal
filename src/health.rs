@@ -527,4 +527,52 @@ mod tests {
             assert_eq!(parsed, reason, "round-trip failed for {json}");
         }
     }
+
+    #[test]
+    fn test_watchdog_dry_run_logs_but_no_state_change() {
+        // Simulate dry-run: classify returns Some(RateLimit), but we only log, don't set.
+        let mut h = HealthTracker::new();
+        let backend = crate::backend::Backend::ClaudeCode;
+        let output = "Error: 429 overloaded";
+        let reason = crate::state::classify_pty_output(&backend, output);
+        assert!(reason.is_some(), "should classify as blocked");
+
+        // Dry-run: do NOT call set_blocked_reason
+        // (in production, daemon checks AGEND_WATCHDOG_DRY_RUN)
+        assert!(h.current_reason.is_none(), "dry-run must not mutate health state");
+
+        // check_hang should still fire (no reason set)
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+    }
+
+    #[test]
+    fn test_watchdog_live_sets_reason() {
+        // Simulate live mode: classify returns Some, set_blocked_reason called.
+        let mut h = HealthTracker::new();
+        let backend = crate::backend::Backend::KiroCli;
+        let output = "ThrottlingError: Too Many Requests";
+        if let Some(reason) = crate::state::classify_pty_output(&backend, output) {
+            h.set_blocked_reason(reason);
+        }
+        assert!(
+            matches!(h.current_reason, Some(BlockedReason::RateLimit { .. })),
+            "live mode must set current_reason, got: {:?}",
+            h.current_reason
+        );
+        // check_hang should be suppressed
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+    }
+
+    #[test]
+    fn test_watchdog_ignores_classify_none() {
+        // Healthy output → classify returns None → no change.
+        let mut h = HealthTracker::new();
+        let backend = crate::backend::Backend::ClaudeCode;
+        let output = "Thinking about your request...";
+        let reason = crate::state::classify_pty_output(&backend, output);
+        assert!(reason.is_none(), "healthy output should not classify");
+        assert!(h.current_reason.is_none());
+        // check_hang still works normally
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+    }
 }
