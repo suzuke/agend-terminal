@@ -68,6 +68,10 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
                 core.state.update_heartbeat(age);
             }
 
+            // Expire stale latched states (ToolUse/Thinking) that feed()
+            // can't reach when the agent goes quiet (no PTY output).
+            core.state.tick();
+
             // §4.4 stale decay: clear waiting_on when heartbeat is stale.
             clear_waiting_on_if_stale(home, &name, !core.state.is_heartbeat_fresh());
 
