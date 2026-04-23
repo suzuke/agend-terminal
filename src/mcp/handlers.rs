@@ -377,6 +377,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             }
         }
 
+        "describe_thread" => {
+            let thread_id = match args["thread_id"].as_str() {
+                Some(id) => id,
+                None => return json!({"error": "missing 'thread_id'"}),
+            };
+            let instance = args["instance"].as_str();
+            let msgs = crate::inbox::get_thread(&home, thread_id, instance);
+            json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
+        }
+
         // --- Instance management ---
         "list_instances" => {
             match crate::api::call(&home, &json!({"method": crate::api::method::LIST})) {
