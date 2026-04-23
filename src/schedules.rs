@@ -764,7 +764,11 @@ mod tests {
         std::fs::write(home.join("schedules.json"), store.to_string()).ok();
 
         let replayed = replay_missed_oneshots(&home);
-        assert_eq!(replayed.len(), 1, "missed one-shot within 24h must be replayed");
+        assert_eq!(
+            replayed.len(),
+            1,
+            "missed one-shot within 24h must be replayed"
+        );
         assert_eq!(replayed[0].id, "s-missed");
         assert_eq!(replayed[0].message, "replay me");
 
@@ -798,13 +802,18 @@ mod tests {
         std::fs::write(home.join("schedules.json"), store.to_string()).ok();
 
         let replayed = replay_missed_oneshots(&home);
-        assert!(replayed.is_empty(), "stale one-shot (>24h) must NOT be replayed");
+        assert!(
+            replayed.is_empty(),
+            "stale one-shot (>24h) must NOT be replayed"
+        );
 
         // Schedule must still be disabled
         let listed = list(&home, &serde_json::json!({}));
         assert_eq!(listed["schedules"][0]["enabled"], false);
         // run_history should record stale_dropped
-        let history = listed["schedules"][0]["run_history"].as_array().expect("arr");
+        let history = listed["schedules"][0]["run_history"]
+            .as_array()
+            .expect("arr");
         assert_eq!(history[0]["status"], "stale_dropped");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -895,7 +904,9 @@ mod tests {
         let listed = list(&home, &serde_json::json!({}));
         assert_eq!(listed["schedules"][0]["enabled"], false);
         // run_history should record "replayed"
-        let history = listed["schedules"][0]["run_history"].as_array().expect("arr");
+        let history = listed["schedules"][0]["run_history"]
+            .as_array()
+            .expect("arr");
         assert_eq!(history[0]["status"], "replayed");
 
         std::fs::remove_dir_all(&home).ok();

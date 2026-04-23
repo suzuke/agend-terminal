@@ -285,7 +285,9 @@ fn test_inbox(home: &Path) -> TestResult {
             home,
             test_name,
             inbox::InboxMessage {
-                schema_version: 0, id: None, read_at: None,
+                schema_version: 0,
+                id: None,
+                read_at: None,
                 from: format!("test-{i}"),
                 text: format!("msg {i}"),
                 kind: None,

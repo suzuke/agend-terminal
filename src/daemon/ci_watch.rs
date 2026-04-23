@@ -197,7 +197,9 @@ async fn ci_check_repo(
             home,
             instance,
             crate::inbox::InboxMessage {
-                schema_version: 0, id: None, read_at: None,
+                schema_version: 0,
+                id: None,
+                read_at: None,
                 from: "system:ci".to_string(),
                 text: msg,
                 kind: Some("ci-watch".to_string()),
@@ -377,10 +379,7 @@ mod tests {
         // When a watch file exists and the PR is terminal, the file
         // should be removed. We test the update_watch_state + remove
         // flow by verifying the file lifecycle.
-        let dir = std::env::temp_dir().join(format!(
-            "agend-ci-test-merged-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("agend-ci-test-merged-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("ci-watches")).ok();
         let watch_path = dir.join("ci-watches").join("test.json");
         std::fs::write(
@@ -392,7 +391,10 @@ mod tests {
 
         // Simulate PR terminal → auto-clear
         let _ = std::fs::remove_file(&watch_path);
-        assert!(!watch_path.exists(), "watcher file must be removed on PR terminal");
+        assert!(
+            !watch_path.exists(),
+            "watcher file must be removed on PR terminal"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -411,6 +413,9 @@ mod tests {
 
         // Different branches of same repo must differ
         let f4 = watch_filename("owner/repo", "feat");
-        assert_ne!(f1, f4, "different branches must produce different filenames");
+        assert_ne!(
+            f1, f4,
+            "different branches must produce different filenames"
+        );
     }
 }

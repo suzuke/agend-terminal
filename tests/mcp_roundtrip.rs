@@ -563,11 +563,18 @@ fn test_describe_message_mcp() {
         // describe_message with a nonexistent ID → not_found
         r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"describe_message","arguments":{"message_id":"m-nonexistent"}}}"#,
     ]);
-    assert!(responses.len() >= 4, "expected 4 responses, got {}", responses.len());
+    assert!(
+        responses.len() >= 4,
+        "expected 4 responses, got {}",
+        responses.len()
+    );
 
     // describe_message for nonexistent ID should return not_found
     let desc_result = extract_tool_result(&responses[3]);
-    assert_eq!(desc_result["status"], "not_found", "nonexistent message should be not_found, got: {desc_result}");
+    assert_eq!(
+        desc_result["status"], "not_found",
+        "nonexistent message should be not_found, got: {desc_result}"
+    );
 }
 
 #[test]
@@ -588,21 +595,31 @@ fn test_sweep_expired_removes_old_read_messages() {
     std::fs::write(
         inbox_dir.join("test-agent.jsonl"),
         format!("{old_read}\n{fresh_unread}\n"),
-    ).expect("write test inbox");
+    )
+    .expect("write test inbox");
 
     // Use MCP to describe both messages
-    let responses = mcp_session_in_home(&home, &[
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe_message","arguments":{"message_id":"m-old-read"}}}"#,
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe_message","arguments":{"message_id":"m-fresh-unread"}}}"#,
-    ]);
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe_message","arguments":{"message_id":"m-old-read"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe_message","arguments":{"message_id":"m-fresh-unread"}}}"#,
+        ],
+    );
     assert!(responses.len() >= 3);
 
     let old_result = extract_tool_result(&responses[1]);
-    assert_eq!(old_result["status"], "read", "old read message should report 'read', got: {old_result}");
+    assert_eq!(
+        old_result["status"], "read",
+        "old read message should report 'read', got: {old_result}"
+    );
 
     let fresh_result = extract_tool_result(&responses[2]);
-    assert_eq!(fresh_result["status"], "not_found", "fresh unread should be 'not_found', got: {fresh_result}");
+    assert_eq!(
+        fresh_result["status"], "not_found",
+        "fresh unread should be 'not_found', got: {fresh_result}"
+    );
 
     let _ = std::fs::remove_dir_all(&home);
 }
