@@ -3,6 +3,7 @@
 
 pub(crate) mod ci_watch;
 pub(crate) mod cron_tick;
+pub(crate) mod poll_reminder;
 pub(crate) mod supervisor;
 mod tui_bridge;
 pub(crate) mod watchdog;
@@ -481,6 +482,18 @@ fn run_core(
             {
                 crate::inbox::sweep_expired(home);
                 crate::inbox::check_disk_space(home);
+            }
+        }
+
+        // Poll-reminder: nudge idle agents with unread inbox (every 30 ticks)
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static POLL_COUNTER: AtomicU64 = AtomicU64::new(0);
+            if POLL_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(30)
+            {
+                poll_reminder::poll_reminder_pass(home, &registry);
             }
         }
 

@@ -372,6 +372,31 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
 
 pub const INLINE_THRESHOLD: usize = 500;
 
+/// Count unread messages (read_at == None) for an agent.
+pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
+    let path = inbox_path(home, name);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (0, None),
+    };
+    let mut count = 0usize;
+    let mut oldest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for line in content.lines() {
+        if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
+            if msg.read_at.is_none() {
+                count += 1;
+                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp) {
+                    let ts_utc = ts.with_timezone(&chrono::Utc);
+                    if oldest.is_none() || oldest.unwrap() > ts_utc {
+                        oldest = Some(ts_utc);
+                    }
+                }
+            }
+        }
+    }
+    (count, oldest)
+}
+
 /// Size threshold for header-only PTY injection. Messages with body > this
 /// value inject only a structured header line; the full body stays in inbox.
 pub const HEADER_SIZE_THRESHOLD: usize = 300;
