@@ -1206,6 +1206,10 @@ instances:
     /// and the temp-home path so callers can clean up.
     fn setup_recorder(tag: &str) -> (Arc<Recorder>, std::path::PathBuf) {
         let home = tmp_home(tag);
+        // Still set AGEND_HOME for sub-calls inside handle_tool_with_home
+        // that read home_dir() (e.g. get_submit_key fallback, inbox ops).
+        // Safe: fleet_test_guard serializes these tests, and the cross-module
+        // racers (instructions.rs, telegram.rs) no longer set AGEND_HOME.
         std::env::set_var("AGEND_HOME", &home);
         // Minimal fleet so send_to's `get_submit_key` lookup resolves
         // (fallback path on unreachable daemon still needs submit_key).
