@@ -302,6 +302,12 @@ fn run_core(
 
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
 
+    // Replay missed one-shot schedules from before daemon was down.
+    // Must run once at startup, before the tick loop, so missed one-shots
+    // fire exactly once. The tick loop's check_schedules handles future
+    // one-shots and recurring crons.
+    replay_missed_at_startup(home, &registry);
+
     let mut last_snapshot_json = String::new();
 
     // Hot-reload watcher: poll fleet.yaml mtime on each tick. `known_digest`
@@ -740,6 +746,51 @@ fn apply_fleet_reload(
     }
 
     *known_digest = new_digest;
+}
+
+/// Replay missed one-shot schedules on daemon startup.
+/// Calls `schedules::replay_missed_oneshots` and fires each returned
+/// schedule through the same path as `cron_tick::check_schedules`.
+fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
+    let missed = crate::schedules::replay_missed_oneshots(home);
+    if missed.is_empty() {
+        return;
+    }
+    tracing::info!(count = missed.len(), "replaying missed one-shot schedules");
+    let now = chrono::Utc::now();
+    for sched in &missed {
+        let target = sched.target.as_str();
+        let message = sched.message.as_str();
+        let label = sched.label.as_deref().unwrap_or("(unnamed)");
+
+        tracing::info!(label, target, message, "replaying missed one-shot");
+        crate::event_log::log(
+            home,
+            "schedule_replay",
+            target,
+            &format!("{label}: {message}"),
+        );
+
+        let reg = agent::lock_registry(registry);
+        if let Some(handle) = reg.get(target) {
+            if let Err(e) = agent::inject_to_agent(handle, message.as_bytes()) {
+                tracing::warn!(error = %e, "replay inject failed");
+            }
+        } else {
+            drop(reg);
+            let _ = crate::inbox::enqueue(
+                home,
+                target,
+                crate::inbox::InboxMessage {
+                    schema_version: 0,
+                    from: "system:schedule".to_string(),
+                    text: message.to_string(),
+                    kind: Some("schedule_replay".to_string()),
+                    timestamp: now.to_rfc3339(),
+                },
+            );
+        }
+    }
 }
 
 /// Staggered-spawn delay — rate-limits PTY init during multi-agent bursts

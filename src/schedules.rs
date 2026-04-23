@@ -838,4 +838,64 @@ mod tests {
         assert_eq!(listed["schedules"][0]["enabled"], true);
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn test_replay_fires_message_to_inbox_on_restart() {
+        // Integration test: simulate daemon restart with a missed one-shot.
+        // Pre-seed schedules.json with a one-shot whose run_at is 1 hour ago.
+        // Call replay_missed_oneshots (as daemon startup would), then fire
+        // each returned schedule into the inbox (no live agent → inbox path).
+        // Verify: message appears in inbox AND schedule is disabled.
+        let home = tmp_home("restart_replay");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let store = serde_json::json!({
+            "schema_version": 2,
+            "schedules": [{
+                "id": "s-restart",
+                "trigger": {"kind": "once", "at": past},
+                "message": "check inbox after restart",
+                "target": "agent-replay",
+                "label": "restart-test",
+                "timezone": "UTC",
+                "enabled": true,
+                "created_by": "test",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "run_history": []
+            }]
+        });
+        std::fs::write(home.join("schedules.json"), store.to_string()).ok();
+
+        // Simulate what replay_missed_at_startup does:
+        let missed = replay_missed_oneshots(&home);
+        assert_eq!(missed.len(), 1);
+        for sched in &missed {
+            let _ = crate::inbox::enqueue(
+                &home,
+                &sched.target,
+                crate::inbox::InboxMessage {
+                    schema_version: 0,
+                    from: "system:schedule".to_string(),
+                    text: sched.message.clone(),
+                    kind: Some("schedule_replay".to_string()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                },
+            );
+        }
+
+        // Verify message landed in inbox
+        let msgs = crate::inbox::drain(&home, "agent-replay");
+        assert_eq!(msgs.len(), 1, "replayed message must appear in inbox");
+        assert_eq!(msgs[0].text, "check inbox after restart");
+        assert_eq!(msgs[0].kind.as_deref(), Some("schedule_replay"));
+
+        // Verify schedule is disabled
+        let listed = list(&home, &serde_json::json!({}));
+        assert_eq!(listed["schedules"][0]["enabled"], false);
+        // run_history should record "replayed"
+        let history = listed["schedules"][0]["run_history"].as_array().expect("arr");
+        assert_eq!(history[0]["status"], "replayed");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
