@@ -387,7 +387,7 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
                 count += 1;
                 if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&msg.timestamp) {
                     let ts_utc = ts.with_timezone(&chrono::Utc);
-                    if oldest.is_none() || oldest.unwrap() > ts_utc {
+                    if oldest.is_none_or(|t| t > ts_utc) {
                         oldest = Some(ts_utc);
                     }
                 }
