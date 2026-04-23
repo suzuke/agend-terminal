@@ -162,12 +162,15 @@ pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, te
 }
 
 /// Compose-aware notification delivery: checks `is_composing` and enqueues
-/// if the target agent is mid-typing, otherwise injects directly via the API.
-/// Uses raw write (no submit_key) — appropriate for passive notifications
-/// that should not auto-submit (per PR #81).
+/// if the target agent is mid-typing, otherwise injects **with** submit_key
+/// so idle agents actually wake up on the incoming notification. The
+/// is_composing guard (3 s input-idle window) preserves PR #81's race fix —
+/// user keystrokes never collide with a background submit — while restoring
+/// the pre-#81 behavior of actually delivering Telegram / notify_agent
+/// traffic to backends that don't poll inbox on their own.
 pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     let _ = route_notification(home, agent_name, notification, |msg| {
-        inject_notification(home, agent_name, msg)
+        inject_with_submit(home, agent_name, msg)
     });
 }
 
