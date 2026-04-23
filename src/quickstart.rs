@@ -243,9 +243,6 @@ fn generate_fleet_yaml(
 
     let backend_name = backend.name();
 
-    // Detect project roots
-    let project_dir = detect_project_root();
-
     let channel_section = if let Some(gid) = group_id {
         format!(
             r#"
@@ -260,9 +257,9 @@ channel:
         "\n# channel:\n#   type: telegram\n#   bot_token_env: AGEND_BOT_TOKEN\n#   group_id: YOUR_GROUP_ID\n".to_string()
     };
 
-    let working_dir = project_dir
-        .map(|p| format!("    working_directory: {}", p.display()))
-        .unwrap_or_else(|| "    # working_directory: ~/your-project".to_string());
+    let workspace_dir = home.join("workspace").join("general");
+    std::fs::create_dir_all(&workspace_dir)?;
+    let working_dir = format!("    working_directory: {}", workspace_dir.display());
 
     let yaml = format!(
         r#"defaults:
@@ -279,32 +276,6 @@ instances:
     println!("  ✓ Generated {}\n", fleet_path.display());
 
     Ok(())
-}
-
-fn detect_project_root() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let candidates = [
-        format!("{home}/Documents"),
-        format!("{home}/Projects"),
-        format!("{home}/Code"),
-        format!("{home}/src"),
-        format!("{home}/dev"),
-    ];
-
-    for dir in &candidates {
-        let path = std::path::PathBuf::from(dir);
-        if path.exists() {
-            // Find first git repo
-            if let Ok(entries) = std::fs::read_dir(&path) {
-                for entry in entries.flatten() {
-                    if entry.path().join(".git").exists() {
-                        return Some(entry.path());
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Save AGEND_BOT_TOKEN to .env, preserving other variables.
@@ -409,13 +380,6 @@ mod tests {
     fn mask_token_9_chars() {
         let masked = mask_token("123456789");
         assert_eq!(masked, "1234...6789");
-    }
-
-    #[test]
-    fn detect_project_root_empty_home() {
-        // With no standard dirs, should return None (or some existing project)
-        // This test validates the function doesn't panic
-        let _ = detect_project_root();
     }
 
     #[test]
