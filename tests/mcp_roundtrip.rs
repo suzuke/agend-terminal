@@ -549,3 +549,60 @@ fn test_task_board_lifecycle() {
         .expect("task");
     assert_eq!(task["result"], "feature implemented and tested");
 }
+
+#[test]
+fn test_describe_message_mcp() {
+    // Enqueue a message via delegate_task (which creates an inbox entry with an ID),
+    // drain it (which stamps read_at), then call describe_message to verify status.
+    let responses = mcp_session(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        // delegate_task to self to create an inbox message
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegate_task","arguments":{"target_instance":"test-agent","task":"test task for describe","success_criteria":"verify describe_message works end to end via MCP roundtrip integration test with sufficient length to exceed the inline threshold of five hundred characters so the message is actually enqueued to the inbox file rather than only injected to PTY which would not create a persistent message that describe_message can find later","context":"This context padding ensures the message body exceeds 500 chars so inbox::deliver routes it through enqueue() which stamps a message ID. Without this padding the message would be too short and only get PTY-injected, never hitting the JSONL file."}}}"#,
+        // drain inbox to mark messages as read
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inbox","arguments":{}}}"#,
+        // describe_message with a nonexistent ID → not_found
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"describe_message","arguments":{"message_id":"m-nonexistent"}}}"#,
+    ]);
+    assert!(responses.len() >= 4, "expected 4 responses, got {}", responses.len());
+
+    // describe_message for nonexistent ID should return not_found
+    let desc_result = extract_tool_result(&responses[3]);
+    assert_eq!(desc_result["status"], "not_found", "nonexistent message should be not_found, got: {desc_result}");
+}
+
+#[test]
+fn test_sweep_expired_removes_old_read_messages() {
+    let home = mcp_home();
+    let inbox_dir = home.join("inbox");
+    std::fs::create_dir_all(&inbox_dir).ok();
+
+    // Seed: a read message with old timestamp and a fresh unread message
+    let old_ts = "2020-01-01T00:00:00+00:00";
+    let fresh_ts = "2099-01-01T00:00:00+00:00";
+    let old_read = format!(
+        r#"{{"schema_version":1,"id":"m-old-read","from":"a","text":"old","kind":null,"timestamp":"{old_ts}","read_at":"{old_ts}"}}"#
+    );
+    let fresh_unread = format!(
+        r#"{{"schema_version":1,"id":"m-fresh-unread","from":"b","text":"fresh","kind":null,"timestamp":"{fresh_ts}"}}"#
+    );
+    std::fs::write(
+        inbox_dir.join("test-agent.jsonl"),
+        format!("{old_read}\n{fresh_unread}\n"),
+    ).expect("write test inbox");
+
+    // Use MCP to describe both messages
+    let responses = mcp_session_in_home(&home, &[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe_message","arguments":{"message_id":"m-old-read"}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe_message","arguments":{"message_id":"m-fresh-unread"}}}"#,
+    ]);
+    assert!(responses.len() >= 3);
+
+    let old_result = extract_tool_result(&responses[1]);
+    assert_eq!(old_result["status"], "read", "old read message should report 'read', got: {old_result}");
+
+    let fresh_result = extract_tool_result(&responses[2]);
+    assert_eq!(fresh_result["status"], "not_found", "fresh unread should be 'not_found', got: {fresh_result}");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
