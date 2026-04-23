@@ -403,6 +403,82 @@ impl StatePatterns {
     }
 }
 
+/// Classify PTY output into a [`BlockedReason`] for the given backend.
+///
+/// Returns `None` when the output does not match any known error pattern.
+/// Uses simple substring/regex checks aligned with the per-backend patterns
+/// in [`StatePatterns::for_backend`].
+///
+/// Stacking dep: production caller wired in S2-T4 (daemon watchdog).
+pub fn classify_pty_output(
+    backend: &crate::backend::Backend,
+    output: &str,
+) -> Option<crate::health::BlockedReason> {
+    use crate::backend::Backend;
+    use crate::health::BlockedReason;
+
+    match backend {
+        Backend::ClaudeCode => {
+            if regex::Regex::new(r"(?i)credit_balance_too_low")
+                .ok()?
+                .is_match(output)
+            {
+                return Some(BlockedReason::QuotaExceeded);
+            }
+            if regex::Regex::new(r"(?i)overloaded|rate.?limit|429")
+                .ok()?
+                .is_match(output)
+            {
+                return Some(BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            }
+        }
+        Backend::KiroCli => {
+            if regex::Regex::new(r"ServiceQuotaExceeded|InsufficientModelCapacity")
+                .ok()?
+                .is_match(output)
+            {
+                return Some(BlockedReason::QuotaExceeded);
+            }
+            if regex::Regex::new(r"Too Many Requests|ThrottlingError|\b429\b")
+                .ok()?
+                .is_match(output)
+            {
+                return Some(BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            }
+        }
+        Backend::Codex => {
+            if regex::Regex::new(r"hit your usage limit|try again at")
+                .ok()?
+                .is_match(output)
+            {
+                return Some(BlockedReason::QuotaExceeded);
+            }
+            if regex::Regex::new(r"(?i)rate.?limit|\b429\b")
+                .ok()?
+                .is_match(output)
+            {
+                return Some(BlockedReason::RateLimit {
+                    retry_after_secs: None,
+                });
+            }
+        }
+        Backend::Gemini => {
+            if regex::Regex::new(r"RESOURCE_EXHAUSTED|\b429\b")
+                .ok()?
+                .is_match(output)
+            {
+                return Some(BlockedReason::QuotaExceeded);
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 /// Cheap structural test for a generic startup-time interactive prompt.
 ///
 /// Only called while the agent is still in `Starting` state, so false
@@ -2104,5 +2180,62 @@ mod tests {
         // last_heartbeat is None by default
         t.feed("Allow this action y/n/t");
         assert_eq!(t.get_state(), AgentState::PermissionPrompt);
+    }
+
+    #[test]
+    fn test_classify_fixtures() {
+        use crate::health::BlockedReason;
+
+        let fixtures: &[(&str, &Backend, Option<BlockedReason>)] = &[
+            (
+                "claude_429.txt",
+                &Backend::ClaudeCode,
+                Some(BlockedReason::RateLimit { retry_after_secs: None }),
+            ),
+            (
+                "claude_quota.txt",
+                &Backend::ClaudeCode,
+                Some(BlockedReason::QuotaExceeded),
+            ),
+            (
+                "kiro_throttle.txt",
+                &Backend::KiroCli,
+                Some(BlockedReason::RateLimit { retry_after_secs: None }),
+            ),
+            (
+                "kiro_quota.txt",
+                &Backend::KiroCli,
+                Some(BlockedReason::QuotaExceeded),
+            ),
+            (
+                "kiro_false_usage_limit.txt",
+                &Backend::KiroCli,
+                None, // false positive: agent discussing usage limits, not an error
+            ),
+            (
+                "codex_quota.txt",
+                &Backend::Codex,
+                Some(BlockedReason::QuotaExceeded),
+            ),
+            (
+                "gemini_resource_exhausted.txt",
+                &Backend::Gemini,
+                Some(BlockedReason::QuotaExceeded),
+            ),
+        ];
+
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/backend_error_fixtures");
+
+        for (file, backend, expected) in fixtures {
+            let path = fixture_dir.join(file);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing fixture {file}: {e}"));
+            let result = super::classify_pty_output(backend, &content);
+            assert_eq!(
+                result, *expected,
+                "fixture {file}: expected {expected:?}, got {result:?}"
+            );
+        }
     }
 }

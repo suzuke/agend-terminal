@@ -1,0 +1,6 @@
+I'll help you check the current usage limit configuration. Let me read the relevant files.
+
+● Read src/config.rs
+● Read src/quota.rs
+
+The usage limit is set to 1000 requests per hour in src/config.rs:42.
