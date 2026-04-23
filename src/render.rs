@@ -1422,10 +1422,44 @@ pub fn render_tasks(
             }
             frame.render_widget(Paragraph::new(lines), inner_popup);
         }
+        TaskBoardMode::Help => {
+            let text = vec![
+                Line::from(Span::styled("Task Board Help", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from("───────────────"),
+                Line::from("  n           New task"),
+                Line::from("  ↑↓ / j k    Select task in column"),
+                Line::from("  ←→ / h l    Switch column"),
+                Line::from("  H / L       Move task left/right (change status)"),
+                Line::from("  Shift+D     Mark done from any column"),
+                Line::from("  a           Assign to agent or team"),
+                Line::from("  d           Cancel task"),
+                Line::from("  Enter       View task detail"),
+                Line::from("  Esc / q     Close Task Board"),
+                Line::from(""),
+                Line::from(Span::styled("Press ? or Esc to close help", Style::default().fg(Color::DarkGray))),
+            ];
+            let h = (text.len() as u16 + 2).min(inner.height.saturating_sub(2));
+            let w = 52u16.min(inner.width.saturating_sub(4));
+            let popup = Rect::new(
+                inner.x + (inner.width.saturating_sub(w)) / 2,
+                inner.y + (inner.height.saturating_sub(h)) / 2,
+                w,
+                h,
+            );
+            frame.render_widget(Clear, popup);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(Span::styled(" ? Help ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+            let inner_popup = block.inner(popup);
+            frame.render_widget(block, popup);
+            frame.render_widget(Paragraph::new(text), inner_popup);
+        }
         _ => {}
     }
 }
-
+/// Sorted by priority desc then created_at asc within each column.
+/// Cancelled tasks are excluded.
 /// Group tasks into 4 kanban columns: Backlog, Open, In Progress, Done.
 /// Sorted by priority desc then created_at asc within each column.
 /// Cancelled tasks are excluded.
