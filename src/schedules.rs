@@ -875,10 +875,12 @@ mod tests {
                 &sched.target,
                 crate::inbox::InboxMessage {
                     schema_version: 0,
+                    id: None,
                     from: "system:schedule".to_string(),
                     text: sched.message.clone(),
                     kind: Some("schedule_replay".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    read_at: None,
                 },
             );
         }
