@@ -362,7 +362,11 @@ fn handle_team_created(
     }
 
     ingest_members_into_team_tab(team_name, &running, layout, registry, wakeup_tx);
-    tracing::info!(team = team_name, tabs_after = layout.tabs.len(), "handle_team_created end");
+    tracing::info!(
+        team = team_name,
+        tabs_after = layout.tabs.len(),
+        "handle_team_created end"
+    );
 }
 
 /// Shared helper: locate or create the team tab, then move/attach each member

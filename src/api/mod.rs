@@ -965,7 +965,11 @@ mod tests {
         );
         assert_eq!(resp["ok"], true);
         let events = notifier.take();
-        assert_eq!(events.len(), 1, "expected TeamCreated for existing members, got {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected TeamCreated for existing members, got {events:?}"
+        );
         let ApiEvent::TeamCreated { name, members } = &events[0] else {
             panic!("expected TeamCreated, got {:?}", events[0])
         };
@@ -1542,7 +1546,11 @@ mod tests {
         assert_eq!(resp["spawned"], json!([]));
         // Existing members now emit TeamCreated with full roster.
         let events = notifier.take();
-        assert_eq!(events.len(), 1, "expected TeamCreated for existing members, got {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected TeamCreated for existing members, got {events:?}"
+        );
         let ApiEvent::TeamCreated { name, members } = &events[0] else {
             panic!("expected TeamCreated, got {:?}", events[0])
         };

@@ -1436,7 +1436,12 @@ pub fn render_tasks(
         }
         TaskBoardMode::Help => {
             let text = vec![
-                Line::from(Span::styled("Task Board Help", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    "Task Board Help",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from("───────────────"),
                 Line::from("  n           New task"),
                 Line::from("  ↑↓ / j k    Select task in column"),
@@ -1448,7 +1453,10 @@ pub fn render_tasks(
                 Line::from("  Enter       View task detail"),
                 Line::from("  Esc / q     Close Task Board"),
                 Line::from(""),
-                Line::from(Span::styled("Press ? or Esc to close help", Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(
+                    "Press ? or Esc to close help",
+                    Style::default().fg(Color::DarkGray),
+                )),
             ];
             let h = (text.len() as u16 + 2).min(inner.height.saturating_sub(2));
             let w = 52u16.min(inner.width.saturating_sub(4));
@@ -1462,7 +1470,12 @@ pub fn render_tasks(
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
-                .title(Span::styled(" ? Help ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+                .title(Span::styled(
+                    " ? Help ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
             let inner_popup = block.inner(popup);
             frame.render_widget(block, popup);
             frame.render_widget(Paragraph::new(text), inner_popup);
@@ -1777,12 +1790,7 @@ mod tests {
         let layout = crate::layout::Layout::new();
         terminal
             .draw(|frame| {
-                render_status_bar(
-                    frame,
-                    frame.area(),
-                    &layout,
-                    TelegramStatus::NotConfigured,
-                );
+                render_status_bar(frame, frame.area(), &layout, TelegramStatus::NotConfigured);
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();

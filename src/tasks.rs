@@ -487,12 +487,27 @@ mod tests {
     fn task_board_shift_d_marks_done() {
         // Test Shift+D (done action) from all 3 non-done columns
         for (label, setup) in [
-            ("backlog", vec![("create", r#"{"action":"create","title":"t","priority":"low"}"#)]),
-            ("open", vec![("create", r#"{"action":"create","title":"t","priority":"normal"}"#)]),
+            (
+                "backlog",
+                vec![(
+                    "create",
+                    r#"{"action":"create","title":"t","priority":"low"}"#,
+                )],
+            ),
+            (
+                "open",
+                vec![(
+                    "create",
+                    r#"{"action":"create","title":"t","priority":"normal"}"#,
+                )],
+            ),
             (
                 "in_progress",
                 vec![
-                    ("create", r#"{"action":"create","title":"t","priority":"normal"}"#),
+                    (
+                        "create",
+                        r#"{"action":"create","title":"t","priority":"normal"}"#,
+                    ),
                     ("claim", r#"{"action":"claim","id":"__ID__"}"#),
                 ],
             ),
@@ -501,7 +516,8 @@ mod tests {
             let mut id = String::new();
             for (_, json_str) in &setup {
                 let json_str = json_str.replace("__ID__", &id);
-                let v: serde_json::Value = serde_json::from_str(&json_str).expect("test JSON literal");
+                let v: serde_json::Value =
+                    serde_json::from_str(&json_str).expect("test JSON literal");
                 let r = handle(&home, "user", &v);
                 if let Some(i) = r["id"].as_str() {
                     id = i.to_string();
@@ -510,7 +526,11 @@ mod tests {
             if id.is_empty() {
                 id = list_all(&home)[0].id.clone();
             }
-            let r = handle(&home, "user", &serde_json::json!({"action": "done", "id": id}));
+            let r = handle(
+                &home,
+                "user",
+                &serde_json::json!({"action": "done", "id": id}),
+            );
             assert_eq!(r["status"], "done", "failed for {label}");
             assert_eq!(list_all(&home)[0].status, "done", "failed for {label}");
             std::fs::remove_dir_all(&home).ok();
