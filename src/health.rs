@@ -469,7 +469,9 @@ mod tests {
     #[test]
     fn test_check_hang_skipped_when_rate_limited() {
         let mut h = HealthTracker::new();
-        h.set_blocked_reason(BlockedReason::RateLimit { retry_after_secs: Some(60) });
+        h.set_blocked_reason(BlockedReason::RateLimit {
+            retry_after_secs: Some(60),
+        });
         // Thinking + 700s silence would normally trigger hang
         assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
         assert_ne!(h.state, HealthState::Hung);
@@ -492,7 +494,9 @@ mod tests {
     #[test]
     fn test_clear_blocked_reason_resumes_hang_check() {
         let mut h = HealthTracker::new();
-        h.set_blocked_reason(BlockedReason::RateLimit { retry_after_secs: None });
+        h.set_blocked_reason(BlockedReason::RateLimit {
+            retry_after_secs: None,
+        });
         assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
 
         h.clear_blocked_reason();
@@ -504,8 +508,12 @@ mod tests {
     fn test_blocked_reason_serde() {
         let cases = vec![
             BlockedReason::Hang,
-            BlockedReason::RateLimit { retry_after_secs: Some(60) },
-            BlockedReason::RateLimit { retry_after_secs: None },
+            BlockedReason::RateLimit {
+                retry_after_secs: Some(60),
+            },
+            BlockedReason::RateLimit {
+                retry_after_secs: None,
+            },
             BlockedReason::QuotaExceeded,
             BlockedReason::AwaitingOperator,
             BlockedReason::PermissionPrompt,
