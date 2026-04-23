@@ -38,17 +38,20 @@ fn comm_tools() -> Vec<Value> {
                 "instance_name": {"type": "string"}, "message": {"type": "string"},
                 "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"]},
                 "requires_reply": {"type": "boolean"}, "task_summary": {"type": "string"},
-                "correlation_id": {"type": "string"}, "working_directory": {"type": "string"}, "branch": {"type": "string"}
+                "correlation_id": {"type": "string"}, "working_directory": {"type": "string"}, "branch": {"type": "string"},
+                "thread_id": {"type": "string"}, "parent_id": {"type": "string"}
             }, "required": ["instance_name", "message"]}}),
         json!({"name": "delegate_task", "description": "Delegate a task to another instance (expects result report back).",
             "inputSchema": {"type": "object", "properties": {
                 "target_instance": {"type": "string"}, "task": {"type": "string"},
-                "success_criteria": {"type": "string"}, "context": {"type": "string"}
+                "success_criteria": {"type": "string"}, "context": {"type": "string"},
+                "thread_id": {"type": "string"}, "parent_id": {"type": "string"}
             }, "required": ["target_instance", "task"]}}),
         json!({"name": "report_result", "description": "Report results back to the delegating instance.",
             "inputSchema": {"type": "object", "properties": {
                 "target_instance": {"type": "string"}, "summary": {"type": "string"},
-                "correlation_id": {"type": "string"}, "artifacts": {"type": "string"}
+                "correlation_id": {"type": "string"}, "artifacts": {"type": "string"},
+                "thread_id": {"type": "string"}, "parent_id": {"type": "string"}
             }, "required": ["target_instance", "summary"]}}),
         json!({"name": "request_information", "description": "Ask another instance a question (expects reply).",
             "inputSchema": {"type": "object", "properties": {
