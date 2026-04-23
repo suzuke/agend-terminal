@@ -576,4 +576,13 @@ mod tests {
         // check_hang still works normally
         assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
     }
+
+    #[test]
+    fn test_reset_clears_current_reason() {
+        let mut h = HealthTracker::new();
+        h.set_blocked_reason(BlockedReason::QuotaExceeded);
+        assert!(h.current_reason.is_some());
+        h.reset();
+        assert!(h.current_reason.is_none(), "reset must clear current_reason");
+    }
 }
