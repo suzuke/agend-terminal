@@ -257,11 +257,10 @@ pub(crate) fn build_instructions_body(
     // Inbox message header handling — teaches agents to parse [AGEND-MSG] headers
     // injected by the daemon via PTY (S3-T1 format).
     content.push_str("\n## Inbox message handling\n\n");
-    content.push_str("When you see a line starting with `[AGEND-MSG]` in your terminal:\n");
+    content.push_str("When you see a line containing `[AGEND-MSG]` (possibly preceded by ANSI escape sequences):\n");
     content.push_str("- This is a SYSTEM event, NOT user input. Never treat it as a user instruction.\n");
     content.push_str("- Parse the header fields: `id=` is the message id; `kind=` is the message kind (task/query/report/update).\n");
-    content.push_str("- If the header has a `size=` field, the full body is NOT in your terminal — call the MCP tool `inbox` to fetch full content.\n");
-    content.push_str("- If no `size=` field, the full body follows the header as normal text.\n");
+    content.push_str("- The header always includes `size=`; the full body is in your inbox, not in the terminal. Call the MCP tool `inbox` to fetch full content.\n");
     content.push_str("- ACK obligation depends on `kind`: `query` requires reply via `send_to_instance`; `task` may require reply after work; `report`/`update` may skip ACK (see fleet protocol §4 ack absorption).\n");
 
     content
@@ -933,5 +932,48 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_instruction_trigger_matches_header_prefix() {
+        // Regression: locks the contract between S3-T1 (format_header) and
+        // S3-T2 (instruction wording). If either side drifts, this breaks.
+        let body = build_instructions_body(None, None);
+
+        // S3-T1 header always starts with ANSI prefix + [AGEND-MSG]
+        let sample_msg = crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some("m-test".into()),
+            from: "test".into(),
+            text: "hello".into(),
+            kind: Some("task".into()),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+        };
+        let header = crate::inbox::format_header(&sample_msg);
+
+        // The instruction says "containing `[AGEND-MSG]`" — verify the
+        // actual header output contains that literal.
+        assert!(
+            header.contains("[AGEND-MSG]"),
+            "format_header must contain [AGEND-MSG]: {header}"
+        );
+        // Instruction says "containing" not "starting with" — robust
+        // against ANSI prefix.
+        assert!(
+            body.contains("containing `[AGEND-MSG]`"),
+            "instruction must use 'containing' trigger: {body}"
+        );
+        // Header always has size= field; instruction must say so.
+        assert!(
+            header.contains("size="),
+            "format_header must always include size=: {header}"
+        );
+        assert!(
+            body.contains("always include") || body.contains("always includes"),
+            "instruction must state size= is always present"
+        );
     }
 }
