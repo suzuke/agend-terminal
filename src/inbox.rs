@@ -422,46 +422,36 @@ pub fn sweep_expired(home: &Path) {
     }
 }
 
-/// Look up a message by ID across all inbox files.
-pub fn describe_message(home: &Path, msg_id: &str) -> MessageStatus {
-    let inbox_dir = home.join("inbox");
-    let entries = match std::fs::read_dir(&inbox_dir) {
-        Ok(e) => e,
+/// Look up a message by ID in a specific agent's inbox file.
+/// If `instance` is provided, only that agent's inbox is searched.
+pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageStatus {
+    let path = inbox_path(home, instance);
+    if !path.exists() {
+        return MessageStatus::NotFound;
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
         Err(_) => return MessageStatus::NotFound,
     };
     let now = chrono::Utc::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
+    for line in content.lines() {
+        let msg: InboxMessage = match serde_json::from_str(line) {
+            Ok(m) => m,
             Err(_) => continue,
         };
-        for line in content.lines() {
-            let msg: InboxMessage = match serde_json::from_str(line) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if msg.id.as_deref() != Some(msg_id) {
-                continue;
-            }
-            // Found the message
-            if let Some(ref read_at) = msg.read_at {
-                return MessageStatus::ReadAt(read_at.clone());
-            }
-            // Unread — check if expired
-            let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or(now);
-            if now.signed_duration_since(ts) > chrono::Duration::days(30) {
-                return MessageStatus::UnreadExpired;
-            }
-            // Unread and not expired — still "not found" in the read sense
-            // (message exists but hasn't been consumed yet)
-            return MessageStatus::NotFound;
+        if msg.id.as_deref() != Some(msg_id) {
+            continue;
         }
+        if let Some(ref read_at) = msg.read_at {
+            return MessageStatus::ReadAt(read_at.clone());
+        }
+        let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or(now);
+        if now.signed_duration_since(ts) > chrono::Duration::days(30) {
+            return MessageStatus::UnreadExpired;
+        }
+        return MessageStatus::NotFound;
     }
     MessageStatus::NotFound
 }
@@ -1273,20 +1263,20 @@ mod tests {
         .ok();
 
         // ReadAt
-        match describe_message(&home, "m-read") {
+        match describe_message(&home, "m-read", "agent1") {
             MessageStatus::ReadAt(t) => assert_eq!(t, now),
             other => panic!("expected ReadAt, got: {other:?}"),
         }
 
         // UnreadExpired
         assert_eq!(
-            describe_message(&home, "m-expired"),
+            describe_message(&home, "m-expired", "agent1"),
             MessageStatus::UnreadExpired
         );
 
         // NotFound
         assert_eq!(
-            describe_message(&home, "m-nonexistent"),
+            describe_message(&home, "m-nonexistent", "agent1"),
             MessageStatus::NotFound
         );
 

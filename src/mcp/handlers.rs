@@ -363,8 +363,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 None => return json!({"error": "missing 'message_id'"}),
             };
             let target = args["instance"].as_str().unwrap_or(instance_name);
-            let _ = target; // describe_message scans all inbox files
-            let status = crate::inbox::describe_message(&home, msg_id);
+            let status = crate::inbox::describe_message(&home, msg_id, target);
             match status {
                 crate::inbox::MessageStatus::ReadAt(t) => {
                     json!({"status": "read", "read_at": t})
