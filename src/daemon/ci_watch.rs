@@ -109,6 +109,7 @@ fn ci_notification_message(
 /// Also tracks `head_sha` — if the branch HEAD changes (e.g. force push),
 /// `last_run_id` is reset so the new run is picked up.
 /// On PR terminal states (merged/closed), the watcher is auto-cleared.
+#[allow(clippy::too_many_arguments)]
 async fn ci_check_repo(
     home: &Path,
     watch_path: &Path,

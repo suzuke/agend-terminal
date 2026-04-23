@@ -448,7 +448,10 @@ fn run_core(
         {
             use std::sync::atomic::{AtomicU64, Ordering};
             static SWEEP_COUNTER: AtomicU64 = AtomicU64::new(0);
-            if SWEEP_COUNTER.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
+            if SWEEP_COUNTER
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(60)
+            {
                 crate::inbox::sweep_expired(home);
                 crate::inbox::check_disk_space(home);
             }
