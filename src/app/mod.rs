@@ -522,6 +522,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     for (_name, handle) in reg.iter() {
                         if let Ok(mut core) = handle.core.lock() {
                             core.health.maybe_decay();
+                            core.state.tick();
                             let agent_state = core.state.current;
                             let silent = core.state.last_output.elapsed();
                             core.health.check_hang(agent_state, silent);

@@ -618,6 +618,13 @@ impl StateTracker {
         self.current
     }
 
+    /// Periodic tick — expire stale latched states without requiring new PTY
+    /// output. Called from supervisor and app mode tick loops so idle agents
+    /// don't stay stuck on ToolUse/Thinking indefinitely.
+    pub(crate) fn tick(&mut self) {
+        self.maybe_expire_latched_state();
+    }
+
     /// Force state to Restarting (called by reaper on crash).
     pub fn set_restarting(&mut self) {
         self.current = AgentState::Restarting;
@@ -848,6 +855,44 @@ mod tests {
         let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 120);
         t.feed("nothing matches here");
         assert_eq!(t.get_state(), AgentState::PermissionPrompt);
+    }
+
+    // ── tick() regression pins (t-20260423040613) ───────────────────────
+
+    #[test]
+    fn tick_expires_stale_tool_use_without_feed() {
+        // ToolUse held > 30s with no PTY output. tick() must expire it
+        // to Ready without requiring feed() (which needs new screen text).
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+        t.tick();
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn tick_does_not_expire_fresh_tool_use() {
+        // ToolUse held < 30s should NOT be expired by tick().
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 10);
+        t.tick();
+        assert_eq!(t.get_state(), AgentState::ToolUse);
+    }
+
+    #[test]
+    fn tick_does_not_expire_permission_prompt() {
+        // PermissionPrompt requires operator action, never auto-expires.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 120);
+        t.tick();
+        assert_eq!(t.get_state(), AgentState::PermissionPrompt);
+    }
+
+    #[test]
+    fn tick_called_twice_still_expires() {
+        // Verify tick() works on repeated calls (no hash-based early return).
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 35);
+        t.tick();
+        assert_eq!(t.get_state(), AgentState::Ready);
+        // Second tick on Ready is a no-op (Ready is not expiring).
+        t.tick();
+        assert_eq!(t.get_state(), AgentState::Ready);
     }
 
     #[test]
