@@ -4,7 +4,7 @@ use crate::agent::{self, AgentRegistry};
 use crate::app::MenuItem;
 use crate::layout::{DragTabTarget, Layout, PaneNode, SplitDir};
 use crate::state::AgentState;
-use ratatui::layout::{Constraint, Direction, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -788,13 +788,32 @@ fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout, telegram: T
         TelegramStatus::NotConfigured => {}
     }
 
-    spans.push(Span::styled(
-        " | Ctrl+B c new | : cmd | n/p switch | d detach | Ctrl+B ? help ",
-        Style::default().fg(Color::DarkGray),
-    ));
+    // Left side: agent / pane / layout / TG status (the spans above).
+    // Right side: keybinding cheatsheet ending in the help hotkey so it
+    // hugs the bottom-right corner regardless of terminal width. Rendered
+    // as a separate right-aligned Paragraph over the same area — when
+    // the terminal is narrow enough that the two overlap, the right hint
+    // wins (kept short specifically for that case), so the user never
+    // loses the "how do I open help?" affordance.
+    let left_bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(left_bar, area);
 
-    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
-    frame.render_widget(bar, area);
+    let right_hint = Line::from(vec![
+        Span::styled(
+            "Ctrl+B c new | : cmd | n/p switch | d detach | ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            "Ctrl+B ? help ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let right_bar = Paragraph::new(right_hint)
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(Color::DarkGray));
+    frame.render_widget(right_bar, area);
 }
 
 // --- Overlay renderers ---
