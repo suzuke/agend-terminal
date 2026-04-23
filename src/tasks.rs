@@ -635,56 +635,112 @@ mod tests {
     fn test_task_blocked_when_dep_not_done() {
         let home = tmp_home("dep-blocked");
         // Create dep task (stays open)
-        let r1 = handle(&home, "u", &serde_json::json!({"action": "create", "title": "dep"}));
+        let r1 = handle(
+            &home,
+            "u",
+            &serde_json::json!({"action": "create", "title": "dep"}),
+        );
         let dep_id = r1["id"].as_str().unwrap().to_string();
         // Create task depending on dep
-        handle(&home, "u", &serde_json::json!({
-            "action": "create", "title": "child", "depends_on": [dep_id]
-        }));
+        handle(
+            &home,
+            "u",
+            &serde_json::json!({
+                "action": "create", "title": "child", "depends_on": [dep_id]
+            }),
+        );
         // List triggers eval → child should be blocked
         let listed = handle(&home, "u", &serde_json::json!({"action": "list"}));
         let tasks = listed["tasks"].as_array().unwrap();
         let child = tasks.iter().find(|t| t["title"] == "child").unwrap();
-        assert_eq!(child["status"], "blocked", "task with open dep must be blocked");
+        assert_eq!(
+            child["status"], "blocked",
+            "task with open dep must be blocked"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn test_task_auto_unblock_when_all_deps_done() {
         let home = tmp_home("dep-unblock");
-        let r1 = handle(&home, "u", &serde_json::json!({"action": "create", "title": "dep"}));
+        let r1 = handle(
+            &home,
+            "u",
+            &serde_json::json!({"action": "create", "title": "dep"}),
+        );
         let dep_id = r1["id"].as_str().unwrap().to_string();
-        handle(&home, "u", &serde_json::json!({
-            "action": "create", "title": "child", "depends_on": [dep_id]
-        }));
+        handle(
+            &home,
+            "u",
+            &serde_json::json!({
+                "action": "create", "title": "child", "depends_on": [dep_id]
+            }),
+        );
         // List → child blocked
         let listed = handle(&home, "u", &serde_json::json!({"action": "list"}));
-        let child = listed["tasks"].as_array().unwrap().iter().find(|t| t["title"] == "child").unwrap();
+        let child = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["title"] == "child")
+            .unwrap();
         assert_eq!(child["status"], "blocked");
 
         // Complete dep → done triggers re-eval → child auto-unblocks
-        handle(&home, "u", &serde_json::json!({"action": "done", "id": dep_id, "result": "ok"}));
+        handle(
+            &home,
+            "u",
+            &serde_json::json!({"action": "done", "id": dep_id, "result": "ok"}),
+        );
         let listed = handle(&home, "u", &serde_json::json!({"action": "list"}));
-        let child = listed["tasks"].as_array().unwrap().iter().find(|t| t["title"] == "child").unwrap();
-        assert_eq!(child["status"], "open", "child must auto-unblock when dep is done");
+        let child = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["title"] == "child")
+            .unwrap();
+        assert_eq!(
+            child["status"], "open",
+            "child must auto-unblock when dep is done"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn test_claimed_task_not_touched_by_dep_eval() {
         let home = tmp_home("dep-claimed");
-        let r1 = handle(&home, "u", &serde_json::json!({"action": "create", "title": "dep"}));
+        let r1 = handle(
+            &home,
+            "u",
+            &serde_json::json!({"action": "create", "title": "dep"}),
+        );
         let dep_id = r1["id"].as_str().unwrap().to_string();
-        let r2 = handle(&home, "u", &serde_json::json!({
-            "action": "create", "title": "child", "depends_on": [dep_id]
-        }));
+        let r2 = handle(
+            &home,
+            "u",
+            &serde_json::json!({
+                "action": "create", "title": "child", "depends_on": [dep_id]
+            }),
+        );
         let child_id = r2["id"].as_str().unwrap().to_string();
         // Claim the child (impl started working despite dep)
-        handle(&home, "impl", &serde_json::json!({"action": "claim", "id": child_id}));
+        handle(
+            &home,
+            "impl",
+            &serde_json::json!({"action": "claim", "id": child_id}),
+        );
         // List → claimed task must stay claimed, not flipped to blocked
         let listed = handle(&home, "u", &serde_json::json!({"action": "list"}));
-        let child = listed["tasks"].as_array().unwrap().iter().find(|t| t["title"] == "child").unwrap();
-        assert_eq!(child["status"], "claimed", "claimed task must not be touched by dep eval");
+        let child = listed["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["title"] == "child")
+            .unwrap();
+        assert_eq!(
+            child["status"], "claimed",
+            "claimed task must not be touched by dep eval"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -692,12 +748,24 @@ mod tests {
     fn test_circular_dep_no_infinite_loop() {
         let home = tmp_home("dep-circular");
         // Create two tasks that depend on each other
-        let r1 = handle(&home, "u", &serde_json::json!({"action": "create", "title": "A"}));
+        let r1 = handle(
+            &home,
+            "u",
+            &serde_json::json!({"action": "create", "title": "A"}),
+        );
         let id_a = r1["id"].as_str().unwrap().to_string();
-        let r2 = handle(&home, "u", &serde_json::json!({"action": "create", "title": "B", "depends_on": [id_a]}));
+        let r2 = handle(
+            &home,
+            "u",
+            &serde_json::json!({"action": "create", "title": "B", "depends_on": [id_a]}),
+        );
         let id_b = r2["id"].as_str().unwrap().to_string();
         // Update A to depend on B (circular)
-        handle(&home, "u", &serde_json::json!({"action": "update", "id": id_a, "status": "open"}));
+        handle(
+            &home,
+            "u",
+            &serde_json::json!({"action": "update", "id": id_a, "status": "open"}),
+        );
         // Manually set depends_on for A → B via mutate
         let _ = crate::store::mutate_versioned(&store_path(&home), |store: &mut TaskStore| {
             if let Some(t) = store.tasks.iter_mut().find(|t| t.id == id_a) {
@@ -710,7 +778,11 @@ mod tests {
         let tasks = listed["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 2, "must return without infinite loop");
         for t in tasks {
-            assert_eq!(t["status"], "blocked", "circular dep tasks must be blocked: {}", t["title"]);
+            assert_eq!(
+                t["status"], "blocked",
+                "circular dep tasks must be blocked: {}",
+                t["title"]
+            );
         }
         std::fs::remove_dir_all(&home).ok();
     }
