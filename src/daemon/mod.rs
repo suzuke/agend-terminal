@@ -756,8 +756,28 @@ fn apply_fleet_reload(
     for name in &diff.working_dir_changed {
         tracing::warn!(agent = %name, "fleet.yaml working_directory changed — requires manual restart");
     }
+    // Role changes get a live broadcast — every running agent has the
+    // old role in its `## Fleet Peers` (or `## Team`) block, so the
+    // `<fleet-update kind="role-changed">` marker lets them update
+    // their mental model without waiting for a respawn. The subject
+    // itself also receives the marker so its own `## Identity` Role
+    // line stays accurate. Closes the "log-and-skip" TODO in
+    // bootstrap/reload.rs line 10-14.
     for name in &diff.role_changed {
-        tracing::info!(agent = %name, "fleet.yaml role changed — won't be reflected until agent respawns");
+        let new_role = new_config.instances.get(name).and_then(|c| c.role.clone());
+        tracing::info!(
+            agent = %name,
+            new_role = ?new_role,
+            "fleet.yaml role changed — broadcasting to running agents"
+        );
+        crate::fleet_broadcast::broadcast(
+            home,
+            registry,
+            &crate::fleet_broadcast::FleetUpdate::RoleChanged {
+                name: name.clone(),
+                new_role,
+            },
+        );
     }
     for name in &diff.topic_id_changed {
         tracing::info!(agent = %name, "fleet.yaml topic_id changed — won't be reflected until agent respawns");

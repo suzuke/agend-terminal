@@ -235,6 +235,11 @@ pub(crate) fn build_instructions_body(
     content.push_str(
         "- `team-members-changed` — your team roster changed (fields: `team`, `added`, `removed`)\n",
     );
+    content.push_str(
+        "- `role-changed` — a peer (possibly you) had their role re-edited in fleet.yaml \
+         (fields: `name`, `role`); update your peer-role knowledge, and if `name` is your own, \
+         treat `role` as your new Role\n",
+    );
 
     // Protocol injection — path + minimal stub fallback
     content.push_str("\n## Fleet Protocol\n\n");
