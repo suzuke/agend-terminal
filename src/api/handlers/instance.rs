@@ -174,8 +174,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
             // returns Err and the helper returns None). Previously only
             // the MCP `create_instance` wrappers called this, so
             // deploy_template-spawned agents silently lacked topics.
-            let topic_id =
-                crate::channel::telegram::create_topic_for_instance(ctx.home, name);
+            let topic_id = crate::channel::telegram::create_topic_for_instance(ctx.home, name);
             if let Some(n) = ctx.notifier {
                 let layout_hint = LayoutHint::parse(params["layout"].as_str().unwrap_or("tab"));
                 let spawner = params["spawner"]

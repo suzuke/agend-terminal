@@ -205,10 +205,8 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     // when building the AgentContext for its agend.md. Single lock take
     // for the whole batch.
     if !yaml_entries.is_empty() {
-        let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> = yaml_entries
-            .iter()
-            .map(|(n, e)| (n.as_str(), e))
-            .collect();
+        let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> =
+            yaml_entries.iter().map(|(n, e)| (n.as_str(), e)).collect();
         if let Err(e) = crate::fleet::add_instances_to_yaml(home, &refs) {
             tracing::warn!(error = %e, "failed to persist deployment to fleet.yaml");
         }
@@ -496,7 +494,11 @@ templates:
 
         let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
         let lead = reloaded.instances.get("dev-lead").expect("dev-lead");
-        assert!(lead.role.is_none(), "unset role must stay None, got {:?}", lead.role);
+        assert!(
+            lead.role.is_none(),
+            "unset role must stay None, got {:?}",
+            lead.role
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

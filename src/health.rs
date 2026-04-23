@@ -220,11 +220,13 @@ impl HealthTracker {
 
     /// Set the current blocked reason. Prevents `check_hang` from
     /// misdiagnosing expected waits as hangs.
+    #[allow(dead_code)] // stacking dep: wired by S2-T2/S2-T3/S2-T4
     pub fn set_blocked_reason(&mut self, reason: BlockedReason) {
         self.current_reason = Some(reason);
     }
 
     /// Clear the current blocked reason, resuming normal hang detection.
+    #[allow(dead_code)] // stacking dep: wired by S2-T2 MCP clear_blocked_reason tool
     pub fn clear_blocked_reason(&mut self) {
         self.current_reason = None;
     }
