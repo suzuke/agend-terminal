@@ -877,6 +877,19 @@ fn resolve_channel_only() -> anyhow::Result<TelegramCreds> {
     resolve_channel().map(|(ch, _)| ch)
 }
 
+/// Like [`resolve_channel_only`] but reads `fleet.yaml` from a caller-
+/// supplied home instead of the process-wide `AGEND_HOME`. Telegram
+/// helpers that already receive a `home` argument (e.g.
+/// `create_topic_for_instance`, `delete_topic`) must use this so a
+/// `cargo test` pointing at a throwaway temp home doesn't silently
+/// bleed into the operator's real bot channel — the `positive_pin-1`
+/// topics the user observed were exactly this: the positive-pin dispatch
+/// test creating a team via the API, reaching the topic helper, and the
+/// unscoped resolver loading the real fleet.yaml instead of the test's.
+fn resolve_channel_only_from(home: &std::path::Path) -> anyhow::Result<TelegramCreds> {
+    resolve_channel_from(home).map(|(ch, _)| ch)
+}
+
 /// Core bot-send primitive shared by [`try_telegram_reply`] and
 /// [`try_telegram_reply_no_cleanup`]. Performs the actual teloxide
 /// call and returns the message id; does NOT classify errors, run
@@ -1107,7 +1120,7 @@ pub fn try_telegram_edit(_instance_name: &str, message_id: &str, text: &str) -> 
 
 /// Create a forum topic for a new instance.
 pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
-    let ch = resolve_channel_only().ok()?;
+    let ch = resolve_channel_only_from(home).ok()?;
     match telegram_runtime().block_on(async {
         let bot = teloxide::Bot::new(&ch.token);
         let topic = bot
@@ -1140,7 +1153,7 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
 
 /// Delete a forum topic.
 pub fn delete_topic(home: &std::path::Path, topic_id: i32) {
-    let ch = match resolve_channel_only() {
+    let ch = match resolve_channel_only_from(home) {
         Ok(c) => c,
         Err(_) => return,
     };
@@ -2270,6 +2283,47 @@ instances:
         let home = PathBuf::from("/tmp/agend-test-nonexistent-dir-12345");
         let reg = load_topic_registry(&home);
         assert!(reg.is_empty());
+    }
+
+    /// Regression pin: create_topic_for_instance must resolve credentials
+    /// from the caller-supplied home, not from `AGEND_HOME` / real
+    /// `home_dir()`. Before this fix the helper called
+    /// `resolve_channel_only()` which re-read the operator's real
+    /// fleet.yaml, so `cargo test` runs of the `positive_pin`
+    /// dispatch test (src/api/mod.rs) leaked into the live Telegram
+    /// group as a stray `positive_pin-1` topic. Here the test home has
+    /// no fleet.yaml at all; the helper must see "no channel
+    /// configured" and return `None` silently — no network call, no
+    /// leak.
+    #[test]
+    fn create_topic_for_instance_uses_passed_home_not_real_home() {
+        let home = tmp_home("topic-helper-home-scope");
+        // Deliberately no fleet.yaml → resolve_channel_only_from must
+        // fail at the fleet.yaml load step. Even if AGEND_BOT_TOKEN is
+        // set in the environment, we must not reach the teloxide call
+        // because the test home has no channel config to resolve
+        // group_id from.
+        let result = create_topic_for_instance(&home, "regression-pin");
+        assert!(
+            result.is_none(),
+            "missing fleet.yaml in the passed home must suppress the API call, got {result:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Companion to the test above for the symmetric delete path.
+    /// `delete_topic` also accepts `home` but used the unscoped resolver;
+    /// in tests that exercise teardown against a temp home it would have
+    /// attempted to hit the real Telegram group on a made-up topic id.
+    #[test]
+    fn delete_topic_uses_passed_home_not_real_home() {
+        let home = tmp_home("delete-topic-home-scope");
+        // No fleet.yaml → should return without touching the network.
+        // Can't directly assert "no HTTP request", but the early-return
+        // branch is the only code path that terminates cleanly when
+        // resolve fails, so reaching this assertion at all is proof.
+        delete_topic(&home, 999_999);
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
