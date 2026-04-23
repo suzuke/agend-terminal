@@ -379,27 +379,34 @@ pub const HEADER_SIZE_THRESHOLD: usize = 300;
 /// ANSI-colored header prefix for visual distinction in terminal.
 pub const HEADER_PREFIX: &str = "\x1b[44;97m[AGEND-MSG]\x1b[0m";
 
+/// Sanitize a value for header inclusion: replace control chars with space.
+fn sanitize_header_value(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 /// Format a single-line structured header for PTY injection.
 /// Fields: from / id / kind / thread / parent / size.
 /// Optional fields (thread/parent) omitted when None.
 pub fn format_header(msg: &InboxMessage) -> String {
     let mut parts = vec![
         HEADER_PREFIX.to_string(),
-        format!("from={}", msg.from),
+        format!("from={}", sanitize_header_value(&msg.from)),
     ];
     if let Some(ref id) = msg.id {
-        parts.push(format!("id={id}"));
+        parts.push(format!("id={}", sanitize_header_value(id)));
     }
     if let Some(ref kind) = msg.kind {
-        parts.push(format!("kind={kind}"));
+        parts.push(format!("kind={}", sanitize_header_value(kind)));
     }
     if let Some(ref thread) = msg.thread_id {
-        parts.push(format!("thread={thread}"));
+        parts.push(format!("thread={}", sanitize_header_value(thread)));
     }
     if let Some(ref parent) = msg.parent_id {
-        parts.push(format!("parent={parent}"));
+        parts.push(format!("parent={}", sanitize_header_value(parent)));
     }
-    parts.push(format!("size={}", msg.text.len()));
+    parts.push(format!("size={}", msg.text.chars().count()));
     parts.join(" ")
 }
 
@@ -1541,6 +1548,44 @@ mod tests {
         assert!(!header.contains("thread="));
         assert!(!header.contains("parent="));
         assert!(header.contains("size=5"));
+    }
+
+    #[test]
+    fn test_format_header_escapes_newlines() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:evil\nagent".into(),
+            text: "hello".into(),
+            kind: Some("task\r\ninjection".into()),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: Some("t\n1".into()),
+            parent_id: None,
+        };
+        let header = format_header(&msg);
+        assert!(!header.contains('\n'), "header must not contain newline: {header:?}");
+        assert!(!header.contains('\r'), "header must not contain CR: {header:?}");
+        assert!(header.contains("from=from:evil agent"));
+        assert!(header.contains("kind=task  injection"));
+    }
+
+    #[test]
+    fn test_format_header_escapes_control_chars() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: None,
+            from: "from:\x00null\x07bell".into(),
+            text: "t".into(),
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+        };
+        let header = format_header(&msg);
+        assert!(!header.chars().any(|c| c.is_control() && c != '\x1b'),
+            "header must not contain control chars (except ANSI escape): {header:?}");
     }
 
     #[test]
