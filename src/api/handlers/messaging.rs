@@ -34,7 +34,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         crate::inbox::InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None,
+            read_at: None, thread_id: None, parent_id: None,
             from: format!("from:{from}"),
             text: text.to_string(),
             kind: params

@@ -167,6 +167,10 @@ pub struct InboxMessage {
     pub timestamp: String,
     #[serde(default)]
     pub read_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 impl InboxMessage {
@@ -494,7 +498,7 @@ pub fn deliver(
         let msg = InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None,
+            read_at: None, thread_id: None, parent_id: None,
             from: source.to_string(),
             text: text.to_string(),
             kind,
@@ -622,7 +626,7 @@ mod tests {
         InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None,
+            read_at: None, thread_id: None, parent_id: None,
             from: from.to_string(),
             text: text.to_string(),
             kind: None,
@@ -744,7 +748,7 @@ mod tests {
         let msg = InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None,
+            read_at: None, thread_id: None, parent_id: None,
             from: "sender".to_string(),
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
@@ -833,7 +837,7 @@ mod tests {
         let msg = InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None,
+            read_at: None, thread_id: None, parent_id: None,
             from: "test".to_string(),
             text: "hello \"world\"".to_string(),
             kind: None,
@@ -851,7 +855,7 @@ mod tests {
         let msg = InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None,
+            read_at: None, thread_id: None, parent_id: None,
             from: "user".to_string(),
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
@@ -1424,5 +1428,41 @@ mod tests {
         );
 
         fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_inbox_msg_thread_parent_fields_roundtrip() {
+        // New fields with #[serde(default)] must round-trip and be absent from legacy
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "a".into(),
+            text: "t".into(),
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: Some("thread-42".into()),
+            parent_id: Some("m-0".into()),
+        };
+        let json = serde_json::to_string(&msg).expect("ser");
+        assert!(json.contains("thread_id"));
+        assert!(json.contains("parent_id"));
+        let parsed: InboxMessage = serde_json::from_str(&json).expect("deser");
+        assert_eq!(parsed.thread_id.as_deref(), Some("thread-42"));
+        assert_eq!(parsed.parent_id.as_deref(), Some("m-0"));
+
+        // Legacy JSON without these fields → None (forward compat)
+        let legacy = r#"{"from":"x","text":"y","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let parsed: InboxMessage = serde_json::from_str(legacy).expect("legacy deser");
+        assert!(parsed.thread_id.is_none());
+        assert!(parsed.parent_id.is_none());
+
+        // None fields should be omitted from serialization (skip_serializing_if)
+        let msg_no_thread = InboxMessage {
+            thread_id: None, parent_id: None, ..msg.clone()
+        };
+        let json2 = serde_json::to_string(&msg_no_thread).expect("ser");
+        assert!(!json2.contains("thread_id"));
+        assert!(!json2.contains("parent_id"));
     }
 }

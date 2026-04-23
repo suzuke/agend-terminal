@@ -436,7 +436,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     let msg_obj = InboxMessage {
         schema_version: 0,
         id: None,
-        read_at: None,
+        read_at: None, thread_id: None, parent_id: None,
         from: format!("user:{username}"),
         text: text.to_string(),
         kind: Some("telegram".to_string()),
