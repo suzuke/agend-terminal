@@ -408,11 +408,17 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if let Some(ref sel) = pane.selection {
-                    let text = pane
-                        .vterm
-                        .extract_text(sel.start, sel.end, pane.scroll_offset);
-                    if !text.is_empty() {
-                        copy_to_clipboard(&text);
+                    if sel.start == sel.end {
+                        // Click without drag — clear the zero-width selection
+                        // to avoid a 1-cell white block artifact.
+                        pane.selection = None;
+                    } else {
+                        let text = pane
+                            .vterm
+                            .extract_text(sel.start, sel.end, pane.scroll_offset);
+                        if !text.is_empty() {
+                            copy_to_clipboard(&text);
+                        }
                     }
                 }
                 // Keep selection visible — cleared on next mouse down or keypress.
@@ -428,7 +434,7 @@ fn handle_selection(layout: &mut Layout, mouse: &MouseEvent) {
 }
 
 /// Copy text to system clipboard (macOS / Linux / Windows).
-fn copy_to_clipboard(text: &str) {
+pub(super) fn copy_to_clipboard(text: &str) {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
         Ok(()) => {}
         Err(e) => tracing::warn!(error = %e, "clipboard copy failed"),

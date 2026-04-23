@@ -46,6 +46,8 @@ pub enum Action {
     ShowHelp,
     /// Summon a floating scratch shell overlay (Ctrl+B ~). Esc closes & kills it.
     ScratchShell,
+    /// Copy the focused pane's selection to clipboard (Cmd+C).
+    CopySelection,
     None,
 }
 
@@ -84,6 +86,10 @@ impl KeyHandler {
                 if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.state = PrefixState::WaitingFirst;
                     return Action::None;
+                }
+                // Cmd+C (macOS) → copy selection to clipboard
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SUPER) {
+                    return Action::CopySelection;
                 }
                 Action::Forward(key)
             }
@@ -216,10 +222,19 @@ fn is_repeatable(action: &Action) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     fn prefix_action(code: KeyCode, modifiers: KeyModifiers) -> Action {
         dispatch_prefix(KeyEvent::new(code, modifiers))
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
     }
 
     // --- Shift+L: ResizeRight (not LastTab) ---
@@ -326,5 +341,30 @@ mod tests {
             prefix_action(KeyCode::Char('K'), KeyModifiers::empty()),
             Action::ResizeUp
         );
+    }
+
+    // --- Cmd+C / Normal mode ---
+
+    #[test]
+    fn cmd_c_returns_copy_selection() {
+        let mut handler = KeyHandler::new();
+        let action = handler.handle(key(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert_eq!(action, Action::CopySelection);
+    }
+
+    #[test]
+    fn ctrl_b_still_enters_prefix() {
+        let mut handler = KeyHandler::new();
+        let action = handler.handle(key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(action, Action::None);
+        let action2 = handler.handle(key(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(action2, Action::NextTab);
+    }
+
+    #[test]
+    fn plain_c_forwards() {
+        let mut handler = KeyHandler::new();
+        let action = handler.handle(key(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(action, Action::Forward(_)));
     }
 }
