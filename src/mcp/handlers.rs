@@ -871,6 +871,65 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             json!({"repo": repo, "watching": false})
         }
 
+        // --- Health reporting ---
+        "report_health" => {
+            let Some(_) = sender.as_ref() else {
+                return err_needs_identity(tool);
+            };
+            let reason = match args["reason"].as_str() {
+                Some(r) => r,
+                None => return json!({"error": "missing 'reason'"}),
+            };
+            match crate::api::call(
+                &home,
+                &json!({
+                    "method": crate::api::method::SET_BLOCKED_REASON,
+                    "params": {
+                        "name": instance_name,
+                        "reason": reason,
+                        "retry_after_secs": args.get("retry_after_secs")
+                    }
+                }),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    json!({
+                        "status": "reason_set",
+                        "reason": reason,
+                        "current_state": resp["current_state"]
+                    })
+                }
+                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("set_blocked_reason failed")}),
+                Err(e) => json!({"error": format!("{e}")}),
+            }
+        }
+        "clear_blocked_reason" => {
+            let instance = match args["instance"].as_str() {
+                Some(n) => n,
+                None => return json!({"error": "missing 'instance'"}),
+            };
+            let mut params = json!({"name": instance});
+            if let Some(r) = args["reason"].as_str() {
+                params["reason"] = json!(r);
+            }
+            match crate::api::call(
+                &home,
+                &json!({
+                    "method": crate::api::method::CLEAR_BLOCKED_REASON,
+                    "params": params
+                }),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    json!({
+                        "status": "cleared",
+                        "instance": instance,
+                        "was": resp["was"]
+                    })
+                }
+                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("clear_blocked_reason failed")}),
+                Err(e) => json!({"error": format!("{e}")}),
+            }
+        }
+
         _ => json!({"error": format!("unknown tool: {tool}")}),
     }
 }
