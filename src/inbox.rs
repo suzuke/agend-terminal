@@ -1616,4 +1616,34 @@ mod tests {
         assert!(header.len() < HEADER_SIZE_THRESHOLD, "header must be compact");
         assert!(header.contains(&format!("size={}", HEADER_SIZE_THRESHOLD + 1)));
     }
+
+    #[test]
+    fn test_threshold_uses_char_count_not_bytes() {
+        // 100 CJK chars = 100 chars but 300 bytes (3 bytes each in UTF-8).
+        // Must be treated as short (100 < 300 threshold), not long.
+        let cjk = "你".repeat(100);
+        assert_eq!(cjk.chars().count(), 100);
+        assert_eq!(cjk.len(), 300); // bytes
+        // 100 chars < HEADER_SIZE_THRESHOLD (300) → should be short path
+        assert!(cjk.chars().count() <= HEADER_SIZE_THRESHOLD);
+
+        // 301 CJK chars = 301 chars → should be long path
+        let long_cjk = "你".repeat(HEADER_SIZE_THRESHOLD + 1);
+        assert!(long_cjk.chars().count() > HEADER_SIZE_THRESHOLD);
+
+        // format_header size= should report char count, not byte count
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: None,
+            from: "from:x".into(),
+            text: cjk,
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+        };
+        let header = format_header(&msg);
+        assert!(header.contains("size=100"), "size must be char count (100), not byte count (300): {header}");
+    }
 }
