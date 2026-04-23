@@ -1710,4 +1710,23 @@ mod tests {
             "size must be char count (100), not byte count (300): {header}"
         );
     }
+
+    #[test]
+    fn test_format_event_header_basic() {
+        let h = format_event_header("poll-reminder", &[("unread", "3"), ("oldest", "5m")]);
+        assert!(h.contains("[AGEND-MSG]"), "must have prefix");
+        assert!(h.contains("kind=poll-reminder"), "must have kind");
+        assert!(h.contains("unread=3"), "must have unread field");
+        assert!(h.contains("oldest=5m"), "must have oldest field");
+        assert!(!h.contains('\n'), "must be single line");
+    }
+
+    #[test]
+    fn test_format_event_header_sanitizes_fields() {
+        let h = format_event_header("evil\nkind", &[("key", "val\r\nue")]);
+        assert!(!h.contains('\n'), "newlines in kind must be sanitized: {h:?}");
+        assert!(!h.contains('\r'), "CR in value must be sanitized: {h:?}");
+        assert!(h.contains("kind=evil kind"));
+        assert!(h.contains("key=val  ue"));
+    }
 }

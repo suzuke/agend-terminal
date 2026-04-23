@@ -25,49 +25,50 @@ fn should_notify_and_record(name: &str, count: usize) -> bool {
     true
 }
 
-/// Run one poll-reminder pass. Called from daemon tick every N ticks.
-///
-/// For each managed agent: if Idle + unread > 0 + count changed since
-/// last notification → inject a single-line reminder to PTY.
-pub fn poll_reminder_pass(home: &Path, registry: &AgentRegistry) {
-    let mut to_notify: Vec<(String, String)> = Vec::new();
-    {
-        let reg = agent::lock_registry(registry);
-        for (name, handle) in reg.iter() {
-            let agent_state = match handle.core.lock() {
-                Ok(c) => c.state.current,
-                Err(_) => continue,
-            };
-            if agent_state != AgentState::Idle {
-                continue;
-            }
-            let (count, oldest) = crate::inbox::unread_count(home, name);
-            if count == 0 {
-                continue;
-            }
-            if !should_notify_and_record(name, count) {
-                continue;
-            }
-
-            let age_str = match oldest {
-                Some(ts) => {
-                    let mins = chrono::Utc::now()
-                        .signed_duration_since(ts)
-                        .num_minutes()
-                        .max(0);
-                    format!("{mins}m")
-                }
-                None => "?".to_string(),
-            };
-            let count_str = count.to_string();
-            let reminder = crate::inbox::format_event_header(
-                "poll-reminder",
-                &[("unread", &count_str), ("oldest", &age_str)],
-            );
-            to_notify.push((name.clone(), reminder));
+/// Pure collector: returns (agent_name, reminder_string) for each agent
+/// that should be nudged. No side effects — does not inject into PTY.
+pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let reg = agent::lock_registry(registry);
+    for (name, handle) in reg.iter() {
+        let agent_state = match handle.core.lock() {
+            Ok(c) => c.state.current,
+            Err(_) => continue,
+        };
+        if agent_state != AgentState::Idle {
+            continue;
         }
+        let (count, oldest) = crate::inbox::unread_count(home, name);
+        if count == 0 {
+            continue;
+        }
+        if !should_notify_and_record(name, count) {
+            continue;
+        }
+        let age_str = match oldest {
+            Some(ts) => {
+                let mins = chrono::Utc::now()
+                    .signed_duration_since(ts)
+                    .num_minutes()
+                    .max(0);
+                format!("{mins}m")
+            }
+            None => "?".to_string(),
+        };
+        let count_str = count.to_string();
+        let reminder = crate::inbox::format_event_header(
+            "poll-reminder",
+            &[("unread", &count_str), ("oldest", &age_str)],
+        );
+        result.push((name.clone(), reminder));
     }
-    for (name, reminder) in to_notify {
+    result
+}
+
+/// Run one poll-reminder pass. Called from daemon tick every N ticks.
+/// Collects reminders via [`collect_poll_reminders`] then injects each.
+pub fn poll_reminder_pass(home: &Path, registry: &AgentRegistry) {
+    for (name, reminder) in collect_poll_reminders(home, registry) {
         crate::inbox::compose_aware_inject(home, &name, &reminder);
     }
 }
@@ -101,7 +102,7 @@ mod tests {
                 agent,
                 crate::inbox::InboxMessage {
                     schema_version: 1,
-                    id: Some(format!("m-{i}")),
+                    id: Some(format!("m-{agent}-{i}")),
                     from: "test".into(),
                     text: format!("msg {i}"),
                     kind: None,
@@ -114,32 +115,20 @@ mod tests {
         }
     }
 
-    /// Build a minimal AgentRegistry with one agent at the given state.
-    /// The PTY/writer are real but unused — we only inspect inbox side effects.
     fn mock_registry(name: &str, state: AgentState) -> AgentRegistry {
         use portable_pty::{CommandBuilder, PtySize};
         let pty_system = native_pty_system();
         let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
             .expect("openpty");
-        let child = pair
-            .slave
-            .spawn_command(CommandBuilder::new("true"))
-            .expect("spawn");
-
+        let child = pair.slave.spawn_command(CommandBuilder::new("true")).expect("spawn");
         let writer = pair.master.take_writer().expect("writer");
-        let mut state_tracker = StateTracker::new(None);
-        state_tracker.current = state;
-
+        let mut st = StateTracker::new(None);
+        st.current = state;
         let core = AgentCore {
             vterm: crate::vterm::VTerm::new(24, 80),
             subscribers: Vec::new(),
-            state: state_tracker,
+            state: st,
             health: crate::health::HealthTracker::new(),
         };
         let handle = AgentHandle {
@@ -158,64 +147,80 @@ mod tests {
         reg
     }
 
+    /// Reset dedup state for a specific agent to allow fresh test runs.
+    fn reset_dedup(name: &str) {
+        let mut guard = LAST_NOTIFIED.lock().unwrap();
+        if let Some(map) = guard.as_mut() {
+            map.remove(name);
+        }
+    }
+
     #[test]
-    fn test_poll_reminder_pass_injects_when_idle_with_unread() {
-        let home = tmp_home("pass-inject");
-        // Use a unique agent name to avoid dedup interference from other tests
-        let agent = "poll-inject-agent";
+    fn test_collect_poll_reminders_returns_reminder_when_idle_with_unread() {
+        let home = tmp_home("collect-idle");
+        let agent = "collect-idle-agent";
         seed_unread(&home, agent, 3);
         let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
 
-        // Reset dedup state for this agent
-        should_notify_and_record(agent, 0);
-
-        poll_reminder_pass(&home, &registry);
-
-        // Verify: dedup state updated to 3
-        assert!(!should_notify_and_record(agent, 3), "dedup should block same count");
+        let v = collect_poll_reminders(&home, &registry);
+        assert_eq!(v.len(), 1, "should produce 1 reminder");
+        assert_eq!(v[0].0, agent);
+        assert!(v[0].1.contains("[AGEND-MSG]"), "must contain header prefix");
+        assert!(v[0].1.contains("kind=poll-reminder"), "must contain kind");
+        assert!(v[0].1.contains("unread=3"), "must contain unread count");
 
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn test_poll_reminder_pass_dedupes_same_count() {
-        let home = tmp_home("pass-dedup");
-        let agent = "poll-dedup-agent";
-        seed_unread(&home, agent, 2);
+    fn test_collect_poll_reminders_dedupes_same_count() {
+        let home = tmp_home("collect-dedup");
+        let agent = "collect-dedup-agent";
+        seed_unread(&home, agent, 3);
         let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
 
-        // Reset dedup
-        should_notify_and_record(agent, 0);
+        let v1 = collect_poll_reminders(&home, &registry);
+        assert_eq!(v1.len(), 1);
 
-        // First pass: should notify (count changed 0→2)
-        poll_reminder_pass(&home, &registry);
-        // Second pass: same count → should NOT notify (dedup blocks)
-        assert!(!should_notify_and_record(agent, 2));
-
-        // Add more unread → count changes → should notify again
-        seed_unread(&home, agent, 1); // now 3 total
-        assert!(should_notify_and_record(agent, 3));
+        let v2 = collect_poll_reminders(&home, &registry);
+        assert!(v2.is_empty(), "second call with same count must be suppressed by dedup");
 
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn test_poll_reminder_pass_skips_when_busy() {
-        let home = tmp_home("pass-busy");
-        let agent = "poll-busy-agent";
+    fn test_collect_poll_reminders_re_notifies_on_count_change() {
+        let home = tmp_home("collect-renotify");
+        let agent = "collect-renotify-agent";
+        seed_unread(&home, agent, 3);
+        let registry = mock_registry(agent, AgentState::Idle);
+        reset_dedup(agent);
+
+        let v1 = collect_poll_reminders(&home, &registry);
+        assert_eq!(v1.len(), 1);
+        assert!(v1[0].1.contains("unread=3"));
+
+        // Add 2 more unread → count changes to 5
+        seed_unread(&home, agent, 2);
+        let v2 = collect_poll_reminders(&home, &registry);
+        assert_eq!(v2.len(), 1, "count changed → should re-notify");
+        assert!(v2[0].1.contains("unread=5"), "must reflect new count, got: {}", v2[0].1);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_collect_poll_reminders_skips_when_busy() {
+        let home = tmp_home("collect-busy");
+        let agent = "collect-busy-agent";
         seed_unread(&home, agent, 5);
         let registry = mock_registry(agent, AgentState::Thinking);
+        reset_dedup(agent);
 
-        // Reset dedup
-        should_notify_and_record(agent, 0);
-
-        poll_reminder_pass(&home, &registry);
-
-        // Dedup state should NOT have been updated (agent was busy, skipped)
-        assert!(
-            should_notify_and_record(agent, 5),
-            "busy agent should not have been recorded in dedup"
-        );
+        let v = collect_poll_reminders(&home, &registry);
+        assert!(v.is_empty(), "busy agent must not get reminder");
 
         std::fs::remove_dir_all(&home).ok();
     }
