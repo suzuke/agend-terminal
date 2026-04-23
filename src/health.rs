@@ -5,7 +5,7 @@
 //! - HealthState: cumulative lifecycle (Healthy, Recovering, Unstable, Failed...)
 
 use crate::state::AgentState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -61,6 +61,22 @@ impl HealthState {
     }
 }
 
+/// Why an agent is blocked. Used to prevent `check_hang` from
+/// misdiagnosing expected waits as hangs (race mutex).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum BlockedReason {
+    Hang,
+    RateLimit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_secs: Option<u64>,
+    },
+    QuotaExceeded,
+    AwaitingOperator,
+    PermissionPrompt,
+    Crash,
+}
+
 /// Tracks health for one agent.
 #[derive(Clone)]
 #[allow(dead_code)] // error_events, last_output, record_error, reset: reserved for daemon health monitoring
@@ -72,6 +88,7 @@ pub struct HealthTracker {
     last_notification: Option<Instant>,
     error_events: VecDeque<(Instant, AgentState)>,
     pub last_output: Instant,
+    pub current_reason: Option<BlockedReason>,
 }
 
 impl HealthTracker {
@@ -84,6 +101,7 @@ impl HealthTracker {
             last_notification: None,
             error_events: VecDeque::new(),
             last_output: Instant::now(),
+            current_reason: None,
         }
     }
 
@@ -170,6 +188,19 @@ impl HealthTracker {
     /// internally) so tests can construct arbitrary durations without
     /// overflowing on platforms where `Instant` is boot-anchored (Windows).
     pub fn check_hang(&mut self, agent_state: AgentState, silent: Duration) -> bool {
+        // Race mutex: skip hang check when agent is blocked for a known
+        // reason that legitimately suppresses output.
+        if let Some(ref reason) = self.current_reason {
+            if matches!(
+                reason,
+                BlockedReason::RateLimit { .. }
+                    | BlockedReason::QuotaExceeded
+                    | BlockedReason::AwaitingOperator
+            ) {
+                return false;
+            }
+        }
+
         let is_hang = match agent_state {
             AgentState::Idle => false, // Waiting for input
             AgentState::Starting => silent > Duration::from_secs(120),
@@ -185,6 +216,17 @@ impl HealthTracker {
             self.state = HealthState::Healthy;
         }
         false
+    }
+
+    /// Set the current blocked reason. Prevents `check_hang` from
+    /// misdiagnosing expected waits as hangs.
+    pub fn set_blocked_reason(&mut self, reason: BlockedReason) {
+        self.current_reason = Some(reason);
+    }
+
+    /// Clear the current blocked reason, resuming normal hang detection.
+    pub fn clear_blocked_reason(&mut self) {
+        self.current_reason = None;
     }
 
     /// Record an error state. Returns true if error loop detected (3x in 10min).
@@ -422,5 +464,57 @@ mod tests {
         // Decay won't trigger immediately (need 30 min)
         h.maybe_decay();
         assert_eq!(h.total_crashes, 2);
+    }
+
+    #[test]
+    fn test_check_hang_skipped_when_rate_limited() {
+        let mut h = HealthTracker::new();
+        h.set_blocked_reason(BlockedReason::RateLimit { retry_after_secs: Some(60) });
+        // Thinking + 700s silence would normally trigger hang
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert_ne!(h.state, HealthState::Hung);
+
+        // Also test QuotaExceeded and AwaitingOperator
+        h.clear_blocked_reason();
+        h.set_blocked_reason(BlockedReason::QuotaExceeded);
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+
+        h.clear_blocked_reason();
+        h.set_blocked_reason(BlockedReason::AwaitingOperator);
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+
+        // PermissionPrompt does NOT suppress hang check
+        h.clear_blocked_reason();
+        h.set_blocked_reason(BlockedReason::PermissionPrompt);
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+    }
+
+    #[test]
+    fn test_clear_blocked_reason_resumes_hang_check() {
+        let mut h = HealthTracker::new();
+        h.set_blocked_reason(BlockedReason::RateLimit { retry_after_secs: None });
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+
+        h.clear_blocked_reason();
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert_eq!(h.state, HealthState::Hung);
+    }
+
+    #[test]
+    fn test_blocked_reason_serde() {
+        let cases = vec![
+            BlockedReason::Hang,
+            BlockedReason::RateLimit { retry_after_secs: Some(60) },
+            BlockedReason::RateLimit { retry_after_secs: None },
+            BlockedReason::QuotaExceeded,
+            BlockedReason::AwaitingOperator,
+            BlockedReason::PermissionPrompt,
+            BlockedReason::Crash,
+        ];
+        for reason in cases {
+            let json = serde_json::to_string(&reason).expect("serialize");
+            let parsed: BlockedReason = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(parsed, reason, "round-trip failed for {json}");
+        }
     }
 }
