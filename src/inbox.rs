@@ -158,7 +158,15 @@ pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, te
         text.to_string()
     };
     let notification = format!("[{source}] {display_text}{}", source.reply_hint());
-    let _ = route_notification(home, agent_name, &notification, |msg| {
+    compose_aware_inject(home, agent_name, &notification);
+}
+
+/// Compose-aware notification delivery: checks `is_composing` and enqueues
+/// if the target agent is mid-typing, otherwise injects directly via the API.
+/// Used by both `notify_agent` (Telegram/system path) and `handle_send`
+/// (agent-to-agent MCP path) to ensure a single source of truth.
+pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
+    let _ = route_notification(home, agent_name, notification, |msg| {
         inject_notification(home, agent_name, msg)
     });
 }
