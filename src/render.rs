@@ -789,7 +789,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout, telegram: T
     }
 
     spans.push(Span::styled(
-        " | Ctrl+B c new | : cmd | n/p switch | d detach | ? help ",
+        " | Ctrl+B c new | : cmd | n/p switch | d detach | Ctrl+B ? help ",
         Style::default().fg(Color::DarkGray),
     ));
 
@@ -1756,5 +1756,33 @@ mod tests {
             .map(|(text, _)| text)
             .collect::<String>();
         assert!(joined.contains("[3]"));
+    }
+
+    #[test]
+    fn main_tui_footer_shows_help_hint() {
+        let backend = ratatui::backend::TestBackend::new(100, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let layout = crate::layout::Layout::new();
+        terminal
+            .draw(|frame| {
+                render_status_bar(
+                    frame,
+                    frame.area(),
+                    &layout,
+                    TelegramStatus::NotConfigured,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+        }
+        assert!(
+            text.contains("Ctrl+B ?"),
+            "status bar should contain 'Ctrl+B ?' hint, got: {text}"
+        );
     }
 }
