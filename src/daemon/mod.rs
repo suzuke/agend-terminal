@@ -1,8 +1,8 @@
 //! Daemon: manages agent registry, TUI sockets, auto-respawn, fleet lifecycle,
 //! schedule checking, health monitoring, Telegram notifications.
 
-mod ci_watch;
-mod cron_tick;
+pub(crate) mod ci_watch;
+pub(crate) mod cron_tick;
 pub(crate) mod supervisor;
 mod tui_bridge;
 
