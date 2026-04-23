@@ -36,9 +36,8 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         if thread_id.is_none() {
             if let Some(ref pid) = parent_id {
                 if let Some(parent_msg) = crate::inbox::find_message(ctx.home, pid) {
-                    thread_id = parent_msg
-                        .thread_id
-                        .or_else(|| parent_msg.id.clone()); // parent becomes thread root
+                    thread_id = parent_msg.thread_id.or_else(|| parent_msg.id.clone());
+                    // parent becomes thread root
                 }
             }
         }

@@ -145,7 +145,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     if resolved_thread.is_none() {
                         if let Some(ref pid) = resolved_parent {
                             if let Some(parent_msg) = crate::inbox::find_message(&home, pid) {
-                                resolved_thread = parent_msg.thread_id.or_else(|| parent_msg.id.clone());
+                                resolved_thread =
+                                    parent_msg.thread_id.or_else(|| parent_msg.id.clone());
                             }
                         }
                     }
