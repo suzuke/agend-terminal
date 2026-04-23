@@ -628,15 +628,21 @@ fn test_sweep_expired_removes_old_read_messages() {
 fn test_send_to_instance_passes_thread_id() {
     let home = mcp_home();
     // Send to a different agent (not self) with thread_id
-    let responses = mcp_session_in_home(&home, &[
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_to_instance","arguments":{"instance_name":"other-agent","message":"thread test message that needs to be long enough to exceed the inline threshold of five hundred characters so it actually gets enqueued to the inbox JSONL file rather than only being injected to PTY which would not persist the thread_id field we are testing here. Adding more padding text to ensure we cross the 500 char boundary reliably in this integration test scenario.","thread_id":"t-root-42","request_kind":"task"}}}"#,
-    ]);
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_to_instance","arguments":{"instance_name":"other-agent","message":"thread test message that needs to be long enough to exceed the inline threshold of five hundred characters so it actually gets enqueued to the inbox JSONL file rather than only being injected to PTY which would not persist the thread_id field we are testing here. Adding more padding text to ensure we cross the 500 char boundary reliably in this integration test scenario.","thread_id":"t-root-42","request_kind":"task"}}}"#,
+        ],
+    );
     assert!(responses.len() >= 2);
     // Verify the message was enqueued to other-agent's inbox with thread_id
     let inbox_path = home.join("inbox").join("other-agent.jsonl");
     let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
-    assert!(content.contains("t-root-42"), "thread_id must be in inbox JSONL: {content}");
+    assert!(
+        content.contains("t-root-42"),
+        "thread_id must be in inbox JSONL: {content}"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -649,15 +655,25 @@ fn test_describe_thread_returns_ordered_msgs() {
     let m1 = r#"{"schema_version":1,"id":"m-1","from":"a","text":"first","kind":null,"timestamp":"2026-01-01T00:00:01Z","thread_id":"t-99"}"#;
     let m2 = r#"{"schema_version":1,"id":"m-2","from":"b","text":"second","kind":null,"timestamp":"2026-01-01T00:00:02Z","thread_id":"t-99"}"#;
     let m3 = r#"{"schema_version":1,"id":"m-3","from":"c","text":"other thread","kind":null,"timestamp":"2026-01-01T00:00:03Z","thread_id":"t-other"}"#;
-    std::fs::write(inbox_dir.join("test-agent.jsonl"), format!("{m1}\n{m2}\n{m3}\n")).ok();
+    std::fs::write(
+        inbox_dir.join("test-agent.jsonl"),
+        format!("{m1}\n{m2}\n{m3}\n"),
+    )
+    .ok();
 
-    let responses = mcp_session_in_home(&home, &[
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe_thread","arguments":{"thread_id":"t-99"}}}"#,
-    ]);
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe_thread","arguments":{"thread_id":"t-99"}}}"#,
+        ],
+    );
     assert!(responses.len() >= 2);
     let result = extract_tool_result(&responses[1]);
-    assert_eq!(result["count"], 2, "should find 2 messages in thread t-99, got: {result}");
+    assert_eq!(
+        result["count"], 2,
+        "should find 2 messages in thread t-99, got: {result}"
+    );
     let msgs = result["messages"].as_array().expect("messages");
     assert_eq!(msgs[0]["id"], "m-1");
     assert_eq!(msgs[1]["id"], "m-2");
@@ -674,16 +690,25 @@ fn test_describe_thread_filters_by_instance() {
     std::fs::write(inbox_dir.join("agent-a.jsonl"), format!("{m1}\n")).ok();
     std::fs::write(inbox_dir.join("agent-b.jsonl"), format!("{m2}\n")).ok();
 
-    let responses = mcp_session_in_home(&home, &[
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe_thread","arguments":{"thread_id":"t-shared","instance":"agent-a"}}}"#,
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe_thread","arguments":{"thread_id":"t-shared"}}}"#,
-    ]);
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"describe_thread","arguments":{"thread_id":"t-shared","instance":"agent-a"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"describe_thread","arguments":{"thread_id":"t-shared"}}}"#,
+        ],
+    );
     assert!(responses.len() >= 3);
     let filtered = extract_tool_result(&responses[1]);
-    assert_eq!(filtered["count"], 1, "filtered to agent-a should have 1 msg");
+    assert_eq!(
+        filtered["count"], 1,
+        "filtered to agent-a should have 1 msg"
+    );
     let all = extract_tool_result(&responses[2]);
-    assert_eq!(all["count"], 2, "unfiltered should have 2 msgs across agents");
+    assert_eq!(
+        all["count"], 2,
+        "unfiltered should have 2 msgs across agents"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -697,18 +722,26 @@ fn test_parent_id_auto_inherits_thread() {
     std::fs::write(inbox_dir.join("other-agent.jsonl"), format!("{parent}\n")).ok();
 
     // Send a reply with parent_id but no thread_id — should auto-inherit
-    let responses = mcp_session_in_home(&home, &[
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_to_instance","arguments":{"instance_name":"other-agent","message":"reply with auto-inherit. Padding to exceed 500 chars threshold so the message gets enqueued to inbox JSONL where we can verify thread_id inheritance. More padding text here to ensure we reliably cross the boundary for this integration test of the parent auto-inherit thread correlation feature in the agend-terminal daemon.","parent_id":"m-parent"}}}"#,
-    ]);
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_to_instance","arguments":{"instance_name":"other-agent","message":"reply with auto-inherit. Padding to exceed 500 chars threshold so the message gets enqueued to inbox JSONL where we can verify thread_id inheritance. More padding text here to ensure we reliably cross the boundary for this integration test of the parent auto-inherit thread correlation feature in the agend-terminal daemon.","parent_id":"m-parent"}}}"#,
+        ],
+    );
     assert!(responses.len() >= 2);
     // Read other-agent's inbox directly to verify thread_id was inherited
     let content = std::fs::read_to_string(inbox_dir.join("other-agent.jsonl")).unwrap_or_default();
     let lines: Vec<&str> = content.lines().collect();
     // Find the reply (has parent_id=m-parent, not the parent itself)
-    let reply_line = lines.iter().find(|l| l.contains("m-parent") && l.contains("reply with auto-inherit"));
+    let reply_line = lines
+        .iter()
+        .find(|l| l.contains("m-parent") && l.contains("reply with auto-inherit"));
     assert!(reply_line.is_some(), "reply must be in inbox");
-    assert!(reply_line.unwrap().contains("t-conv-1"),
-        "thread_id must be auto-inherited from parent: {}", reply_line.unwrap());
+    assert!(
+        reply_line.unwrap().contains("t-conv-1"),
+        "thread_id must be auto-inherited from parent: {}",
+        reply_line.unwrap()
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
