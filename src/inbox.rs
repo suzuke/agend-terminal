@@ -92,7 +92,9 @@ pub fn recover_half_writes(home: &Path) {
                 let lines: Vec<&str> = content.lines().collect();
                 let bad: Vec<&&str> = lines
                     .iter()
-                    .filter(|l| !l.trim().is_empty() && serde_json::from_str::<InboxMessage>(l).is_err())
+                    .filter(|l| {
+                        !l.trim().is_empty() && serde_json::from_str::<InboxMessage>(l).is_err()
+                    })
                     .collect();
                 if !bad.is_empty() {
                     // Move entire file to recovery, agent gets a fresh start
@@ -471,7 +473,9 @@ pub fn deliver(
         notify_agent(home, agent_name, source, text);
     } else {
         let msg = InboxMessage {
-            schema_version: 0, id: None, read_at: None,
+            schema_version: 0,
+            id: None,
+            read_at: None,
             from: source.to_string(),
             text: text.to_string(),
             kind,
@@ -590,7 +594,9 @@ mod tests {
 
     fn make_msg(from: &str, text: &str) -> InboxMessage {
         InboxMessage {
-            schema_version: 0, id: None, read_at: None,
+            schema_version: 0,
+            id: None,
+            read_at: None,
             from: from.to_string(),
             text: text.to_string(),
             kind: None,
@@ -710,7 +716,9 @@ mod tests {
     fn inbox_message_fields_preserved() {
         let home = tmp_home("fields");
         let msg = InboxMessage {
-            schema_version: 0, id: None, read_at: None,
+            schema_version: 0,
+            id: None,
+            read_at: None,
             from: "sender".to_string(),
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
@@ -797,7 +805,9 @@ mod tests {
     #[test]
     fn inbox_message_serialization() {
         let msg = InboxMessage {
-            schema_version: 0, id: None, read_at: None,
+            schema_version: 0,
+            id: None,
+            read_at: None,
             from: "test".to_string(),
             text: "hello \"world\"".to_string(),
             kind: None,
@@ -813,7 +823,9 @@ mod tests {
     fn inbox_message_with_special_chars() {
         let home = tmp_home("special");
         let msg = InboxMessage {
-            schema_version: 0, id: None, read_at: None,
+            schema_version: 0,
+            id: None,
+            read_at: None,
             from: "user".to_string(),
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
@@ -1085,18 +1097,18 @@ mod tests {
 
         // Simulate stale tmp from interrupted enqueue
         let tmp = inbox_dir.join("agent1.jsonl.tmp");
-        fs::write(&tmp, "{\"from\":\"x\",\"text\":\"orphan\",\"kind\":null,\"timestamp\":\"t\"}\n")
-            .ok();
+        fs::write(
+            &tmp,
+            "{\"from\":\"x\",\"text\":\"orphan\",\"kind\":null,\"timestamp\":\"t\"}\n",
+        )
+        .ok();
 
         recover_half_writes(&home);
 
         assert!(!tmp.exists(), ".tmp must be moved to recovery");
         let recovery = home.join("inbox.recovery");
         assert!(recovery.exists(), "recovery dir must be created");
-        let entries: Vec<_> = fs::read_dir(&recovery)
-            .unwrap()
-            .flatten()
-            .collect();
+        let entries: Vec<_> = fs::read_dir(&recovery).unwrap().flatten().collect();
         assert_eq!(entries.len(), 1, "one timestamped recovery dir");
 
         fs::remove_dir_all(&home).ok();
@@ -1112,7 +1124,11 @@ mod tests {
         let jsonl = inbox_dir.join("agent1.jsonl");
         let good = serde_json::to_string(&make_msg("ok", "fine")).unwrap();
         // Write a good line followed by a truncated/corrupt line
-        fs::write(&jsonl, format!("{good}\n{{\"from\":\"broken\",\"text\":\"trun")).ok();
+        fs::write(
+            &jsonl,
+            format!("{good}\n{{\"from\":\"broken\",\"text\":\"trun"),
+        )
+        .ok();
 
         recover_half_writes(&home);
 
@@ -1122,10 +1138,7 @@ mod tests {
         // The recovery subdir should contain the moved file
         let subdirs: Vec<_> = fs::read_dir(&recovery).unwrap().flatten().collect();
         assert_eq!(subdirs.len(), 1);
-        let files: Vec<_> = fs::read_dir(subdirs[0].path())
-            .unwrap()
-            .flatten()
-            .collect();
+        let files: Vec<_> = fs::read_dir(subdirs[0].path()).unwrap().flatten().collect();
         assert_eq!(files.len(), 1);
         assert!(files[0].file_name().to_string_lossy().contains("agent1"));
 
@@ -1146,7 +1159,10 @@ mod tests {
 
         // Second drain returns empty (already read)
         let msgs2 = drain(&home, "agent1");
-        assert!(msgs2.is_empty(), "already-read messages must not be returned");
+        assert!(
+            msgs2.is_empty(),
+            "already-read messages must not be returned"
+        );
 
         // But the file still exists with the messages
         let path = inbox_path(&home, "agent1");
@@ -1177,14 +1193,18 @@ mod tests {
         fs::write(
             inbox_dir.join("agent1.jsonl"),
             format!("{read_old}\n{read_fresh}\n"),
-        ).ok();
+        )
+        .ok();
 
         sweep_expired(&home);
 
         let content = fs::read_to_string(inbox_dir.join("agent1.jsonl")).expect("file");
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1, "read message >7d must be swept");
-        assert!(lines[0].contains("m-fresh"), "fresh read message must survive");
+        assert!(
+            lines[0].contains("m-fresh"),
+            "fresh read message must survive"
+        );
 
         fs::remove_dir_all(&home).ok();
     }
@@ -1206,14 +1226,18 @@ mod tests {
         fs::write(
             inbox_dir.join("agent1.jsonl"),
             format!("{unread_old}\n{unread_recent}\n"),
-        ).ok();
+        )
+        .ok();
 
         sweep_expired(&home);
 
         let content = fs::read_to_string(inbox_dir.join("agent1.jsonl")).expect("file");
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1, "unread message >30d must be swept");
-        assert!(lines[0].contains("m-unread-recent"), "recent unread must survive");
+        assert!(
+            lines[0].contains("m-unread-recent"),
+            "recent unread must survive"
+        );
 
         fs::remove_dir_all(&home).ok();
     }
@@ -1238,7 +1262,8 @@ mod tests {
         fs::write(
             inbox_dir.join("agent1.jsonl"),
             format!("{read_msg}\n{expired_msg}\n"),
-        ).ok();
+        )
+        .ok();
 
         // ReadAt
         match describe_message(&home, "m-read") {
