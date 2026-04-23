@@ -137,7 +137,7 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('c') => Action::NewTab,
         KeyCode::Char('n') => Action::NextTab,
         KeyCode::Char('p') => Action::PrevTab,
-        KeyCode::Char('l') => Action::LastTab,
+        KeyCode::Char('l') if !key.modifiers.contains(KeyModifiers::SHIFT) => Action::LastTab,
         KeyCode::Char('&') => Action::CloseTab,
         KeyCode::Char(',') => Action::RenameTab,
         KeyCode::Char('w') => Action::ListTabs,
@@ -162,14 +162,19 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         // Alt+Arrow encoding depends on the terminal (macOS Terminal, Ghostty,
         // iTerm2 all disagree on whether Option is Meta), so we also accept
         // uppercase H/J/K/L as a portable tmux-style resize fallback.
+        // Match both uppercase (legacy) and lowercase+SHIFT (Kitty protocol).
         KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeUp,
         KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeDown,
         KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeLeft,
         KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => Action::ResizeRight,
         KeyCode::Char('K') => Action::ResizeUp,
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::ResizeUp,
         KeyCode::Char('J') => Action::ResizeDown,
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::ResizeDown,
         KeyCode::Char('H') => Action::ResizeLeft,
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::ResizeLeft,
         KeyCode::Char('L') => Action::ResizeRight,
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::ResizeRight,
         KeyCode::Up => Action::FocusUp,
         KeyCode::Down => Action::FocusDown,
         KeyCode::Left => Action::FocusLeft,
@@ -179,8 +184,9 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('[') => Action::ScrollMode,
         KeyCode::Char(':') => Action::CommandPalette,
         KeyCode::Char('D') => Action::ShowDecisions,
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::ShowDecisions,
         KeyCode::Char('T') | KeyCode::Char('t') => Action::ShowTasks,
-        KeyCode::Char('d') => Action::Detach,
+        KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::SHIFT) => Action::Detach,
         KeyCode::Char('?') => Action::ShowHelp,
         KeyCode::Char('~') => Action::ScratchShell,
 
@@ -205,4 +211,120 @@ fn is_repeatable(action: &Action) -> bool {
             | Action::PrevTab
             | Action::NextLayout
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn prefix_action(code: KeyCode, modifiers: KeyModifiers) -> Action {
+        dispatch_prefix(KeyEvent::new(code, modifiers))
+    }
+
+    // --- Shift+L: ResizeRight (not LastTab) ---
+
+    #[test]
+    fn keybind_ctrl_b_shift_l_resize_right_kitty() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('l'), KeyModifiers::SHIFT),
+            Action::ResizeRight
+        );
+    }
+
+    #[test]
+    fn keybind_ctrl_b_shift_l_resize_right_legacy() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('L'), KeyModifiers::empty()),
+            Action::ResizeRight
+        );
+    }
+
+    #[test]
+    fn keybind_ctrl_b_l_last_tab_no_shift() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('l'), KeyModifiers::empty()),
+            Action::LastTab
+        );
+    }
+
+    // --- Shift+D: ShowDecisions (not Detach) ---
+
+    #[test]
+    fn keybind_ctrl_b_shift_d_show_decisions_kitty() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('d'), KeyModifiers::SHIFT),
+            Action::ShowDecisions
+        );
+    }
+
+    #[test]
+    fn keybind_ctrl_b_shift_d_show_decisions_legacy() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('D'), KeyModifiers::empty()),
+            Action::ShowDecisions
+        );
+    }
+
+    #[test]
+    fn keybind_ctrl_b_d_detach_no_shift() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('d'), KeyModifiers::empty()),
+            Action::Detach
+        );
+    }
+
+    // --- Shift+H: ResizeLeft ---
+
+    #[test]
+    fn keybind_ctrl_b_shift_h_resize_left_kitty() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('h'), KeyModifiers::SHIFT),
+            Action::ResizeLeft
+        );
+    }
+
+    #[test]
+    fn keybind_ctrl_b_shift_h_resize_left_legacy() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('H'), KeyModifiers::empty()),
+            Action::ResizeLeft
+        );
+    }
+
+    // --- Shift+J: ResizeDown ---
+
+    #[test]
+    fn keybind_ctrl_b_shift_j_resize_down_kitty() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('j'), KeyModifiers::SHIFT),
+            Action::ResizeDown
+        );
+    }
+
+    #[test]
+    fn keybind_ctrl_b_shift_j_resize_down_legacy() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('J'), KeyModifiers::empty()),
+            Action::ResizeDown
+        );
+    }
+
+    // --- Shift+K: ResizeUp ---
+
+    #[test]
+    fn keybind_ctrl_b_shift_k_resize_up_kitty() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('k'), KeyModifiers::SHIFT),
+            Action::ResizeUp
+        );
+    }
+
+    #[test]
+    fn keybind_ctrl_b_shift_k_resize_up_legacy() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('K'), KeyModifiers::empty()),
+            Action::ResizeUp
+        );
+    }
 }
