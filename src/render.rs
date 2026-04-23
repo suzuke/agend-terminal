@@ -1359,6 +1359,18 @@ pub fn render_tasks(
         frame.render_widget(Paragraph::new(lines), block_inner);
     }
 
+    // Help hint at bottom-right (hidden in Help mode)
+    if !matches!(mode, TaskBoardMode::Help) && inner.height > 1 && inner.width > 6 {
+        let hint = "? help";
+        let hint_x = inner.x + inner.width.saturating_sub(hint.len() as u16 + 1);
+        let hint_y = inner.y + inner.height.saturating_sub(1);
+        let hint_area = Rect::new(hint_x, hint_y, hint.len() as u16, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            hint_area,
+        );
+    }
+
     // Overlay sub-modes rendered on top of the kanban
     match mode {
         TaskBoardMode::NewTask { input } => {
@@ -1783,6 +1795,55 @@ mod tests {
         assert!(
             text.contains("Ctrl+B ?"),
             "status bar should contain 'Ctrl+B ?' hint, got: {text}"
+        );
+    }
+
+    fn render_task_board_to_string(mode: &crate::app::TaskBoardMode) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let tasks = vec![crate::tasks::Task {
+            id: "t-1".into(),
+            title: "test task".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: "normal".into(),
+            assignee: None,
+            routed_to: None,
+            depends_on: Vec::new(),
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            created_by: "test".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        terminal
+            .draw(|frame| render_tasks(frame, &tasks, 0, 0, mode))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn task_board_footer_shows_help_hint() {
+        let output = render_task_board_to_string(&crate::app::TaskBoardMode::Board);
+        assert!(
+            output.contains("? help"),
+            "Board mode should show '? help' hint, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn task_board_help_mode_hides_footer() {
+        let output = render_task_board_to_string(&crate::app::TaskBoardMode::Help);
+        assert!(
+            !output.contains("? help"),
+            "Help mode should NOT show '? help' hint, got:\n{output}"
         );
     }
 }
