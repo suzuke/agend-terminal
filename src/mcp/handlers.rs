@@ -853,10 +853,23 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 "instance": instance_name, "last_run_id": null, "head_sha": null
             });
             let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
+            let watch_path = ci_dir.join(&filename);
             let _ = std::fs::write(
-                ci_dir.join(&filename),
+                &watch_path,
                 serde_json::to_string_pretty(&watch).unwrap_or_default(),
             );
+            // Backdate the mtime past the throttle window so the next
+            // daemon tick (≤10 s later) actually polls GitHub, instead of
+            // waiting the full `interval_secs` before the first check —
+            // the lag the operator observed with PR #115's watch, where
+            // the ci-pass notification didn't arrive until long after CI
+            // had finished. The +1 buys a margin over clock-skew between
+            // the write call and the subsequent `elapsed()` read.
+            let backdate =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(interval + 1);
+            if let Ok(f) = std::fs::File::options().write(true).open(&watch_path) {
+                let _ = f.set_modified(backdate);
+            }
             json!({"repo": repo, "watching": true})
         }
         "unwatch_ci" => {
