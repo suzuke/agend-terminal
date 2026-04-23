@@ -96,6 +96,13 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     };
 
     let mut created = Vec::new();
+    // Buffered fleet.yaml entries — written in one `add_instances_to_yaml`
+    // call after the loop so we take the fleet lock once, not N times.
+    // Persisting these is what lets `pane_factory::create_pane_from_resolved`
+    // find the instance in fleet.yaml and emit a full Identity + Role + Peers
+    // block into the backend's agend.md; without it, template-deployed agents
+    // boot with a nameless/roleless instructions file.
+    let mut yaml_entries: Vec<(String, crate::fleet::InstanceYamlEntry)> = Vec::new();
     let dir = std::path::PathBuf::from(directory);
 
     for (name_val, inst_val) in instances_def {
@@ -131,6 +138,16 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             .or_else(|| inst_val.get("backend"))
             .and_then(|v| v.as_str())
             .unwrap_or("claude");
+        // Accept `role:` (preferred) and `description:` (alias, mirrors
+        // InstanceConfig's serde alias). Empty string → None so we don't
+        // write a blank "Role:" line into agend.md.
+        let role = inst_val
+            .get("role")
+            .or_else(|| inst_val.get("description"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
 
         // Create worktree if branch specified
         let work_dir = if let Some(br) = branch {
@@ -175,19 +192,55 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 }
             }),
         );
+        yaml_entries.push((
+            inst_name.clone(),
+            crate::fleet::InstanceYamlEntry {
+                backend: Some(command.to_string()),
+                working_directory: Some(work_dir),
+                role,
+            },
+        ));
         created.push(inst_name);
     }
 
-    // Create team if multiple instances
+    // Persist to fleet.yaml. Keep this outside the loop so the fleet lock is
+    // taken once. Symmetrical with the cleanup in `teardown` — if we left
+    // entries after teardown, daemon restart would auto-spawn ghost instances.
+    if !yaml_entries.is_empty() {
+        let refs: Vec<(&str, &crate::fleet::InstanceYamlEntry)> = yaml_entries
+            .iter()
+            .map(|(n, e)| (n.as_str(), e))
+            .collect();
+        if let Err(e) = crate::fleet::add_instances_to_yaml(home, &refs) {
+            tracing::warn!(error = %e, "failed to persist deployment to fleet.yaml");
+        }
+    }
+
+    // Create team if multiple instances. The template may nominate an
+    // orchestrator by instance *suffix* (e.g. `orchestrator: lead` for a
+    // member called `dev-lead`) — deploy rewrites it to the fully prefixed
+    // name before handing off. Silently drop the field when the suffix is
+    // unknown or its instance failed to spawn; a warn log lets operators
+    // catch the typo without aborting the whole deployment.
     if created.len() > 1 {
-        let _ = crate::teams::create(
-            home,
-            &serde_json::json!({
-                "name": deploy_name,
-                "members": created,
-                "description": format!("Template deployment: {template}")
-            }),
-        );
+        let mut team_args = serde_json::json!({
+            "name": deploy_name,
+            "members": created,
+            "description": format!("Template deployment: {template}")
+        });
+        if let Some(suffix) = template_def.get("orchestrator").and_then(|v| v.as_str()) {
+            let full = format!("{deploy_name}-{suffix}");
+            if created.contains(&full) {
+                team_args["orchestrator"] = serde_json::Value::String(full);
+            } else {
+                tracing::warn!(
+                    template,
+                    suffix,
+                    "template orchestrator not among spawned instances; team created without one"
+                );
+            }
+        }
+        let _ = crate::teams::create(home, &team_args);
     }
 
     // Track deployment
@@ -229,6 +282,13 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
             home,
             &serde_json::json!({"method": crate::api::method::KILL, "params": {"name": inst}}),
         );
+    }
+
+    // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
+    // pane_factory could render identity; teardown must remove them or
+    // daemon restart would resurrect dead agents via auto_start_fleet.
+    if let Err(e) = crate::fleet::remove_instances_from_yaml(home, &deployment.instances) {
+        tracing::warn!(error = %e, "failed to clean up fleet.yaml on teardown");
     }
 
     // Delete team if exists
@@ -296,6 +356,239 @@ mod tests {
         assert!(
             err.contains("invalid template name"),
             "expected template-name rejection, got: {out}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_persists_role_into_fleet_yaml() {
+        // Role declared on a template instance must flow into fleet.yaml's
+        // instances: block so pane_factory::create_pane_from_resolved can
+        // render Identity/Role into the agent's agend.md. Before this PR,
+        // template schema ignored role entirely and no fleet.yaml entry was
+        // written on deploy.
+        let home = tmp_home("role_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        role: orchestrator
+      impl:
+        backend: kiro-cli
+        role: implementer
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+
+        let args = serde_json::json!({
+            "template": "dev",
+            "directory": home.display().to_string(),
+        });
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded =
+            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("reload fleet.yaml");
+        let lead = reloaded
+            .instances
+            .get("dev-lead")
+            .expect("dev-lead must be persisted");
+        assert_eq!(lead.role.as_deref(), Some("orchestrator"));
+        let imp = reloaded
+            .instances
+            .get("dev-impl")
+            .expect("dev-impl must be persisted");
+        assert_eq!(imp.role.as_deref(), Some("implementer"));
+        // Template block untouched by the instances: mutation.
+        assert!(
+            reloaded.templates.is_some(),
+            "templates section must survive the write"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_accepts_description_alias_for_role() {
+        // Mirror InstanceConfig's `#[serde(alias = "description")]`. Users
+        // coming from the TS version write `description:` — accept both so
+        // the schemas stay in sync.
+        let home = tmp_home("role_alias");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        description: orchestrator via alias
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+
+        let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        assert_eq!(
+            reloaded
+                .instances
+                .get("dev-lead")
+                .and_then(|i| i.role.clone())
+                .as_deref(),
+            Some("orchestrator via alias")
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_omits_role_when_not_set() {
+        // A template without `role:` must not write a blank role field —
+        // empty Role lines in agend.md would mislead agents into thinking
+        // "" is their role.
+        let home = tmp_home("role_absent");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+
+        let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let lead = reloaded.instances.get("dev-lead").expect("dev-lead");
+        assert!(lead.role.is_none(), "unset role must stay None, got {:?}", lead.role);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn teardown_removes_deployed_entries_from_fleet_yaml() {
+        // Cleanup symmetry: without this, daemon restart would auto-spawn
+        // dead agents because auto_start_fleet reads fleet.yaml instances.
+        let home = tmp_home("teardown_cleanup");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        role: orchestrator
+      impl:
+        backend: claude
+        role: implementer
+instances:
+  preexisting:
+    backend: claude
+    role: survivor
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        // Sanity: deployed entries are there.
+        let after_deploy =
+            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("post-deploy");
+        assert!(after_deploy.instances.contains_key("dev-lead"));
+        assert!(after_deploy.instances.contains_key("dev-impl"));
+
+        let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
+
+        let after_teardown =
+            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("post-teardown");
+        assert!(
+            !after_teardown.instances.contains_key("dev-lead"),
+            "deployed entry must be removed"
+        );
+        assert!(
+            !after_teardown.instances.contains_key("dev-impl"),
+            "deployed entry must be removed"
+        );
+        // Entries not owned by the deployment stay.
+        assert!(
+            after_teardown.instances.contains_key("preexisting"),
+            "teardown must not touch pre-existing instances"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_sets_orchestrator_from_template_suffix() {
+        // Template nominates orchestrator by suffix; deploy must rewrite it
+        // to the fully-prefixed name (`<deploy_name>-<suffix>`) before calling
+        // teams::create, otherwise the member-of-team check rejects it.
+        let home = tmp_home("orch_ok");
+        let yaml = r#"
+templates:
+  dev:
+    orchestrator: lead
+    instances:
+      lead:
+        backend: claude
+        role: orchestrator
+      impl:
+        backend: claude
+        role: implementer
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+
+        let orch =
+            crate::teams::resolve_team_orchestrator(&home, "dev").expect("team dev must exist");
+        assert_eq!(
+            orch.as_deref(),
+            Some("dev-lead"),
+            "orchestrator suffix must be expanded to full name"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_ignores_unknown_orchestrator_suffix() {
+        // Typo protection: a template pointing orchestrator at a non-existent
+        // suffix must not fail the deploy. The team gets created without an
+        // orchestrator — operator sees a warn log and can fix via update_team.
+        let home = tmp_home("orch_typo");
+        let yaml = r#"
+templates:
+  dev:
+    orchestrator: captian   # typo — should be "captain" (or a real suffix)
+    instances:
+      lead:
+        backend: claude
+      impl:
+        backend: claude
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+
+        // resolve_team_orchestrator errors on degraded teams ("no orchestrator,
+        // cannot route"), so probe via list and inspect the orchestrator field
+        // directly — we want to assert the team exists but is orchestrator-less,
+        // not prove routing works.
+        let listed = crate::teams::list(&home);
+        let team = listed["teams"]
+            .as_array()
+            .and_then(|ts| ts.iter().find(|t| t["name"] == "dev"))
+            .cloned()
+            .expect("team 'dev' must still be created");
+        assert!(
+            team["orchestrator"].is_null(),
+            "unknown orchestrator suffix must leave team with no orchestrator, got {}",
+            team["orchestrator"]
         );
         std::fs::remove_dir_all(&home).ok();
     }
