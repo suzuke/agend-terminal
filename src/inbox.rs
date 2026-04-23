@@ -536,7 +536,9 @@ pub fn deliver(
         let msg = InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None, thread_id: None, parent_id: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
             from: source.to_string(),
             text: text.to_string(),
             kind,
@@ -664,7 +666,9 @@ mod tests {
         InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None, thread_id: None, parent_id: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
             from: from.to_string(),
             text: text.to_string(),
             kind: None,
@@ -786,7 +790,9 @@ mod tests {
         let msg = InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None, thread_id: None, parent_id: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
             from: "sender".to_string(),
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
@@ -875,7 +881,9 @@ mod tests {
         let msg = InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None, thread_id: None, parent_id: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
             from: "test".to_string(),
             text: "hello \"world\"".to_string(),
             kind: None,
@@ -893,7 +901,9 @@ mod tests {
         let msg = InboxMessage {
             schema_version: 0,
             id: None,
-            read_at: None, thread_id: None, parent_id: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
             from: "user".to_string(),
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
@@ -1497,7 +1507,9 @@ mod tests {
 
         // None fields should be omitted from serialization (skip_serializing_if)
         let msg_no_thread = InboxMessage {
-            thread_id: None, parent_id: None, ..msg.clone()
+            thread_id: None,
+            parent_id: None,
+            ..msg.clone()
         };
         let json2 = serde_json::to_string(&msg_no_thread).expect("ser");
         assert!(!json2.contains("thread_id"));
@@ -1564,8 +1576,14 @@ mod tests {
             parent_id: None,
         };
         let header = format_header(&msg);
-        assert!(!header.contains('\n'), "header must not contain newline: {header:?}");
-        assert!(!header.contains('\r'), "header must not contain CR: {header:?}");
+        assert!(
+            !header.contains('\n'),
+            "header must not contain newline: {header:?}"
+        );
+        assert!(
+            !header.contains('\r'),
+            "header must not contain CR: {header:?}"
+        );
         assert!(header.contains("from=from:evil agent"));
         assert!(header.contains("kind=task  injection"));
     }
@@ -1584,8 +1602,10 @@ mod tests {
             parent_id: None,
         };
         let header = format_header(&msg);
-        assert!(!header.chars().any(|c| c.is_control() && c != '\x1b'),
-            "header must not contain control chars (except ANSI escape): {header:?}");
+        assert!(
+            !header.chars().any(|c| c.is_control() && c != '\x1b'),
+            "header must not contain control chars (except ANSI escape): {header:?}"
+        );
     }
 
     #[test]
@@ -1613,7 +1633,10 @@ mod tests {
             parent_id: None,
         };
         let header = format_header(&msg);
-        assert!(header.len() < HEADER_SIZE_THRESHOLD, "header must be compact");
+        assert!(
+            header.len() < HEADER_SIZE_THRESHOLD,
+            "header must be compact"
+        );
         assert!(header.contains(&format!("size={}", HEADER_SIZE_THRESHOLD + 1)));
     }
 
@@ -1624,7 +1647,7 @@ mod tests {
         let cjk = "你".repeat(100);
         assert_eq!(cjk.chars().count(), 100);
         assert_eq!(cjk.len(), 300); // bytes
-        // 100 chars < HEADER_SIZE_THRESHOLD (300) → should be short path
+                                    // 100 chars < HEADER_SIZE_THRESHOLD (300) → should be short path
         assert!(cjk.chars().count() <= HEADER_SIZE_THRESHOLD);
 
         // 301 CJK chars = 301 chars → should be long path
@@ -1644,6 +1667,9 @@ mod tests {
             parent_id: None,
         };
         let header = format_header(&msg);
-        assert!(header.contains("size=100"), "size must be char count (100), not byte count (300): {header}");
+        assert!(
+            header.contains("size=100"),
+            "size must be char count (100), not byte count (300): {header}"
+        );
     }
 }

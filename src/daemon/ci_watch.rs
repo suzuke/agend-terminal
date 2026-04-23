@@ -226,7 +226,9 @@ async fn ci_check_repo(
             crate::inbox::InboxMessage {
                 schema_version: 0,
                 id: None,
-                read_at: None, thread_id: None, parent_id: None,
+                read_at: None,
+                thread_id: None,
+                parent_id: None,
                 from: "system:ci".to_string(),
                 text: msg,
                 kind: Some("ci-watch".to_string()),
