@@ -16,6 +16,7 @@ mod deployments;
 mod error;
 mod event_log;
 mod fleet;
+mod fleet_broadcast;
 mod framing;
 mod health;
 mod identity;
