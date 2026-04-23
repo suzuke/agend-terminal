@@ -545,13 +545,35 @@ impl StateTracker {
     /// See `maybe_expire_latched_state` for rationale.
     const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);
 
+    /// Max time `InteractivePrompt` / `PermissionPrompt` may stay latched
+    /// after its trigger pattern stops matching. Longer than
+    /// LATCHED_STATE_EXPIRY because operators legitimately take a while
+    /// to respond to a dialog, but bounded so a prompt dismissed
+    /// out-of-band (screen hash unchanged after dismissal ⇒ no re-detect)
+    /// eventually recovers to Ready instead of staying stuck — the
+    /// operator-reported `dev-reviewer 卡在互動 prompt` false positive.
+    const INTERACTIVE_EXPIRY: Duration = Duration::from_secs(120);
+
     /// If the last MCP heartbeat is within this window, the agent is
     /// considered alive and `PermissionPrompt` detection is suppressed.
     const HEARTBEAT_FRESH_WINDOW: Duration = Duration::from_secs(120);
 
     pub fn new(backend: Option<&Backend>) -> Self {
+        // Backends without a state pattern catalog (Shell, Raw) skip the
+        // `Starting → Ready` handshake. Without this they sat in
+        // `Starting` forever — `detect()` can't possibly fire Ready
+        // without any patterns — and the silence-based
+        // `check_awaiting_operator` then flagged every idle shell as
+        // "stuck on interactive prompt" after 30s of normal quiet at
+        // its own prompt. Managed backends still start in `Starting` so
+        // their onboarding / auth dialogs can pattern-match before
+        // Ready is declared.
+        let initial_state = match backend {
+            Some(Backend::Shell | Backend::Raw(_)) | None => AgentState::Ready,
+            Some(_) => AgentState::Starting,
+        };
         Self {
-            current: AgentState::Starting,
+            current: initial_state,
             since: Instant::now(),
             last_output: Instant::now(),
             last_screen_hash: None,
@@ -684,8 +706,28 @@ impl StateTracker {
     /// Starting / AwaitingOperator / Hang are driven by their own
     /// supervisors (see `daemon::supervisor`).
     fn maybe_expire_latched_state(&mut self) {
-        let expiring = matches!(self.current, AgentState::Thinking | AgentState::ToolUse);
-        if expiring && self.since.elapsed() >= Self::LATCHED_STATE_EXPIRY {
+        // Active states (Thinking / ToolUse) expire on the short window —
+        // their trigger patterns (spinners, tool-call banners) commonly
+        // stop rendering mid-operation even when the agent is still
+        // working, so a brief latch is fine but holding beyond
+        // LATCHED_STATE_EXPIRY is almost always stale.
+        let short_expiring = matches!(self.current, AgentState::Thinking | AgentState::ToolUse);
+        if short_expiring && self.since.elapsed() >= Self::LATCHED_STATE_EXPIRY {
+            self.transition(AgentState::Ready);
+            return;
+        }
+        // Prompt states (InteractivePrompt / PermissionPrompt) expire on
+        // the longer window. When the screen goes stable after the
+        // operator dismisses the dialog, feed()'s hash-dedup skips
+        // `detect()` and the state never re-evaluates — which is how
+        // `dev-reviewer` stayed flagged as "卡在互動 prompt" long after
+        // the prompt was gone. The 2-minute bound gives a real operator
+        // reaction window while still guaranteeing self-recovery.
+        let long_expiring = matches!(
+            self.current,
+            AgentState::InteractivePrompt | AgentState::PermissionPrompt
+        );
+        if long_expiring && self.since.elapsed() >= Self::INTERACTIVE_EXPIRY {
             self.transition(AgentState::Ready);
         }
     }
@@ -786,6 +828,95 @@ mod tests {
         t.current = state;
         t.since = Instant::now() - Duration::from_secs(elapsed_secs);
         t
+    }
+
+    // ── False-positive regression pins ──────────────────────────────────
+    //
+    // Operator reported two misfires:
+    //   1. `shell` flagged with "⚠️ shell 靜默 38s，可能卡在互動 prompt" while
+    //      sitting at a normal `❯` prompt.
+    //   2. `dev-reviewer` (Codex) flagged with "卡在互動 prompt" after
+    //      dismissing a transient banner — the state never recovered
+    //      because hash-dedup suppressed re-detection.
+
+    #[test]
+    fn shell_backend_starts_in_ready_not_starting() {
+        // Regression: Shell/Raw have no state pattern catalog, so `detect()`
+        // can never produce Ready; they used to sit in `Starting` forever
+        // and `check_awaiting_operator` fired on every idle shell after
+        // 30 s. Initial state Ready sidesteps the silence fallback — a
+        // truly-stuck shell still gets caught by `check_hang` later.
+        let t = StateTracker::new(Some(&Backend::Shell));
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn raw_backend_starts_in_ready_not_starting() {
+        let t = StateTracker::new(Some(&Backend::Raw("/opt/whatever".to_string())));
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn managed_backends_still_start_in_starting() {
+        // Keep the handshake for real backends so their
+        // onboarding / auth prompts have a chance to pattern-match before
+        // we declare Ready.
+        for backend in [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Gemini,
+            Backend::Codex,
+            Backend::OpenCode,
+        ] {
+            let t = StateTracker::new(Some(&backend));
+            assert_eq!(
+                t.get_state(),
+                AgentState::Starting,
+                "managed backend {backend:?} must still start in Starting"
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_prompt_expires_to_ready_after_two_minutes() {
+        // `dev-reviewer`-style lockup: operator dismissed the dialog
+        // out-of-band, screen went stable, hash-dedup meant `detect()`
+        // never re-fired. With no re-detect and only
+        // Thinking/ToolUse in the expiry list, the state was stuck
+        // indefinitely. Ticking past INTERACTIVE_EXPIRY now drops to
+        // Ready on its own.
+        let mut t = tracker_at(&Backend::Codex, AgentState::InteractivePrompt, 119);
+        t.tick();
+        assert_eq!(
+            t.get_state(),
+            AgentState::InteractivePrompt,
+            "must still be latched before expiry"
+        );
+
+        let mut t = tracker_at(&Backend::Codex, AgentState::InteractivePrompt, 121);
+        t.tick();
+        assert_eq!(
+            t.get_state(),
+            AgentState::Ready,
+            "expected Ready after INTERACTIVE_EXPIRY, still {:?}",
+            t.get_state()
+        );
+    }
+
+    #[test]
+    fn permission_prompt_also_expires_to_ready() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 130);
+        t.tick();
+        assert_eq!(t.get_state(), AgentState::Ready);
+    }
+
+    #[test]
+    fn tool_use_still_uses_short_expiry() {
+        // Regression guard against accidentally widening the short
+        // expiry — Thinking / ToolUse should still drop at 30 s.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::ToolUse, 31);
+        t.tick();
+        assert_eq!(t.get_state(), AgentState::Ready);
     }
 
     // ── P0: Core behavior ───────────────────────────────────────────────
@@ -927,9 +1058,13 @@ mod tests {
     }
 
     #[test]
-    fn feed_fallback_does_not_expire_permission_prompt() {
-        // PermissionPrompt must be dismissed by the operator, not by time.
-        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 120);
+    fn feed_fallback_does_not_expire_fresh_permission_prompt() {
+        // Before INTERACTIVE_EXPIRY (120 s) a PermissionPrompt must stay
+        // latched — an operator answering a dialog within a reasonable
+        // window expects the banner to still be marked as active.
+        // Post-INTERACTIVE_EXPIRY expiry is covered by
+        // `permission_prompt_also_expires_to_ready`.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 60);
         t.feed("nothing matches here");
         assert_eq!(t.get_state(), AgentState::PermissionPrompt);
     }
@@ -954,9 +1089,11 @@ mod tests {
     }
 
     #[test]
-    fn tick_does_not_expire_permission_prompt() {
-        // PermissionPrompt requires operator action, never auto-expires.
-        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 120);
+    fn tick_does_not_expire_fresh_permission_prompt() {
+        // Within INTERACTIVE_EXPIRY the prompt stays latched so operators
+        // have a real reaction window. Post-expiry recovery is covered
+        // by `permission_prompt_also_expires_to_ready`.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::PermissionPrompt, 60);
         t.tick();
         assert_eq!(t.get_state(), AgentState::PermissionPrompt);
     }
@@ -973,8 +1110,11 @@ mod tests {
     }
 
     #[test]
-    fn feed_fallback_does_not_expire_interactive_prompt() {
-        let mut t = tracker_at(&Backend::Codex, AgentState::InteractivePrompt, 120);
+    fn feed_fallback_does_not_expire_fresh_interactive_prompt() {
+        // Same contract as PermissionPrompt — within INTERACTIVE_EXPIRY
+        // the prompt stays latched; after the threshold it recovers
+        // (see `interactive_prompt_expires_to_ready_after_two_minutes`).
+        let mut t = tracker_at(&Backend::Codex, AgentState::InteractivePrompt, 60);
         t.feed("nothing matches here");
         assert_eq!(t.get_state(), AgentState::InteractivePrompt);
     }
