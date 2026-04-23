@@ -362,6 +362,19 @@ fn handle_team_created(
     }
 
     ingest_members_into_team_tab(team_name, &running, layout, registry, wakeup_tx);
+
+    // Ingestion chains split_focused calls, which degrades the pane tree
+    // into a 50/25/12.5/12.5 staircase for 4 members — the user reported
+    // this as "layout not even" after the deploy_template smoke. Re-tile
+    // the fresh team tab so each member gets a roughly equal share.
+    //
+    // Only runs for the initial TeamCreated event, not on later
+    // add/remove (handle_team_members_changed), because operators may
+    // have manually resized and we don't want update_team to undo that.
+    if let Some(tab_idx) = layout.tabs.iter().position(|t| t.name == team_name) {
+        layout.tabs[tab_idx].apply_layout(crate::layout::LayoutPreset::Tiled);
+    }
+
     tracing::info!(
         team = team_name,
         tabs_after = layout.tabs.len(),
