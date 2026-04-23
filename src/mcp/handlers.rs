@@ -124,12 +124,14 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             let kind = args["request_kind"]
                 .as_str()
                 .or_else(|| args["kind"].as_str());
+            let thread_id = args["thread_id"].as_str();
+            let parent_id = args["parent_id"].as_str();
 
             match crate::api::call(
                 &home,
                 &json!({
                     "method": crate::api::method::SEND,
-                    "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind }
+                    "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id }
                 }),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -137,14 +139,33 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
                 Err(e) => {
-                    let submit_key = get_submit_key(&home, target);
-                    crate::inbox::deliver(
+                    // Resolve thread inheritance for direct delivery
+                    let mut resolved_thread = thread_id.map(String::from);
+                    let resolved_parent = parent_id.map(String::from);
+                    if resolved_thread.is_none() {
+                        if let Some(ref pid) = resolved_parent {
+                            if let Some(parent_msg) = crate::inbox::find_message(&home, pid) {
+                                resolved_thread = parent_msg.thread_id.or_else(|| parent_msg.id.clone());
+                            }
+                        }
+                    }
+                    let msg = crate::inbox::InboxMessage {
+                        schema_version: 0,
+                        id: None,
+                        read_at: None,
+                        thread_id: resolved_thread,
+                        parent_id: resolved_parent,
+                        from: format!("from:{}", sender.as_str()),
+                        text: text.to_string(),
+                        kind: None,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = crate::inbox::enqueue(&home, target, msg);
+                    crate::inbox::notify_agent(
                         &home,
                         target,
                         &crate::inbox::NotifySource::Agent(sender.as_str()),
                         text,
-                        &submit_key,
-                        None,
                     );
                     json!({"target": target, "note": format!("API unavailable, sent direct: {e}")})
                 }

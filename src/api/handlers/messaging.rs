@@ -28,19 +28,35 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     if from == target {
         return json!({"ok": false, "error": "cannot send to self"});
     }
-    let msg = crate::inbox::InboxMessage {
-        schema_version: 0,
-        id: None,
-        read_at: None,
-        thread_id: None,
-        parent_id: None,
-        from: format!("from:{from}"),
-        text: text.to_string(),
-        kind: params
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .map(String::from),
-        timestamp: chrono::Utc::now().to_rfc3339(),
+    let msg = {
+        let mut thread_id = params["thread_id"].as_str().map(String::from);
+        let parent_id = params["parent_id"].as_str().map(String::from);
+
+        // Auto-inherit: if parent_id given but thread_id not, inherit from parent
+        if thread_id.is_none() {
+            if let Some(ref pid) = parent_id {
+                if let Some(parent_msg) = crate::inbox::find_message(ctx.home, pid) {
+                    thread_id = parent_msg
+                        .thread_id
+                        .or_else(|| parent_msg.id.clone()); // parent becomes thread root
+                }
+            }
+        }
+
+        crate::inbox::InboxMessage {
+            schema_version: 0,
+            id: None,
+            read_at: None,
+            thread_id,
+            parent_id,
+            from: format!("from:{from}"),
+            text: text.to_string(),
+            kind: params
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
     };
     let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
 
