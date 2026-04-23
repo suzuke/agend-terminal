@@ -270,6 +270,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
