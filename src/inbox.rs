@@ -189,14 +189,28 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
     home.join("inbox").join(format!("{name}.jsonl"))
 }
 
+/// Acquire a per-agent flock and run `f` with the inbox path.
+/// All read-modify-write operations on an agent's inbox (enqueue, drain,
+/// sweep_expired) must go through this helper to prevent concurrent races.
+fn with_inbox_lock<T>(home: &Path, name: &str, f: impl FnOnce(&Path) -> T) -> anyhow::Result<T> {
+    let path = inbox_path(home, name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("jsonl.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)?;
+    Ok(f(&path))
+}
+
 /// Enqueue a message — atomic append via flock + tmp + fsync + rename.
 ///
 /// Returns an error when the inbox is in readonly mode (disk full).
 /// Callers should invoke [`check_disk_space`] periodically (e.g. daemon tick);
 /// enqueue only reads the cached flag.
 ///
-/// Concurrent safety: a per-file flock on `{name}.jsonl.lock` serialises
-/// concurrent writers to the same agent inbox (cross-process safe).
+/// Concurrent safety: a per-agent flock via [`with_inbox_lock`] serialises
+/// all read-modify-write operations (enqueue, drain, sweep) on the same
+/// agent inbox (cross-process safe).
 pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result<()> {
     if is_readonly() {
         anyhow::bail!("inbox readonly: disk space critically low");
@@ -209,32 +223,25 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
         let seq = MSG_SEQ.fetch_add(1, AtOrd::Relaxed);
         msg.id = Some(format!("m-{ts}-{seq}"));
     }
-    let path = inbox_path(home, name);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let line = format!("{}\n", serde_json::to_string(&msg)?);
 
-    // Per-file flock serialises concurrent writers to the same agent inbox.
-    let lock_path = path.with_extension("jsonl.lock");
-    let _lock = crate::store::acquire_file_lock(&lock_path)?;
-
-    // Read existing content (if any), append new line, write atomically.
-    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
-    content.push_str(&line);
-
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    with_inbox_lock(home, name, |path| {
+        let mut content = std::fs::read_to_string(path).unwrap_or_default();
+        content.push_str(&line);
+        let tmp = path.with_extension("jsonl.tmp");
+        let result = (|| -> anyhow::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        result
+    })?
 }
 
 /// Drain unread messages: mark them with `read_at` and write back.
@@ -256,60 +263,67 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
         return Vec::new();
     }
 
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-
-    let now = chrono::Utc::now().to_rfc3339();
-    let mut unread = Vec::new();
-    let mut all_messages: Vec<InboxMessage> = Vec::new();
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut msg: InboxMessage = match serde_json::from_str(line) {
-            Ok(m) => m,
-            Err(_) => continue,
+    match with_inbox_lock(home, name, |path| {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
         };
-        if msg.schema_version > InboxMessage::CURRENT_VERSION {
-            tracing::error!(
-                found = msg.schema_version,
-                supported = InboxMessage::CURRENT_VERSION,
-                "dropping inbox message written by newer schema version"
-            );
-            continue;
-        }
-        if msg.read_at.is_none() {
-            msg.read_at = Some(now.clone());
-            unread.push(msg.clone());
-        }
-        all_messages.push(msg);
-    }
 
-    if !unread.is_empty() {
-        // Write back atomically with read_at stamps
-        let write_tmp = path.with_extension("jsonl.tmp");
-        let result = (|| -> anyhow::Result<()> {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&write_tmp)?;
-            for m in &all_messages {
-                writeln!(f, "{}", serde_json::to_string(m)?)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut unread = Vec::new();
+        let mut all_messages: Vec<InboxMessage> = Vec::new();
+
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
             }
-            f.sync_all()?;
-            std::fs::rename(&write_tmp, &path)?;
-            Ok(())
-        })();
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "inbox drain write-back failed");
+            let mut msg: InboxMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if msg.schema_version > InboxMessage::CURRENT_VERSION {
+                tracing::error!(
+                    found = msg.schema_version,
+                    supported = InboxMessage::CURRENT_VERSION,
+                    "dropping inbox message written by newer schema version"
+                );
+                continue;
+            }
+            if msg.read_at.is_none() {
+                msg.read_at = Some(now.clone());
+                unread.push(msg.clone());
+            }
+            all_messages.push(msg);
+        }
+
+        if !unread.is_empty() {
+            let write_tmp = path.with_extension("jsonl.tmp");
+            let result = (|| -> anyhow::Result<()> {
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&write_tmp)?;
+                for m in &all_messages {
+                    writeln!(f, "{}", serde_json::to_string(m)?)?;
+                }
+                f.sync_all()?;
+                std::fs::rename(&write_tmp, path)?;
+                Ok(())
+            })();
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "inbox drain write-back failed");
+            }
+        }
+
+        unread
+    }) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            tracing::warn!(error = %e, "inbox drain lock failed");
+            Vec::new()
         }
     }
-
-    unread
 }
 
 fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
@@ -368,57 +382,64 @@ pub fn sweep_expired(home: &Path) {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        // Extract agent name from filename (e.g. "agent1.jsonl" → "agent1")
+        let agent_name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
         };
-        let mut kept: Vec<String> = Vec::new();
-        let mut changed = false;
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let msg: InboxMessage = match serde_json::from_str(line) {
-                Ok(m) => m,
-                Err(_) => continue,
+        let _ = with_inbox_lock(home, &agent_name, |path| {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => return,
             };
-            let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or(now);
-            let age = now.signed_duration_since(ts);
-            let expired = match &msg.read_at {
-                Some(_) => age > chrono::Duration::days(7),
-                None => age > chrono::Duration::days(30),
-            };
-            if expired {
-                changed = true;
-            } else {
-                kept.push(line.to_string());
-            }
-        }
-        if changed {
-            if kept.is_empty() {
-                let _ = std::fs::remove_file(&path);
-            } else {
-                let tmp = path.with_extension("jsonl.tmp");
-                let result = (|| -> anyhow::Result<()> {
-                    let mut f = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(&tmp)?;
-                    for l in &kept {
-                        writeln!(f, "{l}")?;
-                    }
-                    f.sync_all()?;
-                    std::fs::rename(&tmp, &path)?;
-                    Ok(())
-                })();
-                if let Err(e) = result {
-                    tracing::warn!(error = %e, "inbox sweep write-back failed");
+            let mut kept: Vec<String> = Vec::new();
+            let mut changed = false;
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let msg: InboxMessage = match serde_json::from_str(line) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or(now);
+                let age = now.signed_duration_since(ts);
+                let expired = match &msg.read_at {
+                    Some(_) => age > chrono::Duration::days(7),
+                    None => age > chrono::Duration::days(30),
+                };
+                if expired {
+                    changed = true;
+                } else {
+                    kept.push(line.to_string());
                 }
             }
-        }
+            if changed {
+                if kept.is_empty() {
+                    let _ = std::fs::remove_file(path);
+                } else {
+                    let tmp = path.with_extension("jsonl.tmp");
+                    let result = (|| -> anyhow::Result<()> {
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .truncate(true)
+                            .open(&tmp)?;
+                        for l in &kept {
+                            writeln!(f, "{l}")?;
+                        }
+                        f.sync_all()?;
+                        std::fs::rename(&tmp, path)?;
+                        Ok(())
+                    })();
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "inbox sweep write-back failed");
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -1306,6 +1327,47 @@ mod tests {
             20,
             "all 20 concurrent enqueues must survive, got {}",
             msgs.len()
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_enqueue_vs_drain_no_lost_msg() {
+        // Thread A enqueues 10 messages; thread B drains after each.
+        // Total drained must equal 10 — no lost messages.
+        let home = tmp_home("enqueue-vs-drain");
+        let home_a = std::sync::Arc::new(home.clone());
+        let home_b = home_a.clone();
+
+        let writer = std::thread::spawn(move || {
+            for i in 0..10 {
+                enqueue(&home_a, "agent1", make_msg(&format!("w{i}"), &format!("msg{i}")))
+                    .expect("enqueue");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        let reader = std::thread::spawn(move || {
+            let mut total = Vec::new();
+            for _ in 0..20 {
+                let batch = drain(&home_b, "agent1");
+                total.extend(batch);
+                std::thread::sleep(std::time::Duration::from_millis(3));
+            }
+            total
+        });
+
+        writer.join().expect("writer");
+        let mut drained = reader.join().expect("reader");
+        // Final drain to catch any remaining
+        drained.extend(drain(&home, "agent1"));
+
+        assert_eq!(
+            drained.len(),
+            10,
+            "all 10 enqueued messages must be drained, got {}",
+            drained.len()
         );
 
         fs::remove_dir_all(&home).ok();
