@@ -68,6 +68,11 @@ fn comm_tools() -> Vec<Value> {
                 "message_id": {"type": "string", "description": "The message ID to look up"},
                 "instance": {"type": "string", "description": "Target instance name (defaults to caller)"}
             }, "required": ["message_id"]}}),
+        json!({"name": "describe_thread", "description": "Get all messages in a conversation thread, ordered by timestamp.",
+            "inputSchema": {"type": "object", "properties": {
+                "thread_id": {"type": "string", "description": "The thread ID to look up"},
+                "instance": {"type": "string", "description": "Filter to a specific instance's inbox (optional, scans all if omitted)"}
+            }, "required": ["thread_id"]}}),
     ]
 }
 

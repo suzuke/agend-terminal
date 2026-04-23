@@ -558,6 +558,63 @@ pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageSta
     MessageStatus::NotFound
 }
 
+/// Get all messages in a thread, ordered by timestamp.
+/// If `instance` is Some, only scan that agent's inbox; otherwise scan all.
+pub fn get_thread(home: &Path, thread_id: &str, instance: Option<&str>) -> Vec<InboxMessage> {
+    let inbox_dir = home.join("inbox");
+    let entries = match std::fs::read_dir(&inbox_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut msgs = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(inst) = instance {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if stem != inst {
+                continue;
+            }
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for line in content.lines() {
+            if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
+                if msg.thread_id.as_deref() == Some(thread_id) {
+                    msgs.push(msg);
+                }
+            }
+        }
+    }
+    msgs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    msgs
+}
+
+/// Look up a message by ID across all inbox files. Returns the message if found.
+pub fn find_message(home: &Path, msg_id: &str) -> Option<InboxMessage> {
+    let inbox_dir = home.join("inbox");
+    let entries = std::fs::read_dir(&inbox_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).ok()?;
+        for line in content.lines() {
+            if let Ok(msg) = serde_json::from_str::<InboxMessage>(line) {
+                if msg.id.as_deref() == Some(msg_id) {
+                    return Some(msg);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Deliver a message: short messages (≤500 chars) inject directly to PTY,
 /// long messages store to inbox + inject truncated notification.
 pub fn deliver(
