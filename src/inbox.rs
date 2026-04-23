@@ -252,18 +252,19 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
 /// Uses atomic tmp+fsync+rename for crash safety.
 pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
     let path = inbox_path(home, name);
-    let tmp = path.with_extension("draining");
 
-    // Leftover from a crashed predecessor — consume it first.
-    if tmp.exists() {
-        return read_drain_file(&tmp);
-    }
-
-    if !path.exists() {
+    if !path.exists() && !path.with_extension("draining").exists() {
         return Vec::new();
     }
 
     match with_inbox_lock(home, name, |path| {
+        // Leftover from a crashed predecessor — consume it first, under lock
+        // to prevent duplicate delivery when two drain callers race.
+        let tmp = path.with_extension("draining");
+        if tmp.exists() {
+            return read_drain_file(&tmp);
+        }
+
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return Vec::new(),
@@ -1368,6 +1369,43 @@ mod tests {
             10,
             "all 10 enqueued messages must be drained, got {}",
             drained.len()
+        );
+
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_concurrent_drain_no_duplicate_recovery() {
+        // Pre-write a stale .draining file with 3 messages.
+        // Spawn 2 threads that both call drain simultaneously.
+        // Total recovered messages must be exactly 3 (no duplicates).
+        let home = tmp_home("concurrent-recovery");
+        let inbox_dir = home.join("inbox");
+        fs::create_dir_all(&inbox_dir).ok();
+
+        let draining = inbox_dir.join("agent1.draining");
+        let mut content = String::new();
+        for i in 0..3 {
+            let msg = make_msg(&format!("recover{i}"), &format!("msg{i}"));
+            content.push_str(&serde_json::to_string(&msg).unwrap());
+            content.push('\n');
+        }
+        fs::write(&draining, &content).ok();
+
+        let home_a = std::sync::Arc::new(home.clone());
+        let home_b = home_a.clone();
+
+        let a = std::thread::spawn(move || drain(&home_a, "agent1"));
+        let b = std::thread::spawn(move || drain(&home_b, "agent1"));
+
+        let mut all = a.join().expect("thread a");
+        all.extend(b.join().expect("thread b"));
+
+        assert_eq!(
+            all.len(),
+            3,
+            "exactly 3 recovered messages expected (no duplicates), got {}",
+            all.len()
         );
 
         fs::remove_dir_all(&home).ok();
