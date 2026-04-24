@@ -123,6 +123,138 @@ Add to every review report:
 - `scope_source`: decision ID or design doc section that defined scope
 - `audit_mode`: `full_review` | `finding_reaudit` | `scope_conformance`
 
+
+### 3.5 Multi-reviewer dispatch
+
+Multi-reviewer support exists to reduce reviewer bottlenecks without weakening Reviewer Contract v1.1. The default remains **one accountable reviewer per PR**.
+
+#### Allocation
+
+The orchestrator assigns a review to one primary reviewer using load-based routing first, with round-robin fallback.
+
+Load-based routing checks, in order:
+
+1. Open or claimed review tasks on the shared task board.
+2. The reviewer instance `waiting_on` state.
+3. Recent inbox task/query obligations that require a reply.
+4. Explicit busy responses from the reviewer.
+
+If reviewer availability is equivalent or unknown, use round-robin among eligible reviewers.
+
+A reviewer who cannot start promptly should reply with a structured busy response:
+
+```text
+BUSY
+current: <task id or message id>
+unblock: <condition or estimate>
+can_take_after: <time or "unknown">
+```
+
+The orchestrator may then reassign the review instead of waiting.
+
+**Implementation note:** Review delegates are tracked in `dispatch_tracking.json` alongside impl delegates. The 15/30min stuck timeout (`sweep_stuck`) applies to review dispatches equally.
+
+#### Active review lifecycle
+
+A reviewer may have at most one active review task unless an incoming task is explicitly marked `interrupt=true` with a reason.
+
+A review task becomes active when the reviewer reads or accepts the delegate_task, and remains active until `report_result` is sent.
+
+New review dispatches to an active reviewer are queued, not implicitly preemptive. The reviewer must finish and report the active task before starting another, unless:
+
+1. The new task is an explicit continuation of the same PR/thread, or
+2. The dispatch includes `interrupt=true` with a reason and the orchestrator records why.
+
+This encodes the anti-interrupt rule from the post-Sprint 7 review: silent preemption by newer dispatch was the Sprint 8 PR-H failure mode. The addendum prevents it by protocol rather than reviewer discipline alone.
+
+#### Primary reviewer accountability
+
+Every PR review has exactly one **primary reviewer**. The primary reviewer owns the final review report and must cover the full Reviewer Contract v1.1:
+
+1. Source of truth.
+2. Scope boundary.
+3. Freshness boundary.
+
+The primary report must include the standard metadata fields:
+
+```yaml
+scope_source: <decision id or design doc section>
+audit_mode: full_review | finding_reaudit | scope_conformance
+freshness_boundary: <commit sha, file version, or explicit stale condition>
+```
+
+#### Second reviewer exception
+
+Do not assign two reviewers to the same PR by default.
+
+A second reviewer may be assigned only when the dispatch explicitly includes `second_reviewer: true` or equivalent prose, and one of these conditions applies:
+
+1. High-risk shared behavior, protocol, CI, or merge-gate change.
+2. Repeated reject/re-review loop where a fresh eye is needed.
+3. Primary reviewer requests a second opinion on a bounded question.
+4. Operator or orchestrator records a scope decision requiring dual review.
+
+The second reviewer must receive a bounded contract:
+
+```text
+Second reviewer scope: <specific files, findings, or question>
+Must pin freshness boundary: <same commit/file boundary as primary>
+Expected output: VERIFIED | REJECTED | UNVERIFIED with evidence
+```
+
+A second reviewer may narrow the audit surface, but must not omit the freshness boundary. A secondary `VERIFIED` does not replace the primary review.
+
+#### Contract splitting
+
+Do not split Reviewer Contract v1.1 so that no reviewer owns the whole contract.
+
+Allowed:
+
+- Primary covers source of truth, scope boundary, and freshness boundary.
+- Secondary audits a bounded risk area against the same freshness boundary.
+- Secondary performs grep-based confirmation for a named finding or regression risk.
+
+Not allowed:
+
+- Primary checks only source/freshness while secondary checks only scope.
+- Two partial reviews are combined into one implied full review.
+- A secondary review uses a different commit or file state without declaring the primary review stale.
+
+#### Verdict merge rules
+
+For merge gating, verdict severity is ordered:
+
+```text
+REJECTED > UNVERIFIED > VERIFIED
+```
+
+Worst verdict wins for the PR gate.
+
+A `REJECTED` verdict must include finding-level evidence and the violated source/scope reference. The orchestrator creates one task per accepted finding.
+
+An `UNVERIFIED` verdict must state the missing audit surface or stale boundary that prevented verification.
+
+A `VERIFIED` verdict must state the freshness boundary reviewed.
+
+If reviewers disagree on verdict or evidence:
+
+1. The PR remains unmerged.
+2. The orchestrator compares findings against the dispatch contract and freshness boundary.
+3. If the conflict is factual or scope-related, the orchestrator posts a correction or clarification decision.
+4. If the conflict cannot be resolved by the dispatch contract, escalate to the operator.
+
+#### Re-review routing
+
+Finding re-audits should normally return to the reviewer who issued the finding.
+
+Reassign only when:
+
+1. The original reviewer is unavailable or busy.
+2. The re-audit is purely mechanical and the source/freshness boundary is explicit.
+3. The orchestrator records that a fresh reviewer is intentional.
+
+A reassigned re-audit must reference the finding task ID and must not broaden scope unless the dispatch explicitly says so.
+
 ## 4. Communication rules
 
 ### Hop reduction
