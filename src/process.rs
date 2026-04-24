@@ -80,6 +80,7 @@ pub fn kill_process_tree(pid: u32) {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 
