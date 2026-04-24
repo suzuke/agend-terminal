@@ -74,7 +74,7 @@ fn handle_down(
     registry: &AgentRegistry,
     out: &mut MouseOutcome,
 ) {
-    if layout.is_tab_bar_row(mouse.row) {
+    if crate::layout::is_tab_bar_row(mouse.row) {
         match tab_bar_hit_test(layout, mouse.column) {
             Some(TabBarClick::Tab(idx)) => {
                 out.new_last_tab = Some(layout.active);
@@ -159,7 +159,7 @@ fn handle_drag(mouse: MouseEvent, layout: &mut Layout, state: &mut MouseState) {
         // but resizing the PTY every mouse cell triggers the backend
         // (Claude/etc.) to reflow its entire UI and floods us with redraw
         // data. Defer the single PTY resize to mouse-up.
-    } else if layout.tab_reorder_source.is_some() && layout.is_tab_bar_row(mouse.row) {
+    } else if layout.tab_reorder_source.is_some() && crate::layout::is_tab_bar_row(mouse.row) {
         // Tab reorder drag: update drop target
         layout.tab_reorder_target = match tab_bar_hit_test(layout, mouse.column) {
             Some(TabBarClick::Tab(idx)) => Some(idx),
@@ -173,7 +173,7 @@ fn handle_drag(mouse: MouseEvent, layout: &mut Layout, state: &mut MouseState) {
         // inside the pane area is an intra-tab swap intent. Set exactly one
         // of `drag_target_tab` / `drag_target` per mouse position so that
         // render + mouse-up dispatch unambiguously.
-        if layout.is_tab_bar_row(mouse.row) {
+        if crate::layout::is_tab_bar_row(mouse.row) {
             let hit = tab_bar_hit_test(layout, mouse.column);
             let active_idx = layout.active;
             let tab_target = match hit {
