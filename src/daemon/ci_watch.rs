@@ -2,6 +2,27 @@ use crate::agent::{self, AgentRegistry};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
+pub const WATCH_TTL_HOURS: i64 = 72;
+
+/// Remove a watch file and log the removal event.
+pub fn remove_watch(
+    home: &Path,
+    watch_path: &Path,
+    instance: &str,
+    repo: &str,
+    branch: &str,
+    reason: &str,
+) {
+    let _ = std::fs::remove_file(watch_path);
+    crate::event_log::log(
+        home,
+        "ci_watch_removed",
+        instance,
+        &format!("repo={repo} branch={branch} reason={reason}"),
+    );
+}
+
 /// Deterministic, collision-free filename for a CI watch entry.
 /// Uses SHA-256 of `"{repo}:{branch}"` to avoid path traversal and
 /// collisions when repo names contain `/` (e.g. `owner/repo` vs
@@ -94,32 +115,19 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
         if let Some(expires_at) = watch["expires_at"].as_str() {
             if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
                 if now_utc > exp.with_timezone(&chrono::Utc) {
-                    let _ = std::fs::remove_file(&path);
-                    crate::event_log::log(
-                        home,
-                        "ci_watch_removed",
-                        &instance,
-                        &format!("repo={repo} branch={branch} reason=expired"),
-                    );
+                    remove_watch(home, &path, &instance, &repo, &branch, "expired");
                     tracing::info!(repo = %repo, branch = %branch, "CI watch expired (TTL)");
                     continue;
                 }
             }
         }
-        // Inactivity TTL: 72h since last terminal run seen
-        const INACTIVITY_TTL_HOURS: i64 = 72;
+        // Inactivity TTL: WATCH_TTL_HOURS since last terminal run seen
         if let Some(last_seen) = watch["last_terminal_seen_at"].as_str() {
             if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
                 let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
-                if elapsed > chrono::Duration::hours(INACTIVITY_TTL_HOURS) {
-                    let _ = std::fs::remove_file(&path);
-                    crate::event_log::log(
-                        home,
-                        "ci_watch_removed",
-                        &instance,
-                        &format!("repo={repo} branch={branch} reason=inactivity_ttl"),
-                    );
-                    tracing::info!(repo = %repo, branch = %branch, hours = INACTIVITY_TTL_HOURS, "CI watch removed: inactivity TTL");
+                if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
+                    remove_watch(home, &path, &instance, &repo, &branch, "inactivity_ttl");
+                    tracing::info!(repo = %repo, branch = %branch, hours = WATCH_TTL_HOURS, "CI watch removed: inactivity TTL");
                     continue;
                 }
             }
@@ -354,13 +362,7 @@ async fn ci_check_repo(
     // Check if the PR associated with this branch has reached a terminal state.
     if let Some(should_clear) = check_pr_terminal(&gh_get, repo, branch).await {
         if should_clear {
-            let _ = std::fs::remove_file(watch_path);
-            crate::event_log::log(
-                home,
-                "ci_watch_removed",
-                instance,
-                &format!("repo={repo} branch={branch} reason=pr_terminal"),
-            );
+            remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
             tracing::info!(repo, branch, "CI watcher auto-cleared: PR terminal");
             return Ok(());
         }
@@ -1130,6 +1132,56 @@ mod tests {
         assert!(
             watch_path.exists(),
             "legacy watch without TTL fields must not be removed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_remove_watch_on_pr_terminal_logs_event() {
+        let dir = tmp_dir("pr-terminal");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let filename = watch_filename("o/r", "feat-merged");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(
+            &watch_path,
+            r#"{"repo":"o/r","branch":"feat-merged","instance":"a1"}"#,
+        )
+        .unwrap();
+        assert!(watch_path.exists());
+
+        remove_watch(&dir, &watch_path, "a1", "o/r", "feat-merged", "pr_terminal");
+
+        assert!(!watch_path.exists(), "watch must be removed");
+        let log = std::fs::read_to_string(dir.join("event-log.jsonl")).unwrap_or_default();
+        assert!(log.contains("ci_watch_removed"));
+        assert!(log.contains("reason=pr_terminal"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_watch_preserved_when_pr_check_unavailable() {
+        let dir = tmp_dir("pr-fail");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(48)).to_rfc3339();
+        let recent = chrono::Utc::now().to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat-active", "interval_secs": 60,
+            "instance": "a1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null, "expires_at": future, "last_terminal_seen_at": recent,
+        });
+        let filename = watch_filename("o/r", "feat-active");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).unwrap();
+
+        let registry: AgentRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        check_ci_watches(&dir, &registry);
+
+        assert!(
+            watch_path.exists(),
+            "watch must survive when PR check unavailable"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
