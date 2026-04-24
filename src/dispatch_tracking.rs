@@ -128,7 +128,10 @@ mod tests {
         );
         let (warns, asks) = sweep_stuck(&home);
         // 31min → jumps straight to ask (skips warn since ask threshold met)
-        assert!(warns.is_empty(), "31min should go straight to ask, not warn");
+        assert!(
+            warns.is_empty(),
+            "31min should go straight to ask, not warn"
+        );
         assert_eq!(asks.len(), 1, "31min old dispatch must ask");
         assert_eq!(asks[0].to, "reviewer");
         std::fs::remove_dir_all(&home).ok();
