@@ -253,6 +253,15 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Some(ctx) = args["context"].as_str() {
                 msg.push_str(&format!("\n\nContext: {ctx}"));
             }
+            let interrupt_meta_json = if interrupt {
+                Some(json!({
+                    "interrupted": true,
+                    "reason": reason.unwrap_or(""),
+                    "interrupted_at": chrono::Utc::now().to_rfc3339()
+                }))
+            } else {
+                None
+            };
             let task_id_str = args["task_id"].as_str();
             let result = match crate::api::call(
                 &home,
@@ -264,6 +273,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         "text": msg,
                         "kind": "task",
                         "task_id": task_id_str,
+                        "interrupt_meta": interrupt_meta_json,
                     }
                 }),
             ) {
@@ -285,7 +295,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         thread_id: None,
                         parent_id: None,
                         task_id: task_id_str.map(String::from),
-                        interrupt_meta: None,
+                        interrupt_meta: interrupt_meta_json.as_ref().and_then(|v| {
+                            serde_json::from_value::<crate::inbox::InterruptMeta>(v.clone()).ok()
+                        }),
                         delivery_mode: Some("inbox_fallback".to_string()),
                         from: format!("from:{}", sender.as_str()),
                         text: msg.clone(),
@@ -2490,6 +2502,19 @@ instances:
                 || !result["error"].as_str().unwrap_or("").contains("busy"),
             "must not error on busy: {result}"
         );
+        // Verify interrupt_meta persisted in receiver's inbox
+        let msgs = crate::inbox::drain(&home, "target");
+        assert!(!msgs.is_empty(), "target must have inbox message");
+        let msg = &msgs[0];
+        assert!(
+            msg.interrupt_meta.is_some(),
+            "interrupt_meta must be set on inbox message: {:?}",
+            msg.interrupt_meta
+        );
+        let meta = msg.interrupt_meta.as_ref().unwrap();
+        assert!(meta.interrupted);
+        assert_eq!(meta.reason, "critical bug");
+        assert!(!meta.interrupted_at.is_empty());
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }

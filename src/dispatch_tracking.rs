@@ -44,17 +44,17 @@ pub fn track_dispatch(home: &Path, entry: DispatchEntry) {
 }
 
 /// Mark a dispatch as completed (matched by task_id or to-instance).
-pub fn mark_completed(home: &Path, correlation_id: Option<&str>, to: &str) {
+pub fn mark_completed(home: &Path, correlation_id: Option<&str>, _to: &str) {
+    let cid = match correlation_id {
+        Some(c) if !c.is_empty() => c,
+        _ => return, // No correlation_id → can't match, let sweep continue tracking
+    };
     let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
         for entry in store.entries.iter_mut() {
             if entry.status == "completed" {
                 continue;
             }
-            let matches = correlation_id
-                .and_then(|cid| entry.task_id.as_deref().map(|tid| tid == cid))
-                .unwrap_or(false)
-                || entry.to == to;
-            if matches {
+            if entry.task_id.as_deref() == Some(cid) {
                 entry.status = "completed".to_string();
             }
         }
