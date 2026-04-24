@@ -1325,6 +1325,18 @@ pub fn render_tasks(
     .split(inner);
 
     let col_titles = ["Backlog", "Open", "In Progress", "Done"];
+    let done_visible = columns.get(3).map(|c| c.len()).unwrap_or(0);
+    let col_title_strs: Vec<String> = col_titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            if i == 3 {
+                format!(" {} ({}/14d) ", t, done_visible)
+            } else {
+                format!(" {} ({}) ", t, columns.get(i).map(|c| c.len()).unwrap_or(0))
+            }
+        })
+        .collect();
     let col_colors = [Color::Gray, Color::Green, Color::Yellow, Color::DarkGray];
 
     for (ci, (tasks, area)) in columns.iter().zip(col_areas.iter()).enumerate() {
@@ -1338,7 +1350,7 @@ pub fn render_tasks(
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
             .title(Span::styled(
-                format!(" {} ({}) ", col_titles[ci], tasks.len()),
+                &col_title_strs[ci],
                 Style::default()
                     .fg(if is_active {
                         Color::Blue
@@ -1377,6 +1389,31 @@ pub fn render_tasks(
             lines.push(Line::from(Span::styled(text, style)));
         }
         frame.render_widget(Paragraph::new(lines), block_inner);
+    }
+
+    // Status line: active/idle agent summary from In Progress column
+    if inner.height > 2 && inner.width > 10 {
+        let active_agents: std::collections::HashSet<&str> = columns[2]
+            .iter()
+            .filter_map(|t| t.assignee.as_deref())
+            .collect();
+        let status_text = if active_agents.is_empty() {
+            "all idle".to_string()
+        } else {
+            let names: Vec<&str> = active_agents.into_iter().collect();
+            format!("active: {}", names.join(", "))
+        };
+        let status_y = inner.y + inner.height.saturating_sub(1);
+        let status_area = Rect::new(
+            inner.x + 1,
+            status_y,
+            inner.width.saturating_sub(2).min(status_text.len() as u16),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(status_text, Style::default().fg(Color::Cyan))),
+            status_area,
+        );
     }
 
     // Help hint at bottom-right (hidden in Help mode)
@@ -1545,6 +1582,13 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
     sort_col(&mut backlog);
     sort_col(&mut open);
     sort_col(&mut in_progress);
+    // Secondary sort: group In Progress by assignee for visual grouping
+    in_progress.sort_by(|a, b| {
+        a.assignee
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.assignee.as_deref().unwrap_or(""))
+    });
     sort_col(&mut done);
 
     [backlog, open, in_progress, done]
