@@ -46,7 +46,9 @@ fn comm_tools() -> Vec<Value> {
                 "target_instance": {"type": "string"}, "task": {"type": "string"},
                 "success_criteria": {"type": "string"}, "context": {"type": "string"},
                 "task_id": {"type": "string", "description": "Task board ID for correlation"},
-                "thread_id": {"type": "string"}, "parent_id": {"type": "string"}
+                "thread_id": {"type": "string"}, "parent_id": {"type": "string"},
+                "interrupt": {"type": "boolean", "description": "Override busy gate (requires reason)"},
+                "reason": {"type": "string", "description": "Reason for interrupt (required when interrupt=true)"}
             }, "required": ["target_instance", "task"]}}),
         json!({"name": "report_result", "description": "Report results back to the delegating instance.",
             "inputSchema": {"type": "object", "properties": {

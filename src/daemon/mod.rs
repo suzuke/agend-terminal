@@ -828,7 +828,7 @@ fn apply_fleet_reload(
 /// Replay missed one-shot schedules on daemon startup.
 /// Calls `schedules::replay_missed_oneshots` and fires each returned
 /// schedule through the same path as `cron_tick::check_schedules`.
-/// Sweep overdue claimed tasks and log events.
+/// Sweep overdue claimed tasks and stuck dispatches, log events.
 pub fn run_task_maintenance(home: &Path) {
     let unclaimed = crate::tasks::sweep_overdue_claimed(home);
     for tid in &unclaimed {
@@ -839,6 +839,30 @@ pub fn run_task_maintenance(home: &Path) {
             "due_at expired, status → open",
         );
         tracing::info!(task_id = %tid, "task overdue, unclaimed");
+    }
+    // Dispatch timeout detection
+    let (warns, asks) = crate::dispatch_tracking::sweep_stuck(home);
+    for w in &warns {
+        crate::event_log::log(
+            home,
+            "dispatch_stuck_warn",
+            &w.to,
+            &format!(
+                "no report_result after {}min",
+                crate::dispatch_tracking::DISPATCH_WARN_MINUTES
+            ),
+        );
+    }
+    for a in &asks {
+        crate::event_log::log(
+            home,
+            "dispatch_stuck_ask",
+            &a.to,
+            &format!(
+                "no report_result after {}min, querying assignee",
+                crate::dispatch_tracking::DISPATCH_ASK_MINUTES
+            ),
+        );
     }
 }
 

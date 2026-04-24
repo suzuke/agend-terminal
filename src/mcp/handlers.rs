@@ -205,6 +205,38 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(t) => t,
                 None => return json!({"error": "missing 'task'"}),
             };
+
+            // Busy gate: check if target has claimed tasks on the task board.
+            let interrupt = args["interrupt"].as_bool().unwrap_or(false);
+            let reason = args["reason"].as_str();
+            let claimed_tasks: Vec<_> = crate::tasks::list_all(&home)
+                .into_iter()
+                .filter(|t| t.assignee.as_deref() == Some(target) && t.status == "claimed")
+                .collect();
+            if !claimed_tasks.is_empty() {
+                if interrupt {
+                    if reason.is_none() || reason == Some("") {
+                        return json!({"error": "interrupt=true requires a non-empty 'reason'"});
+                    }
+                } else {
+                    let current = &claimed_tasks[0];
+                    let age_secs = chrono::DateTime::parse_from_rfc3339(&current.updated_at)
+                        .ok()
+                        .map(|dt| {
+                            chrono::Utc::now()
+                                .signed_duration_since(dt.with_timezone(&chrono::Utc))
+                                .num_seconds()
+                        })
+                        .unwrap_or(0);
+                    return json!({
+                        "busy": true,
+                        "current_task": {"id": current.id, "title": current.title, "age_seconds": age_secs},
+                        "options": ["interrupt=true (with reason)", "queue=true"],
+                        "suggestion": format!("target busy on task {} ({}s old). Use interrupt=true with reason to override.", current.id, age_secs)
+                    });
+                }
+            }
+
             let mut msg = format!("[delegate_task] {task}");
             if let Some(tid) = args["task_id"].as_str() {
                 msg.push_str(&format!(" (task id: {tid})"));
@@ -265,6 +297,17 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             };
             if is_ok_result(&result) {
                 let task_id = task_id_str.map(str::to_string);
+                // Track dispatch for timeout detection
+                crate::dispatch_tracking::track_dispatch(
+                    &home,
+                    crate::dispatch_tracking::DispatchEntry {
+                        task_id: task_id.clone(),
+                        from: sender.as_str().to_string(),
+                        to: target.to_string(),
+                        delegated_at: chrono::Utc::now().to_rfc3339(),
+                        status: "pending".to_string(),
+                    },
+                );
                 ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
                     from: sender.as_str().to_string(),
                     to: target.to_string(),
@@ -2354,6 +2397,140 @@ instances:
             result["delivery_mode"].as_str(),
             Some("inbox_fallback"),
             "describe_message must show delivery_mode: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Sprint 8: busy gate + interrupt ---
+
+    #[test]
+    fn test_delegate_task_busy_returns_structured_response() {
+        let _g = fleet_test_guard();
+        let home = tmp_home("busy-gate");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        // Create and claim a task for target
+        crate::tasks::handle(
+            &home,
+            "target",
+            &json!({"action": "create", "title": "busy work"}),
+        );
+        let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+        let tid = tasks["tasks"][0]["id"].as_str().unwrap();
+        crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
+
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "new work"}),
+            "sender",
+        );
+        assert_eq!(result["busy"], true, "must return busy: {result}");
+        assert!(
+            result["current_task"]["id"].is_string(),
+            "must have current_task.id: {result}"
+        );
+        assert!(result["options"].is_array(), "must have options: {result}");
+        assert!(
+            result["suggestion"].is_string(),
+            "must have suggestion: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_delegate_task_interrupt_true_bypasses_busy_gate() {
+        let _g = fleet_test_guard();
+        let home = tmp_home("interrupt-bypass");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        crate::tasks::handle(
+            &home,
+            "target",
+            &json!({"action": "create", "title": "busy"}),
+        );
+        let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+        let tid = tasks["tasks"][0]["id"].as_str().unwrap();
+        crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
+
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "urgent", "interrupt": true, "reason": "critical bug"}),
+            "sender",
+        );
+        assert!(
+            result.get("busy").is_none(),
+            "interrupt=true must bypass busy gate: {result}"
+        );
+        assert!(
+            result.get("error").is_none()
+                || !result["error"].as_str().unwrap_or("").contains("busy"),
+            "must not error on busy: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_delegate_task_interrupt_true_without_reason_rejected() {
+        let _g = fleet_test_guard();
+        let home = tmp_home("interrupt-no-reason");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        crate::tasks::handle(
+            &home,
+            "target",
+            &json!({"action": "create", "title": "busy"}),
+        );
+        let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+        let tid = tasks["tasks"][0]["id"].as_str().unwrap();
+        crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
+
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "urgent", "interrupt": true}),
+            "sender",
+        );
+        assert!(
+            result["error"].as_str().unwrap_or("").contains("reason"),
+            "interrupt without reason must error: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_delegate_task_idle_target_normal_delivery() {
+        let _g = fleet_test_guard();
+        let home = tmp_home("idle-target");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        // No claimed tasks for target
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "normal work"}),
+            "sender",
+        );
+        assert!(
+            result.get("busy").is_none(),
+            "idle target must not return busy: {result}"
         );
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();

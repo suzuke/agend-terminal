@@ -13,6 +13,7 @@ mod connect;
 mod daemon;
 mod decisions;
 mod deployments;
+mod dispatch_tracking;
 mod error;
 mod event_log;
 mod fleet;
