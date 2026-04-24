@@ -899,6 +899,17 @@ pub fn run_task_maintenance(home: &Path) {
             &format!("task_id={tid} dispatched_at={}", orphan.delegated_at),
         );
     }
+    // Worktree auto-cleanup: remove worktrees whose branches are merged into main
+    let cleaned = crate::worktree_cleanup::sweep_merged_worktrees(home);
+    for (branch, path) in &cleaned {
+        crate::event_log::log(
+            home,
+            "worktree_auto_removed",
+            branch,
+            &format!("path={path}, branch merged into main"),
+        );
+        tracing::info!(branch, path, "worktree auto-removed (branch merged)");
+    }
 }
 
 fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
