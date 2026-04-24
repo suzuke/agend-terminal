@@ -1040,5 +1040,13 @@ mod tests {
             body.contains("current:"),
             "BUSY format must include current field"
         );
+        assert!(
+            body.contains("unblock:"),
+            "BUSY format must include unblock field"
+        );
+        assert!(
+            body.contains("can_take_after:"),
+            "BUSY format must include can_take_after field"
+        );
     }
 }

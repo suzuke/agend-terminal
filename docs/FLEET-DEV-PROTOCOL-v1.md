@@ -154,6 +154,19 @@ The orchestrator may then reassign the review instead of waiting.
 
 **Implementation note:** Review delegates are tracked in `dispatch_tracking.json` alongside impl delegates. The 15/30min stuck timeout (`sweep_stuck`) applies to review dispatches equally.
 
+#### Active review lifecycle
+
+A reviewer may have at most one active review task unless an incoming task is explicitly marked `interrupt=true` with a reason.
+
+A review task becomes active when the reviewer reads or accepts the delegate_task, and remains active until `report_result` is sent.
+
+New review dispatches to an active reviewer are queued, not implicitly preemptive. The reviewer must finish and report the active task before starting another, unless:
+
+1. The new task is an explicit continuation of the same PR/thread, or
+2. The dispatch includes `interrupt=true` with a reason and the orchestrator records why.
+
+This encodes the anti-interrupt rule from the post-Sprint 7 review: silent preemption by newer dispatch was the Sprint 8 PR-H failure mode. The addendum prevents it by protocol rather than reviewer discipline alone.
+
 #### Primary reviewer accountability
 
 Every PR review has exactly one **primary reviewer**. The primary reviewer owns the final review report and must cover the full Reviewer Contract v1.1:
