@@ -283,13 +283,11 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                             anyhow::bail!("task '{id}' status is '{}', cannot claim", task.status);
                         }
                         // Cannot steal from another assignee
-                        if task.status == "claimed" {
-                            if task.assignee.as_deref() != Some(&iname) {
-                                anyhow::bail!(
-                                    "task '{id}' already claimed by '{}'",
-                                    task.assignee.as_deref().unwrap_or("unknown")
-                                );
-                            }
+                        if task.status == "claimed" && task.assignee.as_deref() != Some(&iname) {
+                            anyhow::bail!(
+                                "task '{id}' already claimed by '{}'",
+                                task.assignee.as_deref().unwrap_or("unknown")
+                            );
                         }
                         task.status = "claimed".to_string();
                         task.assignee = Some(iname.clone());
