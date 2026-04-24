@@ -114,17 +114,38 @@ pub fn sweep_merged_worktrees(home: &Path) -> Vec<(String, String)> {
 
     let entries = list_worktrees(repo);
     let mut removed = Vec::new();
-    let current_dir = std::env::current_dir().ok();
+
+    // Collect agent working directories from fleet.yaml for in-use check
+    let agent_dirs: Vec<std::path::PathBuf> =
+        crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+            .ok()
+            .map(|config| {
+                config
+                    .instance_names()
+                    .iter()
+                    .filter_map(|name| {
+                        config
+                            .resolve_instance(name)
+                            .and_then(|r| r.working_directory)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
     for entry in &entries {
         let wt_path = std::path::Path::new(&entry.path);
 
-        // Safety: skip if any process cwd is this worktree
-        if let Some(ref cwd) = current_dir {
-            if cwd.starts_with(wt_path) {
-                tracing::debug!(branch = %entry.branch, path = %entry.path, "skipping worktree (cwd in use)");
-                continue;
-            }
+        // Safety: skip if any agent's working_directory is inside this worktree
+        let wt_canonical = wt_path
+            .canonicalize()
+            .unwrap_or_else(|_| wt_path.to_path_buf());
+        let in_use = agent_dirs.iter().any(|wd| {
+            let wd_canonical = wd.canonicalize().unwrap_or_else(|_| wd.clone());
+            wd_canonical.starts_with(&wt_canonical)
+        });
+        if in_use {
+            tracing::debug!(branch = %entry.branch, path = %entry.path, "skipping worktree (agent working_directory in use)");
+            continue;
         }
 
         // Safety: skip dirty worktrees
@@ -280,6 +301,38 @@ mod tests {
         let removed = sweep_merged_worktrees(&repo);
         assert!(removed.is_empty(), "unmerged worktree must NOT be removed");
         assert!(wt.exists());
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn test_auto_cleanup_skips_worktree_when_agent_cwd_inside() {
+        let repo = setup_test_repo("agent-cwd");
+        git_in(&repo, &["branch", "feat/agent-use"]);
+        let wt = repo.join("wt-agent");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/agent-use"],
+        );
+        git_in(&repo, &["merge", "feat/agent-use"]);
+        // Merged + clean, but an agent's working_directory points here.
+        // Write fleet.yaml with an instance whose working_directory is the worktree.
+        std::fs::write(
+            repo.join("fleet.yaml"),
+            format!(
+                "instances:\n  busy-agent:\n    backend: claude\n    working_directory: \"{}\"\n",
+                wt.display()
+            ),
+        )
+        .ok();
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let removed = sweep_merged_worktrees(&repo);
+        assert!(
+            removed.is_empty(),
+            "worktree in use by agent must NOT be removed: {removed:?}"
+        );
+        assert!(wt.exists(), "worktree dir must still exist");
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         std::fs::remove_dir_all(&repo).ok();
     }
