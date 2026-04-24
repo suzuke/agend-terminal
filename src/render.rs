@@ -1740,6 +1740,7 @@ mod tests {
             result: None,
             created_at: created_at.to_string(),
             updated_at: String::new(),
+            due_at: None,
         }
     }
 
@@ -1843,6 +1844,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".into(),
             created_by: "test".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
+            due_at: None,
         }];
         terminal
             .draw(|frame| render_tasks(frame, &tasks, 0, 0, mode))
