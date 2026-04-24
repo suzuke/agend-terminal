@@ -55,19 +55,25 @@ fn instance_exists(home: &Path, name: &str) -> bool {
 }
 
 /// Check if caller is allowed to mutate a task (assignee or orchestrator).
-/// Unassigned tasks and open tasks can be mutated by anyone.
+/// Unassigned tasks can be mutated by anyone.
 fn can_mutate_task(home: &Path, caller: &str, task: &Task) -> bool {
-    // Open/blocked tasks: anyone can update (not yet claimed)
-    if task.status == "open" || task.status == "blocked" {
-        return true;
-    }
     match &task.assignee {
         None => true,
         Some(assignee) => {
             if assignee == caller {
                 return true;
             }
-            crate::teams::is_orchestrator_of(home, caller, assignee)
+            // Check if caller is orchestrator of assignee's team
+            if crate::teams::is_orchestrator_of(home, caller, assignee) {
+                return true;
+            }
+            // Check if assignee is a team name and caller is its orchestrator
+            if let Ok(Some(orch)) = crate::teams::resolve_team_orchestrator(home, assignee) {
+                if orch == caller {
+                    return true;
+                }
+            }
+            false
         }
     }
 }
@@ -278,15 +284,13 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
-                        // Cannot claim done/cancelled tasks
-                        if task.status == "done" || task.status == "cancelled" {
-                            anyhow::bail!("task '{id}' status is '{}', cannot claim", task.status);
-                        }
-                        // Cannot steal from another assignee
-                        if task.status == "claimed" && task.assignee.as_deref() != Some(&iname) {
+                        // Self re-claim is always ok
+                        if task.status == "claimed" && task.assignee.as_deref() == Some(&iname) {
+                            // no-op re-claim, just update timestamp
+                        } else if task.status != "open" {
                             anyhow::bail!(
-                                "task '{id}' already claimed by '{}'",
-                                task.assignee.as_deref().unwrap_or("unknown")
+                                "task '{id}' status is '{}', only 'open' tasks can be claimed",
+                                task.status
                             );
                         }
                         task.status = "claimed".to_string();
@@ -364,6 +368,11 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         }
                         if let Some(ref s) = new_status {
                             task.status = s.clone();
+                            // Release claim: setting status=open clears ownership
+                            if s == "open" {
+                                task.assignee = None;
+                                task.routed_to = None;
+                            }
                         }
                         if let Some(ref p) = new_priority {
                             task.priority = p.clone();
@@ -562,7 +571,7 @@ mod tests {
         assert_eq!(list_all(&home)[0].routed_to.as_deref(), Some("a1"));
         handle(
             &home,
-            "user",
+            "a1",
             &serde_json::json!({"action": "update", "id": id, "assignee": "beta"}),
         );
         let t = &list_all(&home)[0];
@@ -1140,8 +1149,8 @@ mod tests {
             &serde_json::json!({"action": "claim", "id": id}),
         );
         assert!(
-            r["error"].as_str().unwrap().contains("already claimed"),
-            "got: {r}"
+            r["error"].as_str().unwrap().contains("only 'open'"),
+            "claimed task must not be claimable by others: {r}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1339,6 +1348,64 @@ mod tests {
         let tasks = list_all(&home);
         let t = tasks.iter().find(|t| t.id == id).unwrap();
         assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none(), "release must clear assignee");
+        assert!(t.routed_to.is_none(), "release must clear routed_to");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_claim_blocked_task_rejected() {
+        let home = tmp_home("claim-blocked");
+        write_fleet_yaml(&home, &["agent-a"]);
+        // Create dep (stays open) + child that depends on it (auto-blocked)
+        let r1 = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "dep"}),
+        );
+        let dep_id = r1["id"].as_str().unwrap().to_string();
+        let r2 = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "child", "depends_on": [dep_id]}),
+        );
+        let child_id = r2["id"].as_str().unwrap();
+        // List triggers dep eval → child becomes blocked
+        handle(&home, "agent-a", &serde_json::json!({"action": "list"}));
+        // Try to claim blocked task
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": child_id}),
+        );
+        assert!(
+            r["error"].as_str().unwrap().contains("only 'open'"),
+            "blocked task must not be claimable: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_update_non_owner_on_open_assigned_rejected() {
+        let home = tmp_home("update-non-owner-assigned");
+        write_fleet_yaml(&home, &["agent-a", "agent-b"]);
+        // Create task assigned to agent-a (but not claimed yet → status open)
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t", "assignee": "agent-a"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        // agent-b tries to change priority on agent-a's assigned task
+        let r = handle(
+            &home,
+            "agent-b",
+            &serde_json::json!({"action": "update", "id": id, "priority": "urgent"}),
+        );
+        assert!(
+            r["error"].as_str().unwrap().contains("not authorized"),
+            "non-owner must not update assigned task: {r}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
