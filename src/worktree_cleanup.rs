@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)] // Windows path format mismatch (forward/back slash + UNC) — Sprint 10 backlog
+    #[cfg(unix)] // Windows path format mismatch (forward/back slash + UNC) — t-20260424173948421544-1
     fn test_auto_cleanup_skips_worktree_when_agent_cwd_inside() {
         let repo = setup_test_repo("agent-cwd");
         git_in(&repo, &["branch", "feat/agent-use"]);
