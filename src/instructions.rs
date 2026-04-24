@@ -205,8 +205,15 @@ pub(crate) fn build_instructions_body(
     content.push_str("- `report_result` — reply with task results\n");
     content.push_str("- `request_information` — ask another agent a question\n");
     content.push_str("- `list_instances` — see all running agents\n\n");
-    content
-        .push_str("Always reply to messages using `send_to_instance`, NOT direct text output.\n");
+    content.push_str(
+        "Reply obligation depends on `kind`:\n\
+         - `query` — requires reply (other instance is waiting)\n\
+         - `task` — may require reply after work (see Fleet Protocol §4 ack absorption)\n\
+         - `report` / `update` — do NOT reply unless you have new information to add\n\n\
+         For acknowledgement without triggering a reply loop, use the `react` MCP tool \
+         (emoji reaction; no inbox message on recipient side). \
+         Pure ack messages (\"收到\", \"OK\", \"👍\") should use `react`, not `send_to_instance`.\n",
+    );
     content.push_str("Check your `inbox` periodically for pending messages.\n");
 
     // Fleet Updates contract — live broadcasts via fleet_broadcast.
@@ -980,6 +987,32 @@ mod tests {
         assert!(
             body.contains("always include") || body.contains("always includes"),
             "instruction must state size= is always present"
+        );
+    }
+
+    #[test]
+    fn kind_aware_reply_obligation_in_prompt() {
+        let body = build_instructions_body(None, None);
+        assert!(
+            body.contains("Reply obligation depends on"),
+            "prompt must contain kind-aware reply guidance"
+        );
+        assert!(
+            body.contains("do NOT reply unless"),
+            "prompt must tell agents not to reply to report/update"
+        );
+        assert!(
+            !body.contains("Always reply"),
+            "old 'Always reply' must be removed"
+        );
+    }
+
+    #[test]
+    fn react_tool_mentioned_in_prompt() {
+        let body = build_instructions_body(None, None);
+        assert!(
+            body.contains("react"),
+            "prompt must mention react tool for ack without reply loop"
         );
     }
 }
