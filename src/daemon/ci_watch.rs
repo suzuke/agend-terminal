@@ -127,7 +127,12 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
 /// HTTP status explicitly so API errors surface as `Err` instead of
 /// imitating a quiescent branch.
 enum RunsResponse<'a> {
+    // Tests use the payload to verify classify_runs_response unwraps the
+    // first run; production caller (ci_check_repo) now reads the full
+    // runs array itself for multi-run scan and only matches ApiError here.
+    #[allow(dead_code)]
     Run(&'a serde_json::Value),
+    #[allow(dead_code)]
     NoRuns,
     ApiError(String),
 }
