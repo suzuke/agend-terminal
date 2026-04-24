@@ -1,7 +1,8 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
 use crate::agent_ops::{
-    cleanup_working_dir, list_agents, merge_metadata, save_metadata, send_to, validate_branch,
+    cleanup_working_dir, list_agents, merge_metadata, save_metadata, save_metadata_batch, send_to,
+    validate_branch,
 };
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::telegram;
@@ -697,13 +698,25 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             };
             let condition = args["condition"].as_str().unwrap_or("");
             if condition.is_empty() {
-                save_metadata(&home, instance_name, "waiting_on", json!(null));
-                save_metadata(&home, instance_name, "waiting_on_since", json!(null));
+                save_metadata_batch(
+                    &home,
+                    instance_name,
+                    &[
+                        ("waiting_on", json!(null)),
+                        ("waiting_on_since", json!(null)),
+                    ],
+                );
                 json!({"cleared": true})
             } else {
                 let now = chrono::Utc::now().to_rfc3339();
-                save_metadata(&home, instance_name, "waiting_on", json!(condition));
-                save_metadata(&home, instance_name, "waiting_on_since", json!(&now));
+                save_metadata_batch(
+                    &home,
+                    instance_name,
+                    &[
+                        ("waiting_on", json!(condition)),
+                        ("waiting_on_since", json!(&now)),
+                    ],
+                );
                 json!({"waiting_on": condition, "since": now})
             }
         }
@@ -1838,21 +1851,11 @@ instances:
         assert_eq!(result["waiting_on"], "review from at-dev-4");
 
         // Value-source pin: return value `since` must match metadata file.
-        // On Windows, two sequential save_metadata calls (waiting_on then
-        // waiting_on_since) can race with the file system cache, so we
-        // retry the read once after a short sleep.
         let returned_since = result["since"].as_str().expect("since in return");
-        let read_meta = || -> Value {
-            serde_json::from_str(
-                &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
-            )
-            .expect("parse meta")
-        };
-        let mut meta = read_meta();
-        if meta["waiting_on_since"].is_null() {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            meta = read_meta();
-        }
+        let meta: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
+        )
+        .expect("parse meta");
         assert_eq!(meta["waiting_on"], "review from at-dev-4");
         assert_eq!(
             meta["waiting_on_since"].as_str().expect("since in file"),
