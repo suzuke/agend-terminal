@@ -178,6 +178,33 @@ fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse
     }
 }
 
+/// Select runs from a GitHub Actions response that should trigger notifications.
+/// Returns indices into `runs` of terminal runs with `id > last_run_id`, ordered
+/// oldest-first so notifications arrive chronologically.
+/// In-progress runs (conclusion=null) are skipped.
+pub(crate) fn select_runs_to_notify(
+    runs: &[serde_json::Value],
+    last_run_id: Option<u64>,
+) -> Vec<usize> {
+    let threshold = last_run_id.unwrap_or(0);
+    let mut selected: Vec<(usize, u64)> = runs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, run)| {
+            let id = run["id"].as_u64()?;
+            if id <= threshold {
+                return None;
+            }
+            // Skip non-terminal (in-progress) runs
+            run["conclusion"].as_str()?;
+            Some((i, id))
+        })
+        .collect();
+    // Sort oldest-first by run_id
+    selected.sort_by_key(|&(_, id)| id);
+    selected.into_iter().map(|(i, _)| i).collect()
+}
+
 /// Build the notification message for a CI run conclusion.
 /// Returns `None` for non-terminal states (in-progress / null conclusion).
 fn ci_notification_message(
@@ -667,5 +694,50 @@ mod tests {
             f1, f4,
             "different branches must produce different filenames"
         );
+    }
+
+    #[test]
+    fn test_multi_run_notifies_all_terminal_since_last() {
+        use serde_json::json;
+        let runs = vec![
+            json!({"id": 100, "conclusion": "success", "head_sha": "aaa"}),
+            json!({"id": 101, "conclusion": "success", "head_sha": "bbb"}),
+            json!({"id": 102, "conclusion": null, "head_sha": "ccc"}), // in-progress
+        ];
+        let selected = select_runs_to_notify(&runs, Some(99));
+        assert_eq!(selected, vec![0, 1], "should notify runs 100 and 101, skip 102 (in-progress)");
+    }
+
+    #[test]
+    fn test_in_progress_does_not_appear_in_selection() {
+        use serde_json::json;
+        let runs = vec![
+            json!({"id": 200, "conclusion": null, "head_sha": "aaa"}),
+        ];
+        let selected = select_runs_to_notify(&runs, None);
+        assert!(selected.is_empty(), "in-progress run must not be selected");
+    }
+
+    #[test]
+    fn test_mixed_terminal_states_all_notified() {
+        use serde_json::json;
+        let runs = vec![
+            json!({"id": 300, "conclusion": "failure", "head_sha": "a"}),
+            json!({"id": 301, "conclusion": "cancelled", "head_sha": "b"}),
+            json!({"id": 302, "conclusion": "success", "head_sha": "c"}),
+        ];
+        let selected = select_runs_to_notify(&runs, Some(299));
+        assert_eq!(selected, vec![0, 1, 2], "all 3 terminal runs should be selected");
+    }
+
+    #[test]
+    fn test_already_notified_runs_skipped() {
+        use serde_json::json;
+        let runs = vec![
+            json!({"id": 400, "conclusion": "success", "head_sha": "a"}),
+            json!({"id": 401, "conclusion": "success", "head_sha": "b"}),
+        ];
+        let selected = select_runs_to_notify(&runs, Some(400));
+        assert_eq!(selected, vec![1], "run 400 already notified, only 401 selected");
     }
 }
