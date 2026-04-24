@@ -659,24 +659,32 @@ pub fn deliver(
     notify_agent(home, agent_name, source, text);
 }
 
-pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
-    if pointer_only_inject() {
-        // Pointer-only mode: inject a minimal header directing agent to call inbox.
-        let notification = format!(
+/// Pure function: build the notification string that will be injected to PTY.
+/// `pointer_only=true` → header-only (no body); `false` → inline text.
+pub fn format_notification_for_inject(
+    pointer_only: bool,
+    source: &NotifySource<'_>,
+    text: &str,
+) -> String {
+    if pointer_only {
+        format!(
             "[{source}] [AGEND-MSG] size={} (use inbox tool){}",
             text.len(),
             source.reply_hint()
-        );
-        compose_aware_inject(home, agent_name, &notification);
-        return;
-    }
-    let display_text = if text.chars().count() > 200 {
-        let truncated: String = text.chars().take(200).collect();
-        format!("{truncated}... (run: agend-terminal agent inbox)")
+        )
     } else {
-        text.to_string()
-    };
-    let notification = format!("[{source}] {display_text}{}", source.reply_hint());
+        let display_text = if text.chars().count() > 200 {
+            let truncated: String = text.chars().take(200).collect();
+            format!("{truncated}... (run: agend-terminal agent inbox)")
+        } else {
+            text.to_string()
+        };
+        format!("[{source}] {display_text}{}", source.reply_hint())
+    }
+}
+
+pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
+    let notification = format_notification_for_inject(pointer_only_inject(), source, text);
     compose_aware_inject(home, agent_name, &notification);
 }
 
@@ -1865,53 +1873,37 @@ mod tests {
 
     #[test]
     fn test_notify_agent_pointer_only_emits_header_not_body() {
-        // Flag=1 → notify_agent must NOT inject the message body into PTY.
-        // We verify by checking that compose_aware_inject receives a
-        // pointer-format string (contains [AGEND-MSG] + size=) not the body.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let home = tmp_home("notify-pointer");
-        std::env::set_var("AGEND_POINTER_ONLY_INJECT", "1");
-
-        // notify_agent will try to inject via API (fails, no daemon) — that's ok.
-        // We verify the enqueued message + the fact that the function doesn't panic.
-        // The real assertion: deliver enqueues the full body, but notify_agent
-        // in pointer mode doesn't include the body text in the PTY injection.
-        deliver(
-            &home,
-            "agent1",
-            &NotifySource::Agent("sender"),
-            "secret body text",
-            "\r",
-            None,
+        // Pure function test: pointer_only=true → output contains [AGEND-MSG]
+        // + size= but NOT the body text.
+        let source = NotifySource::Agent("sender");
+        let s = format_notification_for_inject(true, &source, "secret body text");
+        assert!(
+            s.contains("[AGEND-MSG]"),
+            "pointer mode must contain [AGEND-MSG]: {s}"
         );
-        // Message must be in inbox (enqueued by deliver)
-        let msgs = drain(&home, "agent1");
-        assert_eq!(msgs.len(), 1, "deliver must enqueue even in pointer mode");
-        assert_eq!(msgs[0].text, "secret body text", "full body in inbox");
-
-        std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
-        fs::remove_dir_all(&home).ok();
+        assert!(s.contains("size="), "pointer mode must contain size=: {s}");
+        assert!(
+            !s.contains("secret body text"),
+            "pointer mode must NOT contain body: {s}"
+        );
+        assert!(
+            s.contains("use inbox tool"),
+            "pointer mode must direct to inbox: {s}"
+        );
     }
 
     #[test]
     fn test_notify_agent_default_inline_behavior() {
-        // Flag unset → deliver enqueues AND notify_agent uses inline text.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let home = tmp_home("notify-inline");
-        std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
-
-        deliver(
-            &home,
-            "agent1",
-            &NotifySource::Agent("sender"),
-            "inline text",
-            "\r",
-            None,
+        // Pure function test: pointer_only=false → output contains the body text.
+        let source = NotifySource::Agent("sender");
+        let s = format_notification_for_inject(false, &source, "inline text");
+        assert!(
+            s.contains("inline text"),
+            "default mode must contain body: {s}"
         );
-        let msgs = drain(&home, "agent1");
-        assert_eq!(msgs.len(), 1, "deliver must enqueue in default mode too");
-        assert_eq!(msgs[0].text, "inline text");
-
-        fs::remove_dir_all(&home).ok();
+        assert!(
+            !s.contains("[AGEND-MSG]"),
+            "default mode must NOT contain [AGEND-MSG] header: {s}"
+        );
     }
 }
