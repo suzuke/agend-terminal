@@ -1606,6 +1606,69 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
 }
 
 /// Render the Fleet View — agent-centric dashboard grouped by team.
+/// Pure function: build fleet view text lines for testing.
+/// Returns plain-text lines (no styling) representing the fleet view content.
+pub fn build_fleet_view_lines(
+    tasks: &[crate::tasks::Task],
+    teams: &[crate::teams::Team],
+    all_instances: &[String],
+) -> Vec<String> {
+    let mut agent_tasks: std::collections::HashMap<&str, Vec<&crate::tasks::Task>> =
+        std::collections::HashMap::new();
+    for t in tasks {
+        if t.status == "claimed" {
+            if let Some(ref a) = t.assignee {
+                agent_tasks.entry(a.as_str()).or_default().push(t);
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for team in teams {
+        lines.push(format!(
+            "═══ {} (orchestrator: {}) ═══",
+            team.name,
+            team.orchestrator.as_deref().unwrap_or("none")
+        ));
+        for member in &team.members {
+            assigned.insert(member.as_str());
+            let symbol = if agent_tasks.contains_key(member.as_str()) {
+                "🟠"
+            } else {
+                "🟢"
+            };
+            let task_info = agent_tasks
+                .get(member.as_str())
+                .and_then(|ts| ts.first())
+                .map(|t| format!(" → {} ({})", t.title, t.id))
+                .unwrap_or_else(|| " idle".to_string());
+            lines.push(format!("  {symbol} {member}{task_info}"));
+        }
+    }
+    let unassigned: Vec<&str> = all_instances
+        .iter()
+        .filter(|n| !assigned.contains(n.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unassigned.is_empty() {
+        lines.push("═══ unassigned ═══".to_string());
+        for name in &unassigned {
+            let symbol = if agent_tasks.contains_key(name) {
+                "🟠"
+            } else {
+                "🟢"
+            };
+            let task_info = agent_tasks
+                .get(name)
+                .and_then(|ts| ts.first())
+                .map(|t| format!(" → {} ({})", t.title, t.id))
+                .unwrap_or_else(|| " idle".to_string());
+            lines.push(format!("  {symbol} {name}{task_info}"));
+        }
+    }
+    lines
+}
+
 fn render_fleet_view(
     frame: &mut Frame,
     tasks: &[crate::tasks::Task],
@@ -2040,6 +2103,68 @@ mod tests {
         assert!(
             !output.contains("? help"),
             "Help mode should NOT show '? help' hint, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_fleet_view_content() {
+        let teams = vec![crate::teams::Team {
+            name: "dev".to_string(),
+            members: vec!["dev-lead".to_string(), "dev-impl".to_string()],
+            orchestrator: Some("dev-lead".to_string()),
+            description: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+        let tasks = vec![crate::tasks::Task {
+            id: "t-1".to_string(),
+            title: "busy work".to_string(),
+            description: String::new(),
+            status: "claimed".to_string(),
+            priority: "normal".to_string(),
+            assignee: Some("dev-impl".to_string()),
+            routed_to: None,
+            created_by: "lead".to_string(),
+            depends_on: vec![],
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            due_at: None,
+        }];
+        let all_instances = vec![
+            "dev-lead".to_string(),
+            "dev-impl".to_string(),
+            "general".to_string(),
+        ];
+        let lines = build_fleet_view_lines(&tasks, &teams, &all_instances);
+        // Team header
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("dev") && l.contains("orchestrator: dev-lead")),
+            "must have team header: {lines:?}"
+        );
+        // Busy member with task
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("🟠") && l.contains("dev-impl") && l.contains("busy work")),
+            "busy member must show task: {lines:?}"
+        );
+        // Idle member
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("🟢") && l.contains("dev-lead") && l.contains("idle")),
+            "idle member must show idle: {lines:?}"
+        );
+        // Unassigned group
+        assert!(
+            lines.iter().any(|l| l.contains("unassigned")),
+            "must have unassigned group: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("general")),
+            "unassigned agent must appear: {lines:?}"
         );
     }
 }
