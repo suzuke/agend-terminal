@@ -1249,11 +1249,22 @@ pub fn render_tasks(
     sel_col: usize,
     sel_row: usize,
     mode: &crate::app::TaskBoardMode,
+    view: crate::app::BoardView,
+    home: &std::path::Path,
 ) {
-    use crate::app::TaskBoardMode;
+    use crate::app::{BoardView, TaskBoardMode};
     let count = items.len();
-    let title = format!(" Task Board ({count}) | ←→ move | n new | a assign | d cancel | q close ");
+    let view_tabs = match view {
+        BoardView::Tasks => "[t] tasks  [f] fleet",
+        BoardView::Fleet => " [t] tasks [f] fleet",
+    };
+    let title = format!(" Board ({count}) | {view_tabs} | Tab switch | q close ");
     let inner = render_overlay_frame(frame, Color::Blue, &title);
+
+    if matches!(view, BoardView::Fleet) {
+        render_fleet_view(frame, items, inner, home);
+        return;
+    }
 
     if items.is_empty() {
         frame.render_widget(
@@ -1594,6 +1605,112 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
     [backlog, open, in_progress, done]
 }
 
+/// Render the Fleet View — agent-centric dashboard grouped by team.
+/// Pure function: build fleet view text lines for testing.
+/// Returns plain-text lines (no styling) representing the fleet view content.
+pub fn build_fleet_view_lines(
+    tasks: &[crate::tasks::Task],
+    teams: &[crate::teams::Team],
+    all_instances: &[String],
+) -> Vec<String> {
+    let mut agent_tasks: std::collections::HashMap<&str, Vec<&crate::tasks::Task>> =
+        std::collections::HashMap::new();
+    for t in tasks {
+        if t.status == "claimed" {
+            if let Some(ref a) = t.assignee {
+                agent_tasks.entry(a.as_str()).or_default().push(t);
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    let mut assigned: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for team in teams {
+        lines.push(format!(
+            "═══ {} (orchestrator: {}) ═══",
+            team.name,
+            team.orchestrator.as_deref().unwrap_or("none")
+        ));
+        for member in &team.members {
+            assigned.insert(member.as_str());
+            let symbol = if agent_tasks.contains_key(member.as_str()) {
+                "🟠"
+            } else {
+                "🟢"
+            };
+            let task_info = agent_tasks
+                .get(member.as_str())
+                .and_then(|ts| ts.first())
+                .map(|t| format!(" → {} ({})", t.title, t.id))
+                .unwrap_or_else(|| " idle".to_string());
+            lines.push(format!("  {symbol} {member}{task_info}"));
+        }
+    }
+    let unassigned: Vec<&str> = all_instances
+        .iter()
+        .filter(|n| !assigned.contains(n.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unassigned.is_empty() {
+        lines.push("═══ unassigned ═══".to_string());
+        for name in &unassigned {
+            let symbol = if agent_tasks.contains_key(name) {
+                "🟠"
+            } else {
+                "🟢"
+            };
+            let task_info = agent_tasks
+                .get(name)
+                .and_then(|ts| ts.first())
+                .map(|t| format!(" → {} ({})", t.title, t.id))
+                .unwrap_or_else(|| " idle".to_string());
+            lines.push(format!("  {symbol} {name}{task_info}"));
+        }
+    }
+    lines
+}
+
+fn render_fleet_view(
+    frame: &mut Frame,
+    tasks: &[crate::tasks::Task],
+    area: Rect,
+    home: &std::path::Path,
+) {
+    let teams = crate::teams::list_all(home);
+    let all_instances: Vec<String> = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+        .ok()
+        .map(|c| c.instance_names())
+        .unwrap_or_default();
+    let text_lines = build_fleet_view_lines(tasks, &teams, &all_instances);
+
+    let lines: Vec<Line> = if text_lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "No agents configured. Add instances to fleet.yaml.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        text_lines
+            .iter()
+            .map(|l| {
+                let style = if l.starts_with('═') {
+                    if l.contains("unassigned") {
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    }
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::from(Span::styled(l.as_str(), style))
+            })
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// Centered box sized to 60% of `area`, clamped so a tiny window still gets
 /// a readable box. Shared by the spawn path (`Action::ScratchShell` in
 /// `app::dispatch`) and the render path so both agree on geometry.
@@ -1892,7 +2009,17 @@ mod tests {
             due_at: None,
         }];
         terminal
-            .draw(|frame| render_tasks(frame, &tasks, 0, 0, mode))
+            .draw(|frame| {
+                render_tasks(
+                    frame,
+                    &tasks,
+                    0,
+                    0,
+                    mode,
+                    crate::app::BoardView::Tasks,
+                    std::path::Path::new("/tmp"),
+                )
+            })
             .expect("test terminal draw should succeed");
         let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
@@ -1920,6 +2047,68 @@ mod tests {
         assert!(
             !output.contains("? help"),
             "Help mode should NOT show '? help' hint, got:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_fleet_view_content() {
+        let teams = vec![crate::teams::Team {
+            name: "dev".to_string(),
+            members: vec!["dev-lead".to_string(), "dev-impl".to_string()],
+            orchestrator: Some("dev-lead".to_string()),
+            description: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+        let tasks = vec![crate::tasks::Task {
+            id: "t-1".to_string(),
+            title: "busy work".to_string(),
+            description: String::new(),
+            status: "claimed".to_string(),
+            priority: "normal".to_string(),
+            assignee: Some("dev-impl".to_string()),
+            routed_to: None,
+            created_by: "lead".to_string(),
+            depends_on: vec![],
+            result: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            due_at: None,
+        }];
+        let all_instances = vec![
+            "dev-lead".to_string(),
+            "dev-impl".to_string(),
+            "general".to_string(),
+        ];
+        let lines = build_fleet_view_lines(&tasks, &teams, &all_instances);
+        // Team header
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("dev") && l.contains("orchestrator: dev-lead")),
+            "must have team header: {lines:?}"
+        );
+        // Busy member with task
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("🟠") && l.contains("dev-impl") && l.contains("busy work")),
+            "busy member must show task: {lines:?}"
+        );
+        // Idle member
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("🟢") && l.contains("dev-lead") && l.contains("idle")),
+            "idle member must show idle: {lines:?}"
+        );
+        // Unassigned group
+        assert!(
+            lines.iter().any(|l| l.contains("unassigned")),
+            "must have unassigned group: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("general")),
+            "unassigned agent must appear: {lines:?}"
         );
     }
 }

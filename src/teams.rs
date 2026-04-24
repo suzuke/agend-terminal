@@ -145,6 +145,11 @@ pub fn delete(home: &Path, args: &Value) -> Value {
     }
 }
 
+/// Return all teams as typed structs.
+pub fn list_all(home: &Path) -> Vec<Team> {
+    load(home).teams
+}
+
 pub fn list(home: &Path) -> Value {
     let store = load(home);
     let teams: Vec<Value> = store
