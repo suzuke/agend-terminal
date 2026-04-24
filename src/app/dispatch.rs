@@ -122,6 +122,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                     },
                     source_pane_id: pane_id,
                     source_tab_idx: active,
+                    split_dir: crate::layout::SplitDir::Horizontal,
                 });
             }
         }

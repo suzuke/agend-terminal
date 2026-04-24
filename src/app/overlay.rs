@@ -80,6 +80,8 @@ pub(super) enum Overlay {
         /// Source tab index at overlay-open time. Same defensive capture as
         /// `source_pane_id`; `move_pane_across_tabs` re-verifies existence.
         source_tab_idx: usize,
+        /// Target split direction when moving into an existing tab.
+        split_dir: crate::layout::SplitDir,
     },
     Help,
     /// Keyboard scroll mode (j/k/PgUp/PgDn). Pane's scroll_offset is used directly.
@@ -412,6 +414,7 @@ pub(super) fn handle_key(
         },
         Overlay::MovePaneTarget {
             ref mut selected,
+            ref mut split_dir,
             source_pane_id,
             source_tab_idx,
         } => {
@@ -420,6 +423,12 @@ pub(super) fn handle_key(
             // are valid move targets. `selected` can legally equal tabs.len().
             let list_len = ctx.layout.tabs.len() + 1;
             match key.code {
+                KeyCode::Tab | KeyCode::Char('s') => {
+                    *split_dir = match split_dir {
+                        crate::layout::SplitDir::Horizontal => crate::layout::SplitDir::Vertical,
+                        crate::layout::SplitDir::Vertical => crate::layout::SplitDir::Horizontal,
+                    };
+                }
                 KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
                     *selected -= 1;
                 }
@@ -430,6 +439,7 @@ pub(super) fn handle_key(
                     let src_pane = *source_pane_id;
                     let src_tab = *source_tab_idx;
                     let sel = *selected;
+                    let dir = *split_dir;
                     let tabs_count = ctx.layout.tabs.len();
                     *overlay = Overlay::None;
                     if sel == tabs_count {
@@ -456,10 +466,7 @@ pub(super) fn handle_key(
                         if let Some(new_idx) = ctx.layout.move_pane_across_tabs(
                             src_tab,
                             src_pane,
-                            crate::layout::MovePlacement::SplitFocused {
-                                to_tab: sel,
-                                dir: crate::layout::SplitDir::Horizontal,
-                            },
+                            crate::layout::MovePlacement::SplitFocused { to_tab: sel, dir },
                         ) {
                             // Follow the pane — the user just pointed at this tab.
                             ctx.layout.goto_tab(new_idx);
@@ -467,6 +474,7 @@ pub(super) fn handle_key(
                         }
                     }
                     // sel == src_tab: no-op (already in that tab).
+                    *overlay = Overlay::None;
                 }
                 KeyCode::Esc | KeyCode::Char('q') => {
                     *overlay = Overlay::None;

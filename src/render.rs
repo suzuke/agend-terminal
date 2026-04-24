@@ -948,6 +948,7 @@ pub fn render_move_pane_target(
     layout: &Layout,
     selected: usize,
     source_tab_idx: usize,
+    split_dir: crate::layout::SplitDir,
 ) {
     let area = frame.area();
     let list_len = layout.tabs.len() + 1; // tabs + "New tab"
@@ -961,7 +962,7 @@ pub fn render_move_pane_target(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Magenta))
         .title(Span::styled(
-            " Move pane to... (Enter, Esc) ",
+            format!(" Move pane to... (Split: {:?}) (Tab to toggle) ", split_dir),
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),

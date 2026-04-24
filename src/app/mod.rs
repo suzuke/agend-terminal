@@ -365,9 +365,16 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 Overlay::MovePaneTarget {
                     selected,
                     source_tab_idx,
+                    split_dir,
                     ..
                 } => {
-                    render::render_move_pane_target(frame, &layout, *selected, *source_tab_idx);
+                    render::render_move_pane_target(
+                        frame,
+                        &layout,
+                        *selected,
+                        *source_tab_idx,
+                        *split_dir,
+                    );
                 }
                 Overlay::Help => {
                     render::render_help(frame);
