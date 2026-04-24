@@ -339,8 +339,7 @@ pub fn resolve_team_orchestrator(home: &Path, name: &str) -> Result<Option<Strin
 pub fn is_orchestrator_of(home: &Path, caller: &str, member: &str) -> bool {
     let store = load(home);
     store.teams.iter().any(|t| {
-        t.members.contains(&member.to_string())
-            && t.orchestrator.as_deref() == Some(caller)
+        t.members.contains(&member.to_string()) && t.orchestrator.as_deref() == Some(caller)
     })
 }
 
