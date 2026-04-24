@@ -214,7 +214,15 @@ pub(crate) fn build_instructions_body(
          (emoji reaction; no inbox message on recipient side). \
          Pure ack messages (\"收到\", \"OK\", \"👍\") should use `react`, not `send_to_instance`.\n\
          When sending kind=report, include `parent_id` (the message you're replying to) \
-         and `correlation_id` (the task board ID) for correlation tracking.\n",
+         and `correlation_id` (the task board ID) for correlation tracking.\n\
+         If you receive a delegate_task while already working on an active review or task, \
+         respond with a structured BUSY message:\n\
+         ```\n\
+         BUSY\n\
+         current: <task id or message id you are working on>\n\
+         unblock: <condition or estimate>\n\
+         can_take_after: <time or \"unknown\">\n\
+         ```\n",
     );
     content.push_str("Check your `inbox` periodically for pending messages.\n");
 
@@ -1018,6 +1026,19 @@ mod tests {
         assert!(
             body.contains("react"),
             "prompt must mention react tool for ack without reply loop"
+        );
+    }
+
+    #[test]
+    fn busy_response_format_in_prompt() {
+        let body = build_instructions_body(None, None);
+        assert!(
+            body.contains("BUSY"),
+            "prompt must contain BUSY response guidance"
+        );
+        assert!(
+            body.contains("current:"),
+            "BUSY format must include current field"
         );
     }
 }
