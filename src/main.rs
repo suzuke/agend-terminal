@@ -31,6 +31,7 @@ mod mcp_config;
 mod notification_queue;
 mod process;
 mod protocol;
+mod pty_signal;
 mod quickstart;
 mod render;
 mod schedules;
