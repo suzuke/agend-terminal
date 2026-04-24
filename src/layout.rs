@@ -567,8 +567,28 @@ pub struct SplitBorderHit {
     pub dir: SplitDir,
 }
 
+/// Mouse-hit tolerance for vertical-split borders, in columns. The
+/// rendered separator (`│`) is one cell wide and dragging it precisely
+/// is annoying — an off-by-one click silently fell through to the
+/// text-selection path, leaving the user unable to resize horizontally
+/// without pixel-level aim.
+///
+/// Applied only to `SplitDir::Vertical`. Horizontal splits are mouse-
+/// resized via the bottom pane's title bar (see `app::mouse::handle`),
+/// not the border itself, so widening that hit zone would just steal
+/// clicks from pane content.
+pub const VSPLIT_BORDER_HIT_TOLERANCE: u16 = 1;
+
 /// Walk the pane tree with area info to find a split border at (col, row).
-/// A border is the 1-cell boundary between the two children of a split.
+/// A border is the 1-cell boundary between the two children of a split,
+/// optionally widened to a ±[`VSPLIT_BORDER_HIT_TOLERANCE`] zone for
+/// vertical splits.
+///
+/// Children are checked before the parent so a click on a nested split's
+/// exact border always resolves to the inner split, even when the outer's
+/// tolerance zone reaches the same column. Without this order, the
+/// parent would steal precise inner-border clicks the moment we widened
+/// it.
 pub fn find_split_border(
     node: &PaneNode,
     area: (u16, u16, u16, u16),
@@ -584,6 +604,12 @@ pub fn find_split_border(
             second,
         } => {
             let (first_area, second_area) = split_child_areas(area, *dir, *ratio);
+            if let Some(hit) = find_split_border(first, first_area, col, row) {
+                return Some(hit);
+            }
+            if let Some(hit) = find_split_border(second, second_area, col, row) {
+                return Some(hit);
+            }
             let (ax, ay, aw, ah) = area;
             // Shared-border convention: with 1-cell overlap between siblings,
             // the border column/row is the last cell of `first` == first cell
@@ -596,19 +622,19 @@ pub fn find_split_border(
                 }
                 SplitDir::Vertical => {
                     let border_col = second_area.0;
-                    col == border_col && row >= ay && row < ay + ah
+                    col.abs_diff(border_col) <= VSPLIT_BORDER_HIT_TOLERANCE
+                        && row >= ay
+                        && row < ay + ah
                 }
             };
             if on_border {
-                return Some(SplitBorderHit {
+                Some(SplitBorderHit {
                     split_area: area,
                     dir: *dir,
-                });
+                })
+            } else {
+                None
             }
-            if let Some(hit) = find_split_border(first, first_area, col, row) {
-                return Some(hit);
-            }
-            find_split_border(second, second_area, col, row)
         }
     }
 }
@@ -1467,9 +1493,136 @@ mod tests {
         let shared_col = first.0 + first.2 - 1;
         assert_eq!(shared_col, second.0);
         assert!(find_split_border(&root, area, shared_col, 5).is_some());
-        // After overlap, the old border column (first.x + first.w) is now
-        // inside `second`; no longer a border cell.
-        assert!(find_split_border(&root, area, first.0 + first.2, 5).is_none());
+        // ±VSPLIT_BORDER_HIT_TOLERANCE is now a hit too: clicking exactly
+        // one column off the border still grabs it, fixing the
+        // pixel-perfect-aim regression where off-by-one fell through to
+        // text selection.
+        assert!(find_split_border(&root, area, shared_col + 1, 5).is_some());
+        assert!(find_split_border(&root, area, shared_col - 1, 5).is_some());
+        // Two columns out is well into pane content and must NOT hit.
+        assert!(
+            find_split_border(&root, area, shared_col + 2, 5).is_none(),
+            "tolerance must not bleed past ±1 column"
+        );
+        assert!(
+            find_split_border(&root, area, shared_col.saturating_sub(2), 5).is_none(),
+            "tolerance must not bleed past ±1 column"
+        );
+    }
+
+    #[test]
+    fn nested_vsplit_inner_border_wins_over_outer_tolerance() {
+        // Outer vertical split contains an inner vertical split as its
+        // first child. With the children-first recursion order, a click
+        // on the inner border resolves to the inner split — even if the
+        // outer's ±1 tolerance zone happens to overlap. Regression pin
+        // for the recursion-order change introduced with hit tolerance.
+        fn leaf(id: usize, name: &str) -> PaneNode {
+            PaneNode::Leaf(Box::new(Pane {
+                agent_name: name.to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
+                selection: None,
+                source: PaneSource::Local,
+            }))
+        }
+        let inner = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(leaf(1, "a")),
+            second: Box::new(leaf(2, "b")),
+        };
+        let outer = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(inner),
+            second: Box::new(leaf(3, "c")),
+        };
+        let outer_area = (0u16, 0u16, 40u16, 10u16);
+        let (inner_area, outer_second_area) =
+            split_child_areas(outer_area, SplitDir::Vertical, 0.5);
+        let outer_border = outer_second_area.0;
+        let (inner_first, inner_second) = split_child_areas(inner_area, SplitDir::Vertical, 0.5);
+        let inner_border = inner_second.0;
+        // Sanity: both borders exist at distinct columns
+        assert_ne!(inner_border, outer_border);
+        assert_eq!(inner_border, inner_first.0 + inner_first.2 - 1);
+
+        // Click on inner border → inner split's area, not outer's.
+        let hit =
+            find_split_border(&outer, outer_area, inner_border, 5).expect("inner border must hit");
+        assert_eq!(
+            hit.split_area, inner_area,
+            "click on inner border must resolve to inner split"
+        );
+
+        // Click on outer border → outer.
+        let hit =
+            find_split_border(&outer, outer_area, outer_border, 5).expect("outer border must hit");
+        assert_eq!(hit.split_area, outer_area);
+    }
+
+    #[test]
+    fn hsplit_border_hit_is_not_widened() {
+        // Horizontal splits are NOT mouse-resizable via the border (the
+        // bottom pane's title bar lives at the same row and gets
+        // grabbed first by the mouse handler), so applying the column
+        // tolerance to rows would only steal pane content clicks.
+        // Pin the asymmetry so a future "make it consistent" refactor
+        // doesn't accidentally regress horizontal selection.
+        let root = PaneNode::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            first: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "top".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 1,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
+                selection: None,
+                source: PaneSource::Local,
+            }))),
+            second: Box::new(PaneNode::Leaf(Box::new(Pane {
+                agent_name: "bot".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam::channel::bounded(1).1,
+                id: 2,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
+                selection: None,
+                source: PaneSource::Local,
+            }))),
+        };
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (_first, second) = split_child_areas(area, SplitDir::Horizontal, 0.5);
+        let border_row = second.1;
+        assert!(find_split_border(&root, area, 5, border_row).is_some());
+        // ±1 row must NOT hit on horizontal splits — pane content lives
+        // on those rows and the keyboard is the supported resize path.
+        assert!(find_split_border(&root, area, 5, border_row + 1).is_none());
+        assert!(find_split_border(&root, area, 5, border_row.saturating_sub(1)).is_none());
     }
 
     #[test]
