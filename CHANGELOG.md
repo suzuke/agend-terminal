@@ -5,9 +5,89 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
-Post-`0.3.1` work on `main`. 48 commits over the tray-resident arc,
-Task #9 Option C dual-track elimination, codebase-review correctness
-fixes, and performance hotspots.
+170+ commits since `0.3.2` — multi-agent collaboration plumbing (fleet
+protocol v1.1, correlation threads, health reporting), inbox resilience
++ correlation, task-board dependencies + deadlines, a `watch_ci`
+reliability overhaul, plus a slate of TUI / spawn lifecycle / Telegram
+fixes.
+
+### Added
+
+- **Fleet Development Protocol v1 + v1.1** — `protocol/.default/FLEET-DEV-PROTOCOL.md` formalizes source-of-truth, dispatch contracts, ack absorption, `set_waiting_on` / timeout (§7), and Reviewer Contract addenda (wire-up grep enforcement). Embedded in the binary; extracted to `$AGEND_HOME/protocol/.default/` on first run.
+- **Live `<fleet-update>` injection** — daemon broadcasts instance / team / role mutations to every active agent in real time (`fleet_broadcast`); rosters and roles propagate without restart (#113, #123).
+- **MCP correlation threads** — `send_to_instance` / `delegate_task` accept `thread_id` + `parent_id` (auto-inherit on reply); new `describe_thread` + `get_thread` MCP tools surface full conversation chains.
+- **Health reporting MCP** — agents call `report_health(reason, retry_after?, note?)`; operators clear via `clear_blocked_reason`. `BlockedReason` enum (Hang / RateLimit / QuotaExceeded / AwaitingOperator / PermissionPrompt / Crash) shares a mutex with the hang detector so the two can't race-classify.
+- **Daemon watchdog with dry-run mode** — `classify_pty_output` against per-backend fixtures (Claude / Kiro / Codex / Gemini, including a `kiro_false_usage_limit.txt` guard) writes a `BlockedReason` to event_log every tick. `AGEND_WATCHDOG_DRY_RUN=1` keeps writes log-only for a one-week soak before flipping live.
+- **Task board: dependencies + deadlines** — `depends_on` auto-blocks downstream tasks until parents are done; new `due_at` + `--duration` field; daemon sweep unclaims overdue tasks back to `open` with event_log + notification.
+- **Task-board mutation integrity** — `claim` / `done` / `update` now enforce assignee ownership and target existence; descriptive errors instead of silent no-op (Sprint 5 #4 expanded scope).
+- **MCP `target` validation** — `send_to_instance` / `delegate_task` reject unknown instance names instead of enqueueing into a phantom inbox; `delegate_task` resolves teams to orchestrator like `task create` does (#136).
+- **Spawn `delivery_mode` field** — `send_to_instance` / `delegate_task` responses distinguish `pty` vs `inbox_fallback` so callers can tell whether the message reached the agent live or just landed in their inbox (#140).
+- **Inbox correlation + observability** — `thread_id` / `parent_id` fields, `read_at` + TTL sweep (read 7d / unread 30d soft-delete), `describe_message` MCP tool, schema versioning with future-version rejection.
+- **Inbox disk resilience** — readonly mode at <5% free space, atomic append (tmp + fsync + rename), `.draining` half-write recovery, per-file flock covering enqueue / drain / sweep with recovery inside the lock.
+- **PTY header injection for large messages** — messages >300 chars (Unicode-aware char count) inject only `[AGEND-MSG] from=X id=Y kind=Z thread=T parent=P size=N` with control-char-sanitized fields; agents drain via `inbox` MCP. Backend instructions teach all four CLIs to recognize the header (with optional ANSI prefix).
+- **Idle poll-reminder injection** — daemon notices idle agent + unread inbox > 0 → injects `[AGEND-MSG] kind=poll-reminder unread=N` with atomic dedup so the same count doesn't spam.
+- **Schedules: missed one-shot replay** — daemon startup scans `enabled && run_at < now && trigger=once`, fires within 24h window (drops + warns past), wired through the actual fire path with integration test.
+- **`watch_ci` reliability overhaul** —
+  - `head_sha` tracking + auto-clear when the PR reaches a terminal state (#119, #121)
+  - first poll fires immediately after registration instead of waiting `interval_secs`
+  - `per_page=5` + `select_runs_to_notify` scans every terminal run since `last_run_id` (rapid-push runs no longer shadowed by an in-progress later run)
+  - `classify_runs_response` distinguishes API errors from "no runs" — rate-limit JSON no longer silently drops notifications (#131)
+  - background thread errors logged at `warn` instead of silently dropped
+  - preventive `warning` field in the `watch_ci` MCP response when `GITHUB_TOKEN` is unset, with `gh auth token` hint (#133)
+- **`save_metadata_batch`** — atomic batched write replaces the per-instance loop that produced cross-process write races on Windows CI.
+- **Vertical-split mouse resize tolerance** — ±1 column hit zone on the `│` separator so off-by-one clicks no longer fall through to text selection (#139).
+- **Split-direction picker** in the MovePaneTarget menu — choose horizontal / vertical when moving a pane into a target tab (#37).
+- **TUI usability hints** — `? help` indicator on Task Board overlay; `Ctrl+B ? help` in main status bar (#93, #94).
+- **Team-aware peer sections in `agend.md`** — auto-generated peer block distinguishes team members from other fleet agents.
+- **Pre-flight Claude session check** — daemon, TUI session-restore, and API spawn paths downgrade `Resume → Fresh` up front when `~/.claude/projects/<encoded-cwd>/` has no jsonl with a `"type":"user"` line. Eliminates the "No conversation found to continue" error flash on idle-pane restart (#130).
+
+### Changed
+
+- **`watch_ci` throttle state in schema** — `last_polled_at` field replaces the mtime-backdating kludge; first-poll-immediate is now a schema-local rule, not a filesystem trick.
+- **Crash-respawn uses `Fresh` mode** — stale `--resume` after a crash reliably loops on "conversation not found"; respawn now skips it.
+- **`spawn_one` returns the actual `SpawnMode` used** — the Resume → Fresh downgrade is visible to callers so post-spawn gates (e.g. broadcast suppression) act on the real outcome, not the requested mode.
+- **`is_tab_bar_row` standalone fn + `TAB_BAR_HEIGHT` const** — eliminates magic `row == 0` checks across mouse + render paths (#38).
+- **`spawn_one` uses backend preset `submit_key`** — Gemini's `\n\r` is no longer hardcoded to `\r` (#98).
+- **Task IDs gain microsecond + atomic seq** — collision-free under concurrent creates (mirrors `decisions.rs` format).
+- **State detection gentler on shells / stuck prompts** — fewer false positives in stall classification (#122).
+- **Periodic tick wired into app mode** — schedules, CI watches, health decay, sweeps all run on the same daemon cadence in app mode (previously daemon-only) (#100).
+
+### Fixed
+
+- **`watch_ci` notifies on every terminal CI state**, not just `failure` (#105).
+- **Mouse selection white-block residue + Cmd+C false PTY input** (#104).
+- **Ctrl+B prefix Shift+key bindings** broken on Kitty-protocol terminals (#100, #102).
+- **Shift+Enter newline** + Repeat mode + LF on terminals that need keyboard enhancement disambiguation (#71, #72, #75).
+- **`compose_aware_inject` auto-submits when agent is idle** — earlier path required manual submit (#96, #99).
+- **Help hint right-align** in status bar (#109).
+- **Telegram routing** — channel resolution from passed home (#115); thread home through react / edit / download (#116); topic creation on every API spawn; UxEvent producers wired (#66, #68); block_on-inside-runtime panic prevention (#69); contract test bot-free for macOS (#48).
+- **MCP `AGEND_INSTANCE_NAME` injection** into MCP config env for all backends (#61).
+- **Stale `ToolUse` / `Thinking` states** expired via periodic tick (#102 follow-up).
+- **`delete_instance` guard** only blocks fleet members, not pure ad-hoc instances.
+- **Sender identity stamping** via `Sender` newtype — fixes empty `[from:]` header injections.
+- **Quickstart `working_directory`** defaults to `$AGEND_HOME/workspace/general`.
+- **Tab drag highlight + persistent selection** (#74); 4 UX fixes — Shift+Enter / tab drag reorder / pane drag hit area / single-pane drag (#70).
+- **Notify-agent input race** — drop `submit_key` from `notify_agent` (#81).
+- **TUI re-tile on team tab initial ingest**.
+- **Per-instance workdir for template members**.
+- **`AGEND_HOME` env var race** in tests — Windows CI flake source (#107).
+
+### Removed
+
+- **`per_page=1` polling** in watch_ci (replaced with per_page=5 + multi-run scan).
+- **Mtime-based throttle state** in watch_ci (replaced with schema field).
+
+### Docs
+
+- **USAGE.md** — startup modes, architecture, keyboard shortcuts (#73).
+- **Fleet Development Protocol v1 + v1.1** with §7 Waiting and timeout (#62, #64).
+- **Wave 3 Stage B-UX design + Reviewer Contract v0.1** (#50).
+- **Track 1 design** — waiting_on annotation + heartbeat (A2 + A5 fix) (#58).
+
+## [0.3.2] — 2026-04-22
+
+Tray-resident arc, Task #9 Option C dual-track elimination,
+codebase-review correctness fixes, and performance hotspots.
 
 ### Added
 
@@ -122,6 +202,7 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/suzuke/agend-terminal/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/suzuke/agend-terminal/compare/85f2bc3...v0.3.1
 [0.3.0]: https://github.com/suzuke/agend-terminal/commit/85f2bc3
