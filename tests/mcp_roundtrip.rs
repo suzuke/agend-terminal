@@ -29,6 +29,12 @@ fn mcp_home() -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let home = std::env::temp_dir().join(format!("agend-mcp-test-{}-{}", std::process::id(), id));
     std::fs::create_dir_all(&home).ok();
+    // Seed fleet.yaml so target validation passes for test-agent.
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  test-agent:\n    backend: claude\n  other-agent:\n    backend: claude\n",
+    )
+    .ok();
     home
 }
 

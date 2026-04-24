@@ -35,6 +35,16 @@ pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str)
         Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
+            // Validate target exists in fleet.yaml before writing to inbox.
+            // Without this, daemon-down + ghost target silently creates an
+            // unread inbox file — the exact silent-failure this PR eliminates.
+            let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                .ok()
+                .map(|c| c.instances.contains_key(target))
+                .unwrap_or(false);
+            if !in_fleet {
+                return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {e})")});
+            }
             let submit_key = get_submit_key(home, target);
             crate::inbox::deliver(
                 home,

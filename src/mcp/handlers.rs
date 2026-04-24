@@ -139,6 +139,14 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
                 Err(e) => {
+                    // Validate target exists in fleet.yaml before fallback delivery.
+                    let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                        .ok()
+                        .map(|c| c.instances.contains_key(target))
+                        .unwrap_or(false);
+                    if !in_fleet {
+                        return json!({"error": format!("target instance '{target}' not found (API unavailable: {e})")});
+                    }
                     // Resolve thread inheritance for direct delivery
                     let mut resolved_thread = thread_id.map(String::from);
                     let resolved_parent = parent_id.map(String::from);
@@ -2147,60 +2155,74 @@ instances:
     // --- Sprint 5: target validation + team routing ---
 
     #[test]
-    fn test_send_to_nonexistent_target_returns_error() {
-        // #7 fix: sending to a typo/nonexistent instance must return error.
+    fn test_send_to_nonexistent_target_returns_error_and_no_inbox() {
+        // F1+F2: daemon down + ghost target → error, NO inbox file created.
+        let _g = fleet_test_guard();
         let home = tmp_home("send-nonexist");
-        // No fleet.yaml, no registry → target doesn't exist anywhere.
+        std::env::set_var("AGEND_HOME", &home);
+        // No fleet.yaml → target doesn't exist anywhere.
         let result = handle_tool(
             "send_to_instance",
             &json!({"instance_name": "ghost-agent", "message": "hello"}),
             "sender",
         );
-        // The MCP handler calls send_to → api::call which will fail
-        // (no daemon). The fallback path in agent_ops::send_to delivers
-        // via inbox. To test the API-level validation, we test handle_send
-        // directly below.
-        // For MCP level: at minimum, the tool should not panic.
         assert!(
-            result.is_object(),
-            "send_to_instance must return a JSON object"
+            result.get("error").is_some(),
+            "send to nonexistent target must return error, got: {result}"
         );
+        let ghost_inbox = home.join("inbox").join("ghost-agent.jsonl");
+        assert!(
+            !ghost_inbox.exists(),
+            "inbox file must NOT be created for nonexistent target"
+        );
+        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn test_delegate_task_resolves_team_to_orchestrator() {
-        // #1 fix: delegate_task to a team name should resolve to orchestrator.
+    fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
+        // F3: delegate_task to team name → resolved to orchestrator,
+        // verify the actual inbox recipient is the orchestrator.
+        let _g = fleet_test_guard();
         let home = tmp_home("delegate-team");
-        // Create a team in fleet.yaml
-        let fleet_yaml = r#"
-instances:
-  dev-lead:
-    backend: claude
-  dev-impl:
-    backend: claude
-teams:
-  dev:
-    members: [dev-lead, dev-impl]
-    orchestrator: dev-lead
-"#;
-        std::fs::write(home.join("fleet.yaml"), fleet_yaml).ok();
+        // fleet.yaml for instance validation, teams.json for team resolution
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  dev-lead:\n    backend: claude\n  dev-impl:\n    backend: claude\n",
+        )
+        .ok();
+        // teams.json is the runtime store used by resolve_team_orchestrator
+        std::fs::write(
+            home.join("teams.json"),
+            r#"{"schema_version":1,"teams":[{"name":"dev","members":["dev-lead","dev-impl"],"orchestrator":"dev-lead","description":null,"created_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
 
-        // delegate_task to "dev" (team name) — should resolve to dev-lead.
-        // Without a running daemon, send_to will fallback to inbox delivery.
         let result = handle_tool(
             "delegate_task",
             &json!({"target_instance": "dev", "task": "test task"}),
             "dev-impl",
         );
-        // The result should target dev-lead (resolved from team), not "dev".
-        // Since no daemon is running, the fallback path delivers to inbox.
-        // Check that it didn't error with "missing target" — the team was resolved.
+        // Should not error — team resolved to dev-lead.
         let err = result["error"].as_str().unwrap_or("");
         assert!(
-            !err.contains("not found") && !err.contains("missing"),
+            !err.contains("not found"),
             "delegate_task to team name should resolve, got error: {err}"
         );
+        // Result should target dev-lead (orchestrator), not "dev" (team).
+        assert_eq!(
+            result["target"].as_str().unwrap_or(""),
+            "dev-lead",
+            "delegate_task must resolve team to orchestrator in result"
+        );
+        // No inbox for the team name itself.
+        let team_inbox = home.join("inbox").join("dev.jsonl");
+        assert!(
+            !team_inbox.exists(),
+            "inbox must NOT be created for team name 'dev'"
+        );
+        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 }
