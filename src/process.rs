@@ -60,21 +60,55 @@ pub fn terminate(pid: u32) {
 pub fn kill_process_tree(pid: u32) {
     #[cfg(unix)]
     {
-        // First try SIGTERM to the process group
+        let pgid = -(pid as i32);
+        // SIGTERM the entire process group
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+            libc::kill(pgid, libc::SIGTERM);
         }
-        // Brief grace period, then SIGKILL
+        // Grace period, then unconditional SIGKILL (handles grandchildren
+        // that ignore SIGTERM even if leader already exited).
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if is_pid_alive(pid) {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+        unsafe {
+            libc::kill(pgid, libc::SIGKILL);
         }
+        // ESRCH (no such process) is fine — group already dead.
     }
     #[cfg(windows)]
     {
-        // Windows: TerminateProcess on the leader (process groups work differently)
         terminate(pid);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn test_kill_process_tree_kills_child_subprocess() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        // Spawn a shell in its own process group (like PTY agents do).
+        let mut child = unsafe {
+            Command::new("sh")
+                .args(["-c", "sleep 60 & wait"])
+                .pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+                .expect("spawn sh + sleep")
+        };
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(is_pid_alive(pid), "shell must be alive before kill");
+
+        kill_process_tree(pid);
+        let _ = child.wait();
+
+        assert!(
+            !is_pid_alive(pid),
+            "shell must be dead after kill_process_tree"
+        );
     }
 }
