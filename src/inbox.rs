@@ -408,6 +408,16 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
 /// value inject only a structured header line; the full body stays in inbox.
 pub const HEADER_SIZE_THRESHOLD: usize = 300;
 
+/// Returns true when the `AGEND_POINTER_ONLY_INJECT` feature flag is set to "1".
+/// When enabled, PTY injection uses header-only format for all messages,
+/// forcing agents to call `inbox` to read content (solves dispatch non-FIFO).
+pub fn pointer_only_inject() -> bool {
+    std::env::var("AGEND_POINTER_ONLY_INJECT")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// ANSI-colored header prefix for visual distinction in terminal.
 pub const HEADER_PREFIX: &str = "\x1b[44;97m[AGEND-MSG]\x1b[0m";
 
@@ -622,8 +632,8 @@ pub fn find_message(home: &Path, msg_id: &str) -> Option<InboxMessage> {
     None
 }
 
-/// Deliver a message: short messages (≤500 chars) inject directly to PTY,
-/// long messages store to inbox + inject truncated notification.
+/// Deliver a message: always enqueue to inbox JSONL for persistence,
+/// then inject to PTY (inline or pointer-only depending on feature flag).
 pub fn deliver(
     home: &Path,
     agent_name: &str,
@@ -632,25 +642,21 @@ pub fn deliver(
     _submit_key: &str,
     kind: Option<String>,
 ) {
-    if text.chars().count() <= INLINE_THRESHOLD {
-        notify_agent(home, agent_name, source, text);
-    } else {
-        let msg = InboxMessage {
-            schema_version: 0,
-            id: None,
-            read_at: None,
-            thread_id: None,
-            parent_id: None,
-            task_id: None,
-            from: source.to_string(),
-            text: text.to_string(),
-            kind,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            delivery_mode: None,
-        };
-        let _ = enqueue(home, agent_name, msg);
-        notify_agent(home, agent_name, source, text);
-    }
+    let msg = InboxMessage {
+        schema_version: 0,
+        id: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        task_id: None,
+        from: source.to_string(),
+        text: text.to_string(),
+        kind,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        delivery_mode: None,
+    };
+    let _ = enqueue(home, agent_name, msg);
+    notify_agent(home, agent_name, source, text);
 }
 
 pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
@@ -918,10 +924,10 @@ mod tests {
     }
 
     #[test]
-    fn deliver_short_message_does_not_enqueue() {
+    fn deliver_short_message_also_enqueues() {
         let home = tmp_home("deliver-short");
-        // deliver with short text — should NOT write to inbox file
-        // (notify_agent will fail because no daemon, but enqueue should not be called)
+        // deliver with short text — must enqueue to inbox for persistence
+        // (previously skipped enqueue for ≤500 chars, causing data loss)
         deliver(
             &home,
             "agent1",
@@ -931,7 +937,11 @@ mod tests {
             None,
         );
         let msgs = drain(&home, "agent1");
-        assert!(msgs.is_empty(), "short messages bypass inbox");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "short messages must be enqueued for persistence"
+        );
 
         fs::remove_dir_all(&home).ok();
     }
@@ -1820,5 +1830,23 @@ mod tests {
         assert!(!h.contains('\r'), "CR in value must be sanitized: {h:?}");
         assert!(h.contains("kind=evil kind"));
         assert!(h.contains("key=val  ue"));
+    }
+
+    #[test]
+    fn test_pointer_only_feature_flag() {
+        // AGEND_POINTER_ONLY_INJECT=1 → pointer_only_inject() returns true
+        std::env::set_var("AGEND_POINTER_ONLY_INJECT", "1");
+        assert!(pointer_only_inject(), "flag=1 must enable pointer-only");
+        std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
+    }
+
+    #[test]
+    fn test_pointer_only_disabled_default() {
+        // Unset → pointer_only_inject() returns false (default behaviour)
+        std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
+        assert!(!pointer_only_inject(), "unset flag must default to false");
+        std::env::set_var("AGEND_POINTER_ONLY_INJECT", "0");
+        assert!(!pointer_only_inject(), "flag=0 must be disabled");
+        std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
     }
 }
