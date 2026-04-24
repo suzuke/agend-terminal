@@ -46,6 +46,7 @@ mod tui;
 mod verify;
 mod vterm;
 mod worktree;
+mod worktree_cleanup;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
