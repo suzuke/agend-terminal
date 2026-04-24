@@ -806,7 +806,7 @@ pub enum Direction {
 /// `drag_target` (which names a pane in the *current* tab for intra-tab swap):
 /// this field represents a cross-tab drop intent that will be realized on
 /// mouse-up via `Layout::move_pane_across_tabs`.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DragTabTarget {
     /// Pointer is over the tab at this index. On drop, move the pane into that tab.
     ExistingTab(usize),

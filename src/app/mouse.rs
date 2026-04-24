@@ -445,7 +445,7 @@ pub(super) fn copy_to_clipboard(text: &str) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::layout::{Pane, PaneSource, Tab};
+    use crate::layout::{DragTabTarget, Pane, PaneSource, SplitDir, Tab};
     use crate::vterm::VTerm;
     use crossterm::event::KeyModifiers;
 
@@ -526,5 +526,97 @@ mod tests {
         assert!(layout.tabs[1].dragging_pane.is_none());
         assert!(layout.tabs[1].drag_target.is_none());
         assert!(layout.tabs[1].drag_target_tab.is_none());
+    }
+
+    #[test]
+    fn test_drag_tab_reorder_updates_target() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("a".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("b".to_string(), leaf(2, "b")));
+        
+        let mut state = MouseState::default();
+        layout.tab_reorder_source = Some(0);
+        
+        // Drag over tab 1. Tab 0 is " a* " (~5 cols).
+        let event = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 7, 
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        
+        handle_drag(event, &mut layout, &mut state);
+        assert_eq!(layout.tab_reorder_target, Some(1));
+    }
+
+    #[test]
+    fn test_drag_pane_to_tab_bar_updates_target_tab() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("dst".to_string(), leaf(2, "b")));
+        layout.active = 0;
+        
+        let mut state = MouseState::default();
+        layout.tabs[0].dragging_pane = Some(1);
+        
+        // Drag over "dst" tab (idx 1) at row 0
+        let event = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 10,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        
+        handle_drag(event, &mut layout, &mut state);
+        assert_eq!(layout.tabs[0].drag_target_tab, Some(DragTabTarget::ExistingTab(1)));
+        assert!(layout.tabs[0].drag_target.is_none());
+    }
+
+    #[test]
+    fn test_drag_pane_to_new_tab_slot() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.active = 0;
+        
+        let mut state = MouseState::default();
+        layout.tabs[0].dragging_pane = Some(1);
+        
+        // Drag over "[+]" slot.
+        let event = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 8, 
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        
+        handle_drag(event, &mut layout, &mut state);
+        assert_eq!(layout.tabs[0].drag_target_tab, Some(DragTabTarget::NewTab));
+    }
+
+    #[test]
+    fn test_drag_pane_within_tab_updates_swap_target() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("tab".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        layout.active = 0;
+        
+        // Manually set pane rects to simulate a rendered state
+        layout.tabs[0].pane_rects.insert(1, (0, 1, 10, 10));
+        layout.tabs[0].pane_rects.insert(2, (10, 1, 10, 10));
+        
+        let mut state = MouseState::default();
+        layout.tabs[0].dragging_pane = Some(1);
+        
+        // Drag over pane 2
+        let event = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 15,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        };
+        
+        handle_drag(event, &mut layout, &mut state);
+        assert_eq!(layout.tabs[0].drag_target, Some(2));
+        assert!(layout.tabs[0].drag_target_tab.is_none());
     }
 }
