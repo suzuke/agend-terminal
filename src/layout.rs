@@ -1151,6 +1151,13 @@ pub struct Layout {
     pub tab_reorder_target: Option<usize>,
 }
 
+pub const TAB_BAR_HEIGHT: u16 = 1;
+
+/// True if the given screen row is within the tab bar area.
+pub fn is_tab_bar_row(row: u16) -> bool {
+    row < TAB_BAR_HEIGHT
+}
+
 impl Layout {
     pub fn new() -> Self {
         Self {
