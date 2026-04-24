@@ -114,9 +114,18 @@ pub fn sweep_merged_worktrees(home: &Path) -> Vec<(String, String)> {
 
     let entries = list_worktrees(repo);
     let mut removed = Vec::new();
+    let current_dir = std::env::current_dir().ok();
 
     for entry in &entries {
         let wt_path = std::path::Path::new(&entry.path);
+
+        // Safety: skip if any process cwd is this worktree
+        if let Some(ref cwd) = current_dir {
+            if cwd.starts_with(wt_path) {
+                tracing::debug!(branch = %entry.branch, path = %entry.path, "skipping worktree (cwd in use)");
+                continue;
+            }
+        }
 
         // Safety: skip dirty worktrees
         if is_worktree_dirty(wt_path) {
@@ -165,5 +174,113 @@ mod tests {
         let removed = sweep_merged_worktrees(&home);
         assert!(removed.is_empty(), "must not remove anything when flag off");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn setup_test_repo(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-wt-git-{}-{}-{}",
+            tag,
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "init").ok();
+        git(&["add", "."]);
+        git(&["commit", "-m", "init"]);
+        dir
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+    }
+
+    #[test]
+    fn test_auto_cleanup_removes_merged_branch_worktree() {
+        let repo = setup_test_repo("merged");
+        git_in(&repo, &["branch", "feat/merged-test"]);
+        let wt = repo.join("wt-merged");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/merged-test"],
+        );
+        git_in(&repo, &["merge", "feat/merged-test"]);
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let removed = sweep_merged_worktrees(&repo);
+        assert!(
+            removed.iter().any(|(b, _)| b == "feat/merged-test"),
+            "merged worktree must be removed: {removed:?}"
+        );
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn test_auto_cleanup_preserves_dirty_worktree() {
+        let repo = setup_test_repo("dirty");
+        git_in(&repo, &["branch", "feat/dirty-test"]);
+        let wt = repo.join("wt-dirty");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/dirty-test"],
+        );
+        git_in(&repo, &["merge", "feat/dirty-test"]);
+        std::fs::write(wt.join("uncommitted.txt"), "dirty").ok();
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let removed = sweep_merged_worktrees(&repo);
+        assert!(removed.is_empty(), "dirty worktree must NOT be removed");
+        assert!(wt.exists());
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn test_auto_cleanup_preserves_unmerged_worktree() {
+        let repo = setup_test_repo("unmerged");
+        git_in(&repo, &["branch", "feat/unmerged-test"]);
+        let wt = repo.join("wt-unmerged");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                wt.to_str().unwrap(),
+                "feat/unmerged-test",
+            ],
+        );
+        // Commit on the branch (not merged into main)
+        std::fs::write(wt.join("new.txt"), "x").ok();
+        git_in(&wt, &["add", "."]);
+        git_in(&wt, &["commit", "-m", "wip"]);
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let removed = sweep_merged_worktrees(&repo);
+        assert!(removed.is_empty(), "unmerged worktree must NOT be removed");
+        assert!(wt.exists());
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
