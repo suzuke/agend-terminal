@@ -978,6 +978,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 "last_run_id": null,
                 "head_sha": null,
                 "last_polled_at": null,
+                "last_notified_head_sha": null,
             });
             let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
             let watch_path = ci_dir.join(&filename);
