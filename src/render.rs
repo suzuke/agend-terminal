@@ -1675,95 +1675,39 @@ fn render_fleet_view(
     area: Rect,
     home: &std::path::Path,
 ) {
-    // Build agent → claimed task mapping
-    let mut agent_tasks: std::collections::HashMap<&str, Vec<&crate::tasks::Task>> =
-        std::collections::HashMap::new();
-    for t in tasks {
-        if t.status == "claimed" {
-            if let Some(ref a) = t.assignee {
-                agent_tasks.entry(a.as_str()).or_default().push(t);
-            }
-        }
-    }
-
-    // Load teams for grouping
     let teams = crate::teams::list_all(home);
-    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
-    let all_instances: Vec<String> = fleet.map(|c| c.instance_names()).unwrap_or_default();
+    let all_instances: Vec<String> = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+        .ok()
+        .map(|c| c.instance_names())
+        .unwrap_or_default();
+    let text_lines = build_fleet_view_lines(tasks, &teams, &all_instances);
 
-    let mut lines: Vec<Line> = Vec::new();
-
-    // Group by team
-    let mut assigned_agents: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for team in &teams {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "═══ {} (orchestrator: {}) ═══",
-                team.name,
-                team.orchestrator.as_deref().unwrap_or("none")
-            ),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for member in &team.members {
-            assigned_agents.insert(member.as_str());
-            let symbol = if agent_tasks.contains_key(member.as_str()) {
-                "🟠"
-            } else {
-                "🟢"
-            };
-            let task_info = agent_tasks
-                .get(member.as_str())
-                .and_then(|ts| ts.first())
-                .map(|t| format!(" → {} ({})", t.title, t.id))
-                .unwrap_or_else(|| " idle".to_string());
-            lines.push(Line::from(Span::styled(
-                format!("  {symbol} {member}{task_info}"),
-                Style::default().fg(Color::White),
-            )));
-        }
-        lines.push(Line::from(""));
-    }
-
-    // Unassigned agents
-    let unassigned: Vec<&str> = all_instances
-        .iter()
-        .filter(|n| !assigned_agents.contains(n.as_str()))
-        .map(String::as_str)
-        .collect();
-    if !unassigned.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "═══ unassigned ═══",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for name in &unassigned {
-            let symbol = if agent_tasks.contains_key(name) {
-                "🟠"
-            } else {
-                "🟢"
-            };
-            let task_info = agent_tasks
-                .get(name)
-                .and_then(|ts| ts.first())
-                .map(|t| format!(" → {} ({})", t.title, t.id))
-                .unwrap_or_else(|| " idle".to_string());
-            lines.push(Line::from(Span::styled(
-                format!("  {symbol} {name}{task_info}"),
-                Style::default().fg(Color::White),
-            )));
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
+    let lines: Vec<Line> = if text_lines.is_empty() {
+        vec![Line::from(Span::styled(
             "No agents configured. Add instances to fleet.yaml.",
             Style::default().fg(Color::DarkGray),
-        )));
-    }
-
+        ))]
+    } else {
+        text_lines
+            .iter()
+            .map(|l| {
+                let style = if l.starts_with('═') {
+                    if l.contains("unassigned") {
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
+                    }
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::from(Span::styled(l.as_str(), style))
+            })
+            .collect()
+    };
     frame.render_widget(Paragraph::new(lines), area);
 }
 
