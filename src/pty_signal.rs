@@ -60,6 +60,7 @@ pub fn send_sigint_to_foreground(
 }
 
 #[cfg(not(unix))]
+#[allow(dead_code)]
 pub fn send_sigint_to_foreground(
     _pty_master: &std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
 ) -> anyhow::Result<i32> {
