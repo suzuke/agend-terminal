@@ -482,6 +482,7 @@ fn run_core(
             {
                 crate::inbox::sweep_expired(home);
                 crate::inbox::check_disk_space(home);
+                run_task_maintenance(home);
             }
         }
 
@@ -827,6 +828,20 @@ fn apply_fleet_reload(
 /// Replay missed one-shot schedules on daemon startup.
 /// Calls `schedules::replay_missed_oneshots` and fires each returned
 /// schedule through the same path as `cron_tick::check_schedules`.
+/// Sweep overdue claimed tasks and log events.
+pub fn run_task_maintenance(home: &Path) {
+    let unclaimed = crate::tasks::sweep_overdue_claimed(home);
+    for tid in &unclaimed {
+        crate::event_log::log(
+            home,
+            "task_overdue_unclaimed",
+            tid,
+            "due_at expired, status → open",
+        );
+        tracing::info!(task_id = %tid, "task overdue, unclaimed");
+    }
+}
+
 fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
     let missed = crate::schedules::replay_missed_oneshots(home);
     if missed.is_empty() {

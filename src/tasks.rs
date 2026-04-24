@@ -20,6 +20,8 @@ pub struct Task {
     pub result: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -100,6 +102,63 @@ pub fn list_all(home: &Path) -> Vec<Task> {
     load(home).tasks
 }
 
+/// Sweep overdue claimed tasks back to open.
+/// Returns the IDs of tasks that were unclaimed.
+pub fn sweep_overdue_claimed(home: &Path) -> Vec<String> {
+    let now = chrono::Utc::now();
+    let mut unclaimed = Vec::new();
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
+        for task in store.tasks.iter_mut() {
+            if task.status != "claimed" {
+                continue;
+            }
+            let due = match &task.due_at {
+                Some(d) => d,
+                None => continue,
+            };
+            let due_utc = match chrono::DateTime::parse_from_rfc3339(due) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            };
+            if now > due_utc {
+                task.status = "open".to_string();
+                task.assignee = None;
+                task.routed_to = None;
+                task.updated_at = now.to_rfc3339();
+                unclaimed.push(task.id.clone());
+            }
+        }
+        Ok(())
+    });
+    unclaimed
+}
+
+fn parse_due_at(args: &Value) -> Option<String> {
+    if let Some(due) = args["due_at"].as_str() {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(due) {
+            return Some(dt.with_timezone(&chrono::Utc).to_rfc3339());
+        }
+    }
+    if let Some(dur) = args["duration"].as_str() {
+        if let Some(d) = parse_duration(dur) {
+            return Some((chrono::Utc::now() + d).to_rfc3339());
+        }
+    }
+    None
+}
+
+fn parse_duration(s: &str) -> Option<chrono::Duration> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i64 = num.parse().ok()?;
+    match unit {
+        "m" => Some(chrono::Duration::minutes(n)),
+        "h" => Some(chrono::Duration::hours(n)),
+        "d" => Some(chrono::Duration::days(n)),
+        _ => None,
+    }
+}
+
 pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
     let action = match args["action"].as_str() {
         Some(a) => a,
@@ -149,6 +208,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 result: None,
                 created_at: now.clone(),
                 updated_at: now,
+                due_at: parse_due_at(args),
             };
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 store.tasks.push(task);
@@ -785,6 +845,184 @@ mod tests {
                 t["title"]
             );
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_task_create_accepts_due_at_iso() {
+        let home = tmp_home("due-at-iso");
+        let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let result = handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "create", "title": "timed", "due_at": future}),
+        );
+        assert_eq!(result["status"], "created");
+        let listed = handle(&home, "agent1", &serde_json::json!({"action": "list"}));
+        let task = &listed["tasks"][0];
+        assert!(task["due_at"].is_string(), "due_at must be set");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_overdue_claimed_task_unclaimed_by_sweep() {
+        let home = tmp_home("overdue-sweep");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let r = handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "create", "title": "overdue", "due_at": past}),
+        );
+        let id = r["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let unclaimed = sweep_overdue_claimed(&home);
+        assert_eq!(unclaimed, vec![id.clone()]);
+        let listed = handle(&home, "agent1", &serde_json::json!({"action": "list"}));
+        let task = &listed["tasks"][0];
+        assert_eq!(task["status"], "open");
+        assert!(task["assignee"].is_null());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_not_yet_due_not_touched() {
+        let home = tmp_home("not-due");
+        let future = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let r = handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "create", "title": "future", "due_at": future}),
+        );
+        let id = r["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let unclaimed = sweep_overdue_claimed(&home);
+        assert!(unclaimed.is_empty(), "future task must not be unclaimed");
+        let listed = handle(&home, "agent1", &serde_json::json!({"action": "list"}));
+        assert_eq!(listed["tasks"][0]["status"], "claimed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_done_task_ignored_by_sweep() {
+        let home = tmp_home("done-ignore");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let r = handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "create", "title": "done-overdue", "due_at": past}),
+        );
+        let id = r["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "done", "id": id, "result": "finished"}),
+        );
+        let unclaimed = sweep_overdue_claimed(&home);
+        assert!(unclaimed.is_empty(), "done task must not be unclaimed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_task_create_accepts_duration_30m() {
+        let home = tmp_home("dur-30m");
+        let before = chrono::Utc::now();
+        let result = handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "create", "title": "timed", "duration": "30m"}),
+        );
+        assert_eq!(result["status"], "created");
+        let listed = handle(&home, "agent1", &serde_json::json!({"action": "list"}));
+        let due_str = listed["tasks"][0]["due_at"].as_str().expect("due_at set");
+        let due = chrono::DateTime::parse_from_rfc3339(due_str)
+            .expect("valid rfc3339")
+            .with_timezone(&chrono::Utc);
+        let expected = before + chrono::Duration::minutes(30);
+        let diff = (due - expected).num_seconds().abs();
+        assert!(diff < 5, "due_at should be ~now+30m, diff={diff}s");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_task_create_duration_variants() {
+        let home = tmp_home("dur-variants");
+        let now = chrono::Utc::now();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "1h", "duration": "1h"}),
+        );
+        let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
+        let due =
+            chrono::DateTime::parse_from_rfc3339(listed["tasks"][0]["due_at"].as_str().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        assert!((due - now).num_minutes() >= 59);
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "2d", "duration": "2d"}),
+        );
+        let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
+        let due =
+            chrono::DateTime::parse_from_rfc3339(listed["tasks"][1]["due_at"].as_str().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        assert!((due - now).num_hours() >= 47);
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "bad", "duration": "xyz"}),
+        );
+        let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
+        assert!(
+            listed["tasks"][2]["due_at"].is_null(),
+            "invalid duration → no due_at"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_daemon_maintenance_unclaims_overdue_and_logs_event() {
+        let home = tmp_home("daemon-maint");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let r = handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "create", "title": "overdue-maint", "due_at": past}),
+        );
+        let id = r["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "agent1",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        crate::daemon::run_task_maintenance(&home);
+        let listed = handle(&home, "agent1", &serde_json::json!({"action": "list"}));
+        assert_eq!(listed["tasks"][0]["status"], "open");
+        assert!(listed["tasks"][0]["assignee"].is_null());
+        let log_content = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log_content.contains("task_overdue_unclaimed"),
+            "event_log must contain task_overdue_unclaimed entry"
+        );
+        assert!(
+            log_content.contains(&id),
+            "event_log must reference the task id"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
