@@ -100,6 +100,7 @@ pub(super) fn create_pane(
     // Backend-specific flags (Claude's --append-system-prompt-file / --mcp-config /
     // --settings) are now injected centrally by agent::spawn_agent, so callers pass
     // raw args and spawn_agent enriches them from files under work_dir.
+    let spawn_mode = spawn_mode.downgraded_for(command, Some(&work_dir));
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: &name,

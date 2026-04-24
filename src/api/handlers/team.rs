@@ -138,7 +138,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             work_dir,
             size,
         ) {
-            Ok(()) => {
+            Ok(_) => {
                 tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");
                 // Mirror handle_spawn: every successful spawn gets a
                 // Telegram topic so deploy_template (which routes team

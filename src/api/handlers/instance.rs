@@ -178,7 +178,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         &work_dir,
         size,
     ) {
-        Ok(()) => {
+        Ok(spawn_mode) => {
             // Every API-level spawn gets a Telegram forum topic (no-op
             // when the channel isn't configured — resolve_channel_only
             // returns Err and the helper returns None). Previously only
