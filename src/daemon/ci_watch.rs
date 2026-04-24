@@ -110,6 +110,43 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
     }
 }
 
+/// Outcome of interpreting a `GET /repos/.../actions/runs` response.
+///
+/// Without this, a non-2xx response (e.g. unauthenticated rate-limit
+/// `{"message":"API rate limit exceeded ..."}`) parses cleanly as JSON
+/// but its `workflow_runs` field is absent, and the caller's
+/// `body["workflow_runs"].as_array()` returns `None` — silently behaving
+/// as if the branch had no runs and skipping every subsequent
+/// notification while `last_polled_at` keeps marching forward. Tag the
+/// HTTP status explicitly so API errors surface as `Err` instead of
+/// imitating a quiescent branch.
+enum RunsResponse<'a> {
+    Run(&'a serde_json::Value),
+    NoRuns,
+    ApiError(String),
+}
+
+/// Pure interpreter for a runs-list response. See [`RunsResponse`] for
+/// why the rate-limit / NoRuns distinction matters.
+fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse<'_> {
+    if !(200..300).contains(&status) {
+        let message = body["message"].as_str().unwrap_or("(no message)");
+        let hint = if status == 403
+            && std::env::var("GITHUB_TOKEN").is_err()
+            && message.to_lowercase().contains("rate limit")
+        {
+            " — set GITHUB_TOKEN to raise the unauthenticated 60/hr cap"
+        } else {
+            ""
+        };
+        return RunsResponse::ApiError(format!("GH API {status}: {message}{hint}"));
+    }
+    match body["workflow_runs"].as_array().and_then(|a| a.first()) {
+        Some(run) => RunsResponse::Run(run),
+        None => RunsResponse::NoRuns,
+    }
+}
+
 /// Build the notification message for a CI run conclusion.
 /// Returns `None` for non-terminal states (in-progress / null conclusion).
 fn ci_notification_message(
@@ -171,16 +208,17 @@ async fn ci_check_repo(
         }
     }
 
-    let resp: serde_json::Value = gh_get(&format!(
+    let resp = gh_get(&format!(
         "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=1"
     ))
     .send()
-    .await?
-    .json()
     .await?;
-    let run = match resp["workflow_runs"].as_array().and_then(|a| a.first()) {
-        Some(r) => r,
-        None => return Ok(()),
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await?;
+    let run = match classify_runs_response(status, &body) {
+        RunsResponse::Run(r) => r,
+        RunsResponse::NoRuns => return Ok(()),
+        RunsResponse::ApiError(msg) => return Err(anyhow::anyhow!(msg)),
     };
     let run_id = run["id"].as_u64().unwrap_or(0);
     let current_sha = run["head_sha"].as_str().unwrap_or("");
@@ -469,6 +507,85 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- classify_runs_response: silent-rate-limit regression pin ---
+
+    #[test]
+    fn classify_response_picks_first_run_on_2xx() {
+        let body = serde_json::json!({
+            "workflow_runs": [{"id": 42, "head_sha": "abc"}, {"id": 41}]
+        });
+        match classify_runs_response(200, &body) {
+            RunsResponse::Run(r) => assert_eq!(r["id"].as_u64(), Some(42)),
+            other => panic!("expected Run, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn classify_response_no_runs_on_2xx_empty_array() {
+        // Genuine "branch has no runs yet" — must NOT be confused with
+        // an API error.
+        let body = serde_json::json!({"workflow_runs": []});
+        assert!(matches!(
+            classify_runs_response(200, &body),
+            RunsResponse::NoRuns
+        ));
+    }
+
+    #[test]
+    fn classify_response_rate_limit_is_api_error_not_no_runs() {
+        // Real-world body returned by GitHub when an unauthenticated
+        // client exceeds 60/hr. Without the status check, the absence
+        // of `workflow_runs` here looks identical to the legit empty
+        // case above and silently swallows every subsequent CI event.
+        let body = serde_json::json!({
+            "message": "API rate limit exceeded for 1.2.3.4. (But here's the good news: ...)",
+            "documentation_url": "https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting"
+        });
+        match classify_runs_response(403, &body) {
+            RunsResponse::ApiError(msg) => {
+                assert!(msg.contains("403"), "msg should include status: {msg}");
+                assert!(
+                    msg.contains("rate limit"),
+                    "msg should surface GH message: {msg}"
+                );
+            }
+            _ => panic!("rate-limit response must be ApiError, not NoRuns"),
+        }
+    }
+
+    #[test]
+    fn classify_response_token_hint_only_when_unauthenticated_403() {
+        // Hint should fire on unauthenticated 403 rate-limit. We can't
+        // safely mutate $GITHUB_TOKEN in a parallel-test process, so
+        // assert only the prefix shape and trust the env-gated branch.
+        let body =
+            serde_json::json!({"message": "API rate limit exceeded for example. Authenticated …"});
+        let RunsResponse::ApiError(msg) = classify_runs_response(403, &body) else {
+            panic!("expected ApiError");
+        };
+        assert!(msg.starts_with("GH API 403: API rate limit exceeded"));
+    }
+
+    #[test]
+    fn classify_response_5xx_is_api_error() {
+        let body = serde_json::json!({"message": "Server Error"});
+        assert!(matches!(
+            classify_runs_response(500, &body),
+            RunsResponse::ApiError(_)
+        ));
+    }
+
+    #[test]
+    fn classify_response_unknown_payload_falls_through_safely() {
+        // 200 OK but missing workflow_runs entirely (would never happen
+        // in practice but must not panic).
+        let body = serde_json::json!({});
+        assert!(matches!(
+            classify_runs_response(200, &body),
+            RunsResponse::NoRuns
+        ));
     }
 
     #[test]
