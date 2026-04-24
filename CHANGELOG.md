@@ -5,6 +5,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-04-24
+
 170+ commits since `0.3.2` — multi-agent collaboration plumbing (fleet
 protocol v1.1, correlation threads, health reporting), inbox resilience
 + correlation, task-board dependencies + deadlines, a `watch_ci`
@@ -202,7 +204,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/suzuke/agend-terminal/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/suzuke/agend-terminal/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/suzuke/agend-terminal/compare/85f2bc3...v0.3.1
 [0.3.0]: https://github.com/suzuke/agend-terminal/commit/85f2bc3
