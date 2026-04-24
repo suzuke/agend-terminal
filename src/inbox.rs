@@ -178,6 +178,17 @@ pub struct InboxMessage {
     pub delivery_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
+    /// Interrupt metadata — set when delegate_task used interrupt=true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_meta: Option<InterruptMeta>,
+}
+
+/// Metadata attached to an interrupted delegation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterruptMeta {
+    pub interrupted: bool,
+    pub reason: String,
+    pub interrupted_at: String,
 }
 
 impl InboxMessage {
@@ -649,6 +660,7 @@ pub fn deliver(
         thread_id: None,
         parent_id: None,
         task_id: None,
+        interrupt_meta: None,
         from: source.to_string(),
         text: text.to_string(),
         kind,
@@ -798,6 +810,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            interrupt_meta: None,
             from: from.to_string(),
             text: text.to_string(),
             kind: None,
@@ -924,6 +937,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            interrupt_meta: None,
             from: "sender".to_string(),
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
@@ -1021,6 +1035,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            interrupt_meta: None,
             from: "test".to_string(),
             text: "hello \"world\"".to_string(),
             kind: None,
@@ -1043,6 +1058,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            interrupt_meta: None,
             from: "user".to_string(),
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
@@ -1629,6 +1645,7 @@ mod tests {
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
+            interrupt_meta: None,
             read_at: None,
             thread_id: Some("thread-42".into()),
             parent_id: Some("m-0".into()),
@@ -1652,6 +1669,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            interrupt_meta: None,
             ..msg.clone()
         };
         let json2 = serde_json::to_string(&msg_no_thread).expect("ser");
@@ -1669,6 +1687,7 @@ mod tests {
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
+            interrupt_meta: None,
             read_at: None,
             thread_id: Some("t-100".into()),
             parent_id: Some("m-41".into()),
@@ -1695,6 +1714,7 @@ mod tests {
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
+            interrupt_meta: None,
             read_at: None,
             thread_id: None,
             parent_id: None,
@@ -1719,6 +1739,7 @@ mod tests {
             kind: Some("task\r\ninjection".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
+            interrupt_meta: None,
             read_at: None,
             thread_id: Some("t\n1".into()),
             parent_id: None,
@@ -1747,6 +1768,7 @@ mod tests {
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
+            interrupt_meta: None,
             read_at: None,
             thread_id: None,
             parent_id: None,
@@ -1780,6 +1802,7 @@ mod tests {
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
+            interrupt_meta: None,
             read_at: None,
             thread_id: None,
             parent_id: None,
@@ -1816,6 +1839,7 @@ mod tests {
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
+            interrupt_meta: None,
             read_at: None,
             thread_id: None,
             parent_id: None,

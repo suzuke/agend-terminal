@@ -454,6 +454,7 @@ async fn ci_check_repo(
                     thread_id: None,
                     parent_id: None,
                     task_id: None,
+                    interrupt_meta: None,
                     from: "system:ci".to_string(),
                     text: body,
                     kind: Some("ci-watch".to_string()),
