@@ -1391,6 +1391,31 @@ pub fn render_tasks(
         frame.render_widget(Paragraph::new(lines), block_inner);
     }
 
+    // Status line: active/idle agent summary from In Progress column
+    if inner.height > 2 && inner.width > 10 {
+        let active_agents: std::collections::HashSet<&str> = columns[2]
+            .iter()
+            .filter_map(|t| t.assignee.as_deref())
+            .collect();
+        let status_text = if active_agents.is_empty() {
+            "all idle".to_string()
+        } else {
+            let names: Vec<&str> = active_agents.into_iter().collect();
+            format!("active: {}", names.join(", "))
+        };
+        let status_y = inner.y + inner.height.saturating_sub(1);
+        let status_area = Rect::new(
+            inner.x + 1,
+            status_y,
+            inner.width.saturating_sub(2).min(status_text.len() as u16),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(Span::styled(status_text, Style::default().fg(Color::Cyan))),
+            status_area,
+        );
+    }
+
     // Help hint at bottom-right (hidden in Help mode)
     if !matches!(mode, TaskBoardMode::Help) && inner.height > 1 && inner.width > 6 {
         let hint = "? help";
@@ -1557,6 +1582,13 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
     sort_col(&mut backlog);
     sort_col(&mut open);
     sort_col(&mut in_progress);
+    // Secondary sort: group In Progress by assignee for visual grouping
+    in_progress.sort_by(|a, b| {
+        a.assignee
+            .as_deref()
+            .unwrap_or("")
+            .cmp(b.assignee.as_deref().unwrap_or(""))
+    });
     sort_col(&mut done);
 
     [backlog, open, in_progress, done]
