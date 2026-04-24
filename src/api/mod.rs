@@ -1140,6 +1140,12 @@ mod tests {
     #[test]
     fn dispatch_send_delivers_to_inbox() {
         let (port, home, _notifier, shutdown) = start_test_server("send-char");
+        // Target must exist in fleet.yaml for validation to pass.
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  receiver:\n    backend: claude\n",
+        )
+        .ok();
         let resp = api_request(
             port,
             &home,
