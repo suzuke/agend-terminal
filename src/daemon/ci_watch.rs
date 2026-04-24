@@ -87,6 +87,7 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
         let interval = watch["interval_secs"].as_u64().unwrap_or(60);
         let last_run_id = watch["last_run_id"].as_u64();
         let head_sha = watch["head_sha"].as_str().map(String::from);
+        let last_notified_sha = watch["last_notified_head_sha"].as_str().map(String::from);
 
         // Throttle from a dedicated `last_polled_at` (epoch millis) in the
         // watch file itself, not file mtime. mtime conflates "when this
@@ -133,6 +134,7 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
                     &instance,
                     last_run_id,
                     head_sha.as_deref(),
+                    last_notified_sha.as_deref(),
                     &registry,
                 )) {
                     tracing::debug!(repo = %repo, error = %e, "CI check failed");
@@ -216,20 +218,66 @@ pub(crate) fn select_runs_to_notify(
     selected.into_iter().map(|(i, _)| i).collect()
 }
 
+/// Pure function: deduplicate terminal runs by head_sha.
+/// Returns `(run_index, run_id, head_sha)` tuples, one per unique sha,
+/// keeping the latest run_id per sha. Skips shas matching `last_notified`.
+/// Sorted by run_id (oldest first) for chronological notification order.
+pub(crate) fn dedupe_notifications_by_head_sha<'a>(
+    runs: &'a [serde_json::Value],
+    to_notify: &[usize],
+    last_notified: Option<&str>,
+) -> Vec<(usize, u64, &'a str)> {
+    let mut best: std::collections::HashMap<&str, (usize, u64)> = std::collections::HashMap::new();
+    for &idx in to_notify {
+        let run = &runs[idx];
+        let sha = run["head_sha"].as_str().unwrap_or("");
+        let id = run["id"].as_u64().unwrap_or(0);
+        best.entry(sha)
+            .and_modify(|e| {
+                if id > e.1 {
+                    *e = (idx, id);
+                }
+            })
+            .or_insert((idx, id));
+    }
+    let mut result: Vec<_> = best
+        .into_iter()
+        .filter(|(sha, _)| last_notified != Some(*sha))
+        .map(|(sha, (idx, id))| (idx, id, sha))
+        .collect();
+    result.sort_by_key(|&(_, id, _)| id);
+    result
+}
+
+/// Pure function: build the inbox body text for a CI notification.
+/// Headline + optional failure detail + run URL.
+pub(crate) fn build_inbox_body(
+    headline: &str,
+    conclusion: &str,
+    failure_detail: Option<&str>,
+    run_url: &str,
+) -> String {
+    if conclusion == "failure" {
+        let detail = failure_detail.unwrap_or("unknown step");
+        format!("{headline}\nDetail: {detail}\nURL: {run_url}")
+    } else {
+        format!("{headline}\nURL: {run_url}")
+    }
+}
+
 /// Build the notification message for a CI run conclusion.
 /// Returns `None` for non-terminal states (in-progress / null conclusion).
+/// Job/step detail is excluded from the headline — agents use `inbox` or
+/// `gh run view` for details.
 fn ci_notification_message(
     repo: &str,
     branch: &str,
     conclusion: Option<&str>,
-    failure_detail: Option<&str>,
+    _failure_detail: Option<&str>,
 ) -> Option<String> {
     let conclusion = conclusion?;
     let msg = match conclusion {
-        "failure" => {
-            let detail = failure_detail.unwrap_or("unknown step");
-            format!("[ci-fail] {repo}@{branch}: {detail}\r")
-        }
+        "failure" => format!("[ci-fail] {repo}@{branch}: failure\r"),
         "success" => format!("[ci-pass] {repo}@{branch}: passed ✓\r"),
         other => format!("[ci-ended] {repo}@{branch}: {other}\r"),
     };
@@ -250,6 +298,7 @@ async fn ci_check_repo(
     instance: &str,
     last_run_id: Option<u64>,
     prev_head_sha: Option<&str>,
+    last_notified_sha: Option<&str>,
     registry: &AgentRegistry,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
@@ -321,59 +370,88 @@ async fn ci_check_repo(
 
     let mut max_notified_id = effective_last_run_id.unwrap_or(0);
     for &idx in &to_notify {
-        let run = &runs[idx];
-        let run_id = run["id"].as_u64().unwrap_or(0);
-        let conclusion = run["conclusion"].as_str();
-
-        let failure_detail = if conclusion == Some("failure") {
-            Some(fetch_failure_summary(&gh_get, repo, run_id).await)
-        } else {
-            None
-        };
-
-        if let Some(msg) =
-            ci_notification_message(repo, branch, conclusion, failure_detail.as_deref())
-        {
-            let reg = agent::lock_registry(registry);
-            if let Some(handle) = reg.get(instance) {
-                let _ = agent::inject_to_agent(handle, msg.as_bytes());
-            } else {
-                drop(reg);
-                let _ = crate::inbox::enqueue(
-                    home,
-                    instance,
-                    crate::inbox::InboxMessage {
-                        schema_version: 0,
-                        id: None,
-                        read_at: None,
-                        thread_id: None,
-                        parent_id: None,
-                        task_id: None,
-                        from: "system:ci".to_string(),
-                        text: msg,
-                        kind: Some("ci-watch".to_string()),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        delivery_mode: None,
-                    },
-                );
-            }
-        }
-        if run_id > max_notified_id {
-            max_notified_id = run_id;
+        let id = runs[idx]["id"].as_u64().unwrap_or(0);
+        if id > max_notified_id {
+            max_notified_id = id;
         }
     }
 
-    update_watch_state(watch_path, Some(max_notified_id), current_sha);
+    let deduped = dedupe_notifications_by_head_sha(runs, &to_notify, last_notified_sha);
+    let mut new_notified_sha = last_notified_sha.map(String::from);
+
+    for (idx, run_id, sha) in &deduped {
+        let run = &runs[*idx];
+        let conclusion = run["conclusion"].as_str();
+
+        if let Some(headline) = ci_notification_message(repo, branch, conclusion, None) {
+            let run_url = run["html_url"].as_str().unwrap_or("");
+            let failure_detail = if conclusion == Some("failure") {
+                Some(fetch_failure_summary(&gh_get, repo, *run_id).await)
+            } else {
+                None
+            };
+            let body = build_inbox_body(
+                &headline,
+                conclusion.unwrap_or(""),
+                failure_detail.as_deref(),
+                run_url,
+            );
+
+            let reg = agent::lock_registry(registry);
+            if let Some(handle) = reg.get(instance) {
+                let _ = agent::inject_to_agent(handle, headline.as_bytes());
+            }
+            drop(reg);
+            let _ = crate::inbox::enqueue(
+                home,
+                instance,
+                crate::inbox::InboxMessage {
+                    schema_version: 0,
+                    id: None,
+                    read_at: None,
+                    thread_id: None,
+                    parent_id: None,
+                    task_id: None,
+                    from: "system:ci".to_string(),
+                    text: body,
+                    kind: Some("ci-watch".to_string()),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    delivery_mode: None,
+                },
+            );
+        }
+        new_notified_sha = Some(sha.to_string());
+    }
+
+    update_watch_state_with_notify(
+        watch_path,
+        Some(max_notified_id),
+        current_sha,
+        new_notified_sha.as_deref(),
+    );
     Ok(())
 }
 
 /// Persist updated tracking state (last_run_id + head_sha) to the watch file.
 fn update_watch_state(watch_path: &Path, run_id: Option<u64>, head_sha: &str) {
+    update_watch_state_with_notify(watch_path, run_id, head_sha, None);
+}
+
+/// Persist tracking state including last_notified_head_sha.
+fn update_watch_state_with_notify(
+    watch_path: &Path,
+    run_id: Option<u64>,
+    head_sha: &str,
+    notified_sha: Option<&str>,
+) {
     if let Ok(content) = std::fs::read_to_string(watch_path) {
         if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
             watch["last_run_id"] = serde_json::json!(run_id);
             if !head_sha.is_empty() {
                 watch["head_sha"] = serde_json::json!(head_sha);
+            }
+            if let Some(sha) = notified_sha {
+                watch["last_notified_head_sha"] = serde_json::json!(sha);
             }
             let _ = std::fs::write(
                 watch_path,
@@ -444,6 +522,7 @@ async fn fetch_failure_summary(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -500,22 +579,17 @@ mod tests {
     }
 
     #[test]
-    fn ci_watch_failure_includes_detail() {
+    fn ci_watch_failure_headline_excludes_detail() {
+        // Job detail moved to inbox body — headline just says "failure"
         let msg =
             ci_notification_message("owner/repo", "main", Some("failure"), Some("Build / Test"));
-        assert_eq!(
-            msg.as_deref(),
-            Some("[ci-fail] owner/repo@main: Build / Test\r")
-        );
+        assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure\r"));
     }
 
     #[test]
-    fn ci_watch_failure_without_detail_falls_back() {
+    fn ci_watch_failure_without_detail_same_headline() {
         let msg = ci_notification_message("owner/repo", "main", Some("failure"), None);
-        assert_eq!(
-            msg.as_deref(),
-            Some("[ci-fail] owner/repo@main: unknown step\r")
-        );
+        assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure\r"));
     }
 
     #[test]
@@ -777,6 +851,114 @@ mod tests {
             selected,
             vec![1],
             "run 400 already notified, only 401 selected"
+        );
+    }
+
+    #[test]
+    fn test_same_head_sha_deduplicates_notification() {
+        use serde_json::json;
+        let runs = vec![
+            json!({"id": 500, "conclusion": "failure", "head_sha": "abc"}),
+            json!({"id": 501, "conclusion": "success", "head_sha": "abc"}),
+        ];
+        let selected = select_runs_to_notify(&runs, Some(499));
+        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None);
+        assert_eq!(deduped.len(), 1, "same sha → 1 notification");
+        assert_eq!(deduped[0].1, 501, "latest run_id wins");
+        assert_eq!(deduped[0].2, "abc");
+    }
+
+    #[test]
+    fn test_dedupe_skips_already_notified_sha() {
+        use serde_json::json;
+        let runs = vec![
+            json!({"id": 600, "conclusion": "success", "head_sha": "aaa"}),
+            json!({"id": 601, "conclusion": "success", "head_sha": "bbb"}),
+        ];
+        let selected = select_runs_to_notify(&runs, Some(599));
+        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("aaa"));
+        assert_eq!(deduped.len(), 1, "aaa already notified → only bbb");
+        assert_eq!(deduped[0].2, "bbb");
+    }
+
+    #[test]
+    fn test_different_head_sha_triggers_new_notification() {
+        use serde_json::json;
+        let runs = vec![
+            json!({"id": 600, "conclusion": "success", "head_sha": "aaa"}),
+            json!({"id": 601, "conclusion": "success", "head_sha": "bbb"}),
+        ];
+        let selected = select_runs_to_notify(&runs, Some(599));
+        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None);
+        assert_eq!(deduped.len(), 2, "different shas → 2 notifications");
+    }
+
+    #[test]
+    fn test_inbox_body_failure_has_detail_and_url() {
+        let body = build_inbox_body(
+            "[ci-fail] o/r@main: failure\r",
+            "failure",
+            Some("Check / Clippy"),
+            "https://github.com/o/r/actions/runs/123",
+        );
+        assert!(
+            body.contains("Detail: Check / Clippy"),
+            "failure body must have detail: {body}"
+        );
+        assert!(body.contains("URL: https://"), "body must have URL: {body}");
+    }
+
+    #[test]
+    fn test_inbox_body_success_has_url_no_detail() {
+        let body = build_inbox_body(
+            "[ci-pass] o/r@main: passed ✓\r",
+            "success",
+            None,
+            "https://github.com/o/r/actions/runs/456",
+        );
+        assert!(
+            body.contains("URL: https://"),
+            "success body must have URL: {body}"
+        );
+        assert!(
+            !body.contains("Detail:"),
+            "success body must not have Detail: {body}"
+        );
+    }
+
+    #[test]
+    fn test_headline_excludes_job_detail() {
+        // ci_notification_message must NOT contain job/step names like
+        // "(ubuntu-latest)" or "(tray feature)" — those go in inbox body.
+        let msg = ci_notification_message(
+            "o/r",
+            "main",
+            Some("failure"),
+            Some("Check / Clippy (tray)"),
+        );
+        let headline = msg.unwrap();
+        assert!(
+            !headline.contains("Clippy"),
+            "headline must not contain job detail: {headline}"
+        );
+        assert!(
+            !headline.contains("tray"),
+            "headline must not contain step detail: {headline}"
+        );
+        assert!(
+            headline.contains("failure"),
+            "headline must contain conclusion: {headline}"
+        );
+    }
+
+    #[test]
+    fn test_headline_success_clean() {
+        let msg = ci_notification_message("o/r", "feat", Some("success"), None);
+        let headline = msg.unwrap();
+        assert!(headline.contains("passed"), "success headline: {headline}");
+        assert!(
+            !headline.contains("unknown"),
+            "no unknown in success: {headline}"
         );
     }
 }
