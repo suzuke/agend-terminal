@@ -236,21 +236,31 @@ async fn ci_check_repo(
     }
 
     let resp = gh_get(&format!(
-        "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=1"
+        "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=5"
     ))
     .send()
     .await?;
     let status = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await?;
-    let run = match classify_runs_response(status, &body) {
-        RunsResponse::Run(r) => r,
-        RunsResponse::NoRuns => return Ok(()),
-        RunsResponse::ApiError(msg) => return Err(anyhow::anyhow!(msg)),
+    // Use classify_runs_response to surface API errors (rate-limit, auth, etc.)
+    // so they don't silently look like a quiescent branch. Then extract the
+    // full runs array ourselves for multi-run scan (classify only returns the
+    // first run — fine for its API-error contract, but we need all 5).
+    if let RunsResponse::ApiError(msg) = classify_runs_response(status, &body) {
+        return Err(anyhow::anyhow!(msg));
+    }
+    let runs = match body["workflow_runs"].as_array() {
+        Some(a) if !a.is_empty() => a,
+        _ => return Ok(()),
     };
-    let run_id = run["id"].as_u64().unwrap_or(0);
-    let current_sha = run["head_sha"].as_str().unwrap_or("");
 
-    // If head_sha changed (force push), reset last_run_id so we pick up the new run.
+    // Determine the latest head_sha from the newest run.
+    let current_sha = runs
+        .first()
+        .and_then(|r| r["head_sha"].as_str())
+        .unwrap_or("");
+
+    // If head_sha changed (force push), reset last_run_id so we pick up new runs.
     let effective_last_run_id = if prev_head_sha.is_some_and(|prev| prev != current_sha) {
         tracing::info!(repo, branch, old_sha = ?prev_head_sha, new_sha = current_sha, "head_sha changed, resetting run tracking");
         None
@@ -258,52 +268,58 @@ async fn ci_check_repo(
         last_run_id
     };
 
-    // Skip duplicate notifications for the same run.
-    if Some(run_id) == effective_last_run_id {
-        // Still update head_sha in case it changed without a new run yet
-        update_watch_state(watch_path, Some(run_id), current_sha);
+    let to_notify = select_runs_to_notify(runs, effective_last_run_id);
+    if to_notify.is_empty() {
+        // No new terminal runs — update head_sha but keep last_run_id.
+        if let Some(id) = effective_last_run_id {
+            update_watch_state(watch_path, Some(id), current_sha);
+        }
         return Ok(());
     }
 
-    // conclusion is null while the run is in-progress; skip non-terminal states.
-    let conclusion = run["conclusion"].as_str();
+    let mut max_notified_id = effective_last_run_id.unwrap_or(0);
+    for &idx in &to_notify {
+        let run = &runs[idx];
+        let run_id = run["id"].as_u64().unwrap_or(0);
+        let conclusion = run["conclusion"].as_str();
 
-    // For failures, fetch job-level detail before building the message.
-    let failure_detail = if conclusion == Some("failure") {
-        Some(fetch_failure_summary(&gh_get, repo, run_id).await)
-    } else {
-        None
-    };
+        let failure_detail = if conclusion == Some("failure") {
+            Some(fetch_failure_summary(&gh_get, repo, run_id).await)
+        } else {
+            None
+        };
 
-    let msg = match ci_notification_message(repo, branch, conclusion, failure_detail.as_deref()) {
-        Some(m) => m,
-        None => return Ok(()), // in-progress
-    };
-
-    let reg = agent::lock_registry(registry);
-    if let Some(handle) = reg.get(instance) {
-        let _ = agent::inject_to_agent(handle, msg.as_bytes());
-    } else {
-        drop(reg);
-        let _ = crate::inbox::enqueue(
-            home,
-            instance,
-            crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                thread_id: None,
-                parent_id: None,
-                from: "system:ci".to_string(),
-                text: msg,
-                kind: Some("ci-watch".to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            },
-        );
+        if let Some(msg) =
+            ci_notification_message(repo, branch, conclusion, failure_detail.as_deref())
+        {
+            let reg = agent::lock_registry(registry);
+            if let Some(handle) = reg.get(instance) {
+                let _ = agent::inject_to_agent(handle, msg.as_bytes());
+            } else {
+                drop(reg);
+                let _ = crate::inbox::enqueue(
+                    home,
+                    instance,
+                    crate::inbox::InboxMessage {
+                        schema_version: 0,
+                        id: None,
+                        read_at: None,
+                        thread_id: None,
+                        parent_id: None,
+                        from: "system:ci".to_string(),
+                        text: msg,
+                        kind: Some("ci-watch".to_string()),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    },
+                );
+            }
+        }
+        if run_id > max_notified_id {
+            max_notified_id = run_id;
+        }
     }
 
-    // Update last_run_id and head_sha for any terminal state to prevent re-notification.
-    update_watch_state(watch_path, Some(run_id), current_sha);
+    update_watch_state(watch_path, Some(max_notified_id), current_sha);
     Ok(())
 }
 
