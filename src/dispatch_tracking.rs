@@ -92,6 +92,35 @@ pub fn sweep_stuck(home: &Path) -> (Vec<DispatchEntry>, Vec<DispatchEntry>) {
     (warns, asks)
 }
 
+/// Hours after which an uncompleted dispatch is considered orphaned.
+pub const DISPATCH_ORPHAN_HOURS: i64 = 24;
+
+/// Sweep for orphaned dispatches (>24h uncompleted). Marks them as "orphaned"
+/// and returns the list for event logging.
+pub fn sweep_orphans(home: &Path) -> Vec<DispatchEntry> {
+    let now = chrono::Utc::now();
+    let mut orphans = Vec::new();
+
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+        for entry in store.entries.iter_mut() {
+            if entry.status == "completed" || entry.status == "orphaned" {
+                continue;
+            }
+            let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            };
+            let age_hours = now.signed_duration_since(delegated).num_hours();
+            if age_hours >= DISPATCH_ORPHAN_HOURS {
+                entry.status = "orphaned".to_string();
+                orphans.push(entry.clone());
+            }
+        }
+        Ok(())
+    });
+    orphans
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -201,6 +230,27 @@ mod tests {
             "reviewer must receive stuck query in inbox: {:?}",
             msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_dispatch_orphan_after_24h() {
+        let home = tmp_home("orphan");
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-orphan".into()),
+                from: "lead".into(),
+                to: "worker".into(),
+                delegated_at: old_ts,
+                status: "pending".into(),
+            },
+        );
+        let orphans = sweep_orphans(&home);
+        assert_eq!(orphans.len(), 1, "25h old dispatch must be orphaned");
+        assert_eq!(orphans[0].task_id.as_deref(), Some("t-orphan"));
+        assert_eq!(orphans[0].status, "orphaned");
         std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -69,6 +69,8 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             interrupt_meta: params.get("interrupt_meta").and_then(|v| {
                 serde_json::from_value::<crate::inbox::InterruptMeta>(v.clone()).ok()
             }),
+            correlation_id: params["correlation_id"].as_str().map(String::from),
+            reviewed_head: params["reviewed_head"].as_str().map(String::from),
             from: format!("from:{from}"),
             text: text.to_string(),
             kind: params

@@ -815,3 +815,120 @@ fn test_delegate_task_no_task_id_remains_none() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn test_correlation_id_persisted_as_typed_field() {
+    let home = mcp_home();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  test-agent:\n    backend: claude\n",
+    )
+    .ok();
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"report_result","arguments":{"target_instance":"test-agent","summary":"done","correlation_id":"t-corr-99","parent_id":"m-parent","thread_id":"t-thread"}}}"#,
+        ],
+    );
+    assert!(responses.len() >= 2);
+    let inbox_path = home.join("inbox").join("test-agent.jsonl");
+    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    let msg: serde_json::Value = content
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .find(|v: &serde_json::Value| v["text"].as_str().unwrap_or("").contains("[report_result]"))
+        .expect("report_result message must be in inbox");
+    assert_eq!(
+        msg["correlation_id"].as_str(),
+        Some("t-corr-99"),
+        "typed correlation_id must be persisted: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_report_result_reviewed_head_persisted() {
+    let home = mcp_home();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  test-agent:\n    backend: claude\n",
+    )
+    .ok();
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"report_result","arguments":{"target_instance":"test-agent","summary":"reviewed","reviewed_head":"abc123","correlation_id":"t-1","parent_id":"m-1"}}}"#,
+        ],
+    );
+    assert!(responses.len() >= 2);
+    let inbox_path = home.join("inbox").join("test-agent.jsonl");
+    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    let msg: serde_json::Value = content
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .find(|v: &serde_json::Value| v["text"].as_str().unwrap_or("").contains("[report_result]"))
+        .expect("report_result must be in inbox");
+    assert_eq!(
+        msg["reviewed_head"].as_str(),
+        Some("abc123"),
+        "reviewed_head must be persisted: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_send_to_report_kind_without_parent_id_returns_warning() {
+    let home = mcp_home();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  test-agent:\n    backend: claude\n  other:\n    backend: claude\n",
+    )
+    .ok();
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_to_instance","arguments":{"instance_name":"other","message":"status update","request_kind":"report"}}}"#,
+        ],
+    );
+    assert!(responses.len() >= 2);
+    let result = extract_tool_result(&responses[1]);
+    assert!(
+        result.get("warning").is_some(),
+        "report kind without parent_id must return warning: {result}"
+    );
+    assert!(
+        result["warning"]
+            .as_str()
+            .unwrap_or("")
+            .contains("parent_id"),
+        "warning must mention parent_id: {result}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn test_send_to_report_kind_with_parent_id_no_warning() {
+    let home = mcp_home();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  test-agent:\n    backend: claude\n  other:\n    backend: claude\n",
+    )
+    .ok();
+    let responses = mcp_session_in_home(
+        &home,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_to_instance","arguments":{"instance_name":"other","message":"status update","request_kind":"report","parent_id":"m-123"}}}"#,
+        ],
+    );
+    assert!(responses.len() >= 2);
+    let result = extract_tool_result(&responses[1]);
+    assert!(
+        result.get("warning").is_none(),
+        "report with parent_id must not have warning: {result}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
