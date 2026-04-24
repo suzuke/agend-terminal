@@ -131,7 +131,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 &home,
                 &json!({
                     "method": crate::api::method::SEND,
-                    "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id }
+                    "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str() }
                 }),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -167,7 +167,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         parent_id: resolved_parent,
                         task_id: None,
                         interrupt_meta: None,
-                        correlation_id: None,
+                        correlation_id: args["correlation_id"].as_str().map(String::from),
                         reviewed_head: None,
                         from: format!("from:{}", sender.as_str()),
                         text: text.to_string(),
@@ -402,6 +402,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                             "kind": "report",
                             "correlation_id": correlation_id,
                             "reviewed_head": reviewed_head,
+                            "thread_id": args["thread_id"].as_str(),
+                            "parent_id": args["parent_id"].as_str(),
                         }
                     }),
                 ) {
@@ -586,6 +588,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     let mut resp = json!({"status": "read", "read_at": t});
                     if let Some(mode) = dm {
                         resp["delivery_mode"] = json!(mode);
+                    }
+                    // Expose typed fields from the message
+                    if let Some(msg) = crate::inbox::find_message(&home, msg_id) {
+                        if let Some(ref cid) = msg.correlation_id {
+                            resp["correlation_id"] = json!(cid);
+                        }
+                        if let Some(ref rh) = msg.reviewed_head {
+                            resp["reviewed_head"] = json!(rh);
+                            resp["stale_possible"] = json!(true);
+                        }
                     }
                     resp
                 }
