@@ -1181,6 +1181,7 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
 // on disk. See commit message for details.
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
