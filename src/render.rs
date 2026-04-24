@@ -56,7 +56,7 @@ pub fn render(
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(crate::layout::TAB_BAR_HEIGHT),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
