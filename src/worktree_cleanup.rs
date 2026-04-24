@@ -93,8 +93,8 @@ fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool 
 /// Normalize a path: strip Windows `\\?\` UNC prefix for consistent comparison.
 fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
     let s = p.to_string_lossy();
-    if s.starts_with(r"\\?\") {
-        std::path::PathBuf::from(&s[4..])
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(stripped)
     } else {
         p.to_path_buf()
     }
