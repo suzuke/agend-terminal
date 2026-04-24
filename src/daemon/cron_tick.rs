@@ -123,6 +123,8 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     parent_id: None,
                     task_id: None,
                     interrupt_meta: None,
+                    correlation_id: None,
+                    reviewed_head: None,
                     from: "system:schedule".to_string(),
                     text: message.to_string(),
                     kind: Some("schedule".to_string()),

@@ -127,11 +127,11 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             let thread_id = args["thread_id"].as_str();
             let parent_id = args["parent_id"].as_str();
 
-            match crate::api::call(
+            let result = match crate::api::call(
                 &home,
                 &json!({
                     "method": crate::api::method::SEND,
-                    "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id }
+                    "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str() }
                 }),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -167,6 +167,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         parent_id: resolved_parent,
                         task_id: None,
                         interrupt_meta: None,
+                        correlation_id: args["correlation_id"].as_str().map(String::from),
+                        reviewed_head: None,
                         from: format!("from:{}", sender.as_str()),
                         text: text.to_string(),
                         kind: None,
@@ -182,7 +184,15 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     );
                     json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable, sent direct: {e}")})
                 }
+            };
+            // Warn if kind=report without parent_id
+            let mut result = result;
+            if kind == Some("report") && parent_id.is_none() {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("warning".to_string(), json!("parent_id recommended for report kind; will be required in future version"));
+                }
             }
+            result
         }
         "delegate_task" => {
             let Some(sender) = sender.as_ref() else {
@@ -298,6 +308,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         interrupt_meta: interrupt_meta_json.as_ref().and_then(|v| {
                             serde_json::from_value::<crate::inbox::InterruptMeta>(v.clone()).ok()
                         }),
+                        correlation_id: None,
+                        reviewed_head: None,
                         delivery_mode: Some("inbox_fallback".to_string()),
                         from: format!("from:{}", sender.as_str()),
                         text: msg.clone(),
@@ -376,7 +388,62 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Some(artifacts) = args["artifacts"].as_str() {
                 msg.push_str(&format!("\nArtifacts: {artifacts}"));
             }
-            let result = send_to(&home, sender, target, &msg, "report");
+            let result = {
+                let correlation_id = args["correlation_id"].as_str();
+                let reviewed_head = args["reviewed_head"].as_str();
+                match crate::api::call(
+                    &home,
+                    &json!({
+                        "method": crate::api::method::SEND,
+                        "params": {
+                            "from": sender.as_str(),
+                            "target": target,
+                            "text": msg,
+                            "kind": "report",
+                            "correlation_id": correlation_id,
+                            "reviewed_head": reviewed_head,
+                            "thread_id": args["thread_id"].as_str(),
+                            "parent_id": args["parent_id"].as_str(),
+                        }
+                    }),
+                ) {
+                    Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
+                    Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
+                    Err(e) => {
+                        let inbox_msg = crate::inbox::InboxMessage {
+                            schema_version: 0,
+                            id: None,
+                            read_at: None,
+                            thread_id: args["thread_id"].as_str().map(String::from),
+                            parent_id: args["parent_id"].as_str().map(String::from),
+                            task_id: None,
+                            interrupt_meta: None,
+                            correlation_id: correlation_id.map(String::from),
+                            reviewed_head: reviewed_head.map(String::from),
+                            delivery_mode: Some("inbox_fallback".to_string()),
+                            from: format!("from:{}", sender.as_str()),
+                            text: msg.clone(),
+                            kind: Some("report".to_string()),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        };
+                        let _ = crate::inbox::enqueue(&home, target, inbox_msg);
+                        crate::inbox::notify_agent(
+                            &home,
+                            target,
+                            &crate::inbox::NotifySource::Agent(sender.as_str()),
+                            &msg,
+                        );
+                        json!({"target": target, "note": format!("API unavailable: {e}")})
+                    }
+                }
+            };
+            // Add warning for report kind without parent_id
+            let mut result = result;
+            if args["parent_id"].as_str().is_none() {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("warning".to_string(), json!("parent_id recommended for report kind; will be required in future version"));
+                }
+            }
             if is_ok_result(&result) {
                 // Mark dispatch as completed so timeout sweep doesn't false-warn.
                 let cid = args["correlation_id"].as_str();
@@ -521,6 +588,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     let mut resp = json!({"status": "read", "read_at": t});
                     if let Some(mode) = dm {
                         resp["delivery_mode"] = json!(mode);
+                    }
+                    // Expose typed fields from the message
+                    if let Some(msg) = crate::inbox::find_message(&home, msg_id) {
+                        if let Some(ref cid) = msg.correlation_id {
+                            resp["correlation_id"] = json!(cid);
+                        }
+                        if let Some(ref rh) = msg.reviewed_head {
+                            resp["reviewed_head"] = json!(rh);
+                            resp["stale_possible"] = json!(true);
+                        }
                     }
                     resp
                 }
@@ -802,6 +879,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     parent_id: None,
                     task_id: None,
                     interrupt_meta: None,
+                    correlation_id: None,
+                    reviewed_head: None,
                     from: "system:replace".to_string(),
                     text: format!("[handover] {handover}"),
                     kind: Some("handover".to_string()),
@@ -2183,6 +2262,8 @@ instances:
                 parent_id: None,
                 task_id: None,
                 interrupt_meta: None,
+                correlation_id: None,
+                reviewed_head: None,
                 from: "user:test".to_string(),
                 text: "hello".to_string(),
                 kind: Some("telegram".to_string()),
@@ -2237,6 +2318,8 @@ instances:
                 parent_id: None,
                 task_id: None,
                 interrupt_meta: None,
+                correlation_id: None,
+                reviewed_head: None,
                 from: "user:test".to_string(),
                 text: "burst".to_string(),
                 kind: Some("telegram".to_string()),
@@ -2404,6 +2487,8 @@ instances:
             parent_id: None,
             delivery_mode: Some("inbox_fallback".into()),
             interrupt_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
             task_id: None,
         };
         let inbox_dir = home.join("inbox");

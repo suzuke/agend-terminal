@@ -54,6 +54,7 @@ fn comm_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "target_instance": {"type": "string"}, "summary": {"type": "string"},
                 "correlation_id": {"type": "string"}, "artifacts": {"type": "string"},
+                "reviewed_head": {"type": "string", "description": "Git HEAD SHA at time of review"},
                 "thread_id": {"type": "string"}, "parent_id": {"type": "string"}
             }, "required": ["target_instance", "summary"]}}),
         json!({"name": "request_information", "description": "Ask another instance a question (expects reply).",

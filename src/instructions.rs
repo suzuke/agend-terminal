@@ -212,7 +212,9 @@ pub(crate) fn build_instructions_body(
          - `report` / `update` — do NOT reply unless you have new information to add\n\n\
          For acknowledgement without triggering a reply loop, use the `react` MCP tool \
          (emoji reaction; no inbox message on recipient side). \
-         Pure ack messages (\"收到\", \"OK\", \"👍\") should use `react`, not `send_to_instance`.\n",
+         Pure ack messages (\"收到\", \"OK\", \"👍\") should use `react`, not `send_to_instance`.\n\
+         When sending kind=report, include `parent_id` (the message you're replying to) \
+         and `correlation_id` (the task board ID) for correlation tracking.\n",
     );
     content.push_str("Check your `inbox` periodically for pending messages.\n");
 
@@ -961,6 +963,8 @@ mod tests {
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
             interrupt_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
             read_at: None,
             thread_id: None,
             parent_id: None,
