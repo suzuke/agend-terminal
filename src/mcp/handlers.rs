@@ -1,8 +1,7 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
 use crate::agent_ops::{
-    cleanup_working_dir, get_submit_key, list_agents, merge_metadata, save_metadata, send_to,
-    validate_branch,
+    cleanup_working_dir, list_agents, merge_metadata, save_metadata, send_to, validate_branch,
 };
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::telegram;
