@@ -165,6 +165,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         read_at: None,
                         thread_id: resolved_thread,
                         parent_id: resolved_parent,
+                        task_id: None,
                         from: format!("from:{}", sender.as_str()),
                         text: text.to_string(),
                         kind: None,
@@ -214,9 +215,56 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Some(ctx) = args["context"].as_str() {
                 msg.push_str(&format!("\n\nContext: {ctx}"));
             }
-            let result = send_to(&home, sender, target, &msg, "task");
+            let task_id_str = args["task_id"].as_str();
+            let result = match crate::api::call(
+                &home,
+                &json!({
+                    "method": crate::api::method::SEND,
+                    "params": {
+                        "from": sender.as_str(),
+                        "target": target,
+                        "text": msg,
+                        "kind": "task",
+                        "task_id": task_id_str,
+                    }
+                }),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
+                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
+                Err(e) => {
+                    // Fallback: direct delivery with task_id
+                    let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                        .ok()
+                        .map(|c| c.instances.contains_key(target))
+                        .unwrap_or(false);
+                    if !in_fleet {
+                        return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {e})")});
+                    }
+                    let inbox_msg = crate::inbox::InboxMessage {
+                        schema_version: 0,
+                        id: None,
+                        read_at: None,
+                        thread_id: None,
+                        parent_id: None,
+                        task_id: task_id_str.map(String::from),
+                        delivery_mode: Some("inbox_fallback".to_string()),
+                        from: format!("from:{}", sender.as_str()),
+                        text: msg.clone(),
+                        kind: Some("task".to_string()),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let _ = crate::inbox::enqueue(&home, target, inbox_msg);
+                    crate::inbox::notify_agent(
+                        &home,
+                        target,
+                        &crate::inbox::NotifySource::Agent(sender.as_str()),
+                        &msg,
+                    );
+                    json!({"target": target, "note": format!("API unavailable: {e}")})
+                }
+            };
             if is_ok_result(&result) {
-                let task_id = args["task_id"].as_str().map(str::to_string);
+                let task_id = task_id_str.map(str::to_string);
                 ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
                     from: sender.as_str().to_string(),
                     to: target.to_string(),
@@ -687,6 +735,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     read_at: None,
                     thread_id: None,
                     parent_id: None,
+                    task_id: None,
                     from: "system:replace".to_string(),
                     text: format!("[handover] {handover}"),
                     kind: Some("handover".to_string()),
@@ -2063,6 +2112,7 @@ instances:
                 read_at: None,
                 thread_id: None,
                 parent_id: None,
+                task_id: None,
                 from: "user:test".to_string(),
                 text: "hello".to_string(),
                 kind: Some("telegram".to_string()),
@@ -2115,6 +2165,7 @@ instances:
                 read_at: None,
                 thread_id: None,
                 parent_id: None,
+                task_id: None,
                 from: "user:test".to_string(),
                 text: "burst".to_string(),
                 kind: Some("telegram".to_string()),
@@ -2281,6 +2332,7 @@ instances:
             thread_id: None,
             parent_id: None,
             delivery_mode: Some("inbox_fallback".into()),
+            task_id: None,
         };
         let inbox_dir = home.join("inbox");
         std::fs::create_dir_all(&inbox_dir).ok();

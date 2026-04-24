@@ -956,6 +956,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
         };
         let header = crate::inbox::format_header(&sample_msg);
 

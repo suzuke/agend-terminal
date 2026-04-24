@@ -197,6 +197,7 @@ fn test_inbox(home: &Path) -> anyhow::Result<()> {
                 read_at: None,
                 thread_id: None,
                 parent_id: None,
+                task_id: None,
                 from: format!("tester-{i}"),
                 text: format!("Message {i}"),
                 kind: None,

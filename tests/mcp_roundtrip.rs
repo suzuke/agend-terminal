@@ -766,19 +766,22 @@ fn test_delegate_task_persists_task_id() {
         &home,
         &[
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegate_task","arguments":{"target_instance":"test-agent","task":"implement feature X","task_id":"t-sprint6-42","success_criteria":"all tests pass with full coverage","context":"This is a test of the typed task_id field in delegate_task. The message needs to be long enough to exceed the inline threshold of five hundred characters so it gets enqueued to the inbox JSONL file where we can verify the task_id was persisted. Adding sufficient padding text to reliably cross the 500 char boundary for this integration test of the delegate_task typed task_id correlation feature in the agend-terminal daemon."}}}"#,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inbox","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegate_task","arguments":{"target_instance":"test-agent","task":"implement feature X","task_id":"t-sprint6-42","success_criteria":"all tests pass with full coverage","context":"This is a test of the typed task_id field in delegate_task. The message needs to be long enough to exceed the inline threshold of five hundred characters so it gets enqueued to the inbox JSONL file where we can verify the task_id was persisted as a typed field. Adding sufficient padding text to reliably cross the 500 char boundary for this integration test of the delegate_task typed task_id correlation feature in the agend-terminal daemon."}}}"#,
         ],
     );
-    assert!(responses.len() >= 3);
-    let inbox_result = extract_tool_result(&responses[2]);
-    let messages = inbox_result["messages"].as_array().expect("messages");
-    let found = messages
-        .iter()
-        .any(|m| m["text"].as_str().unwrap_or("").contains("t-sprint6-42"));
-    assert!(
-        found,
-        "task_id must appear in inbox message text: {messages:?}"
+    assert!(responses.len() >= 2);
+    // Deserialize inbox JSONL and verify typed task_id field
+    let inbox_path = home.join("inbox").join("test-agent.jsonl");
+    let content = std::fs::read_to_string(&inbox_path).expect("inbox file must exist");
+    let msg: serde_json::Value = content
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .find(|v: &serde_json::Value| v["text"].as_str().unwrap_or("").contains("[delegate_task]"))
+        .expect("delegate_task message must be in inbox");
+    assert_eq!(
+        msg["task_id"].as_str(),
+        Some("t-sprint6-42"),
+        "typed task_id field must be persisted in InboxMessage JSON: {msg}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -795,20 +798,20 @@ fn test_delegate_task_no_task_id_remains_none() {
         &home,
         &[
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegate_task","arguments":{"target_instance":"test-agent","task":"implement feature Y without any task_id parameter provided at all","success_criteria":"verify that when no task_id is given the message text does not contain a parenthetical task id reference","context":"This delegate_task call intentionally omits the task_id field entirely. The combined message body including task description plus success criteria plus this context string needs to exceed five hundred characters total to be enqueued to the inbox JSONL file by the deliver function. We verify that when task_id is not provided by the caller, the formatted message text does not contain a parenthetical task id reference. This padding ensures we reliably cross the five hundred character threshold boundary for the test."}}}"#,
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"inbox","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegate_task","arguments":{"target_instance":"test-agent","task":"implement feature Y without any task_id parameter provided at all","success_criteria":"verify that when no task_id is given the typed field is absent from the serialized JSON","context":"This delegate_task call intentionally omits the task_id field entirely. The combined message body including task description plus success criteria plus this context string needs to exceed five hundred characters total to be enqueued to the inbox JSONL file by the deliver function. We verify that when task_id is not provided by the caller, the InboxMessage JSON does not contain a task_id field. This padding ensures we reliably cross the five hundred character threshold boundary for the test."}}}"#,
         ],
     );
-    assert!(responses.len() >= 3);
-    let inbox_result = extract_tool_result(&responses[2]);
-    let messages = inbox_result["messages"].as_array().expect("messages");
-    let found = messages.iter().any(|m| {
-        let text = m["text"].as_str().unwrap_or("");
-        text.contains("[delegate_task]") && !text.contains("(task id:")
-    });
+    assert!(responses.len() >= 2);
+    let inbox_path = home.join("inbox").join("test-agent.jsonl");
+    let content = std::fs::read_to_string(&inbox_path).expect("inbox file must exist");
+    let msg: serde_json::Value = content
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .find(|v: &serde_json::Value| v["text"].as_str().unwrap_or("").contains("[delegate_task]"))
+        .expect("delegate_task message must be in inbox");
     assert!(
-        found,
-        "delegate_task without task_id must not contain '(task id:' in text: {messages:?}"
+        msg.get("task_id").is_none() || msg["task_id"].is_null(),
+        "task_id must be absent or null when not provided: {msg}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

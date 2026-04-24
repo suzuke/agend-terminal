@@ -290,6 +290,7 @@ fn test_inbox(home: &Path) -> TestResult {
                 read_at: None,
                 thread_id: None,
                 parent_id: None,
+                task_id: None,
                 from: format!("test-{i}"),
                 text: format!("msg {i}"),
                 kind: None,
