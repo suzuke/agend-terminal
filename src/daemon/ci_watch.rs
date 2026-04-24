@@ -2,6 +2,27 @@ use crate::agent::{self, AgentRegistry};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
+pub const WATCH_TTL_HOURS: i64 = 72;
+
+/// Remove a watch file and log the removal event.
+pub fn remove_watch(
+    home: &Path,
+    watch_path: &Path,
+    instance: &str,
+    repo: &str,
+    branch: &str,
+    reason: &str,
+) {
+    let _ = std::fs::remove_file(watch_path);
+    crate::event_log::log(
+        home,
+        "ci_watch_removed",
+        instance,
+        &format!("repo={repo} branch={branch} reason={reason}"),
+    );
+}
+
 /// Deterministic, collision-free filename for a CI watch entry.
 /// Uses SHA-256 of `"{repo}:{branch}"` to avoid path traversal and
 /// collisions when repo names contain `/` (e.g. `owner/repo` vs
@@ -88,6 +109,29 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
         let last_run_id = watch["last_run_id"].as_u64();
         let head_sha = watch["head_sha"].as_str().map(String::from);
         let last_notified_sha = watch["last_notified_head_sha"].as_str().map(String::from);
+
+        // TTL check: remove expired watches before polling.
+        let now_utc = chrono::Utc::now();
+        if let Some(expires_at) = watch["expires_at"].as_str() {
+            if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+                if now_utc > exp.with_timezone(&chrono::Utc) {
+                    remove_watch(home, &path, &instance, &repo, &branch, "expired");
+                    tracing::info!(repo = %repo, branch = %branch, "CI watch expired (TTL)");
+                    continue;
+                }
+            }
+        }
+        // Inactivity TTL: WATCH_TTL_HOURS since last terminal run seen
+        if let Some(last_seen) = watch["last_terminal_seen_at"].as_str() {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
+                let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
+                if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
+                    remove_watch(home, &path, &instance, &repo, &branch, "inactivity_ttl");
+                    tracing::info!(repo = %repo, branch = %branch, hours = WATCH_TTL_HOURS, "CI watch removed: inactivity TTL");
+                    continue;
+                }
+            }
+        }
 
         // Throttle from a dedicated `last_polled_at` (epoch millis) in the
         // watch file itself, not file mtime. mtime conflates "when this
@@ -316,13 +360,11 @@ async fn ci_check_repo(
     };
 
     // Check if the PR associated with this branch has reached a terminal state.
-    if branch != "main" && branch != "master" {
-        if let Some(should_clear) = check_pr_terminal(&gh_get, repo, branch).await {
-            if should_clear {
-                let _ = std::fs::remove_file(watch_path);
-                tracing::info!(repo, branch, "CI watcher auto-cleared: PR terminal");
-                return Ok(());
-            }
+    if let Some(should_clear) = check_pr_terminal(&gh_get, repo, branch).await {
+        if should_clear {
+            remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
+            tracing::info!(repo, branch, "CI watcher auto-cleared: PR terminal");
+            return Ok(());
         }
     }
 
@@ -453,6 +495,7 @@ fn update_watch_state_with_notify(
             if let Some(sha) = notified_sha {
                 watch["last_notified_head_sha"] = serde_json::json!(sha);
             }
+            watch["last_terminal_seen_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
             let _ = std::fs::write(
                 watch_path,
                 serde_json::to_string_pretty(&watch).unwrap_or_default(),
@@ -525,6 +568,21 @@ async fn fetch_failure_summary(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::agent::AgentRegistry;
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-ciwatch-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
 
     #[test]
     fn watch_is_due_null_last_polled_at_fires_immediately() {
@@ -960,5 +1018,171 @@ mod tests {
             !headline.contains("unknown"),
             "no unknown in success: {headline}"
         );
+    }
+
+    #[test]
+    fn test_watch_expires_after_ttl_inactivity() {
+        let dir = tmp_dir("ttl-expire");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        // Watch with last_terminal_seen_at 80 hours ago (> 72h TTL)
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(80)).to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat", "interval_secs": 60,
+            "instance": "agent1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": old_ts,
+        });
+        let filename = watch_filename("o/r", "feat");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
+
+        // Run check — should remove the watch
+        let registry: AgentRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        check_ci_watches(&dir, &registry);
+
+        assert!(!watch_path.exists(), "expired watch must be removed");
+        // Event log should have entry
+        let log = std::fs::read_to_string(dir.join("event-log.jsonl")).unwrap_or_default();
+        assert!(log.contains("ci_watch_removed"), "removal must be logged");
+        assert!(
+            log.contains("inactivity_ttl"),
+            "reason must be inactivity_ttl"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_watch_preserved_when_not_expired() {
+        let dir = tmp_dir("ttl-fresh");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        // Watch with recent last_terminal_seen_at (1 hour ago, well within 72h)
+        let recent_ts = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat", "interval_secs": 60,
+            "instance": "agent1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": recent_ts,
+        });
+        let filename = watch_filename("o/r", "feat");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
+
+        let registry: AgentRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        check_ci_watches(&dir, &registry);
+
+        assert!(watch_path.exists(), "fresh watch must be preserved");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_watch_expires_at_absolute() {
+        let dir = tmp_dir("ttl-absolute");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        // Watch with expires_at in the past
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "old", "interval_secs": 60,
+            "instance": "agent1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": past,
+        });
+        let filename = watch_filename("o/r", "old");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
+
+        let registry: AgentRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        check_ci_watches(&dir, &registry);
+
+        assert!(
+            !watch_path.exists(),
+            "past-expires_at watch must be removed"
+        );
+        let log = std::fs::read_to_string(dir.join("event-log.jsonl")).unwrap_or_default();
+        assert!(log.contains("reason=expired"), "reason must be expired");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_legacy_watch_without_ttl_fields_not_removed() {
+        let dir = tmp_dir("ttl-legacy");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        // Legacy watch without expires_at or last_terminal_seen_at
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat", "interval_secs": 60,
+            "instance": "agent1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+        });
+        let filename = watch_filename("o/r", "feat");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
+
+        let registry: AgentRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        check_ci_watches(&dir, &registry);
+
+        assert!(
+            watch_path.exists(),
+            "legacy watch without TTL fields must not be removed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_remove_watch_on_pr_terminal_logs_event() {
+        let dir = tmp_dir("pr-terminal");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let filename = watch_filename("o/r", "feat-merged");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(
+            &watch_path,
+            r#"{"repo":"o/r","branch":"feat-merged","instance":"a1"}"#,
+        )
+        .unwrap();
+        assert!(watch_path.exists());
+
+        remove_watch(&dir, &watch_path, "a1", "o/r", "feat-merged", "pr_terminal");
+
+        assert!(!watch_path.exists(), "watch must be removed");
+        let log = std::fs::read_to_string(dir.join("event-log.jsonl")).unwrap_or_default();
+        assert!(log.contains("ci_watch_removed"));
+        assert!(log.contains("reason=pr_terminal"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_watch_preserved_when_pr_check_unavailable() {
+        let dir = tmp_dir("pr-fail");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let future = (chrono::Utc::now() + chrono::Duration::hours(48)).to_rfc3339();
+        let recent = chrono::Utc::now().to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat-active", "interval_secs": 60,
+            "instance": "a1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null, "expires_at": future, "last_terminal_seen_at": recent,
+        });
+        let filename = watch_filename("o/r", "feat-active");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).unwrap();
+
+        let registry: AgentRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        check_ci_watches(&dir, &registry);
+
+        assert!(
+            watch_path.exists(),
+            "watch must survive when PR check unavailable"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
