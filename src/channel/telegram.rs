@@ -439,6 +439,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         read_at: None,
         thread_id: None,
         parent_id: None,
+        task_id: None,
         from: format!("user:{username}"),
         text: text.to_string(),
         kind: Some("telegram".to_string()),

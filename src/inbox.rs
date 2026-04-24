@@ -176,6 +176,8 @@ pub struct InboxMessage {
     /// Absent on legacy messages; backwards-compatible via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
 }
 
 impl InboxMessage {
@@ -639,6 +641,7 @@ pub fn deliver(
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
             from: source.to_string(),
             text: text.to_string(),
             kind,
@@ -770,6 +773,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
             from: from.to_string(),
             text: text.to_string(),
             kind: None,
@@ -895,6 +899,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
             from: "sender".to_string(),
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
@@ -987,6 +992,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
             from: "test".to_string(),
             text: "hello \"world\"".to_string(),
             kind: None,
@@ -1008,6 +1014,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
             from: "user".to_string(),
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
@@ -1597,6 +1604,7 @@ mod tests {
             read_at: None,
             thread_id: Some("thread-42".into()),
             parent_id: Some("m-0".into()),
+            task_id: None,
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("thread_id"));
@@ -1615,6 +1623,7 @@ mod tests {
         let msg_no_thread = InboxMessage {
             thread_id: None,
             parent_id: None,
+            task_id: None,
             ..msg.clone()
         };
         let json2 = serde_json::to_string(&msg_no_thread).expect("ser");
@@ -1635,6 +1644,7 @@ mod tests {
             read_at: None,
             thread_id: Some("t-100".into()),
             parent_id: Some("m-41".into()),
+            task_id: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("[AGEND-MSG]"));
@@ -1660,6 +1670,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("from=from:agent"));
@@ -1683,6 +1694,7 @@ mod tests {
             read_at: None,
             thread_id: Some("t\n1".into()),
             parent_id: None,
+            task_id: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1710,6 +1722,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1742,6 +1755,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1777,6 +1791,7 @@ mod tests {
             read_at: None,
             thread_id: None,
             parent_id: None,
+            task_id: None,
         };
         let header = format_header(&msg);
         assert!(

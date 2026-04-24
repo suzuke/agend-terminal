@@ -45,6 +45,7 @@ fn comm_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "target_instance": {"type": "string"}, "task": {"type": "string"},
                 "success_criteria": {"type": "string"}, "context": {"type": "string"},
+                "task_id": {"type": "string", "description": "Task board ID for correlation"},
                 "thread_id": {"type": "string"}, "parent_id": {"type": "string"}
             }, "required": ["target_instance", "task"]}}),
         json!({"name": "report_result", "description": "Report results back to the delegating instance.",

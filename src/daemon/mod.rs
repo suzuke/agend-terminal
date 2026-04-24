@@ -883,6 +883,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                     read_at: None,
                     thread_id: None,
                     parent_id: None,
+                    task_id: None,
                 },
             );
         }
