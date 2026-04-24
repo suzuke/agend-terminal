@@ -377,7 +377,7 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
     messages
 }
 
-pub const INLINE_THRESHOLD: usize = 500;
+// INLINE_THRESHOLD removed — deliver() now always enqueues regardless of length.
 
 /// Count unread messages (read_at == None) for an agent.
 pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn deliver_long_message_enqueues() {
         let home = tmp_home("deliver-long");
-        let long_text: String = "x".repeat(INLINE_THRESHOLD + 100);
+        let long_text: String = "x".repeat(600);
         deliver(
             &home,
             "agent1",
