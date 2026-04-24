@@ -1,6 +1,6 @@
 [package]
 name = "agend-terminal"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 35 MCP tools"
 license = "MIT"
@@ -15,6 +15,12 @@ include = [
     "src/**/*.rs",
     "build.rs",
     "assets/windows/*",
+    # `src/protocol.rs` does `include_str!("../docs/FLEET-DEV-PROTOCOL-v1.md")`
+    # at compile time. Without this entry, `cargo publish`'s verification
+    # build (which works on the packaged tarball, not the source tree)
+    # fails with "No such file or directory" — caught the hard way during
+    # the v0.4.0 publish attempt. Add any future bundled docs here too.
+    "docs/FLEET-DEV-PROTOCOL-v1.md",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
