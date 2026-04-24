@@ -879,6 +879,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                     text: message.to_string(),
                     kind: Some("schedule_replay".to_string()),
                     timestamp: now.to_rfc3339(),
+                    delivery_mode: None,
                     read_at: None,
                     thread_id: None,
                     parent_id: None,

@@ -171,6 +171,11 @@ pub struct InboxMessage {
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    /// How the message was delivered: "pty" (injected to agent PTY) or
+    /// "inbox_fallback" (daemon down, written to inbox file only).
+    /// Absent on legacy messages; backwards-compatible via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_mode: Option<String>,
 }
 
 impl InboxMessage {
@@ -182,7 +187,7 @@ impl InboxMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageStatus {
     /// Message was read at the given timestamp.
-    ReadAt(String),
+    ReadAt(String, Option<String>), // (read_at, delivery_mode)
     /// Message exists but has not been read and has expired (>30d).
     UnreadExpired,
     /// Message not found.
@@ -545,7 +550,7 @@ pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageSta
             continue;
         }
         if let Some(ref read_at) = msg.read_at {
-            return MessageStatus::ReadAt(read_at.clone());
+            return MessageStatus::ReadAt(read_at.clone(), msg.delivery_mode.clone());
         }
         let ts = chrono::DateTime::parse_from_rfc3339(&msg.timestamp)
             .map(|dt| dt.with_timezone(&chrono::Utc))
@@ -638,6 +643,7 @@ pub fn deliver(
             text: text.to_string(),
             kind,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            delivery_mode: None,
         };
         let _ = enqueue(home, agent_name, msg);
         notify_agent(home, agent_name, source, text);
@@ -768,6 +774,7 @@ mod tests {
             text: text.to_string(),
             kind: None,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            delivery_mode: None,
         }
     }
 
@@ -892,6 +899,7 @@ mod tests {
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
             timestamp: "2025-06-15T12:30:00Z".to_string(),
+            delivery_mode: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -983,6 +991,7 @@ mod tests {
             text: "hello \"world\"".to_string(),
             kind: None,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            delivery_mode: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1003,6 +1012,7 @@ mod tests {
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            delivery_mode: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1441,7 +1451,7 @@ mod tests {
 
         // ReadAt
         match describe_message(&home, "m-read", "agent1") {
-            MessageStatus::ReadAt(t) => assert_eq!(t, now),
+            MessageStatus::ReadAt(t, _dm) => assert_eq!(t, now),
             other => panic!("expected ReadAt, got: {other:?}"),
         }
 
@@ -1583,6 +1593,7 @@ mod tests {
             text: "t".into(),
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
+            delivery_mode: None,
             read_at: None,
             thread_id: Some("thread-42".into()),
             parent_id: Some("m-0".into()),
@@ -1620,6 +1631,7 @@ mod tests {
             text: "x".repeat(500),
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
+            delivery_mode: None,
             read_at: None,
             thread_id: Some("t-100".into()),
             parent_id: Some("m-41".into()),
@@ -1644,6 +1656,7 @@ mod tests {
             text: "hello".into(),
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
+            delivery_mode: None,
             read_at: None,
             thread_id: None,
             parent_id: None,
@@ -1666,6 +1679,7 @@ mod tests {
             text: "hello".into(),
             kind: Some("task\r\ninjection".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
+            delivery_mode: None,
             read_at: None,
             thread_id: Some("t\n1".into()),
             parent_id: None,
@@ -1692,6 +1706,7 @@ mod tests {
             text: "t".into(),
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
+            delivery_mode: None,
             read_at: None,
             thread_id: None,
             parent_id: None,
@@ -1723,6 +1738,7 @@ mod tests {
             text: long,
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
+            delivery_mode: None,
             read_at: None,
             thread_id: None,
             parent_id: None,
@@ -1757,6 +1773,7 @@ mod tests {
             text: cjk,
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
+            delivery_mode: None,
             read_at: None,
             thread_id: None,
             parent_id: None,

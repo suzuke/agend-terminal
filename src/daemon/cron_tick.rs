@@ -125,6 +125,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     text: message.to_string(),
                     kind: Some("schedule".to_string()),
                     timestamp: now_utc.to_rfc3339(),
+                    delivery_mode: None,
                 },
             );
             "ok_inbox"

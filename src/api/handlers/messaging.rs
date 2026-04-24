@@ -72,6 +72,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             timestamp: chrono::Utc::now().to_rfc3339(),
+            delivery_mode: None,
         }
     };
     let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
