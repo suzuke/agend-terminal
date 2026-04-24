@@ -742,6 +742,9 @@ fn run_core(
     };
     for (name, child) in &agents_to_kill {
         let mut c = crate::sync::lock_poisoned(child, "child_proc");
+        if let Some(pid) = c.process_id() {
+            crate::process::kill_process_tree(pid);
+        }
         let _ = c.kill();
         tracing::info!(agent = %name, "killed");
     }

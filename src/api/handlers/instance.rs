@@ -57,7 +57,12 @@ pub(crate) fn handle_kill(params: &Value, ctx: &HandlerCtx) -> Value {
                 core.state.set_restarting();
             }
             let mut child = crate::sync::lock_poisoned(&handle.child, "api_child");
-            let _ = child.kill();
+            // Kill the process group (not just the leader) to propagate to
+            // child subprocesses (kiro-cli spawns bun/mcp/acp children).
+            if let Some(pid) = child.process_id() {
+                crate::process::kill_process_tree(pid);
+            }
+            let _ = child.kill(); // also kill via PTY handle as fallback
             drop(child);
             drop(reg);
             crate::event_log::log(ctx.home, "kill", name, "killed via API");
@@ -92,6 +97,9 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
     let mut reg = agent::lock_registry(ctx.registry);
     if let Some(handle) = reg.get(name) {
         let mut child = crate::sync::lock_poisoned(&handle.child, "api_child");
+        if let Some(pid) = child.process_id() {
+            crate::process::kill_process_tree(pid);
+        }
         let _ = child.kill();
         drop(child);
     }

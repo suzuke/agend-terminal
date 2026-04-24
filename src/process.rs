@@ -53,3 +53,28 @@ pub fn terminate(pid: u32) {
         }
     }
 }
+
+/// Kill an entire process group. On Unix, sends SIGTERM to -pgid (all processes
+/// in the group), then waits briefly and escalates to SIGKILL if still alive.
+/// On Windows, falls back to TerminateProcess on the leader.
+pub fn kill_process_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        // First try SIGTERM to the process group
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        // Brief grace period, then SIGKILL
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if is_pid_alive(pid) {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows: TerminateProcess on the leader (process groups work differently)
+        terminate(pid);
+    }
+}
