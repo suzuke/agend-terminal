@@ -553,19 +553,13 @@ mod tests {
         // Job detail moved to inbox body — headline just says "failure"
         let msg =
             ci_notification_message("owner/repo", "main", Some("failure"), Some("Build / Test"));
-        assert_eq!(
-            msg.as_deref(),
-            Some("[ci-fail] owner/repo@main: failure\r")
-        );
+        assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure\r"));
     }
 
     #[test]
     fn ci_watch_failure_without_detail_same_headline() {
         let msg = ci_notification_message("owner/repo", "main", Some("failure"), None);
-        assert_eq!(
-            msg.as_deref(),
-            Some("[ci-fail] owner/repo@main: failure\r")
-        );
+        assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure\r"));
     }
 
     #[test]
