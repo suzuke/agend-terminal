@@ -42,6 +42,13 @@ pub enum TaskBoardMode {
     Help,
 }
 
+/// Which view is active in the board overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoardView {
+    Tasks,
+    Fleet,
+}
+
 pub(super) enum Overlay {
     None,
     /// New tab selection menu.
@@ -104,6 +111,8 @@ pub(super) enum Overlay {
         row: usize,
         /// Sub-mode: None=board, Detail, NewTask(input), Assign(selected).
         mode: TaskBoardMode,
+        /// Active view: Tasks (kanban) or Fleet (agent dashboard).
+        view: BoardView,
     },
     /// Floating scratch shell (Ctrl+B ~). Esc kills the shell and closes the
     /// overlay. Pane is boxed because it's much larger than any other variant.
@@ -535,7 +544,16 @@ pub(super) fn handle_key(
             ref mut col,
             ref mut row,
             ref mut mode,
+            ref mut view,
         } => {
+            // Tab switches between Tasks and Fleet views
+            if key.code == KeyCode::Tab && matches!(mode, TaskBoardMode::Board) {
+                *view = match view {
+                    BoardView::Tasks => BoardView::Fleet,
+                    BoardView::Fleet => BoardView::Tasks,
+                };
+                return outcome;
+            }
             match mode {
                 TaskBoardMode::Detail => {
                     if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
@@ -809,6 +827,7 @@ mod tests {
             col: 0,
             row: 0,
             mode: TaskBoardMode::Board,
+            view: BoardView::Tasks,
         }
     }
 
@@ -866,6 +885,7 @@ mod tests {
             col: 0,
             row: 0,
             mode: TaskBoardMode::Help,
+            view: BoardView::Tasks,
         };
         handle_key(&mut overlay, press(KeyCode::Esc), &mut ctx);
         assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
@@ -895,6 +915,7 @@ mod tests {
             col: 0,
             row: 0,
             mode: TaskBoardMode::Help,
+            view: BoardView::Tasks,
         };
         handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
         assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
@@ -964,6 +985,7 @@ mod tests {
             col: 1,
             row: 0,
             mode: TaskBoardMode::Board,
+            view: BoardView::Tasks,
         };
 
         // Kitty protocol: Shift+L → KeyCode::Char('l') + SHIFT
@@ -1006,6 +1028,7 @@ mod tests {
                 col: 1,
                 row: 0,
                 mode: TaskBoardMode::Board,
+                view: BoardView::Tasks,
             };
 
             let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);
@@ -1060,6 +1083,7 @@ mod tests {
             col: 1,
             row: 0,
             mode: TaskBoardMode::Board,
+            view: BoardView::Tasks,
         };
 
         let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter, &tg);

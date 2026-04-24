@@ -203,6 +203,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
+                view: super::overlay::BoardView::Tasks,
             });
         }
         Action::ShowHelp => {

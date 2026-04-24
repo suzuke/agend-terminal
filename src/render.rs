@@ -1249,11 +1249,21 @@ pub fn render_tasks(
     sel_col: usize,
     sel_row: usize,
     mode: &crate::app::TaskBoardMode,
+    view: crate::app::BoardView,
 ) {
-    use crate::app::TaskBoardMode;
+    use crate::app::{BoardView, TaskBoardMode};
     let count = items.len();
-    let title = format!(" Task Board ({count}) | ←→ move | n new | a assign | d cancel | q close ");
+    let view_tabs = match view {
+        BoardView::Tasks => "[t] tasks  [f] fleet",
+        BoardView::Fleet => " [t] tasks [f] fleet",
+    };
+    let title = format!(" Board ({count}) | {view_tabs} | Tab switch | q close ");
     let inner = render_overlay_frame(frame, Color::Blue, &title);
+
+    if matches!(view, BoardView::Fleet) {
+        render_fleet_view(frame, items, inner);
+        return;
+    }
 
     if items.is_empty() {
         frame.render_widget(
@@ -1594,6 +1604,101 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
     [backlog, open, in_progress, done]
 }
 
+/// Render the Fleet View — agent-centric dashboard grouped by team.
+fn render_fleet_view(frame: &mut Frame, tasks: &[crate::tasks::Task], area: Rect) {
+    // Build agent → claimed task mapping
+    let mut agent_tasks: std::collections::HashMap<&str, Vec<&crate::tasks::Task>> =
+        std::collections::HashMap::new();
+    for t in tasks {
+        if t.status == "claimed" {
+            if let Some(ref a) = t.assignee {
+                agent_tasks.entry(a.as_str()).or_default().push(t);
+            }
+        }
+    }
+
+    // Load teams for grouping
+    let home = crate::home_dir();
+    let teams = crate::teams::list_all(&home);
+    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+    let all_instances: Vec<String> = fleet.map(|c| c.instance_names()).unwrap_or_default();
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Group by team
+    let mut assigned_agents: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for team in &teams {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "═══ {} (orchestrator: {}) ═══",
+                team.name,
+                team.orchestrator.as_deref().unwrap_or("none")
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for member in &team.members {
+            assigned_agents.insert(member.as_str());
+            let symbol = if agent_tasks.contains_key(member.as_str()) {
+                "🟠"
+            } else {
+                "🟢"
+            };
+            let task_info = agent_tasks
+                .get(member.as_str())
+                .and_then(|ts| ts.first())
+                .map(|t| format!(" → {} ({})", t.title, t.id))
+                .unwrap_or_else(|| " idle".to_string());
+            lines.push(Line::from(Span::styled(
+                format!("  {symbol} {member}{task_info}"),
+                Style::default().fg(Color::White),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Unassigned agents
+    let unassigned: Vec<&str> = all_instances
+        .iter()
+        .filter(|n| !assigned_agents.contains(n.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unassigned.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "═══ unassigned ═══",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for name in &unassigned {
+            let symbol = if agent_tasks.contains_key(name) {
+                "🟠"
+            } else {
+                "🟢"
+            };
+            let task_info = agent_tasks
+                .get(name)
+                .and_then(|ts| ts.first())
+                .map(|t| format!(" → {} ({})", t.title, t.id))
+                .unwrap_or_else(|| " idle".to_string());
+            lines.push(Line::from(Span::styled(
+                format!("  {symbol} {name}{task_info}"),
+                Style::default().fg(Color::White),
+            )));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No agents configured. Add instances to fleet.yaml.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// Centered box sized to 60% of `area`, clamped so a tiny window still gets
 /// a readable box. Shared by the spawn path (`Action::ScratchShell` in
 /// `app::dispatch`) and the render path so both agree on geometry.
@@ -1892,7 +1997,7 @@ mod tests {
             due_at: None,
         }];
         terminal
-            .draw(|frame| render_tasks(frame, &tasks, 0, 0, mode))
+            .draw(|frame| render_tasks(frame, &tasks, 0, 0, mode, crate::app::BoardView::Tasks))
             .expect("test terminal draw should succeed");
         let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
