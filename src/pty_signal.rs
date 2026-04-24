@@ -5,6 +5,11 @@
 //!
 //! Approach: use `tcgetpgrp(pty_master_fd)` to get the foreground process group,
 //! then `kill(-pgid, SIGINT)` to interrupt it.
+//!
+//! **Go/No-Go conclusion**: GO — portable_pty already exposes
+//! `process_group_leader()` which wraps `tcgetpgrp`. No new crate needed.
+//! Note: `process_group_leader()` and the `tcgetpgrp` fallback are the same
+//! underlying mechanism (single path, not independent validation).
 
 #[cfg(unix)]
 use std::sync::{Arc, Mutex};
@@ -12,8 +17,7 @@ use std::sync::{Arc, Mutex};
 /// Send SIGINT to the foreground process group of a PTY master.
 ///
 /// Returns Ok(pgid) on success, Err on failure.
-/// The agent process (session leader) is NOT in the foreground group when
-/// a tool subprocess is running, so it survives the signal.
+/// ESRCH (process already exited) is treated as benign success.
 #[cfg(unix)]
 #[allow(dead_code)] // spike — production caller wired in Phase 2
 pub fn send_sigint_to_foreground(
@@ -22,22 +26,6 @@ pub fn send_sigint_to_foreground(
     let master = pty_master
         .lock()
         .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-
-    // Method 1: portable_pty's built-in process_group_leader
-    if let Some(pgid) = master.process_group_leader() {
-        if pgid > 0 {
-            let ret = unsafe { libc::kill(-pgid, libc::SIGINT) };
-            if ret == 0 {
-                return Ok(pgid);
-            }
-            return Err(anyhow::anyhow!(
-                "kill(-{pgid}, SIGINT) failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-
-    // Method 2: tcgetpgrp on the raw fd
     let fd = master
         .as_raw_fd()
         .ok_or_else(|| anyhow::anyhow!("pty_master has no raw fd"))?;
@@ -52,10 +40,12 @@ pub fn send_sigint_to_foreground(
     if ret == 0 {
         Ok(pgid)
     } else {
-        Err(anyhow::anyhow!(
-            "kill(-{pgid}, SIGINT) failed: {}",
-            std::io::Error::last_os_error()
-        ))
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(pgid) // benign: process exited between lookup and kill
+        } else {
+            Err(anyhow::anyhow!("kill(-{pgid}, SIGINT) failed: {err}"))
+        }
     }
 }
 
@@ -70,16 +60,14 @@ pub fn send_sigint_to_foreground(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 #[cfg(unix)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     #[test]
-    fn test_sigint_kills_foreground_tool_but_shell_survives() {
-        // Spawn a shell via PTY, run `sleep 60` as foreground tool,
-        // send SIGINT to foreground group, verify sleep dies but shell lives.
+    fn test_sigint_kills_sleep_but_shell_survives() {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -94,40 +82,39 @@ mod tests {
             .slave
             .spawn_command(CommandBuilder::new("/bin/sh"))
             .expect("spawn shell");
-        drop(pair.slave); // close slave side
+        drop(pair.slave);
 
         let master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
             Arc::new(Mutex::new(pair.master));
 
-        // Write "sleep 60" to the shell
+        // Start sleep 60 as foreground tool
         {
             let m = master.lock().unwrap();
             let mut writer = m.take_writer().expect("writer");
-            writer.write_all(b"sleep 60\n").expect("write");
+            writer.write_all(b"sleep 60\n").expect("write sleep");
         }
-
-        // Give shell time to start sleep
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Send SIGINT to foreground (sleep process group)
+        // Send SIGINT to foreground process group (sleep)
         let result = send_sigint_to_foreground(&master);
         assert!(result.is_ok(), "SIGINT should succeed: {result:?}");
-        let pgid = result.unwrap();
-        assert!(pgid > 0, "pgid must be positive");
+        assert!(result.unwrap() > 0, "pgid must be positive");
 
-        // Give time for signal delivery
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(300));
 
-        // Shell should still be alive (try_wait returns None = still running)
-        let status = child.try_wait();
-        assert!(status.is_ok(), "shell process should still be accessible");
-        // If try_wait returns Ok(Some(_)), shell exited — that's a failure
-        // If try_wait returns Ok(None), shell is still running — that's success
-        // Note: in some environments the shell may also exit on SIGINT
-        // depending on job control settings. The key assertion is that
-        // send_sigint_to_foreground succeeded without error.
+        // STRONG ASSERTION: shell must still be running
+        // try_wait() returns Ok(None) if process is alive, Ok(Some(_)) if exited
+        match child.try_wait() {
+            Ok(None) => {} // still running — PASS
+            Ok(Some(status)) => {
+                panic!(
+                    "FAIL: shell exited with {status:?} — SIGINT killed the shell, not just sleep"
+                );
+            }
+            Err(e) => panic!("try_wait error: {e}"),
+        }
 
-        // Cleanup: kill the shell
+        // Cleanup
         child.kill().ok();
     }
 
@@ -155,8 +142,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let result = send_sigint_to_foreground(&master);
-        // Should succeed — shell is the foreground process
         assert!(result.is_ok(), "should get pgid: {result:?}");
+        assert!(result.unwrap() > 0, "pgid must be positive");
 
         child.kill().ok();
     }
