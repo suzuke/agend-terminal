@@ -248,6 +248,15 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 }
             }
 
+            // Second reviewer flag validation (§3.5 dual review)
+            let second_reviewer = args["second_reviewer"].as_bool().unwrap_or(false);
+            if second_reviewer {
+                let sr_reason = args["second_reviewer_reason"].as_str().unwrap_or("");
+                if sr_reason.is_empty() {
+                    return json!({"error": "second_reviewer=true requires non-empty second_reviewer_reason"});
+                }
+            }
+
             let mut msg = format!("[delegate_task] {task}");
             if interrupt {
                 if let Some(r) = reason {
@@ -2655,6 +2664,91 @@ instances:
         assert!(
             result.get("busy").is_none(),
             "idle target must not return busy: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Sprint 9 Gap 5: second_reviewer flag ---
+
+    #[test]
+    fn test_delegate_task_second_reviewer_flag_requires_reason() {
+        let _g = fleet_test_guard();
+        let home = tmp_home("sr-no-reason");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "review PR", "second_reviewer": true}),
+            "sender",
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("second_reviewer_reason"),
+            "second_reviewer=true without reason must error: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_delegate_task_second_reviewer_with_reason_ok() {
+        let _g = fleet_test_guard();
+        let home = tmp_home("sr-with-reason");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        let result = handle_tool(
+            "delegate_task",
+            &json!({
+                "target_instance": "target",
+                "task": "review PR",
+                "second_reviewer": true,
+                "second_reviewer_reason": "high-risk protocol change"
+            }),
+            "sender",
+        );
+        assert!(
+            result.get("error").is_none()
+                || !result["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("second_reviewer"),
+            "second_reviewer with reason must not error on flag: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_delegate_task_no_second_reviewer_flag_default_behavior() {
+        let _g = fleet_test_guard();
+        let home = tmp_home("sr-default");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "normal work"}),
+            "sender",
+        );
+        // No second_reviewer flag → no error related to it
+        let err = result["error"].as_str().unwrap_or("");
+        assert!(
+            !err.contains("second_reviewer"),
+            "default (no flag) must not error on second_reviewer: {result}"
         );
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
