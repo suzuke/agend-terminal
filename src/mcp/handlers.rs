@@ -205,6 +205,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 None => return json!({"error": "missing 'task'"}),
             };
             let mut msg = format!("[delegate_task] {task}");
+            if let Some(tid) = args["task_id"].as_str() {
+                msg.push_str(&format!(" (task id: {tid})"));
+            }
             if let Some(criteria) = args["success_criteria"].as_str() {
                 msg.push_str(&format!("\n\nSuccess criteria: {criteria}"));
             }
@@ -213,15 +216,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             }
             let result = send_to(&home, sender, target, &msg, "task");
             if is_ok_result(&result) {
-                // Fleet visibility (plan §4 `DelegateTask`, design §4.3).
-                // `task_id: None` — MCP `delegate_task` has no typed id
-                // slot; correlation appears later via `report_result`'s
-                // `correlation_id`. Renderer omits id when None.
+                let task_id = args["task_id"].as_str().map(str::to_string);
                 ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
                     from: sender.as_str().to_string(),
                     to: target.to_string(),
                     summary: task.to_string(),
-                    task_id: None,
+                    task_id,
                 }));
                 // S2d provenance injection (DESIGN §6). Only DELEGATE
                 // triggers this: the receiving agent's topic gets a
