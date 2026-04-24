@@ -104,6 +104,7 @@ mod tests {
                     text: format!("msg {i}"),
                     kind: None,
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    delivery_mode: None,
                     read_at: None,
                     thread_id: None,
                     parent_id: None,

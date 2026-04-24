@@ -135,7 +135,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 }),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    json!({"target": target})
+                    let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
+                    json!({"target": target, "delivery_mode": dm})
                 }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
                 Err(e) => {
@@ -168,6 +169,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         text: text.to_string(),
                         kind: None,
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        delivery_mode: Some("inbox_fallback".to_string()),
                     };
                     let _ = crate::inbox::enqueue(&home, target, msg);
                     crate::inbox::notify_agent(
@@ -176,7 +178,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         &crate::inbox::NotifySource::Agent(sender.as_str()),
                         text,
                     );
-                    json!({"target": target, "note": format!("API unavailable, sent direct: {e}")})
+                    json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable, sent direct: {e}")})
                 }
             }
         }
@@ -402,8 +404,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             let target = args["instance"].as_str().unwrap_or(instance_name);
             let status = crate::inbox::describe_message(&home, msg_id, target);
             match status {
-                crate::inbox::MessageStatus::ReadAt(t) => {
-                    json!({"status": "read", "read_at": t})
+                crate::inbox::MessageStatus::ReadAt(t, dm) => {
+                    let mut resp = json!({"status": "read", "read_at": t});
+                    if let Some(mode) = dm {
+                        resp["delivery_mode"] = json!(mode);
+                    }
+                    resp
                 }
                 crate::inbox::MessageStatus::UnreadExpired => {
                     json!({"status": "unread_expired"})
@@ -685,6 +691,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     text: format!("[handover] {handover}"),
                     kind: Some("handover".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    delivery_mode: None,
                 },
             );
             tracing::info!(%name, %reason, "replace_instance");
@@ -1175,6 +1182,7 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
 // on disk. See commit message for details.
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -2059,6 +2067,7 @@ instances:
                 text: "hello".to_string(),
                 kind: Some("telegram".to_string()),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                delivery_mode: None,
             },
         );
 
@@ -2110,6 +2119,7 @@ instances:
                 text: "burst".to_string(),
                 kind: Some("telegram".to_string()),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                delivery_mode: None,
             },
         );
 
@@ -2221,6 +2231,74 @@ instances:
         assert!(
             !team_inbox.exists(),
             "inbox must NOT be created for team name 'dev'"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Sprint 6: delivery_mode ---
+
+    #[test]
+    fn test_send_to_inbox_fallback_mode() {
+        // Daemon down → fallback path → delivery_mode = "inbox_fallback"
+        let _g = fleet_test_guard();
+        let home = tmp_home("delivery-fallback");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  receiver:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        let result = handle_tool(
+            "send_to_instance",
+            &json!({"instance_name": "receiver", "message": "test"}),
+            "sender",
+        );
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_fallback"),
+            "daemon-down path must set delivery_mode=inbox_fallback: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_describe_message_shows_delivery_mode() {
+        // Verify describe_message returns delivery_mode when stored on the message.
+        let _g = fleet_test_guard();
+        let home = tmp_home("describe-dm");
+        std::env::set_var("AGEND_HOME", &home);
+        // Seed an inbox message with delivery_mode
+        let msg = crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some("m-dm-test".into()),
+            from: "test".into(),
+            text: "hello".into(),
+            kind: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            read_at: Some(chrono::Utc::now().to_rfc3339()),
+            thread_id: None,
+            parent_id: None,
+            delivery_mode: Some("inbox_fallback".into()),
+        };
+        let inbox_dir = home.join("inbox");
+        std::fs::create_dir_all(&inbox_dir).ok();
+        std::fs::write(
+            inbox_dir.join("agent1.jsonl"),
+            format!("{}\n", serde_json::to_string(&msg).unwrap()),
+        )
+        .ok();
+        let result = handle_tool(
+            "describe_message",
+            &json!({"message_id": "m-dm-test", "instance": "agent1"}),
+            "agent1",
+        );
+        assert_eq!(result["status"], "read");
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_fallback"),
+            "describe_message must show delivery_mode: {result}"
         );
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();

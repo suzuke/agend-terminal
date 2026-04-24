@@ -294,6 +294,7 @@ fn test_inbox(home: &Path) -> TestResult {
                 text: format!("msg {i}"),
                 kind: None,
                 timestamp: "2024-01-01T00:00:00Z".into(),
+                delivery_mode: None,
             },
         );
     }

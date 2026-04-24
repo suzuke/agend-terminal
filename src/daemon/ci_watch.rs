@@ -352,6 +352,7 @@ async fn ci_check_repo(
                         text: msg,
                         kind: Some("ci-watch".to_string()),
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        delivery_mode: None,
                     },
                 );
             }

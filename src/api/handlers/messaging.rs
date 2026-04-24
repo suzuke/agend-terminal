@@ -72,6 +72,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             timestamp: chrono::Utc::now().to_rfc3339(),
+            delivery_mode: None,
         }
     };
     let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
@@ -93,11 +94,15 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     };
 
     let reg = agent::lock_registry(ctx.registry);
-    if reg.contains_key(target) {
+    let delivery_mode = if reg.contains_key(target) {
         drop(reg);
         crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
-    }
-    json!({"ok": true})
+        "pty"
+    } else {
+        drop(reg);
+        "inbox_only"
+    };
+    json!({"ok": true, "delivery_mode": delivery_mode})
 }
 
 #[cfg(test)]
@@ -165,6 +170,71 @@ mod tests {
             result["ok"], true,
             "fleet.yaml-defined instance must be accepted: {result}"
         );
+        // Not in registry → inbox_only (not pty)
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "inactive target must get inbox_only delivery: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_send_to_active_registry_target_returns_pty() {
+        let home = tmp_home("active-pty");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  active-agent:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        // Spawn a real agent so it's in the registry
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: "active-agent",
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        let result = handle_send(
+            &json!({"from": "sender", "target": "active-agent", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("pty"),
+            "active agent must get pty delivery: {result}"
+        );
+        // Cleanup
+        let reg = agent::lock_registry(registry);
+        if let Some(h) = reg.get("active-agent") {
+            let _ = crate::sync::lock_poisoned(&h.child, "test").kill();
+        }
+        drop(reg);
         std::fs::remove_dir_all(&home).ok();
     }
 

@@ -443,6 +443,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         text: text.to_string(),
         kind: Some("telegram".to_string()),
         timestamp: chrono::Utc::now().to_rfc3339(),
+        delivery_mode: None,
     };
     let _ = inbox::enqueue(&home, &instance_name, msg_obj);
 

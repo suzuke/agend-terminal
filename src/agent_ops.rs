@@ -32,7 +32,10 @@ pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str)
             "params": { "from": from_str, "target": target, "text": text, "kind": kind }
         }),
     ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+            let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
+            json!({"target": target, "delivery_mode": dm})
+        }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
             // Validate target exists in fleet.yaml before writing to inbox.
@@ -54,7 +57,7 @@ pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str)
                 &submit_key,
                 None,
             );
-            json!({"target": target, "note": format!("API unavailable: {e}")})
+            json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {e}")})
         }
     }
 }
