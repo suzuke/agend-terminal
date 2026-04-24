@@ -90,6 +90,16 @@ fn remove_worktree(repo_root: &Path, worktree_path: &str, branch: &str) -> bool 
     wt_ok
 }
 
+/// Normalize a path: strip Windows `\\?\` UNC prefix for consistent comparison.
+fn normalize_path(p: &std::path::Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if s.starts_with(r"\\?\") {
+        std::path::PathBuf::from(&s[4..])
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// Sweep merged worktrees. Returns list of (branch, path) that were removed.
 pub fn sweep_merged_worktrees(home: &Path) -> Vec<(String, String)> {
     if !auto_cleanup_enabled() {
@@ -136,11 +146,13 @@ pub fn sweep_merged_worktrees(home: &Path) -> Vec<(String, String)> {
         let wt_path = std::path::Path::new(&entry.path);
 
         // Safety: skip if any agent's working_directory is inside this worktree
-        let wt_canonical = wt_path
-            .canonicalize()
-            .unwrap_or_else(|_| wt_path.to_path_buf());
+        let wt_canonical = normalize_path(
+            &wt_path
+                .canonicalize()
+                .unwrap_or_else(|_| wt_path.to_path_buf()),
+        );
         let in_use = agent_dirs.iter().any(|wd| {
-            let wd_canonical = wd.canonicalize().unwrap_or_else(|_| wd.clone());
+            let wd_canonical = normalize_path(&wd.canonicalize().unwrap_or_else(|_| wd.clone()));
             wd_canonical.starts_with(&wt_canonical)
         });
         if in_use {
