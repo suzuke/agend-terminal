@@ -91,6 +91,7 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
                     .enable_all()
                     .build()
                 else {
+                    tracing::warn!(repo = %repo, "ci_check: failed to build tokio runtime");
                     return;
                 };
                 if let Err(e) = rt.block_on(ci_check_repo(
@@ -106,7 +107,12 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
                     tracing::debug!(repo = %repo, error = %e, "CI check failed");
                 }
             })
-            .ok();
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "ci_check: failed to spawn background thread");
+                // Return a dummy JoinHandle — thread::spawn always succeeds in
+                // practice, but if it doesn't we've logged the failure.
+                std::thread::spawn(|| {})
+            });
     }
 }
 
@@ -660,15 +666,17 @@ mod tests {
             json!({"id": 102, "conclusion": null, "head_sha": "ccc"}), // in-progress
         ];
         let selected = select_runs_to_notify(&runs, Some(99));
-        assert_eq!(selected, vec![0, 1], "should notify runs 100 and 101, skip 102 (in-progress)");
+        assert_eq!(
+            selected,
+            vec![0, 1],
+            "should notify runs 100 and 101, skip 102 (in-progress)"
+        );
     }
 
     #[test]
     fn test_in_progress_does_not_appear_in_selection() {
         use serde_json::json;
-        let runs = vec![
-            json!({"id": 200, "conclusion": null, "head_sha": "aaa"}),
-        ];
+        let runs = vec![json!({"id": 200, "conclusion": null, "head_sha": "aaa"})];
         let selected = select_runs_to_notify(&runs, None);
         assert!(selected.is_empty(), "in-progress run must not be selected");
     }
@@ -682,7 +690,11 @@ mod tests {
             json!({"id": 302, "conclusion": "success", "head_sha": "c"}),
         ];
         let selected = select_runs_to_notify(&runs, Some(299));
-        assert_eq!(selected, vec![0, 1, 2], "all 3 terminal runs should be selected");
+        assert_eq!(
+            selected,
+            vec![0, 1, 2],
+            "all 3 terminal runs should be selected"
+        );
     }
 
     #[test]
@@ -693,6 +705,10 @@ mod tests {
             json!({"id": 401, "conclusion": "success", "head_sha": "b"}),
         ];
         let selected = select_runs_to_notify(&runs, Some(400));
-        assert_eq!(selected, vec![1], "run 400 already notified, only 401 selected");
+        assert_eq!(
+            selected,
+            vec![1],
+            "run 400 already notified, only 401 selected"
+        );
     }
 }
