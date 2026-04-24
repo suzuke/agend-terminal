@@ -218,6 +218,53 @@ pub(crate) fn select_runs_to_notify(
     selected.into_iter().map(|(i, _)| i).collect()
 }
 
+/// Pure function: deduplicate terminal runs by head_sha.
+/// Returns `(run_index, run_id, head_sha)` tuples, one per unique sha,
+/// keeping the latest run_id per sha. Skips shas matching `last_notified`.
+/// Sorted by run_id (oldest first) for chronological notification order.
+pub(crate) fn dedupe_notifications_by_head_sha<'a>(
+    runs: &'a [serde_json::Value],
+    to_notify: &[usize],
+    last_notified: Option<&str>,
+) -> Vec<(usize, u64, &'a str)> {
+    let mut best: std::collections::HashMap<&str, (usize, u64)> = std::collections::HashMap::new();
+    for &idx in to_notify {
+        let run = &runs[idx];
+        let sha = run["head_sha"].as_str().unwrap_or("");
+        let id = run["id"].as_u64().unwrap_or(0);
+        best.entry(sha)
+            .and_modify(|e| {
+                if id > e.1 {
+                    *e = (idx, id);
+                }
+            })
+            .or_insert((idx, id));
+    }
+    let mut result: Vec<_> = best
+        .into_iter()
+        .filter(|(sha, _)| last_notified != Some(*sha))
+        .map(|(sha, (idx, id))| (idx, id, sha))
+        .collect();
+    result.sort_by_key(|&(_, id, _)| id);
+    result
+}
+
+/// Pure function: build the inbox body text for a CI notification.
+/// Headline + optional failure detail + run URL.
+pub(crate) fn build_inbox_body(
+    headline: &str,
+    conclusion: &str,
+    failure_detail: Option<&str>,
+    run_url: &str,
+) -> String {
+    if conclusion == "failure" {
+        let detail = failure_detail.unwrap_or("unknown step");
+        format!("{headline}\nDetail: {detail}\nURL: {run_url}")
+    } else {
+        format!("{headline}\nURL: {run_url}")
+    }
+}
+
 /// Build the notification message for a CI run conclusion.
 /// Returns `None` for non-terminal states (in-progress / null conclusion).
 /// Job/step detail is excluded from the headline — agents use `inbox` or
@@ -322,51 +369,33 @@ async fn ci_check_repo(
     }
 
     let mut max_notified_id = effective_last_run_id.unwrap_or(0);
-
-    // Dedupe: group terminal runs by head_sha, pick latest per sha.
-    // Only notify for shas not yet notified (different from last_notified_head_sha).
-    let mut best_per_sha: std::collections::HashMap<&str, (usize, u64)> =
-        std::collections::HashMap::new();
     for &idx in &to_notify {
-        let run = &runs[idx];
-        let sha = run["head_sha"].as_str().unwrap_or("");
-        let id = run["id"].as_u64().unwrap_or(0);
-        best_per_sha
-            .entry(sha)
-            .and_modify(|e| {
-                if id > e.1 {
-                    *e = (idx, id);
-                }
-            })
-            .or_insert((idx, id));
+        let id = runs[idx]["id"].as_u64().unwrap_or(0);
         if id > max_notified_id {
             max_notified_id = id;
         }
     }
 
+    let deduped = dedupe_notifications_by_head_sha(runs, &to_notify, last_notified_sha);
     let mut new_notified_sha = last_notified_sha.map(String::from);
-    // Sort by run_id for deterministic notification order
-    let mut to_send: Vec<_> = best_per_sha.into_iter().collect();
-    to_send.sort_by_key(|&(_, (_, id))| id);
 
-    for (sha, (idx, run_id)) in to_send {
-        // Skip if this sha was already notified
-        if last_notified_sha == Some(sha) {
-            continue;
-        }
-        let run = &runs[idx];
+    for (idx, run_id, sha) in &deduped {
+        let run = &runs[*idx];
         let conclusion = run["conclusion"].as_str();
 
-        // Build headline (no job detail — agent uses inbox/gh for details)
         if let Some(headline) = ci_notification_message(repo, branch, conclusion, None) {
-            // Build inbox body with detail for agent to read
             let run_url = run["html_url"].as_str().unwrap_or("");
-            let body = if conclusion == Some("failure") {
-                let detail = fetch_failure_summary(&gh_get, repo, run_id).await;
-                format!("{headline}\nDetail: {detail}\nURL: {run_url}")
+            let failure_detail = if conclusion == Some("failure") {
+                Some(fetch_failure_summary(&gh_get, repo, *run_id).await)
             } else {
-                format!("{headline}\nURL: {run_url}")
+                None
             };
+            let body = build_inbox_body(
+                &headline,
+                conclusion.unwrap_or(""),
+                failure_detail.as_deref(),
+                run_url,
+            );
 
             let reg = agent::lock_registry(registry);
             if let Some(handle) = reg.get(instance) {
@@ -828,29 +857,28 @@ mod tests {
     #[test]
     fn test_same_head_sha_deduplicates_notification() {
         use serde_json::json;
-        // Two runs with same head_sha → select_runs_to_notify picks both,
-        // but dedupe logic (HashMap by sha) keeps only the latest.
         let runs = vec![
             json!({"id": 500, "conclusion": "failure", "head_sha": "abc"}),
             json!({"id": 501, "conclusion": "success", "head_sha": "abc"}),
         ];
         let selected = select_runs_to_notify(&runs, Some(499));
-        assert_eq!(selected.len(), 2, "select picks both runs");
-        // Dedupe: group by head_sha, keep latest id
-        let mut best: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
-        for &idx in &selected {
-            let sha = runs[idx]["head_sha"].as_str().unwrap();
-            let id = runs[idx]["id"].as_u64().unwrap();
-            best.entry(sha)
-                .and_modify(|e| {
-                    if id > *e {
-                        *e = id;
-                    }
-                })
-                .or_insert(id);
-        }
-        assert_eq!(best.len(), 1, "same sha → 1 notification group");
-        assert_eq!(best["abc"], 501, "latest run wins");
+        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None);
+        assert_eq!(deduped.len(), 1, "same sha → 1 notification");
+        assert_eq!(deduped[0].1, 501, "latest run_id wins");
+        assert_eq!(deduped[0].2, "abc");
+    }
+
+    #[test]
+    fn test_dedupe_skips_already_notified_sha() {
+        use serde_json::json;
+        let runs = vec![
+            json!({"id": 600, "conclusion": "success", "head_sha": "aaa"}),
+            json!({"id": 601, "conclusion": "success", "head_sha": "bbb"}),
+        ];
+        let selected = select_runs_to_notify(&runs, Some(599));
+        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("aaa"));
+        assert_eq!(deduped.len(), 1, "aaa already notified → only bbb");
+        assert_eq!(deduped[0].2, "bbb");
     }
 
     #[test]
@@ -861,11 +889,41 @@ mod tests {
             json!({"id": 601, "conclusion": "success", "head_sha": "bbb"}),
         ];
         let selected = select_runs_to_notify(&runs, Some(599));
-        let mut shas: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for &idx in &selected {
-            shas.insert(runs[idx]["head_sha"].as_str().unwrap());
-        }
-        assert_eq!(shas.len(), 2, "different shas → 2 notification groups");
+        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None);
+        assert_eq!(deduped.len(), 2, "different shas → 2 notifications");
+    }
+
+    #[test]
+    fn test_inbox_body_failure_has_detail_and_url() {
+        let body = build_inbox_body(
+            "[ci-fail] o/r@main: failure\r",
+            "failure",
+            Some("Check / Clippy"),
+            "https://github.com/o/r/actions/runs/123",
+        );
+        assert!(
+            body.contains("Detail: Check / Clippy"),
+            "failure body must have detail: {body}"
+        );
+        assert!(body.contains("URL: https://"), "body must have URL: {body}");
+    }
+
+    #[test]
+    fn test_inbox_body_success_has_url_no_detail() {
+        let body = build_inbox_body(
+            "[ci-pass] o/r@main: passed ✓\r",
+            "success",
+            None,
+            "https://github.com/o/r/actions/runs/456",
+        );
+        assert!(
+            body.contains("URL: https://"),
+            "success body must have URL: {body}"
+        );
+        assert!(
+            !body.contains("Detail:"),
+            "success body must not have Detail: {body}"
+        );
     }
 
     #[test]
