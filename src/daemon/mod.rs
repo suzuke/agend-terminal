@@ -483,6 +483,46 @@ fn run_core(
                 crate::inbox::sweep_expired(home);
                 crate::inbox::check_disk_space(home);
                 run_task_maintenance(home);
+                // Worktree auto-cleanup (runtime registry based)
+                {
+                    let cfgs = crate::sync::lock_poisoned(&configs, "configs");
+                    let config_data: std::collections::HashMap<
+                        String,
+                        (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
+                    > = cfgs
+                        .iter()
+                        .map(|(name, cfg)| {
+                            (
+                                name.clone(),
+                                (cfg.working_dir.clone(), cfg.worktree_source.clone()),
+                            )
+                        })
+                        .collect();
+                    drop(cfgs);
+                    let fleet_dirs: Vec<std::path::PathBuf> =
+                        crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                            .ok()
+                            .map(|c| {
+                                c.instance_names()
+                                    .iter()
+                                    .filter_map(|n| {
+                                        c.resolve_instance(n).and_then(|r| r.working_directory)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    let cleaned =
+                        crate::worktree_cleanup::sweep_from_registry(&config_data, &fleet_dirs);
+                    for (branch, path) in &cleaned {
+                        crate::event_log::log(
+                            home,
+                            "worktree_auto_removed",
+                            branch,
+                            &format!("path={path}, branch merged into main"),
+                        );
+                        tracing::info!(branch, path, "worktree auto-removed (branch merged)");
+                    }
+                }
             }
         }
 
