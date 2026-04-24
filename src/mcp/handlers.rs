@@ -901,7 +901,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 &watch_path,
                 serde_json::to_string_pretty(&watch).unwrap_or_default(),
             );
-            json!({"repo": repo, "watching": true})
+            // Surface the unauthenticated-polling gotcha in the response
+            // itself so the calling agent can relay it to the operator
+            // immediately, rather than waiting for a silent rate-limit
+            // storm to drop notifications. See
+            // `ci_watch::github_token_warning` for the full rationale.
+            let mut resp = json!({"repo": repo, "watching": true});
+            if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
+                resp["warning"] = json!(w);
+            }
+            resp
         }
         "unwatch_ci" => {
             let repo = match args["repo"].as_str() {

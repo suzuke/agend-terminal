@@ -33,6 +33,37 @@ fn watch_is_due(last_polled_at: Option<i64>, interval_secs: u64, now_ms: i64) ->
     }
 }
 
+/// Preventive warning shown in the `watch_ci` MCP response when the
+/// daemon's environment doesn't carry a usable `GITHUB_TOKEN`.
+///
+/// The daemon reads `GITHUB_TOKEN` on every poll to authenticate against
+/// the GitHub REST API (`ci_check_repo`). Without it, the process falls
+/// back to the unauthenticated 60-requests/hour cap — shared across
+/// every active watch. Five watches on 60-second intervals push ~300
+/// req/hr, so a silent 403 storm is easy to trigger without ever
+/// hitting a single fetch explicitly.
+///
+/// Split as a pure helper so unit tests don't have to serialize over a
+/// shared `std::env` mutation (cf. `watchdog::ENV_LOCK`).
+pub fn github_token_warning(token: Option<&str>) -> Option<&'static str> {
+    match token.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(_) => None,
+        None => Some(
+            "GITHUB_TOKEN not set — daemon polls GitHub unauthenticated \
+             (60 req/hr, shared by all active watches). \
+             Export GITHUB_TOKEN (e.g. `export GITHUB_TOKEN=$(gh auth token)`) \
+             and restart the daemon so it inherits the value.",
+        ),
+    }
+}
+
+/// `github_token_warning` fed from the daemon's actual env. Separate
+/// from the pure helper so the handler can call this one-liner while
+/// tests drive the pure form with synthetic inputs.
+pub fn github_token_warning_from_env() -> Option<&'static str> {
+    github_token_warning(std::env::var("GITHUB_TOKEN").ok().as_deref())
+}
+
 /// Check CI watch configs and inject failure logs to agents when CI fails.
 pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
     let entries = match std::fs::read_dir(home.join("ci-watches")) {
@@ -586,6 +617,36 @@ mod tests {
             classify_runs_response(200, &body),
             RunsResponse::NoRuns
         ));
+    }
+
+    // --- github_token_warning: preventive watch_ci response hint ---
+
+    #[test]
+    fn github_token_warning_none_when_token_present() {
+        assert!(github_token_warning(Some("ghp_realtokenhere")).is_none());
+    }
+
+    #[test]
+    fn github_token_warning_set_when_absent() {
+        let msg = github_token_warning(None).expect("missing token must warn");
+        assert!(
+            msg.contains("GITHUB_TOKEN"),
+            "message must name the env var: {msg}"
+        );
+        assert!(
+            msg.contains("unauthenticated") || msg.contains("60"),
+            "message must explain the cost: {msg}"
+        );
+    }
+
+    #[test]
+    fn github_token_warning_treats_empty_and_whitespace_as_absent() {
+        // `std::env::var("GITHUB_TOKEN")` returns `Ok("")` when the var is
+        // exported-but-empty — a distinct case from "unset" but equally
+        // unusable. Whitespace-only should be treated the same.
+        assert!(github_token_warning(Some("")).is_some());
+        assert!(github_token_warning(Some("   ")).is_some());
+        assert!(github_token_warning(Some("\t\n")).is_some());
     }
 
     #[test]
