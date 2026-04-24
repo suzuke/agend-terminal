@@ -33,7 +33,8 @@ pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str)
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({"target": target, "delivery_mode": "pty"})
+            let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
+            json!({"target": target, "delivery_mode": dm})
         }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {

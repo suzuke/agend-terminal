@@ -94,11 +94,15 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     };
 
     let reg = agent::lock_registry(ctx.registry);
-    if reg.contains_key(target) {
+    let delivery_mode = if reg.contains_key(target) {
         drop(reg);
         crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
-    }
-    json!({"ok": true})
+        "pty"
+    } else {
+        drop(reg);
+        "inbox_only"
+    };
+    json!({"ok": true, "delivery_mode": delivery_mode})
 }
 
 #[cfg(test)]
@@ -165,6 +169,12 @@ mod tests {
         assert_eq!(
             result["ok"], true,
             "fleet.yaml-defined instance must be accepted: {result}"
+        );
+        // Not in registry → inbox_only (not pty)
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "inactive target must get inbox_only delivery: {result}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

@@ -135,7 +135,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 }),
             ) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    json!({"target": target, "delivery_mode": "pty"})
+                    let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
+                    json!({"target": target, "delivery_mode": dm})
                 }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
                 Err(e) => {
