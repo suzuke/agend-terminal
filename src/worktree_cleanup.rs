@@ -129,7 +129,7 @@ pub fn sweep_from_registry(
     let mut repos: HashSet<PathBuf> = HashSet::new();
     let mut active_dirs: Vec<PathBuf> = Vec::new();
 
-    for (_name, (working_dir, worktree_source)) in configs {
+    for (working_dir, worktree_source) in configs.values() {
         if let Some(src) = worktree_source {
             repos.insert(src.clone());
         }
