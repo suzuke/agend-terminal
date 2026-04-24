@@ -335,6 +335,12 @@ fn list_instances_falls_back_when_daemon_down() {
 #[test]
 fn send_to_instance_falls_back_when_daemon_down() {
     let home = temp_home("send-fallback");
+    // Target must exist in fleet.yaml for validation to pass.
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  other-agent:\n    backend: claude\n  sender:\n    backend: claude\n",
+    )
+    .ok();
     let result = call_tool_as(
         &home,
         "sender",

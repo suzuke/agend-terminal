@@ -1,7 +1,8 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
 use crate::agent_ops::{
-    cleanup_working_dir, list_agents, merge_metadata, save_metadata, send_to, validate_branch,
+    cleanup_working_dir, list_agents, merge_metadata, save_metadata, save_metadata_batch, send_to,
+    validate_branch,
 };
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::telegram;
@@ -138,6 +139,14 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
                 Err(e) => {
+                    // Validate target exists in fleet.yaml before fallback delivery.
+                    let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                        .ok()
+                        .map(|c| c.instances.contains_key(target))
+                        .unwrap_or(false);
+                    if !in_fleet {
+                        return json!({"error": format!("target instance '{target}' not found (API unavailable: {e})")});
+                    }
                     // Resolve thread inheritance for direct delivery
                     let mut resolved_thread = thread_id.map(String::from);
                     let resolved_parent = parent_id.map(String::from);
@@ -175,13 +184,20 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             let Some(sender) = sender.as_ref() else {
                 return err_needs_identity(tool);
             };
-            let target = match args["target_instance"].as_str() {
+            let raw_target = match args["target_instance"].as_str() {
                 Some(t) => t,
                 None => return json!({"error": "missing 'target_instance'"}),
             };
-            if let Err(e) = crate::agent::validate_name(target) {
+            if let Err(e) = crate::agent::validate_name(raw_target) {
                 return json!({"error": e});
             }
+            // Resolve team name → orchestrator (align with task create behaviour).
+            let resolved_target = match crate::teams::resolve_team_orchestrator(&home, raw_target) {
+                Ok(Some(orch)) => orch,
+                Ok(None) => raw_target.to_string(), // not a team, use as-is
+                Err(e) => return json!({"error": e}),
+            };
+            let target = resolved_target.as_str();
             let task = match args["task"].as_str() {
                 Some(t) => t,
                 None => return json!({"error": "missing 'task'"}),
@@ -690,13 +706,25 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             };
             let condition = args["condition"].as_str().unwrap_or("");
             if condition.is_empty() {
-                save_metadata(&home, instance_name, "waiting_on", json!(null));
-                save_metadata(&home, instance_name, "waiting_on_since", json!(null));
+                save_metadata_batch(
+                    &home,
+                    instance_name,
+                    &[
+                        ("waiting_on", json!(null)),
+                        ("waiting_on_since", json!(null)),
+                    ],
+                );
                 json!({"cleared": true})
             } else {
                 let now = chrono::Utc::now().to_rfc3339();
-                save_metadata(&home, instance_name, "waiting_on", json!(condition));
-                save_metadata(&home, instance_name, "waiting_on_since", json!(&now));
+                save_metadata_batch(
+                    &home,
+                    instance_name,
+                    &[
+                        ("waiting_on", json!(condition)),
+                        ("waiting_on_since", json!(&now)),
+                    ],
+                );
                 json!({"waiting_on": condition, "since": now})
             }
         }
@@ -1830,7 +1858,7 @@ instances:
         );
         assert_eq!(result["waiting_on"], "review from at-dev-4");
 
-        // Value-source pin: return value `since` must match metadata file
+        // Value-source pin: return value `since` must match metadata file.
         let returned_since = result["since"].as_str().expect("since in return");
         let meta: Value = serde_json::from_str(
             &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
@@ -2120,6 +2148,80 @@ instances:
             "pending_pickup_ids must be cleared after drain"
         );
 
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Sprint 5: target validation + team routing ---
+
+    #[test]
+    fn test_send_to_nonexistent_target_returns_error_and_no_inbox() {
+        // F1+F2: daemon down + ghost target → error, NO inbox file created.
+        let _g = fleet_test_guard();
+        let home = tmp_home("send-nonexist");
+        std::env::set_var("AGEND_HOME", &home);
+        // No fleet.yaml → target doesn't exist anywhere.
+        let result = handle_tool(
+            "send_to_instance",
+            &json!({"instance_name": "ghost-agent", "message": "hello"}),
+            "sender",
+        );
+        assert!(
+            result.get("error").is_some(),
+            "send to nonexistent target must return error, got: {result}"
+        );
+        let ghost_inbox = home.join("inbox").join("ghost-agent.jsonl");
+        assert!(
+            !ghost_inbox.exists(),
+            "inbox file must NOT be created for nonexistent target"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
+        // F3: delegate_task to team name → resolved to orchestrator,
+        // verify the actual inbox recipient is the orchestrator.
+        let _g = fleet_test_guard();
+        let home = tmp_home("delegate-team");
+        // fleet.yaml for instance validation, teams.json for team resolution
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  dev-lead:\n    backend: claude\n  dev-impl:\n    backend: claude\n",
+        )
+        .ok();
+        // teams.json is the runtime store used by resolve_team_orchestrator
+        std::fs::write(
+            home.join("teams.json"),
+            r#"{"schema_version":1,"teams":[{"name":"dev","members":["dev-lead","dev-impl"],"orchestrator":"dev-lead","description":null,"created_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "dev", "task": "test task"}),
+            "dev-impl",
+        );
+        // Should not error — team resolved to dev-lead.
+        let err = result["error"].as_str().unwrap_or("");
+        assert!(
+            !err.contains("not found"),
+            "delegate_task to team name should resolve, got error: {err}"
+        );
+        // Result should target dev-lead (orchestrator), not "dev" (team).
+        assert_eq!(
+            result["target"].as_str().unwrap_or(""),
+            "dev-lead",
+            "delegate_task must resolve team to orchestrator in result"
+        );
+        // No inbox for the team name itself.
+        let team_inbox = home.join("inbox").join("dev.jsonl");
+        assert!(
+            !team_inbox.exists(),
+            "inbox must NOT be created for team name 'dev'"
+        );
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }

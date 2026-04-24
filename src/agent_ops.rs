@@ -35,6 +35,16 @@ pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str)
         Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
+            // Validate target exists in fleet.yaml before writing to inbox.
+            // Without this, daemon-down + ghost target silently creates an
+            // unread inbox file — the exact silent-failure this PR eliminates.
+            let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                .ok()
+                .map(|c| c.instances.contains_key(target))
+                .unwrap_or(false);
+            if !in_fleet {
+                return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {e})")});
+            }
             let submit_key = get_submit_key(home, target);
             crate::inbox::deliver(
                 home,
@@ -79,6 +89,26 @@ pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) 
         .map(|c| serde_json::from_str(&c).unwrap_or(json!({})))
         .unwrap_or(json!({}));
     meta[key] = value;
+    let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
+    let tmp_path = meta_path.with_extension("json.tmp");
+    if std::fs::write(&tmp_path, &content).is_ok() {
+        let _ = std::fs::rename(&tmp_path, &meta_path);
+    }
+}
+
+/// Persist multiple metadata key/value pairs in a single atomic write.
+/// Avoids the race condition where two sequential `save_metadata` calls
+/// can interleave on Windows (the second read-modify-write reads stale data).
+pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, Value)]) {
+    let meta_dir = home.join("metadata");
+    std::fs::create_dir_all(&meta_dir).ok();
+    let meta_path = meta_dir.join(format!("{instance_name}.json"));
+    let mut meta: Value = std::fs::read_to_string(&meta_path)
+        .map(|c| serde_json::from_str(&c).unwrap_or(json!({})))
+        .unwrap_or(json!({}));
+    for (key, value) in entries {
+        meta[*key] = value.clone();
+    }
     let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
     let tmp_path = meta_path.with_extension("json.tmp");
     if std::fs::write(&tmp_path, &content).is_ok() {

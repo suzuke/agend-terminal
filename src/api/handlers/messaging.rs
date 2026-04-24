@@ -28,6 +28,23 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     if from == target {
         return json!({"ok": false, "error": "cannot send to self"});
     }
+
+    // Validate target exists: check runtime registry OR fleet.yaml definitions.
+    // Messages to non-existent targets would silently land in an unread inbox file.
+    {
+        let reg = agent::lock_registry(ctx.registry);
+        let in_registry = reg.contains_key(target);
+        drop(reg);
+        if !in_registry {
+            let in_fleet = crate::fleet::FleetConfig::load(&ctx.home.join("fleet.yaml"))
+                .ok()
+                .map(|c| c.instances.contains_key(target))
+                .unwrap_or(false);
+            if !in_fleet {
+                return json!({"ok": false, "error": format!("target instance '{target}' not found (not in registry or fleet.yaml)")});
+            }
+        }
+    }
     let msg = {
         let mut thread_id = params["thread_id"].as_str().map(String::from);
         let parent_id = params["parent_id"].as_str().map(String::from);
@@ -81,4 +98,86 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
     }
     json!({"ok": true})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    fn test_ctx(home: &std::path::Path) -> HandlerCtx<'_> {
+        // Leak registries for 'static — acceptable in tests.
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home,
+        }
+    }
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agend-msg-test-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn test_send_to_nonexistent_target_returns_error() {
+        let home = tmp_home("nonexist");
+        // No fleet.yaml → target not in registry or fleet
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({"from": "sender", "target": "ghost", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], false);
+        assert!(
+            result["error"].as_str().unwrap_or("").contains("not found"),
+            "must return not-found error for nonexistent target: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_send_to_fleet_defined_instance_succeeds() {
+        let home = tmp_home("fleet-defined");
+        // Define instance in fleet.yaml but don't start it
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  offline-agent:\n    backend: claude\n",
+        )
+        .ok();
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({"from": "sender", "target": "offline-agent", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], true,
+            "fleet.yaml-defined instance must be accepted: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_send_to_self_rejected() {
+        let home = tmp_home("self-send");
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({"from": "agent1", "target": "agent1", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], false);
+        assert!(result["error"].as_str().unwrap_or("").contains("self"));
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
