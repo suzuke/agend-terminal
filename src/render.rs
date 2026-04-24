@@ -1325,6 +1325,18 @@ pub fn render_tasks(
     .split(inner);
 
     let col_titles = ["Backlog", "Open", "In Progress", "Done"];
+    let done_visible = columns.get(3).map(|c| c.len()).unwrap_or(0);
+    let col_title_strs: Vec<String> = col_titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            if i == 3 {
+                format!(" {} ({}/14d) ", t, done_visible)
+            } else {
+                format!(" {} ({}) ", t, columns.get(i).map(|c| c.len()).unwrap_or(0))
+            }
+        })
+        .collect();
     let col_colors = [Color::Gray, Color::Green, Color::Yellow, Color::DarkGray];
 
     for (ci, (tasks, area)) in columns.iter().zip(col_areas.iter()).enumerate() {
@@ -1338,7 +1350,7 @@ pub fn render_tasks(
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
             .title(Span::styled(
-                format!(" {} ({}) ", col_titles[ci], tasks.len()),
+                &col_title_strs[ci],
                 Style::default()
                     .fg(if is_active {
                         Color::Blue

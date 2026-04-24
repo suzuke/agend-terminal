@@ -263,11 +263,24 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let store = load(home);
             let filter_assignee = args["filter_assignee"].as_str();
             let filter_status = args["filter_status"].as_str();
+            let now = chrono::Utc::now();
+            let done_ttl = chrono::Duration::days(14);
             let filtered: Vec<_> = store
                 .tasks
                 .iter()
                 .filter(|t| filter_assignee.is_none_or(|a| t.assignee.as_deref() == Some(a)))
                 .filter(|t| filter_status.is_none_or(|s| t.status == s))
+                .filter(|t| {
+                    // When no explicit status filter, hide done tasks older than 14d
+                    if filter_status.is_some() || t.status != "done" {
+                        return true;
+                    }
+                    chrono::DateTime::parse_from_rfc3339(&t.updated_at)
+                        .map(|dt| {
+                            now.signed_duration_since(dt.with_timezone(&chrono::Utc)) < done_ttl
+                        })
+                        .unwrap_or(true)
+                })
                 .collect();
             serde_json::json!({"tasks": filtered})
         }
@@ -1406,6 +1419,154 @@ mod tests {
             r["error"].as_str().unwrap().contains("not authorized"),
             "non-owner must not update assigned task: {r}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Sprint 8 PR-M: Done TTL filter ---
+
+    #[test]
+    fn test_list_default_hides_done_older_than_14d() {
+        let home = tmp_home("done-ttl-hide");
+        // Create two tasks, mark both done
+        let r1 = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "old done"}),
+        );
+        let id1 = r1["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "claim", "id": id1}),
+        );
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "done", "id": id1, "result": "ok"}),
+        );
+
+        let r2 = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "recent done"}),
+        );
+        let id2 = r2["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "claim", "id": id2}),
+        );
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "done", "id": id2, "result": "ok"}),
+        );
+
+        // Backdate the first task's updated_at to 15 days ago
+        let _ = crate::store::mutate_versioned(
+            &crate::store::store_path(&home, "tasks.json"),
+            |store: &mut TaskStore| {
+                if let Some(t) = store.tasks.iter_mut().find(|t| t.id == id1) {
+                    t.updated_at = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
+                }
+                Ok(())
+            },
+        );
+
+        // Default list (no filter_status) should hide the old done task
+        let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1, "old done task must be hidden");
+        assert_eq!(tasks[0]["title"], "recent done");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_list_done_filter_returns_all() {
+        let home = tmp_home("done-ttl-all");
+        let r1 = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "old"}),
+        );
+        let id1 = r1["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "claim", "id": id1}),
+        );
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "done", "id": id1, "result": "ok"}),
+        );
+
+        let r2 = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "new"}),
+        );
+        let id2 = r2["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "claim", "id": id2}),
+        );
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "done", "id": id2, "result": "ok"}),
+        );
+
+        let _ = crate::store::mutate_versioned(
+            &crate::store::store_path(&home, "tasks.json"),
+            |store: &mut TaskStore| {
+                if let Some(t) = store.tasks.iter_mut().find(|t| t.id == id1) {
+                    t.updated_at = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
+                }
+                Ok(())
+            },
+        );
+
+        // Explicit filter_status=done returns ALL done tasks regardless of age
+        let listed = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "list", "filter_status": "done"}),
+        );
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "filter_status=done must return all done tasks"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_list_non_done_always_returns() {
+        let home = tmp_home("done-ttl-nondone");
+        // Create open + claimed tasks — they should always appear
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "open task"}),
+        );
+        let r2 = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "claimed task"}),
+        );
+        let id2 = r2["id"].as_str().unwrap().to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "claim", "id": id2}),
+        );
+
+        let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2, "non-done tasks must always appear");
         std::fs::remove_dir_all(&home).ok();
     }
 }
