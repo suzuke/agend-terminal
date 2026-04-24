@@ -124,6 +124,31 @@ impl ResumeMode {
     }
 }
 
+impl SpawnMode {
+    /// Downgrade `Resume` to `Fresh` when the backend has no resumable session
+    /// in `working_dir`. A no-op for `Fresh` inputs and for backends / paths
+    /// where detection is unavailable.
+    ///
+    /// Call this at every "auto-resume on startup / session-restore" site so
+    /// the Claude "opened-but-idle pane" case never issues `--continue` (which
+    /// would error out and flash the failure into the pane's vterm before the
+    /// daemon's crash-respawn falls back to Fresh).
+    pub fn downgraded_for(self, command: &str, working_dir: Option<&std::path::Path>) -> Self {
+        if !matches!(self, SpawnMode::Resume) {
+            return self;
+        }
+        let Some(wd) = working_dir else { return self };
+        let Some(backend) = Backend::from_command(command) else {
+            return self;
+        };
+        if backend.has_resumable_session(wd) {
+            self
+        } else {
+            SpawnMode::Fresh
+        }
+    }
+}
+
 /// Preset configuration for a backend.
 #[derive(Debug, Clone)]
 pub struct BackendPreset {
@@ -335,6 +360,29 @@ impl Backend {
         ]
     }
 
+    /// Whether the previous session in `working_dir` is actually resumable.
+    ///
+    /// On daemon (re)start every agent is spawned with [`SpawnMode::Resume`]
+    /// (`spawn_and_register_agent` in `daemon/mod.rs`). Some backends — Claude
+    /// in particular — only persist a session file once the user sends a
+    /// message; if a pane was opened but never used, `claude --continue` fails
+    /// with "No conversation found to continue" and the daemon falls back to a
+    /// Fresh spawn via crash-respawn — but the failure briefly renders into
+    /// the pane's vterm before recovery, which looks broken.
+    ///
+    /// Returning `false` lets callers downgrade Resume → Fresh up front so the
+    /// user never sees the failure flash. Backends without their own detection
+    /// here return `true` (optimistic) and rely on the existing crash-respawn
+    /// path as a safety net.
+    pub fn has_resumable_session(&self, working_dir: &std::path::Path) -> bool {
+        match self {
+            Backend::ClaudeCode => {
+                claude_session::has_resumable(working_dir, &claude_session::default_projects_root())
+            }
+            _ => true,
+        }
+    }
+
     /// Format a `--model` value for this backend.
     /// OpenCode requires `provider/model` format — auto-prefixes `anthropic/`
     /// if the value doesn't already contain a `/`.
@@ -450,6 +498,194 @@ impl Backend {
             Backend::OpenCode => "1.4.0",
             Backend::Gemini => "0.37.1",
             Backend::Shell | Backend::Raw(_) => "n/a",
+        }
+    }
+}
+
+/// Detection helpers for `Backend::ClaudeCode`'s on-disk session storage.
+///
+/// Claude Code persists every conversation under
+/// `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`. The encoding is
+/// undocumented but stable in practice: every char that isn't `[A-Za-z0-9-]`
+/// is replaced with `-` (so `/Users/x/.foo/bar` → `-Users-x--foo-bar`).
+mod claude_session {
+    use std::io::{BufRead, BufReader};
+    use std::path::{Path, PathBuf};
+
+    /// `~/.claude/projects/`. Falls back to `$TMPDIR/.claude/projects` when
+    /// `$HOME` is unresolvable — that path almost certainly won't exist and
+    /// `has_resumable` will return false, which is the correct conservative
+    /// answer.
+    pub fn default_projects_root() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".claude")
+            .join("projects")
+    }
+
+    /// Whether `working_dir` has a resumable Claude session under
+    /// `projects_root`.
+    ///
+    /// "Resumable" here means: at least one `.jsonl` in the project dir has a
+    /// `"type":"user"` entry. Claude writes metadata-only files
+    /// (`custom-title`, `agent-name`, `pr-link`) before the first user
+    /// message, and `claude --continue` cannot resume from those.
+    pub fn has_resumable(working_dir: &Path, projects_root: &Path) -> bool {
+        let project_dir = projects_root.join(encode_project_dir(working_dir));
+        let Ok(entries) = std::fs::read_dir(&project_dir) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+            .any(|e| jsonl_has_user_entry(&e.path()))
+    }
+
+    /// Encode an absolute path the way Claude names project dirs.
+    fn encode_project_dir(path: &Path) -> String {
+        path.to_string_lossy()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+
+    /// Streamed scan: returns true on the first line containing
+    /// `"type":"user"`. Line-buffered, so a multi-MB session file aborts after
+    /// the first match without loading the rest into memory.
+    fn jsonl_has_user_entry(path: &Path) -> bool {
+        let Ok(file) = std::fs::File::open(path) else {
+            return false;
+        };
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .any(|line| line.contains("\"type\":\"user\""))
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod tests {
+        use super::*;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        fn unique_tmp(label: &str) -> PathBuf {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "agend-claude-session-test-{}-{}-{}",
+                std::process::id(),
+                label,
+                id
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn encode_project_dir_matches_claudes_scheme() {
+            // Real path encoding seen under ~/.claude/projects/ on macOS:
+            // /Users/x/.agend-terminal/workspace/general
+            //   → -Users-x--agend-terminal-workspace-general
+            assert_eq!(
+                encode_project_dir(Path::new("/Users/x/.agend-terminal/workspace/general")),
+                "-Users-x--agend-terminal-workspace-general"
+            );
+            // Underscore is not in [A-Za-z0-9-] so it becomes `-`.
+            assert_eq!(
+                encode_project_dir(Path::new("/tmp/with_underscore")),
+                "-tmp-with-underscore"
+            );
+            // Existing dashes pass through unchanged.
+            assert_eq!(
+                encode_project_dir(Path::new("/private/tmp/agend-terminal-test")),
+                "-private-tmp-agend-terminal-test"
+            );
+        }
+
+        #[test]
+        fn missing_project_dir_is_not_resumable() {
+            let root = unique_tmp("missing");
+            assert!(!has_resumable(Path::new("/nonexistent/work/dir"), &root));
+        }
+
+        #[test]
+        fn empty_project_dir_is_not_resumable() {
+            let root = unique_tmp("empty");
+            let work = Path::new("/work/empty");
+            std::fs::create_dir_all(root.join(encode_project_dir(work))).unwrap();
+            assert!(!has_resumable(work, &root));
+        }
+
+        #[test]
+        fn metadata_only_jsonl_is_not_resumable() {
+            // Mirrors a real "opened-but-never-used" session captured on
+            // disk: only custom-title + agent-name lines, no user entry.
+            let root = unique_tmp("metadata");
+            let work = Path::new("/work/metadata");
+            let proj = root.join(encode_project_dir(work));
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("a.jsonl"),
+                "{\"type\":\"custom-title\",\"customTitle\":\"x\",\"sessionId\":\"a\"}\n\
+                 {\"type\":\"agent-name\",\"agentName\":\"x\",\"sessionId\":\"a\"}\n",
+            )
+            .unwrap();
+            assert!(!has_resumable(work, &root));
+        }
+
+        #[test]
+        fn user_bearing_jsonl_is_resumable() {
+            let root = unique_tmp("user");
+            let work = Path::new("/work/user");
+            let proj = root.join(encode_project_dir(work));
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("a.jsonl"),
+                "{\"type\":\"file-history-snapshot\",\"sessionId\":\"a\"}\n\
+                 {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+            )
+            .unwrap();
+            assert!(has_resumable(work, &root));
+        }
+
+        #[test]
+        fn mixed_dir_with_any_user_jsonl_is_resumable() {
+            // Multiple sessions in the same project dir: one metadata-only,
+            // one with a user entry. Either order should resolve to true.
+            let root = unique_tmp("mixed");
+            let work = Path::new("/work/mixed");
+            let proj = root.join(encode_project_dir(work));
+            std::fs::create_dir_all(&proj).unwrap();
+            std::fs::write(
+                proj.join("metadata.jsonl"),
+                "{\"type\":\"custom-title\",\"customTitle\":\"x\",\"sessionId\":\"a\"}\n",
+            )
+            .unwrap();
+            std::fs::write(
+                proj.join("real.jsonl"),
+                "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+            )
+            .unwrap();
+            assert!(has_resumable(work, &root));
+        }
+
+        #[test]
+        fn non_jsonl_files_are_ignored() {
+            let root = unique_tmp("nonjsonl");
+            let work = Path::new("/work/nonjsonl");
+            let proj = root.join(encode_project_dir(work));
+            std::fs::create_dir_all(&proj).unwrap();
+            // A `.txt` file with `"type":"user"` text must not count.
+            std::fs::write(proj.join("note.txt"), "{\"type\":\"user\"}\n").unwrap();
+            assert!(!has_resumable(work, &root));
         }
     }
 }

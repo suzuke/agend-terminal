@@ -385,11 +385,17 @@ fn spawn_one(
     spawn_mode: crate::backend::SpawnMode,
     work_dir: &Path,
     size: (u16, u16),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<crate::backend::SpawnMode> {
     std::fs::create_dir_all(work_dir).ok();
     let preset_submit_key = crate::backend::Backend::from_command(backend)
         .map(|b| b.preset().submit_key)
         .unwrap_or("\r");
+    // No-op when caller already passed Fresh; downgrades Resume → Fresh when
+    // there is no resumable session in `work_dir` (see
+    // `SpawnMode::downgraded_for`). Returned so callers (e.g. the
+    // `create_instance` API handler) can see the actual mode used and gate
+    // post-spawn behavior like the "skip broadcast on Resume" rule.
+    let spawn_mode = spawn_mode.downgraded_for(backend, Some(work_dir));
     agent::spawn_agent(
         &agent::SpawnConfig {
             name,
@@ -414,7 +420,7 @@ fn spawn_one(
         .name(format!("{n}_tui"))
         .spawn(move || crate::daemon::serve_agent_tui(&n, &rdir, &reg))
         .ok();
-    Ok(())
+    Ok(spawn_mode)
 }
 
 /// Send a request to the daemon API and read one NDJSON response.

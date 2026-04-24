@@ -928,12 +928,17 @@ fn spawn_and_register_agent(
     );
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    // Default to Resume so daemon (re)starts pick up where each agent left off,
+    // but downgrade when the backend reports nothing to resume — see
+    // `SpawnMode::downgraded_for` for the why.
+    let spawn_mode =
+        crate::backend::SpawnMode::Resume.downgraded_for(command, working_dir.as_deref());
     if let Err(e) = agent::spawn_agent(
         &agent::SpawnConfig {
             name,
             backend_command: command,
             args,
-            spawn_mode: crate::backend::SpawnMode::Resume,
+            spawn_mode,
             cols,
             rows,
             env: env.as_ref(),
