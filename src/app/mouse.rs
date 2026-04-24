@@ -540,7 +540,7 @@ mod tests {
         // Drag over tab 1. Tab 0 is " a* " (~5 cols).
         let event = MouseEvent {
             kind: MouseEventKind::Drag(MouseButton::Left),
-            column: 7,
+            column: 6,
             row: 0,
             modifiers: KeyModifiers::empty(),
         };
