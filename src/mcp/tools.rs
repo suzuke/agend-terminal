@@ -48,7 +48,9 @@ fn comm_tools() -> Vec<Value> {
                 "task_id": {"type": "string", "description": "Task board ID for correlation"},
                 "thread_id": {"type": "string"}, "parent_id": {"type": "string"},
                 "interrupt": {"type": "boolean", "description": "Override busy gate (requires reason)"},
-                "reason": {"type": "string", "description": "Reason for interrupt (required when interrupt=true)"}
+                "reason": {"type": "string", "description": "Reason for interrupt (required when interrupt=true)"},
+                "second_reviewer": {"type": "boolean", "description": "Signal that this dispatch requests dual review (§3.5)"},
+                "second_reviewer_reason": {"type": "string", "description": "Reason for dual review (required when second_reviewer=true)"}
             }, "required": ["target_instance", "task"]}}),
         json!({"name": "report_result", "description": "Report results back to the delegating instance.",
             "inputSchema": {"type": "object", "properties": {
