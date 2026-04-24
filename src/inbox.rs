@@ -377,7 +377,7 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
     messages
 }
 
-pub const INLINE_THRESHOLD: usize = 500;
+// INLINE_THRESHOLD removed — deliver() now always enqueues regardless of length.
 
 /// Count unread messages (read_at == None) for an agent.
 pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
@@ -407,6 +407,16 @@ pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<
 /// Size threshold for header-only PTY injection. Messages with body > this
 /// value inject only a structured header line; the full body stays in inbox.
 pub const HEADER_SIZE_THRESHOLD: usize = 300;
+
+/// Returns true when the `AGEND_POINTER_ONLY_INJECT` feature flag is set to "1".
+/// When enabled, PTY injection uses header-only format for all messages,
+/// forcing agents to call `inbox` to read content (solves dispatch non-FIFO).
+pub fn pointer_only_inject() -> bool {
+    std::env::var("AGEND_POINTER_ONLY_INJECT")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
 
 /// ANSI-colored header prefix for visual distinction in terminal.
 pub const HEADER_PREFIX: &str = "\x1b[44;97m[AGEND-MSG]\x1b[0m";
@@ -622,8 +632,8 @@ pub fn find_message(home: &Path, msg_id: &str) -> Option<InboxMessage> {
     None
 }
 
-/// Deliver a message: short messages (≤500 chars) inject directly to PTY,
-/// long messages store to inbox + inject truncated notification.
+/// Deliver a message: always enqueue to inbox JSONL for persistence,
+/// then inject to PTY (inline or pointer-only depending on feature flag).
 pub fn deliver(
     home: &Path,
     agent_name: &str,
@@ -632,35 +642,49 @@ pub fn deliver(
     _submit_key: &str,
     kind: Option<String>,
 ) {
-    if text.chars().count() <= INLINE_THRESHOLD {
-        notify_agent(home, agent_name, source, text);
+    let msg = InboxMessage {
+        schema_version: 0,
+        id: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        task_id: None,
+        from: source.to_string(),
+        text: text.to_string(),
+        kind,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        delivery_mode: None,
+    };
+    let _ = enqueue(home, agent_name, msg);
+    notify_agent(home, agent_name, source, text);
+}
+
+/// Pure function: build the notification string that will be injected to PTY.
+/// `pointer_only=true` → header-only (no body); `false` → inline text.
+pub fn format_notification_for_inject(
+    pointer_only: bool,
+    source: &NotifySource<'_>,
+    text: &str,
+) -> String {
+    if pointer_only {
+        format!(
+            "[{source}] [AGEND-MSG] size={} (use inbox tool){}",
+            text.len(),
+            source.reply_hint()
+        )
     } else {
-        let msg = InboxMessage {
-            schema_version: 0,
-            id: None,
-            read_at: None,
-            thread_id: None,
-            parent_id: None,
-            task_id: None,
-            from: source.to_string(),
-            text: text.to_string(),
-            kind,
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            delivery_mode: None,
+        let display_text = if text.chars().count() > 200 {
+            let truncated: String = text.chars().take(200).collect();
+            format!("{truncated}... (run: agend-terminal agent inbox)")
+        } else {
+            text.to_string()
         };
-        let _ = enqueue(home, agent_name, msg);
-        notify_agent(home, agent_name, source, text);
+        format!("[{source}] {display_text}{}", source.reply_hint())
     }
 }
 
 pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
-    let display_text = if text.chars().count() > 200 {
-        let truncated: String = text.chars().take(200).collect();
-        format!("{truncated}... (run: agend-terminal agent inbox)")
-    } else {
-        text.to_string()
-    };
-    let notification = format!("[{source}] {display_text}{}", source.reply_hint());
+    let notification = format_notification_for_inject(pointer_only_inject(), source, text);
     compose_aware_inject(home, agent_name, &notification);
 }
 
@@ -918,10 +942,10 @@ mod tests {
     }
 
     #[test]
-    fn deliver_short_message_does_not_enqueue() {
+    fn deliver_short_message_also_enqueues() {
         let home = tmp_home("deliver-short");
-        // deliver with short text — should NOT write to inbox file
-        // (notify_agent will fail because no daemon, but enqueue should not be called)
+        // deliver with short text — must enqueue to inbox for persistence
+        // (previously skipped enqueue for ≤500 chars, causing data loss)
         deliver(
             &home,
             "agent1",
@@ -931,7 +955,11 @@ mod tests {
             None,
         );
         let msgs = drain(&home, "agent1");
-        assert!(msgs.is_empty(), "short messages bypass inbox");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "short messages must be enqueued for persistence"
+        );
 
         fs::remove_dir_all(&home).ok();
     }
@@ -939,7 +967,7 @@ mod tests {
     #[test]
     fn deliver_long_message_enqueues() {
         let home = tmp_home("deliver-long");
-        let long_text: String = "x".repeat(INLINE_THRESHOLD + 100);
+        let long_text: String = "x".repeat(600);
         deliver(
             &home,
             "agent1",
@@ -1820,5 +1848,62 @@ mod tests {
         assert!(!h.contains('\r'), "CR in value must be sanitized: {h:?}");
         assert!(h.contains("kind=evil kind"));
         assert!(h.contains("key=val  ue"));
+    }
+
+    /// Serialize tests that mutate AGEND_POINTER_ONLY_INJECT env var.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_pointer_only_feature_flag() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::set_var("AGEND_POINTER_ONLY_INJECT", "1");
+        assert!(pointer_only_inject(), "flag=1 must enable pointer-only");
+        std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
+    }
+
+    #[test]
+    fn test_pointer_only_disabled_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
+        assert!(!pointer_only_inject(), "unset flag must default to false");
+        std::env::set_var("AGEND_POINTER_ONLY_INJECT", "0");
+        assert!(!pointer_only_inject(), "flag=0 must be disabled");
+        std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
+    }
+
+    #[test]
+    fn test_notify_agent_pointer_only_emits_header_not_body() {
+        // Pure function test: pointer_only=true → output contains [AGEND-MSG]
+        // + size= but NOT the body text.
+        let source = NotifySource::Agent("sender");
+        let s = format_notification_for_inject(true, &source, "secret body text");
+        assert!(
+            s.contains("[AGEND-MSG]"),
+            "pointer mode must contain [AGEND-MSG]: {s}"
+        );
+        assert!(s.contains("size="), "pointer mode must contain size=: {s}");
+        assert!(
+            !s.contains("secret body text"),
+            "pointer mode must NOT contain body: {s}"
+        );
+        assert!(
+            s.contains("use inbox tool"),
+            "pointer mode must direct to inbox: {s}"
+        );
+    }
+
+    #[test]
+    fn test_notify_agent_default_inline_behavior() {
+        // Pure function test: pointer_only=false → output contains the body text.
+        let source = NotifySource::Agent("sender");
+        let s = format_notification_for_inject(false, &source, "inline text");
+        assert!(
+            s.contains("inline text"),
+            "default mode must contain body: {s}"
+        );
+        assert!(
+            !s.contains("[AGEND-MSG]"),
+            "default mode must NOT contain [AGEND-MSG] header: {s}"
+        );
     }
 }
