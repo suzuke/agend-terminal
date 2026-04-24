@@ -166,6 +166,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         thread_id: resolved_thread,
                         parent_id: resolved_parent,
                         task_id: None,
+                        interrupt_meta: None,
                         from: format!("from:{}", sender.as_str()),
                         text: text.to_string(),
                         kind: None,
@@ -238,6 +239,11 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             }
 
             let mut msg = format!("[delegate_task] {task}");
+            if interrupt {
+                if let Some(r) = reason {
+                    msg.push_str(&format!("\n\n⚠️ INTERRUPT (reason: {r})"));
+                }
+            }
             if let Some(tid) = args["task_id"].as_str() {
                 msg.push_str(&format!(" (task id: {tid})"));
             }
@@ -279,6 +285,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         thread_id: None,
                         parent_id: None,
                         task_id: task_id_str.map(String::from),
+                        interrupt_meta: None,
                         delivery_mode: Some("inbox_fallback".to_string()),
                         from: format!("from:{}", sender.as_str()),
                         text: msg.clone(),
@@ -359,6 +366,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             }
             let result = send_to(&home, sender, target, &msg, "report");
             if is_ok_result(&result) {
+                // Mark dispatch as completed so timeout sweep doesn't false-warn.
+                let cid = args["correlation_id"].as_str();
+                crate::dispatch_tracking::mark_completed(&home, cid, sender.as_str());
                 // Fleet visibility. `correlation_id` is caller-chosen
                 // (e.g. "AGD-42"); an empty string collapses to `None`
                 // so the renderer omits the id rather than showing "()".
@@ -779,6 +789,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     thread_id: None,
                     parent_id: None,
                     task_id: None,
+                    interrupt_meta: None,
                     from: "system:replace".to_string(),
                     text: format!("[handover] {handover}"),
                     kind: Some("handover".to_string()),
@@ -2159,6 +2170,7 @@ instances:
                 thread_id: None,
                 parent_id: None,
                 task_id: None,
+                interrupt_meta: None,
                 from: "user:test".to_string(),
                 text: "hello".to_string(),
                 kind: Some("telegram".to_string()),
@@ -2212,6 +2224,7 @@ instances:
                 thread_id: None,
                 parent_id: None,
                 task_id: None,
+                interrupt_meta: None,
                 from: "user:test".to_string(),
                 text: "burst".to_string(),
                 kind: Some("telegram".to_string()),
@@ -2378,6 +2391,7 @@ instances:
             thread_id: None,
             parent_id: None,
             delivery_mode: Some("inbox_fallback".into()),
+            interrupt_meta: None,
             task_id: None,
         };
         let inbox_dir = home.join("inbox");

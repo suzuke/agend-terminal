@@ -105,6 +105,7 @@ mod tests {
                     kind: None,
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     delivery_mode: None,
+                    interrupt_meta: None,
                     read_at: None,
                     thread_id: None,
                     parent_id: None,

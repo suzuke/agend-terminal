@@ -863,6 +863,29 @@ pub fn run_task_maintenance(home: &Path) {
                 crate::dispatch_tracking::DISPATCH_ASK_MINUTES
             ),
         );
+        let tid = a.task_id.as_deref().unwrap_or("unknown");
+        let query = format!(
+            "dispatch stuck check: still working on task_id={tid} (dispatched {}min ago)?",
+            crate::dispatch_tracking::DISPATCH_ASK_MINUTES
+        );
+        let _ = crate::inbox::enqueue(
+            home,
+            &a.to,
+            crate::inbox::InboxMessage {
+                schema_version: 0,
+                id: None,
+                read_at: None,
+                thread_id: None,
+                parent_id: None,
+                task_id: None,
+                from: "system:dispatch".to_string(),
+                text: query,
+                kind: Some("query".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                delivery_mode: None,
+                interrupt_meta: None,
+            },
+        );
     }
 }
 
@@ -904,6 +927,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                     kind: Some("schedule_replay".to_string()),
                     timestamp: now.to_rfc3339(),
                     delivery_mode: None,
+                    interrupt_meta: None,
                     read_at: None,
                     thread_id: None,
                     parent_id: None,

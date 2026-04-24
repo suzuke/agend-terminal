@@ -66,6 +66,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             thread_id,
             parent_id,
             task_id: params["task_id"].as_str().map(String::from),
+            interrupt_meta: None,
             from: format!("from:{from}"),
             text: text.to_string(),
             kind: params
