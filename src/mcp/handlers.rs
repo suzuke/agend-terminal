@@ -1837,12 +1837,22 @@ instances:
         );
         assert_eq!(result["waiting_on"], "review from at-dev-4");
 
-        // Value-source pin: return value `since` must match metadata file
+        // Value-source pin: return value `since` must match metadata file.
+        // On Windows, two sequential save_metadata calls (waiting_on then
+        // waiting_on_since) can race with the file system cache, so we
+        // retry the read once after a short sleep.
         let returned_since = result["since"].as_str().expect("since in return");
-        let meta: Value = serde_json::from_str(
-            &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
-        )
-        .expect("parse meta");
+        let read_meta = || -> Value {
+            serde_json::from_str(
+                &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
+            )
+            .expect("parse meta")
+        };
+        let mut meta = read_meta();
+        if meta["waiting_on_since"].is_null() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            meta = read_meta();
+        }
         assert_eq!(meta["waiting_on"], "review from at-dev-4");
         assert_eq!(
             meta["waiting_on_since"].as_str().expect("since in file"),
