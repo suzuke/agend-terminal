@@ -5,6 +5,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-04-24
+
+### Fixed
+
+- **`cargo install agend-terminal` build failure on 0.4.0** — `src/protocol.rs` does `include_str!("../docs/FLEET-DEV-PROTOCOL-v1.md")` but the file wasn't in the `Cargo.toml` `include` whitelist. The packaged tarball that `cargo publish` ships to crates.io was therefore missing the bundled protocol doc, and verification compile failed with "No such file or directory". GitHub Release binaries (built from the source tree, not the packaged tarball) were unaffected, so v0.4.0's binary downloads still work — but there is no v0.4.0 on crates.io. v0.4.1 is identical to v0.4.0 in source apart from this single packaging fix.
+
 ## [0.4.0] — 2026-04-24
 
 170+ commits since `0.3.2` — multi-agent collaboration plumbing (fleet
@@ -204,7 +210,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/suzuke/agend-terminal/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/suzuke/agend-terminal/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/suzuke/agend-terminal/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/suzuke/agend-terminal/compare/85f2bc3...v0.3.1
