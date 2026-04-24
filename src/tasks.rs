@@ -42,6 +42,42 @@ fn store_path(home: &Path) -> std::path::PathBuf {
     crate::store::store_path(home, "tasks.json")
 }
 
+/// Check if an instance name is known (in fleet.yaml).
+/// Returns true if fleet.yaml doesn't exist (no fleet = no restriction).
+fn instance_exists(home: &Path, name: &str) -> bool {
+    let fleet_path = home.join("fleet.yaml");
+    if !fleet_path.exists() {
+        return true; // no fleet config = no restriction
+    }
+    crate::fleet::FleetConfig::load(&fleet_path)
+        .map(|c| c.instances.contains_key(name))
+        .unwrap_or(true) // parse error = permissive
+}
+
+/// Check if caller is allowed to mutate a task (assignee or orchestrator).
+/// Unassigned tasks can be mutated by anyone.
+fn can_mutate_task(home: &Path, caller: &str, task: &Task) -> bool {
+    match &task.assignee {
+        None => true,
+        Some(assignee) => {
+            if assignee == caller {
+                return true;
+            }
+            // Check if caller is orchestrator of assignee's team
+            if crate::teams::is_orchestrator_of(home, caller, assignee) {
+                return true;
+            }
+            // Check if assignee is a team name and caller is its orchestrator
+            if let Ok(Some(orch)) = crate::teams::resolve_team_orchestrator(home, assignee) {
+                if orch == caller {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
 fn load(home: &Path) -> TaskStore {
     crate::store::load_versioned(
         &store_path(home),
@@ -241,12 +277,25 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 None => return serde_json::json!({"error": "missing 'id'"}),
             };
             let iname = instance_name.to_string();
+            // Verify caller is a known instance
+            if !instance_exists(home, &iname) {
+                return serde_json::json!({"error": format!("instance '{iname}' not found in fleet.yaml")});
+            }
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
+                        // Self re-claim is always ok
+                        if task.status == "claimed" && task.assignee.as_deref() == Some(&iname) {
+                            // no-op re-claim, just update timestamp
+                        } else if task.status != "open" {
+                            anyhow::bail!(
+                                "task '{id}' status is '{}', only 'open' tasks can be claimed",
+                                task.status
+                            );
+                        }
                         task.status = "claimed".to_string();
                         task.assignee = Some(iname.clone());
-                        task.routed_to = None; // agent claims directly
+                        task.routed_to = None;
                         task.updated_at = chrono::Utc::now().to_rfc3339();
                         Ok(true)
                     }
@@ -266,13 +315,19 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 None => return serde_json::json!({"error": "missing 'id'"}),
             };
             let result_text = args["result"].as_str().map(String::from);
+            let caller = instance_name.to_string();
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
+                        if !can_mutate_task(home, &caller, task) {
+                            anyhow::bail!(
+                                "task '{id}' owned by '{}', caller '{caller}' not authorized",
+                                task.assignee.as_deref().unwrap_or("unassigned")
+                            );
+                        }
                         task.status = "done".to_string();
                         task.result.clone_from(&result_text);
                         task.updated_at = chrono::Utc::now().to_rfc3339();
-                        // Re-evaluate dependents so blocked tasks auto-unblock
                         apply_dependency_eval(&mut store.tasks);
                         Ok(true)
                     }
@@ -301,11 +356,23 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             } else {
                 None
             };
+            let caller = instance_name.to_string();
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
+                        if !can_mutate_task(home, &caller, task) {
+                            anyhow::bail!(
+                                "task '{id}' owned by '{}', caller '{caller}' not authorized",
+                                task.assignee.as_deref().unwrap_or("unassigned")
+                            );
+                        }
                         if let Some(ref s) = new_status {
                             task.status = s.clone();
+                            // Release claim: setting status=open clears ownership
+                            if s == "open" {
+                                task.assignee = None;
+                                task.routed_to = None;
+                            }
                         }
                         if let Some(ref p) = new_priority {
                             task.priority = p.clone();
@@ -504,7 +571,7 @@ mod tests {
         assert_eq!(list_all(&home)[0].routed_to.as_deref(), Some("a1"));
         handle(
             &home,
-            "user",
+            "a1",
             &serde_json::json!({"action": "update", "id": id, "assignee": "beta"}),
         );
         let t = &list_all(&home)[0];
@@ -1022,6 +1089,322 @@ mod tests {
         assert!(
             log_content.contains(&id),
             "event_log must reference the task id"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Mutation integrity tests ──
+
+    fn write_fleet_yaml(home: &std::path::Path, instances: &[&str]) {
+        let entries: Vec<String> = instances
+            .iter()
+            .map(|n| format!("  {n}:\n    backend: claude"))
+            .collect();
+        let yaml = format!("instances:\n{}", entries.join("\n"));
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+    }
+
+    #[test]
+    fn test_claim_unknown_instance_rejected() {
+        let home = tmp_home("claim-unknown");
+        write_fleet_yaml(&home, &["known-agent"]);
+        let r = handle(
+            &home,
+            "known-agent",
+            &serde_json::json!({"action": "create", "title": "t"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        // Unknown instance tries to claim
+        let r = handle(
+            &home,
+            "phantom",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        assert!(
+            r["error"].as_str().unwrap().contains("not found in fleet"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_claim_already_claimed_by_other_rejected() {
+        let home = tmp_home("claim-stolen");
+        write_fleet_yaml(&home, &["agent-a", "agent-b"]);
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        // agent-b tries to steal
+        let r = handle(
+            &home,
+            "agent-b",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        assert!(
+            r["error"].as_str().unwrap().contains("only 'open'"),
+            "claimed task must not be claimable by others: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_claim_self_reclaim_ok() {
+        let home = tmp_home("claim-reclaim");
+        write_fleet_yaml(&home, &["agent-a"]);
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        // Re-claim own task → ok
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        assert_eq!(r["status"], "claimed", "self re-claim must succeed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_done_non_assignee_rejected() {
+        let home = tmp_home("done-non-assignee");
+        write_fleet_yaml(&home, &["agent-a", "agent-b"]);
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        // agent-b tries to mark done
+        let r = handle(
+            &home,
+            "agent-b",
+            &serde_json::json!({"action": "done", "id": id}),
+        );
+        assert!(
+            r["error"].as_str().unwrap().contains("not authorized"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_done_assignee_ok() {
+        let home = tmp_home("done-assignee");
+        write_fleet_yaml(&home, &["agent-a"]);
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "done", "id": id, "result": "ok"}),
+        );
+        assert_eq!(r["status"], "done");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_done_orchestrator_ok() {
+        let home = tmp_home("done-orch");
+        write_fleet_yaml(&home, &["lead", "worker"]);
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "dev", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        let r = handle(
+            &home,
+            "lead",
+            &serde_json::json!({"action": "create", "title": "t", "assignee": "worker"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        // Orchestrator marks done on behalf
+        let r = handle(
+            &home,
+            "lead",
+            &serde_json::json!({"action": "done", "id": id, "result": "merged"}),
+        );
+        assert_eq!(
+            r["status"], "done",
+            "orchestrator must be able to mark done"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_update_non_owner_rejected() {
+        let home = tmp_home("update-non-owner");
+        write_fleet_yaml(&home, &["agent-a", "agent-b"]);
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        // agent-b tries to change priority
+        let r = handle(
+            &home,
+            "agent-b",
+            &serde_json::json!({"action": "update", "id": id, "priority": "urgent"}),
+        );
+        assert!(
+            r["error"].as_str().unwrap().contains("not authorized"),
+            "got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_update_orchestrator_ok() {
+        let home = tmp_home("update-orch");
+        write_fleet_yaml(&home, &["lead", "worker"]);
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "dev", "members": ["lead", "worker"], "orchestrator": "lead"}),
+        );
+        let r = handle(
+            &home,
+            "lead",
+            &serde_json::json!({"action": "create", "title": "t", "assignee": "worker"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        handle(
+            &home,
+            "worker",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let r = handle(
+            &home,
+            "lead",
+            &serde_json::json!({"action": "update", "id": id, "priority": "urgent"}),
+        );
+        assert_eq!(
+            r["status"], "updated",
+            "orchestrator must be able to update"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_update_release_claim_ok() {
+        let home = tmp_home("update-release");
+        write_fleet_yaml(&home, &["agent-a"]);
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        // Release claim by setting status=open
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "update", "id": id, "status": "open"}),
+        );
+        assert_eq!(r["status"], "updated");
+        let tasks = list_all(&home);
+        let t = tasks.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(t.status, "open");
+        assert!(t.assignee.is_none(), "release must clear assignee");
+        assert!(t.routed_to.is_none(), "release must clear routed_to");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_claim_blocked_task_rejected() {
+        let home = tmp_home("claim-blocked");
+        write_fleet_yaml(&home, &["agent-a"]);
+        // Create dep (stays open) + child that depends on it (auto-blocked)
+        let r1 = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "dep"}),
+        );
+        let dep_id = r1["id"].as_str().unwrap().to_string();
+        let r2 = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "child", "depends_on": [dep_id]}),
+        );
+        let child_id = r2["id"].as_str().unwrap();
+        // List triggers dep eval → child becomes blocked
+        handle(&home, "agent-a", &serde_json::json!({"action": "list"}));
+        // Try to claim blocked task
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": child_id}),
+        );
+        assert!(
+            r["error"].as_str().unwrap().contains("only 'open'"),
+            "blocked task must not be claimable: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_update_non_owner_on_open_assigned_rejected() {
+        let home = tmp_home("update-non-owner-assigned");
+        write_fleet_yaml(&home, &["agent-a", "agent-b"]);
+        // Create task assigned to agent-a (but not claimed yet → status open)
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t", "assignee": "agent-a"}),
+        );
+        let id = r["id"].as_str().unwrap();
+        // agent-b tries to change priority on agent-a's assigned task
+        let r = handle(
+            &home,
+            "agent-b",
+            &serde_json::json!({"action": "update", "id": id, "priority": "urgent"}),
+        );
+        assert!(
+            r["error"].as_str().unwrap().contains("not authorized"),
+            "non-owner must not update assigned task: {r}"
         );
         std::fs::remove_dir_all(&home).ok();
     }
