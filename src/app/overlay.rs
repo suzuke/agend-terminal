@@ -465,10 +465,7 @@ pub(super) fn handle_key(
                         if let Some(new_idx) = ctx.layout.move_pane_across_tabs(
                             src_tab,
                             src_pane,
-                            crate::layout::MovePlacement::SplitFocused {
-                                to_tab: sel,
-                                dir: dir,
-                            },
+                            crate::layout::MovePlacement::SplitFocused { to_tab: sel, dir },
                         ) {
                             // Follow the pane — the user just pointed at this tab.
                             ctx.layout.goto_tab(new_idx);
