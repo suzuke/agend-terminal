@@ -231,7 +231,7 @@ fn deploy_tools() -> Vec<Value> {
 
 fn ci_tools() -> Vec<Value> {
     vec![
-        json!({"name": "watch_ci", "description": "Watch GitHub Actions CI for a repo. When CI completes (success, failure, or any terminal state), a notification is automatically injected to this agent.",
+        json!({"name": "watch_ci", "description": "Watch GitHub Actions CI for a repo. When CI completes (success, failure, or any terminal state), a notification is automatically injected to this agent. If GITHUB_TOKEN is not set in the daemon's environment, the response includes a `warning` field — the daemon is falling back to unauthenticated polling (60 req/hr, shared by all watches) and notifications will silently drop once the cap is hit.",
             "inputSchema": {"type": "object", "properties": {
                 "repo": {"type": "string", "description": "GitHub repo (owner/repo)"},
                 "branch": {"type": "string", "description": "Branch to watch (default: main)"},
