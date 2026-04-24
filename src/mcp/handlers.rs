@@ -1211,6 +1211,8 @@ mod tests {
     }
 
     // get_submit_key tests
+    use crate::agent_ops::get_submit_key;
+
     #[test]
     fn get_submit_key_default() {
         let home = tmp_home("submit_key");

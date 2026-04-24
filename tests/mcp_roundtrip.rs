@@ -1,6 +1,8 @@
 //! MCP round-trip tests — spawn `agend-terminal mcp` as subprocess,
 //! send JSON-RPC requests via stdin, verify responses.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
