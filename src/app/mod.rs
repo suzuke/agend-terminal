@@ -400,7 +400,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     ref mode,
                     ref view,
                 } => {
-                    render::render_tasks(frame, items, *col, *row, mode, *view);
+                    render::render_tasks(frame, items, *col, *row, mode, *view, &home);
                 }
                 Overlay::ScratchShell { pane } => {
                     render::render_scratch_shell(frame, pane, &registry);

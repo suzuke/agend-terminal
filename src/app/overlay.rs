@@ -1104,4 +1104,80 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // --- Sprint 8 PR-N: Tab routing ---
+
+    #[test]
+    fn test_board_overlay_tab_toggles_view() {
+        let home = std::env::temp_dir().join("overlay_test_tab_toggle");
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+        let mut layout = crate::layout::Layout::new();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &tx,
+            name_counter: &mut name_counter,
+            telegram_state: &tg,
+        };
+        let mut overlay = Overlay::Tasks {
+            items: Vec::new(),
+            col: 0,
+            row: 0,
+            mode: TaskBoardMode::Board,
+            view: BoardView::Tasks,
+        };
+        handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
+        if let Overlay::Tasks { view, .. } = &overlay {
+            assert_eq!(*view, BoardView::Fleet, "Tab must switch to Fleet");
+        } else {
+            panic!("overlay must still be Tasks");
+        }
+        handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
+        if let Overlay::Tasks { view, .. } = &overlay {
+            assert_eq!(*view, BoardView::Tasks, "Tab must switch back to Tasks");
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_non_board_mode_ignores_tab() {
+        let home = std::env::temp_dir().join("overlay_test_tab_ignore");
+        std::fs::create_dir_all(&home).ok();
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = crossbeam::channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let tg: Option<Arc<dyn crate::channel::Channel>> = None;
+        let mut layout = crate::layout::Layout::new();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &tx,
+            name_counter: &mut name_counter,
+            telegram_state: &tg,
+        };
+        let mut overlay = Overlay::Tasks {
+            items: Vec::new(),
+            col: 0,
+            row: 0,
+            mode: TaskBoardMode::Help,
+            view: BoardView::Tasks,
+        };
+        handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
+        if let Overlay::Tasks { view, .. } = &overlay {
+            assert_eq!(
+                *view,
+                BoardView::Tasks,
+                "Tab in Help mode must not switch view"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

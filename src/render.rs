@@ -1250,6 +1250,7 @@ pub fn render_tasks(
     sel_row: usize,
     mode: &crate::app::TaskBoardMode,
     view: crate::app::BoardView,
+    home: &std::path::Path,
 ) {
     use crate::app::{BoardView, TaskBoardMode};
     let count = items.len();
@@ -1261,7 +1262,7 @@ pub fn render_tasks(
     let inner = render_overlay_frame(frame, Color::Blue, &title);
 
     if matches!(view, BoardView::Fleet) {
-        render_fleet_view(frame, items, inner);
+        render_fleet_view(frame, items, inner, home);
         return;
     }
 
@@ -1605,7 +1606,12 @@ pub fn task_board_columns(items: &[crate::tasks::Task]) -> [Vec<&crate::tasks::T
 }
 
 /// Render the Fleet View — agent-centric dashboard grouped by team.
-fn render_fleet_view(frame: &mut Frame, tasks: &[crate::tasks::Task], area: Rect) {
+fn render_fleet_view(
+    frame: &mut Frame,
+    tasks: &[crate::tasks::Task],
+    area: Rect,
+    home: &std::path::Path,
+) {
     // Build agent → claimed task mapping
     let mut agent_tasks: std::collections::HashMap<&str, Vec<&crate::tasks::Task>> =
         std::collections::HashMap::new();
@@ -1618,8 +1624,7 @@ fn render_fleet_view(frame: &mut Frame, tasks: &[crate::tasks::Task], area: Rect
     }
 
     // Load teams for grouping
-    let home = crate::home_dir();
-    let teams = crate::teams::list_all(&home);
+    let teams = crate::teams::list_all(home);
     let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
     let all_instances: Vec<String> = fleet.map(|c| c.instance_names()).unwrap_or_default();
 
@@ -1997,7 +2002,17 @@ mod tests {
             due_at: None,
         }];
         terminal
-            .draw(|frame| render_tasks(frame, &tasks, 0, 0, mode, crate::app::BoardView::Tasks))
+            .draw(|frame| {
+                render_tasks(
+                    frame,
+                    &tasks,
+                    0,
+                    0,
+                    mode,
+                    crate::app::BoardView::Tasks,
+                    std::path::Path::new("/tmp"),
+                )
+            })
             .expect("test terminal draw should succeed");
         let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
