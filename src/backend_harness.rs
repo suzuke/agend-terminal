@@ -471,10 +471,6 @@ mod tests {
         matrix.record_semantics_results("codex", level.clone(), &notes);
         println!("codex: {level:?} — {notes}");
         // Harness measures — any definitive outcome is valid
-        assert!(
-            true, // measurement tool — any outcome is valid evidence
-            "codex probe: {level:?} {notes}"
-        );
         assert_eq!(matrix.backends["codex"].esc_semantics_verified, level);
     }
 
@@ -486,10 +482,6 @@ mod tests {
         matrix.record_semantics_results("gemini", level.clone(), &notes);
         println!("gemini: {level:?} — {notes}");
         // Harness measures — any definitive outcome is valid
-        assert!(
-            true, // measurement tool — any outcome is valid evidence
-            "gemini probe: {level:?} {notes}"
-        );
         assert_eq!(matrix.backends["gemini"].esc_semantics_verified, level);
     }
 
@@ -501,10 +493,6 @@ mod tests {
         matrix.record_semantics_results("claude", level.clone(), &notes);
         println!("claude: {level:?} — {notes}");
         // Harness measures — any definitive outcome is valid
-        assert!(
-            true, // measurement tool — any outcome is valid evidence
-            "claude probe: {level:?} {notes}"
-        );
         assert_eq!(matrix.backends["claude"].esc_semantics_verified, level);
     }
 }
