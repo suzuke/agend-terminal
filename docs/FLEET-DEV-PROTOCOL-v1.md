@@ -255,7 +255,7 @@ Reassign only when:
 
 A reassigned re-audit must reference the finding task ID and must not broaden scope unless the dispatch explicitly says so.
 
-### 3.5.8 Cross-backend behavior claims
+#### 3.5.8 Cross-backend behavior claims
 
 Any PR body claim of cross-backend behavior—e.g. "All CLI backends do X", "supports Y across kiro/Codex/Claude/Gemini", "behavior consistent on Linux/macOS/Windows"—**must** be either:
 
@@ -267,13 +267,13 @@ Any PR body claim of cross-backend behavior—e.g. "All CLI backends do X", "sup
    - PR body must contain phrase `unverified cross-backend claim` plus task ID
    - Backlog task must describe how/when verification will run
 
-#### Reviewer enforcement
+##### Reviewer enforcement
 
 When reviewing a PR with cross-backend claims:
 - Check PR body for both evidence (option 1) and unverified mark (option 2)
 - If neither present, output `REJECTED` with finding "unverified cross-backend claim — must add per-backend test evidence or mark as unverified with backlog reference"
 
-#### Rationale
+##### Rationale
 
 Sprint 9 PR #159 (`interrupt` MCP tool) merged with PR body claim "All CLI backends treat ESC as stop generation". No per-backend test verified this; the claim was inferred from documentation. Operator caught the gap post-merge. Sprint 10 PR-X (backend harness) added transport verification but explicitly left semantics `Unverified`.
 
