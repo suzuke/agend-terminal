@@ -10,6 +10,7 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[cfg(test)]
 pub enum CapabilityLevel {
     True,
     False,
@@ -18,6 +19,7 @@ pub enum CapabilityLevel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(test)]
 pub struct BackendCapability {
     /// PTY byte delivery works (proven via shell proxy)
     pub transport_verified: CapabilityLevel,
@@ -29,11 +31,13 @@ pub struct BackendCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(test)]
 pub struct CapabilityMatrix {
     pub backends: HashMap<String, BackendCapability>,
     pub tested_at: String,
 }
 
+#[cfg(test)]
 impl CapabilityMatrix {
     pub fn new() -> Self {
         let mut backends = HashMap::new();
