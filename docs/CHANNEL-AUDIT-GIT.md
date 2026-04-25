@@ -120,7 +120,38 @@ GitHub Actions workflow files. Expected to be GitHub-specific.
 
 **Classification**: **Documentation**. Protocol examples reference `gh` CLI as a concrete tool. Would need updating if protocol becomes git-server-agnostic, but not a code dependency.
 
-### 2.5 `docs/archived/HANDOVER-windows-conpty-nested.md` — Archived References
+### 2.5 `.github/workflows/release.yml` — Build Infra GitHub References
+
+| Line | Usage | Detail |
+|---|---|---|
+| 153 | Comment | `https://github.com/linuxdeploy/linuxdeploy/releases` — reference to upstream release |
+| 154 | Comment | `gh api repos/linuxdeploy/linuxdeploy/releases/tags/<tag>` — asset digest lookup hint |
+| 156 | Comment | `https://github.com/linuxdeploy/linuxdeploy-plugin-gtk/commits/master` — upstream ref |
+| 165 | `wget` | `https://github.com/linuxdeploy/linuxdeploy/releases/download/...` — downloads AppImage build tool |
+
+**Classification**: **GitHub-specific build infra** (non-runtime). Release workflow fetches build tools from GitHub Releases. Replaced entirely when adopting another CI provider.
+
+### 2.6 Docs Cosmetic GitHub URLs
+
+| File:Line | Usage | Detail |
+|---|---|---|
+| `docs/PLAN-channel-abstraction.md:244` | Reference link | `https://github.com/serenity-rs/serenity` — external crate reference |
+| `docs/PLAN-channel-ux-layer.md:197` | Self-reference | `https://github.com/suzuke/agend-terminal` — link to own repo |
+
+**Classification**: **Cosmetic / documentation**. No runtime impact.
+
+### 2.7 Test Fixture Data References
+
+| File:Line | Usage | Detail |
+|---|---|---|
+| `tests/fixtures/state-replay/codex-tooluse.raw:7` | Snapshot data | `https://github.com/openai/codex/releases/latest` — Codex update banner captured in PTY replay |
+| `tests/fixtures/state-replay/codex-thinking.raw:7` | Snapshot data | Same URL in different Codex state replay |
+| `tests/fixtures/state-replay/codex-update.raw:7` | Snapshot data | Same URL in Codex update prompt replay |
+| `tests/fixtures/state-replay/codex-perm.raw:7` | Snapshot data | Same URL in Codex permission prompt replay |
+
+**Classification**: **Test fixture data** (non-runtime). These are raw PTY output captures used for state-replay testing. The GitHub URL is part of Codex's own update banner, not an agend-terminal API consumer.
+
+### 2.8 `docs/archived/HANDOVER-windows-conpty-nested.md` — Archived References
 
 External GitHub issue URLs (pinokio, codex, gemini-cli). Archived documentation.
 
@@ -176,8 +207,13 @@ These modules use **plain `git` CLI** with no GitHub API assumptions:
 | `mcp_config.rs` reference URL comment | Source link |
 | `Cargo.toml` repository field | Cargo metadata |
 | `CHANGELOG.md` compare URLs | Changelog convention |
-| `.github/workflows/` | Expected; replaced per-provider |
+| `.github/workflows/ci.yml` | Expected; replaced per-provider |
+| `.github/workflows/release.yml` (lines 153-165) | Build infra; downloads linuxdeploy from GitHub Releases |
 | `docs/FLEET-DEV-PROTOCOL-v1.md` `gh` CLI examples | Documentation |
+| `docs/PLAN-channel-abstraction.md:244` serenity ref | External crate link |
+| `docs/PLAN-channel-ux-layer.md:197` self-ref | Link to own repo |
+| `tests/fixtures/state-replay/codex-*.raw:7` (×4) | Codex update banner in PTY replay snapshots |
+| `docs/archived/HANDOVER-windows-conpty-nested.md` | Archived external issue refs |
 
 ---
 
@@ -188,7 +224,7 @@ These modules use **plain `git` CLI** with no GitHub API assumptions:
 **Key numbers**:
 - **1 module** with deep GitHub API coupling (`ci_watch.rs`, ~600 lines production + ~600 lines tests)
 - **2 files** with shallow GitHub references in tool schema/handler (`tools.rs`, `handlers.rs`)
-- **9 files** with cosmetic/metadata GitHub URLs (no runtime impact)
+- **13 files** with cosmetic/metadata GitHub URLs (no runtime impact): release workflow (4 hits), docs refs (2), test fixtures (4), archived docs, Cargo.toml, CHANGELOG.md
 - **8+ files** already git-server-agnostic (worktree, branch, bootstrap operations)
 - **0** third-party GitHub crate dependencies (no octocrab)
 
