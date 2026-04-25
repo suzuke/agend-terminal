@@ -366,6 +366,46 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
     }
 }
 
+pub(crate) fn handle_tool_kill(params: &Value, ctx: &HandlerCtx) -> Value {
+    #[cfg(not(unix))]
+    {
+        let _ = (params, ctx);
+        json!({"ok": false, "error": "tool_kill is only supported on Unix (Linux/macOS)"})
+    }
+    #[cfg(unix)]
+    {
+        let name = match params["name"].as_str() {
+            Some(n) => n,
+            None => return json!({"ok": false, "error": "missing 'name'"}),
+        };
+        let reg = agent::lock_registry(ctx.registry);
+        let handle = match reg.get(name) {
+            Some(h) => h,
+            None => return json!({"ok": false, "error": format!("instance '{name}' not found")}),
+        };
+        let master = match handle.pty_master.lock() {
+            Ok(m) => m,
+            Err(_) => return json!({"ok": false, "error": "PTY master lock failed"}),
+        };
+        let fd = match master.as_raw_fd() {
+            Some(fd) => fd,
+            None => return json!({"ok": false, "error": "PTY master has no raw fd"}),
+        };
+        let pgid = unsafe { libc::tcgetpgrp(fd) };
+        drop(master);
+        drop(reg);
+        if pgid <= 0 {
+            return json!({"ok": false, "error": format!("tcgetpgrp returned {pgid}")});
+        }
+        let result = unsafe { libc::kill(-pgid, libc::SIGINT) };
+        if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            json!({"ok": true, "pgid": pgid})
+        } else {
+            json!({"ok": false, "error": format!("kill(-{pgid}, SIGINT) failed: {}", std::io::Error::last_os_error())})
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

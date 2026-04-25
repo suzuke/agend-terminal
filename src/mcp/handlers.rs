@@ -31,6 +31,22 @@ fn err_needs_identity(tool: &str) -> Value {
     })
 }
 
+/// Pure function: build tool_kill success response.
+#[cfg(unix)]
+pub(crate) fn build_tool_kill_result(target: &str, pgid: i32, reason: &str) -> Value {
+    let mut result = json!({"ok": true, "target": target, "pgid": pgid});
+    if !reason.is_empty() {
+        result["reason"] = json!(reason);
+    }
+    result
+}
+
+/// Pure function: build tool_kill audit log detail string.
+#[cfg(unix)]
+pub(crate) fn build_tool_kill_audit(reason: &str, pgid: i32) -> String {
+    format!("reason={reason}, pgid={pgid}")
+}
+
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let home = crate::home_dir();
     // Explicit arg beats env var. Cross-instance arms require `Some`;
@@ -951,6 +967,45 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("inject failed")}),
                 Err(e) => {
                     json!({"error": format!("interrupt failed — agent '{target}' not reachable (API unavailable: {e})")})
+                }
+            }
+        }
+        "tool_kill" => {
+            #[cfg(not(unix))]
+            {
+                json!({"error": "tool_kill is only supported on Unix (Linux/macOS)"})
+            }
+            #[cfg(unix)]
+            {
+                let target = match args["target"].as_str() {
+                    Some(t) => t,
+                    None => return json!({"error": "missing 'target'"}),
+                };
+                if let Err(e) = crate::agent::validate_name(target) {
+                    return json!({"error": e});
+                }
+                let reason = args["reason"].as_str().unwrap_or("");
+                match crate::api::call(
+                    &home,
+                    &json!({
+                        "method": crate::api::method::TOOL_KILL,
+                        "params": {"name": target}
+                    }),
+                ) {
+                    Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                        let pgid = resp["pgid"].as_i64().unwrap_or(0) as i32;
+                        crate::event_log::log(
+                            &home,
+                            "tool_kill_invoked",
+                            target,
+                            &build_tool_kill_audit(reason, pgid),
+                        );
+                        build_tool_kill_result(target, pgid, reason)
+                    }
+                    Ok(resp) => {
+                        json!({"error": resp["error"].as_str().unwrap_or("tool_kill failed")})
+                    }
+                    Err(e) => json!({"error": format!("tool_kill failed: {e}")}),
                 }
             }
         }
@@ -2921,5 +2976,47 @@ instances:
         assert!(meta.forced, "interrupted=true must map to forced=true");
         assert_eq!(meta.reason, "legacy");
         assert!(!meta.forced_at.is_empty());
+    }
+
+    // --- Sprint 11: tool_kill pure function tests ---
+
+    #[test]
+    #[cfg(unix)]
+    fn test_tool_kill_result_includes_pgid_and_target() {
+        let result = build_tool_kill_result("agent1", 12345, "");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["target"], "agent1");
+        assert_eq!(result["pgid"], 12345);
+        assert!(result["reason"].is_null(), "empty reason must not appear");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_tool_kill_result_includes_reason_when_provided() {
+        let result = build_tool_kill_result("agent1", 12345, "stuck on cargo test");
+        assert_eq!(result["reason"], "stuck on cargo test");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_tool_kill_audit_format() {
+        let audit = build_tool_kill_audit("priority task", 42);
+        assert!(audit.contains("reason=priority task"), "audit: {audit}");
+        assert!(audit.contains("pgid=42"), "audit: {audit}");
+    }
+
+    #[test]
+    fn test_tool_kill_target_not_found_returns_error() {
+        let _g = fleet_test_guard();
+        let home = tmp_home("tool-kill-notfound");
+        std::env::set_var("AGEND_HOME", &home);
+        // No fleet.yaml → target doesn't exist
+        let result = handle_tool("tool_kill", &json!({"target": "ghost"}), "sender");
+        assert!(
+            result.get("error").is_some(),
+            "tool_kill to nonexistent target must error: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
     }
 }

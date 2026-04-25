@@ -202,6 +202,7 @@ pub mod method {
     pub const SHUTDOWN: &str = "shutdown";
     pub const SET_BLOCKED_REASON: &str = "set_blocked_reason";
     pub const CLEAR_BLOCKED_REASON: &str = "clear_blocked_reason";
+    pub const TOOL_KILL: &str = "tool_kill";
 }
 
 /// Start API socket server (blocks calling thread).
@@ -360,6 +361,7 @@ fn handle_session(
             method::CLEAR_BLOCKED_REASON => {
                 handlers::instance::handle_clear_blocked_reason(params, &ctx)
             }
+            method::TOOL_KILL => handlers::instance::handle_tool_kill(params, &ctx),
             method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
