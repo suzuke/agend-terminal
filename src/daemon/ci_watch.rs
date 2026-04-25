@@ -8,12 +8,26 @@ use std::sync::Arc;
 // (GitLab, Buildkite, …) can be added without touching the orchestration.
 // ---------------------------------------------------------------------------
 
-/// Response from polling CI runs for a branch.
-pub struct CiRunsResponse {
-    /// HTTP-level status (e.g. 200, 403, 500).
-    pub status: u16,
-    /// Parsed JSON body.
-    pub body: serde_json::Value,
+/// A single CI pipeline/workflow run, provider-neutral.
+#[derive(Debug, Clone)]
+pub struct CiRun {
+    pub id: u64,
+    /// `None` means in-progress / not yet concluded.
+    pub conclusion: Option<String>,
+    pub head_sha: String,
+    pub url: String,
+}
+
+/// Result of polling CI runs for a branch.
+pub enum CiPollResult {
+    /// Runs retrieved successfully (may be empty).
+    Runs(Vec<CiRun>),
+    /// API-level error (rate limit, auth failure, server error).
+    ApiError {
+        #[allow(dead_code)]
+        status: u16,
+        message: String,
+    },
 }
 
 /// PR terminal-state check result.
@@ -27,14 +41,15 @@ pub enum PrState {
 }
 
 /// Abstraction over a CI server's REST API.
-/// Each method corresponds to one GitHub-specific HTTP call in the
-/// original `ci_check_repo`.
+/// Each method corresponds to one provider-specific HTTP call.
+/// Return types are provider-neutral — all schema parsing happens
+/// inside the impl, not in the ci_watch state machine.
 #[async_trait::async_trait]
 pub trait CiProvider: Send + Sync {
     /// Poll workflow/pipeline runs for `repo@branch`.
-    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiRunsResponse>;
+    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult>;
 
-    /// Check whether the PR for `branch` has reached a terminal state.
+    /// Check whether the PR/MR for `branch` has reached a terminal state.
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState;
 
     /// Fetch a human-readable summary of the first failed job/step.
@@ -76,7 +91,7 @@ impl GitHubCiProvider {
 
 #[async_trait::async_trait]
 impl CiProvider for GitHubCiProvider {
-    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiRunsResponse> {
+    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
         let resp = self
             .gh_get(&format!(
                 "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=5"
@@ -85,7 +100,45 @@ impl CiProvider for GitHubCiProvider {
             .await?;
         let status = resp.status().as_u16();
         let body: serde_json::Value = resp.json().await?;
-        Ok(CiRunsResponse { status, body })
+
+        // Surface API errors (rate-limit, auth, server) instead of
+        // silently treating them as "no runs".
+        if !(200..300).contains(&status) {
+            let message = body["message"]
+                .as_str()
+                .unwrap_or("(no message)")
+                .to_string();
+            let hint = if status == 403
+                && std::env::var("GITHUB_TOKEN").is_err()
+                && message.to_lowercase().contains("rate limit")
+            {
+                " — set GITHUB_TOKEN to raise the unauthenticated 60/hr cap"
+            } else {
+                ""
+            };
+            return Ok(CiPollResult::ApiError {
+                status,
+                message: format!("GH API {status}: {message}{hint}"),
+            });
+        }
+
+        // Parse GitHub-specific `workflow_runs` array into neutral CiRun structs.
+        let runs = body["workflow_runs"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        Some(CiRun {
+                            id: r["id"].as_u64()?,
+                            conclusion: r["conclusion"].as_str().map(String::from),
+                            head_sha: r["head_sha"].as_str()?.to_string(),
+                            url: r["html_url"].as_str().unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(CiPollResult::Runs(runs))
     }
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
@@ -372,19 +425,23 @@ fn check_ci_watches_with_provider(
 /// notification while `last_polled_at` keeps marching forward. Tag the
 /// HTTP status explicitly so API errors surface as `Err` instead of
 /// imitating a quiescent branch.
+///
+/// Production code now uses [`CiPollResult`] via the [`CiProvider`] trait;
+/// this enum is retained for unit-testing the classification logic that
+/// lives inside [`GitHubCiProvider::poll_runs`].
+#[cfg(test)]
 enum RunsResponse<'a> {
-    // Tests use the payload to verify classify_runs_response unwraps the
-    // first run; production caller (ci_check_repo) now reads the full
-    // runs array itself for multi-run scan and only matches ApiError here.
-    #[allow(dead_code)]
     Run(&'a serde_json::Value),
-    #[allow(dead_code)]
     NoRuns,
     ApiError(String),
 }
 
 /// Pure interpreter for a runs-list response. See [`RunsResponse`] for
 /// why the rate-limit / NoRuns distinction matters.
+///
+/// Retained under `#[cfg(test)]` — production classification now happens
+/// inside [`GitHubCiProvider::poll_runs`].
+#[cfg(test)]
 fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse<'_> {
     if !(200..300).contains(&status) {
         let message = body["message"].as_str().unwrap_or("(no message)");
@@ -404,26 +461,22 @@ fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse
     }
 }
 
-/// Select runs from a GitHub Actions response that should trigger notifications.
+/// Select runs from a CI poll result that should trigger notifications.
 /// Returns indices into `runs` of terminal runs with `id > last_run_id`, ordered
 /// oldest-first so notifications arrive chronologically.
-/// In-progress runs (conclusion=null) are skipped.
-pub(crate) fn select_runs_to_notify(
-    runs: &[serde_json::Value],
-    last_run_id: Option<u64>,
-) -> Vec<usize> {
+/// In-progress runs (conclusion=None) are skipped.
+pub(crate) fn select_runs_to_notify(runs: &[CiRun], last_run_id: Option<u64>) -> Vec<usize> {
     let threshold = last_run_id.unwrap_or(0);
     let mut selected: Vec<(usize, u64)> = runs
         .iter()
         .enumerate()
         .filter_map(|(i, run)| {
-            let id = run["id"].as_u64()?;
-            if id <= threshold {
+            if run.id <= threshold {
                 return None;
             }
             // Skip non-terminal (in-progress) runs
-            run["conclusion"].as_str()?;
-            Some((i, id))
+            run.conclusion.as_ref()?;
+            Some((i, run.id))
         })
         .collect();
     // Sort oldest-first by run_id
@@ -436,15 +489,15 @@ pub(crate) fn select_runs_to_notify(
 /// keeping the latest run_id per sha. Skips shas matching `last_notified`.
 /// Sorted by run_id (oldest first) for chronological notification order.
 pub(crate) fn dedupe_notifications_by_head_sha<'a>(
-    runs: &'a [serde_json::Value],
+    runs: &'a [CiRun],
     to_notify: &[usize],
     last_notified: Option<&str>,
 ) -> Vec<(usize, u64, &'a str)> {
     let mut best: std::collections::HashMap<&str, (usize, u64)> = std::collections::HashMap::new();
     for &idx in to_notify {
         let run = &runs[idx];
-        let sha = run["head_sha"].as_str().unwrap_or("");
-        let id = run["id"].as_u64().unwrap_or(0);
+        let sha = run.head_sha.as_str();
+        let id = run.id;
         best.entry(sha)
             .and_modify(|e| {
                 if id > e.1 {
@@ -522,24 +575,15 @@ async fn ci_check_repo(
         return Ok(());
     }
 
-    let CiRunsResponse { status, body } = provider.poll_runs(repo, branch).await?;
-    // Use classify_runs_response to surface API errors (rate-limit, auth, etc.)
-    // so they don't silently look like a quiescent branch. Then extract the
-    // full runs array ourselves for multi-run scan (classify only returns the
-    // first run — fine for its API-error contract, but we need all 5).
-    if let RunsResponse::ApiError(msg) = classify_runs_response(status, &body) {
-        return Err(anyhow::anyhow!(msg));
-    }
-    let runs = match body["workflow_runs"].as_array() {
-        Some(a) if !a.is_empty() => a,
-        _ => return Ok(()),
+    let poll_result = provider.poll_runs(repo, branch).await?;
+    let runs = match poll_result {
+        CiPollResult::ApiError { message, .. } => return Err(anyhow::anyhow!(message)),
+        CiPollResult::Runs(r) if r.is_empty() => return Ok(()),
+        CiPollResult::Runs(r) => r,
     };
 
     // Determine the latest head_sha from the newest run.
-    let current_sha = runs
-        .first()
-        .and_then(|r| r["head_sha"].as_str())
-        .unwrap_or("");
+    let current_sha = runs.first().map(|r| r.head_sha.as_str()).unwrap_or("");
 
     // If head_sha changed (force push), reset last_run_id so we pick up new runs.
     let effective_last_run_id = if prev_head_sha.is_some_and(|prev| prev != current_sha) {
@@ -549,7 +593,7 @@ async fn ci_check_repo(
         last_run_id
     };
 
-    let to_notify = select_runs_to_notify(runs, effective_last_run_id);
+    let to_notify = select_runs_to_notify(&runs, effective_last_run_id);
     if to_notify.is_empty() {
         // No new terminal runs — update head_sha but keep last_run_id.
         if let Some(id) = effective_last_run_id {
@@ -560,21 +604,19 @@ async fn ci_check_repo(
 
     let mut max_notified_id = effective_last_run_id.unwrap_or(0);
     for &idx in &to_notify {
-        let id = runs[idx]["id"].as_u64().unwrap_or(0);
-        if id > max_notified_id {
-            max_notified_id = id;
+        if runs[idx].id > max_notified_id {
+            max_notified_id = runs[idx].id;
         }
     }
 
-    let deduped = dedupe_notifications_by_head_sha(runs, &to_notify, last_notified_sha);
+    let deduped = dedupe_notifications_by_head_sha(&runs, &to_notify, last_notified_sha);
     let mut new_notified_sha = last_notified_sha.map(String::from);
 
     for (idx, run_id, sha) in &deduped {
         let run = &runs[*idx];
-        let conclusion = run["conclusion"].as_str();
+        let conclusion = run.conclusion.as_deref();
 
         if let Some(headline) = ci_notification_message(repo, branch, conclusion, None) {
-            let run_url = run["html_url"].as_str().unwrap_or("");
             let failure_detail = if conclusion == Some("failure") {
                 Some(provider.fetch_failure_summary(repo, *run_id).await)
             } else {
@@ -584,7 +626,7 @@ async fn ci_check_repo(
                 &headline,
                 conclusion.unwrap_or(""),
                 failure_detail.as_deref(),
-                run_url,
+                &run.url,
             );
 
             let reg = agent::lock_registry(registry);
@@ -950,11 +992,25 @@ mod tests {
 
     #[test]
     fn test_multi_run_notifies_all_terminal_since_last() {
-        use serde_json::json;
         let runs = vec![
-            json!({"id": 100, "conclusion": "success", "head_sha": "aaa"}),
-            json!({"id": 101, "conclusion": "success", "head_sha": "bbb"}),
-            json!({"id": 102, "conclusion": null, "head_sha": "ccc"}), // in-progress
+            CiRun {
+                id: 100,
+                conclusion: Some("success".into()),
+                head_sha: "aaa".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 101,
+                conclusion: Some("success".into()),
+                head_sha: "bbb".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 102,
+                conclusion: None,
+                head_sha: "ccc".into(),
+                url: String::new(),
+            },
         ];
         let selected = select_runs_to_notify(&runs, Some(99));
         assert_eq!(
@@ -966,19 +1022,37 @@ mod tests {
 
     #[test]
     fn test_in_progress_does_not_appear_in_selection() {
-        use serde_json::json;
-        let runs = vec![json!({"id": 200, "conclusion": null, "head_sha": "aaa"})];
+        let runs = vec![CiRun {
+            id: 200,
+            conclusion: None,
+            head_sha: "aaa".into(),
+            url: String::new(),
+        }];
         let selected = select_runs_to_notify(&runs, None);
         assert!(selected.is_empty(), "in-progress run must not be selected");
     }
 
     #[test]
     fn test_mixed_terminal_states_all_notified() {
-        use serde_json::json;
         let runs = vec![
-            json!({"id": 300, "conclusion": "failure", "head_sha": "a"}),
-            json!({"id": 301, "conclusion": "cancelled", "head_sha": "b"}),
-            json!({"id": 302, "conclusion": "success", "head_sha": "c"}),
+            CiRun {
+                id: 300,
+                conclusion: Some("failure".into()),
+                head_sha: "a".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 301,
+                conclusion: Some("cancelled".into()),
+                head_sha: "b".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 302,
+                conclusion: Some("success".into()),
+                head_sha: "c".into(),
+                url: String::new(),
+            },
         ];
         let selected = select_runs_to_notify(&runs, Some(299));
         assert_eq!(
@@ -990,10 +1064,19 @@ mod tests {
 
     #[test]
     fn test_already_notified_runs_skipped() {
-        use serde_json::json;
         let runs = vec![
-            json!({"id": 400, "conclusion": "success", "head_sha": "a"}),
-            json!({"id": 401, "conclusion": "success", "head_sha": "b"}),
+            CiRun {
+                id: 400,
+                conclusion: Some("success".into()),
+                head_sha: "a".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 401,
+                conclusion: Some("success".into()),
+                head_sha: "b".into(),
+                url: String::new(),
+            },
         ];
         let selected = select_runs_to_notify(&runs, Some(400));
         assert_eq!(
@@ -1005,10 +1088,19 @@ mod tests {
 
     #[test]
     fn test_same_head_sha_deduplicates_notification() {
-        use serde_json::json;
         let runs = vec![
-            json!({"id": 500, "conclusion": "failure", "head_sha": "abc"}),
-            json!({"id": 501, "conclusion": "success", "head_sha": "abc"}),
+            CiRun {
+                id: 500,
+                conclusion: Some("failure".into()),
+                head_sha: "abc".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 501,
+                conclusion: Some("success".into()),
+                head_sha: "abc".into(),
+                url: String::new(),
+            },
         ];
         let selected = select_runs_to_notify(&runs, Some(499));
         let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None);
@@ -1019,10 +1111,19 @@ mod tests {
 
     #[test]
     fn test_dedupe_skips_already_notified_sha() {
-        use serde_json::json;
         let runs = vec![
-            json!({"id": 600, "conclusion": "success", "head_sha": "aaa"}),
-            json!({"id": 601, "conclusion": "success", "head_sha": "bbb"}),
+            CiRun {
+                id: 600,
+                conclusion: Some("success".into()),
+                head_sha: "aaa".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 601,
+                conclusion: Some("success".into()),
+                head_sha: "bbb".into(),
+                url: String::new(),
+            },
         ];
         let selected = select_runs_to_notify(&runs, Some(599));
         let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("aaa"));
@@ -1032,10 +1133,19 @@ mod tests {
 
     #[test]
     fn test_different_head_sha_triggers_new_notification() {
-        use serde_json::json;
         let runs = vec![
-            json!({"id": 600, "conclusion": "success", "head_sha": "aaa"}),
-            json!({"id": 601, "conclusion": "success", "head_sha": "bbb"}),
+            CiRun {
+                id: 600,
+                conclusion: Some("success".into()),
+                head_sha: "aaa".into(),
+                url: String::new(),
+            },
+            CiRun {
+                id: 601,
+                conclusion: Some("success".into()),
+                head_sha: "bbb".into(),
+                url: String::new(),
+            },
         ];
         let selected = select_runs_to_notify(&runs, Some(599));
         let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None);
@@ -1283,15 +1393,26 @@ mod tests {
 
     /// Mock CI provider for testing ci_check_repo state machine without HTTP.
     struct MockCiProvider {
-        runs_response: Mutex<Option<CiRunsResponse>>,
+        poll_result: Mutex<Option<CiPollResult>>,
         pr_state: Mutex<PrState>,
         failure_summary: Mutex<String>,
     }
 
     impl MockCiProvider {
-        fn new(status: u16, body: serde_json::Value) -> Self {
+        fn with_runs(runs: Vec<CiRun>) -> Self {
             Self {
-                runs_response: Mutex::new(Some(CiRunsResponse { status, body })),
+                poll_result: Mutex::new(Some(CiPollResult::Runs(runs))),
+                pr_state: Mutex::new(PrState::Open),
+                failure_summary: Mutex::new("Build / Test".to_string()),
+            }
+        }
+
+        fn with_api_error(status: u16, message: &str) -> Self {
+            Self {
+                poll_result: Mutex::new(Some(CiPollResult::ApiError {
+                    status,
+                    message: message.to_string(),
+                })),
                 pr_state: Mutex::new(PrState::Open),
                 failure_summary: Mutex::new("Build / Test".to_string()),
             }
@@ -1305,8 +1426,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CiProvider for MockCiProvider {
-        async fn poll_runs(&self, _repo: &str, _branch: &str) -> anyhow::Result<CiRunsResponse> {
-            Ok(self.runs_response.lock().unwrap().take().unwrap())
+        async fn poll_runs(&self, _repo: &str, _branch: &str) -> anyhow::Result<CiPollResult> {
+            Ok(self.poll_result.lock().unwrap().take().unwrap())
         }
         async fn check_pr_terminal(&self, _repo: &str, _branch: &str) -> PrState {
             let mut guard = self.pr_state.lock().unwrap();
@@ -1370,10 +1491,12 @@ mod tests {
     #[test]
     fn mock_success_run_updates_watch_state() {
         let dir = tmp_dir("mock-success");
-        let body = serde_json::json!({
-            "workflow_runs": [{"id": 100, "conclusion": "success", "head_sha": "abc", "html_url": "https://example.com/100"}]
-        });
-        let provider = MockCiProvider::new(200, body);
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 100,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/100".into(),
+        }]);
         run_ci_check(&dir, &base_watch(), &provider).unwrap();
 
         // Watch file should be updated with last_run_id and head_sha
@@ -1396,10 +1519,12 @@ mod tests {
     #[test]
     fn mock_failure_run_includes_detail() {
         let dir = tmp_dir("mock-failure");
-        let body = serde_json::json!({
-            "workflow_runs": [{"id": 200, "conclusion": "failure", "head_sha": "def", "html_url": "https://example.com/200"}]
-        });
-        let provider = MockCiProvider::new(200, body);
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 200,
+            conclusion: Some("failure".into()),
+            head_sha: "def".into(),
+            url: "https://example.com/200".into(),
+        }]);
         run_ci_check(&dir, &base_watch(), &provider).unwrap();
 
         // Check inbox contains failure detail
@@ -1421,8 +1546,7 @@ mod tests {
     #[test]
     fn mock_api_error_propagates() {
         let dir = tmp_dir("mock-api-err");
-        let body = serde_json::json!({"message": "rate limit exceeded"});
-        let provider = MockCiProvider::new(403, body);
+        let provider = MockCiProvider::with_api_error(403, "GH API 403: rate limit exceeded");
         let result = run_ci_check(&dir, &base_watch(), &provider);
         assert!(result.is_err(), "API error must propagate");
         let err = result.unwrap_err().to_string();
@@ -1441,8 +1565,7 @@ mod tests {
         std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
 
         // Provider says PR is terminal — runs response doesn't matter
-        let body = serde_json::json!({"workflow_runs": []});
-        let provider = MockCiProvider::new(200, body).with_pr_terminal();
+        let provider = MockCiProvider::with_runs(vec![]).with_pr_terminal();
 
         let registry: AgentRegistry =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -1476,8 +1599,7 @@ mod tests {
     #[test]
     fn mock_no_runs_preserves_watch() {
         let dir = tmp_dir("mock-no-runs");
-        let body = serde_json::json!({"workflow_runs": []});
-        let provider = MockCiProvider::new(200, body);
+        let provider = MockCiProvider::with_runs(vec![]);
         run_ci_check(&dir, &base_watch(), &provider).unwrap();
 
         let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
@@ -1492,12 +1614,12 @@ mod tests {
         let mut watch = base_watch();
         watch["head_sha"] = serde_json::json!("old123");
         watch["last_run_id"] = serde_json::json!(50);
-        let body = serde_json::json!({
-            "workflow_runs": [
-                {"id": 51, "conclusion": "success", "head_sha": "new456", "html_url": "https://example.com/51"}
-            ]
-        });
-        let provider = MockCiProvider::new(200, body);
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 51,
+            conclusion: Some("success".into()),
+            head_sha: "new456".into(),
+            url: "https://example.com/51".into(),
+        }]);
         run_ci_check(&dir, &watch, &provider).unwrap();
 
         let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
