@@ -122,8 +122,8 @@ fn ensure_recovery_dir(dir: &Path) {
 
 /// Type-safe notification source — replaces raw string conventions.
 pub enum NotifySource<'a> {
-    /// Message from a Telegram user (e.g., "chiacheng").
-    Telegram(&'a str),
+    /// Message from a channel user (Telegram, Discord, etc.).
+    Channel(&'a str, crate::channel::ChannelKind),
     /// Message from another agent instance (e.g., "dev").
     Agent(&'a str),
     /// System message (e.g., "replace", "ci").
@@ -134,7 +134,12 @@ pub enum NotifySource<'a> {
 impl fmt::Display for NotifySource<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Telegram(user) => write!(f, "user:{user} via telegram"),
+            Self::Channel(user, kind) => {
+                let kind_str = match kind {
+                    crate::channel::ChannelKind::Telegram => "telegram",
+                };
+                write!(f, "user:{user} via {kind_str}")
+            }
             Self::Agent(name) => write!(f, "from:{name}"),
             Self::System(label) => write!(f, "system:{label}"),
         }
@@ -144,7 +149,7 @@ impl fmt::Display for NotifySource<'_> {
 impl NotifySource<'_> {
     fn reply_hint(&self) -> Cow<'static, str> {
         match self {
-            Self::Telegram(_) => {
+            Self::Channel(_, _) => {
                 "\n(Reply using the reply tool — do NOT respond with direct text)".into()
             }
             Self::Agent(sender) => {
@@ -981,7 +986,7 @@ mod tests {
         deliver(
             &home,
             "agent1",
-            &NotifySource::Telegram("user"),
+            &NotifySource::Channel("user", crate::channel::ChannelKind::Telegram),
             "short msg",
             "\r",
             None,
@@ -1003,7 +1008,7 @@ mod tests {
         deliver(
             &home,
             "agent1",
-            &NotifySource::Telegram("user"),
+            &NotifySource::Channel("user", crate::channel::ChannelKind::Telegram),
             &long_text,
             "\r",
             Some("chat".to_string()),
@@ -1099,7 +1104,7 @@ mod tests {
 
     #[test]
     fn notify_source_telegram_display() {
-        let s = NotifySource::Telegram("chiacheng");
+        let s = NotifySource::Channel("chiacheng", crate::channel::ChannelKind::Telegram);
         assert_eq!(s.to_string(), "user:chiacheng via telegram");
         assert!(s.reply_hint().contains("reply tool"));
     }

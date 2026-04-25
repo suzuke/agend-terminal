@@ -20,7 +20,7 @@ pub fn tool_definitions() -> Value {
 
 fn channel_tools() -> Vec<Value> {
     vec![
-        json!({"name": "reply", "description": "Reply to the user via Telegram.",
+        json!({"name": "reply", "description": "Reply to the user via the active channel.",
             "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
         json!({"name": "react", "description": "React to a message with an emoji.",
             "inputSchema": {"type": "object", "properties": {"emoji": {"type": "string"}}, "required": ["emoji"]}}),

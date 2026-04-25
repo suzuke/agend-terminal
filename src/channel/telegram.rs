@@ -455,7 +455,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     inbox::notify_agent(
         &home,
         &instance_name,
-        &inbox::NotifySource::Telegram(username),
+        &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
         text,
     );
 

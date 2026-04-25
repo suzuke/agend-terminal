@@ -40,12 +40,22 @@ pub mod ux_event;
 
 pub use binding::BindingRef;
 pub use caps::{ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint, RateBudget};
-pub use event::{ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason, User};
+pub use event::{
+    Attachment, AttachmentKind, ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason, User,
+};
 pub use sink_registry::{registry, UxSinkRegistry};
 pub use ux_event::{select_action, FleetEvent, NoopUxSink, UxAction, UxEvent, UxEventSink};
 
 use crate::agent::AgentRegistry;
 use anyhow::Result;
+
+/// Typed channel kind — replaces magic strings like `"telegram"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelKind {
+    Telegram,
+    // Future: Discord, Slack, Matrix, ...
+}
 
 /// Platform-neutral channel trait. Implementations live next to their
 /// platform glue (e.g., `src/telegram.rs` → future `src/channel/telegram.rs`).
