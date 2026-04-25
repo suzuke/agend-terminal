@@ -2905,4 +2905,21 @@ instances:
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn test_old_inbox_json_with_interrupt_meta_deserializes_into_force_meta() {
+        // Sprint 8-9 inbox JSONL uses "interrupt_meta" + "interrupted" + "interrupted_at".
+        // Must deserialize into ForceMeta via serde aliases.
+        let old_json = r#"{"schema_version":1,"id":"m-old","from":"test","text":"hi","kind":null,"timestamp":"2026-01-01T00:00:00Z","interrupt_meta":{"interrupted":true,"reason":"legacy","interrupted_at":"2026-01-01T00:00:00Z"}}"#;
+        let msg: crate::inbox::InboxMessage =
+            serde_json::from_str(old_json).expect("deserialize old format");
+        assert!(
+            msg.force_meta.is_some(),
+            "old interrupt_meta must deserialize into force_meta"
+        );
+        let meta = msg.force_meta.unwrap();
+        assert!(meta.forced, "interrupted=true must map to forced=true");
+        assert_eq!(meta.reason, "legacy");
+        assert!(!meta.forced_at.is_empty());
+    }
 }

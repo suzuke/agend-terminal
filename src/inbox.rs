@@ -179,8 +179,12 @@ pub struct InboxMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     /// Force metadata — set when delegate_task used force=true (overrides busy gate).
-    /// Serde alias "force_meta" for backwards-compat with Sprint 8-9 inbox JSONL.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "force_meta")]
+    /// Serde alias "interrupt_meta" for backwards-compat with Sprint 8-9 inbox JSONL.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "interrupt_meta"
+    )]
     pub force_meta: Option<ForceMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
@@ -189,11 +193,13 @@ pub struct InboxMessage {
 }
 
 /// Metadata attached to a forced delegation (busy gate override).
-/// Renamed from ForceMeta in Sprint 10 (semantic correction).
+/// Renamed from InterruptMeta in Sprint 10 (semantic correction).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForceMeta {
+    #[serde(alias = "interrupted")]
     pub forced: bool,
     pub reason: String,
+    #[serde(alias = "interrupted_at")]
     pub forced_at: String,
 }
 
