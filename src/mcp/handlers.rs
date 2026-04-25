@@ -32,6 +32,7 @@ fn err_needs_identity(tool: &str) -> Value {
 }
 
 /// Pure function: build tool_kill success response.
+#[cfg(unix)]
 pub(crate) fn build_tool_kill_result(target: &str, pgid: i32, reason: &str) -> Value {
     let mut result = json!({"ok": true, "target": target, "pgid": pgid});
     if !reason.is_empty() {
@@ -41,6 +42,7 @@ pub(crate) fn build_tool_kill_result(target: &str, pgid: i32, reason: &str) -> V
 }
 
 /// Pure function: build tool_kill audit log detail string.
+#[cfg(unix)]
 pub(crate) fn build_tool_kill_audit(reason: &str, pgid: i32) -> String {
     format!("reason={reason}, pgid={pgid}")
 }
@@ -971,7 +973,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "tool_kill" => {
             #[cfg(not(unix))]
             {
-                return json!({"error": "tool_kill is only supported on Unix (Linux/macOS)"});
+                json!({"error": "tool_kill is only supported on Unix (Linux/macOS)"})
             }
             #[cfg(unix)]
             {
