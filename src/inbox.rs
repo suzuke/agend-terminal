@@ -178,21 +178,23 @@ pub struct InboxMessage {
     pub delivery_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
-    /// Interrupt metadata — set when delegate_task used interrupt=true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interrupt_meta: Option<InterruptMeta>,
+    /// Force metadata — set when delegate_task used force=true (overrides busy gate).
+    /// Serde alias "force_meta" for backwards-compat with Sprint 8-9 inbox JSONL.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "force_meta")]
+    pub force_meta: Option<ForceMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_head: Option<String>,
 }
 
-/// Metadata attached to an interrupted delegation.
+/// Metadata attached to a forced delegation (busy gate override).
+/// Renamed from ForceMeta in Sprint 10 (semantic correction).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InterruptMeta {
-    pub interrupted: bool,
+pub struct ForceMeta {
+    pub forced: bool,
     pub reason: String,
-    pub interrupted_at: String,
+    pub forced_at: String,
 }
 
 impl InboxMessage {
@@ -664,7 +666,7 @@ pub fn deliver(
         thread_id: None,
         parent_id: None,
         task_id: None,
-        interrupt_meta: None,
+        force_meta: None,
         correlation_id: None,
         reviewed_head: None,
         from: source.to_string(),
@@ -816,7 +818,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             from: from.to_string(),
@@ -945,7 +947,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             from: "sender".to_string(),
@@ -1045,7 +1047,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             from: "test".to_string(),
@@ -1070,7 +1072,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             from: "user".to_string(),
@@ -1659,7 +1661,7 @@ mod tests {
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             read_at: None,
@@ -1685,7 +1687,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             ..msg.clone()
@@ -1705,7 +1707,7 @@ mod tests {
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             read_at: None,
@@ -1734,7 +1736,7 @@ mod tests {
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             read_at: None,
@@ -1761,7 +1763,7 @@ mod tests {
             kind: Some("task\r\ninjection".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             read_at: None,
@@ -1792,7 +1794,7 @@ mod tests {
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             read_at: None,
@@ -1828,7 +1830,7 @@ mod tests {
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             read_at: None,
@@ -1867,7 +1869,7 @@ mod tests {
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             read_at: None,

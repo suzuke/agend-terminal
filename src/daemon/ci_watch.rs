@@ -454,7 +454,7 @@ async fn ci_check_repo(
                     thread_id: None,
                     parent_id: None,
                     task_id: None,
-                    interrupt_meta: None,
+                    force_meta: None,
                     correlation_id: None,
                     reviewed_head: None,
                     from: "system:ci".to_string(),

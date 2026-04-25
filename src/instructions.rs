@@ -970,7 +970,7 @@ mod tests {
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
             delivery_mode: None,
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             read_at: None,
