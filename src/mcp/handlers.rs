@@ -919,13 +919,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 return json!({"error": e});
             }
             // Inject ESC byte (0x1b) to interrupt current LLM generation turn
-            match crate::api::call(
-                &home,
-                &json!({
-                    "method": crate::api::method::INJECT,
-                    "params": {"name": target, "data": "\x1b", "raw": true}
-                }),
-            ) {
+            match crate::api::call(&home, &interrupt_esc_params(target)) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => {
                     // Optionally inject follow-up reason message
                     if let Some(reason) = args["reason"].as_str() {
@@ -1264,6 +1258,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 }
 
 /// Spawn a single instance (the non-team path of create_instance).
+/// Build the INJECT API params for an interrupt ESC byte injection.
+/// Extracted for testability — unit tests verify the exact params
+/// without needing a running daemon.
+pub fn interrupt_esc_params(target: &str) -> Value {
+    json!({
+        "method": crate::api::method::INJECT,
+        "params": {"name": target, "data": "\x1b", "raw": true}
+    })
+}
+
 fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Value) -> Value {
     let raw_name = match args["name"].as_str() {
         Some(n) => n,
@@ -2782,6 +2786,60 @@ instances:
             "default (no flag) must not error on second_reviewer: {result}"
         );
         std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── interrupt tool tests ──
+
+    #[test]
+    fn test_interrupt_esc_params_contains_exact_esc_byte() {
+        let params = super::interrupt_esc_params("my-agent");
+        assert_eq!(params["method"], "inject");
+        assert_eq!(params["params"]["name"], "my-agent");
+        // Verify the data field is exactly the ESC byte (0x1b)
+        let data = params["params"]["data"]
+            .as_str()
+            .expect("data must be string");
+        assert_eq!(data.len(), 1, "ESC byte must be exactly 1 byte");
+        assert_eq!(data.as_bytes()[0], 0x1b, "data must be ESC byte (0x1b)");
+        assert_eq!(params["params"]["raw"], true, "must be raw inject");
+    }
+
+    #[test]
+    fn test_interrupt_reason_header_format() {
+        let header = crate::inbox::format_event_header("interrupt", &[("reason", "priority task")]);
+        assert!(header.contains("[AGEND-MSG]"), "must have header prefix");
+        assert!(
+            header.contains("kind=interrupt"),
+            "must have interrupt kind"
+        );
+        assert!(
+            header.contains("reason=priority task"),
+            "must contain reason"
+        );
+        assert!(!header.contains('\n'), "must be single line");
+    }
+
+    #[test]
+    fn test_interrupt_handler_validates_target() {
+        let home = tmp_home("interrupt-validate");
+        std::env::set_var("AGEND_HOME", &home);
+
+        // Missing target
+        let r = handle_tool("interrupt", &json!({}), "caller");
+        assert!(r["error"].as_str().unwrap().contains("missing"));
+
+        // Invalid target name
+        let r = handle_tool("interrupt", &json!({"target": "../escape"}), "caller");
+        assert!(r.get("error").is_some());
+
+        // Valid target but no daemon → reaches inject path
+        let r = handle_tool("interrupt", &json!({"target": "valid-agent"}), "caller");
+        let err = r["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("not reachable") || err.contains("API unavailable"),
+            "valid target must reach inject path: {err}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
