@@ -1057,20 +1057,6 @@ fn test_report_result_persists_parent_and_thread() {
 }
 
 #[test]
-fn test_interrupt_target_not_exist() {
-    let responses = mcp_session(&[
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interrupt","arguments":{"target":"nonexistent-agent"}}}"#,
-    ]);
-    assert!(responses.len() >= 2);
-    let result = extract_tool_result(&responses[1]);
-    assert!(
-        result.get("error").is_some(),
-        "unknown target must return error: {result}"
-    );
-}
-
-#[test]
 fn test_interrupt_missing_target() {
     let responses = mcp_session(&[
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
@@ -1095,5 +1081,40 @@ fn test_interrupt_invalid_target_name() {
     assert!(
         result.get("error").is_some(),
         "invalid name must error: {result}"
+    );
+}
+
+#[test]
+fn test_interrupt_without_reason_reaches_inject_path() {
+    // Without daemon, API inject fails — but the handler must reach the inject
+    // path (not fail on validation). Error message should mention "not reachable"
+    // not "missing" or "invalid".
+    let responses = mcp_session(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interrupt","arguments":{"target":"valid-agent"}}}"#,
+    ]);
+    assert!(responses.len() >= 2);
+    let result = extract_tool_result(&responses[1]);
+    let err = result["error"].as_str().unwrap_or("");
+    // Must reach inject path (API unavailable), not fail on validation
+    assert!(
+        err.contains("not reachable") || err.contains("API unavailable"),
+        "valid target must reach inject path, got: {err}"
+    );
+    assert!(!err.contains("missing"), "must not be a validation error");
+}
+
+#[test]
+fn test_interrupt_with_reason_reaches_inject_path() {
+    let responses = mcp_session(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interrupt","arguments":{"target":"valid-agent","reason":"priority task incoming"}}}"#,
+    ]);
+    assert!(responses.len() >= 2);
+    let result = extract_tool_result(&responses[1]);
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("not reachable") || err.contains("API unavailable"),
+        "with reason must also reach inject path, got: {err}"
     );
 }

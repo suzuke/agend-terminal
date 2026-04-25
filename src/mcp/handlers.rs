@@ -936,7 +936,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     json!({"ok": true, "target": target})
                 }
                 Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("inject failed")}),
-                Err(e) => json!({"error": format!("API unavailable: {e}")}),
+                Err(e) => {
+                    json!({"error": format!("interrupt failed — agent '{target}' not reachable (API unavailable: {e})")})
+                }
             }
         }
         "set_waiting_on" => {
