@@ -452,15 +452,11 @@ mod tests {
     #[test]
     #[ignore] // Requires kiro-cli installed
     fn test_backend_semantics_kiro() {
+        let mut matrix = CapabilityMatrix::new();
         let (level, notes) = probe_esc_stops_generation(&crate::backend::Backend::KiroCli);
+        matrix.record_semantics_results("kiro-cli", level.clone(), &notes);
         println!("kiro-cli: {level:?} — {notes}");
-        assert!(
-            matches!(
-                level,
-                CapabilityLevel::True | CapabilityLevel::Partial | CapabilityLevel::Unverified
-            ),
-            "kiro-cli probe must not crash: {level:?} {notes}"
-        );
+        assert_eq!(matrix.backends["kiro-cli"].esc_semantics_verified, level);
     }
 
     #[test]
