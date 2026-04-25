@@ -83,16 +83,46 @@ pub struct MsgPayload {
 
 /// Outbound message — the payload passed to `Channel::send` / `Channel::edit`.
 /// TODO: expand with buttons, attachments, reply-to once adapters consume it.
-#[derive(Debug, Clone, Default)]
+/// Kind of media attachment.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    Photo,
+    Voice,
+    Document,
+    Video,
+    Sticker,
+}
+
+/// Media attachment for outbound/inbound messages.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Attachment {
+    pub kind: AttachmentKind,
+    pub path: std::path::PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OutMsg {
     pub text: String,
-    // TODO(T1b+): buttons, attachments, reply_to, parse mode override.
+    /// Optional media attachment. When present, adapters that support media
+    /// will send the attachment; others fall back to text-only with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
 }
 
 impl OutMsg {
     /// Shorthand for a plain-text outbound message.
     pub fn text(t: impl Into<String>) -> Self {
-        Self { text: t.into() }
+        Self {
+            text: t.into(),
+            attachment: None,
+        }
     }
 }
 
@@ -124,5 +154,46 @@ mod tests {
     fn out_msg_text_helper() {
         let m = OutMsg::text("hello");
         assert_eq!(m.text, "hello");
+        assert!(m.attachment.is_none());
+    }
+
+    #[test]
+    fn out_msg_with_attachment_roundtrip() {
+        let attachment = Attachment {
+            kind: AttachmentKind::Photo,
+            path: std::path::PathBuf::from("/tmp/photo.jpg"),
+            mime: Some("image/jpeg".into()),
+            caption: Some("test photo".into()),
+            size_bytes: Some(12345),
+        };
+        let msg = OutMsg {
+            text: "see attached".into(),
+            attachment: Some(attachment),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["text"], "see attached");
+        assert_eq!(parsed["attachment"]["kind"], "photo");
+        assert_eq!(parsed["attachment"]["path"], "/tmp/photo.jpg");
+        assert_eq!(parsed["attachment"]["mime"], "image/jpeg");
+    }
+
+    #[test]
+    fn out_msg_without_attachment_backwards_compat() {
+        // Old JSONL without attachment field must deserialize with attachment=None
+        let old_json = r#"{"text":"hello"}"#;
+        let msg: OutMsg = serde_json::from_str(old_json).expect("deserialize old format");
+        assert_eq!(msg.text, "hello");
+        assert!(msg.attachment.is_none());
+    }
+
+    #[test]
+    fn out_msg_text_only_skips_attachment_in_serialization() {
+        let msg = OutMsg::text("plain");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            !json.contains("attachment"),
+            "None attachment must be skipped: {json}"
+        );
     }
 }
