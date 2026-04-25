@@ -382,6 +382,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     );
                 }
             }
+            // Add deprecation warning if caller used old field names
+            let mut result = result;
+            if used_deprecated {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "warning".into(),
+                        json!("interrupt/reason fields deprecated, use force/force_reason; will be removed Sprint 11"),
+                    );
+                }
+            }
             result
         }
         "report_result" => {
@@ -2880,10 +2890,17 @@ instances:
             &json!({"target_instance": "target", "task": "urgent", "interrupt": true, "reason": "legacy caller"}),
             "sender",
         );
-        // Should bypass busy gate (backwards-compat)
+        // Should bypass busy gate (backwards-compat) + emit deprecation warning
         assert!(
             result.get("busy").is_none(),
             "old interrupt=true must still bypass busy gate: {result}"
+        );
+        assert!(
+            result["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("deprecated"),
+            "old names must emit deprecation warning: {result}"
         );
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
