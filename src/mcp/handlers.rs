@@ -2981,6 +2981,7 @@ instances:
     // --- Sprint 11: tool_kill pure function tests ---
 
     #[test]
+    #[cfg(unix)]
     fn test_tool_kill_result_includes_pgid_and_target() {
         let result = build_tool_kill_result("agent1", 12345, "");
         assert_eq!(result["ok"], true);
@@ -2990,12 +2991,14 @@ instances:
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_tool_kill_result_includes_reason_when_provided() {
         let result = build_tool_kill_result("agent1", 12345, "stuck on cargo test");
         assert_eq!(result["reason"], "stuck on cargo test");
     }
 
     #[test]
+    #[cfg(unix)]
     fn test_tool_kill_audit_format() {
         let audit = build_tool_kill_audit("priority task", 42);
         assert!(audit.contains("reason=priority task"), "audit: {audit}");
