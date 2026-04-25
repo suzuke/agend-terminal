@@ -1,8 +1,8 @@
-//! Backend harness — cross-backend capability matrix for ESC interrupt + PTY signal.
+//! Backend harness — PTY mechanism verification + cross-backend capability matrix.
 //!
-//! Verifies byte delivery mechanism works per backend and documents
-//! per-backend capability flags. Shell survival already proven in PR-S
-//! spike (Linux/macOS); this harness captures cross-backend differences.
+//! Proves PTY byte delivery (ESC/Ctrl-C) and tcgetpgrp work via shell proxy.
+//! Backend-specific semantics (does ESC stop LLM generation?) are separately
+//! tracked as unverified — real CLI verification is future work (backlog).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -21,8 +21,12 @@ pub enum CapabilityLevel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct BackendCapability {
-    pub supports_esc_interrupt: CapabilityLevel,
-    pub supports_pty_signal_tool_kill: CapabilityLevel,
+    /// PTY byte delivery works (proven via shell proxy)
+    pub transport_verified: CapabilityLevel,
+    /// Backend interprets ESC as "stop generation" (requires real CLI test)
+    pub esc_semantics_verified: CapabilityLevel,
+    /// SIGINT to foreground pgid kills tool subprocess (requires real CLI test)
+    pub signal_semantics_verified: CapabilityLevel,
     pub notes: String,
 }
 
@@ -37,22 +41,41 @@ pub struct CapabilityMatrix {
 impl CapabilityMatrix {
     pub fn new() -> Self {
         let mut backends = HashMap::new();
-        for (name, esc, sig, notes) in [
-            ("kiro-cli", CapabilityLevel::Unverified, CapabilityLevel::Unverified, ""),
-            ("codex", CapabilityLevel::Unverified, CapabilityLevel::Unverified, ""),
-            ("claude", CapabilityLevel::False, CapabilityLevel::False,
-             "Claude Code LLM context not tied to PTY buffer (known gap t-20260424011906930464-7)"),
-            ("gemini", CapabilityLevel::Unverified, CapabilityLevel::Unverified, ""),
+        for (name, notes) in [
+            ("kiro-cli", ""),
+            ("codex", ""),
+            ("claude", "LLM context not tied to PTY buffer (known gap)"),
+            ("gemini", ""),
         ] {
-            backends.insert(name.into(), BackendCapability {
-                supports_esc_interrupt: esc,
-                supports_pty_signal_tool_kill: sig,
-                notes: notes.into(),
-            });
+            backends.insert(
+                name.into(),
+                BackendCapability {
+                    transport_verified: CapabilityLevel::Unverified,
+                    esc_semantics_verified: CapabilityLevel::Unverified,
+                    signal_semantics_verified: CapabilityLevel::Unverified,
+                    notes: notes.into(),
+                },
+            );
         }
         Self {
             backends,
             tested_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// Record shell proxy transport verification results.
+    pub fn record_transport_results(&mut self, esc_ok: bool, signal_ok: bool) {
+        for (name, b) in &mut self.backends {
+            if name == "claude" {
+                b.transport_verified = CapabilityLevel::False;
+                continue;
+            }
+            b.transport_verified = if esc_ok && signal_ok {
+                CapabilityLevel::True
+            } else {
+                CapabilityLevel::Unverified
+            };
+            // Semantics stay Unverified — shell proxy doesn't prove backend behavior
         }
     }
 
@@ -62,14 +85,11 @@ impl CapabilityMatrix {
     }
 }
 
-/// Verify a single byte can be written to a PTY without error.
-/// This proves the delivery mechanism works — the byte reaches the terminal.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn verify_byte_delivery(byte: u8) -> anyhow::Result<()> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::Write;
-
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows: 24,
@@ -86,12 +106,10 @@ pub fn verify_byte_delivery(byte: u8) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Verify tcgetpgrp returns a valid pgid from a PTY master.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub fn verify_tcgetpgrp() -> anyhow::Result<i32> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows: 24,
@@ -122,27 +140,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_capability_matrix_serializes() {
+    fn test_capability_matrix_serializes_with_split_columns() {
         let matrix = CapabilityMatrix::new();
         assert_eq!(matrix.backends.len(), 4);
+        // All start unverified
+        for b in matrix.backends.values() {
+            assert_eq!(b.esc_semantics_verified, CapabilityLevel::Unverified);
+            assert_eq!(b.signal_semantics_verified, CapabilityLevel::Unverified);
+        }
+    }
+
+    #[test]
+    fn test_record_transport_keeps_semantics_unverified() {
+        let mut matrix = CapabilityMatrix::new();
+        matrix.record_transport_results(true, true);
+        // Transport verified for non-claude
         assert_eq!(
-            matrix.backends["claude"].supports_esc_interrupt,
+            matrix.backends["kiro-cli"].transport_verified,
+            CapabilityLevel::True
+        );
+        assert_eq!(
+            matrix.backends["codex"].transport_verified,
+            CapabilityLevel::True
+        );
+        // Claude stays false (known gap)
+        assert_eq!(
+            matrix.backends["claude"].transport_verified,
             CapabilityLevel::False
         );
-        let yaml = serde_yaml::to_string(&matrix).unwrap();
-        assert!(yaml.contains("kiro-cli"));
-        assert!(yaml.contains("claude"));
+        // Semantics stay unverified for ALL — shell proxy doesn't prove backend behavior
+        for b in matrix.backends.values() {
+            assert_eq!(b.esc_semantics_verified, CapabilityLevel::Unverified);
+            assert_eq!(b.signal_semantics_verified, CapabilityLevel::Unverified);
+        }
     }
 
     #[test]
     fn test_esc_byte_delivery() {
-        // ESC (0x1b) — used by CLI backends to stop LLM generation
         verify_byte_delivery(0x1b).expect("ESC byte must be deliverable via PTY");
     }
 
     #[test]
     fn test_ctrl_c_byte_delivery() {
-        // Ctrl-C (0x03) — terminal interrupt signal
         verify_byte_delivery(0x03).expect("Ctrl-C byte must be deliverable via PTY");
     }
 
@@ -153,63 +192,29 @@ mod tests {
     }
 
     #[test]
-    fn test_capability_matrix_save_load() {
+    fn test_full_harness_produces_honest_matrix() {
+        let mut matrix = CapabilityMatrix::new();
+        let esc_ok = verify_byte_delivery(0x1b).is_ok();
+        let signal_ok = verify_tcgetpgrp().is_ok();
+        matrix.record_transport_results(esc_ok, signal_ok);
+
+        // Save and verify
         let dir = std::env::temp_dir().join(format!("agend-harness-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
-        let path = dir.join("capability_matrix.yaml");
-
-        let mut matrix = CapabilityMatrix::new();
-        matrix
-            .backends
-            .get_mut("kiro-cli")
-            .unwrap()
-            .supports_esc_interrupt = CapabilityLevel::True;
-        matrix.backends.get_mut("kiro-cli").unwrap().notes =
-            "Verified: ESC stops generation".into();
-        matrix.save(&path).unwrap();
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("kiro-cli"));
-        assert!(content.contains("true"));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_full_harness_produces_matrix() {
-        let mut matrix = CapabilityMatrix::new();
-
-        let esc_ok = verify_byte_delivery(0x1b).is_ok();
-        let ctrl_c_ok = verify_byte_delivery(0x03).is_ok();
-        let pgid_ok = verify_tcgetpgrp().is_ok();
-
-        // Record results — shell proxy proves PTY mechanism works
-        // Real backend behavior inferred (same PTY write path)
-        for name in ["kiro-cli", "codex", "gemini"] {
-            if let Some(b) = matrix.backends.get_mut(name) {
-                b.supports_esc_interrupt = if esc_ok {
-                    CapabilityLevel::Partial
-                } else {
-                    CapabilityLevel::Unverified
-                };
-                b.supports_pty_signal_tool_kill = if pgid_ok {
-                    CapabilityLevel::Partial
-                } else {
-                    CapabilityLevel::Unverified
-                };
-                b.notes = format!(
-                    "Shell proxy: ESC={esc_ok}, Ctrl-C={ctrl_c_ok}, tcgetpgrp={pgid_ok}. \
-                     Real CLI verification requires #[ignore] test."
-                );
-            }
-        }
-
-        let dir = std::env::temp_dir().join(format!("agend-harness-matrix-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).ok();
         matrix.save(&dir.join("capability_matrix.yaml")).unwrap();
-
-        assert!(esc_ok, "ESC delivery must work");
-        assert!(ctrl_c_ok, "Ctrl-C delivery must work");
-        assert!(pgid_ok, "tcgetpgrp must work");
+        let content = std::fs::read_to_string(dir.join("capability_matrix.yaml")).unwrap();
+        // Transport should be true (shell proxy works)
+        assert!(
+            content.contains("transport_verified: true")
+                || content.contains("transport_verified: 'true'"),
+            "transport must be verified via shell proxy"
+        );
+        // Semantics must stay unverified
+        assert!(
+            content.contains("esc_semantics_verified: unverified"),
+            "ESC semantics must stay unverified (no real backend test)"
+        );
+        assert!(esc_ok && signal_ok);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
