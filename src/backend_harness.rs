@@ -4,8 +4,11 @@
 //! Backend-specific semantics (does ESC stop LLM generation?) are separately
 //! tracked as unverified — real CLI verification is future work (backlog).
 
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::collections::HashMap;
+#[cfg(test)]
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
