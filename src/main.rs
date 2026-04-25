@@ -4,6 +4,7 @@ mod api;
 mod app;
 mod auth_cookie;
 mod backend;
+mod backend_harness;
 mod bootstrap;
 mod bridge_client;
 mod bugreport;
