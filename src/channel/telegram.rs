@@ -1509,8 +1509,14 @@ impl crate::channel::Channel for TelegramChannel {
     fn send(
         &self,
         _binding: &crate::channel::BindingRef,
-        _msg: crate::channel::OutMsg,
+        msg: crate::channel::OutMsg,
     ) -> anyhow::Result<crate::channel::MsgRef> {
+        // TODO(Phase 3): wire real sendPhoto/sendVoice/sendDocument when attachment present
+        if msg.attachment.is_some() {
+            tracing::warn!(
+                "attachment not yet wired for channel telegram; falling back to text path"
+            );
+        }
         // Current call sites still use the `try_telegram_reply` free fn.
         // The trait-based send path lands with the dispatcher in T2.
         anyhow::bail!("TelegramChannel::send not wired yet — use try_telegram_reply")
