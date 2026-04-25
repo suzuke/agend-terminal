@@ -28,6 +28,12 @@
 | `app/mod.rs` | 15 | Telegram state threading through app lifecycle |
 | `render.rs` | 11 | Telegram-specific rendering (topic names, status) |
 | `daemon/mod.rs` | 11 | Telegram channel init + state passing |
+| `inbox.rs` | 5 | `NotifySource::Telegram` + Telegram-specific reply hint formatting |
+| `api/handlers/instance.rs` | 3 | API spawn calls `crate::channel::telegram::create_topic_for_instance` |
+| `api/handlers/team.rs` | 3 | Team/deploy path creates Telegram topic |
+| `bootstrap/telegram_init.rs` | 39 | Dedicated Telegram bootstrap wrapper (separate from bootstrap/mod.rs) |
+| `daemon/supervisor.rs` | 5 | Direct Telegram notification plumbing for stall notice |
+| `mcp/tools.rs` | 1 | Public tool description says "Reply to the user via Telegram" |
 
 ## 2. Abstraction Surface
 
@@ -47,8 +53,11 @@ pub struct OutMsg { pub text: String }
 - **No parse_mode** — markdown/HTML formatting not controllable
 
 ### InboxMessage (`src/inbox.rs`)
-- No Telegram-specific fields leak into InboxMessage ✓
-- `NotifySource::Telegram(&str)` variant exists but is a clean enum discriminator, not a leak
+- ⚠️ **Telegram metadata leaks via magic strings and formatting**, even though struct fields are generic:
+  - `telegram.rs:436-449` — InboxMessage enqueued with `kind: Some("telegram")` magic string
+  - `telegram.rs:406-409` — `pending_pickup_ids` entry carries `"kind": "telegram"` + Telegram `msg_id`
+  - `inbox.rs:124-148` — `NotifySource::Telegram` variant produces Telegram-specific reply hint ("Reply using the reply tool")
+- Channel-agnostic design must address: `kind` field carries channel identity as untyped string; reply hints are channel-specific formatting baked into inbox delivery
 
 ## 3. Inbound Media Gaps
 
@@ -85,24 +94,27 @@ pub struct OutMsg { pub text: String }
 
 ## 6. PR #54 (Photo/Document Inbound) Prior Art
 
-**Design axis**: Extends `handle_message()` to process `msg.photo()` and `msg.document()`.
+**Design axis**: Extends `handle_message()` in `telegram.rs` to extract photo/document file_id.
 
-**Key structures**:
-- Downloads file via Telegram `get_file` API → saves to temp path
-- Adds `file_id` to `InboxMessage` (or separate attachment metadata)
-- Caption becomes the text; file_id enables later `download_attachment` MCP tool
+**Actual implementation** (from `gh pr diff 54`):
+- Modifies `handle_message()` to extract `msg.photo()` largest PhotoSize file_id and `msg.document()` file_id
+- Adds `try_download_attachment_to(...)` helper — downloads via Telegram `get_file` API to local path
+- Appends `[attachment: {file_id} -> {local_path}]` string to message text
+- **Does NOT modify `InboxMessage` struct** — no new fields, no separate attachment metadata
+- Caption becomes the text; attachment info is inline text, not structured data
 
 **Conflict surface with main**:
 - `telegram.rs` `handle_message()` — direct modification of existing function
-- `InboxMessage` struct — potential new field for attachment metadata
+- No `InboxMessage` struct change — low conflict
 - Low conflict with PR #53 (different adapter vs same adapter extension)
+- `OutMsg` gap remains unaddressed
 
 ## 7. Summary
 
-**Telegram boundary**: Well-defined via `Channel` trait, but 10+ files outside `src/channel/` have direct Telegram references. The biggest leaks are in `fleet.rs` (config schema), `mcp/handlers.rs` (react/edit tools), and `bootstrap/` (init).
+**Telegram boundary**: Well-defined via `Channel` trait, but 15+ files outside `src/channel/` have direct Telegram references. The biggest leaks are in `fleet.rs` (config schema), `mcp/handlers.rs` (react/edit tools), `bootstrap/` (init), `api/handlers/` (topic creation), and `inbox.rs` (channel-specific metadata via magic strings).
 
 **Outbound media**: Completely missing — `OutMsg` is text-only with a TODO comment.
 
-**Inbound media**: Only text handled; photo/document/voice/video/sticker all silently dropped. PR #54 addresses photo+document.
+**Inbound media**: Only text handled; photo/document/voice/video/sticker all silently dropped. PR #54 addresses photo+document via text-append (no struct change).
 
-**PR #53/#54 compatibility**: Both are additive and low-conflict with each other. PR #53 adds a parallel adapter; PR #54 extends the existing Telegram adapter. Neither addresses the `OutMsg` gap.
+**PR #53/#54 compatibility**: Both are additive and low-conflict with each other. PR #53 adds a parallel adapter; PR #54 extends Telegram inbound with file download + text append. Neither addresses the `OutMsg` gap or `InboxMessage` metadata coupling.
