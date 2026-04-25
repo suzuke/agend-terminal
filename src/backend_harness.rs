@@ -4,16 +4,16 @@
 //! Backend-specific semantics (does ESC stop LLM generation?) are separately
 //! tracked as unverified — real CLI verification is future work (backlog).
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
+#[cfg(all(unix, test))]
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(all(unix, test))]
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-#[cfg(test)]
+#[cfg(all(unix, test))]
 pub enum CapabilityLevel {
     True,
     False,
@@ -22,7 +22,7 @@ pub enum CapabilityLevel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(test)]
+#[cfg(all(unix, test))]
 pub struct BackendCapability {
     /// PTY byte delivery works (proven via shell proxy)
     pub transport_verified: CapabilityLevel,
@@ -34,13 +34,13 @@ pub struct BackendCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg(test)]
+#[cfg(all(unix, test))]
 pub struct CapabilityMatrix {
     pub backends: HashMap<String, BackendCapability>,
     pub tested_at: String,
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 impl CapabilityMatrix {
     pub fn new() -> Self {
         let mut backends = HashMap::new();
