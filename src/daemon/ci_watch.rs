@@ -655,8 +655,6 @@ fn update_watch_state_with_notify(
     }
 }
 
-
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1408,8 +1406,14 @@ mod tests {
         let inbox_path = dir.join("inbox").join("agent1.jsonl");
         if inbox_path.exists() {
             let content = std::fs::read_to_string(&inbox_path).unwrap();
-            assert!(content.contains("ci-fail"), "inbox should have ci-fail: {content}");
-            assert!(content.contains("Build / Test"), "inbox should have failure detail: {content}");
+            assert!(
+                content.contains("ci-fail"),
+                "inbox should have ci-fail: {content}"
+            );
+            assert!(
+                content.contains("Build / Test"),
+                "inbox should have failure detail: {content}"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1447,14 +1451,25 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(ci_check_repo(
-            &dir, &watch_path, "o/r", "feat", "agent1",
-            None, None, None, &registry, &provider,
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            "agent1",
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
         ))
         .unwrap();
 
         assert!(!watch_path.exists(), "PR terminal must remove watch file");
         let log = std::fs::read_to_string(dir.join("event-log.jsonl")).unwrap_or_default();
-        assert!(log.contains("pr_terminal"), "event log must record pr_terminal");
+        assert!(
+            log.contains("pr_terminal"),
+            "event log must record pr_terminal"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
