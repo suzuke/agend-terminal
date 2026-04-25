@@ -291,7 +291,7 @@ fn test_inbox(home: &Path) -> TestResult {
                 thread_id: None,
                 parent_id: None,
                 task_id: None,
-                interrupt_meta: None,
+                force_meta: None,
                 correlation_id: None,
                 reviewed_head: None,
                 from: format!("test-{i}"),

@@ -47,8 +47,10 @@ fn comm_tools() -> Vec<Value> {
                 "success_criteria": {"type": "string"}, "context": {"type": "string"},
                 "task_id": {"type": "string", "description": "Task board ID for correlation"},
                 "thread_id": {"type": "string"}, "parent_id": {"type": "string"},
-                "interrupt": {"type": "boolean", "description": "Override busy gate (requires reason)"},
-                "reason": {"type": "string", "description": "Reason for interrupt (required when interrupt=true)"},
+                "force": {"type": "boolean", "description": "Override busy gate (requires force_reason)"},
+                "force_reason": {"type": "string", "description": "Reason for force override (required when force=true)"},
+                "interrupt": {"type": "boolean", "description": "Deprecated: use 'force'. Override busy gate (requires reason)"},
+                "reason": {"type": "string", "description": "Deprecated: use 'force_reason'. Reason for interrupt"},
                 "second_reviewer": {"type": "boolean", "description": "Signal that this dispatch requests dual review (§3.5)"},
                 "second_reviewer_reason": {"type": "string", "description": "Reason for dual review (required when second_reviewer=true)"}
             }, "required": ["target_instance", "task"]}}),

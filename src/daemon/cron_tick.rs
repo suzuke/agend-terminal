@@ -122,7 +122,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     thread_id: None,
                     parent_id: None,
                     task_id: None,
-                    interrupt_meta: None,
+                    force_meta: None,
                     correlation_id: None,
                     reviewed_head: None,
                     from: "system:schedule".to_string(),

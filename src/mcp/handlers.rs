@@ -166,7 +166,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         thread_id: resolved_thread,
                         parent_id: resolved_parent,
                         task_id: None,
-                        interrupt_meta: None,
+                        force_meta: None,
                         correlation_id: args["correlation_id"].as_str().map(String::from),
                         reviewed_head: None,
                         from: format!("from:{}", sender.as_str()),
@@ -218,16 +218,25 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             };
 
             // Busy gate: check if target has claimed tasks on the task board.
-            let interrupt = args["interrupt"].as_bool().unwrap_or(false);
-            let reason = args["reason"].as_str();
+            // New names: force/force_reason. Old names: interrupt/reason (backwards-compat).
+            let force = args
+                .get("force")
+                .and_then(|v| v.as_bool())
+                .or_else(|| args.get("interrupt").and_then(|v| v.as_bool()))
+                .unwrap_or(false);
+            let force_reason = args
+                .get("force_reason")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("reason").and_then(|v| v.as_str()));
+            let used_deprecated = args.get("interrupt").is_some() || args.get("reason").is_some();
             let claimed_tasks: Vec<_> = crate::tasks::list_all(&home)
                 .into_iter()
                 .filter(|t| t.assignee.as_deref() == Some(target) && t.status == "claimed")
                 .collect();
             if !claimed_tasks.is_empty() {
-                if interrupt {
-                    if reason.is_none() || reason == Some("") {
-                        return json!({"error": "interrupt=true requires a non-empty 'reason'"});
+                if force {
+                    if force_reason.is_none() || force_reason == Some("") {
+                        return json!({"error": "force=true requires a non-empty 'force_reason' (or deprecated 'reason')"});
                     }
                 } else {
                     let current = &claimed_tasks[0];
@@ -242,8 +251,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     return json!({
                         "busy": true,
                         "current_task": {"id": current.id, "title": current.title, "age_seconds": age_secs},
-                        "options": ["interrupt=true (with reason)", "queue=true"],
-                        "suggestion": format!("target busy on task {} ({}s old). Use interrupt=true with reason to override.", current.id, age_secs)
+                        "options": ["force=true (with force_reason)", "queue=true"],
+                        "suggestion": format!("target busy on task {} ({}s old). Use force=true with force_reason to override.", current.id, age_secs)
                     });
                 }
             }
@@ -258,9 +267,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             }
 
             let mut msg = format!("[delegate_task] {task}");
-            if interrupt {
-                if let Some(r) = reason {
-                    msg.push_str(&format!("\n\n⚠️ INTERRUPT (reason: {r})"));
+            if force {
+                if let Some(r) = force_reason {
+                    msg.push_str(&format!("\n\n⚠️ FORCED (reason: {r})"));
                 }
             }
             if let Some(tid) = args["task_id"].as_str() {
@@ -272,11 +281,11 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if let Some(ctx) = args["context"].as_str() {
                 msg.push_str(&format!("\n\nContext: {ctx}"));
             }
-            let interrupt_meta_json = if interrupt {
+            let force_meta_json = if force {
                 Some(json!({
-                    "interrupted": true,
-                    "reason": reason.unwrap_or(""),
-                    "interrupted_at": chrono::Utc::now().to_rfc3339()
+                    "forced": true,
+                    "reason": force_reason.unwrap_or(""),
+                    "forced_at": chrono::Utc::now().to_rfc3339()
                 }))
             } else {
                 None
@@ -292,7 +301,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         "text": msg,
                         "kind": "task",
                         "task_id": task_id_str,
-                        "interrupt_meta": interrupt_meta_json,
+                        "force_meta": force_meta_json,
                     }
                 }),
             ) {
@@ -314,8 +323,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         thread_id: None,
                         parent_id: None,
                         task_id: task_id_str.map(String::from),
-                        interrupt_meta: interrupt_meta_json.as_ref().and_then(|v| {
-                            serde_json::from_value::<crate::inbox::InterruptMeta>(v.clone()).ok()
+                        force_meta: force_meta_json.as_ref().and_then(|v| {
+                            serde_json::from_value::<crate::inbox::ForceMeta>(v.clone()).ok()
                         }),
                         correlation_id: None,
                         reviewed_head: None,
@@ -373,6 +382,16 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     );
                 }
             }
+            // Add deprecation warning if caller used old field names
+            let mut result = result;
+            if used_deprecated {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert(
+                        "warning".into(),
+                        json!("interrupt/reason fields deprecated, use force/force_reason; will be removed Sprint 11"),
+                    );
+                }
+            }
             result
         }
         "report_result" => {
@@ -426,7 +445,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                             thread_id: args["thread_id"].as_str().map(String::from),
                             parent_id: args["parent_id"].as_str().map(String::from),
                             task_id: None,
-                            interrupt_meta: None,
+                            force_meta: None,
                             correlation_id: correlation_id.map(String::from),
                             reviewed_head: reviewed_head.map(String::from),
                             delivery_mode: Some("inbox_fallback".to_string()),
@@ -887,7 +906,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     thread_id: None,
                     parent_id: None,
                     task_id: None,
-                    interrupt_meta: None,
+                    force_meta: None,
                     correlation_id: None,
                     reviewed_head: None,
                     from: "system:replace".to_string(),
@@ -2305,7 +2324,7 @@ instances:
                 thread_id: None,
                 parent_id: None,
                 task_id: None,
-                interrupt_meta: None,
+                force_meta: None,
                 correlation_id: None,
                 reviewed_head: None,
                 from: "user:test".to_string(),
@@ -2361,7 +2380,7 @@ instances:
                 thread_id: None,
                 parent_id: None,
                 task_id: None,
-                interrupt_meta: None,
+                force_meta: None,
                 correlation_id: None,
                 reviewed_head: None,
                 from: "user:test".to_string(),
@@ -2530,7 +2549,7 @@ instances:
             thread_id: None,
             parent_id: None,
             delivery_mode: Some("inbox_fallback".into()),
-            interrupt_meta: None,
+            force_meta: None,
             correlation_id: None,
             reviewed_head: None,
             task_id: None,
@@ -2599,7 +2618,7 @@ instances:
     }
 
     #[test]
-    fn test_delegate_task_interrupt_true_bypasses_busy_gate() {
+    fn test_delegate_task_force_true_bypasses_busy_gate() {
         let _g = fleet_test_guard();
         let home = tmp_home("interrupt-bypass");
         std::fs::write(
@@ -2619,7 +2638,7 @@ instances:
 
         let result = handle_tool(
             "delegate_task",
-            &json!({"target_instance": "target", "task": "urgent", "interrupt": true, "reason": "critical bug"}),
+            &json!({"target_instance": "target", "task": "urgent", "force": true, "force_reason": "critical bug"}),
             "sender",
         );
         assert!(
@@ -2631,25 +2650,25 @@ instances:
                 || !result["error"].as_str().unwrap_or("").contains("busy"),
             "must not error on busy: {result}"
         );
-        // Verify interrupt_meta persisted in receiver's inbox
+        // Verify force_meta persisted in receiver's inbox
         let msgs = crate::inbox::drain(&home, "target");
         assert!(!msgs.is_empty(), "target must have inbox message");
         let msg = &msgs[0];
         assert!(
-            msg.interrupt_meta.is_some(),
-            "interrupt_meta must be set on inbox message: {:?}",
-            msg.interrupt_meta
+            msg.force_meta.is_some(),
+            "force_meta must be set on inbox message: {:?}",
+            msg.force_meta
         );
-        let meta = msg.interrupt_meta.as_ref().unwrap();
-        assert!(meta.interrupted);
+        let meta = msg.force_meta.as_ref().unwrap();
+        assert!(meta.forced);
         assert_eq!(meta.reason, "critical bug");
-        assert!(!meta.interrupted_at.is_empty());
+        assert!(!meta.forced_at.is_empty());
         std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn test_delegate_task_interrupt_true_without_reason_rejected() {
+    fn test_delegate_task_force_true_without_reason_rejected() {
         let _g = fleet_test_guard();
         let home = tmp_home("interrupt-no-reason");
         std::fs::write(
@@ -2669,7 +2688,7 @@ instances:
 
         let result = handle_tool(
             "delegate_task",
-            &json!({"target_instance": "target", "task": "urgent", "interrupt": true}),
+            &json!({"target_instance": "target", "task": "urgent", "force": true}),
             "sender",
         );
         assert!(
@@ -2841,5 +2860,66 @@ instances:
             "valid target must reach inject path: {err}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Sprint 10: backwards-compat for old interrupt/reason names ---
+
+    #[test]
+    fn test_delegate_task_old_interrupt_true_still_works() {
+        // Old callers using interrupt=true + reason should still work
+        let _g = fleet_test_guard();
+        let home = tmp_home("old-interrupt-compat");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
+        )
+        .ok();
+        std::env::set_var("AGEND_HOME", &home);
+        crate::tasks::handle(
+            &home,
+            "target",
+            &json!({"action": "create", "title": "busy"}),
+        );
+        let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
+        let tid = tasks["tasks"][0]["id"].as_str().unwrap();
+        crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
+
+        // Use OLD names: interrupt + reason
+        let result = handle_tool(
+            "delegate_task",
+            &json!({"target_instance": "target", "task": "urgent", "interrupt": true, "reason": "legacy caller"}),
+            "sender",
+        );
+        // Should bypass busy gate (backwards-compat) + emit deprecation warning
+        assert!(
+            result.get("busy").is_none(),
+            "old interrupt=true must still bypass busy gate: {result}"
+        );
+        assert!(
+            result["warning"]
+                .as_str()
+                .unwrap_or("")
+                .contains("deprecated"),
+            "old names must emit deprecation warning: {result}"
+        );
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_old_inbox_json_with_interrupt_meta_deserializes_into_force_meta() {
+        // Sprint 8-9 inbox JSONL uses "interrupt_meta" + "interrupted" + "interrupted_at".
+        // Must deserialize into ForceMeta via serde aliases.
+        let old_json = r#"{"schema_version":1,"id":"m-old","from":"test","text":"hi","kind":null,"timestamp":"2026-01-01T00:00:00Z","interrupt_meta":{"interrupted":true,"reason":"legacy","interrupted_at":"2026-01-01T00:00:00Z"}}"#;
+        let msg: crate::inbox::InboxMessage =
+            serde_json::from_str(old_json).expect("deserialize old format");
+        assert!(
+            msg.force_meta.is_some(),
+            "old interrupt_meta must deserialize into force_meta"
+        );
+        let meta = msg.force_meta.unwrap();
+        assert!(meta.forced, "interrupted=true must map to forced=true");
+        assert_eq!(meta.reason, "legacy");
+        assert!(!meta.forced_at.is_empty());
     }
 }

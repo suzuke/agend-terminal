@@ -440,7 +440,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         thread_id: None,
         parent_id: None,
         task_id: None,
-        interrupt_meta: None,
+        force_meta: None,
         correlation_id: None,
         reviewed_head: None,
         from: format!("user:{username}"),
