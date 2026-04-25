@@ -153,7 +153,7 @@ pub fn verify_tcgetpgrp() -> anyhow::Result<i32> {
 /// 6. Observe: did output stop + did prompt return?
 ///
 /// Returns (CapabilityLevel, notes).
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub fn probe_esc_stops_generation(backend: &crate::backend::Backend) -> (CapabilityLevel, String) {
     use portable_pty::{native_pty_system, PtySize};
     use std::io::{Read, Write};
@@ -338,7 +338,7 @@ pub fn probe_esc_stops_generation(backend: &crate::backend::Backend) -> (Capabil
 }
 
 #[cfg(test)]
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
