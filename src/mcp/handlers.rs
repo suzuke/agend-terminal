@@ -954,6 +954,49 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 }
             }
         }
+        "tool_kill" => {
+            #[cfg(not(unix))]
+            {
+                return json!({"error": "tool_kill is only supported on Unix (Linux/macOS)"});
+            }
+            #[cfg(unix)]
+            {
+                let target = match args["target"].as_str() {
+                    Some(t) => t,
+                    None => return json!({"error": "missing 'target'"}),
+                };
+                if let Err(e) = crate::agent::validate_name(target) {
+                    return json!({"error": e});
+                }
+                let reason = args["reason"].as_str().unwrap_or("");
+                match crate::api::call(
+                    &home,
+                    &json!({
+                        "method": crate::api::method::TOOL_KILL,
+                        "params": {"name": target}
+                    }),
+                ) {
+                    Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                        crate::event_log::log(
+                            &home,
+                            "tool_kill_invoked",
+                            target,
+                            &format!("reason={reason}, pgid={}", resp["pgid"]),
+                        );
+                        let mut result =
+                            json!({"ok": true, "target": target, "pgid": resp["pgid"]});
+                        if !reason.is_empty() {
+                            result["reason"] = json!(reason);
+                        }
+                        result
+                    }
+                    Ok(resp) => {
+                        json!({"error": resp["error"].as_str().unwrap_or("tool_kill failed")})
+                    }
+                    Err(e) => json!({"error": format!("tool_kill failed: {e}")}),
+                }
+            }
+        }
         "set_waiting_on" => {
             let Some(_) = sender.as_ref() else {
                 return err_needs_identity(tool);
