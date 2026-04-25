@@ -83,6 +83,23 @@ impl CapabilityMatrix {
         std::fs::write(path, serde_yaml::to_string(self)?)?;
         Ok(())
     }
+
+    #[allow(dead_code)]
+    pub fn record_semantics_results(
+        &mut self,
+        backend: &str,
+        esc_ok: CapabilityLevel,
+        signal_ok: CapabilityLevel,
+        notes: &str,
+    ) {
+        if let Some(b) = self.backends.get_mut(backend) {
+            b.esc_semantics_verified = esc_ok;
+            b.signal_semantics_verified = signal_ok;
+            if !notes.is_empty() {
+                b.notes = notes.into();
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -130,6 +147,94 @@ pub fn verify_tcgetpgrp() -> anyhow::Result<i32> {
         Ok(pgid)
     } else {
         Err(anyhow::anyhow!("tcgetpgrp returned {pgid}"))
+    }
+}
+
+/// Probe a real backend CLI for ESC interrupt semantics.
+/// Returns (capability_level, notes).
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn probe_backend_esc(binary: &str, ready_pattern: &str) -> (CapabilityLevel, String) {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
+
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => return (CapabilityLevel::Unverified, format!("openpty: {e}")),
+    };
+    let mut child = match pair.slave.spawn_command(CommandBuilder::new(binary)) {
+        Ok(c) => c,
+        Err(e) => return (CapabilityLevel::Unverified, format!("spawn {binary}: {e}")),
+    };
+    drop(pair.slave);
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            child.kill().ok();
+            return (CapabilityLevel::Unverified, format!("reader: {e}"));
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(w) => w,
+        Err(e) => {
+            child.kill().ok();
+            return (CapabilityLevel::Unverified, format!("writer: {e}"));
+        }
+    };
+
+    // Wait for ready (30s timeout)
+    let mut buf = vec![0u8; 8192];
+    let mut acc = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let ready = loop {
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+        match reader.read(&mut buf) {
+            Ok(0) => break false,
+            Ok(n) => {
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if acc.contains(ready_pattern) {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    if !ready {
+        child.kill().ok();
+        return (
+            CapabilityLevel::Unverified,
+            "ready pattern not seen in 30s".into(),
+        );
+    }
+
+    // Inject ESC
+    if writer.write_all(b"\x1b").is_err() || writer.flush().is_err() {
+        child.kill().ok();
+        return (CapabilityLevel::False, "ESC write failed".into());
+    }
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    match child.try_wait() {
+        Ok(None) => {
+            child.kill().ok();
+            (CapabilityLevel::True, format!("{binary} survived ESC"))
+        }
+        Ok(Some(s)) => (
+            CapabilityLevel::False,
+            format!("{binary} exited after ESC: {s:?}"),
+        ),
+        Err(e) => {
+            child.kill().ok();
+            (CapabilityLevel::Partial, format!("try_wait: {e}"))
+        }
     }
 }
 
@@ -216,5 +321,48 @@ mod tests {
         );
         assert!(esc_ok && signal_ok);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Real backend probes (#[ignore], run with: cargo test --ignored) ──
+
+    fn probe_if_available(binary: &str, pattern: &str) -> (CapabilityLevel, String) {
+        if std::process::Command::new("which")
+            .arg(binary)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            probe_backend_esc(binary, pattern)
+        } else {
+            (CapabilityLevel::Unverified, format!("{binary} not in PATH"))
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_backend_semantics_kiro() {
+        let (l, n) = probe_if_available("kiro-cli", "Trust All Tools active");
+        println!("kiro-cli: {l:?} — {n}");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_backend_semantics_codex() {
+        let (l, n) = probe_if_available("codex", "OpenAI Codex");
+        println!("codex: {l:?} — {n}");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_backend_semantics_claude() {
+        let (l, n) = probe_if_available("claude", "Claude Code");
+        println!("claude: {l:?} — {n}");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_backend_semantics_gemini() {
+        let (l, n) = probe_if_available("gemini", "Gemini CLI");
+        println!("gemini: {l:?} — {n}");
     }
 }
