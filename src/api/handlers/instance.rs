@@ -370,7 +370,7 @@ pub(crate) fn handle_tool_kill(params: &Value, ctx: &HandlerCtx) -> Value {
     #[cfg(not(unix))]
     {
         let _ = (params, ctx);
-        return json!({"ok": false, "error": "tool_kill is only supported on Unix (Linux/macOS)"});
+        json!({"ok": false, "error": "tool_kill is only supported on Unix (Linux/macOS)"})
     }
     #[cfg(unix)]
     {
@@ -387,7 +387,6 @@ pub(crate) fn handle_tool_kill(params: &Value, ctx: &HandlerCtx) -> Value {
             Ok(m) => m,
             Err(_) => return json!({"ok": false, "error": "PTY master lock failed"}),
         };
-        use portable_pty::MasterPty;
         let fd = match master.as_raw_fd() {
             Some(fd) => fd,
             None => return json!({"ok": false, "error": "PTY master has no raw fd"}),
