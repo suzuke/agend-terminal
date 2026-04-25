@@ -113,6 +113,11 @@ fn instance_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
         json!({"name": "replace_instance", "description": "Replace an instance with a fresh one.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "reason": {"type": "string"}}, "required": ["name"]}}),
+        json!({"name": "interrupt", "description": "Send ESC byte to target agent's PTY to interrupt current LLM turn. Context preserved, agent accepts next prompt.",
+            "inputSchema": {"type": "object", "properties": {
+                "target": {"type": "string", "description": "Target instance name"},
+                "reason": {"type": "string", "description": "Optional follow-up message to inject after ESC"}
+            }, "required": ["target"]}}),
         json!({"name": "set_display_name", "description": "Set your display name.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
         json!({"name": "set_description", "description": "Set a description for this instance.",

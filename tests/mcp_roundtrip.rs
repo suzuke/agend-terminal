@@ -1055,3 +1055,45 @@ fn test_report_result_persists_parent_and_thread() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn test_interrupt_target_not_exist() {
+    let responses = mcp_session(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interrupt","arguments":{"target":"nonexistent-agent"}}}"#,
+    ]);
+    assert!(responses.len() >= 2);
+    let result = extract_tool_result(&responses[1]);
+    assert!(
+        result.get("error").is_some(),
+        "unknown target must return error: {result}"
+    );
+}
+
+#[test]
+fn test_interrupt_missing_target() {
+    let responses = mcp_session(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interrupt","arguments":{}}}"#,
+    ]);
+    assert!(responses.len() >= 2);
+    let result = extract_tool_result(&responses[1]);
+    assert!(
+        result["error"].as_str().unwrap_or("").contains("missing"),
+        "missing target must error: {result}"
+    );
+}
+
+#[test]
+fn test_interrupt_invalid_target_name() {
+    let responses = mcp_session(&[
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"interrupt","arguments":{"target":"../escape"}}}"#,
+    ]);
+    assert!(responses.len() >= 2);
+    let result = extract_tool_result(&responses[1]);
+    assert!(
+        result.get("error").is_some(),
+        "invalid name must error: {result}"
+    );
+}

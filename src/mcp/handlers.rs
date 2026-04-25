@@ -910,6 +910,35 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             save_metadata(&home, instance_name, "description", json!(desc));
             json!({"description": desc})
         }
+        "interrupt" => {
+            let target = match args["target"].as_str() {
+                Some(t) => t,
+                None => return json!({"error": "missing 'target'"}),
+            };
+            if let Err(e) = crate::agent::validate_name(target) {
+                return json!({"error": e});
+            }
+            // Inject ESC byte (0x1b) to interrupt current LLM generation turn
+            match crate::api::call(
+                &home,
+                &json!({
+                    "method": crate::api::method::INJECT,
+                    "params": {"name": target, "data": "\x1b", "raw": true}
+                }),
+            ) {
+                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+                    // Optionally inject follow-up reason message
+                    if let Some(reason) = args["reason"].as_str() {
+                        let header =
+                            crate::inbox::format_event_header("interrupt", &[("reason", reason)]);
+                        crate::inbox::compose_aware_inject(&home, target, &header);
+                    }
+                    json!({"ok": true, "target": target})
+                }
+                Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("inject failed")}),
+                Err(e) => json!({"error": format!("API unavailable: {e}")}),
+            }
+        }
         "set_waiting_on" => {
             let Some(_) = sender.as_ref() else {
                 return err_needs_identity(tool);
