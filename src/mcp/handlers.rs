@@ -189,6 +189,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         text: text.to_string(),
                         kind: None,
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        channel: None,
                         delivery_mode: Some("inbox_fallback".to_string()),
                     };
                     let _ = crate::inbox::enqueue(&home, target, msg);
@@ -349,6 +350,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         text: msg.clone(),
                         kind: Some("task".to_string()),
                         timestamp: chrono::Utc::now().to_rfc3339(),
+                        channel: None,
                     };
                     let _ = crate::inbox::enqueue(&home, target, inbox_msg);
                     crate::inbox::notify_agent(
@@ -469,6 +471,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                             text: msg.clone(),
                             kind: Some("report".to_string()),
                             timestamp: chrono::Utc::now().to_rfc3339(),
+                            channel: None,
                         };
                         let _ = crate::inbox::enqueue(&home, target, inbox_msg);
                         crate::inbox::notify_agent(
@@ -929,6 +932,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     text: format!("[handover] {handover}"),
                     kind: Some("handover".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    channel: None,
                     delivery_mode: None,
                 },
             );
@@ -2386,6 +2390,7 @@ instances:
                 text: "hello".to_string(),
                 kind: Some("telegram".to_string()),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                channel: None,
                 delivery_mode: None,
             },
         );
@@ -2442,6 +2447,7 @@ instances:
                 text: "burst".to_string(),
                 kind: Some("telegram".to_string()),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                channel: None,
                 delivery_mode: None,
             },
         );
@@ -2600,6 +2606,7 @@ instances:
             text: "hello".into(),
             kind: None,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            channel: None,
             read_at: Some(chrono::Utc::now().to_rfc3339()),
             thread_id: None,
             parent_id: None,

@@ -170,6 +170,10 @@ pub struct InboxMessage {
     pub text: String,
     pub kind: Option<String>,
     pub timestamp: String,
+    /// Channel source identity (typed). Additive field replacing the ad-hoc
+    /// `kind: "telegram"` misuse from telegram adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<crate::channel::ChannelKind>,
     #[serde(default)]
     pub read_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -684,6 +688,7 @@ pub fn deliver(
         text: text.to_string(),
         kind,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: None,
         delivery_mode: None,
     };
     let _ = enqueue(home, agent_name, msg);
@@ -836,6 +841,7 @@ mod tests {
             text: text.to_string(),
             kind: None,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            channel: None,
             delivery_mode: None,
         }
     }
@@ -965,6 +971,7 @@ mod tests {
             text: "body text".to_string(),
             kind: Some("notification".to_string()),
             timestamp: "2025-06-15T12:30:00Z".to_string(),
+            channel: None,
             delivery_mode: None,
         };
         enqueue(&home, "agent1", msg).ok();
@@ -1065,6 +1072,7 @@ mod tests {
             text: "hello \"world\"".to_string(),
             kind: None,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            channel: None,
             delivery_mode: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
@@ -1090,6 +1098,7 @@ mod tests {
             text: "line1\nline2\ttab".to_string(),
             kind: Some("special".to_string()),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            channel: None,
             delivery_mode: None,
         };
         enqueue(&home, "agent1", msg).ok();
@@ -1671,6 +1680,7 @@ mod tests {
             text: "t".into(),
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
             delivery_mode: None,
             force_meta: None,
             correlation_id: None,
@@ -1717,6 +1727,7 @@ mod tests {
             text: "x".repeat(500),
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
             delivery_mode: None,
             force_meta: None,
             correlation_id: None,
@@ -1746,6 +1757,7 @@ mod tests {
             text: "hello".into(),
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
             delivery_mode: None,
             force_meta: None,
             correlation_id: None,
@@ -1773,6 +1785,7 @@ mod tests {
             text: "hello".into(),
             kind: Some("task\r\ninjection".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
             delivery_mode: None,
             force_meta: None,
             correlation_id: None,
@@ -1804,6 +1817,7 @@ mod tests {
             text: "t".into(),
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
             delivery_mode: None,
             force_meta: None,
             correlation_id: None,
@@ -1840,6 +1854,7 @@ mod tests {
             text: long,
             kind: Some("task".into()),
             timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
             delivery_mode: None,
             force_meta: None,
             correlation_id: None,
@@ -1879,6 +1894,7 @@ mod tests {
             text: cjk,
             kind: None,
             timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
             delivery_mode: None,
             force_meta: None,
             correlation_id: None,
@@ -1972,5 +1988,29 @@ mod tests {
             !s.contains("[AGEND-MSG]"),
             "default mode must NOT contain [AGEND-MSG] header: {s}"
         );
+    }
+
+    #[test]
+    fn inbox_message_typed_channel_field_compat() {
+        // New typed channel field roundtrip
+        let mut msg = make_msg("test", "hello");
+        assert!(msg.channel.is_none());
+        msg.channel = Some(crate::channel::ChannelKind::Telegram);
+        let serialized = serde_json::to_string(&msg).unwrap();
+        assert!(
+            serialized.contains(r#""channel":"telegram""#),
+            "channel must serialize as snake_case: {serialized}"
+        );
+        let reparsed: InboxMessage = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.channel,
+            Some(crate::channel::ChannelKind::Telegram)
+        );
+
+        // Legacy JSONL without channel field → None
+        let legacy =
+            r#"{"schema_version":1,"from":"x","text":"y","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let legacy_msg: InboxMessage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(legacy_msg.channel, None);
     }
 }

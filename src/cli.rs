@@ -205,6 +205,7 @@ fn test_inbox(home: &Path) -> anyhow::Result<()> {
                 text: format!("Message {i}"),
                 kind: None,
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                channel: None,
                 delivery_mode: None,
             },
         )?;
