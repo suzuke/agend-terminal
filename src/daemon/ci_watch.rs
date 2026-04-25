@@ -2,6 +2,155 @@ use crate::agent::{self, AgentRegistry};
 use std::path::Path;
 use std::sync::Arc;
 
+// ---------------------------------------------------------------------------
+// CiProvider trait — abstracts CI-server-specific HTTP calls so ci_watch
+// state-machine logic can be tested with a mock and future providers
+// (GitLab, Buildkite, …) can be added without touching the orchestration.
+// ---------------------------------------------------------------------------
+
+/// Response from polling CI runs for a branch.
+pub struct CiRunsResponse {
+    /// HTTP-level status (e.g. 200, 403, 500).
+    pub status: u16,
+    /// Parsed JSON body.
+    pub body: serde_json::Value,
+}
+
+/// PR terminal-state check result.
+pub enum PrState {
+    /// PR is closed/merged — watcher should be cleared.
+    Terminal,
+    /// PR is still open.
+    Open,
+    /// Check failed or no PR found — leave watcher alone.
+    Unknown,
+}
+
+/// Abstraction over a CI server's REST API.
+/// Each method corresponds to one GitHub-specific HTTP call in the
+/// original `ci_check_repo`.
+#[async_trait::async_trait]
+pub trait CiProvider: Send + Sync {
+    /// Poll workflow/pipeline runs for `repo@branch`.
+    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiRunsResponse>;
+
+    /// Check whether the PR for `branch` has reached a terminal state.
+    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState;
+
+    /// Fetch a human-readable summary of the first failed job/step.
+    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String;
+
+    /// Optional token/auth warning shown in the `watch_ci` MCP response.
+    /// Currently called via `github_token_warning_from_env()` in the handler;
+    /// future providers will use this method directly.
+    #[allow(dead_code)]
+    fn token_warning(&self) -> Option<&'static str>;
+}
+
+/// GitHub Actions implementation of [`CiProvider`].
+pub struct GitHubCiProvider {
+    client: reqwest::Client,
+}
+
+impl GitHubCiProvider {
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
+        })
+    }
+
+    fn gh_get(&self, url: &str) -> reqwest::RequestBuilder {
+        let mut req = self
+            .client
+            .get(url)
+            .header("User-Agent", "agend-terminal")
+            .header("Accept", "application/vnd.github+json");
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        req
+    }
+}
+
+#[async_trait::async_trait]
+impl CiProvider for GitHubCiProvider {
+    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiRunsResponse> {
+        let resp = self
+            .gh_get(&format!(
+                "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=5"
+            ))
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await?;
+        Ok(CiRunsResponse { status, body })
+    }
+
+    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
+        let resp: serde_json::Value = match self
+            .gh_get(&format!(
+                "https://api.github.com/repos/{repo}/pulls?head={branch}&state=all&per_page=1"
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return PrState::Unknown,
+            },
+            Err(_) => return PrState::Unknown,
+        };
+        match resp.as_array().and_then(|a| a.first()) {
+            Some(pr) => match pr["state"].as_str() {
+                Some("closed") => PrState::Terminal,
+                Some(_) => PrState::Open,
+                None => PrState::Unknown,
+            },
+            None => PrState::Unknown,
+        }
+    }
+
+    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
+        let jobs_resp: serde_json::Value = match self
+            .gh_get(&format!(
+                "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return "unknown step".to_string(),
+            },
+            Err(_) => return "unknown step".to_string(),
+        };
+        jobs_resp["jobs"]
+            .as_array()
+            .and_then(|jobs| {
+                jobs.iter().find_map(|job| {
+                    job["steps"].as_array().and_then(|steps| {
+                        steps.iter().find_map(|step| {
+                            (step["conclusion"].as_str() == Some("failure")).then(|| {
+                                format!(
+                                    "{} / {}",
+                                    job["name"].as_str().unwrap_or("?"),
+                                    step["name"].as_str().unwrap_or("?")
+                                )
+                            })
+                        })
+                    })
+                })
+            })
+            .unwrap_or_else(|| "unknown step".to_string())
+    }
+
+    fn token_warning(&self) -> Option<&'static str> {
+        github_token_warning(std::env::var("GITHUB_TOKEN").ok().as_deref())
+    }
+}
+
 /// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
 pub const WATCH_TTL_HOURS: i64 = 72;
 
@@ -81,12 +230,24 @@ pub fn github_token_warning(token: Option<&str>) -> Option<&'static str> {
 /// `github_token_warning` fed from the daemon's actual env. Separate
 /// from the pure helper so the handler can call this one-liner while
 /// tests drive the pure form with synthetic inputs.
+/// Also serves as the default `token_warning` for [`GitHubCiProvider`].
 pub fn github_token_warning_from_env() -> Option<&'static str> {
     github_token_warning(std::env::var("GITHUB_TOKEN").ok().as_deref())
 }
 
 /// Check CI watch configs and inject failure logs to agents when CI fails.
 pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
+    check_ci_watches_with_provider(home, registry, || {
+        Some(Box::new(GitHubCiProvider::new().ok()?) as Box<dyn CiProvider>)
+    });
+}
+
+/// Inner implementation that accepts a provider factory for testability.
+fn check_ci_watches_with_provider(
+    home: &Path,
+    registry: &AgentRegistry,
+    make_provider: impl Fn() -> Option<Box<dyn CiProvider>> + Send + Sync + 'static,
+) {
     let entries = match std::fs::read_dir(home.join("ci-watches")) {
         Ok(e) => e,
         Err(_) => return,
@@ -160,6 +321,13 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
         let home = home.to_path_buf();
         let watch_path = path.clone();
         let registry = Arc::clone(registry);
+        let provider = match make_provider() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(repo = %repo, "ci_check: failed to build CI provider");
+                continue;
+            }
+        };
         std::thread::Builder::new()
             .name("ci_check".into())
             .spawn(move || {
@@ -180,6 +348,7 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
                     head_sha.as_deref(),
                     last_notified_sha.as_deref(),
                     &registry,
+                    provider.as_ref(),
                 )) {
                     tracing::debug!(repo = %repo, error = %e, "CI check failed");
                 }
@@ -328,7 +497,7 @@ fn ci_notification_message(
     Some(msg)
 }
 
-/// Fetch latest GitHub Actions run and notify the watching agent on any
+/// Fetch latest CI run and notify the watching agent on any
 /// terminal conclusion (success, failure, cancelled, timed_out, etc.).
 /// Also tracks `head_sha` — if the branch HEAD changes (e.g. force push),
 /// `last_run_id` is reset so the new run is picked up.
@@ -344,37 +513,16 @@ async fn ci_check_repo(
     prev_head_sha: Option<&str>,
     last_notified_sha: Option<&str>,
     registry: &AgentRegistry,
+    provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
-    let gh_get = |url: &str| {
-        let mut req = client
-            .get(url)
-            .header("User-Agent", "agend-terminal")
-            .header("Accept", "application/vnd.github+json");
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
-        req
-    };
-
     // Check if the PR associated with this branch has reached a terminal state.
-    if let Some(should_clear) = check_pr_terminal(&gh_get, repo, branch).await {
-        if should_clear {
-            remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
-            tracing::info!(repo, branch, "CI watcher auto-cleared: PR terminal");
-            return Ok(());
-        }
+    if let PrState::Terminal = provider.check_pr_terminal(repo, branch).await {
+        remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
+        tracing::info!(repo, branch, "CI watcher auto-cleared: PR terminal");
+        return Ok(());
     }
 
-    let resp = gh_get(&format!(
-        "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=5"
-    ))
-    .send()
-    .await?;
-    let status = resp.status().as_u16();
-    let body: serde_json::Value = resp.json().await?;
+    let CiRunsResponse { status, body } = provider.poll_runs(repo, branch).await?;
     // Use classify_runs_response to surface API errors (rate-limit, auth, etc.)
     // so they don't silently look like a quiescent branch. Then extract the
     // full runs array ourselves for multi-run scan (classify only returns the
@@ -428,7 +576,7 @@ async fn ci_check_repo(
         if let Some(headline) = ci_notification_message(repo, branch, conclusion, None) {
             let run_url = run["html_url"].as_str().unwrap_or("");
             let failure_detail = if conclusion == Some("failure") {
-                Some(fetch_failure_summary(&gh_get, repo, *run_id).await)
+                Some(provider.fetch_failure_summary(repo, *run_id).await)
             } else {
                 None
             };
@@ -507,65 +655,7 @@ fn update_watch_state_with_notify(
     }
 }
 
-/// Check if the PR for a branch has reached a terminal state (merged or closed).
-/// Returns `Some(true)` if the watcher should be cleared, `Some(false)` if the
-/// PR is still open, `None` if the check failed or no PR was found.
-async fn check_pr_terminal(
-    gh_get: &impl Fn(&str) -> reqwest::RequestBuilder,
-    repo: &str,
-    branch: &str,
-) -> Option<bool> {
-    let resp: serde_json::Value = gh_get(&format!(
-        "https://api.github.com/repos/{repo}/pulls?head={branch}&state=all&per_page=1"
-    ))
-    .send()
-    .await
-    .ok()?
-    .json()
-    .await
-    .ok()?;
-    let pr = resp.as_array()?.first()?;
-    let state = pr["state"].as_str()?;
-    Some(state == "closed")
-}
 
-/// Fetch the first failed job+step name from a GitHub Actions run.
-async fn fetch_failure_summary(
-    gh_get: &impl Fn(&str) -> reqwest::RequestBuilder,
-    repo: &str,
-    run_id: u64,
-) -> String {
-    let jobs_resp: serde_json::Value = match gh_get(&format!(
-        "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
-    ))
-    .send()
-    .await
-    {
-        Ok(r) => match r.json().await {
-            Ok(v) => v,
-            Err(_) => return "unknown step".to_string(),
-        },
-        Err(_) => return "unknown step".to_string(),
-    };
-    jobs_resp["jobs"]
-        .as_array()
-        .and_then(|jobs| {
-            jobs.iter().find_map(|job| {
-                job["steps"].as_array().and_then(|steps| {
-                    steps.iter().find_map(|step| {
-                        (step["conclusion"].as_str() == Some("failure")).then(|| {
-                            format!(
-                                "{} / {}",
-                                job["name"].as_str().unwrap_or("?"),
-                                step["name"].as_str().unwrap_or("?")
-                            )
-                        })
-                    })
-                })
-            })
-        })
-        .unwrap_or_else(|| "unknown step".to_string())
-}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1186,6 +1276,222 @@ mod tests {
             watch_path.exists(),
             "watch must survive when PR check unavailable"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- MockCiProvider + state machine tests ---
+
+    use std::sync::Mutex;
+
+    /// Mock CI provider for testing ci_check_repo state machine without HTTP.
+    struct MockCiProvider {
+        runs_response: Mutex<Option<CiRunsResponse>>,
+        pr_state: Mutex<PrState>,
+        failure_summary: Mutex<String>,
+    }
+
+    impl MockCiProvider {
+        fn new(status: u16, body: serde_json::Value) -> Self {
+            Self {
+                runs_response: Mutex::new(Some(CiRunsResponse { status, body })),
+                pr_state: Mutex::new(PrState::Open),
+                failure_summary: Mutex::new("Build / Test".to_string()),
+            }
+        }
+
+        fn with_pr_terminal(self) -> Self {
+            *self.pr_state.lock().unwrap() = PrState::Terminal;
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CiProvider for MockCiProvider {
+        async fn poll_runs(&self, _repo: &str, _branch: &str) -> anyhow::Result<CiRunsResponse> {
+            Ok(self.runs_response.lock().unwrap().take().unwrap())
+        }
+        async fn check_pr_terminal(&self, _repo: &str, _branch: &str) -> PrState {
+            let mut guard = self.pr_state.lock().unwrap();
+            std::mem::replace(&mut *guard, PrState::Open)
+        }
+        async fn fetch_failure_summary(&self, _repo: &str, _run_id: u64) -> String {
+            self.failure_summary.lock().unwrap().clone()
+        }
+        fn token_warning(&self) -> Option<&'static str> {
+            None
+        }
+    }
+
+    /// Helper: run ci_check_repo with a mock provider in a temp dir.
+    fn run_ci_check(
+        dir: &Path,
+        watch_json: &serde_json::Value,
+        provider: &dyn CiProvider,
+    ) -> anyhow::Result<()> {
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let repo = watch_json["repo"].as_str().unwrap();
+        let branch = watch_json["branch"].as_str().unwrap();
+        let instance = watch_json["instance"].as_str().unwrap();
+        let filename = watch_filename(repo, branch);
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(
+            &watch_path,
+            serde_json::to_string_pretty(watch_json).unwrap(),
+        )
+        .unwrap();
+
+        let registry: AgentRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            dir,
+            &watch_path,
+            repo,
+            branch,
+            instance,
+            watch_json["last_run_id"].as_u64(),
+            watch_json["head_sha"].as_str(),
+            watch_json["last_notified_head_sha"].as_str(),
+            &registry,
+            provider,
+        ))
+    }
+
+    fn base_watch() -> serde_json::Value {
+        serde_json::json!({
+            "repo": "o/r", "branch": "feat", "interval_secs": 60,
+            "instance": "agent1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null, "last_notified_head_sha": null,
+        })
+    }
+
+    #[test]
+    fn mock_success_run_updates_watch_state() {
+        let dir = tmp_dir("mock-success");
+        let body = serde_json::json!({
+            "workflow_runs": [{"id": 100, "conclusion": "success", "head_sha": "abc", "html_url": "https://example.com/100"}]
+        });
+        let provider = MockCiProvider::new(200, body);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+        // Watch file should be updated with last_run_id and head_sha
+        let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(updated["last_run_id"].as_u64(), Some(100));
+        assert_eq!(updated["head_sha"].as_str(), Some("abc"));
+
+        // Inbox should have a notification
+        let inbox_dir = dir.join("inbox");
+        let has_inbox = inbox_dir.exists()
+            && std::fs::read_dir(&inbox_dir)
+                .map(|d| d.count() > 0)
+                .unwrap_or(false);
+        assert!(has_inbox, "success run should enqueue inbox notification");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mock_failure_run_includes_detail() {
+        let dir = tmp_dir("mock-failure");
+        let body = serde_json::json!({
+            "workflow_runs": [{"id": 200, "conclusion": "failure", "head_sha": "def", "html_url": "https://example.com/200"}]
+        });
+        let provider = MockCiProvider::new(200, body);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+        // Check inbox contains failure detail
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        if inbox_path.exists() {
+            let content = std::fs::read_to_string(&inbox_path).unwrap();
+            assert!(content.contains("ci-fail"), "inbox should have ci-fail: {content}");
+            assert!(content.contains("Build / Test"), "inbox should have failure detail: {content}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mock_api_error_propagates() {
+        let dir = tmp_dir("mock-api-err");
+        let body = serde_json::json!({"message": "rate limit exceeded"});
+        let provider = MockCiProvider::new(403, body);
+        let result = run_ci_check(&dir, &base_watch(), &provider);
+        assert!(result.is_err(), "API error must propagate");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("403"), "error should contain status: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mock_pr_terminal_clears_watch() {
+        let dir = tmp_dir("mock-pr-term");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = base_watch();
+        let filename = watch_filename("o/r", "feat");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        // Provider says PR is terminal — runs response doesn't matter
+        let body = serde_json::json!({"workflow_runs": []});
+        let provider = MockCiProvider::new(200, body).with_pr_terminal();
+
+        let registry: AgentRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir, &watch_path, "o/r", "feat", "agent1",
+            None, None, None, &registry, &provider,
+        ))
+        .unwrap();
+
+        assert!(!watch_path.exists(), "PR terminal must remove watch file");
+        let log = std::fs::read_to_string(dir.join("event-log.jsonl")).unwrap_or_default();
+        assert!(log.contains("pr_terminal"), "event log must record pr_terminal");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mock_no_runs_preserves_watch() {
+        let dir = tmp_dir("mock-no-runs");
+        let body = serde_json::json!({"workflow_runs": []});
+        let provider = MockCiProvider::new(200, body);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+        let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+        assert!(watch_path.exists(), "empty runs must preserve watch");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mock_force_push_resets_tracking() {
+        let dir = tmp_dir("mock-force-push");
+        // Watch has old head_sha "old123", new run has different sha
+        let mut watch = base_watch();
+        watch["head_sha"] = serde_json::json!("old123");
+        watch["last_run_id"] = serde_json::json!(50);
+        let body = serde_json::json!({
+            "workflow_runs": [
+                {"id": 51, "conclusion": "success", "head_sha": "new456", "html_url": "https://example.com/51"}
+            ]
+        });
+        let provider = MockCiProvider::new(200, body);
+        run_ci_check(&dir, &watch, &provider).unwrap();
+
+        let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        // After force push, run 51 should be notified even though id > last_run_id=50
+        // would normally catch it — the key is head_sha changed so tracking reset
+        assert_eq!(updated["last_run_id"].as_u64(), Some(51));
+        assert_eq!(updated["head_sha"].as_str(), Some("new456"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
