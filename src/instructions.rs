@@ -968,6 +968,31 @@ mod tests {
     }
 
     #[test]
+    fn test_all_backends_include_attachments_rule() {
+        // PR-AO header rule propagation: every backend's generated instructions
+        // must mention the `attachments=[...]` header field so agents know to
+        // call `inbox` for media metadata. Mirrors the pattern of
+        // `test_all_backends_include_agend_msg_rule`.
+        let dir =
+            std::env::temp_dir().join(format!("agend-instr-attach-test-{}", std::process::id()));
+        for backend_cmd in ["claude", "kiro-cli", "codex", "gemini"] {
+            let work = dir.join(backend_cmd);
+            std::fs::create_dir_all(&work).ok();
+            generate(&work, backend_cmd);
+            let backend = crate::backend::Backend::from_command(backend_cmd).unwrap();
+            let preset = backend.preset();
+            let instr_path = work.join(preset.instructions_path);
+            let content = std::fs::read_to_string(&instr_path).unwrap_or_default();
+            assert!(
+                content.contains("attachments="),
+                "{backend_cmd} instructions must mention `attachments=` header rule, path={}",
+                instr_path.display()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_instruction_trigger_matches_header_prefix() {
         // Regression: locks the contract between S3-T1 (format_header) and
         // S3-T2 (instruction wording). If either side drifts, this breaks.

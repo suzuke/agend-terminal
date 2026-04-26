@@ -509,6 +509,24 @@ pub fn format_header(msg: &InboxMessage) -> String {
     parts.join(" ")
 }
 
+/// Build the `in_reply_to_excerpt` value for inbound replies.
+///
+/// Returns `None` when `text` is empty so callers can `and_then` over an
+/// optional reply target. Otherwise truncates to 200 chars (Unicode-safe via
+/// `chars().take(...)`) and appends `…` if the original exceeded 200 chars.
+pub(crate) fn build_excerpt(text: &str, author: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    let truncated: String = text.chars().take(200).collect();
+    let ellipsis = if text.chars().count() > 200 {
+        "…"
+    } else {
+        ""
+    };
+    Some(format!("[{author}] {truncated}{ellipsis}"))
+}
+
 /// Format a single-line event header (non-message events like poll-reminder).
 /// Uses the same ANSI prefix as [`format_header`] for visual consistency.
 pub fn format_event_header(kind: &str, fields: &[(&str, &str)]) -> String {
@@ -1891,6 +1909,45 @@ mod tests {
     }
 
     #[test]
+    fn test_header_format_joins_multiple_attachments_with_comma() {
+        // Locks the `paths.join(",")` separator contract — future refactor that
+        // changes the separator (e.g. to ";" or " ") must update this test.
+        let mk_att = |p: &str| crate::channel::event::Attachment {
+            kind: crate::channel::event::AttachmentKind::Photo,
+            path: std::path::PathBuf::from(p),
+            mime: None,
+            caption: None,
+            size_bytes: None,
+            original_filename: None,
+        };
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:user".into(),
+            text: "multi".into(),
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![mk_att("/tmp/a.jpg"), mk_att("/tmp/b.jpg"), mk_att("/tmp/c.jpg")],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+        };
+        let header = format_header(&msg);
+        assert!(
+            header.contains("attachments=[/tmp/a.jpg,/tmp/b.jpg,/tmp/c.jpg]"),
+            "multi-attachment paths must be comma-joined: {header}"
+        );
+    }
+
+    #[test]
     fn test_header_reply_excerpt_present() {
         let mut msg = InboxMessage {
             schema_version: 1,
@@ -1925,6 +1982,59 @@ mod tests {
         assert_eq!(trunc.len(), 200);
         let excerpt = format!("[a] {trunc}…");
         assert!(excerpt.contains("…"));
+    }
+
+    #[test]
+    fn test_build_excerpt_empty_returns_none() {
+        assert_eq!(build_excerpt("", "alice"), None);
+    }
+
+    #[test]
+    fn test_build_excerpt_short_text_no_ellipsis() {
+        let out = build_excerpt("hello", "alice").expect("non-empty text returns Some");
+        assert_eq!(out, "[alice] hello");
+        assert!(!out.contains('…'));
+    }
+
+    #[test]
+    fn test_build_excerpt_long_text_truncates_to_200_with_ellipsis() {
+        let long: String = "x".repeat(250);
+        let out = build_excerpt(&long, "bob").expect("non-empty text returns Some");
+        assert!(out.starts_with("[bob] "));
+        assert!(out.ends_with('…'));
+        // Body between "[bob] " prefix and trailing "…" must be 200 chars.
+        let body = out
+            .strip_prefix("[bob] ")
+            .and_then(|s| s.strip_suffix('…'))
+            .expect("expected `[bob] {200 chars}…` shape");
+        assert_eq!(body.chars().count(), 200);
+    }
+
+    #[test]
+    fn test_build_excerpt_cjk_truncated_to_200_chars() {
+        // 250 CJK chars (each is 3 bytes UTF-8). Verifies char-based
+        // truncation, not byte-based — a byte-based take(200) would slice
+        // mid-codepoint and produce invalid UTF-8.
+        let cjk: String = "一".repeat(250);
+        assert_eq!(cjk.chars().count(), 250);
+        assert_eq!(cjk.len(), 250 * 3);
+
+        let out = build_excerpt(&cjk, "carol").expect("non-empty text returns Some");
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "output must be valid UTF-8");
+        let body = out
+            .strip_prefix("[carol] ")
+            .and_then(|s| s.strip_suffix('…'))
+            .expect("expected `[carol] {200 CJK chars}…` shape");
+        assert_eq!(body.chars().count(), 200);
+        assert_eq!(body.len(), 200 * 3, "200 CJK chars = 600 UTF-8 bytes");
+    }
+
+    #[test]
+    fn test_build_excerpt_exactly_200_no_ellipsis() {
+        // Boundary: 200 chars exactly should NOT get truncated marker.
+        let exact: String = "y".repeat(200);
+        let out = build_excerpt(&exact, "dan").expect("non-empty text returns Some");
+        assert!(!out.contains('…'), "200-char input must not get ellipsis: {out}");
     }
 
     #[test]
@@ -2211,6 +2321,17 @@ mod tests {
         let legacy = r#"{"from":"user:op","text":"hello","timestamp":"2026-04-26T00:00:00Z"}"#;
         let msg: InboxMessage = serde_json::from_str(legacy).unwrap();
         assert!(msg.attachments.is_empty());
+    }
+
+    #[test]
+    fn legacy_inbox_message_without_excerpt_deserializes() {
+        // Old messages (pre-PR-AQ) have no `in_reply_to_excerpt` field.
+        // serde(default) must fill `None` so deserialization succeeds — locks
+        // schema backward-compatibility for on-disk JSONL written before PR-AQ.
+        let legacy = r#"{"from":"user:op","text":"hello","timestamp":"2026-04-26T00:00:00Z"}"#;
+        let msg: InboxMessage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(msg.in_reply_to_excerpt, None);
+        assert_eq!(msg.in_reply_to_msg_id, None);
     }
 
     #[test]
