@@ -248,4 +248,31 @@ Pulled from Critical / High / Medium findings. priorities reflect risk; final or
 - 4 Cross-area dependencies (3 to other Tracks, 1 self-Track)
 - 9 Sprint 21 actionable tasks proposed
 
-Per challenge #10, peer pass against `dev-impl-2`'s Track B (DAEMON.md) added once that report drops.
+Per challenge #10, peer pass against `dev-impl-2`'s Track B (DAEMON.md) — see section below.
+
+---
+
+## Peer-pass: reading Track B `DAEMON.md` from a channel angle
+
+(Per dispatch §10 + `m-20260426213832561994-93`. 1 paragraph blindspot critique, in-tree append.)
+
+**Acknowledging B's peer-pass to me first**: B's 5 critiques back at CHANNEL.md (§7 of DAEMON.md) all land. Agreed: (1) C1 fail-closed inbound does NOT close the outbound notify info-leak — `supervisor::tick` lines 126/134 + `ci_watch.rs:622` push stall/recovery/CI notices to the bound Telegram group with no allowlist gate, leaking PTY tails (40 lines per stall) regardless of who's been added; my F1 (Sprint 21) needs an explicit "outbound gate is separate" sentence. (2) CD4 ownership split (persistence=B / format=A) is the right resolution and supersedes my "either / or" framing. (3) H1+H4 daemon consequence — opaque-empty `MsgRef` makes any future "clean up bot-sent messages on `delete_instance`" impossible; this is exactly the kind of cascade my channel-internal lens missed. (4) M5 contention from the tick layer during `crash_tx`-bounded(64) bursts is a real load profile I didn't articulate; "keep Mutex" still stands as advice but the contention regime needs noting. (5) `set_waiting_on` audit gap accepted — my 8-command methodology missed it.
+
+**Blindspots in DAEMON.md from a channel angle (4 critiques)**:
+
+1. **B's "11 spawn sites / 0 graceful-shutdown" inventory is scope-correct but the systemic claim under-states**: Track A holds **two more spawn surfaces** that share the same shape and should be co-counted at fleet-summary time. (a) `src/channel/telegram.rs:78-89` initialises a private `tokio::runtime::Runtime` via `OnceLock<Runtime>`; that runtime hosts the entire teloxide dispatcher (`start_polling` line 348) plus every `block_on(send_with_topic / send_media)` call. On daemon shutdown the runtime is dropped silently with no graceful-task-drain — same shape as B's pty_read_loop F4 (no shutdown-flag observation in the read path). (b) `start_polling` itself spawns `telegram_runtime().spawn(...)` for the dispatcher loop; no JoinHandle stored, no shutdown signal. So the daemon-wide claim should be **"13+ spawn sites / 0 graceful systemic"** including Track A's two — worth a footnote in B's inventory or a Sprint 21 cross-track unification task (S21-A/B joint).
+
+2. **F1–F4 cascade into channel binding state** (B's lifecycle traces stop at `agent.rs` / `api/handlers/instance.rs`, but the partial-state extends into Track A persistence): F1 spawn_agent partial-failure post-`record_binding` leaves an orphan **Telegram binding** (`topics.json` row + `instance_to_topic` map) for an agent that doesn't exist — symmetric to B's "orphan PID / phantom registry" but at the channel persistence layer. F2 delete-step-4 (registry mutate before child exit) compounds: if the dying child still holds the bound topic via teloxide's pending API call, a re-`spawn` of the same name through `record_binding` collides on the topic registry. F3 (app-mode `kill_agent` regression) doesn't call `take_binding`, so the Telegram topic reference leaks in `instance_to_topic` even after the agent is killed in TUI mode — operator who kills via TUI sees the topic stay in the group, no auto-removal. None of these are corruptly Critical (no data loss) but they're concrete A-side effects of B's lifecycle invariants; B's S21-B1/B2/B3 should explicitly cover Telegram-binding rollback as part of the lifecycle transaction.
+
+3. **`fleet_broadcast::broadcast` partial-failure step 8 in B's `handle_delete` trace deserves narrower framing**: B notes "crash here → other agents never get InstanceDeleted; their fleet view stays stale until next ad-hoc sync". After PR #199 (Sprint 18.5 HOTFIX B Hybrid), `fleet_broadcast::append_event_log` writes to `<home>/fleet_events.jsonl` **before** the per-target inject loop (`fleet_broadcast.rs:248-251`). So step 8 is actually two sub-steps: 8a = persistent log (always succeeds barring fs error, which warns-not-fails), 8b = per-target inject (best-effort warn). A crash between 8a and 8b means "log shows InstanceDeleted, no agent received it" — but on next daemon restart, the log is the source of truth and any future replay-API consumer can detect the gap. B's "stale until next ad-hoc sync" is overstated for the post-PR-199 architecture; recovery is bounded by Phase 2 read API rather than unbounded ad-hoc sync. Worth a 1-line correction in B's lifecycle trace once Sprint 21 lands the read API.
+
+4. **C↔D joint sub-track (`app/api_server.rs`) is also an A↔D bridge** worth surfacing: TUI.md flags `app/api_server.rs` (130 lines) for cross-pass with Track D. From the channel angle, MCP handlers route to channel via `try_telegram_reply` / `try_telegram_react` / `try_telegram_edit` / `inject_provenance` (`mcp/handlers.rs:74,88,102,399`) — the MCP→channel bridge is not in `app/api_server.rs` but in `mcp/handlers.rs`. So the cross-pass should be **C↔D for app-bridge AND A↔D for channel-bridge**, both surfaces flowing into the same MCP request handler layer. If the proposed sub-track audits `app/api_server.rs` only, it'll miss the channel-side outbound surface. Recommend the sub-track scope explicitly include the `mcp/handlers.rs` channel-bridge entries (≤200 lines if scoped tight) so A↔D coupling is exercised in the same pass.
+
+**Cross-pollination Sprint 21 backlog ideas (from this peer-pass)**:
+
+- **S21-A/B joint** — unify spawn-site inventory across `src/daemon/` + `src/channel/telegram.rs` + `src/instance_monitor.rs`; document graceful-shutdown stance once in `daemon/mod.rs`.
+- **S21-A** add Telegram-binding rollback to B's S21-B1 lifecycle transaction (so `record_binding` participates in spawn rollback / `take_binding` participates in delete cleanup).
+- **S21-A/D joint** — extend C↔D `app/api_server.rs` audit to the `mcp/handlers.rs` channel-bridge entry points (`try_telegram_reply` / `try_telegram_react` / `try_telegram_edit` / `inject_provenance`); ~200 LOC cross-pass.
+
+(End peer-pass section. CHANNEL.md complete.)
+
