@@ -128,34 +128,69 @@ pub fn parse_task_entry(text: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Auto-close tasks whose branch merged. Called from daemon ci_watch when
-/// a PR reaches terminal state (merged/closed).
-/// Matches branch name against task descriptions containing the branch name.
+/// Auto-close tasks whose branch merged. Only closes tasks in `verified` status
+/// (v1.2 §10.3 lifecycle: verified → done). Skips ambiguous matches.
 pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
     let tasks = crate::tasks::list_all(home);
-    for task in &tasks {
-        if task.status == "done" || task.status == "cancelled" {
-            continue;
-        }
-        // Match: task description or title contains the branch name
-        if task.description.contains(branch) || task.title.contains(branch) {
-            let result = format!("auto-closed: branch '{}' merged", branch);
-            let _ = crate::tasks::handle(
-                home,
-                "system",
-                &serde_json::json!({
-                    "action": "update",
-                    "id": task.id,
-                    "status": "done",
-                    "result": result,
-                }),
-            );
-            tracing::info!(task_id = %task.id, branch, "auto-closed task on PR merge");
-        }
+    let candidates: Vec<_> = tasks
+        .iter()
+        .filter(|t| t.status == "verified")
+        .filter(|t| {
+            contains_as_token(&t.description, branch) || contains_as_token(&t.title, branch)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return;
     }
+    if candidates.len() > 1 {
+        let ids: Vec<_> = candidates.iter().map(|t| t.id.as_str()).collect();
+        tracing::warn!(
+            branch,
+            count = candidates.len(),
+            ?ids,
+            "ambiguous branch→task match, skipping auto-close"
+        );
+        return;
+    }
+
+    let task = candidates[0];
+    let result = format!("auto-closed: branch '{}' merged", branch);
+    let _ = crate::tasks::handle(
+        home,
+        "system",
+        &serde_json::json!({
+            "action": "update",
+            "id": task.id,
+            "status": "done",
+            "result": result,
+        }),
+    );
+    tracing::info!(task_id = %task.id, branch, "auto-closed task on PR merge");
+}
+
+/// Check if `haystack` contains `needle` as a whole token (word-boundary match).
+fn contains_as_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !is_word(haystack.as_bytes()[abs - 1]);
+        let after = abs + needle.len();
+        let after_ok = after >= haystack.len() || !is_word(haystack.as_bytes()[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -216,5 +251,48 @@ mod tests {
         let now = chrono::Utc::now();
         let old = (now - chrono::Duration::hours(5)).to_rfc3339();
         assert!(stale_marker(&old, &now, 4).contains("stale"));
+    }
+
+    #[test]
+    fn contains_as_token_word_boundary() {
+        assert!(contains_as_token(
+            "branch=sprint18-task-board-phase2",
+            "sprint18-task-board-phase2"
+        ));
+        assert!(contains_as_token(
+            "sprint18-task-board-phase2 merged",
+            "sprint18-task-board-phase2"
+        ));
+        assert!(!contains_as_token(
+            "sprint18-task-board-phase2-extra",
+            "sprint18-task-board-phase2"
+        ));
+        assert!(!contains_as_token("", "test"));
+        assert!(!contains_as_token("test", ""));
+    }
+
+    #[test]
+    fn auto_close_skips_unverified_task() {
+        // F1 invariant: only verified → done, never skip review
+        let dir = std::env::temp_dir().join(format!("agend-autoclose-f1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        // Create a task in "claimed" status with branch name in description
+        crate::tasks::handle(
+            &dir,
+            "test",
+            &serde_json::json!({
+                "action": "create",
+                "title": "test task",
+                "description": "branch=sprint18-test-branch",
+            }),
+        );
+        auto_close_merged_tasks(&dir, "sprint18-test-branch");
+        let tasks = crate::tasks::list_all(&dir);
+        let task = tasks.iter().find(|t| t.title == "test task").unwrap();
+        assert_ne!(
+            task.status, "done",
+            "unverified task must NOT be auto-closed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

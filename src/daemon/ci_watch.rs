@@ -34,8 +34,8 @@ pub enum CiPollResult {
 
 /// PR terminal-state check result.
 pub enum PrState {
-    /// PR is closed/merged — watcher should be cleared.
-    Terminal,
+    /// PR reached terminal state (closed or merged).
+    Terminal { merged: bool },
     /// PR is still open.
     Open,
     /// Check failed or no PR found — leave watcher alone.
@@ -165,7 +165,9 @@ impl CiProvider for GitHubCiProvider {
         };
         match resp.as_array().and_then(|a| a.first()) {
             Some(pr) => match pr["state"].as_str() {
-                Some("closed") => PrState::Terminal,
+                Some("closed") => PrState::Terminal {
+                    merged: pr["merged_at"].as_str().is_some(),
+                },
                 Some(_) => PrState::Open,
                 None => PrState::Unknown,
             },
@@ -584,11 +586,12 @@ async fn ci_check_repo(
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
     // Check if the PR associated with this branch has reached a terminal state.
-    if let PrState::Terminal = provider.check_pr_terminal(repo, branch).await {
+    if let PrState::Terminal { merged } = provider.check_pr_terminal(repo, branch).await {
         remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
-        tracing::info!(repo, branch, "CI watcher auto-cleared: PR terminal");
-        // Auto-close tasks whose description/title mentions this branch.
-        crate::status_summary::auto_close_merged_tasks(home, branch);
+        tracing::info!(repo, branch, merged, "CI watcher auto-cleared: PR terminal");
+        if merged {
+            crate::status_summary::auto_close_merged_tasks(home, branch);
+        }
         return Ok(());
     }
 
@@ -1472,7 +1475,7 @@ mod tests {
         }
 
         fn with_pr_terminal(self) -> Self {
-            *self.pr_state.lock().unwrap() = PrState::Terminal;
+            *self.pr_state.lock().unwrap() = PrState::Terminal { merged: true };
             self
         }
     }
