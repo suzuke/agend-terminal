@@ -78,38 +78,43 @@ Per challenge round #1 (all-features intersection policy), Track 1 sweep ran 3 f
 
 ## Track 3: Backlog task hygiene (dev-lead)
 
-### Audit summary — 27 open tasks (post Sprint 18.5/19 PRs)
+### Audit summary — 28 open tasks (post Sprint 18.5/19 PRs through #201)
 
-`task action=list filter_status=open` returned 27 tasks. Classification:
+`task action=list filter_status=open` returned 28 tasks. Classification:
 
 | Category | Count | Action |
 |---|---|---|
-| Strategic backlog (multi-sprint scope, operator priority) | 10 | KEEP — operator排序 |
-| PR follow-up (reviewer non-blocking observations from Sprint 14-19 PRs) | 13 | KEEP low priority |
+| Strategic backlog (multi-sprint scope, operator priority) | 8 | KEEP — operator排序 |
+| PR follow-up (reviewer non-blocking observations from Sprint 14-19 PRs) | 16 | KEEP low priority |
 | Flaky test infra (Windows path / macOS) | 2 | KEEP low — operator/maintainer排程 |
 | Cancellation candidate (sprint-closed, dev-lead non-authorized) | 1 | **OPERATOR ACTION REQUIRED** |
 | Sprint 19 Track 5 (discovered) | 1 | KEEP candidate per #9 |
 
-### Strategic backlog (10) — operator review for Sprint 20+ priority
+### Strategic backlog (8) — operator review for Sprint 20+ priority
+
+(Flaky test infra moved to its own bucket below; previously double-counted here.)
 
 - `t-20260424011906930464-7` — Claude Code agent daemon→LLM notification gap
 - `t-20260424015240518790-0` — watch_ci 多 CI provider 支援
 - `t-20260424020026189561-5` — inbox JSONL compaction
 - `t-20260424164529781904-0` — Claude Code 接 fleet-update 進 user input buffer (**Sprint 18.5 HOTFIX B Hybrid PR #199 已部分解** — 仍 strategic for Claude Agent SDK system event channel migration)
-- `t-20260424173948421544-1` — Windows path normalization for worktree_cleanup tests
-- `t-20260425035142945841-5` — macOS-flaky tests
 - `t-20260426081146799803-2` — backend-specific image paste codec (Bug 6)
 - `t-20260426083533060854-3` — watch_ci silent-drop infra fix (B 路線已 PR-AP cover, A 路線 GITHUB_TOKEN 認證仍 open)
 - `t-20260426083630443353-0` — daemon startup force-regen agend.md (**升 high priority** — 第 2 use case 出現 Sprint 18 Rule 4 broadcast 後)
 - `t-20260426164120257127-1` — fleet-update transport long-term
 
-### PR follow-up backlog (13)
+### Flaky test infra (2) — operator/maintainer排程
+
+- `t-20260424173948421544-1` — Windows path normalization for worktree_cleanup tests
+- `t-20260425035142945841-5` — macOS-flaky tests (`test_describe_message_shows_delivery_mode` / `agent_picked_up_*`)
+
+### PR follow-up backlog (16)
 
 集中 reviewer non-blocking observations for Sprint 14/17/18/18.5/19 PRs。建議**保留 individual** 不合 mega-sweep（不同 PR 不同 reviewer 不同 finding 重新 reconcile 風險）：
 
+- `t-20260426024342801229-20` — PR-AF inbound attachment fail UX (normal priority — 用戶可見 silent failure)
 - `t-20260426074121861355-3` — stacked PR guidance memory append
 - `t-20260426074126143193-4` — invariant test alternation
-- `t-20260426083541166855-4` — PR-AN/AO/AQ test coverage sweep
 - `t-20260426104737606516-3` — PR-AP follow-ups
 - `t-20260426120435664003-7` — PR-AS Phase 2 prereq tests
 - `t-20260426120555737962-8` — PR-AR follow-ups
@@ -119,11 +124,10 @@ Per challenge round #1 (all-features intersection policy), Track 1 sweep ran 3 f
 - `t-20260426130228791508-15` — PR-AW lifecycle test
 - `t-20260426150403693632-0` — HOTFIX #195 follow-ups
 - `t-20260426150432078733-1` — HOTFIX #194 vterm root cause (normal priority)
+- `t-20260426153738539773-2` — PR-AZ F3 test coverage
 - `t-20260426160127609549-4` — PR-AY 5 follow-ups (sub-sweep)
 - `t-20260426171506985479-5` — PR #199 follow-ups
 - `t-20260426173120522467-6` — PR #200 follow-ups
-- `t-20260426153738539773-2` — PR-AZ F3 test coverage
-- `t-20260426024342801229-20` — PR-AF inbound attachment fail UX (normal priority — 用戶可見 silent failure)
 
 ### Cancellation candidate — operator action required ⚠️
 
@@ -210,11 +214,23 @@ Per implicit reading: umbrella scope freeze 已 cover 4 tracks，sub-PR/task wit
 
 Per challenge round #3 fail-safe rules (LOW auto-merge cap N=3 / CI fail freeze / concurrent PR cap=4).
 
-### Triggered events: **(none)**
+### LOW auto-merge cap (N=3) — approaching / reached
 
-- LOW auto-merge cap N=3 not approached (Sprint 19 LOW PRs merged: PR #200 only — Track 1 empty, Track 3-4 in this PR pending)
-- CI fail freeze not triggered (all merged Sprint 19 PRs CI green)
-- Concurrent open PR cap=4 not approached (peak: 1 in-flight Sprint 19 PR at any time)
+Sprint 19 LOW PRs merged so far (chronological):
+1. **PR #200** (Track 2 archive) — merged `346dc51`
+2. **PR #201** (Track 3+4+5 + Challenge rounds + Authority fail-safe sections) — merged `911851d`
+
+In-flight after this report:
+- **PR #202** (Track 3-5 sub-sweep) — about to merge → reaches **3 of 3 cap** → 60-min wait window triggers immediately on subsequent merges
+- **This polish PR (#203)** — opened as the 4th LOW; merge timing follows the wait window or operator wake ratification (whichever first)
+
+### CI fail freeze: not triggered
+
+All merged Sprint 19 PRs CI green (#200, #201). No fail-freeze event.
+
+### Concurrent open PR cap (=4): not exceeded
+
+Fleet-wide peak: 2 in-flight Sprint 19 PRs at any time during the overnight window (this polish PR + #202 sub-sweep). Cap headroom remains.
 
 ### Sprint 18.5 HOTFIX (parallel context)
 
