@@ -42,6 +42,7 @@ pub enum Action {
     CommandPalette,
     ShowDecisions,
     ShowTasks,
+    ShowStatus,
     Detach,
     ShowHelp,
     /// Summon a floating scratch shell overlay (Ctrl+B ~). Esc closes & kills it.
@@ -191,6 +192,7 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char(':') => Action::CommandPalette,
         KeyCode::Char('D') => Action::ShowDecisions,
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::ShowDecisions,
+        KeyCode::Char('s') => Action::ShowStatus,
         KeyCode::Char('T') | KeyCode::Char('t') => Action::ShowTasks,
         KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::SHIFT) => Action::Detach,
         KeyCode::Char('?') => Action::ShowHelp,

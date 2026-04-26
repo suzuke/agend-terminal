@@ -427,6 +427,56 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         None => msg.caption().unwrap_or("").to_string(),
     };
 
+    // Status keyword detection — surface summary to the resolved instance's inbox.
+    // The agent (typically general) sees the summary and can relay to operator.
+    if crate::status_summary::is_status_keyword(&text) {
+        let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
+        let instance_name = {
+            let mut s = lock_state(state);
+            resolve_topic(&mut s, thread_id)
+        };
+        let home = lock_state(state).home.clone();
+        let summary = crate::status_summary::build_summary(&home);
+        tracing::info!(to = %instance_name, "status keyword detected, injecting summary");
+        let _ = crate::inbox::enqueue(
+            &home,
+            &instance_name,
+            crate::inbox::InboxMessage {
+                schema_version: 0,
+                id: None,
+                read_at: None,
+                thread_id: None,
+                parent_id: None,
+                task_id: None,
+                force_meta: None,
+                correlation_id: None,
+                reviewed_head: None,
+                from: "system:status".to_string(),
+                text: summary,
+                kind: Some("status-summary".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                channel: Some(crate::channel::ChannelKind::Telegram),
+                delivery_mode: None,
+                attachments: vec![],
+                in_reply_to_msg_id: None,
+                in_reply_to_excerpt: None,
+            },
+        );
+        // Also notify agent PTY so it picks up the summary
+        let username = msg
+            .from
+            .as_ref()
+            .and_then(|u| u.username.as_deref())
+            .unwrap_or("unknown");
+        crate::inbox::notify_agent(
+            &home,
+            &instance_name,
+            &crate::inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
+            "[status-summary] check inbox for status overview",
+        );
+        return;
+    }
+
     // Extract inbound attachment metadata (photo/voice/document/video/sticker).
     // Download happens later after topic resolution provides instance_name.
     struct InboundFile<'a> {

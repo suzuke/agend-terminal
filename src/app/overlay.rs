@@ -47,6 +47,7 @@ pub enum TaskBoardMode {
 pub enum BoardView {
     Tasks,
     Fleet,
+    Status,
 }
 
 pub(super) enum Overlay {
@@ -550,7 +551,8 @@ pub(super) fn handle_key(
             if key.code == KeyCode::Tab && matches!(mode, TaskBoardMode::Board) {
                 *view = match view {
                     BoardView::Tasks => BoardView::Fleet,
-                    BoardView::Fleet => BoardView::Tasks,
+                    BoardView::Fleet => BoardView::Status,
+                    BoardView::Status => BoardView::Tasks,
                 };
                 return outcome;
             }
@@ -1140,7 +1142,11 @@ mod tests {
         }
         handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
         if let Overlay::Tasks { view, .. } = &overlay {
-            assert_eq!(*view, BoardView::Tasks, "Tab must switch back to Tasks");
+            assert_eq!(*view, BoardView::Status, "Tab must switch to Status");
+        }
+        handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
+        if let Overlay::Tasks { view, .. } = &overlay {
+            assert_eq!(*view, BoardView::Tasks, "Tab must cycle back to Tasks");
         }
         std::fs::remove_dir_all(&home).ok();
     }

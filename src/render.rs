@@ -1255,11 +1255,24 @@ pub fn render_tasks(
     use crate::app::{BoardView, TaskBoardMode};
     let count = items.len();
     let view_tabs = match view {
-        BoardView::Tasks => "[t] tasks  [f] fleet",
-        BoardView::Fleet => " [t] tasks [f] fleet",
+        BoardView::Tasks => "[t] tasks  [f] fleet  [s] status",
+        BoardView::Fleet => " [t] tasks [f] fleet  [s] status",
+        BoardView::Status => " [t] tasks  [f] fleet [s] status",
     };
     let title = format!(" Board ({count}) | {view_tabs} | Tab switch | q close ");
     let inner = render_overlay_frame(frame, Color::Blue, &title);
+
+    if matches!(view, BoardView::Status) {
+        let summary = crate::status_summary::build_summary(home);
+        let lines: Vec<ratatui::text::Line> = summary
+            .lines()
+            .map(|l| ratatui::text::Line::from(l.to_string()))
+            .collect();
+        let para =
+            ratatui::widgets::Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
+        frame.render_widget(para, inner);
+        return;
+    }
 
     if matches!(view, BoardView::Fleet) {
         render_fleet_view(frame, items, inner, home);
