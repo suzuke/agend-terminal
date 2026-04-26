@@ -276,6 +276,16 @@ pub(crate) fn build_instructions_body(
     );
     content.push_str("- Verdict wording: VERIFIED / REJECTED / UNVERIFIED only\n");
 
+    // Response channel discipline — match reply mechanism to input source.
+    content.push_str("\n## Response channel discipline\n\n");
+    content.push_str(
+        "Reply via the same channel the input arrived on:\n\
+         - If you see `(Reply using the reply tool, NOT direct text)` → use the `reply` MCP tool\n\
+         - If you see `[from:AGENT_NAME]` prefix → use `send_to_instance`\n\
+         - If **neither hint is present** (operator typed in TUI) → respond with **direct text**, do NOT use any tool\n\n\
+         Mixing channels (e.g. telegram reply when operator typed in TUI) makes the response appear in the wrong place.\n",
+    );
+
     // Inbox message header handling — teaches agents to parse [AGEND-MSG] headers
     // injected by the daemon via PTY (S3-T1 format).
     content.push_str("\n## Inbox message handling\n\n");

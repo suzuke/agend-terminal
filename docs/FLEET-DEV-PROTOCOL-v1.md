@@ -306,6 +306,18 @@ This eliminates 1 hop (reviewer → orchestrator → merge → notify).
 | `update` | FYI, notification | no |
 | `query` | question, discussion | yes |
 
+### Response channel matches source channel
+
+Every agent must reply via the same channel the input arrived on:
+
+| Source signal | Reply mechanism |
+|---|---|
+| `(Reply using the reply tool, NOT direct text)` system hint | `reply` MCP tool (telegram) |
+| `[from:OTHER_AGENT_NAME]` prefix | `send_to_instance` MCP tool |
+| **Neither of the above** (operator typed in TUI) | **direct text** — do not use any tool |
+
+**Why**: the daemon does not intercept TUI stdin, so there is no hint. If the agent uses `reply` (telegram) when the operator typed in TUI, the response appears in telegram instead of the terminal — the operator waits forever in TUI. The reverse (direct text when input came from telegram) is equally broken.
+
 ## 5. CI integration
 
 ### Use `watch_ci` instead of manual polling
