@@ -38,6 +38,7 @@ mod render;
 mod schedules;
 mod snapshot;
 mod state;
+mod status_summary;
 mod store;
 mod sync;
 mod tasks;
