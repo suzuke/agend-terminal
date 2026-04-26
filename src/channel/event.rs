@@ -82,7 +82,6 @@ pub struct MsgPayload {
 }
 
 /// Outbound message — the payload passed to `Channel::send` / `Channel::edit`.
-/// TODO: expand with buttons, attachments, reply-to once adapters consume it.
 /// Kind of media attachment.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,21 +108,30 @@ pub struct Attachment {
     pub original_filename: Option<String>,
 }
 
+/// Channel-agnostic reference to a specific message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MessageRef {
+    pub channel: crate::channel::ChannelKind,
+    pub msg_id: String,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OutMsg {
     pub text: String,
-    /// Optional media attachment. When present, adapters that support media
-    /// will send the attachment; others fall back to text-only with a warning.
+    /// Optional media attachment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment: Option<Attachment>,
+    /// If set, the outbound message is a reply to this specific message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<MessageRef>,
 }
 
 impl OutMsg {
-    /// Shorthand for a plain-text outbound message.
     pub fn text(t: impl Into<String>) -> Self {
         Self {
             text: t.into(),
             attachment: None,
+            in_reply_to: None,
         }
     }
 }
@@ -172,6 +180,7 @@ mod tests {
         let msg = OutMsg {
             text: "see attached".into(),
             attachment: Some(attachment),
+            in_reply_to: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -198,5 +207,21 @@ mod tests {
             !json.contains("attachment"),
             "None attachment must be skipped: {json}"
         );
+    }
+
+    #[test]
+    fn outmsg_with_in_reply_to_roundtrips() {
+        let msg = OutMsg {
+            text: "x".into(),
+            attachment: None,
+            in_reply_to: Some(MessageRef {
+                channel: crate::channel::ChannelKind::Telegram,
+                msg_id: "42".into(),
+            }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains(r#""msg_id":"42""#), "json: {json}");
+        let back: OutMsg = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.in_reply_to, msg.in_reply_to);
     }
 }

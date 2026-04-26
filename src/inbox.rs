@@ -203,6 +203,9 @@ pub struct InboxMessage {
     /// to a local path before enqueue. Empty for text-only messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::channel::event::Attachment>,
+    /// If the user replied to a specific bot message, this is that message's id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to_msg_id: Option<String>,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).
@@ -695,6 +698,7 @@ pub fn deliver(
         channel: None,
         delivery_mode: None,
         attachments: vec![],
+        in_reply_to_msg_id: None,
     };
     let _ = enqueue(home, agent_name, msg);
     notify_agent(home, agent_name, source, text);
@@ -849,6 +853,7 @@ mod tests {
             channel: None,
             delivery_mode: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         }
     }
 
@@ -980,6 +985,7 @@ mod tests {
             channel: None,
             delivery_mode: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1082,6 +1088,7 @@ mod tests {
             channel: None,
             delivery_mode: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1109,6 +1116,7 @@ mod tests {
             channel: None,
             delivery_mode: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1699,6 +1707,7 @@ mod tests {
             parent_id: Some("m-0".into()),
             task_id: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("thread_id"));
@@ -1747,6 +1756,7 @@ mod tests {
             parent_id: Some("m-41".into()),
             task_id: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("[AGEND-MSG]"));
@@ -1778,6 +1788,7 @@ mod tests {
             parent_id: None,
             task_id: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("from=from:agent"));
@@ -1807,6 +1818,7 @@ mod tests {
             parent_id: None,
             task_id: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1840,6 +1852,7 @@ mod tests {
             parent_id: None,
             task_id: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1878,6 +1891,7 @@ mod tests {
             parent_id: None,
             task_id: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1919,6 +1933,7 @@ mod tests {
             parent_id: None,
             task_id: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2066,11 +2081,25 @@ mod tests {
                 size_bytes: Some(1234),
                 original_filename: None,
             }],
+            in_reply_to_msg_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: InboxMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.attachments.len(), 1);
         assert_eq!(back.attachments[0].kind, AttachmentKind::Photo);
         assert_eq!(back.attachments[0].size_bytes, Some(1234));
+    }
+
+    #[test]
+    fn inbox_message_with_in_reply_to_msg_id_roundtrips() {
+        let mut msg = make_msg("user:op", "reply test");
+        msg.in_reply_to_msg_id = Some("999".to_string());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""in_reply_to_msg_id":"999""#),
+            "json: {json}"
+        );
+        let back: InboxMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.in_reply_to_msg_id, Some("999".to_string()));
     }
 }

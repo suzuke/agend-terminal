@@ -132,6 +132,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     channel: None,
                     delivery_mode: None,
                     attachments: vec![],
+                    in_reply_to_msg_id: None,
                 },
             );
             "ok_inbox"
