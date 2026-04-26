@@ -187,12 +187,12 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         size,
     ) {
         Ok(spawn_mode) => {
-            // Every API-level spawn gets a Telegram forum topic (no-op
-            // when the channel isn't configured — resolve_channel_only
-            // returns Err and the helper returns None). Previously only
-            // the MCP `create_instance` wrappers called this, so
-            // deploy_template-spawned agents silently lacked topics.
-            let topic_id = crate::channel::telegram::create_topic_for_instance(ctx.home, name);
+            // Every API-level spawn gets a channel topic (no-op when
+            // no channel is configured). Routes through the Channel trait
+            // so this handler is channel-agnostic.
+            let topic_id = crate::channel::active_channel()
+                .and_then(|ch| ch.create_topic(name).ok())
+                .map(|t| t.id);
             if let Some(n) = ctx.notifier {
                 let layout_hint = LayoutHint::parse(params["layout"].as_str().unwrap_or("tab"));
                 let spawner = params["spawner"]
