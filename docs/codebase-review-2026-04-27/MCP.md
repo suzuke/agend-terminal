@@ -189,11 +189,14 @@ Some tool descriptions (e.g., `:152 list_decisions: "List active decisions."`) h
 
 ---
 
-## Peer pass placeholder
+## Peer-pass critique reading Track C TUI.md
 
-Per challenge round 對立 peer-cross-check (A↔B, C↔D diagonal):
-**I (Track D) will read dev-reviewer's Track C TUI AREA.md and submit a 1-paragraph blindspot critique** after the four reports are posted. Reciprocal pass from Track C → my Track D expected.
+(Per challenge round 對立 peer-cross-check, C↔D diagonal. Track C's reciprocal pass on this report is in `TUI.md:248-252`. Read: `b1858aa docs/codebase-review-2026-04-27/TUI.md`, 253 lines, audited `1485e85`.)
+
+**1 paragraph blindspot critique from MCP visibility**:
+
+Track C's strongest finding is H1 (5 unbounded `area.height - N` panic sites in `render.rs` overlays, with PR #194 vterm OOB hotfix as prior incident). The severity is correctly tagged HIGH at the *crash-class* level, but the framing **stops at TUI presentation impact** — from MCP-side visibility, the same panic chain may have **availability consequences for the entire MCP tool surface**. If the TUI thread panics inside `render_tab_list` / `render_move_pane_target` / `render_confirm` and the daemon's panic policy is not strictly contained (e.g. a single-runtime panic propagates up through `tokio::select!` or the supervisor doesn't catch a TUI subtask abort), then MCP handlers `proxy_or_local`-routed via `crate::api::call` start failing with "API unavailable", silently degrading to local-handler fallback — **the very fallback path that Track D's M-tier "Preserve-as-is" Praise warned not to remove**. Track C and Track D should jointly verify in Sprint 21 whether a TUI overlay panic actually kills the API server thread (Track B/D ownership boundary). Second blindspot: Track C's *"(none observed)"* on Critical findings declares Track C is "presentation/state layer; security-relevant surfaces live in Tracks A/D" — but `src/state.rs` is a **PTY-output classifier** (Track C correctly self-corrects this in L1) whose classification signal feeds MCP scheduling decisions (`list_instances` → `agent_state` field → caller decides whether to delegate). A malicious or compromised agent producing classifier-confusion bytes (faking "Ready" state during a hang) would not be caught by any Track A/D auth gate — it's a **Track C trust boundary** that was scope-out in this audit pass. Recommend a Sprint 21 sub-track audit of `state.rs` regex/pattern robustness against adversarial PTY output, which neither this nor Track C's audit covered. Praise for Track C's R1 (overlay-dims helper extraction) — it elegantly closes both H1 and L2 in a ~30-line PR; matches my own "centralize the auth predicate" recommendation pattern (parallel to my `can_mutate_decision` Sprint 21 task #1). **Joint Sprint 21 priority alignment**: both reports flagged `src/app/api_server.rs` (130 lines, TUI↔MCP bridge) as cross-area-blindspot — agree this should be top of Sprint 21 backlog, ahead of either track's Tier-1 follow-ups.
 
 ---
 
-*End of Track D audit. Time spent: ~2h within hard cap.*
+*End of Track D audit + peer-pass. Audit time: ~2h within hard cap. Peer-pass time: ~30 min.*
