@@ -1053,16 +1053,22 @@ impl Tab {
     /// rendering in render_pane. Agent state suffix (` [state] `) is excluded so
     /// that clicks on it fall through to split-border resize.
     pub fn title_bar_at(&self, col: u16, row: u16) -> Option<usize> {
-        for (&id, &(px, py, pw, _ph)) in &self.pane_rects {
+        use unicode_width::UnicodeWidthStr;
+        for (&id, &(px, py, _pw, _ph)) in &self.pane_rects {
             if row != py {
                 continue;
             }
-            if self.root().find_pane(id).is_none() {
-                continue;
-            }
-            // Hit area covers the full pane-width title bar row (not just
-            // the text label) so the entire colored region is draggable.
-            if col >= px && col < px + pw {
+            let pane = match self.root().find_pane(id) {
+                Some(p) => p,
+                None => continue,
+            };
+            // Hit area covers only the rendered ` {label} ` region starting
+            // at px+1 (first col is the border glyph). Clicks outside the
+            // label text fall through to border resize handling.
+            let label_w = UnicodeWidthStr::width(pane.label()) as u16;
+            let hit_start = px + 1;
+            let hit_end = hit_start + label_w + 2; // leading space + label + trailing space
+            if col >= hit_start && col < hit_end {
                 return Some(id);
             }
         }
@@ -1702,6 +1708,64 @@ mod tests {
         assert_eq!(UnicodeWidthStr::width("代理") as u16, 4);
         // Mixed
         assert_eq!(UnicodeWidthStr::width("a代") as u16, 3);
+    }
+
+    /// Helper: create a single-pane Tab with a given agent name and pane rect.
+    fn tab_with_pane(name: &str, id: usize, rect: (u16, u16, u16, u16)) -> Tab {
+        let pane = Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam::channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        };
+        let mut tab = Tab::new("test".into(), pane);
+        tab.pane_rects.insert(id, rect);
+        tab
+    }
+
+    #[test]
+    fn title_bar_at_hits_within_name_text() {
+        // Pane "alice" at (0,0) width 40. Label " alice " occupies cols 1..8.
+        let tab = tab_with_pane("alice", 1, (0, 0, 40, 10));
+        // Col 1 = leading space of " alice " → hit
+        assert_eq!(tab.title_bar_at(1, 0), Some(1));
+        // Col 6 = last char of "alice" → hit
+        assert_eq!(tab.title_bar_at(6, 0), Some(1));
+        // Col 7 = trailing space → hit
+        assert_eq!(tab.title_bar_at(7, 0), Some(1));
+    }
+
+    #[test]
+    fn title_bar_at_misses_outside_name_text() {
+        // Pane "alice" at (0,0) width 40. Label ends at col 8.
+        let tab = tab_with_pane("alice", 1, (0, 0, 40, 10));
+        // Col 0 = border glyph → miss
+        assert_eq!(tab.title_bar_at(0, 0), None);
+        // Col 8 = past label → miss (falls through to border check)
+        assert_eq!(tab.title_bar_at(8, 0), None);
+        // Col 30 = far right → miss
+        assert_eq!(tab.title_bar_at(30, 0), None);
+    }
+
+    #[test]
+    fn title_bar_at_name_fills_pane_width() {
+        // Pane name exactly fills the pane: name width 8 + 2 padding = 10 = pane width - 1 (border)
+        // Pane at (0,0) width 11. Label " longname " = cols 1..11.
+        let tab = tab_with_pane("longname", 1, (0, 0, 11, 10));
+        // All cols 1..10 should hit
+        for col in 1..11 {
+            assert_eq!(tab.title_bar_at(col, 0), Some(1), "col {col} should hit");
+        }
     }
 
     // --- Tab / Layout mutation tests ---
