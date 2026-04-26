@@ -9,7 +9,7 @@ mod tui_bridge;
 pub(crate) mod watchdog;
 
 use crate::agent::{self, AgentRegistry};
-use crate::channel::telegram::notify_telegram;
+use crate::channel::NotifySeverity;
 use ci_watch::check_ci_watches;
 use cron_tick::check_schedules;
 pub use tui_bridge::serve_agent_tui;
@@ -604,7 +604,11 @@ fn run_core(
             };
             tracing::warn!(agent = %crashed_name, %state, "notifying");
             let msg = format!("[health] {crashed_name}: {state}");
-            notify_telegram(home, &crashed_name, &msg);
+            if let Some(ch) = crate::channel::active_channel() {
+                let _ = ch.notify(&crashed_name, NotifySeverity::Error, &msg, false);
+            } else {
+                tracing::debug!(agent = %crashed_name, "no active channel for crash notification");
+            }
         }
 
         if should_respawn {
