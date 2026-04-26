@@ -1,8 +1,8 @@
-# Fleet Development Protocol v1
+# Fleet Development Protocol v1.2
 
-**Status:** ACTIVE — all fleet agents must follow this protocol starting next work cycle.
-**Supersedes:** ad-hoc prose conventions from Track 1 (2026-04-22).
-**Informed by:** at-dev-2 (implementer feedback), at-dev-4 (reviewer feedback), friction log A1-C4.
+**Status:** ACTIVE — all fleet agents must follow this protocol.
+**Version history:** v1.0 (2026-04-22), v1.1 (2026-04-23), v1.2 (2026-04-26).
+**Informed by:** implementer feedback, reviewer feedback, operator observations, 4-perspective challenge round.
 
 ## 1. Shared task board as single source of truth
 
@@ -15,9 +15,14 @@ All work items visible to all agents via `task list`.
 ```
 task create (orchestrator)
   → task claim (implementer)
+    → task update --status in_progress (implementer, on PR push)
     → task update --status blocked (if waiting)
-    → task done --result "PR #N merged" (implementer)
+    → task update --status verified (reviewer, on VERIFIED verdict)
+    → task done --result "PR #N merged" (dev-lead, on merge)
 ```
+
+**Three-state completion model (v1.2):** `in_progress` → `verified` → `done`.
+See §10.3 for full rules and edge cases.
 
 ### When to create tasks
 
@@ -117,11 +122,29 @@ post_decision --title "PR59-F1 withdrawn"
 
 `VERIFIED` / `REJECTED` / `UNVERIFIED`
 
-### Metadata fields (v1.1 addition)
+### Metadata fields (v1.1 addition, extended v1.2)
 
 Add to every review report:
 - `scope_source`: decision ID or design doc section that defined scope
 - `audit_mode`: `full_review` | `finding_reaudit` | `scope_conformance`
+- `reviewed_head`: git SHA at time of review (v1.2: snapshot, not contract — any subsequent commit resets verdict state)
+- `commands`: verification commands run (e.g. `cargo test --features tray`)
+- `files`: files audited
+
+**VERIFIED is an audit trail, not a quality guarantee.** The verdict records what was checked at `reviewed_head`; it does not promise the code is bug-free. This framing prevents retroactive blame when post-merge issues surface.
+
+### Re-review dispatch template (v1.2)
+
+When dispatching r2 (re-review after REJECTED), the dispatch must enumerate r1 findings with status:
+
+```
+r1 findings:
+- F1: <description> → fixed (commit abc1234)
+- F2: <description> → deferred (tracked as task t-xxx)
+- F3: <description> → withdrawn (decision d-xxx)
+```
+
+If r1 findings status is missing, reviewer falls back to `audit_mode: full_review`.
 
 
 ### 3.5 Multi-reviewer dispatch
@@ -449,3 +472,66 @@ Clean up immediately. Don't accumulate stale worktrees.
 | Schedule check-in | `create_schedule` (one-shot `--run_at`) | Backend-specific ScheduleWakeup |
 | Timeout escalation | `replace_instance` (after ping fails) | Silently waiting forever |
 
+
+## 10. Workflow efficiency rules (v1.2)
+
+Three rules to eliminate idle time. Operator-authorized 2026-04-26.
+
+### 10.1 Pipeline dispatch
+
+**Rule:** Implementer pushes PR, then immediately starts the next task. Do not wait for review or merge.
+
+- PR rejected → implementer interrupts current task to rework the rejected PR.
+- PR merged → current task unaffected, continue.
+
+**Edge case policies:**
+
+| ID | Policy |
+|---|---|
+| E1.1 | **Strict on-top-of-main.** Pipeline tasks must branch from main. If next task depends on a pending PR, do not pipeline — wait for merge. |
+| E1.2 | **Pipeline depth ≤ 2.** Maximum: 1 PR in review + 1 task in progress. Three-deep cascades are unmanageable. |
+| E1.3 | **Context-switch threshold on reject.** If next task is ≤30% done, switch back immediately. If ≥70% done, dev-lead may allow finishing before rework. Between 30-70%, dev-lead decides. |
+| E1.4 | **Backend-aware capacity.** Claude agents: 3-4 concurrent review items. Kiro-cli agents: 1-2. Same caps apply to implementers. |
+
+### 10.2 Reviewer does not wait for CI
+
+**Rule:** Reviewer starts code review as soon as PR is pushed. CI green → send verdict immediately. CI red → handle by failure type.
+
+**Edge case policies:**
+
+| ID | Policy |
+|---|---|
+| E2.1 | **CI fail classification by job.** `fmt`/`clippy` red → lint issue, impl fixes, verdict still valid. `build`/`test` red → logic error, requires one more review round. Snapshot-only diff (no generator logic change) → impl updates snapshot, verdict valid. |
+| E2.2 | **CI green is necessary, not sufficient.** Reviewer verdict is authoritative regardless of CI color. CI green does not auto-approve; CI red does not auto-reject. |
+| E2.3 | **Force-push during review invalidates verdict.** Default: any push after review starts resets verdict. Exception: reviewer can verify commit-level patch hash matches via stack-base diff — but default invalidation is safer. |
+| E2.4 | **`reviewed_head` is a snapshot, not a contract.** VERIFIED applies to the exact SHA in `reviewed_head`. Any subsequent commit resets verdict state. Aligns with GitHub "dismiss stale review on push". |
+| E2.5 | **Dual reviewer (§3.5.5) not short-circuited.** Rule 2 does not override §3.5.5 mandatory dual review. Dev-lead must not auto-merge on single VERIFIED + CI green when dual review is required. |
+| E2.6 | **Reviewer pipeline cap by backend.** Reviewers also pipeline. Claude: 3-4 concurrent reviews. Kiro-cli: 1-2. |
+| E2.7 | **Scope-creep priority over CI red.** REJECT primary reason is always scope violation. CI failure is secondary detail. |
+| E2.8 | **r2 dispatch must enumerate r1 findings.** Re-review dispatch template must list each r1 finding as fixed/deferred/withdrawn. Missing enumeration → reviewer falls back to `full_review`. |
+
+### 10.3 Task close on completion
+
+**Rule:** Task state tracks PR lifecycle through three states: `in_progress` → `verified` → `done`.
+
+| State | Who sets | When |
+|---|---|---|
+| `claimed` | Implementer | Task accepted |
+| `in_progress` | Implementer | PR pushed |
+| `verified` | Reviewer | VERIFIED verdict sent |
+| `done` | Dev-lead | PR merged |
+
+**Ownership:** Impl-claimed tasks are closed by the impl owner (or dev-lead on merge). Reviewers close only tasks assigned to them (review dispatch tasks). This avoids permission conflicts where reviewer cannot update impl-claimed tasks.
+
+**Edge case policies:**
+
+| ID | Policy |
+|---|---|
+| E3.1 | **Impl owns close for impl tasks.** Reviewer sets `verified`; dev-lead sets `done` on merge. Reviewer does not attempt `task done` on impl-claimed tasks (daemon rejects non-owner close). |
+| E3.2 | **Three-state model.** `in_progress` (impl working) → `verified` (reviewer approved) → `done` (merged). No skipping states. |
+| E3.3 | **Merge fail handling.** If merge fails (conflict) after `verified`, task drops back to `in_progress`. Impl resolves conflict, re-pushes, reviewer re-verifies. |
+| E3.4 | **Multi-round review cycle.** REJECTED → task stays `in_progress` → rework → push → re-review → `verified`. Task never enters `done` until merge. |
+| E3.5 | **Dev-lead merge gate.** Dev-lead verifies task state before merge. If reviewer/impl forgot to update, dev-lead updates as safety net. Protocol-level mitigation; daemon auto-close on PR merge is a future enhancement. |
+| E3.6 | **Idempotent close.** Closing an already-done task is a no-op (daemon should not error). |
+| E3.7 | **Done-but-superseded.** If scope changes after task is done, post a decision and create a new task with `depends_on`. Do not reopen the original. |
+| E3.8 | **Verdict evidence chain.** Every verdict report must include: `reviewed_head`, `scope_source`, `audit_mode`, `commands`, `files`. See §3 metadata fields. |
