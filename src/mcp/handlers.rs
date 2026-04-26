@@ -822,6 +822,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         .map(|r| (r.topic_id, r.working_directory))
                 })
                 .unwrap_or((None, None));
+            // Fallback: if fleet.yaml doesn't have topic_id (dynamically created
+            // instance), look up from topics.json on disk.
+            let topic_id = topic_id.or_else(|| telegram::lookup_topic_for_instance(&home, name));
 
             let _ = crate::api::call(
                 &home,
@@ -833,6 +836,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             // Delete the Telegram topic if one exists
             if let Some(tid) = topic_id {
                 telegram::delete_topic(&home, tid);
+            } else {
+                tracing::warn!(%name, "no topic_id found for delete_instance — possible orphan");
             }
             // Clean up working directory
             if let Some(ref wd) = working_dir {
