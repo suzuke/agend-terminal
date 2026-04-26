@@ -1645,11 +1645,12 @@ pub fn build_fleet_view_lines(
             lines.push(format!("  {symbol} {member}{task_info}"));
         }
     }
-    let unassigned: Vec<&str> = all_instances
+    let mut unassigned: Vec<&str> = all_instances
         .iter()
         .filter(|n| !assigned.contains(n.as_str()))
         .map(String::as_str)
         .collect();
+    unassigned.sort_unstable();
     if !unassigned.is_empty() {
         lines.push("═══ unassigned ═══".to_string());
         for name in &unassigned {
