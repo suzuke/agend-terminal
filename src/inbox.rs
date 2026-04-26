@@ -206,6 +206,9 @@ pub struct InboxMessage {
     /// If the user replied to a specific bot message, this is that message's id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to_msg_id: Option<String>,
+    /// Excerpt of the replied-to message (first 200 chars + author tag).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to_excerpt: Option<String>,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).
@@ -496,6 +499,12 @@ pub fn format_header(msg: &InboxMessage) -> String {
             .collect();
         parts.push(format!("attachments=[{}]", paths.join(",")));
     }
+    if let Some(ref excerpt) = msg.in_reply_to_excerpt {
+        parts.push(format!(
+            "reply_to_excerpt={}",
+            sanitize_header_value(excerpt)
+        ));
+    }
     parts.join(" ")
 }
 
@@ -707,6 +716,7 @@ pub fn deliver(
         delivery_mode: None,
         attachments: vec![],
         in_reply_to_msg_id: None,
+        in_reply_to_excerpt: None,
     };
     let _ = enqueue(home, agent_name, msg);
     notify_agent(home, agent_name, source, text);
@@ -862,6 +872,7 @@ mod tests {
             delivery_mode: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         }
     }
 
@@ -994,6 +1005,7 @@ mod tests {
             delivery_mode: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1097,6 +1109,7 @@ mod tests {
             delivery_mode: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1125,6 +1138,7 @@ mod tests {
             delivery_mode: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1716,6 +1730,7 @@ mod tests {
             task_id: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("thread_id"));
@@ -1765,6 +1780,7 @@ mod tests {
             task_id: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("[AGEND-MSG]"));
@@ -1797,6 +1813,7 @@ mod tests {
             task_id: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("from=from:agent"));
@@ -1834,6 +1851,7 @@ mod tests {
                 original_filename: None,
             }],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1862,12 +1880,77 @@ mod tests {
             task_id: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let header = format_header(&msg);
         assert!(
             !header.contains("attachments"),
             "empty attachments must not appear in header: {header}"
         );
+    }
+
+    #[test]
+    fn test_header_reply_excerpt_present() {
+        let mut msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "u".into(),
+            text: "reply".into(),
+            kind: None,
+            timestamp: "t".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: Some("42".into()),
+            in_reply_to_excerpt: Some("[bob] original".into()),
+        };
+        let h = format_header(&msg);
+        assert!(h.contains("reply_to_excerpt=[bob] original"), "{h}");
+        msg.in_reply_to_excerpt = None;
+        assert!(!format_header(&msg).contains("reply_to_excerpt"));
+    }
+
+    #[test]
+    fn test_reply_excerpt_long_truncated() {
+        let long: String = "x".repeat(300);
+        let trunc: String = long.chars().take(200).collect();
+        assert_eq!(trunc.len(), 200);
+        let excerpt = format!("[a] {trunc}…");
+        assert!(excerpt.contains("…"));
+    }
+
+    #[test]
+    fn test_reply_excerpt_newline_escaped() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "u".into(),
+            text: "r".into(),
+            kind: None,
+            timestamp: "t".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: Some("42".into()),
+            in_reply_to_excerpt: Some("[b] line1\nline2".into()),
+        };
+        let h = format_header(&msg);
+        assert!(!h.contains('\n'), "must be single line: {h}");
+        assert!(h.contains("reply_to_excerpt="), "{h}");
     }
 
     #[test]
@@ -1890,6 +1973,7 @@ mod tests {
             task_id: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1924,6 +2008,7 @@ mod tests {
             task_id: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1963,6 +2048,7 @@ mod tests {
             task_id: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2005,6 +2091,7 @@ mod tests {
             task_id: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2153,6 +2240,7 @@ mod tests {
                 original_filename: None,
             }],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: InboxMessage = serde_json::from_str(&json).unwrap();

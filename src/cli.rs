@@ -209,6 +209,7 @@ fn test_inbox(home: &Path) -> anyhow::Result<()> {
                 delivery_mode: None,
                 attachments: vec![],
                 in_reply_to_msg_id: None,
+                in_reply_to_excerpt: None,
             },
         )?;
     }
