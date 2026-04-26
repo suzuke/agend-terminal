@@ -84,7 +84,7 @@ pub struct MsgPayload {
 /// Outbound message — the payload passed to `Channel::send` / `Channel::edit`.
 /// TODO: expand with buttons, attachments, reply-to once adapters consume it.
 /// Kind of media attachment.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentKind {
     Photo,
@@ -105,6 +105,8 @@ pub struct Attachment {
     pub caption: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -165,6 +167,7 @@ mod tests {
             mime: Some("image/jpeg".into()),
             caption: Some("test photo".into()),
             size_bytes: Some(12345),
+            original_filename: None,
         };
         let msg = OutMsg {
             text: "see attached".into(),

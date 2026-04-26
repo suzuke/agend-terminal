@@ -930,6 +930,7 @@ pub fn run_task_maintenance(home: &Path) {
                 force_meta: None,
                 correlation_id: None,
                 reviewed_head: None,
+                attachments: vec![],
             },
         );
     }
@@ -991,6 +992,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                     thread_id: None,
                     parent_id: None,
                     task_id: None,
+                    attachments: vec![],
                 },
             );
         }

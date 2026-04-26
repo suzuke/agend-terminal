@@ -978,6 +978,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            attachments: vec![],
         };
         let header = crate::inbox::format_header(&sample_msg);
 

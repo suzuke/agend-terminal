@@ -191,6 +191,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         channel: None,
                         delivery_mode: Some("inbox_fallback".to_string()),
+                        attachments: vec![],
                     };
                     let _ = crate::inbox::enqueue(&home, target, msg);
                     crate::inbox::notify_agent(
@@ -351,6 +352,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         kind: Some("task".to_string()),
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         channel: None,
+                        attachments: vec![],
                     };
                     let _ = crate::inbox::enqueue(&home, target, inbox_msg);
                     crate::inbox::notify_agent(
@@ -472,6 +474,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                             kind: Some("report".to_string()),
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             channel: None,
+                            attachments: vec![],
                         };
                         let _ = crate::inbox::enqueue(&home, target, inbox_msg);
                         crate::inbox::notify_agent(
@@ -934,6 +937,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     channel: None,
                     delivery_mode: None,
+                    attachments: vec![],
                 },
             );
             tracing::info!(%name, %reason, "replace_instance");
@@ -2394,6 +2398,7 @@ instances:
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 channel: None,
                 delivery_mode: None,
+                attachments: vec![],
             },
         );
 
@@ -2451,6 +2456,7 @@ instances:
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 channel: None,
                 delivery_mode: None,
+                attachments: vec![],
             },
         );
 
@@ -2617,6 +2623,7 @@ instances:
             correlation_id: None,
             reviewed_head: None,
             task_id: None,
+            attachments: vec![],
         };
         let inbox_dir = home.join("inbox");
         std::fs::create_dir_all(&inbox_dir).ok();

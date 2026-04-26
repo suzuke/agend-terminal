@@ -131,6 +131,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     timestamp: now_utc.to_rfc3339(),
                     channel: None,
                     delivery_mode: None,
+                    attachments: vec![],
                 },
             );
             "ok_inbox"

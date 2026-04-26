@@ -653,6 +653,7 @@ async fn ci_check_repo(
                     timestamp: chrono::Utc::now().to_rfc3339(),
                     channel: None,
                     delivery_mode: None,
+                    attachments: vec![],
                 },
             );
         }
