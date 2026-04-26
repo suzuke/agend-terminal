@@ -1719,7 +1719,7 @@ impl crate::channel::Channel for TelegramChannel {
                 ))?;
                 if needs_separate_text(&msg.text, att) {
                     let _ = telegram_runtime()
-                        .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text));
+                        .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text, None));
                 }
                 Ok(crate::channel::MsgRef {
                     binding: crate::channel::BindingRef::new("telegram", None, ()),
@@ -1731,7 +1731,7 @@ impl crate::channel::Channel for TelegramChannel {
                     anyhow::bail!("OutMsg has no text and no attachment");
                 }
                 telegram_runtime()
-                    .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text))?;
+                    .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text, None))?;
                 Ok(crate::channel::MsgRef {
                     binding: crate::channel::BindingRef::new("telegram", None, ()),
                     id: "0".to_string(),
@@ -3084,6 +3084,7 @@ instances:
         let msg = crate::channel::OutMsg {
             text: "see".into(),
             attachment: Some(make_attachment(crate::channel::AttachmentKind::Photo)),
+            in_reply_to: None,
         };
         let err = channel.send(&binding, msg).expect_err("no bot");
         assert!(

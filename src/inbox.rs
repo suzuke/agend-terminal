@@ -2089,4 +2089,17 @@ mod tests {
         assert_eq!(back.attachments[0].kind, AttachmentKind::Photo);
         assert_eq!(back.attachments[0].size_bytes, Some(1234));
     }
+
+    #[test]
+    fn inbox_message_with_in_reply_to_msg_id_roundtrips() {
+        let mut msg = make_msg("user:op", "reply test");
+        msg.in_reply_to_msg_id = Some("999".to_string());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""in_reply_to_msg_id":"999""#),
+            "json: {json}"
+        );
+        let back: InboxMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.in_reply_to_msg_id, Some("999".to_string()));
+    }
 }

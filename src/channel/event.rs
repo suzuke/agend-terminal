@@ -208,4 +208,20 @@ mod tests {
             "None attachment must be skipped: {json}"
         );
     }
+
+    #[test]
+    fn outmsg_with_in_reply_to_roundtrips() {
+        let msg = OutMsg {
+            text: "x".into(),
+            attachment: None,
+            in_reply_to: Some(MessageRef {
+                channel: crate::channel::ChannelKind::Telegram,
+                msg_id: "42".into(),
+            }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains(r#""msg_id":"42""#), "json: {json}");
+        let back: OutMsg = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.in_reply_to, msg.in_reply_to);
+    }
 }
