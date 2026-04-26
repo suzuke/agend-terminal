@@ -214,29 +214,31 @@ impl TelegramState {
             .bot
             .as_ref()
             .expect("telegram bot not initialized (contract-test construction?)");
-        send_with_topic(bot, self.group_id, Some(*topic_id), text).await
+        send_with_topic(bot, self.group_id, Some(*topic_id), text, None).await
     }
 }
 
-/// Send a message, optionally to a topic.
+/// Send a message, optionally to a topic, optionally as a reply.
 async fn send_with_topic(
     bot: &Bot,
     chat_id: ChatId,
     topic_id: Option<i32>,
     text: &str,
+    reply_to_msg_id: Option<i32>,
 ) -> anyhow::Result<()> {
     use teloxide::payloads::SendMessageSetters;
     use teloxide::prelude::Requester;
-    match topic_id {
-        Some(tid) if tid != 1 => {
-            bot.send_message(chat_id, text)
-                .message_thread_id(ThreadId(MessageId(tid)))
-                .await?;
-        }
-        _ => {
-            bot.send_message(chat_id, text).await?;
+    use teloxide::types::ReplyParameters;
+    let mut req = bot.send_message(chat_id, text);
+    if let Some(tid) = topic_id {
+        if tid != 1 {
+            req = req.message_thread_id(ThreadId(MessageId(tid)));
         }
     }
+    if let Some(mid) = reply_to_msg_id {
+        req = req.reply_parameters(ReplyParameters::new(MessageId(mid)));
+    }
+    req.send().await?;
     Ok(())
 }
 
@@ -631,6 +633,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         channel: Some(crate::channel::ChannelKind::Telegram),
         delivery_mode: None,
         attachments,
+        in_reply_to_msg_id: msg.reply_to_message().map(|r| r.id.0.to_string()),
     };
     let _ = inbox::enqueue(&home, &instance_name, msg_obj);
 
@@ -813,7 +816,7 @@ pub fn send_reply(
         s.home.clone(),
     );
     drop(s);
-    let res = telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text));
+    let res = telegram_runtime().block_on(send_with_topic(&bot, group_id, topic_id, text, None));
     if let Err(e) = &res {
         handle_send_failure(e, &home, instance_name, topic_id, Some(state));
     }
@@ -1660,7 +1663,7 @@ impl TelegramChannel {
         };
         let text = crate::channel::ux_event::format_fleet_oneliner(fe, self.caps.max_msg_bytes);
         if let Err(e) = telegram_runtime()
-            .block_on(async { send_with_topic(&bot, chat_id, Some(topic_id), &text).await })
+            .block_on(async { send_with_topic(&bot, chat_id, Some(topic_id), &text, None).await })
         {
             let handled = handle_fleet_send_failure(&e, &home, &self.state, topic_id);
             if !handled {

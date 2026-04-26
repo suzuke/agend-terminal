@@ -654,6 +654,7 @@ async fn ci_check_repo(
                     channel: None,
                     delivery_mode: None,
                     attachments: vec![],
+                    in_reply_to_msg_id: None,
                 },
             );
         }

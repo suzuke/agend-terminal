@@ -192,6 +192,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         channel: None,
                         delivery_mode: Some("inbox_fallback".to_string()),
                         attachments: vec![],
+                        in_reply_to_msg_id: None,
                     };
                     let _ = crate::inbox::enqueue(&home, target, msg);
                     crate::inbox::notify_agent(
@@ -353,6 +354,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         channel: None,
                         attachments: vec![],
+                        in_reply_to_msg_id: None,
                     };
                     let _ = crate::inbox::enqueue(&home, target, inbox_msg);
                     crate::inbox::notify_agent(
@@ -475,6 +477,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             channel: None,
                             attachments: vec![],
+                            in_reply_to_msg_id: None,
                         };
                         let _ = crate::inbox::enqueue(&home, target, inbox_msg);
                         crate::inbox::notify_agent(
@@ -938,6 +941,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                     channel: None,
                     delivery_mode: None,
                     attachments: vec![],
+                    in_reply_to_msg_id: None,
                 },
             );
             tracing::info!(%name, %reason, "replace_instance");
@@ -2399,6 +2403,7 @@ instances:
                 channel: None,
                 delivery_mode: None,
                 attachments: vec![],
+                in_reply_to_msg_id: None,
             },
         );
 
@@ -2457,6 +2462,7 @@ instances:
                 channel: None,
                 delivery_mode: None,
                 attachments: vec![],
+                in_reply_to_msg_id: None,
             },
         );
 
@@ -2624,6 +2630,7 @@ instances:
             reviewed_head: None,
             task_id: None,
             attachments: vec![],
+            in_reply_to_msg_id: None,
         };
         let inbox_dir = home.join("inbox");
         std::fs::create_dir_all(&inbox_dir).ok();

@@ -301,6 +301,7 @@ fn test_inbox(home: &Path) -> TestResult {
                 channel: None,
                 delivery_mode: None,
                 attachments: vec![],
+                in_reply_to_msg_id: None,
             },
         );
     }
