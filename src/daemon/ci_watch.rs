@@ -587,6 +587,8 @@ async fn ci_check_repo(
     if let PrState::Terminal = provider.check_pr_terminal(repo, branch).await {
         remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
         tracing::info!(repo, branch, "CI watcher auto-cleared: PR terminal");
+        // Auto-close tasks whose description/title mentions this branch.
+        crate::status_summary::auto_close_merged_tasks(home, branch);
         return Ok(());
     }
 
