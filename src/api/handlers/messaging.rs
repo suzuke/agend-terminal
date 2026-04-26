@@ -82,6 +82,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             delivery_mode: None,
             attachments: vec![],
             in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
         }
     };
     let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
