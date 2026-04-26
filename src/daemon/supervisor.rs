@@ -1,5 +1,5 @@
 //! Per-agent supervisor loop — detects pre-ready interactive stalls and
-//! pushes a vterm tail to the agent's Telegram topic.
+//! pushes a vterm tail to the agent's channel topic.
 //!
 //! Runs as a background thread spawned from both daemon mode
 //! (`start_daemon`) and app mode (`app::run`). Both call paths create agents
@@ -9,10 +9,10 @@
 //!
 //! Detection logic lives in `health::HealthTracker::check_awaiting_operator`
 //! and the transition in `state::StateTracker::set_awaiting_operator`. This
-//! module is the plumbing that glues them to Telegram notifications.
+//! module is the plumbing that glues them to channel notifications.
 
 use crate::agent::{self, AgentRegistry};
-use crate::channel::telegram::{notify_telegram, notify_telegram_silent};
+use crate::channel::NotifySeverity;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -123,11 +123,19 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
         match action {
             Some(NoticeAction::Stall { tail, silent_secs }) => {
                 let msg = format_stall_notice(&name, &tail, silent_secs);
-                notify_telegram(home, &name, &msg);
+                if let Some(ch) = crate::channel::active_channel() {
+                    let _ = ch.notify(&name, NotifySeverity::Warn, &msg, false);
+                } else {
+                    tracing::debug!(agent = %name, "no active channel — stall notice dropped");
+                }
             }
             Some(NoticeAction::Recovered) => {
                 let msg = format_recovery_notice(&name);
-                notify_telegram_silent(home, &name, &msg);
+                if let Some(ch) = crate::channel::active_channel() {
+                    let _ = ch.notify(&name, NotifySeverity::Info, &msg, true);
+                } else {
+                    tracing::debug!(agent = %name, "no active channel — recovery notice dropped");
+                }
             }
             None => {}
         }

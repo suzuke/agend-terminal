@@ -15,10 +15,14 @@ use std::sync::Arc;
 /// token env var is set. Returns `None` otherwise (including when the channel
 /// block is missing — not an error).
 ///
-/// When the channel comes up, this also registers it as a
-/// [`UxEventSink`] on the process-wide `ux_sink_registry` so Stage B-UX
-/// `FleetEvent`s (emitted by MCP handlers) get rendered into the
-/// configured `fleet_binding` topic. See `docs/DESIGN-stage-b-ux.md` §4.1.
+/// When the channel comes up, this also:
+/// - Registers it as a [`UxEventSink`] on the process-wide `ux_sink_registry`
+///   so Stage B-UX `FleetEvent`s get rendered into the configured
+///   `fleet_binding` topic.
+/// - Registers it as the process-wide active channel via
+///   [`crate::channel::register_active_channel`] so call sites outside the
+///   adapter boundary can use trait methods (e.g. `create_topic`, `notify`)
+///   without importing Telegram-specific code.
 pub(super) fn init(config: &FleetConfig, home: &Path) -> Option<Arc<dyn Channel>> {
     let submit_keys: HashMap<String, String> = config
         .instances
@@ -30,13 +34,9 @@ pub(super) fn init(config: &FleetConfig, home: &Path) -> Option<Arc<dyn Channel>
         })
         .collect();
     let state = crate::channel::telegram::init_from_config(config, home, submit_keys)?;
-    // `init_from_config` already calls `start_polling` on the concrete
-    // state. Construct `Arc<TelegramChannel>` once and clone-upcast to
-    // BOTH `Arc<dyn Channel>` (returned to the caller, used by dispatch)
-    // AND `Arc<dyn UxEventSink>` (registered for Fleet-event fan-out).
-    // `Arc<dyn Channel>` cannot itself be cast to `Arc<dyn UxEventSink>`
-    // without nightly `trait_upcasting`; the concrete `Arc` is the bridge.
     let channel_concrete: Arc<TelegramChannel> = Arc::new(TelegramChannel::new(state));
     ux_sink_registry().register(channel_concrete.clone() as Arc<dyn UxEventSink>);
-    Some(channel_concrete as Arc<dyn Channel>)
+    let channel_dyn: Arc<dyn Channel> = channel_concrete as Arc<dyn Channel>;
+    crate::channel::register_active_channel(Arc::clone(&channel_dyn));
+    Some(channel_dyn)
 }

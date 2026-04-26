@@ -1596,6 +1596,38 @@ impl crate::channel::Channel for TelegramChannel {
         let mut s = lock_state(&self.state);
         s.registry = Some(registry);
     }
+
+    fn create_topic(
+        &self,
+        name: &str,
+    ) -> std::result::Result<crate::channel::TopicRef, crate::channel::ChannelError> {
+        let home = lock_state(&self.state).home.clone();
+        match create_topic_for_instance(&home, name) {
+            Some(tid) => Ok(crate::channel::TopicRef {
+                id: tid.to_string(),
+                channel_kind: crate::channel::ChannelKind::Telegram,
+            }),
+            None => Err(crate::channel::ChannelError::Other(anyhow::anyhow!(
+                "failed to create topic for {name}"
+            ))),
+        }
+    }
+
+    fn notify(
+        &self,
+        instance: &str,
+        _severity: crate::channel::NotifySeverity,
+        message: &str,
+        silent: bool,
+    ) -> std::result::Result<(), crate::channel::ChannelError> {
+        let home = lock_state(&self.state).home.clone();
+        if silent {
+            notify_telegram_silent(&home, instance, message);
+        } else {
+            notify_telegram(&home, instance, message);
+        }
+        Ok(())
+    }
 }
 
 // ─── UxEventSink: capability-gated degradation ────────────────────────
@@ -2640,5 +2672,71 @@ instances:
 
         std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// TelegramChannel::create_topic delegates to `create_topic_for_instance`.
+    /// Without a fleet.yaml the helper returns None → the trait method
+    /// returns `ChannelError::Other`. This exercises the wiring without
+    /// needing a live bot.
+    #[test]
+    fn telegram_channel_create_topic_returns_error_without_config() {
+        use crate::channel::Channel;
+        let home = tmp_home("create_topic_no_config");
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        let result = channel.create_topic("test-agent");
+        assert!(result.is_err(), "create_topic must fail without fleet.yaml");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// TelegramChannel::notify delegates to `notify_telegram` /
+    /// `notify_telegram_silent`. Without a fleet.yaml the notify helpers
+    /// return early (no-op). The trait method returns Ok(()) because the
+    /// underlying helpers are fire-and-forget.
+    #[test]
+    fn telegram_channel_notify_succeeds_without_config() {
+        use crate::channel::{Channel, NotifySeverity};
+        let home = tmp_home("notify_no_config");
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        // notify delegates to fire-and-forget helpers that silently no-op
+        // when fleet.yaml is missing — so the trait method returns Ok.
+        let result = channel.notify("test-agent", NotifySeverity::Warn, "stall", false);
+        assert!(result.is_ok(), "notify should succeed (fire-and-forget)");
+        let result_silent = channel.notify("test-agent", NotifySeverity::Info, "recovered", true);
+        assert!(result_silent.is_ok(), "silent notify should succeed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Verify that TelegramChannel's create_topic returns a TopicRef with
+    /// the correct channel_kind when it would succeed. We can't test the
+    /// happy path without a live bot, but we can verify the type shape
+    /// via the trait signature.
+    #[test]
+    fn telegram_channel_trait_methods_are_object_safe() {
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        // Verify the channel can be used as a trait object with the new methods.
+        let dyn_channel: &dyn crate::channel::Channel = &channel;
+        let _ = dyn_channel.create_topic("test");
+        let _ = dyn_channel.notify("test", crate::channel::NotifySeverity::Warn, "msg", false);
     }
 }

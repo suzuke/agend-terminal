@@ -48,6 +48,66 @@ pub use ux_event::{select_action, FleetEvent, NoopUxSink, UxAction, UxEvent, UxE
 
 use crate::agent::AgentRegistry;
 use anyhow::Result;
+use std::sync::{Arc, OnceLock};
+
+// ---------------------------------------------------------------------------
+// Supporting types for trait methods added in PR-AE3
+// ---------------------------------------------------------------------------
+
+/// Error type for channel operations that may not be supported.
+#[derive(Debug)]
+pub enum ChannelError {
+    NotSupported(String),
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSupported(op) => write!(f, "operation not supported: {op}"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for ChannelError {}
+
+impl From<anyhow::Error> for ChannelError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// Reference to a created topic / thread / channel.
+#[derive(Debug, Clone)]
+pub struct TopicRef {
+    pub id: String,
+    pub channel_kind: ChannelKind,
+}
+
+/// Severity level for channel notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifySeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide active channel registry
+// ---------------------------------------------------------------------------
+
+static ACTIVE_CHANNEL: OnceLock<Arc<dyn Channel>> = OnceLock::new();
+
+/// Register the process-wide active channel. Called once during bootstrap.
+pub fn register_active_channel(channel: Arc<dyn Channel>) {
+    let _ = ACTIVE_CHANNEL.set(channel);
+}
+
+/// Get the process-wide active channel, if one has been registered.
+pub fn active_channel() -> Option<&'static Arc<dyn Channel>> {
+    ACTIVE_CHANNEL.get()
+}
 
 /// Typed channel kind — replaces magic strings like `"telegram"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -124,6 +184,27 @@ pub trait Channel: Send + Sync {
     /// cross-thread round-trip. Two-phase because adapters initialize
     /// during bootstrap (before the registry exists).
     fn attach_registry(&self, registry: AgentRegistry);
+
+    /// Create a per-instance discussion thread (Telegram forum topic /
+    /// Discord thread / Slack channel).
+    /// Default: `Err(ChannelError::NotSupported)` so channels without the
+    /// concept opt out gracefully.
+    fn create_topic(&self, _name: &str) -> std::result::Result<TopicRef, ChannelError> {
+        Err(ChannelError::NotSupported("create_topic".into()))
+    }
+
+    /// Send a notification (stall warning, system event) to an instance's
+    /// channel. `silent` suppresses push/vibrate when the platform supports it.
+    /// Default: `Err(ChannelError::NotSupported)`.
+    fn notify(
+        &self,
+        _instance: &str,
+        _severity: NotifySeverity,
+        _message: &str,
+        _silent: bool,
+    ) -> std::result::Result<(), ChannelError> {
+        Err(ChannelError::NotSupported("notify".into()))
+    }
 }
 
 /// Options passed to `Channel::create_binding`. Platform-specific hints live
@@ -135,4 +216,116 @@ pub struct BindingOpts {
     pub display_name: Option<String>,
     /// Free-form platform hints. The adapter decides what keys it honors.
     pub extra: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mock channel that hits the default `Err(NotSupported)` for both
+    /// `create_topic` and `notify`. Exercises the opt-out path that
+    /// channels without topic/notify support follow.
+    struct MockChannel {
+        caps: ChannelCapabilities,
+    }
+
+    impl MockChannel {
+        fn new() -> Self {
+            Self {
+                caps: ChannelCapabilities::default(),
+            }
+        }
+    }
+
+    impl Channel for MockChannel {
+        fn kind(&self) -> &'static str {
+            "mock"
+        }
+        fn caps(&self) -> &ChannelCapabilities {
+            &self.caps
+        }
+        fn poll_event(&self) -> Option<ChannelEvent> {
+            None
+        }
+        fn send(&self, _: &BindingRef, _: OutMsg) -> Result<MsgRef> {
+            anyhow::bail!("mock")
+        }
+        fn edit(&self, _: &MsgRef, _: OutMsg) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn delete(&self, _: &MsgRef) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn create_binding(&self, _: &str, _: BindingOpts) -> Result<BindingRef> {
+            anyhow::bail!("mock")
+        }
+        fn remove_binding(&self, _: &BindingRef) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn has_binding(&self, _: &str) -> bool {
+            false
+        }
+        fn record_binding(&self, _: &str, _: BindingRef, _: String) {}
+        fn take_binding(&self, _: &str) -> Option<BindingRef> {
+            None
+        }
+        fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+    }
+
+    #[test]
+    fn default_create_topic_returns_not_supported() {
+        let ch = MockChannel::new();
+        let err = ch.create_topic("test").expect_err("should be NotSupported");
+        assert!(
+            matches!(err, ChannelError::NotSupported(_)),
+            "expected NotSupported, got: {err}"
+        );
+        assert!(err.to_string().contains("create_topic"));
+    }
+
+    #[test]
+    fn default_notify_returns_not_supported() {
+        let ch = MockChannel::new();
+        let err = ch
+            .notify("inst", NotifySeverity::Warn, "msg", false)
+            .expect_err("should be NotSupported");
+        assert!(
+            matches!(err, ChannelError::NotSupported(_)),
+            "expected NotSupported, got: {err}"
+        );
+        assert!(err.to_string().contains("notify"));
+    }
+
+    #[test]
+    fn channel_error_display() {
+        let ns = ChannelError::NotSupported("op".into());
+        assert_eq!(ns.to_string(), "operation not supported: op");
+
+        let other = ChannelError::Other(anyhow::anyhow!("boom"));
+        assert_eq!(other.to_string(), "boom");
+    }
+
+    #[test]
+    fn channel_error_from_anyhow() {
+        let err: ChannelError = anyhow::anyhow!("test").into();
+        assert!(matches!(err, ChannelError::Other(_)));
+    }
+
+    #[test]
+    fn topic_ref_fields() {
+        let tr = TopicRef {
+            id: "42".into(),
+            channel_kind: ChannelKind::Telegram,
+        };
+        assert_eq!(tr.id, "42");
+        assert_eq!(tr.channel_kind, ChannelKind::Telegram);
+    }
+
+    #[test]
+    fn notify_severity_variants() {
+        // Ensure all variants exist and are distinct.
+        assert_ne!(NotifySeverity::Info, NotifySeverity::Warn);
+        assert_ne!(NotifySeverity::Warn, NotifySeverity::Error);
+        assert_ne!(NotifySeverity::Info, NotifySeverity::Error);
+    }
 }

@@ -140,11 +140,12 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         ) {
             Ok(_) => {
                 tracing::info!(team = team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");
-                // Mirror handle_spawn: every successful spawn gets a
-                // Telegram topic so deploy_template (which routes team
-                // creation through this handler) doesn't have to know
-                // about topics. No-op when the channel isn't configured.
-                crate::channel::telegram::create_topic_for_instance(ctx.home, inst_name);
+                // Every successful spawn gets a channel topic so
+                // deploy_template doesn't have to know about topics.
+                // No-op when no channel is configured.
+                if let Some(ch) = crate::channel::active_channel() {
+                    let _ = ch.create_topic(inst_name);
+                }
                 spawned.push((inst_name.clone(), backend.clone()));
             }
             Err(e) => {
