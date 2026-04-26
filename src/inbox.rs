@@ -1936,7 +1936,11 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
-            attachments: vec![mk_att("/tmp/a.jpg"), mk_att("/tmp/b.jpg"), mk_att("/tmp/c.jpg")],
+            attachments: vec![
+                mk_att("/tmp/a.jpg"),
+                mk_att("/tmp/b.jpg"),
+                mk_att("/tmp/c.jpg"),
+            ],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
         };
@@ -2020,7 +2024,10 @@ mod tests {
         assert_eq!(cjk.len(), 250 * 3);
 
         let out = build_excerpt(&cjk, "carol").expect("non-empty text returns Some");
-        assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "output must be valid UTF-8");
+        assert!(
+            std::str::from_utf8(out.as_bytes()).is_ok(),
+            "output must be valid UTF-8"
+        );
         let body = out
             .strip_prefix("[carol] ")
             .and_then(|s| s.strip_suffix('…'))
@@ -2034,7 +2041,10 @@ mod tests {
         // Boundary: 200 chars exactly should NOT get truncated marker.
         let exact: String = "y".repeat(200);
         let out = build_excerpt(&exact, "dan").expect("non-empty text returns Some");
-        assert!(!out.contains('…'), "200-char input must not get ellipsis: {out}");
+        assert!(
+            !out.contains('…'),
+            "200-char input must not get ellipsis: {out}"
+        );
     }
 
     #[test]
