@@ -27,6 +27,8 @@ pub enum CiPollResult {
         #[allow(dead_code)]
         status: u16,
         message: String,
+        /// If rate-limited, epoch seconds when quota resets.
+        rate_limit_reset: Option<u64>,
     },
 }
 
@@ -99,6 +101,11 @@ impl CiProvider for GitHubCiProvider {
             .send()
             .await?;
         let status = resp.status().as_u16();
+        let rate_limit_reset = resp
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
         let body: serde_json::Value = resp.json().await?;
 
         // Surface API errors (rate-limit, auth, server) instead of
@@ -119,6 +126,7 @@ impl CiProvider for GitHubCiProvider {
             return Ok(CiPollResult::ApiError {
                 status,
                 message: format!("GH API {status}: {message}{hint}"),
+                rate_limit_reset,
             });
         }
 
@@ -347,6 +355,13 @@ fn check_ci_watches_with_provider(
             }
         }
 
+        // Rate-limit backoff: skip polling until X-RateLimit-Reset time.
+        if let Some(reset_epoch) = watch["rate_limit_until"].as_u64() {
+            if (chrono::Utc::now().timestamp() as u64) < reset_epoch {
+                continue;
+            }
+        }
+
         // Throttle from a dedicated `last_polled_at` (epoch millis) in the
         // watch file itself, not file mtime. mtime conflates "when this
         // file was touched" with "when we last polled" and broke whenever
@@ -403,7 +418,7 @@ fn check_ci_watches_with_provider(
                     &registry,
                     provider.as_ref(),
                 )) {
-                    tracing::debug!(repo = %repo, error = %e, "CI check failed");
+                    tracing::warn!(repo = %repo, error = %e, "CI check failed");
                 }
             })
             .unwrap_or_else(|e| {
@@ -577,7 +592,38 @@ async fn ci_check_repo(
 
     let poll_result = provider.poll_runs(repo, branch).await?;
     let runs = match poll_result {
-        CiPollResult::ApiError { message, .. } => return Err(anyhow::anyhow!(message)),
+        CiPollResult::ApiError {
+            status,
+            message,
+            rate_limit_reset,
+        } => {
+            if let Some(reset_epoch) = rate_limit_reset {
+                if let Ok(content) = std::fs::read_to_string(watch_path) {
+                    if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
+                        watch["rate_limit_until"] = serde_json::json!(reset_epoch);
+                        let _ = std::fs::write(
+                            watch_path,
+                            serde_json::to_string_pretty(&watch).unwrap_or_default(),
+                        );
+                    }
+                }
+            }
+            let notify_msg = match rate_limit_reset {
+                Some(reset) => format!(
+                    "[ci-warn] {repo}@{branch}: {message} — backoff until reset (epoch {reset})"
+                ),
+                None => format!("[ci-warn] {repo}@{branch}: {message}"),
+            };
+            if let Some(ch) = crate::channel::active_channel() {
+                let _ = ch.notify(
+                    instance,
+                    crate::channel::NotifySeverity::Warn,
+                    &notify_msg,
+                    false,
+                );
+            }
+            return Err(anyhow::anyhow!("{status}: {message}"));
+        }
         CiPollResult::Runs(r) if r.is_empty() => return Ok(()),
         CiPollResult::Runs(r) => r,
     };
@@ -1415,6 +1461,7 @@ mod tests {
                 poll_result: Mutex::new(Some(CiPollResult::ApiError {
                     status,
                     message: message.to_string(),
+                    rate_limit_reset: None,
                 })),
                 pr_state: Mutex::new(PrState::Open),
                 failure_summary: Mutex::new("Build / Test".to_string()),
@@ -1632,6 +1679,49 @@ mod tests {
         // would normally catch it — the key is head_sha changed so tracking reset
         assert_eq!(updated["last_run_id"].as_u64(), Some(51));
         assert_eq!(updated["head_sha"].as_str(), Some("new456"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mock_rate_limit_writes_backoff_and_propagates_error() {
+        let dir = tmp_dir("mock-rate-limit");
+        let provider = MockCiProvider {
+            poll_result: Mutex::new(Some(CiPollResult::ApiError {
+                status: 403,
+                message: "GH API 403: rate limit exceeded".to_string(),
+                rate_limit_reset: Some(9999999999),
+            })),
+            pr_state: Mutex::new(PrState::Open),
+            failure_summary: Mutex::new(String::new()),
+        };
+        let result = run_ci_check(&dir, &base_watch(), &provider);
+        assert!(result.is_err(), "rate-limit must propagate as error");
+        let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(updated["rate_limit_until"].as_u64(), Some(9999999999));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rate_limit_backoff_skips_polling() {
+        let dir = tmp_dir("backoff-skip");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let future = (chrono::Utc::now().timestamp() + 3600) as u64;
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat", "interval_secs": 60,
+            "instance": "agent1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null, "rate_limit_until": future,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+        });
+        let filename = watch_filename("o/r", "feat");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
+        let registry: AgentRegistry =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        check_ci_watches(&dir, &registry);
+        assert!(watch_path.exists(), "backoff watch must be preserved");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
