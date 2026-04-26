@@ -488,6 +488,14 @@ pub fn format_header(msg: &InboxMessage) -> String {
         parts.push(format!("parent={}", sanitize_header_value(parent)));
     }
     parts.push(format!("size={}", msg.text.chars().count()));
+    if !msg.attachments.is_empty() {
+        let paths: Vec<&str> = msg
+            .attachments
+            .iter()
+            .map(|a| a.path.to_str().unwrap_or("?"))
+            .collect();
+        parts.push(format!("attachments=[{}]", paths.join(",")));
+    }
     parts.join(" ")
 }
 
@@ -1797,6 +1805,69 @@ mod tests {
         assert!(!header.contains("thread="));
         assert!(!header.contains("parent="));
         assert!(header.contains("size=5"));
+    }
+
+    #[test]
+    fn test_header_format_includes_attachments_when_present() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:user".into(),
+            text: "see photo".into(),
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![crate::channel::event::Attachment {
+                kind: crate::channel::event::AttachmentKind::Photo,
+                path: std::path::PathBuf::from("/tmp/photo.jpg"),
+                mime: None,
+                caption: None,
+                size_bytes: None,
+                original_filename: None,
+            }],
+            in_reply_to_msg_id: None,
+        };
+        let header = format_header(&msg);
+        assert!(
+            header.contains("attachments=[/tmp/photo.jpg]"),
+            "header must include attachment paths: {header}"
+        );
+    }
+
+    #[test]
+    fn test_header_format_omits_attachments_when_empty() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:user".into(),
+            text: "text only".into(),
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+        };
+        let header = format_header(&msg);
+        assert!(
+            !header.contains("attachments"),
+            "empty attachments must not appear in header: {header}"
+        );
     }
 
     #[test]

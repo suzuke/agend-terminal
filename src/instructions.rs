@@ -295,6 +295,7 @@ pub(crate) fn build_instructions_body(
     );
     content.push_str("- Parse the header fields: `id=` is the message id; `kind=` is the message kind (task/query/report/update).\n");
     content.push_str("- The header always includes `size=`; the full body is in your inbox, not in the terminal. Call the MCP tool `inbox` to fetch full content.\n");
+    content.push_str("- If the header contains `attachments=[path1,path2,...]`, the message includes media files. Call `inbox` for full metadata, then use your file-reading tools to inspect the files.\n");
     content.push_str("- ACK obligation depends on `kind`: `query` requires reply via `send_to_instance`; `task` may require reply after work; `report`/`update` may skip ACK (see fleet protocol §4 ack absorption).\n");
 
     content
