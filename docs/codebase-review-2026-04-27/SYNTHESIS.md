@@ -186,3 +186,132 @@
 | Synthesis (this) | (current PR) | 32 findings → 5 phases → 8 PR Sprint 21 roadmap |
 
 **Sprint 20 fully wrapped** — 4 audit + 4 peer-pass + 1 synthesis = 9 markdown deliverables, 0 code change, 0 fleet structural ops。Operator wake decision required for Sprint 21 scope-freeze。
+
+---
+
+# Sprint 20.5 cross-validation update (v2)
+
+> **Source**: 4 missing-pair peer-passes (Sprint 20.5 PR #211 A↔C / #213 A↔D / #212 B↔C / #214 B↔D) merged 2026-04-27. Per Sprint 20 partial diagonal coverage (only A↔B + C↔D), 4 missing pairs cross-validated 1-direction each. Sprint 21 roadmap finalized post-this-update。
+>
+> **Scope freeze v2**: `d-20260426225921440175-6` (Sprint 20.5 sub-tracks within Sprint 20 umbrella)
+
+## Sprint 20.5 NEW findings discovered via cross-validation
+
+| Track | Finding | Pair | Severity | Impact |
+|---|---|---|---|---|
+| **Track 8 (B→D)** | C1-A outbound notify leak — `supervisor::tick` + `ci_watch.rs:622` push notices unfiltered, leak PTY tails (40 lines/stall) regardless inbound auth | B peer-reviews A | **Critical** | C1 fail-closed inbound 解 1 半 — outbound 需獨立 gate（Sprint 21 task #11 cascade fix） |
+| **Track 5 (A→C)** | Telegram topic leak on app-mode kill — `kill_agent` (app.rs:859-866) 不 call `take_binding`，TUI-mode kill 後 `instance_to_topic` 仍 alive | A peer-reviews B | **High** | F3 cross-area extension — app-mode kill asymmetric vs API delete，operator 看到 orphan topics |
+| **Track 5 (A→C)** | Spawn-site graceful count understate — `telegram.rs:78-89` runtime + `start_polling` 加 2 sites（0 graceful）→ fleet **13+/0**（B 原 11） | A peer-reviews B | **High** | Systemic graceful-shutdown debt 比 v1 數字大 |
+| **Track 8 (B→D)** | Empty MsgRef prevents future cleanup — H1+H4 opaque binding + id="0" 讓「delete_instance 清 bot 訊息」impossible | B peer-reviews A | **High** | F2 partial-failure × MsgRef 不 recoverable cascade |
+| **Track 7 (C→B)** | api_server.rs is dual-bridge — TUI↔MCP **AND** Channel↔MCP — C1 攻擊面 widens beyond 「compromised agent」to 「any prompt-injection reaching TUI input」 | C peer-reviews D earlier confirmed by 7 | **High** | Sub-track scope expand C↔D → B+C+D triangulation（~200 LOC） |
+
+## Confirmed cascade attack chain — full end-to-end
+
+**Channel C1 (fail-open inbound) + outbound notify leak + MCP C1 (decisions::update no auth) + MCP H1 (destructive handlers no per-agent gate) + api_server.rs untrusted bridge** =
+
+> **「any Telegram group member silently archives operator strategic decisions OR kills production agents」** — Track 6 headline framing。
+
+**Each layer fix alone insufficient**：
+- C1-A inbound 修但 outbound notify 漏 → tail leak persists
+- C1-D auth gate 修但 C1-A inbound 漏 → still trigger via Telegram inject
+- H1-D handler gate 修但 api_server bridge untrusted → still trigger via TUI input
+
+**Sprint 21 task #11 mandate**: bundle-or-explicit-exposure-decision sequencing — 不能 partial fix。
+
+## NEW systemic patterns NOT in v1 SYNTHESIS
+
+5 clusters dedupe + cross-validated:
+
+| Cluster | Sub-findings | v1 gap | Sprint 21 |
+|---|---|---|---|
+| **Partial-failure rollback asymmetry** | F1-F5 + binding orphan A + MCP handler 90% unread | v1 traced lifecycle invariants but 漏 binding/handler downstream | unified rollback transaction across A+B+D (Phase 1 expand) |
+| **Grace shutdown stance undocumented** | 13+/0 fleet-wide; respawn loop assumption 未明示 | 各 track 數自己 spawn 不知 fleet 規模 | A+B joint task — daemon/mod.rs document stance + unified inventory |
+| **Tick-layer contention undercounted** | crash_tx 64-bounded burst → supervisor + main-loop + ci_watch + instance_monitor 全 lock 同 TelegramState | 各 track 量自己 contention 不見 cross-track | A: contention note; B: tick registry R3 |
+| **Metadata persistence atomicity scattered** | F7 dual-write + M5 parallel-map + M2 untyped serde | 各 track patches own slice, no transactional boundary | A: bidi-map helper; B: atomic multi-field; D: `#[serde(deny_unknown_fields)]` |
+| **API server bridge un-audited fleet-wide** | api_server.rs 130 LOC + handlers.rs 90% unread + mcp/handlers.rs channel-bridge ~70 LOC | 3 tracks each flagged 1 side, neither audit covered both | B+C+D triangulation joint sub-track（取代 v1 C↔D only） |
+
+## JoinHandle systemic UPDATED count
+
+- **v1**: 11 daemon spawn / 0 graceful (Track B inventory)
+- **v2 cross-validated**: **13+ spawn / 0 graceful** (+ 2 from Track 5 A peer-pass: `telegram.rs:78-89` runtime + `start_polling`)
+- Track 7 (C peer-pass) 進一步 grep `app/telegram_hooks.rs:56,76` — 2 more unnamed `std::thread::spawn` → potentially **15+/0**
+
+**Sprint 21 protocol-level rule (per Track 7 NEW S21-FLEET-SYSTEMIC-2)**: `thread::spawn` allowlist invariant test — every spawn site MUST `Builder::new().name(...)` + `// fire-and-forget: <reason>` comment OR store JoinHandle。Pattern from `handle_message_body_has_no_block_on` invariant test。
+
+## app/api_server.rs sub-track UPDATED scope
+
+- **v1**: C↔D joint of `app/api_server.rs:1-130` only
+- **v2 expanded** (Track 7 + Track 8 confirmation): **B+C+D triangulation** scope:
+  - `src/app/api_server.rs:1-130`（TUI→MCP entry surface — C1 attack chain entry）
+  - `src/mcp/handlers.rs:74,88,102,399`（MCP→Channel outbound bridge `try_telegram_*` + `inject_provenance` — A↔D coupling）
+  - 含 `serve_agent_tui`（B spawn site + C server body + D tool routing — Track 7 提）
+  - Total scope ~200 LOC
+
+**Sprint 21 priority**: 移到 Phase 1 列表（同 lifecycle Critical），因 cascade attack chain 跨 3-track 無 isolated audit 可 cover。
+
+## Disagreements raised + resolution
+
+| Disagreement | Resolution |
+|---|---|
+| B's "orphan PID" complete vs A's binding orphan | **Compounding not conflict** — S21-B1 must include A's binding cleanup |
+| A's CD4 ownership ambiguous (channel vs daemon) | **Resolved by PR #199 architecture**: persistence=B, format=A. S21 task wording clarified |
+| A's `TelegramState` "no read-heavy" vs B's burst contention | **Both correct**: Mutex still right; 但 contention profile understated. S21: add note |
+| C's auto-Critical state.rs flag wrong | **C self-corrected**: state.rs is PTY classifier 不是 session restoration. session.rs trust acceptable |
+
+**No disagreements escalated to conflict** — all refinements / compounding。
+
+## Sprint 21 roadmap FINAL (post-Sprint 20.5 v2)
+
+**Original 5 phases + Sprint 20.5 8 NEW tasks integrated**:
+
+| Phase | Epic | Tasks (含 v2 NEW) | Est. LOC | Cross-Track |
+|---|---|---|---|---|
+| **1** | Lifecycle transaction + outbound auth gate | S21-B1/B2/B5 + **S21-A-new1 binding rollback** + S21-A1 outbound notify gate (NEW Critical from Track 8) + S21-B3 + S21-A/B-joint-1 spawn inventory unification | ~300 | A+B+D Critical bundle |
+| **2** | Auth gates + cascade fix | S21-A1 inbound + S21-D1 `can_mutate_decision` + **S21-A/D-joint1 api_server.rs bridge audit (B+C+D triangulation, ≤200 LOC)** + Track 6 task #11 bundle sequencing | ~200 + 1 audit | A+D joint |
+| **3** | Trait contract wiring | S21-A2 Channel send/edit/delete dispatcher | ~200 | A independent post-Phase 1 |
+| **4** | Robustness | S21-C-R1 overlay_dims helper + saturating arithmetic + Track 7 NEW S21-C-SYSTEMIC-1 transient-state badge | ~50 | C independent |
+| **5** | Systemic patterns | S21-A-new2 contention note + S21-B-new1 atomic multi-field metadata + S21-FLEET-SYSTEMIC-2 spawn allowlist invariant test + Track 8 P1+P2 vocabulary unification | ~100 | systemic across tracks |
+
+**Estimated total**: ~850 LOC refactor + 12 PRs + 1 joint audit （v1 600 → v2 850 + 4 PRs）
+
+**Critical phase ordering**:
+- **Phase 1 must precede Phase 2** — auth fixes useless if lifecycle leaks bindings/registry/handler-bridge
+- **Phase 2 includes B+C+D bridge audit** as part of cascade fix (was Phase 5 in v1, elevated)
+- Phase 3-5 parallel independent
+
+## Operator wake actions UPDATED (priority-sorted v2)
+
+1. ⚠️ **Sprint 21 scope-freeze approval** — 5 phases + 12 tasks + 1 joint audit (Phase 2 elevation key change)
+2. ⚠️ **Cascade attack chain bundle decision** — Channel C1 + outbound notify + MCP C1 + MCP H1 + api_server bridge — must ship as bundle per Track 6 task #11 sequencing
+3. ⚠️ **Joint sub-track scope decision** — B+C+D triangulation `app/api_server.rs:1-130` + `mcp/handlers.rs` channel-bridge ~70 LOC = total ~200 LOC
+4. **JoinHandle systemic stance** — fleet-wide 13-15+/0 graceful (per Track 5 + Track 7 extensions); explicit decision + S21-FLEET-SYSTEMIC-2 spawn allowlist invariant test approval
+5. **fleet_broadcast ownership clarification** (RESOLVED Sprint 20.5: persistence=B, format=A, document in module headers)
+6. **Praise pattern adoption** — `can_mutate_*` D template + `render.rs:823-832` saturating arithmetic comment pattern
+7. **PR #194 vterm root cause + H1-C overlay** — same class single fix sweep
+8. **Sprint 19 backlog hygiene 28 tasks** — operator decisions still pending including Sprint 11 backend semantics cancel
+
+## Cross-validation methodology observations (v2 meta)
+
+What Sprint 20.5 peer-passes surfaced that single-track Sprint 20 missed:
+
+1. **Cascade consequence tracing** — forward (Sprint 20) + backward (Sprint 20.5 peer-pass) together catches chains no single vector catches。Channel C1 + MCP C1 chain only emerges from cross-validation。
+2. **Tick-layer contention never visible in isolation** — 各 track 數自己 lock 不知 cross-track concurrency。
+3. **Trust boundary drift across tracks** — state.rs PTY classifier (C scope) feeds MCP scheduling (D scope) — neither solo audit catches end-to-end。
+4. **Scope-out assumptions leak** — A 8-command 漏 grep `set_waiting_on`; D 90% handlers.rs unread; C 漏 api_server.rs。 Each track's out-of-scope = other's blind spot。
+5. **Atomicity is distributed** — F7 + M5 + M2 各 layer Medium severity；cluster-level 才見 systemic refactor opportunity (R1 unified rollback)。
+
+**Implication**: Diagonal peer-pass (A↔B + C↔D + A↔C + A↔D + B↔C + B↔D = full mesh) 不是 polish 是 systemic-finding mandatory。Sprint 20 partial → Sprint 20.5 補 → 完整 cross-validation。Future audit sprints 該預設 full-mesh。
+
+---
+
+# Sprint 20.5 wrap-up
+
+| Track | PR | Outcome |
+|---|---|---|
+| Track 5 (A↔C) | #211 ✅ | impl-1 reads TUI: 4 confirmed + 3 systemic + spawn-count update +2 → 13+/0 |
+| Track 6 (A↔D) | #213 ✅ | reviewer-2 reads CHANNEL: 3 confirmed + 3 NEW (severity drift / stale enum / decision audit-log) + 4 systemic patterns + cascade chain headline |
+| Track 7 (B↔C) | #212 ✅ | reviewer reads DAEMON: 4 confirmed + 3 missed (B+C cross-area: F2×session.rs / F4×vterm flicker / F8×state_color) + 3 systemic (transient badge / spawn allowlist / session-restore downstream) |
+| Track 8 (B↔D) | #214 ✅ | impl-2 reads MCP: 5 confirmed + 4 missed + 4 P-systemic patterns (auth×atomicity / vocabulary fragmented / coverage caveats correlated / api_server B+C+D triple-blindspot) |
+| Synthesis v2 | (this PR) | Aggregate Sprint 20 + 20.5 → 12 phases + 12 tasks + 1 joint audit roadmap, cascade attack chain end-to-end, systemic patterns 5 clusters, JoinHandle 13-15+/0 |
+
+**Sprint 20 + 20.5 fully wrapped** — 4 audit + 4 peer-pass + 4 cross-validation peer-pass + 2 synthesis = **14 markdown deliverables**, 0 code change, 0 fleet structural ops。Sprint 21 roadmap **ready for operator wake decision**。Cross-validation full-mesh complete。
