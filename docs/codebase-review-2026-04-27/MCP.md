@@ -200,3 +200,128 @@ Track C's strongest finding is H1 (5 unbounded `area.height - N` panic sites in 
 ---
 
 *End of Track D audit + peer-pass. Audit time: ~2h within hard cap. Peer-pass time: ~30 min.*
+
+---
+
+## Cross-validation: Channel (Sprint 20.5 missing-pair)
+
+(Per Sprint 20.5 scope freeze `d-20260426225921440175-6` — A↔D peer-pass not done in Sprint 20 main run because B↔A and C↔D were the only diagonals. Read: `docs/codebase-review-2026-04-27/CHANNEL.md` (Track A, dev-impl-1, audited `1485e85`, 277 lines including its own peer-pass to DAEMON.md). Audit metadata: `audit_mode=codebase_audit`, `peer-pass-tier`, time-box 2h hard cap.)
+
+### Confirmed findings from Channel (✅ peer-confirmed from MCP angle)
+
+**A's C1 `is_user_allowed` fail-open** — **confirmed Critical from MCP visibility, with severity elevation rationale**. Track A correctly tags this Critical at the channel layer, but the framing stops at *"anyone in the Telegram group can command the fleet"*. From MCP angle the **full end-to-end attack chain is**:
+
+1. (Channel) `user_allowlist == None` → any Telegram group member's text reaches `handle_message` (telegram.rs:572-589 raw inject path)
+2. (Channel) Message becomes `InboxMessage` enqueued for the bound instance — appears in agent's PTY as operator input
+3. (Agent) Prompt injection in the message body causes agent to issue MCP tool call (e.g. `update_decision { archive: true }`, `delete_instance`, `replace_instance`)
+4. (MCP D-side, my C1) `decisions::update` has **no author gate** — silently archives operator's strategic decisions (e.g. `d-20260425101114174249-11` channel-extension direction)
+5. (MCP D-side, my H1) destructive handlers (`delete_instance` / `replace_instance` / `interrupt` / `clear_blocked_reason`) have **no per-agent auth gate** by design — silently respawn or kill any agent
+6. (No forensics) Decision schema captures `author` at `post` time but not `archived_by` at `update` time — no audit record of *who* archived
+
+**Cascade summary**: Channel A's C1 (fail-open inbound auth) + MCP D's C1 (no decision-update gate) + MCP D's H1 (no per-agent destructive-op gate) = **end-to-end "any random Telegram group member silently archives operator strategic decisions or kills production agents, with no forensic trail"**. Either layer's fix alone is insufficient — both must close. Track A's F1 (Sprint 21 high) + Track D's Sprint 21 task #1 (Critical) need **explicit cross-track sequencing**: ship together or document the residual exposure window between them.
+
+**A's CD2 `active_channel().create_topic()` ignores Err** — confirmed from MCP angle; correctly identified me (Track D) as `primary_owner`. Agreed it should `tracing::warn!` the error. See "Disagreement" below for severity rebid.
+
+**A's CD3 `ChannelKind` discriminator leak** — confirmed pattern. See "Cross-area systemic" below for elevation.
+
+**A's H3 (mod.rs scaffold-unused doc drift)** — quietly affected my own audit: when I cited `active_channel()` from `mcp/mod.rs` in my Track D report I didn't notice the upstream comment claiming the module was unused. If A had flagged this earlier in the sprint, I would have framed my "preserve-as-is" praise for `proxy_or_local` differently (knowing the trait is in fact load-bearing, not scaffold).
+
+### Missed findings discovered (MCP angle catches what Channel auditor missed)
+
+**MX1 — Outbound notify severity contract drift A↔D** (NEW finding, neither track filed)
+
+Track A's L1 notes `notify` impl drops `severity` (warn / error / info render identically). Track D's PR-AE3 (`active_channel().notify(NotifySeverity::Warn|Error|Info, ...)`) callsites are in `daemon/supervisor.rs:126,134`, `daemon/ci_watch.rs:622`, `daemon/mod.rs:608` — every callsite explicitly tags severity. So we have a **contract drift**: D-side callers believe severity-tagged events flow through; A-side renders all-equal.
+
+**MCP angle impact**: when MCP `clear_blocked_reason` triggers a recovery notify with `NotifySeverity::Info` it visually matches a stall warning (`Severity::Warn`) in the Telegram group. Operator can't distinguish "hey, recovery happened" from "stall is back". This is **silent severity erasure** — a finding neither Track A (scope=channel internals) nor Track D (scope=MCP handlers, didn't trace into channel render) caught individually.
+
+**Severity**: MEDIUM. Surface in Sprint 21 as A+D joint finding, fix in Track A (telegram render adds emoji prefix) per L1 + adds round-trip test "MCP severity → Channel render emoji" in cross-area test.
+
+**MX2 — `mcp/handlers.rs:603-605` ChannelKind string-match parallel to A's CD3**
+
+Track A's CD3 flags `inbox.rs:139-140` matching `ChannelKind::Telegram / Discord` to render strings. **My MCP audit also has the same anti-pattern** at `mcp/handlers.rs:603-605`:
+```rust
+let kind: &'static str = match kind_str {
+    "telegram" => "telegram",
+    "discord" => "discord",
+    "slack" => "slack",
+    _ => continue,
+};
+```
+
+`"slack"` is referenced even though `ChannelKind` enum (`channel/mod.rs:118-121`) only has `Telegram | Discord`. So MCP D-side has a **stale string** for an enum variant that doesn't exist (yet). Discriminator leak is wider than CD3 captured — it's a systemic anti-pattern repeated in 2+ surfaces, with at least one stale instance.
+
+**Severity**: LOW (today; would be MEDIUM if the stale "slack" string ever matched in production). Sprint 21 R-CD3 should canonicalise `ChannelKind` ↔ `&str` mapping in one helper (e.g. `impl AsRef<str> for ChannelKind`) and replace both Track A's inbox match AND MCP's handler match.
+
+**MX3 — Decision-archive forensics gap (deeper than Track D's own C1)**
+
+My MCP C1 said: "add `can_mutate_decision(home, caller, decision)` paralleling `can_mutate_task`". But re-reading from Channel-angle (which knows about Telegram group membership being the soft user gate): **even with the gate added, we don't log who archived**. Attacker chains to silently archive — gate rejects them — but we have no audit log of attempted archives. Track A's audit-log discipline (`fleet_events.jsonl` from PR #199) is the right pattern; Decisions need parallel `decision_audit.jsonl` capturing: timestamp / caller / decision_id / change-fields. **Missing in my own MCP.md**; surfaces only via cross-validation with A's audit-log pattern.
+
+**Severity**: HIGH — without forensics we can't tell whether a future C1 attack has happened or is in progress.
+
+### Disagreement / scope dispute
+
+**CD2 priority rebid**: Track A labels CD2 (`create_topic().ok()` discards Err in `api/handlers/instance.rs:193-195` and `api/handlers/team.rs:146-147`) as **"low priority"**. From MCP D-angle, **bump to MEDIUM**. Reason: the silent-failure mode is the canonical "operator support burden" — operator calls `create_instance`, sees instance in registry, but Telegram topic missing → "why no topic?" is a recurring support question. The fix is 2 lines (replace `.ok()` with `match { Ok(t) => Some(t.id), Err(e) => { tracing::warn!(error=%e, "create_topic failed"); None } }`). Low effort, MEDIUM operator-ergonomics value. Track A's "low" framing under-weighs the support-cost dimension.
+
+**Path-keyword reframe of A's C1**: Track A applies path-keyword auto-Critical to `is_user_allowed` based on the **`audit/authorize` keyword**. From MCP D's R2 enforcement angle, **a more direct trigger is the `check` keyword** ("is_user_*" is a check predicate). Either trigger lands the same Critical classification, so no operational disagreement — but for protocol consistency, future audits should surface ALL applicable keyword triggers, not just one. (My own R2 application in MCP C1 listed only one trigger; this is reciprocal "do as I should have, not just as I did".)
+
+### Cross-area systemic patterns NOT in SYNTHESIS.md
+
+(SYNTHESIS.md merged in PR #210; flagging patterns that may have surfaced individually but aren't tagged as cross-area systemic.)
+
+**S1 — "absence-of-config defaults permissive" anti-pattern across A and D**
+
+Three instances in this audit alone:
+- (A) `is_user_allowed` returns true on `None` allowlist
+- (D) `decisions::update` has no caller gate — `None` author check defaults to allow
+- (A→D coupling) `create_topic().ok()` — `None` (Err discarded) defaults to "succeed silently"
+
+**Cross-area principle violation**: at every "absence" point, the codebase chose the permissive default. Sprint 21 cross-track contract: **"absence of explicit config → fail closed"**. A's F1 + D's task #1 + CD2 fix — when bundled — establish this as a Track A + D + (B for daemon-side) joint contract.
+
+**S2 — Stale enum-variant string in MCP D mirrors A's discriminator leak**
+
+See MX2. Reciprocal canonicalisation should land in one PR touching both A and D.
+
+**S3 — Severity contract: MCP tags, Channel erases**
+
+See MX1. A+D joint finding; fix lives in A; test lives in cross-area integration.
+
+**S4 — Audit-log pattern uneven across A and D**
+
+A has `fleet_events.jsonl` (post PR #199). D has no decision-audit-log. Tasks have no audit log either (Track D didn't surface this either; came from cross-validation with A). Sprint 21 should adopt the A pattern in D for decisions and tasks. Joint A+D finding.
+
+### Track D Sprint 21 backlog adjustments (from this peer-pass)
+
+Existing Sprint 21 task #1 (Critical: `can_mutate_decision`) **expanded** to:
+- 1a: implement `can_mutate_decision(home, caller, decision)` gate
+- 1b (NEW): add `<home>/decision_audit.jsonl` write at every `decisions::update` invocation, mirroring `fleet_events.jsonl` pattern from A — captures `ts / caller / decision_id / changed_fields`
+- 1c (NEW): cross-track sequencing constraint — must ship within same Sprint as A's F1 (`is_user_allowed` fail-closed) since the attack chain is end-to-end; document residual exposure if shipped in different sprints
+
+NEW Sprint 21 tasks from this peer-pass:
+- **#8 [Medium] CD2 priority rebid + fix** — make `create_topic` Err visible (warn log + maybe surface to client). Owner: D.
+- **#9 [Medium] Severity contract round-trip test** (MX1) — A renders severity (emoji prefix); D adds integration test asserting MCP-tagged severity reaches Channel render correctly. Joint A+D.
+- **#10 [Low] `ChannelKind` ↔ `&str` canonical mapping** (MX2 / S2) — add `AsRef<str>` impl, replace `inbox.rs:139-140` AND `mcp/handlers.rs:603-605` matches with the helper. Joint A+D, single PR.
+- **#11 [Critical bundle, sequencing-constrained]** — Track A F1 + Track D #1 (1a+1b) shipped together as bundle, OR explicit operator-acked exposure window decision posted as a fleet decision. **No silent split-sprint.**
+
+### Methodology
+
+(Per challenge round R1 — peer-pass methodology transparency)
+
+- **audited_head**: `0b9b473` (origin/main at peer-pass start, post-PR #210 SYNTHESIS merge)
+- **commands_run**:
+  - `git fetch origin main`
+  - `git worktree add -b sprint20.5-track6-d-reads-a ../agend-terminal.worktrees/sprint20.5-track6-d-reads-a origin/main`
+  - Full read of `docs/codebase-review-2026-04-27/CHANNEL.md` (277 lines including A's own peer-pass to DAEMON.md)
+  - Targeted re-read of own `MCP.md` (specifically C1 / H1 / Cross-area dependencies / Sprint 21 sections)
+  - `grep -n 'try_telegram_\|inject_provenance' src/mcp/handlers.rs` (lines 74/88/102/399 cited in dispatch — verified A↔D bridge surface)
+  - `grep -n '"telegram"\|"discord"\|"slack"' src/mcp/handlers.rs` → found MX2 stale "slack" string
+  - `grep -n 'NotifySeverity::' src/daemon/ src/mcp/ -r` → confirmed D-side severity tagging (MX1)
+- **files_scanned** in this peer-pass:
+  - `docs/codebase-review-2026-04-27/CHANNEL.md` — full read (277 lines)
+  - `docs/codebase-review-2026-04-27/MCP.md` — re-read of own C1/H1/Sprint 21 sections (~80 of 199 lines)
+  - `src/mcp/handlers.rs` lines 74/88/102/399 (A↔D bridge), 603-605 (MX2 stale string)
+  - `src/channel/mod.rs:118-121` (ChannelKind enum confirmed only Telegram+Discord)
+- Time spent: ~45 min within 2h hard cap
+
+---
+
+*End of Sprint 20.5 Track 6 peer-pass (D reads A). Cross-validation complete.*
