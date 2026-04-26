@@ -33,6 +33,8 @@
 pub mod binding;
 pub mod caps;
 pub mod contract;
+#[cfg(feature = "discord")]
+pub mod discord;
 pub mod event;
 pub mod sink_registry;
 pub mod telegram;
@@ -114,7 +116,8 @@ pub fn active_channel() -> Option<&'static Arc<dyn Channel>> {
 #[serde(rename_all = "snake_case")]
 pub enum ChannelKind {
     Telegram,
-    // Future: Discord, Slack, Matrix, ...
+    Discord,
+    // Future: Slack, Matrix, ...
 }
 
 /// Platform-neutral channel trait. Implementations live next to their

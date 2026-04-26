@@ -26,6 +26,7 @@ pub(super) fn telegram_status_from_config(
             }
         }
         None => render::TelegramStatus::NotConfigured,
+        Some(crate::fleet::ChannelConfig::Discord { .. }) => render::TelegramStatus::NotConfigured,
     }
 }
 

@@ -37,6 +37,7 @@ unwrap_used = "deny"
 [features]
 default = []
 tray = ["dep:tray-icon", "dep:tao", "dep:toml"]
+discord = []
 
 [profile.release]
 strip = true
