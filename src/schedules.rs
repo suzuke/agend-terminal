@@ -889,6 +889,7 @@ mod tests {
                     text: sched.message.clone(),
                     kind: Some("schedule_replay".to_string()),
                     timestamp: chrono::Utc::now().to_rfc3339(),
+                    channel: None,
                     delivery_mode: None,
                     force_meta: None,
                     correlation_id: None,

@@ -445,8 +445,9 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         reviewed_head: None,
         from: format!("user:{username}"),
         text: text.to_string(),
-        kind: Some("telegram".to_string()),
+        kind: None, // was "telegram" — channel source now in typed `channel` field
         timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: Some(crate::channel::ChannelKind::Telegram),
         delivery_mode: None,
     };
     let _ = inbox::enqueue(&home, &instance_name, msg_obj);
@@ -455,7 +456,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     inbox::notify_agent(
         &home,
         &instance_name,
-        &inbox::NotifySource::Telegram(username),
+        &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
         text,
     );
 

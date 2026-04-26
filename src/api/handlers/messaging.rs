@@ -78,6 +78,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             timestamp: chrono::Utc::now().to_rfc3339(),
+            channel: None,
             delivery_mode: None,
         }
     };
