@@ -177,7 +177,16 @@ mod tests {
             .output()
             .unwrap();
         std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "init"])
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
             .current_dir(dir)
             .output()
             .unwrap();
