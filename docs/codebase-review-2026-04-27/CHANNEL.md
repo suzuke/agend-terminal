@@ -274,5 +274,59 @@ Per challenge #10, peer pass against `dev-impl-2`'s Track B (DAEMON.md) — see 
 - **S21-A** add Telegram-binding rollback to B's S21-B1 lifecycle transaction (so `record_binding` participates in spawn rollback / `take_binding` participates in delete cleanup).
 - **S21-A/D joint** — extend C↔D `app/api_server.rs` audit to the `mcp/handlers.rs` channel-bridge entry points (`try_telegram_reply` / `try_telegram_react` / `try_telegram_edit` / `inject_provenance`); ~200 LOC cross-pass.
 
-(End peer-pass section. CHANNEL.md complete.)
+(End peer-pass section.)
+
+---
+
+## Cross-validation: TUI (Sprint 20.5 missing-pair)
+
+(Per dispatch `m-20260426225949590611-101` + scope freeze `d-20260426225921440175-6`. Sprint 20.5 sub-track to fill the A↔C gap left by Sprint 20's 4-track diamond. CHANNEL author reading TUI.md from the channel angle.)
+
+### Confirmed findings from TUI (✅ peer-confirmed)
+
+- **TUI H1 (unbounded `area.height/width - N` subtraction at 5 overlay sites)** is correctly classified High and the prior-incident framing (PR #194 vterm OOB hotfix) is the right anchor. From the channel angle, the parallel discipline already exists in Telegram inbound — `inbox::notify_agent` threshold uses `text.chars().count()` (S3-T1 fix) instead of `text.len()` to avoid UTF-8 byte-vs-char miscount. Same family of "saturate / count carefully at boundary" idiom; TUI's R1 `overlay_dims` helper is the right shape and worth replicating across any layer that does width/height subtraction.
+- **TUI L2 ("per-site fix without pattern propagation" — render_menu has the saturating fix + comment, four siblings don't)** is the same antipattern I flagged on the channel side: my **M1** (caps.rs doc claims "readers land in a later PR" but ux_event.rs:345 reads them today) and **M2** (mod.rs doc claims scaffold "intentionally unused" but 6 call sites consume it) are both per-site doc updates that didn't propagate when the code shipped. **Cross-track systemic confirmation**: Sprint 19 PR-AE3's "Some/Else log convention" + Sprint 18 PR-BA "every spawn site needs rationale" attempted to formalise this once; neither stuck. Worth pulling into SYNTHESIS.md as a top-level systemic theme rather than per-track L finding.
+- **TUI M2 (Capital `'S'` keybind inconsistency, already filed `t-20260426122506967277-9`)** — backlog-rather-than-defer-with-no-trail discipline matches Track A's pattern (CD3 `ChannelKind` discriminator leak filed informational, M3 edit-event ingest TODO documented in code, etc.). Audit-discipline confirmed consistent across A+C.
+- **TUI L1 (dispatch criterion 3 mismatch — state.rs is PTY classifier, not session restoration trust boundary)** — exactly the kind of dispatch-vs-code drift Track A's H3 / M1 captured (mod.rs / caps.rs doc claims). Confirms cross-track that **dispatch wording lags codebase reorgs** is a fleet-wide audit-process issue, not Track-C-specific.
+
+### Missed findings discovered (channel angle reading TUI)
+
+1. **`src/app/telegram_hooks.rs` (81 lines) — cross-A surface that NEITHER A nor C deep-audited**. TUI's Cross-area C → A flags it informationally ("TUI invokes channel directly via this bridge"); my CHANNEL.md scope was `src/channel/` + `src/fleet_broadcast.rs` and didn't reach into `src/app/`. SYNTHESIS.md captures `app/api_server.rs` joint sub-track but does not list `app/telegram_hooks.rs` similarly. **Sprint 20.5 missing-pair finding**: 81-line bridge between TUI key events and Telegram channel — needs at least a grep-pass to confirm no hidden direct calls into `TelegramState` past the trait surface, and to document the same TUI→A path that `app/api_server.rs` documents for TUI→D. Recommend adding `app/telegram_hooks.rs` as a second joint-audit item in Phase 5 (operator-wake action 2 in SYNTHESIS).
+
+2. **`Option<T> for "always Some in production" invariant** is shared between TUI M1 (Tab.root: Option<PaneNode>, 7 expect sites) and channel-layer `TelegramState.bot: Option<Bot>` (telegram.rs:113-114, with `expect("telegram bot not initialized")` at ≥4 call sites — search `\.expect\("telegram bot`). Same pattern: production always Some, contract-test harness sets None, every transport-path lock-then-unwrap inherits the brittleness. TUI's R2 wrapper-type refactor (NonEmpty<T> or sentinel-replace) **applies to channel adapter too**. Neither A's CHANNEL.md M5 nor TUI M1 surfaced the cross-area twinship. Sprint 21 candidate: lift R2 from Track-C-only to a fleet-wide "non-empty Option discipline" sweep.
+
+3. **TUI key → app/api_server.rs → mcp/handlers.rs → channel free-fn full chain not walked end-to-end by any track**. TUI flagged C↔D bridge at api_server.rs; my Track A peer-pass to B flagged A↔D bridge at mcp/handlers.rs:74,88,102,399 (try_telegram_reply / react / edit / inject_provenance). SYNTHESIS Phase 5 (line 145) absorbs this as ~200 LOC joint scope. **Sprint 20.5 cross-validation confirms**: the TUI→MCP→Channel chain is a **3-track coupled surface** (C+D+A), not a 2-track bridge — the joint audit scope should be C+D+A, not just C+D. Recommend SYNTHESIS update or Sprint 21 Phase 5 dispatch to explicitly include A.
+
+4. **Render layer never reads `ChannelCapabilities`** (TUI Coverage shows render.rs only locks `AgentRegistry` for state coloring). This is **correctly factored** — caps drive `select_action` in `ux_event.rs::select_action` which the channel adapter consumes; the TUI is cap-blind by design (anti-feature per `PLAN-channel-ux-layer.md`: "never mirror AgentThinking into a typing… message when no typing-indicator capability exists"). Calling out so the design-intent is preserved if any future "render channel state in TUI" work tempts a shortcut. **Praise to A's CHANNEL.md replicate-bucket**: caps default-conservatism + cap-blind TUI is the design pair; both halves working together is what makes the discipline durable.
+
+### Disagreement / scope dispute
+
+- **TUI's "Critical: (none observed)"** is appropriate for the presentation/state layer in isolation, but **TUI H1's panic-on-narrow-terminal class is closer to Critical-with-prior-incident** than the report frames. PR #194 was an operator-authored HOTFIX precisely because resize-race vterm panic crashed production. TUI's H1 is the same bug class on different render functions — narrow-terminal trigger replaces resize-race trigger, but the failure mode is identical (u16 underflow → debug-panic / release-wrap). Defensible to stay High since prior incident set a "hotfix not Critical-pre-merge" precedent, but I would have leaned to Critical given operator-burned precedent. Not a hard objection; flagging the scope-defense for synthesis-time visibility.
+- **No actual disagreement on scope ownership**. TUI's Cross-area C → A (telegram_hooks bridge), C → B (lock_registry read), C → D (api_server) labels match what A's perspective sees. Symmetric handoff confirmed.
+
+### Cross-area systemic patterns not in SYNTHESIS.md
+
+SYNTHESIS already covers (a) 13+/0 spawn graceful, (b) lifecycle partial-failure 6-finding cluster, (c) `app/api_server.rs` C↔D joint sub-track, (d) `can_mutate_*` auth pattern, (e) lock+drop deadlock-avoidance discipline. Patterns A↔C cross-validation surfaces that are NOT in SYNTHESIS:
+
+1. **"Per-site fix without pattern propagation" as a top-level systemic theme** — TUI L2 + Track A M1+M2 + multiple Sprint history examples. Currently scattered as per-track L/M findings. Worth elevating to SYNTHESIS systemic so Sprint 21 audits explicitly check for "did the fix propagate?" at every reviewer pass.
+
+2. **`Option<T> for "always Some" invariant brittleness** — TUI M1 Tab.root + channel TelegramState.bot. SYNTHESIS doesn't cluster these. Sprint 21 candidate for fleet-wide non-empty-Option-discipline sweep (rg pattern: `Option<.*>.*\.expect\(.*always|expect\(.*never|expect\(.*not initialized`).
+
+3. **`app/telegram_hooks.rs` second joint sub-track (parallel to `app/api_server.rs`)** — already noted in §Missed findings. Sprint 21 Phase 5 should split to two ~80-130 LOC joint pieces or one combined ~200-line `app/`-bridge audit covering both surfaces.
+
+4. **3-track coupled bridge (TUI key → MCP handler → channel free-fn)** — already noted in §Missed findings #3. SYNTHESIS Phase 5 currently scopes to C+D + ~70 LOC `mcp/handlers.rs` channel routes. The reality is C+D+A with channel adapter as the ultimate destination; scope should be tri-labelled.
+
+5. **Dispatch wording vs code reorg drift** — TUI L1 (state.rs identity wrong in dispatch criterion 3) + Track A H3+M1 (mod.rs / caps.rs doc claim scaffold unused but call sites exist). Both surfaces show the same shape: text written when codebase was at point T₀ stays unchanged after refactor lands at T₁. Audit-process improvement candidate (every audit should grep dispatch criteria against current code before writing findings) — not in SYNTHESIS but cheap to lift in.
+
+---
+
+## Audit complete (post Sprint 20.5 cross-validation)
+
+**Final structure of CHANNEL.md**:
+- §1 Track A audit (Sprint 20 t=0): 1 Critical / 4 High / 5 Medium / 4 Low / Praise 5+3+4 / 4 Cross-area / 9 Sprint 21 actionable
+- §2 Peer-pass: reading Track B DAEMON.md (Sprint 20 t+1): acknowledge B's 5 critiques + 4 channel-angle blindspots + 3 cross-pollination ideas
+- §3 Cross-validation: TUI (Sprint 20.5 missing-pair, t+2): 5 confirmed / 4 missed / 1 scope-defense disagreement / 5 systemic-not-in-synthesis
+
+(CHANNEL.md complete after Sprint 20.5 cross-validation pass.)
+
 
