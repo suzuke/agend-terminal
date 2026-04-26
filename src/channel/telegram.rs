@@ -240,6 +240,108 @@ async fn send_with_topic(
     Ok(())
 }
 
+/// Telegram Bot API caption limit (characters).
+const CAPTION_MAX_CHARS: usize = 1024;
+
+/// Resolve the caption for a media send.
+fn resolve_caption(text: &str, att: &crate::channel::Attachment) -> Option<String> {
+    use crate::channel::AttachmentKind;
+    if att.kind == AttachmentKind::Sticker {
+        return None;
+    }
+    if let Some(ref cap) = att.caption {
+        return Some(cap.chars().take(CAPTION_MAX_CHARS).collect());
+    }
+    if !text.is_empty() && text.chars().count() <= CAPTION_MAX_CHARS {
+        return Some(text.to_string());
+    }
+    None
+}
+
+/// Returns true when text should be sent as a separate follow-up message.
+fn needs_separate_text(text: &str, att: &crate::channel::Attachment) -> bool {
+    use crate::channel::AttachmentKind;
+    if text.is_empty() {
+        return false;
+    }
+    if att.caption.is_some() {
+        return true;
+    }
+    att.kind == AttachmentKind::Sticker || text.chars().count() > CAPTION_MAX_CHARS
+}
+
+/// Send a media attachment via the appropriate Telegram Bot API method.
+async fn send_media(
+    bot: &Bot,
+    chat_id: ChatId,
+    topic_id: Option<i32>,
+    att: &crate::channel::Attachment,
+    caption: Option<&str>,
+) -> anyhow::Result<i32> {
+    use crate::channel::AttachmentKind;
+    use teloxide::prelude::Requester;
+    use teloxide::types::InputFile;
+
+    let input = InputFile::file(&att.path);
+    let input = if let Some(ref name) = att.original_filename {
+        input.file_name(name.clone())
+    } else {
+        input
+    };
+    let thread = topic_id.filter(|&t| t != 1).map(|t| ThreadId(MessageId(t)));
+
+    let msg_id = match att.kind {
+        AttachmentKind::Photo => {
+            let mut req = bot.send_photo(chat_id, input);
+            if let Some(cap) = caption {
+                req = req.caption(cap);
+            }
+            if let Some(tid) = thread {
+                req = req.message_thread_id(tid);
+            }
+            req.await?.id.0
+        }
+        AttachmentKind::Voice => {
+            let mut req = bot.send_voice(chat_id, input);
+            if let Some(cap) = caption {
+                req = req.caption(cap);
+            }
+            if let Some(tid) = thread {
+                req = req.message_thread_id(tid);
+            }
+            req.await?.id.0
+        }
+        AttachmentKind::Document => {
+            let mut req = bot.send_document(chat_id, input);
+            if let Some(cap) = caption {
+                req = req.caption(cap);
+            }
+            if let Some(tid) = thread {
+                req = req.message_thread_id(tid);
+            }
+            req.await?.id.0
+        }
+        AttachmentKind::Video => {
+            let mut req = bot.send_video(chat_id, input);
+            if let Some(cap) = caption {
+                req = req.caption(cap);
+            }
+            if let Some(tid) = thread {
+                req = req.message_thread_id(tid);
+            }
+            req.await?.id.0
+        }
+        AttachmentKind::Sticker => {
+            let mut req = bot.send_sticker(chat_id, input);
+            if let Some(tid) = thread {
+                req = req.message_thread_id(tid);
+            }
+            req.await?.id.0
+        }
+    };
+    Ok(msg_id)
+}
+
 /// Start Telegram polling in a dedicated thread with its own tokio runtime.
 pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
     if let Err(e) = std::thread::Builder::new()
@@ -1592,15 +1694,47 @@ impl crate::channel::Channel for TelegramChannel {
         _binding: &crate::channel::BindingRef,
         msg: crate::channel::OutMsg,
     ) -> anyhow::Result<crate::channel::MsgRef> {
-        // TODO(Phase 3): wire real sendPhoto/sendVoice/sendDocument when attachment present
-        if msg.attachment.is_some() {
-            tracing::warn!(
-                "attachment not yet wired for channel telegram; falling back to text path"
-            );
+        let (bot, group_id) = {
+            let s = lock_state(&self.state);
+            match s.bot.clone() {
+                Some(b) => (b, s.group_id),
+                None => anyhow::bail!("telegram bot not initialized"),
+            }
+        };
+        // Full binding-based topic routing lands with the dispatcher in T2.
+        let topic_id: Option<i32> = None;
+
+        match msg.attachment {
+            Some(ref att) => {
+                let caption = resolve_caption(&msg.text, att);
+                let msg_id = telegram_runtime().block_on(send_media(
+                    &bot,
+                    group_id,
+                    topic_id,
+                    att,
+                    caption.as_deref(),
+                ))?;
+                if needs_separate_text(&msg.text, att) {
+                    let _ = telegram_runtime()
+                        .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text));
+                }
+                Ok(crate::channel::MsgRef {
+                    binding: crate::channel::BindingRef::new("telegram", None, ()),
+                    id: msg_id.to_string(),
+                })
+            }
+            None => {
+                if msg.text.is_empty() {
+                    anyhow::bail!("OutMsg has no text and no attachment");
+                }
+                telegram_runtime()
+                    .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text))?;
+                Ok(crate::channel::MsgRef {
+                    binding: crate::channel::BindingRef::new("telegram", None, ()),
+                    id: "0".to_string(),
+                })
+            }
         }
-        // Current call sites still use the `try_telegram_reply` free fn.
-        // The trait-based send path lands with the dispatcher in T2.
-        anyhow::bail!("TelegramChannel::send not wired yet — use try_telegram_reply")
     }
 
     fn edit(
@@ -2818,5 +2952,140 @@ instances:
         let dyn_channel: &dyn crate::channel::Channel = &channel;
         let _ = dyn_channel.create_topic("test");
         let _ = dyn_channel.notify("test", crate::channel::NotifySeverity::Warn, "msg", false);
+    }
+
+    // ─── Outbound media helper tests (Phase 3 PR-AG) ──────────────────
+
+    fn make_attachment(kind: crate::channel::AttachmentKind) -> crate::channel::Attachment {
+        crate::channel::Attachment {
+            kind,
+            path: PathBuf::from("/tmp/test.jpg"),
+            mime: None,
+            caption: None,
+            size_bytes: None,
+            original_filename: None,
+        }
+    }
+
+    #[test]
+    fn resolve_caption_uses_text_when_short() {
+        let att = make_attachment(crate::channel::AttachmentKind::Photo);
+        assert_eq!(resolve_caption("hello", &att).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn resolve_caption_none_when_text_exceeds_limit() {
+        let att = make_attachment(crate::channel::AttachmentKind::Photo);
+        assert!(resolve_caption(&"x".repeat(CAPTION_MAX_CHARS + 1), &att).is_none());
+    }
+
+    #[test]
+    fn resolve_caption_prefers_attachment_caption() {
+        let mut att = make_attachment(crate::channel::AttachmentKind::Document);
+        att.caption = Some("explicit".into());
+        assert_eq!(resolve_caption("text", &att).as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn resolve_caption_truncates_long_attachment_caption() {
+        let mut att = make_attachment(crate::channel::AttachmentKind::Photo);
+        att.caption = Some("x".repeat(CAPTION_MAX_CHARS + 100));
+        let cap = resolve_caption("", &att).expect("should have caption");
+        assert_eq!(cap.chars().count(), CAPTION_MAX_CHARS);
+    }
+
+    #[test]
+    fn resolve_caption_none_for_sticker() {
+        let att = make_attachment(crate::channel::AttachmentKind::Sticker);
+        assert!(resolve_caption("hello", &att).is_none());
+    }
+
+    #[test]
+    fn resolve_caption_none_when_text_empty() {
+        let att = make_attachment(crate::channel::AttachmentKind::Photo);
+        assert!(resolve_caption("", &att).is_none());
+    }
+
+    #[test]
+    fn needs_separate_text_false_when_empty() {
+        assert!(!needs_separate_text(
+            "",
+            &make_attachment(crate::channel::AttachmentKind::Photo)
+        ));
+    }
+
+    #[test]
+    fn needs_separate_text_false_when_short() {
+        assert!(!needs_separate_text(
+            "short",
+            &make_attachment(crate::channel::AttachmentKind::Photo)
+        ));
+    }
+
+    #[test]
+    fn needs_separate_text_true_when_long() {
+        assert!(needs_separate_text(
+            &"x".repeat(CAPTION_MAX_CHARS + 1),
+            &make_attachment(crate::channel::AttachmentKind::Photo)
+        ));
+    }
+
+    #[test]
+    fn needs_separate_text_true_for_sticker_with_text() {
+        assert!(needs_separate_text(
+            "hello",
+            &make_attachment(crate::channel::AttachmentKind::Sticker)
+        ));
+    }
+
+    #[test]
+    fn needs_separate_text_true_when_attachment_has_own_caption() {
+        let mut att = make_attachment(crate::channel::AttachmentKind::Photo);
+        att.caption = Some("cap".into());
+        assert!(needs_separate_text("body", &att));
+    }
+
+    #[test]
+    fn send_text_only_reaches_text_path() {
+        use crate::channel::Channel;
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        let binding = crate::channel::BindingRef::new("telegram", None, ());
+        let err = channel
+            .send(&binding, crate::channel::OutMsg::text("hello"))
+            .expect_err("no bot");
+        assert!(
+            err.to_string().contains("telegram bot not initialized"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn send_attachment_reaches_media_path() {
+        use crate::channel::Channel;
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        let binding = crate::channel::BindingRef::new("telegram", None, ());
+        let msg = crate::channel::OutMsg {
+            text: "see".into(),
+            attachment: Some(make_attachment(crate::channel::AttachmentKind::Photo)),
+        };
+        let err = channel.send(&binding, msg).expect_err("no bot");
+        assert!(
+            err.to_string().contains("telegram bot not initialized"),
+            "{err}"
+        );
     }
 }
