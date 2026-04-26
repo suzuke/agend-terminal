@@ -1255,12 +1255,18 @@ pub fn render_tasks(
     use crate::app::{BoardView, TaskBoardMode};
     let count = items.len();
     let view_tabs = match view {
-        BoardView::Tasks => "[t] tasks  [f] fleet  [s] status",
-        BoardView::Fleet => " [t] tasks [f] fleet  [s] status",
-        BoardView::Status => " [t] tasks  [f] fleet [s] status",
+        BoardView::Tasks => "[t] tasks  [f] fleet  [s] status  [m] monitor",
+        BoardView::Fleet => " [t] tasks [f] fleet  [s] status  [m] monitor",
+        BoardView::Status => " [t] tasks  [f] fleet [s] status  [m] monitor",
+        BoardView::Monitor => " [t] tasks  [f] fleet  [s] status [m] monitor",
     };
     let title = format!(" Board ({count}) | {view_tabs} | Tab switch | q close ");
     let inner = render_overlay_frame(frame, Color::Blue, &title);
+
+    if matches!(view, BoardView::Monitor) {
+        render_monitor_view(frame, inner);
+        return;
+    }
 
     if matches!(view, BoardView::Status) {
         let summary = crate::status_summary::build_summary(home);
@@ -1681,6 +1687,85 @@ pub fn build_fleet_view_lines(
         }
     }
     lines
+}
+
+fn render_monitor_view(frame: &mut Frame, area: ratatui::layout::Rect) {
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+
+    let metrics = crate::instance_monitor::latest_metrics();
+    if metrics.is_empty() {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(
+                "  No instance metrics yet (waiting for first collection tick).",
+            )
+            .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+
+    let header = Line::from(vec![Span::styled(
+        format!(
+            " {:<16} {:<12} {:<12} {:>8} {:>6} {:>10} {:>8} {:>7}",
+            "NAME", "STATE", "HEALTH", "MEM(MB)", "CPU%", "UPTIME", "HB-LAG", "PICKUP"
+        ),
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan),
+    )]);
+
+    let mut lines = vec![header];
+    for m in &metrics {
+        let mem_str = m
+            .rss_bytes
+            .map(|b| format!("{:.1}", b as f64 / 1_048_576.0))
+            .unwrap_or_else(|| "—".into());
+        let cpu_str = m
+            .cpu_percent
+            .map(|c| format!("{c:.1}"))
+            .unwrap_or_else(|| "—".into());
+        let uptime_str = m
+            .uptime_secs
+            .map(format_uptime)
+            .unwrap_or_else(|| "—".into());
+        let hb_str = m
+            .heartbeat_lag_secs
+            .map(|s| format!("{s}s"))
+            .unwrap_or_else(|| "—".into());
+
+        let health_color = match m.health_state.as_str() {
+            "ok" => Color::Green,
+            "hung" | "crashed" | "unstable" => Color::Red,
+            "rate_limit" => Color::Yellow,
+            _ => Color::White,
+        };
+
+        lines.push(Line::from(vec![
+            Span::raw(format!(" {:<16} {:<12} ", m.name, m.agent_state)),
+            Span::styled(
+                format!("{:<12}", m.health_state),
+                Style::default().fg(health_color),
+            ),
+            Span::raw(format!(
+                "{:>8} {:>6} {:>10} {:>8} {:>7}",
+                mem_str, cpu_str, uptime_str, hb_str, m.pending_pickup_count
+            )),
+        ]));
+    }
+
+    let para = ratatui::widgets::Paragraph::new(lines);
+    frame.render_widget(para, area);
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
 }
 
 fn render_fleet_view(

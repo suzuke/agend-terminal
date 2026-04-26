@@ -174,6 +174,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // the app must not also poll a disjoint (empty) registry.
     if !attached_mode {
         crate::daemon::supervisor::spawn(home.clone(), Arc::clone(&registry));
+        crate::instance_monitor::spawn_monitor_tick(home.clone(), Arc::clone(&registry));
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.

@@ -48,6 +48,7 @@ pub enum BoardView {
     Tasks,
     Fleet,
     Status,
+    Monitor,
 }
 
 pub(super) enum Overlay {
@@ -552,7 +553,8 @@ pub(super) fn handle_key(
                 *view = match view {
                     BoardView::Tasks => BoardView::Fleet,
                     BoardView::Fleet => BoardView::Status,
-                    BoardView::Status => BoardView::Tasks,
+                    BoardView::Status => BoardView::Monitor,
+                    BoardView::Monitor => BoardView::Tasks,
                 };
                 return outcome;
             }
@@ -1143,6 +1145,10 @@ mod tests {
         handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
         if let Overlay::Tasks { view, .. } = &overlay {
             assert_eq!(*view, BoardView::Status, "Tab must switch to Status");
+        }
+        handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
+        if let Overlay::Tasks { view, .. } = &overlay {
+            assert_eq!(*view, BoardView::Monitor, "Tab must switch to Monitor");
         }
         handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
         if let Overlay::Tasks { view, .. } = &overlay {

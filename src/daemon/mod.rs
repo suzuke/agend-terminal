@@ -303,6 +303,7 @@ fn run_core(
     consume_upgrade_marker(home.to_path_buf(), Arc::clone(&registry));
 
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
+    crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&registry));
 
     // Recover any half-written inbox files from a previous crash.
     crate::inbox::recover_half_writes(home);

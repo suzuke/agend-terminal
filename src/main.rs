@@ -24,6 +24,7 @@ mod framing;
 mod health;
 mod identity;
 mod inbox;
+mod instance_monitor;
 mod instructions;
 mod ipc;
 mod keybinds;
