@@ -37,7 +37,10 @@ pub struct FleetConfig {
 pub enum ChannelConfig {
     #[serde(rename = "telegram")]
     Telegram {
-        /// Env var name containing the bot token.
+        /// Env var name containing the bot token. Defaults to
+        /// `AGEND_TELEGRAM_BOT_TOKEN`; falls back to legacy `AGEND_BOT_TOKEN`
+        /// with a deprecation warning.
+        #[serde(default = "default_telegram_bot_token_env")]
         bot_token_env: String,
         /// Telegram group chat ID.
         group_id: i64,
@@ -66,6 +69,16 @@ pub enum ChannelConfig {
         /// `docs/DESIGN-stage-b-ux.md` §3 and §5).
         #[serde(default)]
         fleet_binding: Option<FleetBindingConfig>,
+    },
+    /// Discord adapter (Phase 2+). Bootstrap selection lands in Phase 1;
+    /// actual adapter implementation is behind the `discord` feature gate.
+    #[serde(rename = "discord")]
+    Discord {
+        /// Env var name containing the Discord bot token.
+        #[serde(default = "default_discord_bot_token_env")]
+        bot_token_env: String,
+        /// Discord guild (server) ID.
+        guild_id: u64,
     },
 }
 
@@ -103,6 +116,14 @@ pub enum FleetBindingStruct {
 
 fn default_mode() -> String {
     "topic".to_string()
+}
+
+fn default_telegram_bot_token_env() -> String {
+    "AGEND_TELEGRAM_BOT_TOKEN".to_string()
+}
+
+fn default_discord_bot_token_env() -> String {
+    "AGEND_DISCORD_BOT_TOKEN".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -725,6 +746,7 @@ instances:
                 assert_eq!(mode, "topic");
             }
             None => panic!("channel should be Some"),
+            Some(crate::fleet::ChannelConfig::Discord { .. }) => panic!("unexpected discord"),
         }
 
         fs::remove_dir_all(&dir).ok();
@@ -760,6 +782,7 @@ instances: {}
                 assert_eq!(group_id, -100999);
             }
             None => panic!("plural channels: should populate singular channel field"),
+            Some(crate::fleet::ChannelConfig::Discord { .. }) => panic!("unexpected discord"),
         }
         // Plural is still preserved on the struct for later consumers.
         assert!(config.channels.is_some());
@@ -805,6 +828,7 @@ instances: {}
                 );
             }
             None => panic!("channel should be populated"),
+            Some(crate::fleet::ChannelConfig::Discord { .. }) => panic!("unexpected discord"),
         }
         fs::remove_dir_all(&dir).ok();
     }
@@ -837,6 +861,7 @@ instances: {}
                 ref bot_token_env, ..
             }) => assert_eq!(bot_token_env, "SINGULAR_TOKEN"),
             None => panic!("singular channel field must be preserved"),
+            Some(crate::fleet::ChannelConfig::Discord { .. }) => panic!("unexpected discord"),
         }
         fs::remove_dir_all(&dir).ok();
     }
@@ -879,6 +904,7 @@ instances: {}
                 assert_eq!(mode, "topic", "default mode should be 'topic'");
             }
             None => panic!("channel should be Some"),
+            Some(crate::fleet::ChannelConfig::Discord { .. }) => panic!("unexpected discord"),
         }
 
         fs::remove_dir_all(&dir).ok();

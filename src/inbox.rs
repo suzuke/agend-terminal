@@ -137,6 +137,7 @@ impl fmt::Display for NotifySource<'_> {
             Self::Channel(user, kind) => {
                 let kind_str = match kind {
                     crate::channel::ChannelKind::Telegram => "telegram",
+                    crate::channel::ChannelKind::Discord => "discord",
                 };
                 write!(f, "user:{user} via {kind_str}")
             }

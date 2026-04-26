@@ -861,18 +861,32 @@ pub fn init_from_config(
     home: &Path,
     submit_keys: HashMap<String, String>,
 ) -> Option<Arc<Mutex<TelegramState>>> {
-    let ChannelConfig::Telegram {
-        bot_token_env,
-        group_id,
-        user_allowlist,
-        fleet_binding,
-        ..
-    } = config.channel.as_ref()?;
+    let (bot_token_env, group_id, user_allowlist, fleet_binding) = match config.channel.as_ref()? {
+        ChannelConfig::Telegram {
+            bot_token_env,
+            group_id,
+            user_allowlist,
+            fleet_binding,
+            ..
+        } => (bot_token_env, group_id, user_allowlist, fleet_binding),
+        ChannelConfig::Discord { .. } => return None,
+    };
     let token = match std::env::var(bot_token_env) {
         Ok(t) => t,
         Err(_) => {
-            tracing::info!(env = %bot_token_env, "bot token env not set, skipping");
-            return None;
+            // Fallback: legacy AGEND_BOT_TOKEN env var (deprecated).
+            match std::env::var("AGEND_BOT_TOKEN") {
+                Ok(t) => {
+                    tracing::warn!(
+                        "AGEND_BOT_TOKEN is deprecated — migrate to {bot_token_env} in fleet.yaml"
+                    );
+                    t
+                }
+                Err(_) => {
+                    tracing::info!(env = %bot_token_env, "bot token env not set, skipping");
+                    return None;
+                }
+            }
         }
     };
     match user_allowlist {
@@ -1079,6 +1093,15 @@ fn resolve_channel_from(
             ..
         }) => {
             let token = std::env::var(bot_token_env)
+                .or_else(|_| {
+                    let legacy = std::env::var("AGEND_BOT_TOKEN");
+                    if legacy.is_ok() {
+                        tracing::warn!(
+                            "AGEND_BOT_TOKEN is deprecated — migrate to {bot_token_env}"
+                        );
+                    }
+                    legacy
+                })
                 .map_err(|_| anyhow::anyhow!("bot token env '{bot_token_env}' not set"))?;
             Ok((
                 TelegramCreds {
@@ -1087,6 +1110,9 @@ fn resolve_channel_from(
                 },
                 config,
             ))
+        }
+        Some(crate::fleet::ChannelConfig::Discord { .. }) => {
+            anyhow::bail!("Discord channel configured but telegram resolver called")
         }
         None => anyhow::bail!("No Telegram channel configured"),
     }
@@ -1492,6 +1518,7 @@ fn notify_telegram_inner(
             ),
             Err(_) => return,
         },
+        Some(crate::fleet::ChannelConfig::Discord { .. }) => return,
         None => return,
     };
 
