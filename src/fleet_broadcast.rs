@@ -628,7 +628,11 @@ instances:
         assert!(path.exists(), "fleet_events.jsonl must be created");
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 1, "expected exactly one JSONL line, got {content:?}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one JSONL line, got {content:?}"
+        );
 
         let v: serde_json::Value = serde_json::from_str(lines[0]).expect("line must parse as JSON");
         assert_eq!(v["kind"], "instance-created");
