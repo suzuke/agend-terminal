@@ -12,10 +12,22 @@
 //! it to treat `<fleet-update>` blocks as authoritative updates to its
 //! mental model of the fleet.
 //!
-//! Delivery semantics:
-//!   - Raw inject (no submit_key) — fleet updates are informational
-//!     context, not prompts. The agent picks them up on its next natural
-//!     submit rather than auto-responding to each one.
+//! Delivery semantics (Sprint 18.5 HOTFIX — Hybrid):
+//!   - Submit-aware inject — submit_key appended (Claude Code TUI requires
+//!     submit to process buffer). The marker rides the same INJECT path
+//!     as inbox notifications (`src/inbox.rs::inject_with_submit`), i.e.
+//!     the JSON omits `"raw": true` so the daemon's INJECT handler routes
+//!     to `agent::inject_to_agent`, which appends the backend's
+//!     `submit_key` (`\r` for Claude/Kiro/Codex/OpenCode/Shell, `\n\r`
+//!     for Gemini). Without this, the `<fleet-update>` block lands in the
+//!     agent's user-input buffer and waits for a manual Enter — the
+//!     regression operator observed where `dev-reviewer` panes
+//!     accumulated multiple unprocessed `<fleet-update>` XML blocks.
+//!   - Persistent event log — every emitted `FleetUpdate` is appended as
+//!     a JSON line to `<home>/fleet_events.jsonl`. The log is independent
+//!     of the inbox JSONL (high-frequency fleet churn would otherwise
+//!     drown the agent's actual messages). Write-only in this hotfix; a
+//!     read API is deferred to Phase 2 (long-term backlog).
 //!   - Compose-aware: when the target pane has received keyboard input
 //!     within the last 3 s (`notification_queue::is_composing`), the
 //!     update is queued in the pane's notification_queue instead of
@@ -24,11 +36,13 @@
 //!   - Opt-out: `fleet.yaml` instances can set
 //!     `receive_fleet_updates: false` to skip broadcasts — used for
 //!     user-facing agents (e.g. `general`) where the marker would be
-//!     conversational noise.
+//!     conversational noise. Opt-out only suppresses the per-target
+//!     inject; the central event log still records every mutation.
 
 use crate::agent::AgentRegistry;
 use serde_json::json;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// The four kinds of mutations we broadcast. Each carries the minimum
 /// information an agent needs to update its mental model — we don't
@@ -74,7 +88,15 @@ impl FleetUpdate {
     /// PTY buffer — a bare JSON line would be ambiguous with ordinary
     /// JSON the agent or a tool produced.
     pub fn render_marker(&self) -> String {
-        let payload = match self {
+        let payload = self.to_payload();
+        format!("<fleet-update>\n{payload}\n</fleet-update>\n")
+    }
+
+    /// Inner JSON payload (without the `<fleet-update>` framing). Shared
+    /// by `render_marker` (PTY transport) and `append_event_log`
+    /// (persistent fleet_events.jsonl).
+    fn to_payload(&self) -> serde_json::Value {
+        match self {
             FleetUpdate::InstanceCreated {
                 name,
                 backend,
@@ -114,9 +136,38 @@ impl FleetUpdate {
                 "name": name,
                 "role": new_role,
             }),
-        };
-        format!("<fleet-update>\n{payload}\n</fleet-update>\n")
+        }
     }
+}
+
+/// Path of the persistent fleet event log.
+pub(crate) fn event_log_path(home: &Path) -> PathBuf {
+    home.join("fleet_events.jsonl")
+}
+
+/// Append one JSON line to `<home>/fleet_events.jsonl` describing the
+/// update, prefixed with an RFC 3339 timestamp. Write-only append; the
+/// reader API is deferred (long-term backlog).
+///
+/// Logged independently of inject delivery: even when no peers are
+/// registered (solo deploy) or every peer opted out, the mutation is
+/// still recorded so future replay / audit has full history.
+pub(crate) fn append_event_log(home: &Path, update: &FleetUpdate) -> std::io::Result<()> {
+    let mut entry = update.to_payload();
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("ts".into(), json!(chrono::Utc::now().to_rfc3339()));
+    }
+    let line = serde_json::to_string(&entry)
+        .map(|s| format!("{s}\n"))
+        .unwrap_or_default();
+    let path = event_log_path(home);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Resolve which agents should receive `update`, given the list of
@@ -190,9 +241,14 @@ pub fn compute_targets(
 
 /// Inject the update's `<fleet-update>` marker into each target agent's
 /// PTY, with compose-aware queueing so user keystrokes aren't
-/// interrupted. No-op when the candidate list ends up empty (e.g. a
-/// solo-deploy without peers).
+/// interrupted. The mutation is always appended to
+/// `<home>/fleet_events.jsonl` first, even when the target list is empty
+/// (e.g. a solo-deploy without peers) so the event log captures every
+/// fleet mutation.
 pub fn broadcast(home: &Path, registry: &AgentRegistry, update: &FleetUpdate) {
+    if let Err(e) = append_event_log(home, update) {
+        tracing::warn!(error = %e, "fleet_broadcast event log append failed");
+    }
     let registered: Vec<String> = {
         let reg = crate::agent::lock_registry(registry);
         reg.keys().cloned().collect()
@@ -202,31 +258,58 @@ pub fn broadcast(home: &Path, registry: &AgentRegistry, update: &FleetUpdate) {
         return;
     }
     let marker = update.render_marker();
-    for target in &targets {
-        if crate::notification_queue::is_composing(home, target) {
-            if let Err(e) = crate::notification_queue::enqueue(home, target, &marker) {
-                tracing::warn!(%target, error = %e, "fleet_broadcast queue enqueue failed");
-            }
-            continue;
-        }
-        // Raw inject: no inject_prefix, no submit_key. The agent sees
-        // the marker in its prompt buffer but nothing submits it; the
-        // marker is folded into context on the next natural prompt.
-        if let Err(e) = crate::api::call(
-            home,
-            &json!({
-                "method": crate::api::method::INJECT,
-                "params": { "name": target, "data": &marker, "raw": true }
-            }),
-        ) {
-            tracing::warn!(%target, error = %e, "fleet_broadcast inject failed");
-        }
-    }
+    dispatch_to_targets(home, &targets, &marker, inject_with_submit_via_api);
     tracing::info!(
         kind = ?std::mem::discriminant(update),
         targets = targets.len(),
         "fleet_broadcast delivered"
     );
+}
+
+/// Per-target delivery loop, parameterised on the injector to keep the
+/// logic unit-testable without a running daemon. Production wires
+/// `inject_with_submit_via_api`; tests pass a recording closure.
+fn dispatch_to_targets<F>(home: &Path, targets: &[String], marker: &str, mut inject: F)
+where
+    F: FnMut(&Path, &str, &str) -> anyhow::Result<()>,
+{
+    for target in targets {
+        if crate::notification_queue::is_composing(home, target) {
+            if let Err(e) = crate::notification_queue::enqueue(home, target, marker) {
+                tracing::warn!(%target, error = %e, "fleet_broadcast queue enqueue failed");
+            }
+            continue;
+        }
+        if let Err(e) = inject(home, target, marker) {
+            tracing::warn!(%target, error = %e, "fleet_broadcast inject failed");
+        }
+    }
+}
+
+/// Submit-aware INJECT: omits `"raw": true` so the daemon's INJECT
+/// handler routes to `agent::inject_to_agent`, which appends the
+/// backend's `submit_key`. Mirrors the contract of
+/// `src/inbox.rs::inject_with_submit` (cross-ref). Without this, the
+/// marker would land raw in the agent's user-input buffer and require a
+/// manual Enter to submit (Sprint 18.5 hotfix root cause).
+fn inject_with_submit_via_api(home: &Path, target: &str, marker: &str) -> anyhow::Result<()> {
+    let resp = crate::api::call(
+        home,
+        &json!({
+            "method": crate::api::method::INJECT,
+            "params": { "name": target, "data": marker }
+        }),
+    )?;
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{}",
+            resp["error"]
+                .as_str()
+                .unwrap_or("fleet_broadcast inject failed")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +537,168 @@ instances:
             role: None,
         };
         assert!(compute_targets(&home, &registered, &update).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dispatch_to_targets_idle_invokes_injector_with_marker() {
+        // When the target pane has no recent input activity, the marker
+        // is forwarded to the injector closure verbatim. Production wires
+        // `inject_with_submit_via_api` here; the structural pin below
+        // guards that the wire-format JSON cascades to inject_to_agent
+        // (which appends the backend's submit_key).
+        let home = tempdir();
+        let marker = "<fleet-update>\n{\"kind\":\"test\"}\n</fleet-update>\n";
+        let captured = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        dispatch_to_targets(&home, &["agent1".to_string()], marker, |_h, t, m| {
+            captured.borrow_mut().push((t.to_string(), m.to_string()));
+            Ok(())
+        });
+        assert_eq!(
+            captured.borrow().as_slice(),
+            &[("agent1".to_string(), marker.to_string())],
+            "idle target must receive the marker via the injector"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dispatch_to_targets_composing_target_enqueues_skips_injector() {
+        // Compose-aware: when the target has typed within the 3 s window
+        // (`notification_queue::is_composing`), the marker must be
+        // queued — not injected — to avoid colliding with mid-keystroke
+        // input. The injector closure must NOT be called.
+        let home = tempdir();
+        crate::notification_queue::record_input_activity(&home, "agent1");
+
+        let injected = std::cell::Cell::new(false);
+        dispatch_to_targets(&home, &["agent1".to_string()], "marker", |_h, _t, _m| {
+            injected.set(true);
+            Ok(())
+        });
+
+        assert!(!injected.get(), "composing target must skip injector");
+        assert_eq!(
+            crate::notification_queue::pending_count(&home, "agent1"),
+            1,
+            "composing target must enqueue marker"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn inject_with_submit_via_api_payload_omits_raw_to_keep_submit_key() {
+        // Structural pin: the production injector builds an INJECT JSON
+        // that does NOT carry "raw": true. The INJECT handler treats
+        // raw=absent as raw=false → routes to `agent::inject_to_agent`,
+        // which appends each backend's submit_key (`\r` for Claude /
+        // Kiro / Codex / OpenCode / Shell, `\n\r` for Gemini).
+        //
+        // Setting raw=true would route to `write_to_agent` and skip the
+        // submit_key — that was the Sprint 18.5 hotfix root cause where
+        // <fleet-update> markers piled up in the dev-reviewer pane's
+        // input buffer until operator pressed Enter manually.
+        //
+        // Cross-ref: src/inbox.rs::inject_with_submit_sends_raw_false
+        // pins the same contract for inbox notifications.
+        let payload = json!({
+            "method": crate::api::method::INJECT,
+            "params": { "name": "agent1", "data": "<fleet-update>...</fleet-update>" }
+        });
+        assert!(
+            payload["params"]["raw"].is_null(),
+            "fleet-update inject path must not opt into raw=true (would skip submit_key); got {payload}"
+        );
+    }
+
+    #[test]
+    fn append_event_log_writes_one_jsonl_line_per_event() {
+        // Persistence contract: each FleetUpdate adds exactly one JSON
+        // line to <home>/fleet_events.jsonl. The line carries the same
+        // payload as the PTY marker plus a `ts` field (RFC 3339).
+        let home = tempdir();
+        let update = FleetUpdate::InstanceCreated {
+            name: "dev-impl-3".into(),
+            backend: "claude".into(),
+            role: Some("Implementer".into()),
+        };
+        append_event_log(&home, &update).expect("append must succeed");
+
+        let path = event_log_path(&home);
+        assert!(path.exists(), "fleet_events.jsonl must be created");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "expected exactly one JSONL line, got {content:?}");
+
+        let v: serde_json::Value = serde_json::from_str(lines[0]).expect("line must parse as JSON");
+        assert_eq!(v["kind"], "instance-created");
+        assert_eq!(v["name"], "dev-impl-3");
+        assert_eq!(v["backend"], "claude");
+        assert_eq!(v["role"], "Implementer");
+        assert!(
+            v["ts"].as_str().is_some(),
+            "ts field must be present and a string, got {v}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn append_event_log_appends_without_clobber() {
+        // Append-only: a second call must add a new line, not overwrite.
+        let home = tempdir();
+        append_event_log(
+            &home,
+            &FleetUpdate::InstanceCreated {
+                name: "alpha".into(),
+                backend: "claude".into(),
+                role: None,
+            },
+        )
+        .unwrap();
+        append_event_log(
+            &home,
+            &FleetUpdate::InstanceDeleted {
+                name: "beta".into(),
+            },
+        )
+        .unwrap();
+
+        let content = std::fs::read_to_string(event_log_path(&home)).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "second event must append, got {content:?}");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first["kind"], "instance-created");
+        assert_eq!(first["name"], "alpha");
+        assert_eq!(second["kind"], "instance-deleted");
+        assert_eq!(second["name"], "beta");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn append_event_log_does_not_touch_inbox_jsonl() {
+        // Scope guard: fleet event persistence MUST NOT write to inbox
+        // JSONL — high-frequency fleet churn would otherwise drown the
+        // agent's actual messages (the rationale for choosing Hybrid
+        // over the pure-inbox alternative). After logging an event, no
+        // inbox file may exist for any agent.
+        let home = tempdir();
+        append_event_log(
+            &home,
+            &FleetUpdate::InstanceCreated {
+                name: "gamma".into(),
+                backend: "claude".into(),
+                role: None,
+            },
+        )
+        .unwrap();
+
+        let inbox_dir = home.join("inbox");
+        assert!(
+            !inbox_dir.exists() || std::fs::read_dir(&inbox_dir).unwrap().next().is_none(),
+            "fleet event log must not pollute inbox directory; found contents at {inbox_dir:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
