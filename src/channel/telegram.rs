@@ -365,7 +365,7 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
                 let handler = Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
                     let state = Arc::clone(&state2);
                     async move {
-                        handle_message(&state, &msg);
+                        handle_message(&state, &msg).await;
                         respond(())
                     }
                 });
@@ -400,7 +400,7 @@ fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) -> String {
     "general".to_string()
 }
 
-fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
+async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // Detect topic closure/deletion — auto-delete the corresponding instance
     if msg.forum_topic_closed().is_some() {
         let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
@@ -595,9 +595,14 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         serde_json::json!(msg.id.0),
     );
 
-    // Download inbound attachment if present.
+    // Download inbound attachment if present (async — avoids nested runtime panic).
     let attachments: Vec<crate::channel::event::Attachment> = if let Some(f) = inbound_file {
-        match try_download_attachment(&home, &instance_name, f.file_id) {
+        let bot = lock_state(state).bot.clone();
+        let result = match bot {
+            Some(bot) => download_file_async(&bot, &home, &instance_name, f.file_id).await,
+            None => Err(anyhow::anyhow!("telegram bot not initialized")),
+        };
+        match result {
             Ok(local_path) => vec![crate::channel::event::Attachment {
                 kind: f.kind,
                 path: std::path::PathBuf::from(&local_path),
@@ -1401,18 +1406,32 @@ pub fn try_download_attachment(
     let ch = resolve_channel_only_from(home)?;
     telegram_runtime().block_on(async {
         let bot = teloxide::Bot::new(&ch.token);
-        let file = bot.get_file(file_id).await?;
-        let download_dir = home.join("downloads").join(instance_name);
-        std::fs::create_dir_all(&download_dir)?;
-        let filename = std::path::Path::new(&file.path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("attachment");
-        let dest = download_dir.join(filename);
-        let mut dst = tokio::fs::File::create(&dest).await?;
-        bot.download_file(&file.path, &mut dst).await?;
-        Ok(dest.display().to_string())
+        download_file_async(&bot, home, instance_name, file_id).await
     })
+}
+
+/// Async inner: download a telegram file to `$AGEND_HOME/downloads/{instance}/`.
+/// Used directly from async contexts (polling thread) and via `block_on`
+/// wrapper from sync contexts (MCP handler).
+async fn download_file_async(
+    bot: &teloxide::Bot,
+    home: &std::path::Path,
+    instance_name: &str,
+    file_id: &str,
+) -> anyhow::Result<String> {
+    use teloxide::net::Download;
+    use teloxide::prelude::Requester;
+    let file = bot.get_file(file_id).await?;
+    let download_dir = home.join("downloads").join(instance_name);
+    std::fs::create_dir_all(&download_dir)?;
+    let filename = std::path::Path::new(&file.path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment");
+    let dest = download_dir.join(filename);
+    let mut dst = tokio::fs::File::create(&dest).await?;
+    bot.download_file(&file.path, &mut dst).await?;
+    Ok(dest.display().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -3160,5 +3179,30 @@ instances:
         let result = create_topic_for_instance(&home, "new-agent");
         assert!(result.is_none(), "no config → no topic creation");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Invariant: `handle_message` must not call `block_on` — it runs inside
+    /// the telegram polling thread's tokio runtime, so nested `block_on`
+    /// panics. This grep-based test catches regressions.
+    #[test]
+    fn handle_message_body_has_no_block_on() {
+        let src = include_str!("telegram.rs");
+        // Extract handle_message body (from "async fn handle_message" to next top-level fn)
+        let start = src
+            .find("async fn handle_message(")
+            .expect("handle_message must exist");
+        // Find the next top-level function after handle_message
+        let rest = &src[start + 30..];
+        let end = rest
+            .find("\nfn ")
+            .or_else(|| rest.find("\nasync fn "))
+            .or_else(|| rest.find("\npub fn "))
+            .or_else(|| rest.find("\npub(crate) fn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("block_on"),
+            "handle_message must not call block_on (nested runtime panic). Found block_on in body."
+        );
     }
 }
