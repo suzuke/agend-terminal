@@ -319,9 +319,68 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     }
 
     let text = match msg.text() {
-        Some(t) => t,
-        None => return,
+        Some(t) => t.to_string(),
+        None => msg.caption().unwrap_or("").to_string(),
     };
+
+    // Extract inbound attachment metadata (photo/voice/document/video/sticker).
+    // Download happens later after topic resolution provides instance_name.
+    struct InboundFile<'a> {
+        file_id: &'a str,
+        kind: crate::channel::event::AttachmentKind,
+        mime: Option<String>,
+        size: Option<u64>,
+        filename: Option<String>,
+    }
+    let inbound_file: Option<InboundFile<'_>> = {
+        use crate::channel::event::AttachmentKind;
+        if let Some(sizes) = msg.photo() {
+            sizes.last().map(|p| InboundFile {
+                file_id: p.file.id.as_str(),
+                kind: AttachmentKind::Photo,
+                mime: None,
+                size: Some(p.file.size as u64),
+                filename: None,
+            })
+        } else if let Some(doc) = msg.document() {
+            Some(InboundFile {
+                file_id: doc.file.id.as_str(),
+                kind: AttachmentKind::Document,
+                mime: doc.mime_type.as_ref().map(|m| m.to_string()),
+                size: Some(doc.file.size as u64),
+                filename: doc.file_name.clone(),
+            })
+        } else if let Some(voice) = msg.voice() {
+            Some(InboundFile {
+                file_id: voice.file.id.as_str(),
+                kind: AttachmentKind::Voice,
+                mime: voice.mime_type.as_ref().map(|m| m.to_string()),
+                size: Some(voice.file.size as u64),
+                filename: None,
+            })
+        } else if let Some(video) = msg.video() {
+            Some(InboundFile {
+                file_id: video.file.id.as_str(),
+                kind: AttachmentKind::Video,
+                mime: video.mime_type.as_ref().map(|m| m.to_string()),
+                size: Some(video.file.size as u64),
+                filename: video.file_name.clone(),
+            })
+        } else {
+            msg.sticker().map(|sticker| InboundFile {
+                file_id: sticker.file.id.as_str(),
+                kind: AttachmentKind::Sticker,
+                mime: None,
+                size: Some(sticker.file.size as u64),
+                filename: None,
+            })
+        }
+    };
+
+    // If no text and no attachment, nothing to process.
+    if text.is_empty() && inbound_file.is_none() {
+        return;
+    }
 
     let sender_id: Option<i64> = msg.from.as_ref().map(|u| u.id.0 as i64);
     let username = msg
@@ -432,6 +491,26 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         serde_json::json!(msg.id.0),
     );
 
+    // Download inbound attachment if present.
+    let attachments: Vec<crate::channel::event::Attachment> = if let Some(f) = inbound_file {
+        match try_download_attachment(&home, &instance_name, f.file_id) {
+            Ok(local_path) => vec![crate::channel::event::Attachment {
+                kind: f.kind,
+                path: std::path::PathBuf::from(&local_path),
+                mime: f.mime,
+                caption: msg.caption().map(String::from),
+                size_bytes: f.size,
+                original_filename: f.filename,
+            }],
+            Err(e) => {
+                tracing::warn!(file_id = f.file_id, error = %e, "inbound attachment download failed");
+                vec![]
+            }
+        }
+    } else {
+        vec![]
+    };
+
     // Enqueue in inbox
     let msg_obj = InboxMessage {
         schema_version: 0,
@@ -449,6 +528,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         timestamp: chrono::Utc::now().to_rfc3339(),
         channel: Some(crate::channel::ChannelKind::Telegram),
         delivery_mode: None,
+        attachments,
     };
     let _ = inbox::enqueue(&home, &instance_name, msg_obj);
 
@@ -457,7 +537,7 @@ fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         &home,
         &instance_name,
         &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
-        text,
+        &text,
     );
 
     // Emit UxEvent::UserMsgReceived so the channel adapter can react 👀.

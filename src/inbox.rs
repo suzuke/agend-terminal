@@ -199,6 +199,10 @@ pub struct InboxMessage {
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_head: Option<String>,
+    /// Inbound media attachments (additive). Channel adapters download media
+    /// to a local path before enqueue. Empty for text-only messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::channel::event::Attachment>,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).
@@ -690,6 +694,7 @@ pub fn deliver(
         timestamp: chrono::Utc::now().to_rfc3339(),
         channel: None,
         delivery_mode: None,
+        attachments: vec![],
     };
     let _ = enqueue(home, agent_name, msg);
     notify_agent(home, agent_name, source, text);
@@ -843,6 +848,7 @@ mod tests {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             channel: None,
             delivery_mode: None,
+            attachments: vec![],
         }
     }
 
@@ -973,6 +979,7 @@ mod tests {
             timestamp: "2025-06-15T12:30:00Z".to_string(),
             channel: None,
             delivery_mode: None,
+            attachments: vec![],
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1074,6 +1081,7 @@ mod tests {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             channel: None,
             delivery_mode: None,
+            attachments: vec![],
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1100,6 +1108,7 @@ mod tests {
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             channel: None,
             delivery_mode: None,
+            attachments: vec![],
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1689,6 +1698,7 @@ mod tests {
             thread_id: Some("thread-42".into()),
             parent_id: Some("m-0".into()),
             task_id: None,
+            attachments: vec![],
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("thread_id"));
@@ -1736,6 +1746,7 @@ mod tests {
             thread_id: Some("t-100".into()),
             parent_id: Some("m-41".into()),
             task_id: None,
+            attachments: vec![],
         };
         let header = format_header(&msg);
         assert!(header.contains("[AGEND-MSG]"));
@@ -1766,6 +1777,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            attachments: vec![],
         };
         let header = format_header(&msg);
         assert!(header.contains("from=from:agent"));
@@ -1794,6 +1806,7 @@ mod tests {
             thread_id: Some("t\n1".into()),
             parent_id: None,
             task_id: None,
+            attachments: vec![],
         };
         let header = format_header(&msg);
         assert!(
@@ -1826,6 +1839,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            attachments: vec![],
         };
         let header = format_header(&msg);
         assert!(
@@ -1863,6 +1877,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            attachments: vec![],
         };
         let header = format_header(&msg);
         assert!(
@@ -1903,6 +1918,7 @@ mod tests {
             thread_id: None,
             parent_id: None,
             task_id: None,
+            attachments: vec![],
         };
         let header = format_header(&msg);
         assert!(
@@ -2012,5 +2028,49 @@ mod tests {
             r#"{"schema_version":1,"from":"x","text":"y","timestamp":"2026-01-01T00:00:00Z"}"#;
         let legacy_msg: InboxMessage = serde_json::from_str(legacy).unwrap();
         assert_eq!(legacy_msg.channel, None);
+    }
+
+    #[test]
+    fn legacy_inbox_message_without_attachments_deserializes() {
+        // Old messages (pre-PR-AF) have no `attachments` field.
+        // serde(default) must fill Vec::new() so deserialization succeeds.
+        let legacy = r#"{"from":"user:op","text":"hello","timestamp":"2026-04-26T00:00:00Z"}"#;
+        let msg: InboxMessage = serde_json::from_str(legacy).unwrap();
+        assert!(msg.attachments.is_empty());
+    }
+
+    #[test]
+    fn inbox_message_with_attachment_roundtrips() {
+        use crate::channel::event::{Attachment, AttachmentKind};
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            from: "user:op".into(),
+            text: "see photo".into(),
+            kind: None,
+            timestamp: "2026-04-26T00:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            attachments: vec![Attachment {
+                kind: AttachmentKind::Photo,
+                path: "/tmp/photo.jpg".into(),
+                mime: Some("image/jpeg".into()),
+                caption: Some("test".into()),
+                size_bytes: Some(1234),
+                original_filename: None,
+            }],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: InboxMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attachments.len(), 1);
+        assert_eq!(back.attachments[0].kind, AttachmentKind::Photo);
+        assert_eq!(back.attachments[0].size_bytes, Some(1234));
     }
 }

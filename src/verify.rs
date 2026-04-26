@@ -300,6 +300,7 @@ fn test_inbox(home: &Path) -> TestResult {
                 timestamp: "2024-01-01T00:00:00Z".into(),
                 channel: None,
                 delivery_mode: None,
+                attachments: vec![],
             },
         );
     }
