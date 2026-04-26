@@ -535,3 +535,31 @@ Three rules to eliminate idle time. Operator-authorized 2026-04-26.
 | E3.6 | **Idempotent close.** Closing an already-done task is a no-op (daemon should not error). |
 | E3.7 | **Done-but-superseded.** If scope changes after task is done, post a decision and create a new task with `depends_on`. Do not reopen the original. |
 | E3.8 | **Verdict evidence chain.** Every verdict report must include: `reviewed_head`, `scope_source`, `audit_mode`, `commands`, `files`. See §3 metadata fields. |
+
+### 10.4 Worktree mandatory for impl and reviewer (v1.2 amendment)
+
+**Rule:** All implementers and reviewers must work in a git worktree, not the main repository working tree. This prevents checkout races when multiple agents pipeline work concurrently (v1.2 Rule 1).
+
+**Evidence:** git reflog showed 12+ checkout operations in 1 hour on the main repo — two implementers racing `git checkout` on the same working tree during pipeline dispatch.
+
+**Worktree naming convention:**
+```
+git worktree add ../agend-terminal.worktrees/<branch-name> <branch-name>
+```
+Or for reviewers:
+```
+git worktree add /tmp/agend-prNNN-review <branch-name>
+```
+
+**Exceptions:**
+- **dev-lead**: merge operations + read-only queries may use the main repo (atomic merge is safe).
+- **general**: operator interface agent, not bound by impl/reviewer workflow.
+
+**Edge case policies:**
+
+| ID | Policy |
+|---|---|
+| E4.1 | **Worktree per branch.** Each PR branch gets its own worktree. Do not reuse worktrees across branches. |
+| E4.2 | **Cleanup after merge.** `git worktree remove <path>` + `git branch -d <branch>` after PR merge. Stale worktrees waste disk and confuse `git worktree list`. |
+| E4.3 | **Consistent with CLAUDE.md.** This rule formalizes the existing CLAUDE.md global rule "never commit directly to main; always use worktree + branch" into the fleet protocol. |
+| E4.4 | **Pipeline + worktree.** Rule 1 pipeline dispatch naturally requires worktrees — you cannot have two branches checked out in one working tree. Worktree mandatory is the mechanical prerequisite for pipeline to work safely. |

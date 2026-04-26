@@ -275,6 +275,7 @@ pub(crate) fn build_instructions_body(
         "- Review dispatch expects: source of truth, scope boundary, freshness boundary\n",
     );
     content.push_str("- Verdict wording: VERIFIED / REJECTED / UNVERIFIED only\n");
+    content.push_str("- **Worktree mandatory** (§10.4): always work in a git worktree, never the main repo working tree. Use `git worktree add` per branch.\n");
 
     // Response channel discipline — match reply mechanism to input source.
     content.push_str("\n## Response channel discipline\n\n");
