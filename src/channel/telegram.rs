@@ -717,21 +717,12 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         in_reply_to_msg_id: msg.reply_to_message().map(|r| r.id.0.to_string()),
         in_reply_to_excerpt: msg.reply_to_message().and_then(|r| {
             let text = r.text().or_else(|| r.caption()).unwrap_or("");
-            if text.is_empty() {
-                return None;
-            }
             let author = r
                 .from
                 .as_ref()
                 .and_then(|u| u.username.as_deref())
                 .unwrap_or("unknown");
-            let truncated: String = text.chars().take(200).collect();
-            let ellipsis = if text.chars().count() > 200 {
-                "…"
-            } else {
-                ""
-            };
-            Some(format!("[{author}] {truncated}{ellipsis}"))
+            inbox::build_excerpt(text, author)
         }),
     };
     let _ = inbox::enqueue(&home, &instance_name, msg_obj);
