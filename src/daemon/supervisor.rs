@@ -140,6 +140,9 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
             None => {}
         }
     }
+
+    // Collect instance metrics for the Monitor tab (PR-AZ).
+    crate::instance_monitor::collect(home, registry);
 }
 
 /// Internal enum describing what the tick produced for a single agent, so the

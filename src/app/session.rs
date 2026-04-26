@@ -176,67 +176,10 @@ pub(super) fn restore_with_reconciliation(
                 }
             }
 
-            // Rule 3: fleet agents not in session → append as new tabs,
-            // grouped by team (same team → same tab, orchestrator as root).
+            // Rule 3: fleet agents not in session → append as new tabs
             let mut unplaced: Vec<String> = fleet_names.difference(&placed).cloned().collect();
             unplaced.sort();
-
-            // Group by team
-            let teams = crate::teams::list_all(home);
-            let mut team_members: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            let mut standalone = Vec::new();
             for name in &unplaced {
-                if let Some(team) = teams.iter().find(|t| t.members.contains(name)) {
-                    team_members
-                        .entry(team.name.clone())
-                        .or_default()
-                        .push(name.clone());
-                } else {
-                    standalone.push(name.clone());
-                }
-            }
-
-            // Create one tab per team
-            for (team_name, members) in &team_members {
-                let team = teams.iter().find(|t| t.name == *team_name);
-                let orchestrator = team.and_then(|t| t.orchestrator.as_deref());
-                // Sort: orchestrator first, then alphabetical
-                let mut sorted = members.clone();
-                sorted.sort_by(|a, b| {
-                    let a_is_orch = orchestrator == Some(a.as_str());
-                    let b_is_orch = orchestrator == Some(b.as_str());
-                    b_is_orch.cmp(&a_is_orch).then(a.cmp(b))
-                });
-
-                let mut tab_created = false;
-                for name in &sorted {
-                    if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(name)) {
-                        if let Ok(pane) = super::pane_factory::create_pane_from_resolved(
-                            name,
-                            &resolved,
-                            layout,
-                            registry,
-                            home,
-                            cols,
-                            rows,
-                            wakeup_tx,
-                            name_counter,
-                            crate::backend::SpawnMode::Resume,
-                        ) {
-                            if !tab_created {
-                                layout.add_tab(Tab::new(team_name.clone(), pane));
-                                tab_created = true;
-                            } else if let Some(tab) = layout.active_tab_mut() {
-                                tab.split_focused(SplitDir::Horizontal, pane);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Standalone agents get individual tabs
-            for name in &standalone {
                 if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(name)) {
                     if let Ok(pane) = super::pane_factory::create_pane_from_resolved(
                         name,
