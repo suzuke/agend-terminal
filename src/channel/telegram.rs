@@ -477,6 +477,32 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         return;
     }
 
+    // Task entry via telegram: "加 task: <title>" creates a task assigned to dev-lead.
+    if let Some(title) = crate::status_summary::parse_task_entry(&text) {
+        let home = lock_state(state).home.clone();
+        let result = crate::tasks::handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "create",
+                "title": title,
+                "assignee": "dev-lead",
+                "priority": "normal",
+            }),
+        );
+        let task_id = result["id"].as_str().unwrap_or("?");
+        tracing::info!(title, task_id, "task created via telegram keyword");
+        if let Some(ch) = crate::channel::active_channel() {
+            let _ = ch.notify(
+                "operator",
+                crate::channel::NotifySeverity::Info,
+                &format!("✅ Task created: {title} [{task_id}]"),
+                false,
+            );
+        }
+        return;
+    }
+
     // Extract inbound attachment metadata (photo/voice/document/video/sticker).
     // Download happens later after topic resolution provides instance_name.
     struct InboundFile<'a> {
