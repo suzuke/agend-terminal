@@ -1326,8 +1326,22 @@ pub fn try_telegram_edit(
     })
 }
 
+/// Reverse-lookup a topic_id for an instance from `topics.json`.
+/// Returns `None` if no mapping exists or the file is missing.
+pub fn lookup_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
+    let reg = load_topic_registry(home);
+    reg.into_iter()
+        .find(|(_, name)| name == instance_name)
+        .map(|(tid, _)| tid)
+}
+
 /// Create a forum topic for a new instance.
 pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) -> Option<i32> {
+    // Idempotent: reuse existing topic from topics.json if present.
+    if let Some(tid) = lookup_topic_for_instance(home, instance_name) {
+        tracing::info!(instance = %instance_name, topic_id = tid, "reusing existing topic");
+        return Some(tid);
+    }
     let ch = resolve_channel_only_from(home).ok()?;
     match telegram_runtime().block_on(async {
         let bot = teloxide::Bot::new(&ch.token);
@@ -3091,5 +3105,60 @@ instances:
             err.to_string().contains("telegram bot not initialized"),
             "{err}"
         );
+    }
+
+    // ─── Topic orphan fix tests (Sprint 14 PR-AI) ─────────────────────
+
+    #[test]
+    fn lookup_topic_for_instance_finds_existing() {
+        let home = tmp_home("lookup_existing");
+        register_topic(&home, 42, "alice");
+        register_topic(&home, 99, "bob");
+        assert_eq!(lookup_topic_for_instance(&home, "alice"), Some(42));
+        assert_eq!(lookup_topic_for_instance(&home, "bob"), Some(99));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn lookup_topic_for_instance_returns_none_when_missing() {
+        let home = tmp_home("lookup_missing");
+        register_topic(&home, 42, "alice");
+        assert_eq!(lookup_topic_for_instance(&home, "nonexistent"), None);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn lookup_topic_for_instance_returns_none_when_no_file() {
+        let home = PathBuf::from("/tmp/agend-test-no-topics-json-12345");
+        assert_eq!(lookup_topic_for_instance(&home, "any"), None);
+    }
+
+    /// create_topic_for_instance must reuse an existing topic from
+    /// topics.json instead of creating a new one. Without a live bot
+    /// the API call would fail, so the test seeds topics.json and
+    /// verifies the early return path.
+    #[test]
+    fn create_topic_for_instance_reuses_existing_topic() {
+        let home = tmp_home("create_reuse");
+        register_topic(&home, 77, "reuse-agent");
+        // No fleet.yaml / no bot token → if it tried to create, it would
+        // return None. But the lookup-before-create path should return 77.
+        let result = create_topic_for_instance(&home, "reuse-agent");
+        assert_eq!(
+            result,
+            Some(77),
+            "must reuse existing topic, not create new"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// When no existing topic exists and no channel is configured,
+    /// create_topic_for_instance returns None (no bot to call).
+    #[test]
+    fn create_topic_for_instance_returns_none_without_config() {
+        let home = tmp_home("create_no_config");
+        let result = create_topic_for_instance(&home, "new-agent");
+        assert!(result.is_none(), "no config → no topic creation");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
