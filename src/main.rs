@@ -1,3 +1,4 @@
+mod admin;
 mod agent;
 mod agent_ops;
 mod api;
@@ -235,6 +236,11 @@ enum Commands {
         #[command(subcommand)]
         command: FleetCommands,
     },
+    /// Admin maintenance utilities
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
     /// Agent CLI — commands for agent-to-agent coordination (JSON output)
     /// Start MCP stdio server
     Mcp,
@@ -315,6 +321,17 @@ enum FleetCommands {
     },
     /// Stop all fleet agents
     Stop,
+}
+
+#[derive(Subcommand)]
+enum AdminCommands {
+    /// Delete local branches whose PRs have been merged (squash-merge safe).
+    /// Default: --dry-run (preview only). Pass --yes to actually delete.
+    CleanupBranches {
+        /// Actually delete branches (default is dry-run preview).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -573,6 +590,30 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(_) => daemon_not_running_hint(),
+                }
+            }
+        },
+        Some(Commands::Admin { command }) => match command {
+            AdminCommands::CleanupBranches { yes } => {
+                let repo = std::env::current_dir()?;
+                let checks = admin::analyze_branches(&repo);
+                let to_delete = checks
+                    .iter()
+                    .filter(|c| matches!(c.action, admin::BranchAction::Delete { .. }))
+                    .count();
+                if to_delete == 0 {
+                    println!("No branches eligible for cleanup.");
+                } else {
+                    let dry_run = !yes;
+                    if dry_run {
+                        println!("Dry-run mode (pass --yes to delete):\n");
+                    }
+                    let (deleted, skipped) = admin::execute_cleanup(&repo, &checks, dry_run);
+                    println!(
+                        "\nSummary: {} deleted, {} skipped",
+                        if dry_run { 0 } else { deleted },
+                        skipped
+                    );
                 }
             }
         },
