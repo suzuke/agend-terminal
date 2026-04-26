@@ -137,8 +137,10 @@ impl VTerm {
         show_block_cursor: bool,
     ) {
         let grid = self.term.grid();
-        let rows = self.rows.min(area.height);
-        let cols = self.cols.min(area.width);
+        let grid_cols = grid.columns() as u16;
+        let grid_rows = grid.screen_lines() as u16;
+        let rows = self.rows.min(area.height).min(grid_rows);
+        let cols = self.cols.min(area.width).min(grid_cols);
         // `scroll_offset` is usize; `as i32` wraps on 64-bit hosts when the
         // caller somehow passes > i32::MAX. Clamp instead so an unreasonable
         // offset degrades to "deepest scrollback" rather than flipping sign
