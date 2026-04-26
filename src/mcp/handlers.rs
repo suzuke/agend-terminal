@@ -1359,6 +1359,45 @@ pub fn interrupt_esc_params(target: &str) -> Value {
     })
 }
 
+/// Resolve layout + target_pane for a new instance, applying team auto-attach
+/// defaults when the caller didn't explicitly set them.
+///
+/// When `name` belongs to a team and neither `layout` nor `target_pane` was
+/// provided by the caller, returns `("split-right", Some(orchestrator))` so
+/// the new pane lands in the team tab. Otherwise returns the caller's values
+/// (or `("tab", None)` as the default).
+fn resolve_team_layout(
+    home: &std::path::Path,
+    name: &str,
+    layout_arg: Option<&serde_json::Value>,
+    target_pane_arg: Option<&serde_json::Value>,
+) -> (&'static str, Option<String>) {
+    let caller_set_layout = layout_arg.and_then(|v| v.as_str()).is_some();
+    let caller_set_target = target_pane_arg
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if !caller_set_layout && !caller_set_target {
+        if let Some(team) = crate::teams::find_team_for(home, name) {
+            let anchor = team.orchestrator.or_else(|| team.members.first().cloned());
+            return ("split-right", anchor);
+        }
+    }
+    let layout = layout_arg.and_then(|v| v.as_str()).unwrap_or("tab");
+    let target = target_pane_arg
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    // Leak the layout str to get 'static — safe because the only values are
+    // string literals or short-lived JSON borrows that we match to statics.
+    let layout = match layout {
+        "split-right" => "split-right",
+        "split-below" => "split-below",
+        _ => "tab",
+    };
+    (layout, target)
+}
+
 fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Value) -> Value {
     let raw_name = match args["name"].as_str() {
         Some(n) => n,
@@ -1444,11 +1483,12 @@ fn spawn_single_instance(home: &std::path::Path, instance_name: &str, args: &Val
         .get("backend")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let layout = args.get("layout").and_then(|v| v.as_str()).unwrap_or("tab");
-    let target_pane = args
-        .get("target_pane")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
+    // Team auto-attach: when the instance belongs to a team and the caller
+    // didn't explicitly set layout/target_pane, default to split-right next
+    // to the team orchestrator so the new pane lands in the team tab.
+    let (layout, target_pane_owned) =
+        resolve_team_layout(home, name, args.get("layout"), args.get("target_pane"));
+    let target_pane = target_pane_owned.as_deref();
 
     match crate::api::call(
         home,
@@ -3047,6 +3087,50 @@ instances:
             "tool_kill to nonexistent target must error: {result}"
         );
         std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─── Team auto-attach tests (Sprint 14 PR-AL) ────────────────────
+
+    #[test]
+    fn resolve_team_layout_auto_attaches_to_orchestrator() {
+        let home = tmp_home("team_attach");
+        let team = serde_json::json!({
+            "name": "dev", "members": ["dev-lead", "dev-impl-1"],
+            "orchestrator": "dev-lead", "created_at": "2026-01-01T00:00:00Z"
+        });
+        let store = serde_json::json!({"teams": [team]});
+        std::fs::write(home.join("teams.json"), store.to_string()).expect("write");
+        let (layout, target) = resolve_team_layout(&home, "dev-impl-1", None, None);
+        assert_eq!(layout, "split-right");
+        assert_eq!(target.as_deref(), Some("dev-lead"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resolve_team_layout_no_team_defaults_to_tab() {
+        let home = tmp_home("no_team");
+        let (layout, target) = resolve_team_layout(&home, "standalone", None, None);
+        assert_eq!(layout, "tab");
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn resolve_team_layout_caller_override_preserved() {
+        let home = tmp_home("override");
+        let team = serde_json::json!({
+            "name": "dev", "members": ["dev-lead", "dev-impl-1"],
+            "orchestrator": "dev-lead", "created_at": "2026-01-01T00:00:00Z"
+        });
+        let store = serde_json::json!({"teams": [team]});
+        std::fs::write(home.join("teams.json"), store.to_string()).expect("write");
+        let layout_val = serde_json::json!("tab");
+        let (layout, target) = resolve_team_layout(&home, "dev-impl-1", Some(&layout_val), None);
+        assert_eq!(
+            layout, "tab",
+            "caller explicit layout=tab must not be overridden"
+        );
+        assert!(target.is_none());
         std::fs::remove_dir_all(&home).ok();
     }
 }
