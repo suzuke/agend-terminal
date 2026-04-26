@@ -171,7 +171,7 @@ fn task_tools() -> Vec<Value> {
                 "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
                 "assignee": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}},
                 "id": {"type": "string"}, "result": {"type": "string"},
-                "status": {"type": "string", "enum": ["open", "claimed", "done", "blocked", "cancelled"]},
+                "status": {"type": "string", "enum": ["open", "claimed", "in_progress", "blocked", "verified", "done", "cancelled"]},
                 "filter_assignee": {"type": "string"}, "filter_status": {"type": "string"},
                 "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
                 "duration": {"type": "string", "description": "Human duration until deadline (e.g. 30m, 1h, 2d)"}
