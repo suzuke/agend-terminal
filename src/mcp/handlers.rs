@@ -2905,6 +2905,7 @@ instances:
 
     #[test]
     fn test_interrupt_handler_validates_target() {
+        let _g = fleet_test_guard();
         let home = tmp_home("interrupt-validate");
         std::env::set_var("AGEND_HOME", &home);
 
@@ -2923,6 +2924,7 @@ instances:
             err.contains("not reachable") || err.contains("API unavailable"),
             "valid target must reach inject path: {err}"
         );
+        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&home).ok();
     }
 
