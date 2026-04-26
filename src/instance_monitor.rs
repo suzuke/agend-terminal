@@ -2,7 +2,10 @@
 //! and exposes them for the TUI Monitor tab.
 
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Collection interval — operator Q7 ack'd 5 seconds.
+const MONITOR_TICK: Duration = Duration::from_secs(5);
 
 /// Per-instance metrics snapshot.
 #[derive(Debug, Clone)]
@@ -30,6 +33,17 @@ fn cache() -> &'static Arc<Mutex<Vec<InstanceMetrics>>> {
 /// Read the latest metrics snapshot. Returns empty vec if no collection has run.
 pub fn latest_metrics() -> Vec<InstanceMetrics> {
     cache().lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Spawn a dedicated monitor collection thread at 5s interval.
+/// Independent from the supervisor 10s tick to meet operator Q7 spec.
+pub fn spawn_monitor_tick(home: std::path::PathBuf, registry: crate::agent::AgentRegistry) {
+    let _ = std::thread::Builder::new()
+        .name("monitor_tick".into())
+        .spawn(move || loop {
+            std::thread::sleep(MONITOR_TICK);
+            collect(&home, &registry);
+        });
 }
 
 /// Collect metrics for all agents in the registry. Called from daemon tick.
@@ -71,13 +85,8 @@ pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
         let (rss_bytes, cpu_percent, uptime_secs) = if let Some(p) = pid {
             let spid = sysinfo::Pid::from_u32(p);
             if let Some(proc_info) = sys.process(spid) {
-                // Process tree RSS: main + children
-                let mut total_rss = proc_info.memory();
-                for cproc in sys.processes().values() {
-                    if cproc.parent() == Some(spid) {
-                        total_rss += cproc.memory();
-                    }
-                }
+                // Process tree RSS: recursive walk (main + all descendants)
+                let total_rss = tree_rss(&sys, spid);
                 let cpu = proc_info.cpu_usage();
                 let uptime = proc_info.run_time();
                 (Some(total_rss), Some(cpu), Some(uptime))
@@ -106,6 +115,18 @@ pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
 
     metrics.sort_by(|a, b| a.name.cmp(&b.name));
     *cache().lock().unwrap_or_else(|e| e.into_inner()) = metrics;
+}
+
+/// Recursively sum RSS for a process and all its descendants.
+fn tree_rss(sys: &sysinfo::System, root: sysinfo::Pid) -> u64 {
+    let own = sys.process(root).map(|p| p.memory()).unwrap_or(0);
+    let children_sum: u64 = sys
+        .processes()
+        .values()
+        .filter(|p| p.parent() == Some(root))
+        .map(|p| tree_rss(sys, p.pid()))
+        .sum();
+    own + children_sum
 }
 
 /// Read heartbeat lag and pending pickup count from metadata JSON.
