@@ -51,6 +51,12 @@ pub(super) fn start_api_server(
 
     let notifier: Arc<dyn crate::api::ApiNotifier> = Arc::new(TuiNotifier { tx: tui_tx });
 
+    // fire-and-forget: in-process API server thread bound to TUI process
+    // lifetime. `crate::api::serve` runs forever; on TUI quit the OS reaps
+    // the thread (parent main exits → all children die). No graceful join
+    // needed — Sprint 20.5 Track 7 cross-pass confirmed this is the
+    // intended pattern (no panic cascade across the named-thread
+    // isolation).
     std::thread::Builder::new()
         .name("app_api_server".into())
         .spawn(move || {
