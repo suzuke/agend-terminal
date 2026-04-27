@@ -176,7 +176,7 @@ Per-backend semantics for spawn-related capabilities. Cells: ✅ verified by cod
 
 **Cross-area finding** (label: B + A intersect): the matrix shows uniform PID discovery + tree kill but **non-uniform signal semantics** (all ❓). PR #159 ESC integration claimed cross-backend support without per-backend test; PR-X transport-only verification left semantics Unverified. This audit confirms the gap is still systemic in Track B's lifecycle code — no backend-specific signal verification at the spawn or kill site.
 
-**Recommendation**: capability matrix entry per backend, asserted in code via the `BackendPreset` struct (e.g. `signal_semantics_verified: bool`), so reviewers can refuse PRs that claim cross-backend signal behavior without per-backend evidence (per protocol §3.5.8).
+**Recommendation**: capability matrix entry per backend, asserted in code via the `BackendPreset` struct (e.g. `signal_semantics_verified: bool`), so reviewers can refuse PRs that claim cross-backend signal behavior without per-backend evidence (per protocol §3.5.9 — was §3.5.8 pre Sprint 22 P3).
 
 ### Path-keyword auto-Critical mapping
 
