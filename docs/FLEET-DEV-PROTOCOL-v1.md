@@ -425,6 +425,47 @@ External-fixture (§3.5.10) defines **what** a test must exercise (real-world pa
 
 This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception (single-reviewer, no `src/` behavior change). The amendment does not apply to itself recursively — under §3.5.10 it is exempt because no protocol-layer files are touched, and under §3.5.11 it is exempt as a documentation-only PR per §3.5.5 scope.
 
+#### 3.5.12 Deferred-defense process (production-panic recurrence prevention)
+
+Sprint 25 P3 amendment. When a production bug is deferred to a backlog item instead of fixed in the current PR, three enforcement gates prevent the "defer → forget → recur" pattern.
+
+**Incident chain that motivated this rule**: PR #194 (2026-04-21, saturating cap — deferred root-cause resize race to backlog `t-20260426150432078733-1`) → PR #225 (Q7 sweep doc-only — same root cause still deferred) → 2026-04-27 vterm L167 panic recurrence (5 consecutive daemon crashes from the same unfixed race). Two successive "defer" decisions with no enforcement gate allowed a known production panic to recur 6 days later.
+
+##### (a) Known-issue P0 trigger
+
+When a production panic or data-loss incident occurs AND the panic signature (file:line, error message substring) matches an existing deferred backlog item's description, the backlog item is **automatically escalated to P0 hotfix priority**. The orchestrator must dispatch the fix within the current sprint — no further deferral permitted.
+
+**Reviewer enforcement**: when reviewing a PR that defers a bug to backlog, the reviewer must verify the backlog item exists and has a `due_at` set (see rule (b)). If the deferred bug later recurs in production, the original deferral PR's reviewer shares accountability for the gap.
+
+##### (b) Deferred backlog SLA
+
+Every deferred backlog item created from a PR review finding or a known production bug **must** carry a `due_at` deadline (default: 2 sprints from creation). The task board's `due_at` field is the enforcement mechanism.
+
+When `due_at` expires without resolution, the orchestrator must either:
+1. Escalate to P0 and dispatch immediately, OR
+2. Extend `due_at` with explicit operator approval and a `post_decision` recording the extension rationale.
+
+Backlog items without `due_at` that match deferred-from-PR patterns are flagged by the orchestrator during sprint planning.
+
+##### (c) Dual-reviewer escalation on repeated deferral
+
+When the **same root cause** is deferred for the **second time** (i.e., a PR defers a bug that was already deferred in a prior PR), the second deferral requires:
+1. **Mandatory dual reviewer** (even if the PR would otherwise qualify for single reviewer), AND
+2. **Operator sign-off** via `post_decision` with explicit acknowledgment of the repeated deferral.
+
+Without both, the reviewer must issue **UNVERIFIED** on the deferral. The implementation fix itself may still be VERIFIED — only the deferral decision is gated.
+
+**Detection heuristic**: grep the deferred backlog item's description for the same file:line or error signature as the current PR's deferred finding. Match → repeated deferral → dual + operator gate.
+
+##### Explicit exemptions
+
+- **EMERGENCY hotfix** PRs (per §3.5.11 emergency exemption) may defer root-cause fixes with a 24-hour backfill SLA instead of the 2-sprint default, but the backfill item must still carry `due_at`.
+- **Cross-platform issues** where the root cause requires platform-specific investigation (e.g., Windows-only race) may extend `due_at` to 4 sprints with orchestrator approval.
+
+##### Self-amendment qualification
+
+This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. Cross-references the real incident chain (PR #194 → #225 → vterm L167 recurrence) as the motivating evidence.
+
 ## 4. Communication rules
 
 ### Hop reduction
