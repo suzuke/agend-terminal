@@ -203,6 +203,8 @@ pub mod method {
     pub const SET_BLOCKED_REASON: &str = "set_blocked_reason";
     pub const CLEAR_BLOCKED_REASON: &str = "clear_blocked_reason";
     pub const TOOL_KILL: &str = "tool_kill";
+    pub const MCP_TOOL: &str = "mcp_tool";
+    pub const MCP_TOOLS_LIST: &str = "mcp_tools_list";
 }
 
 /// Start API socket server (blocks calling thread).
@@ -362,6 +364,8 @@ fn handle_session(
                 handlers::instance::handle_clear_blocked_reason(params, &ctx)
             }
             method::TOOL_KILL => handlers::instance::handle_tool_kill(params, &ctx),
+            method::MCP_TOOL => handlers::mcp_proxy::handle_mcp_tool(params, &ctx),
+            method::MCP_TOOLS_LIST => handlers::mcp_proxy::handle_mcp_tools_list(params, &ctx),
             method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

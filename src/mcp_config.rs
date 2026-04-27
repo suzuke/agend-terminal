@@ -21,6 +21,19 @@ fn binary_path() -> String {
         .unwrap_or_else(|_| "agend-terminal".to_string())
 }
 
+/// Get the agend-mcp-bridge binary path. Lives alongside the main binary.
+/// Falls back to the main binary with `mcp` arg if bridge not found.
+fn bridge_binary_path() -> (String, Vec<&'static str>) {
+    if let Ok(exe) = std::env::current_exe() {
+        let bridge = exe.with_file_name("agend-mcp-bridge");
+        if bridge.exists() {
+            return (bridge.display().to_string(), vec![]);
+        }
+    }
+    // Fallback: use main binary with --mcp flag (pre-Option-F behaviour)
+    (binary_path(), vec!["mcp"])
+}
+
 /// Get the AGEND_HOME value.
 fn home_path() -> String {
     crate::home_dir().display().to_string()
@@ -34,9 +47,10 @@ fn mcp_server_entry(instance_name: Option<&str>) -> serde_json::Value {
     if let Some(name) = instance_name {
         env["AGEND_INSTANCE_NAME"] = json!(name);
     }
+    let (cmd, args) = bridge_binary_path();
     json!({
-        "command": binary_path(),
-        "args": ["mcp"],
+        "command": cmd,
+        "args": args,
         "env": env
     })
 }
@@ -139,17 +153,21 @@ fn configure_kiro(working_dir: &Path, instance_name: Option<&str>) -> Result<()>
     let instance_env_unix = instance_name
         .map(|n| format!("export AGEND_INSTANCE_NAME={}\n", shell_escape(n)))
         .unwrap_or_default();
+    let (bridge_cmd, bridge_args) = bridge_binary_path();
+    let bridge_args_str = bridge_args.join(" ");
     let wrapper = if cfg!(windows) {
         format!(
-            "@echo off\r\nset \"AGEND_HOME={home}\"\r\n{instance_env_win}\"{bin}\" mcp\r\n",
+            "@echo off\r\nset \"AGEND_HOME={home}\"\r\n{instance_env_win}\"{bin}\" {args}\r\n",
             home = home_path(),
-            bin = binary_path(),
+            bin = bridge_cmd,
+            args = bridge_args_str,
         )
     } else {
         format!(
-            "#!/bin/bash\nexport AGEND_HOME={home}\n{instance_env_unix}exec {bin} mcp\n",
+            "#!/bin/bash\nexport AGEND_HOME={home}\n{instance_env_unix}exec {bin} {args}\n",
             home = shell_escape(&home_path()),
-            bin = shell_escape(&binary_path()),
+            bin = shell_escape(&bridge_cmd),
+            args = bridge_args_str,
         )
     };
     crate::store::atomic_write(&wrapper_path, wrapper.as_bytes())?;
