@@ -1319,7 +1319,7 @@ fn telegram_reply_send_inner(
 /// is gone from the operator's side. Side-channels that MUST NOT have
 /// this authority (e.g. S2d provenance per DESIGN §6) use
 /// [`try_telegram_reply_no_cleanup`] instead.
-pub fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
+pub(crate) fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
     try_telegram_reply_from(&crate::home_dir(), instance_name, text)
 }
 
@@ -1356,7 +1356,7 @@ fn try_telegram_reply_from(
 /// side-channel, no mutation of main state"). This variant closes
 /// that hole: the caller gets the error to `warn!` on, the shared
 /// fleet state stays untouched.
-pub fn try_telegram_reply_no_cleanup(
+pub(crate) fn try_telegram_reply_no_cleanup(
     instance_name: &str,
     text: &str,
 ) -> anyhow::Result<(i32, i64)> {
@@ -1426,7 +1426,7 @@ fn inject_provenance_from(
 /// alternate homes (tests, multi-tenant daemons) can't accidentally
 /// leak into the operator's real Telegram channel — same class of fix
 /// as `create_topic_for_instance`.
-pub fn try_telegram_react(
+pub(crate) fn try_telegram_react(
     home: &std::path::Path,
     instance_name: &str,
     emoji: &str,
@@ -1460,7 +1460,7 @@ pub fn try_telegram_react(
 /// Edit a previously sent message. `home` scopes credential resolution
 /// so this helper can't silently reach the operator's real channel
 /// from a test or alt-home context.
-pub fn try_telegram_edit(
+pub(crate) fn try_telegram_edit(
     home: &std::path::Path,
     _instance_name: &str,
     message_id: &str,
@@ -2170,10 +2170,6 @@ impl crate::channel::Channel for TelegramChannel {
         agent: &str,
         op: crate::channel::AgentOutboundOp,
     ) -> std::result::Result<crate::channel::MsgRef, crate::channel::ChannelError> {
-        use crate::channel::auth::{
-            evaluate_outbound_capability, warn_once_outbound_capabilities_missing,
-            OutboundCapabilityDecision,
-        };
         use crate::channel::ChannelError;
 
         // Step 1: adapter-level allowlist gate (PR #216 contract).
@@ -2184,24 +2180,12 @@ impl crate::channel::Channel for TelegramChannel {
             )));
         }
 
-        // Step 2: per-agent capability gate (Phase 5b gradual migration).
+        // Step 2: per-agent capability gate via shared helper (Sprint 22 P0
+        // Phase 5b — `gate_outbound_for_agent` centralises the policy so
+        // future Discord/Slack adapters can't accidentally bypass).
         let kind = op.kind();
         let home = lock_state(&self.state).home.clone();
-        let caps = lookup_outbound_capabilities(&home, agent);
-        match evaluate_outbound_capability(caps.as_deref(), kind) {
-            OutboundCapabilityDecision::Allowed => {}
-            OutboundCapabilityDecision::Rejected => {
-                return Err(ChannelError::Other(anyhow::anyhow!(
-                    "instance '{agent}' outbound_capabilities does not include '{op}' \
-                     — add to fleet.yaml or remove the explicit list to opt into the \
-                     gradual-migration permissive default",
-                    op = kind.as_str()
-                )));
-            }
-            OutboundCapabilityDecision::PermissiveLegacyMissing => {
-                warn_once_outbound_capabilities_missing(agent, kind);
-            }
-        }
+        crate::channel::auth::gate_outbound_for_agent(&home, agent, kind)?;
 
         // Step 3: dispatch to platform-specific send.
         match op {
@@ -2247,18 +2231,9 @@ impl crate::channel::Channel for TelegramChannel {
     }
 }
 
-/// Look up `outbound_capabilities` for `instance` from `fleet.yaml`.
-/// Returns `None` when the file / instance / field is missing — caller
-/// treats `None` as the gradual-migration permissive default.
-fn lookup_outbound_capabilities(
-    home: &std::path::Path,
-    instance: &str,
-) -> Option<Vec<crate::channel::auth::ChannelOpKind>> {
-    crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
-        .ok()
-        .and_then(|c| c.instances.get(instance).cloned())
-        .and_then(|inst| inst.outbound_capabilities)
-}
+// (Sprint 22 P0) `lookup_outbound_capabilities` moved to
+// `crate::channel::auth` so all `Channel::send_from_agent` impls share
+// one fleet.yaml lookup path. See `auth::gate_outbound_for_agent`.
 
 /// Placeholder `MsgRef` returned when the underlying op (React /
 /// InjectProvenance) does not surface a usable platform message id.

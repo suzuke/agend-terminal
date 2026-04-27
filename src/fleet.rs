@@ -171,15 +171,35 @@ pub struct InstanceConfig {
     /// proxies like `general` where broadcast markers read as noise.
     pub receive_fleet_updates: Option<bool>,
     /// Per-instance agent-callable outbound operations gate
-    /// (Sprint 21 Phase 5b). When `Some(list)`, the instance may emit
-    /// only the listed `ChannelOpKind` values via the MCP→Channel
-    /// bridge (`reply` / `react` / `edit_message` / delegate_task
-    /// provenance). `None` is the **gradual-migration permissive
-    /// default** — the call is permitted with a once-per-instance
-    /// deprecation warn so operators see the migration template
-    /// before Sprint 22's hard-cut. Set to `[]` to lock the instance
-    /// out of all agent-callable outbound while keeping daemon notify
-    /// (PR #216) intact.
+    /// (Sprint 21 Phase 5b → Sprint 22 P0 hard-cut transition).
+    ///
+    /// **2-stage transition** (per dispatch d-20260427042738203707-13):
+    ///
+    /// | State | Sprint 22 P0 (this sprint) | Sprint 23 (planned) |
+    /// |---|---|---|
+    /// | `Some([reply, …])` | only listed ops permitted | same |
+    /// | `Some([])` | fail-closed (no agent outbound; explicit) | same |
+    /// | `None` (absent) | **FATAL warn-then-permit one daemon cycle** | hard parse error |
+    ///
+    /// **Built-in instances** (`general` and future auto-created coordinators)
+    /// receive `[reply, react, edit, inject_provenance]` automatically via
+    /// `bootstrap::fleet_normalize::auto_create_general` — operator never
+    /// has to author this field for first-class fleet members.
+    ///
+    /// **User-yaml entries** (any instance not auto-injected) are forced
+    /// explicit. The Sprint 22 transition window emits a FATAL log via
+    /// `crate::channel::auth::warn_once_outbound_capabilities_missing`
+    /// when the field is absent — operators MUST add the field this sprint
+    /// or Sprint 23 will refuse to load fleet.yaml.
+    ///
+    /// **Migration**: see `docs/MIGRATION-OUTBOUND-CAPS.md` for operator-
+    /// facing transition guide and `docs/USAGE.md` "Channel: Telegram"
+    /// section for fleet.yaml stanza examples.
+    ///
+    /// **Daemon notify** (PR #216 fail-closed gate at supervisor.rs /
+    /// ci_watch.rs notify call sites) remains independent of this field —
+    /// `outbound_capabilities` only gates **agent-callable** MCP→Channel
+    /// ops, not daemon-internal stall/recovery/CI notifications.
     #[serde(default)]
     pub outbound_capabilities: Option<Vec<crate::channel::auth::ChannelOpKind>>,
 }

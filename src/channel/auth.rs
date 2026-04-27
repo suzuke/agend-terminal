@@ -142,14 +142,20 @@ pub fn warn_once_outbound_capabilities_missing(instance: &str, op: ChannelOpKind
         Err(_) => true,
     };
     if first_time {
-        tracing::warn!(
+        // Sprint 22 P0 (Phase 5b hard-cut, 2-stage transition per
+        // d-20260427042738203707-13): elevated to `error!` for FATAL
+        // visibility — Sprint 23 will switch to a hard parse error.
+        // Operator MUST add the field this sprint window.
+        tracing::error!(
             instance,
             op = op.as_str(),
-            "instance '{instance}' outbound_capabilities not set — Sprint 21 Phase 5b gradual \
-             migration permits {op_str} this time. Sprint 22 hard-cut will fail-closed. To opt \
-             in now, add to fleet.yaml:\n  instances.{instance}.outbound_capabilities: \
-             [reply, react, edit, inject_provenance]\nSee docs/USAGE.md \"Channel: Telegram\" \
-             section for details.",
+            "FATAL (warn-but-permit one daemon cycle): instance '{instance}' \
+             outbound_capabilities NOT SET. Sprint 22 P0 grants this {op_str} call \
+             under gradual-migration grace. Sprint 23 will fail-closed (hard parse \
+             error on missing field). Add to fleet.yaml NOW:\n  \
+             instances.{instance}.outbound_capabilities: \
+             [reply, react, edit, inject_provenance]\nSee docs/USAGE.md \"Channel: \
+             Telegram\" + docs/MIGRATION-OUTBOUND-CAPS.md for details.",
             op_str = op.as_str()
         );
     } else {
@@ -159,6 +165,64 @@ pub fn warn_once_outbound_capabilities_missing(instance: &str, op: ChannelOpKind
             "outbound_capabilities still not set (already warned once)"
         );
     }
+}
+
+/// Sprint 22 P0 — shared `gate_outbound_for_agent` helper consumed by every
+/// `Channel::send_from_agent` impl (Telegram + future Discord/Slack/Teams).
+///
+/// Centralises the per-agent capability check so:
+/// 1. Future channel adapters cannot accidentally bypass the gate by
+///    forgetting to call `evaluate_outbound_capability` in their impl.
+/// 2. The `PermissiveLegacyMissing` deprecation warn is consistent across
+///    adapters (one helper, one warn line, one migration message).
+/// 3. The (PermissiveLegacyMissing → permit + warn) branch is testable in
+///    isolation without spinning up a real channel.
+///
+/// Returns `Ok(())` when the agent is permitted to emit `op` (either
+/// explicitly listed OR under gradual-migration grace). Returns
+/// `Err(ChannelError::Other)` with a typed error message when explicitly
+/// rejected (capability list set but does NOT include `op`).
+///
+/// IO note: reads `<home>/fleet.yaml` on each call. For per-call frequency
+/// in production this is acceptable (operator config rarely changes
+/// mid-flight); a future hot-reload optimisation is tracked in dispatch
+/// d-20260427042738203707-13 deferred items (Sprint 23+ candidate).
+pub fn gate_outbound_for_agent(
+    home: &std::path::Path,
+    agent: &str,
+    op: ChannelOpKind,
+) -> std::result::Result<(), super::ChannelError> {
+    let caps = lookup_outbound_capabilities(home, agent);
+    match evaluate_outbound_capability(caps.as_deref(), op) {
+        OutboundCapabilityDecision::Allowed => Ok(()),
+        OutboundCapabilityDecision::Rejected => Err(super::ChannelError::Other(anyhow::anyhow!(
+            "instance '{agent}' outbound_capabilities does not include '{op_str}' \
+             — add to fleet.yaml or remove the explicit list to opt into the \
+             gradual-migration permissive default",
+            op_str = op.as_str()
+        ))),
+        OutboundCapabilityDecision::PermissiveLegacyMissing => {
+            warn_once_outbound_capabilities_missing(agent, op);
+            Ok(())
+        }
+    }
+}
+
+/// Look up `outbound_capabilities` for `instance` from `fleet.yaml`.
+/// Returns `None` when the file / instance / field is missing — caller
+/// treats `None` as the gradual-migration permissive default.
+///
+/// Sprint 22 P0: extracted from `src/channel/telegram.rs` so all
+/// `Channel::send_from_agent` impls share one lookup path.
+fn lookup_outbound_capabilities(
+    home: &std::path::Path,
+    instance: &str,
+) -> Option<Vec<ChannelOpKind>> {
+    let fleet_path = home.join("fleet.yaml");
+    let cfg = crate::fleet::FleetConfig::load(&fleet_path).ok()?;
+    cfg.instances
+        .get(instance)
+        .and_then(|i| i.outbound_capabilities.clone())
 }
 
 #[cfg(test)]
