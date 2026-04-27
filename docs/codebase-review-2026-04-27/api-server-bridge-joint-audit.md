@@ -181,7 +181,29 @@ Reading `mcp/handlers.rs` test section: `inject_provenance` failure-visibility p
 
 ## Cross-pass appendix: dev-impl-1 (channel hot context)
 
-*(To be added by dev-impl-1 in their parallel cross-pass critique. Tracking issue: dev-impl-1 reads this primary report + offers Channel-side blindspot analysis on whether C1's proposed `gated_outbound_for_agent` adequately covers all agent-callable outbound surfaces, including any I missed beyond the four enumerated bridge fns.)*
+(PR #216 + #218 + #219 author. Sprint 20 Track A + Sprint 20.5 Track 5 cross-validation hot context. ~200-400 字 blindspots-only critique post both primary push.)
+
+### `gated_outbound_for_agent` proposal — **CONFIRM as natural PR-216 extension; signature preference**
+
+reviewer-2's proposed helper is the right shape and lives in the right module. From PR #216 author angle, the existing primitive surface is:
+
+- `crate::channel::auth::is_authorized_recipient(allowlist, user_id) -> bool` — predicate
+- `Channel::outbound_authorized(&self) -> bool` — adapter-level decision (TelegramChannel ties it to allowlist non-empty)
+- `crate::channel::gated_notify(channel, instance, severity, message, silent)` — daemon-driven outbound wrapper
+
+`gated_outbound_for_agent` should be a **thin sibling of `gated_notify`** in `src/channel/mod.rs`, NOT a new abstraction. Recommended signature: `pub fn gated_outbound_for_agent(channel: &dyn Channel, caller_agent: &str, op_kind: OutboundOp) -> Result<(), ChannelError>` where `OutboundOp` is an enum (`Reply | React | Edit | Provenance`) — gate-only (Ok = proceed, Err = drop). Caller invokes the existing `try_telegram_*` fn after gate passes. **Two policy variants required** per L1 preservation: `reply / react / edit_message` propagate Err (operator-visible); `inject_provenance` drops-with-warn (matches existing failure-visibility contract). Either two helpers (`gated_outbound_for_agent` + `gated_outbound_for_agent_or_warn`) or single helper with `policy: GatePolicy { Strict, DropWithWarn }` enum param. I lean two helpers — clearer at call site, mirrors `gated_notify` (single call shape per surface).
+
+### Bridge-fn enumeration (4) — **VERIFIED COMPLETE for current production paths**
+
+`grep -rn "try_telegram_reply\|try_telegram_react\|try_telegram_edit\|inject_provenance" src/` in cross-pass worktree: all production callers go through `mcp/handlers.rs:74,88,102,399` (the four reviewer-2 listed). `try_telegram_reply_no_cleanup` is only invoked by `inject_provenance` (telegram.rs:1380, 1391) — transitively gated. `notify_telegram` / `notify_telegram_silent` are only called from `Channel::notify` impl (telegram.rs:1999, 2001) — already gated by PR #216. **Latent surface to flag**: `Channel::send` (bail-stub today, telegram.rs:1860 returns `MsgRef { id: "0" }` placeholder per Sprint 20 Track A H1/H4) — if a future T2 dispatcher wires it into mcp/handlers.rs, that wiring must also route through `gated_outbound_for_agent`. Sprint 21 Phase 5b extension PR should add a structural pin test: `Channel::send` is bail-stub OR gated, never naked.
+
+### Sprint 20.5 Track 7 framing — **A angle was call-graph-correct; vindication, not error**
+
+My Sprint 20.5 Track 5 cross-validation §Missed-findings #3 explicitly wrote: *"the channel-bridge actually lives in `mcp/handlers.rs:74,88,102,399`... the cross-pass should be **C↔D for app-bridge AND A↔D for channel-bridge**."* I correctly named the call-graph node (mcp/handlers.rs channel routes), unlike Track 7's file-path framing. What I did NOT do was DISPROVE the C↔D bridge entirely (dev-reviewer's confession this audit). My A angle stayed additive to Track 7's framing rather than corrective. dev-reviewer's retro entry should note: A angle pointed at the right call graph; C angle pointed at the wrong one. Sprint 22 cross-validation discipline should require call-graph grep evidence (`rg crate::mcp:: src/app/`) before naming any cross-area bridge — would have caught Track 7 mistake at write-time, not audit-time.
+
+### A angle blindspot summary (one item neither primary surfaced)
+
+**Defense-in-depth nuance for cascade chain**: PR #219 closes Telegram inbound auth; C1's gate closes MCP→Channel egress. But the inter-agent ingress (agent A's `send_to_instance` MCP tool carries attacker-text into agent B's PTY → agent B prompt-injected → agent B issues `reply` MCP tool → C1 gate now fires) is the operative attack vector that C1 fix MUST close. PR #219 alone is insufficient because authorized-user A could launder attacker content through inter-agent send (or a tool result with unsanitized URL). **Both primaries describe the attack chain correctly but neither pins this nuance**: agent-callable outbound gate is load-bearing precisely BECAUSE inter-agent ingress is unauthenticated by design (intra-fleet trust). Worth one sentence in C1 fix PR doc-comment: "this gate is the second-line defense against prompt injection laundered through inter-agent communication; do not relax even if inbound auth tightens further."
 
 ---
 
