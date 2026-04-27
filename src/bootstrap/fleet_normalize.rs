@@ -10,10 +10,24 @@
 //! normalize in memory without touching disk.
 
 use crate::backend::Backend;
+use crate::channel::auth::ChannelOpKind;
 use crate::fleet::{self, FleetConfig, InstanceConfig, InstanceYamlEntry};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// Default outbound capability set granted to built-in (auto-injected)
+/// fleet instances. Sprint 22 P0 (Phase 5b): `general` and any future
+/// auto-created coordinator gets the full set so the operator never has
+/// to author outbound_capabilities for first-class fleet members.
+fn default_built_in_outbound_capabilities() -> Vec<ChannelOpKind> {
+    vec![
+        ChannelOpKind::Reply,
+        ChannelOpKind::React,
+        ChannelOpKind::Edit,
+        ChannelOpKind::InjectProvenance,
+    ]
+}
 
 /// Normalize in-memory, optionally persisting fleet.yaml side effects.
 pub(super) fn normalize(config: &mut FleetConfig, home: &Path, persist: bool) {
@@ -37,6 +51,12 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
             backend: Some(default_backend),
             working_directory: None,
             topic_id: Some(1),
+            // Sprint 22 P0 (Phase 5b): built-in instances get auto-injected
+            // outbound capabilities so the operator never has to think about
+            // the field for first-class fleet members. User-yaml entries
+            // remain forced-explicit (the warn-then-permit / hard-cut
+            // transition applies only to operator-authored instances).
+            outbound_capabilities: Some(default_built_in_outbound_capabilities()),
             ..Default::default()
         },
     );
