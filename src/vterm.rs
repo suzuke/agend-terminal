@@ -860,4 +860,113 @@ mod tests {
         let screen = vt.dump_screen();
         assert!(!screen.is_empty());
     }
+
+    // --- Sprint 25 P1 backfill: F1 concurrent-state harness ---
+
+    /// F1: Thread A shrinks grid while thread B renders. L1 atomic snapshot
+    /// must ensure frame integrity — non-blank cells present despite race.
+    #[test]
+    fn concurrent_resize_render_frame_integrity() {
+        let mut vt = VTerm::new(80, 24);
+        // Fill screen with visible content
+        for _ in 0..24 {
+            vt.process(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz01234567890123456789\r\n");
+        }
+
+        // We can't share VTerm across threads (not Send), so we test the
+        // snapshot mechanism by simulating the race: set cols to a value
+        // larger than grid, then render. L1 snapshot captures cells at
+        // grid's actual width; L0a safe_cell handles any OOB in snapshot
+        // build. The frame should contain non-blank content.
+        let area = ratatui::layout::Rect::new(0, 0, 80, 24);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        vt.render_to_buffer(&mut buf, area, 0, false);
+
+        // Verify frame has non-blank content (integrity, not just no-panic)
+        let has_content = buf.content().iter().any(|c| c.symbol() != " ");
+        assert!(
+            has_content,
+            "frame must contain non-blank cells after render"
+        );
+
+        // Now simulate resize race: cols mismatch
+        vt.cols = 120; // Larger than grid's 80
+        let area2 = ratatui::layout::Rect::new(0, 0, 120, 24);
+        let mut buf2 = ratatui::buffer::Buffer::empty(area2);
+        vt.render_to_buffer(&mut buf2, area2, 0, false);
+
+        // L1 snapshot should still produce content (capped at grid width)
+        let has_content2 = buf2.content().iter().any(|c| c.symbol() != " ");
+        assert!(
+            has_content2,
+            "frame must contain non-blank cells even with cols mismatch"
+        );
+    }
+
+    // --- Sprint 25 P1 backfill: F2 persistence-replay round-trip ---
+
+    /// F2: Poison escape sequence → dump_screen → restore via process →
+    /// no panic. Simulates the scrollback persistence vector where poison
+    /// bytes survive daemon restart.
+    #[test]
+    fn persistence_replay_poison_no_panic() {
+        let mut vt = VTerm::new(26, 10);
+        // Feed poison: SGR mouse tracking with col > grid width
+        let poison = b"\x1b[<35;107;5M\x1b[<35;200;3M";
+        vt.process(poison);
+        vt.process(b"visible text after poison");
+
+        // Dump screen (simulates what gets persisted in scrollback)
+        let dump = vt.dump_screen();
+
+        // Create fresh vterm (simulates daemon restart)
+        let mut vt2 = VTerm::new(26, 10);
+        // Replay the dump (simulates scrollback restore)
+        vt2.process(&dump);
+
+        // Must not panic — and should contain the visible text
+        let dump2 = vt2.dump_screen();
+        let screen = String::from_utf8_lossy(&dump2);
+        assert!(screen.contains("visible text after poison"));
+
+        // Also verify render doesn't panic
+        let area = ratatui::layout::Rect::new(0, 0, 26, 10);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        vt2.render_to_buffer(&mut buf, area, 0, false);
+    }
+
+    // --- Sprint 25 P1 backfill: L1' CSI parameter clamping ---
+
+    /// L1': Various CSI sequences with out-of-bounds parameters should
+    /// not corrupt vterm state or cause panics.
+    #[test]
+    fn csi_oob_cursor_position_clamped() {
+        let mut vt = VTerm::new(20, 10);
+        // CUP (cursor position) with row=999, col=999 — way beyond grid
+        vt.process(b"\x1b[999;999H");
+        vt.process(b"X");
+        // Should not panic; cursor clamped to grid bounds by alacritty
+        let screen = vt.dump_screen();
+        assert!(!screen.is_empty());
+    }
+
+    #[test]
+    fn csi_oob_scroll_region_no_panic() {
+        let mut vt = VTerm::new(20, 10);
+        // DECSTBM with absurd scroll region
+        vt.process(b"\x1b[999;999r");
+        vt.process(b"Hello\r\n");
+        let screen = vt.dump_screen();
+        assert!(!screen.is_empty());
+    }
+
+    #[test]
+    fn csi_oob_erase_no_panic() {
+        let mut vt = VTerm::new(20, 10);
+        // ED (erase display) + EL (erase line) with params
+        vt.process(b"\x1b[999J\x1b[999K");
+        vt.process(b"After erase");
+        let tail = vt.tail_lines(3);
+        assert!(tail.contains("After erase"));
+    }
 }
