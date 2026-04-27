@@ -322,11 +322,16 @@ pub fn gated_notify(
     silent: bool,
 ) -> std::result::Result<(), ChannelError> {
     if !channel.outbound_authorized() {
-        tracing::debug!(
-            instance,
-            kind = channel.kind(),
-            "outbound notify dropped — channel not authorised (fail-closed; configure user_allowlist to opt in)"
-        );
+        // Sprint 22 P1.5 (Candidate 4 from PR #229 P1 dispatch): the
+        // previous `tracing::debug!` was invisible at default
+        // `RUST_LOG=info` so operators didn't see the gate firing when
+        // stall / crash / CI notices were silently dropped.
+        // `warn_once_user_allowlist_unconfigured` upgrades to FATAL
+        // (`error!`) once-per-channel:instance pair, mirroring P0's
+        // `warn_once_outbound_capabilities_missing` shape so operators
+        // see the same operator-actionable copy-paste fleet.yaml
+        // stanza regardless of which gate fired.
+        auth::warn_once_user_allowlist_unconfigured(channel.kind(), instance);
         return Ok(());
     }
     channel.notify(instance, severity, message, silent)
