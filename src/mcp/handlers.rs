@@ -1171,6 +1171,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // --- Task board ---
         "task" => crate::tasks::handle(&home, instance_name, args),
 
+        // --- Task sweep config (Sprint 24 P0 PR2) ---
+        // Operator-facing config for the GitHub-PR auto-close sweep daemon.
+        // Reading is a stat call to `<home>/task_sweep.json`; writing
+        // updates the file via atomic save. Sweep tick re-reads on each
+        // 5-min iteration, so changes propagate without daemon restart.
+        "task_sweep_config" => crate::daemon::task_sweep::handle_task_sweep_config(&home, args),
+
         // --- Teams ---
         "create_team" => {
             // Route through the API so the handler emits a TeamCreated TUI
