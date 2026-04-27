@@ -1990,6 +1990,15 @@ impl crate::channel::Channel for TelegramChannel {
         }
         Ok(())
     }
+
+    /// Adapter-side outbound gate: returns `true` iff `user_allowlist`
+    /// is `Some(non-empty)`. Reuses [`crate::channel::auth::is_outbound_authorized`]
+    /// so the same predicate is the source of truth across both the
+    /// trait-level [`gated_notify`](crate::channel::gated_notify) helper
+    /// and Phase 2's pending inbound auth reform.
+    fn outbound_authorized(&self) -> bool {
+        crate::channel::auth::is_outbound_authorized(&lock_state(&self.state).user_allowlist)
+    }
 }
 
 // ─── UxEventSink: capability-gated degradation ────────────────────────

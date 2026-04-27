@@ -605,8 +605,17 @@ fn run_core(
             };
             tracing::warn!(agent = %crashed_name, %state, "notifying");
             let msg = format!("[health] {crashed_name}: {state}");
+            // Outbound info-leak gate (Sprint 21 Phase 1): crash
+            // notification carries the agent state name; gated_notify
+            // drops when the channel is unauthorised.
             if let Some(ch) = crate::channel::active_channel() {
-                let _ = ch.notify(&crashed_name, NotifySeverity::Error, &msg, false);
+                let _ = crate::channel::gated_notify(
+                    ch.as_ref(),
+                    &crashed_name,
+                    NotifySeverity::Error,
+                    &msg,
+                    false,
+                );
             } else {
                 tracing::debug!(agent = %crashed_name, "no active channel for crash notification");
             }

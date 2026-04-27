@@ -123,8 +123,20 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
         match action {
             Some(NoticeAction::Stall { tail, silent_secs }) => {
                 let msg = format_stall_notice(&name, &tail, silent_secs);
+                // Outbound info-leak gate (Sprint 21 Phase 1): `tail`
+                // carries 40 lines of PTY output — must not leak to a
+                // bound group with no operator allowlist configured.
+                // `gated_notify` drops the call when the channel is
+                // unauthorised; legacy `None`-allowlist deployments
+                // require explicit opt-in via `user_allowlist: [...]`.
                 if let Some(ch) = crate::channel::active_channel() {
-                    let _ = ch.notify(&name, NotifySeverity::Warn, &msg, false);
+                    let _ = crate::channel::gated_notify(
+                        ch.as_ref(),
+                        &name,
+                        NotifySeverity::Warn,
+                        &msg,
+                        false,
+                    );
                 } else {
                     tracing::debug!(agent = %name, "no active channel — stall notice dropped");
                 }
@@ -132,7 +144,13 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
             Some(NoticeAction::Recovered) => {
                 let msg = format_recovery_notice(&name);
                 if let Some(ch) = crate::channel::active_channel() {
-                    let _ = ch.notify(&name, NotifySeverity::Info, &msg, true);
+                    let _ = crate::channel::gated_notify(
+                        ch.as_ref(),
+                        &name,
+                        NotifySeverity::Info,
+                        &msg,
+                        true,
+                    );
                 } else {
                     tracing::debug!(agent = %name, "no active channel — recovery notice dropped");
                 }
