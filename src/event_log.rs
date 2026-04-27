@@ -87,6 +87,72 @@ pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
     }
 }
 
+/// Append a typed event to a sister audit log (e.g. `task_events.jsonl`).
+///
+/// Locked + rotated + fsynced. Returns Err so sister modules with strict
+/// audit semantics can fail-loud rather than swallow IO errors the way
+/// [`log`] does. Future audit logs (decision_events, capability_events)
+/// reuse this primitive.
+#[allow(dead_code)]
+pub fn append<T: Serialize>(home: &Path, log_name: &str, event: &T) -> anyhow::Result<()> {
+    append_lines_under_lock(home, log_name, |_| Ok(vec![serde_json::to_string(event)?]))
+}
+
+/// Append multiple typed events under a single fsync (F7 atomic-batch
+/// pattern). Either all events land or none do — readers never observe a
+/// partial-write window.
+#[allow(dead_code)]
+pub fn append_batch<T: Serialize>(home: &Path, log_name: &str, events: &[T]) -> anyhow::Result<()> {
+    append_lines_under_lock(home, log_name, |_| {
+        events
+            .iter()
+            .map(|e| serde_json::to_string(e).map_err(anyhow::Error::from))
+            .collect()
+    })
+}
+
+/// Lower-level primitive used by sister modules that need read access to
+/// existing log content under the same lock as the write — for example
+/// `task_events::append` computes a monotonic per-instance sequence number
+/// by scanning the log, then writes the new envelope, all in one critical
+/// section to avoid TOCTOU races between two concurrent appenders.
+///
+/// `build_lines` receives the log path (lock already held) and returns the
+/// lines to append. Returning `Vec::new()` is a no-op.
+pub fn append_lines_under_lock<F>(home: &Path, log_name: &str, build_lines: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&Path) -> anyhow::Result<Vec<String>>,
+{
+    let log_path = home.join(format!("{log_name}.jsonl"));
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = log_path.with_extension("jsonl.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path)?;
+
+    // No size-based rotation here — sister modules own their retention
+    // policy (e.g. task_events::compact archives events past
+    // COMPACTION_KEEP into a sibling directory replay() also reads).
+    // Rotation would silently move events to `.jsonl.N` files outside
+    // the replay path, breaking the audit invariant.
+
+    let lines = build_lines(&log_path)?;
+    if lines.is_empty() {
+        return Ok(());
+    }
+
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    for line in &lines {
+        writeln!(f, "{line}")?;
+    }
+    f.sync_all()?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

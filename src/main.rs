@@ -42,6 +42,7 @@ mod state;
 mod status_summary;
 mod store;
 mod sync;
+mod task_events;
 mod tasks;
 mod teams;
 #[cfg(feature = "tray")]
