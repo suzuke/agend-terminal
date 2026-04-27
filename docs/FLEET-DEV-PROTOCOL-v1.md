@@ -368,6 +368,7 @@ Acceptable concurrent-state fixtures:
 1. **Multi-threaded harness** — at least two threads exercising distinct roles (one mutates state, the other reads it) with explicit synchronization points and assertion of the consistent-snapshot invariant. Example: vterm grid resize on thread A while thread B walks cells for render.
 2. **Loom / shuttle interleaving** — formal model-checked exhaustive interleaving for small concurrent units, when applicable to the lock structure under test.
 3. **Stress loop** — bounded-iteration loop with PRNG-driven schedule perturbation to surface intermittent races (paired with `--test-threads=1` flag suppression so the test isn't masked).
+4. **Deterministic race-symptom simulation** (when type is `!Send`) — if the type under test cannot cross thread boundaries (e.g., third-party API constraints like alacritty `Term: !Send`), explicit acknowledgment + outcome-state simulation (direct field manipulation reproducing the failure mode without literal concurrent execution) is acceptable in lieu of multi-threaded harness, provided the mechanism is verifiable by code review. Cite PR #259 F1 `concurrent_resize_render_frame_integrity` as canonical example. (Sprint 25 P3 r2 amendment per PR #259 reviewer M1 finding.)
 
 ##### Persistence-replay fixtures
 
@@ -380,6 +381,7 @@ Acceptable persistence-replay fixtures:
 1. **Round-trip test** — `write_state()` → `simulate_daemon_restart()` → `restore_state()` → assert no-panic AND state matches expected (or fails with operator-actionable error, not panic).
 2. **Poison-fixture replay** — known-bad input written through the persistence layer, then replayed from disk. Asserts the restore path either sanitizes/rejects gracefully OR validates input pre-write so poison never reaches disk.
 3. **Migration coverage** — for schema-versioned state, fixtures for v(N-1) data restored by v(N) reader; asserts forward-compat fail-closed (per existing `task_events::SCHEMA_VERSION` pattern, Sprint 24 P0 PR1).
+4. **Logical-lifecycle replay** (when persistence is in-memory cross-boundary) — if state persists across a logical lifecycle boundary (daemon restart / reconnect / new session) but doesn't touch disk (e.g., PTY scrollback in alacritty `Term`), dump→fresh-instance→re-process round-trip is acceptable in lieu of write→disk→restore→replay. Cite PR #259 F2 `persistence_replay_poison_no_panic` as canonical example. (Sprint 25 P3 r2 amendment per PR #259 reviewer M2 finding.)
 
 ##### Reviewer enforcement
 
