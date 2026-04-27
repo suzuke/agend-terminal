@@ -155,7 +155,9 @@ pub fn server_handshake_ndjson<R: BufRead, W: Write>(
     }
     writeln!(writer, r#"{{"ok":true}}"#)?;
     writer.flush().ok();
-    // Sprint 25 P1 F1: extract optional peer PID for liveness tracking
+    // Sprint 25 P1 F1: extract optional peer PID for telemetry.
+    // Telemetry only: daemon does not poll this PID for liveness;
+    // see Sprint 25 P3 follow-up (active peer-process invalidation).
     let peer_pid = parsed.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
     Ok(peer_pid)
 }

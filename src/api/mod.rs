@@ -316,6 +316,7 @@ fn handle_session(
                 return;
             }
         };
+    // Telemetry only — see MCP-DAEMON-PROXY-CONTRACT §peer-PID-telemetry.
     if let Some(pid) = peer_pid {
         tracing::debug!(peer_pid = pid, "API session peer PID");
     }

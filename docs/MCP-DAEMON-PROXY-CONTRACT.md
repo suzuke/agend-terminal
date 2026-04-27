@@ -79,9 +79,15 @@ Tools are classified into 3 tiers:
 
 Timeout is enforced in `handle_mcp_tool` via a scoped thread + `mpsc::recv_timeout`. A timed-out tool returns a structured error; the API session stays alive for subsequent calls.
 
-### PID-watch invalidation
+### Peer PID telemetry
 
-The bridge sends its PID in the auth handshake (`{"auth":"<hex>","pid":12345}`). The daemon logs the peer PID for diagnostics. When the bridge process exits, the TCP connection drops (FIN/RST), and the daemon session thread exits on the next read error. The 30s TCP read timeout bounds the worst-case detection latency.
+The bridge sends its PID in the auth handshake (`{"auth":"<hex>","pid":12345}`). The daemon extracts and logs the peer PID for observability (`tracing::debug!`). This is **telemetry only** — the daemon does not actively poll the PID for liveness.
+
+Dead-bridge detection relies on TCP read timeout (30s): when the bridge process exits, the OS sends FIN/RST, and the daemon session thread exits on the next read error. Per-tool timeout (5/30/60s) further limits thread blocking for in-flight tool calls.
+
+### Deferred: active peer-process invalidation
+
+**Not implemented** (Sprint 25 P3 backlog). Active `kill(pid, 0)` periodic polling would detect bridge crashes within <1s and proactively close the daemon session — faster than the 30s TCP read timeout fallback. Deferred because the single-operator threat model makes the 30s fallback acceptable for current deployments.
 
 ### Slow-loris defense
 
