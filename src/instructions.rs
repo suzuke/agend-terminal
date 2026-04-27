@@ -279,13 +279,18 @@ pub(crate) fn build_instructions_body(
     content.push_str("- **Spawn site rationale** (§10.5): every `tokio::spawn` / `thread::spawn` site MUST carry `// fire-and-forget: <reason>` comment OR explicitly store JoinHandle for graceful join. Tests exempt; trait-method spawns inherit caller rationale. Phase 5b invariant test enforces.\n");
 
     // Response channel discipline — match reply mechanism to input source.
+    // Sprint 23 P1 (F-NEW-CHANNEL-DETECTION-INSTRUCTION-NORMALIZE-1):
+    // detection rule keyed on the explicit message-source prefix the
+    // daemon injects, so agents pick the correct tool deterministically
+    // without falling back to ambient hints.
     content.push_str("\n## Response channel discipline\n\n");
     content.push_str(
-        "Reply via the same channel the input arrived on:\n\
-         - If you see `(Reply using the reply tool, NOT direct text)` → use the `reply` MCP tool\n\
-         - If you see `[from:AGENT_NAME]` prefix → use `send_to_instance`\n\
-         - If **neither hint is present** (operator typed in TUI) → respond with **direct text**, do NOT use any tool\n\n\
-         Mixing channels (e.g. telegram reply when operator typed in TUI) makes the response appear in the wrong place.\n",
+        "Reply via the same channel the input arrived on. Look at the message prefix:\n\
+         - If message has `[user:NAME via telegram]` prefix → use the `reply` MCP tool\n\
+         - If message has `[from:AGENT_NAME]` prefix → use `send_to_instance`\n\
+         - If **neither prefix present** (operator typed in TUI directly) → respond with **direct text**, do NOT use any tool\n\n\
+         The daemon also appends a parenthetical hint after the prefix (e.g. `(Reply using the reply tool — do NOT respond with direct text)`) — this is supplemental confirmation, but the prefix is the authoritative signal.\n\n\
+         Mixing channels (e.g. telegram reply when operator typed in TUI directly) makes the response appear in the wrong place — the operator-typed TUI input has no associated channel binding, so a `reply` MCP call returns \"no active channel\" error.\n",
     );
 
     // Inbox message header handling — teaches agents to parse [AGEND-MSG] headers
@@ -987,6 +992,64 @@ mod tests {
             assert!(
                 content.contains("attachments="),
                 "{backend_cmd} instructions must mention `attachments=` header rule, path={}",
+                instr_path.display()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Sprint 23 P1 (F-NEW-CHANNEL-DETECTION-INSTRUCTION-NORMALIZE-1):
+    /// every backend's generated instructions must teach the explicit
+    /// channel-detection rule keyed on prefix tokens
+    /// (`[user:NAME via telegram]` for telegram, `[from:AGENT_NAME]` for
+    /// agent, neither for TUI-direct). Closes the operator-hit "no
+    /// active channel" error from TUI direct input — agent now picks
+    /// the right reply tool deterministically.
+    ///
+    /// Iterates all 5 backends per dispatch m-20260427105439987624-73
+    /// (claude / kiro-cli / codex / gemini / opencode). Pattern mirrors
+    /// `test_all_backends_include_agend_msg_rule` and
+    /// `test_all_backends_include_attachments_rule`.
+    #[test]
+    fn test_all_backends_include_channel_detection_rule() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-instr-chan-detect-test-{}",
+            std::process::id()
+        ));
+        for backend_cmd in ["claude", "kiro-cli", "codex", "gemini", "opencode"] {
+            let work = dir.join(backend_cmd);
+            std::fs::create_dir_all(&work).ok();
+            generate(&work, backend_cmd);
+            let backend = crate::backend::Backend::from_command(backend_cmd)
+                .unwrap_or_else(|| panic!("backend `{backend_cmd}` must resolve"));
+            let preset = backend.preset();
+            let instr_path = work.join(preset.instructions_path);
+            let content = std::fs::read_to_string(&instr_path).unwrap_or_default();
+
+            // 3 detection branches must all be teachable from the doc.
+            // Telegram: prefix shape token.
+            assert!(
+                content.contains("[user:NAME via telegram]"),
+                "{backend_cmd} instructions must mention `[user:NAME via telegram]` prefix → reply tool, path={}",
+                instr_path.display()
+            );
+            // Agent peer: prefix shape token.
+            assert!(
+                content.contains("[from:AGENT_NAME]"),
+                "{backend_cmd} instructions must mention `[from:AGENT_NAME]` prefix → send_to_instance, path={}",
+                instr_path.display()
+            );
+            // TUI direct: explicit no-prefix branch wording.
+            assert!(
+                content.contains("neither prefix present"),
+                "{backend_cmd} instructions must teach the no-prefix → direct text branch, path={}",
+                instr_path.display()
+            );
+            // The reply MCP tool name must appear (operator-hit error
+            // root-cause: agent called `reply` from TUI-direct context).
+            assert!(
+                content.contains("`reply` MCP tool"),
+                "{backend_cmd} instructions must name the `reply` MCP tool explicitly, path={}",
                 instr_path.display()
             );
         }
