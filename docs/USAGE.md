@@ -116,6 +116,58 @@ agend-terminal tray (menu-bar resident)
   └── Auto-starts daemon → click "Open App" → launches TUI
 ```
 
+## Channel: Telegram
+
+Bind the fleet to a Telegram group for remote control (send messages to
+agents from your phone) and outbound notifications (stall / crash / CI
+alerts pushed back to the group).
+
+### Minimum config
+
+```yaml
+channel:
+  type: telegram
+  bot_token_env: AGEND_BOT_TOKEN          # env var holding the bot token
+  group_id: -1001234567890                # Telegram chat id of the group
+  user_allowlist: [123456789]             # operator Telegram user_id(s)
+```
+
+Then export the bot token before `agend-terminal start`:
+
+```bash
+export AGEND_BOT_TOKEN="123456:abcdef..."
+```
+
+### How to get values
+
+- **Bot token** (`AGEND_BOT_TOKEN`): create a bot via [@BotFather](https://t.me/BotFather), copy the token it returns.
+- **Group id**: add your bot to the target group, then send any message and inspect the bot's `getUpdates` API (`https://api.telegram.org/bot<TOKEN>/getUpdates`) — the `chat.id` is your `group_id` (negative for groups / supergroups).
+- **User id**: message [@userinfobot](https://t.me/userinfobot) on Telegram and it replies with your numeric user id. Add every operator who should be allowed to command the fleet.
+
+### `user_allowlist` semantics (Sprint 21 fail-closed default)
+
+| `user_allowlist` value | Inbound (sender filter) | Outbound (notification gate) |
+|---|---|---|
+| `[123, 456]` (≥ 1 entry) | Listed users only — others rejected | ✅ Notifications delivered |
+| `[]` (empty list) | Everyone rejected | 🔇 Notifications dropped (fail-closed) |
+| field absent / `null` | Legacy: everyone accepted (deprecated) | 🔇 Notifications dropped (fail-closed) |
+
+The outbound gate landed in [PR #216](https://github.com/suzuke/agend-terminal/pull/216) (Sprint 21 Phase 1) to close the
+[Sprint 20.5 cross-validation](codebase-review-2026-04-27/SYNTHESIS.md) outbound info-leak finding (40-line PTY tails were leaking to anyone added to a bound group regardless of inbound auth state). Inbound fail-closed is being landed in Phase 2.
+
+### Migration: upgrading from < Sprint 21
+
+If your `fleet.yaml` previously had a `channel.telegram` block **without** `user_allowlist`, the fleet still runs after upgrading but **outbound notifications now drop silently** (fail-closed). You will see:
+
+```
+WARN: telegram channel.user_allowlist is not set — any group member can command the fleet. \
+      Set `user_allowlist: [123, 456]` in fleet.yaml to lock this down.
+```
+
+To restore outbound notifications, add your operator user_id(s) to `user_allowlist`. This is the **only required migration step**; bot token and group id remain unchanged.
+
+If you previously relied on legacy "anyone in the group can command the fleet" behaviour, the inbound side still accepts all users until Phase 2 lands; configure `user_allowlist` now to close both sides simultaneously.
+
 ## Other Commands
 
 | Command | Purpose |

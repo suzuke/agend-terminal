@@ -50,6 +50,16 @@ instances:
   reviewer:
     role: "Code reviewer"
     working_directory: ~/my-project
+
+# Optional: bind the fleet to a Telegram group for remote control + alerts.
+# `user_allowlist` is REQUIRED to receive outbound notifications (stall /
+# crash / CI alerts). Without it, the fleet runs but the bound group is
+# muted (fail-closed default — see docs/USAGE.md "Channel: Telegram").
+# channel:
+#   type: telegram
+#   bot_token_env: AGEND_BOT_TOKEN
+#   group_id: YOUR_GROUP_ID
+#   user_allowlist: [YOUR_TELEGRAM_USER_ID]   # message @userinfobot to get yours
 YAML
 agend-terminal start
 ```
