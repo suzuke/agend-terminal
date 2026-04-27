@@ -201,8 +201,8 @@ fn connect_daemon(
     let writer = stream.try_clone()?;
     let mut rdr = BufReader::new(stream);
 
-    // Cookie handshake — include PID for daemon-side liveness tracking
-    // (Sprint 25 P1 F1 PID-watch invalidation)
+    // Cookie handshake — include PID for daemon-side telemetry observability.
+    // (Active peer-process invalidation deferred — see MCP-DAEMON-PROXY-CONTRACT §deferred.)
     let hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
     let pid = std::process::id();
     let mut w = writer.try_clone()?;

@@ -307,7 +307,7 @@ fn handle_session(
     // P1-10 gate: first NDJSON line must be `{"auth":"<hex>"}`. Read deadline
     // on the stream (set in `serve`) ensures a silent peer closes out in 30s
     // rather than pinning this worker thread.
-    // Sprint 25 P1 F1: extract optional peer PID for liveness tracking.
+    // Sprint 25 P1 F1: extract optional peer PID for telemetry.
     let peer_pid =
         match crate::auth_cookie::server_handshake_ndjson(&mut reader, &mut writer, &cookie) {
             Ok(pid) => pid,
