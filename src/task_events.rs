@@ -34,7 +34,21 @@ use std::path::{Path, PathBuf};
 /// Persisted-envelope schema version. Bumped only on changes that older
 /// readers cannot interpret. Forward-compat: v(N) reader rejects v(N+1)
 /// envelopes (fail-closed). Backward-compat: v(N) reader accepts v(<=N).
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// **v2 (Sprint 24 P0 PR3)** — adds:
+/// - [`TaskEvent::Released`] (sweep-driven claim release; clears owner
+///   unlike `Reopened` which preserves it for done→open re-work).
+/// - [`TaskEvent::TaskCloseProposed`] (legacy-backfill dry-run proposal;
+///   distinct from `Done` per dev-reviewer-2 must-have).
+/// - [`TaskEvent::Created`] gains `due_at` / `depends_on` / `routed_to`
+///   fields (`#[serde(default)]` so v1 envelopes round-trip).
+/// - [`TaskRecord`] gains `created_by` / `created_at` / `updated_at` /
+///   `due_at` / `depends_on` / `routed_to` / `result` fields.
+///
+/// v1 readers fail-closed on v2 envelopes via the `schema_version >
+/// SCHEMA_VERSION` check in [`replay`]. v2 readers accept v1 envelopes
+/// (the new `Created` fields default to `None` / `Vec::new()`).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Hot-file event count above which [`compact`] archives the older slice.
 pub const COMPACTION_KEEP: usize = 10_000;
@@ -173,6 +187,21 @@ pub enum TaskEvent {
         description: String,
         priority: String,
         owner: Option<InstanceName>,
+        /// **v2** — RFC3339 deadline; `sweep_overdue_claimed` releases
+        /// claims past this. v1 envelopes default to `None`.
+        #[serde(default)]
+        due_at: Option<String>,
+        /// **v2** — task IDs this task depends on; auto-blocks when any
+        /// dep is non-Done (computed in-memory at list time, NOT
+        /// persisted as Blocked/Unblocked events). v1 envelopes default
+        /// to empty.
+        #[serde(default)]
+        depends_on: Vec<TaskId>,
+        /// **v2** — when assignee resolves to a team, the orchestrator
+        /// surfaced for routing. Derived at create-time, captured here
+        /// so replay reproduces team-routing visibility.
+        #[serde(default)]
+        routed_to: Option<InstanceName>,
     },
     Claimed {
         task_id: TaskId,
@@ -215,6 +244,60 @@ pub enum TaskEvent {
         reason: String,
         source_evidence: String,
     },
+    /// **v2** — claim release. Distinct from `Reopened`: Released clears
+    /// the owner (claim is gone), while Reopened preserves it (done→open
+    /// re-work goes back to the same person). Emitted by the overdue-
+    /// claim sweeper and the operator's manual `task release` flow.
+    Released {
+        task_id: TaskId,
+        reason: String,
+    },
+    /// **v2** — sweep dry-run proposal. Distinct from `Done` so an
+    /// operator-confirm gate can intercede before the canonical close
+    /// transition lands. Per dev-reviewer-2 must-have: do NOT use a
+    /// nullable `pr_id` on `Done` to differentiate proposal vs final;
+    /// use this distinct variant.
+    TaskCloseProposed {
+        task_id: TaskId,
+        candidate: DoneSource,
+        sweep_id: String,
+        confidence: ConfidenceScore,
+    },
+    /// **v2** — owner reassignment / clear without status transition.
+    /// Used by `update` MCP arm when the operator changes assignee
+    /// without changing status (e.g. transferring ownership across
+    /// teams while keeping the task Open). Distinct from `Claimed`
+    /// (which forces status → Claimed) so reassigning an Open task
+    /// stays Open.
+    OwnerAssigned {
+        task_id: TaskId,
+        by: InstanceName,
+        owner: Option<InstanceName>,
+        routed_to: Option<InstanceName>,
+    },
+    /// **v2** — priority change without status transition.
+    PriorityChanged {
+        task_id: TaskId,
+        by: InstanceName,
+        priority: String,
+    },
+}
+
+/// Per-task confidence breakdown produced by the legacy-backfill sweep.
+/// Carried inside `TaskCloseProposed` so the operator audit trail shows
+/// why a particular proposal landed in the propose-tier rather than
+/// auto-apply or silent.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfidenceScore {
+    /// Sum of weighted sub-scores. Audit-readable.
+    pub total: f32,
+    /// Count of independent signals that fired (not just sum).
+    pub signal_count: u32,
+    /// Per-sub-score breakdown for forensic review. Keys are signal
+    /// names (e.g. `"branch_exact"`, `"branch_jaccard"`,
+    /// `"closes_marker"`); values are the weighted contribution.
+    pub sub_scores: std::collections::BTreeMap<String, f32>,
 }
 
 impl TaskEvent {
@@ -229,7 +312,11 @@ impl TaskEvent {
             | TaskEvent::Linked { task_id, .. }
             | TaskEvent::Blocked { task_id, .. }
             | TaskEvent::Unblocked { task_id }
-            | TaskEvent::Reopened { task_id, .. } => task_id,
+            | TaskEvent::Reopened { task_id, .. }
+            | TaskEvent::Released { task_id, .. }
+            | TaskEvent::TaskCloseProposed { task_id, .. }
+            | TaskEvent::OwnerAssigned { task_id, .. }
+            | TaskEvent::PriorityChanged { task_id, .. } => task_id,
         }
     }
 
@@ -245,6 +332,10 @@ impl TaskEvent {
             TaskEvent::Blocked { .. } => "blocked",
             TaskEvent::Unblocked { .. } => "unblocked",
             TaskEvent::Reopened { .. } => "reopened",
+            TaskEvent::Released { .. } => "released",
+            TaskEvent::TaskCloseProposed { .. } => "task_close_proposed",
+            TaskEvent::OwnerAssigned { .. } => "owner_assigned",
+            TaskEvent::PriorityChanged { .. } => "priority_changed",
         }
     }
 }
@@ -300,6 +391,16 @@ pub struct TaskRecord {
     pub linked_prs: Vec<PrId>,
     pub block_reason: Option<String>,
     pub history: Vec<HistoryEntry>,
+    // ── v2 fields (PR3) — replicate tasks.json metadata in the
+    //    canonical replay-derived view so retire-tasks.json doesn't
+    //    lose any field consumers rely on.
+    pub created_by: InstanceName,
+    pub created_at: String,
+    pub updated_at: String,
+    pub due_at: Option<String>,
+    pub depends_on: Vec<TaskId>,
+    pub routed_to: Option<InstanceName>,
+    pub result: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -357,12 +458,18 @@ impl TaskBoardState {
             kind,
         };
 
+        // Touch-update timestamp for status mutations so on-board
+        // `updated_at` mirrors tasks.json's pre-cutover surface.
+        let touch_at = env.timestamp.clone();
         match &env.event {
             TaskEvent::Created {
                 title,
                 description,
                 priority,
                 owner,
+                due_at,
+                depends_on,
+                routed_to,
                 ..
             } => {
                 self.tasks
@@ -377,33 +484,50 @@ impl TaskBoardState {
                         linked_prs: Vec::new(),
                         block_reason: None,
                         history: Vec::new(),
+                        created_by: env.instance.clone(),
+                        created_at: env.timestamp.clone(),
+                        updated_at: env.timestamp.clone(),
+                        due_at: due_at.clone(),
+                        depends_on: depends_on.clone(),
+                        routed_to: routed_to.clone(),
+                        result: None,
                     });
             }
             TaskEvent::Claimed { by, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::Claimed;
                     t.owner = Some(by.clone());
+                    // Claim transfers clear team-routing residue.
+                    t.routed_to = None;
+                    t.updated_at = touch_at;
                 }
             }
             TaskEvent::InProgress { by, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::InProgress;
                     t.owner = Some(by.clone());
+                    t.updated_at = touch_at;
                 }
             }
             TaskEvent::Verified { .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::Verified;
+                    t.updated_at = touch_at;
                 }
             }
-            TaskEvent::Done { .. } => {
+            TaskEvent::Done { source, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::Done;
+                    t.updated_at = touch_at;
+                    if let DoneSource::OperatorManual { result, .. } = source {
+                        t.result = result.clone();
+                    }
                 }
             }
             TaskEvent::Cancelled { .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::Cancelled;
+                    t.updated_at = touch_at;
                 }
             }
             TaskEvent::Linked { pr_id, .. } => {
@@ -411,12 +535,14 @@ impl TaskBoardState {
                     if !t.linked_prs.contains(pr_id) {
                         t.linked_prs.push(*pr_id);
                     }
+                    t.updated_at = touch_at;
                 }
             }
             TaskEvent::Blocked { reason, .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::Blocked;
                     t.block_reason = Some(reason.clone());
+                    t.updated_at = touch_at;
                 }
             }
             TaskEvent::Unblocked { .. } => {
@@ -425,11 +551,48 @@ impl TaskBoardState {
                         t.status = TaskStatus::Open;
                     }
                     t.block_reason = None;
+                    t.updated_at = touch_at;
                 }
             }
             TaskEvent::Reopened { .. } => {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::Open;
+                    // Reopened preserves owner: done→open is typically the
+                    // same person re-doing the work after CI fail / revert.
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::Released { .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.status = TaskStatus::Open;
+                    t.owner = None;
+                    t.routed_to = None;
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::TaskCloseProposed { .. } => {
+                // Proposal events are audit-only — they do NOT mutate
+                // task status. The operator-confirm path emits a real
+                // `Done` event after approval.
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.updated_at = touch_at;
+                }
+            }
+            TaskEvent::OwnerAssigned {
+                owner, routed_to, ..
+            } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.owner = owner.clone();
+                    t.routed_to = routed_to.clone();
+                    t.updated_at = touch_at;
+                    // Status NOT changed — distinct from Claimed which
+                    // sets status=Claimed.
+                }
+            }
+            TaskEvent::PriorityChanged { priority, .. } => {
+                if let Some(t) = self.tasks.get_mut(&task_id) {
+                    t.priority = priority.clone();
+                    t.updated_at = touch_at;
                 }
             }
         }
@@ -671,6 +834,9 @@ mod tests {
             description: "desc".to_string(),
             priority: "normal".to_string(),
             owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
         }
     }
 
@@ -1072,6 +1238,9 @@ mod tests {
                 description: String::new(),
                 priority: "normal".into(),
                 owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
             },
         )
         .unwrap();
@@ -1141,6 +1310,9 @@ mod tests {
                     description: String::new(),
                     priority: "normal".into(),
                     owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
                 },
                 "Claimed" => TaskEvent::Claimed {
                     task_id: tid.clone(),
@@ -1313,6 +1485,9 @@ mod tests {
                 description: String::new(),
                 priority: "normal".into(),
                 owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
             },
         )
         .unwrap();
@@ -1385,6 +1560,9 @@ mod tests {
                     description: String::new(),
                     priority: "normal".into(),
                     owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
                 },
             },
             // Sweep Linked appears BEFORE operator Claimed in file order
