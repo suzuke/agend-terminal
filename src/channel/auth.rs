@@ -90,19 +90,34 @@ impl ChannelOpKind {
 }
 
 /// Decision returned by [`evaluate_outbound_capability`] — explicit enum so
-/// callers can distinguish "permitted (configured)" from "permitted under
-/// gradual-migration grace" (the latter must emit the deprecation warn).
+/// callers can distinguish "permitted by explicit allow-list" from
+/// "permitted by default-open" (the latter is now the canonical default,
+/// not a transitional grace).
+///
+/// **Sprint 23 P1 (per operator philosophy override)** — semantics
+/// inverted from Sprint 22 P0's fail-closed default:
+/// - `outbound_capabilities` field absent → `OpenDefault` (PERMIT)
+/// - `outbound_capabilities: []` → `Rejected` (explicit opt-out, retained)
+/// - `outbound_capabilities: [reply]` → `Allowed`/`Rejected` per-op
+///
+/// The `PermissiveLegacyMissing` variant from Sprint 22 P0's hard-cut
+/// transition is renamed to `OpenDefault` to reflect that default-open is
+/// no longer a "grace" — it is the canonical posture for the single-
+/// operator threat model. Cascade attack chain doesn't apply (TUI = full
+/// machine access; operator explicit ack of the security trade-off via
+/// telegram 11:00 UTC routed through `general` m-20260427115706155870-88).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundCapabilityDecision {
     /// `outbound_capabilities` includes the requested op — proceed normally.
     Allowed,
     /// `outbound_capabilities` is set but does NOT include the op — reject.
+    /// Triggered by `Some(non_empty_list_without_op)` and by the explicit
+    /// `Some(empty_list)` opt-out.
     Rejected,
-    /// `outbound_capabilities` is `None` (config absent) — Phase 5b
-    /// gradual-migration permissive default. Caller MUST emit the
-    /// once-per-instance deprecation warn so operators see the migration
-    /// template before Sprint 22's hard-cut.
-    PermissiveLegacyMissing,
+    /// `outbound_capabilities` is `None` (field absent in fleet.yaml) —
+    /// default-open per Sprint 23 P1 reversal. Operator declares the
+    /// field only to opt out (`[]`) or restrict (selective list).
+    OpenDefault,
 }
 
 /// Pure decision: given the configured `outbound_capabilities` Vec for an
@@ -118,54 +133,22 @@ pub fn evaluate_outbound_capability(
     match capabilities {
         Some(caps) if caps.contains(&requested) => OutboundCapabilityDecision::Allowed,
         Some(_) => OutboundCapabilityDecision::Rejected,
-        None => OutboundCapabilityDecision::PermissiveLegacyMissing,
+        None => OutboundCapabilityDecision::OpenDefault,
     }
 }
 
-/// Once-per-instance deprecation-warn guard — `Channel::send_from_agent`
-/// impls call this on every `PermissiveLegacyMissing` decision; the first
-/// call per instance emits the migration template, subsequent calls log
-/// at debug level.
-///
-/// Backed by a global `Mutex<HashSet<String>>` so the once-per-process
-/// guarantee is per-instance-name, not per-call.
-pub fn warn_once_outbound_capabilities_missing(instance: &str, op: ChannelOpKind) {
-    use std::sync::Mutex;
-    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    let first_time = match seen.lock() {
-        Ok(mut set) => set.insert(instance.to_string()),
-        // Poisoned lock — fall through to "log every time" rather than
-        // silently drop the migration warn (deprecation visibility wins
-        // over log spam).
-        Err(_) => true,
-    };
-    if first_time {
-        // Sprint 22 P0 (Phase 5b hard-cut, 2-stage transition per
-        // d-20260427042738203707-13): elevated to `error!` for FATAL
-        // visibility — Sprint 23 will switch to a hard parse error.
-        // Operator MUST add the field this sprint window.
-        tracing::error!(
-            instance,
-            op = op.as_str(),
-            "FATAL (warn-but-permit one daemon cycle): instance '{instance}' \
-             outbound_capabilities NOT SET. Sprint 22 P0 grants this {op_str} call \
-             under gradual-migration grace. Sprint 23 will fail-closed (hard parse \
-             error on missing field). Add to fleet.yaml NOW:\n  \
-             instances.{instance}.outbound_capabilities: \
-             [reply, react, edit, inject_provenance]\nSee docs/USAGE.md \"Channel: \
-             Telegram\" + docs/MIGRATION-OUTBOUND-CAPS.md for details.",
-            op_str = op.as_str()
-        );
-    } else {
-        tracing::debug!(
-            instance,
-            op = op.as_str(),
-            "outbound_capabilities still not set (already warned once)"
-        );
-    }
-}
+// `warn_once_outbound_capabilities_missing` retired — Sprint 23 P1
+// reversal: missing `outbound_capabilities` is the **default-open posture**,
+// no longer a deprecation-warned migration grace. The previous Sprint 22 P0
+// FATAL `tracing::error!` line became misleading after the philosophy
+// override (operator hits the warn on every restart of a fresh fleet,
+// implying breakage where there is none). Removed entirely; the
+// [`OutboundCapabilityDecision::OpenDefault`] branch is now silent.
+//
+// Sister helper [`warn_once_user_allowlist_unconfigured`] is kept — the
+// channel-level allowlist gate is still fail-closed (different threat
+// model: notification fan-out to operator; missing allowlist drops all
+// notifications, surfacing as silent operator regression).
 
 /// Sprint 22 P1.5 (Candidate 4) — sibling of
 /// [`warn_once_outbound_capabilities_missing`] for the *channel-level*
@@ -230,26 +213,28 @@ pub fn warn_once_user_allowlist_unconfigured(channel_kind: &str, instance: &str)
     }
 }
 
-/// Sprint 22 P0 — shared `gate_outbound_for_agent` helper consumed by every
+/// Sprint 22 P0 (introduced) + Sprint 23 P1 (default-open inversion) —
+/// shared `gate_outbound_for_agent` helper consumed by every
 /// `Channel::send_from_agent` impl (Telegram + future Discord/Slack/Teams).
 ///
 /// Centralises the per-agent capability check so:
 /// 1. Future channel adapters cannot accidentally bypass the gate by
 ///    forgetting to call `evaluate_outbound_capability` in their impl.
-/// 2. The `PermissiveLegacyMissing` deprecation warn is consistent across
-///    adapters (one helper, one warn line, one migration message).
-/// 3. The (PermissiveLegacyMissing → permit + warn) branch is testable in
-///    isolation without spinning up a real channel.
+/// 2. The default-open semantic is consistent across adapters (one helper,
+///    one decision matrix, one set of error messages).
+/// 3. The (OpenDefault → permit) branch is testable in isolation without
+///    spinning up a real channel.
 ///
-/// Returns `Ok(())` when the agent is permitted to emit `op` (either
-/// explicitly listed OR under gradual-migration grace). Returns
+/// Returns `Ok(())` when the agent is permitted to emit `op` (explicitly
+/// listed OR field absent → default-open). Returns
 /// `Err(ChannelError::Other)` with a typed error message when explicitly
-/// rejected (capability list set but does NOT include `op`).
+/// rejected (capability list set but does NOT include `op`, including the
+/// `[]` opt-out).
 ///
 /// IO note: reads `<home>/fleet.yaml` on each call. For per-call frequency
 /// in production this is acceptable (operator config rarely changes
 /// mid-flight); a future hot-reload optimisation is tracked in dispatch
-/// d-20260427042738203707-13 deferred items (Sprint 23+ candidate).
+/// d-20260427042738203707-13 deferred items.
 pub fn gate_outbound_for_agent(
     home: &std::path::Path,
     agent: &str,
@@ -260,14 +245,11 @@ pub fn gate_outbound_for_agent(
         OutboundCapabilityDecision::Allowed => Ok(()),
         OutboundCapabilityDecision::Rejected => Err(super::ChannelError::Other(anyhow::anyhow!(
             "instance '{agent}' outbound_capabilities does not include '{op_str}' \
-             — add to fleet.yaml or remove the explicit list to opt into the \
-             gradual-migration permissive default",
+             — either add the op to the list, remove the entire field for default-open, \
+             or change the empty list to declare the desired ops",
             op_str = op.as_str()
         ))),
-        OutboundCapabilityDecision::PermissiveLegacyMissing => {
-            warn_once_outbound_capabilities_missing(agent, op);
-            Ok(())
-        }
+        OutboundCapabilityDecision::OpenDefault => Ok(()),
     }
 }
 
@@ -379,12 +361,26 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_outbound_capability_permissive_legacy_when_missing() {
-        // No config: gradual-migration permissive grace. Sprint 22
-        // hard-cut PR will flip this to Rejected.
+    fn evaluate_outbound_capability_open_default_when_missing() {
+        // **Sprint 23 P1 reversal** — missing `outbound_capabilities`
+        // field is the default-open posture (was `PermissiveLegacyMissing`
+        // in Sprint 22 P0 with FATAL warn). Operator declares the field
+        // only to opt out (`[]`) or restrict (selective list).
         assert_eq!(
             evaluate_outbound_capability(None, ChannelOpKind::Reply),
-            OutboundCapabilityDecision::PermissiveLegacyMissing
+            OutboundCapabilityDecision::OpenDefault
+        );
+        assert_eq!(
+            evaluate_outbound_capability(None, ChannelOpKind::React),
+            OutboundCapabilityDecision::OpenDefault
+        );
+        assert_eq!(
+            evaluate_outbound_capability(None, ChannelOpKind::Edit),
+            OutboundCapabilityDecision::OpenDefault
+        );
+        assert_eq!(
+            evaluate_outbound_capability(None, ChannelOpKind::InjectProvenance),
+            OutboundCapabilityDecision::OpenDefault
         );
     }
 
@@ -430,15 +426,9 @@ mod tests {
         assert_eq!(reparsed, parsed);
     }
 
-    #[test]
-    fn warn_once_outbound_capabilities_missing_does_not_panic() {
-        // Smoke test: helper must be re-entrant + survive concurrent calls.
-        // The actual once-per-instance behaviour is verified by reading
-        // tracing output (operator-visible), not by this unit test.
-        warn_once_outbound_capabilities_missing("test_agent_phase5b", ChannelOpKind::Reply);
-        warn_once_outbound_capabilities_missing("test_agent_phase5b", ChannelOpKind::React);
-        warn_once_outbound_capabilities_missing("another_agent", ChannelOpKind::Edit);
-    }
+    // `warn_once_outbound_capabilities_missing_does_not_panic` removed —
+    // the helper itself is gone (Sprint 23 P1 reversal: missing field is
+    // the canonical default, not a deprecation-warned grace).
 
     #[test]
     fn warn_once_user_allowlist_unconfigured_does_not_panic() {
@@ -457,5 +447,115 @@ mod tests {
         // Different channel_kind same instance is a distinct key — must
         // also not panic (covers future Discord / Slack adapter shape).
         warn_once_user_allowlist_unconfigured("discord", "test_agent_p1_5");
+    }
+
+    // ── Sprint 23 P1 — gate_outbound_for_agent default-open contract ──
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn write_fleet_yaml(home: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(home).expect("create test home dir");
+        std::fs::write(home.join("fleet.yaml"), body).expect("write fleet.yaml fixture");
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-auth-gate-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        std::fs::create_dir_all(&dir).expect("create tmp dir");
+        dir
+    }
+
+    /// Sprint 23 P1 — missing `outbound_capabilities` field permits
+    /// every op (default-open per operator philosophy override).
+    #[test]
+    fn gate_outbound_for_agent_missing_field_returns_permitted() {
+        let home = tmp_home("gate_missing");
+        write_fleet_yaml(
+            &home,
+            r#"
+instances:
+  alpha:
+    backend: claude
+"#,
+        );
+        for op in [
+            ChannelOpKind::Reply,
+            ChannelOpKind::React,
+            ChannelOpKind::Edit,
+            ChannelOpKind::InjectProvenance,
+        ] {
+            assert!(
+                gate_outbound_for_agent(&home, "alpha", op).is_ok(),
+                "default-open: missing outbound_capabilities must permit {op:?}"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Sprint 23 P1 — explicit `outbound_capabilities: []` rejects all
+    /// ops (operator opt-out preserved). Distinct from missing field.
+    #[test]
+    fn gate_outbound_for_agent_empty_list_rejects_all_ops() {
+        let home = tmp_home("gate_empty");
+        write_fleet_yaml(
+            &home,
+            r#"
+instances:
+  alpha:
+    backend: claude
+    outbound_capabilities: []
+"#,
+        );
+        for op in [
+            ChannelOpKind::Reply,
+            ChannelOpKind::React,
+            ChannelOpKind::Edit,
+            ChannelOpKind::InjectProvenance,
+        ] {
+            let err = gate_outbound_for_agent(&home, "alpha", op).err();
+            assert!(
+                err.is_some(),
+                "explicit empty list opt-out must reject {op:?}, got Ok"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Sprint 23 P1 — explicit selective list permits only the listed
+    /// ops; everything else rejected.
+    #[test]
+    fn gate_outbound_for_agent_selective_list_permits_only_listed() {
+        let home = tmp_home("gate_selective");
+        write_fleet_yaml(
+            &home,
+            r#"
+instances:
+  alpha:
+    backend: claude
+    outbound_capabilities: [reply]
+"#,
+        );
+        assert!(
+            gate_outbound_for_agent(&home, "alpha", ChannelOpKind::Reply).is_ok(),
+            "selective list must permit listed op"
+        );
+        for op in [
+            ChannelOpKind::React,
+            ChannelOpKind::Edit,
+            ChannelOpKind::InjectProvenance,
+        ] {
+            assert!(
+                gate_outbound_for_agent(&home, "alpha", op).is_err(),
+                "selective list must reject unlisted op {op:?}"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }

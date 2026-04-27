@@ -237,14 +237,12 @@ pub trait Channel: Send + Sync {
     ///
     /// Implementations must:
     /// 1. Check [`Self::outbound_authorized`] (PR #216 allowlist gate).
-    /// 2. Look up the per-agent `outbound_capabilities` config from
-    ///    `fleet.yaml` and consult
-    ///    [`auth::evaluate_outbound_capability`].
-    /// 3. On `PermissiveLegacyMissing`, call
-    ///    [`auth::warn_once_outbound_capabilities_missing`] (gradual
-    ///    migration: permit + warn; Sprint 22 hard-cut PR flips to
-    ///    reject).
-    /// 4. Dispatch to the platform-specific send.
+    /// 2. Call [`auth::gate_outbound_for_agent`] which loads per-agent
+    ///    `outbound_capabilities` from fleet.yaml and resolves the
+    ///    decision (Allowed / Rejected / OpenDefault per Sprint 23 P1
+    ///    default-open semantics — missing field permits all ops, `[]`
+    ///    rejects all, selective list permits only listed).
+    /// 3. Dispatch to the platform-specific send.
     ///
     /// Default: `Err(NotSupported)` so adapters that haven't opted in
     /// fail closed.
@@ -327,10 +325,12 @@ pub fn gated_notify(
         // `RUST_LOG=info` so operators didn't see the gate firing when
         // stall / crash / CI notices were silently dropped.
         // `warn_once_user_allowlist_unconfigured` upgrades to FATAL
-        // (`error!`) once-per-channel:instance pair, mirroring P0's
-        // `warn_once_outbound_capabilities_missing` shape so operators
-        // see the same operator-actionable copy-paste fleet.yaml
-        // stanza regardless of which gate fired.
+        // (`error!`) once-per-channel:instance pair so operators see an
+        // operator-actionable copy-paste fleet.yaml stanza when the
+        // allowlist is unconfigured. Sprint 23 P1 retired the
+        // outbound-caps sister helper because that gate is now default-
+        // open; the channel-level allowlist gate is still fail-closed
+        // (different threat model — silent notification fan-out).
         auth::warn_once_user_allowlist_unconfigured(channel.kind(), instance);
         return Ok(());
     }

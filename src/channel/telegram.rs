@@ -2157,14 +2157,14 @@ impl crate::channel::Channel for TelegramChannel {
     ///    if the operator has not configured `user_allowlist`, drop
     ///    everything (PR #216 contract).
     /// 2. Per-agent capability lookup —
-    ///    [`crate::channel::auth::evaluate_outbound_capability`]:
-    ///    - `Allowed` → dispatch to internal `try_telegram_*_from`
-    ///    - `Rejected` → return `Err(ChannelError::Other)` with
-    ///      operator-readable message
-    ///    - `PermissiveLegacyMissing` → emit once-per-instance
-    ///      deprecation warn via
-    ///      [`crate::channel::auth::warn_once_outbound_capabilities_missing`],
-    ///      then proceed (Sprint 22 hard-cut PR will flip).
+    ///    [`crate::channel::auth::gate_outbound_for_agent`]:
+    ///    - `OutboundCapabilityDecision::Allowed` → dispatch
+    ///    - `OutboundCapabilityDecision::Rejected` → typed error
+    ///    - `OutboundCapabilityDecision::OpenDefault` → dispatch (Sprint
+    ///      23 P1 default-open: missing `outbound_capabilities` is the
+    ///      canonical posture for the single-operator threat model;
+    ///      operator declares the field only to opt out via `[]` or
+    ///      restrict via selective list).
     fn send_from_agent(
         &self,
         agent: &str,

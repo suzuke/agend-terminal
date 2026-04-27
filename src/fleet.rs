@@ -171,35 +171,35 @@ pub struct InstanceConfig {
     /// proxies like `general` where broadcast markers read as noise.
     pub receive_fleet_updates: Option<bool>,
     /// Per-instance agent-callable outbound operations gate
-    /// (Sprint 21 Phase 5b → Sprint 22 P0 hard-cut transition).
+    /// (Sprint 21 Phase 5b → Sprint 22 P0 hard-cut → **Sprint 23 P1
+    /// default-open reversal** per operator philosophy override).
     ///
-    /// **2-stage transition** (per dispatch d-20260427042738203707-13):
+    /// **Current contract** (Sprint 23 P1):
     ///
-    /// | State | Sprint 22 P0 (this sprint) | Sprint 23 (planned) |
-    /// |---|---|---|
-    /// | `Some([reply, …])` | only listed ops permitted | same |
-    /// | `Some([])` | fail-closed (no agent outbound; explicit) | same |
-    /// | `None` (absent) | **FATAL warn-then-permit one daemon cycle** | hard parse error |
+    /// | State | Behaviour |
+    /// |---|---|
+    /// | `Some([reply, …])` | only listed ops permitted |
+    /// | `Some([])` | all ops rejected (explicit opt-out, retained) |
+    /// | `None` (absent) | **default-open: all ops permitted** |
     ///
-    /// **Built-in instances** (`general` and future auto-created coordinators)
-    /// receive `[reply, react, edit, inject_provenance]` automatically via
-    /// `bootstrap::fleet_normalize::auto_create_general` — operator never
-    /// has to author this field for first-class fleet members.
+    /// **Why default-open**: single-operator threat model. The TUI is
+    /// already full machine access; the cascade-attack-chain defence
+    /// from Sprint 22 P0 was over-spec for the actual deployment shape.
+    /// Operator explicitly accepts the security trade-off (telegram 11:00
+    /// UTC routed via general m-20260427115706155870-88 →
+    /// `t-20260427115754474312-3`).
     ///
-    /// **User-yaml entries** (any instance not auto-injected) are forced
-    /// explicit. The Sprint 22 transition window emits a FATAL log via
-    /// `crate::channel::auth::warn_once_outbound_capabilities_missing`
-    /// when the field is absent — operators MUST add the field this sprint
-    /// or Sprint 23 will refuse to load fleet.yaml.
-    ///
-    /// **Migration**: see `docs/MIGRATION-OUTBOUND-CAPS.md` for operator-
-    /// facing transition guide and `docs/USAGE.md` "Channel: Telegram"
-    /// section for fleet.yaml stanza examples.
+    /// **Migration**: see `docs/MIGRATION-OUTBOUND-CAPS.md` for the
+    /// operator-facing transition guide (now includes the Sprint 23 P1
+    /// reversal section) and `docs/USAGE.md` "Channel: Telegram"
+    /// section for fleet.yaml stanza examples (opt-out / restrict).
     ///
     /// **Daemon notify** (PR #216 fail-closed gate at supervisor.rs /
-    /// ci_watch.rs notify call sites) remains independent of this field —
-    /// `outbound_capabilities` only gates **agent-callable** MCP→Channel
-    /// ops, not daemon-internal stall/recovery/CI notifications.
+    /// ci_watch.rs notify call sites) remains fail-closed — different
+    /// threat model: notification fan-out to operator. Missing
+    /// `user_allowlist` still drops every notification, surfacing as a
+    /// silent operator regression unless `warn_once_user_allowlist_unconfigured`
+    /// fires.
     #[serde(default)]
     pub outbound_capabilities: Option<Vec<crate::channel::auth::ChannelOpKind>>,
 }
