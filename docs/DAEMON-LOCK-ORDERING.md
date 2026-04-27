@@ -8,6 +8,14 @@ supervisor tick + MCP handler load.
 **Maintained**: alongside `tests/heartbeat_pair_atomicity_audit.rs`
 invariant test (Sprint 23 P0 anti-bypass).
 
+**Scope** (Sprint 23 P0 r2 F4 clarification): locks acquired in the
+daemon's runtime hot path (supervisor tick + MCP handler dispatch + agent
+lifecycle). Startup-only locks (`identity::LOCK`,
+`fleet_normalize::WARNED`), cleanup-only locks
+(`worktree_cleanup::ENV_LOCK`), and test-fixture locks are out of scope —
+their non-runtime nature avoids the concurrent-acquisition class this doc
+addresses.
+
 ---
 
 ## Hierarchy (acquire in this order; release in reverse)
@@ -39,6 +47,10 @@ Level 2 (storage / transactional):
 Level 3 (leaf-level):
   heartbeat_pair (per-agent) — `Mutex<HeartbeatPair>`
                               (`crate::daemon::heartbeat_pair::pair_for`)
+  heartbeat_pair_registry    — outer `Mutex<HashMap<String, Arc<…>>>`
+                              (`crate::daemon::heartbeat_pair::registry`).
+                              Brief-acquire-only inside `pair_for()`;
+                              never held across pair-lock acquisitions.
   TelegramState              — `Arc<Mutex<TelegramState>>`
                               (`crate::channel::telegram::lock_state`)
   channel sink registry      — `Mutex<Vec<Arc<dyn UxEventSink>>>`
@@ -65,7 +77,30 @@ Level 3 (leaf-level):
 4. **No cross-instance lock chaining at Level 1+**: holding agent A's
    `core` lock while acquiring agent B's `core` is forbidden (not a
    common case but documented for completeness — future fleet-broadcast
-   refactor must observe this).
+   refactor must observe this). (Within-instance contention on the same
+   Level 1 lock is standard Mutex queueing — first acquirer wins, second
+   blocks; no deadlock risk because there's no cycle.)
+
+---
+
+## Why these rules prevent deadlock
+
+(Sprint 23 P0 r2 F1 — explicit deadlock-prevention proof sketch per
+dev-reviewer-2 cross-vantage demand.)
+
+Deadlock requires a cycle in the lock-acquisition graph (thread A waits
+on lock X held by thread B, thread B waits on lock Y held by thread A).
+Rule 1 (top-down) forces every thread to acquire locks in the same
+partial order Level 0 → Level 1 → Level 2 → Level 3 — eliminating
+cross-level back-edges. Rule 3 (leaf never held during another
+acquisition) collapses Level 3 to brief-acquire-immediate-release,
+eliminating leaf locks from the acquisition-edge graph entirely. Rule 2
+(drop before climbing) prevents accidental violations of Rule 1 by code
+paths that need to re-enter root locks. Rule 4 (no cross-instance
+Level 1) prevents intra-level cycles when two threads operate on
+different agents. Composition: every thread's lock-acquisition trace is
+a strictly-increasing total order over levels, with leaf locks acting
+only as instantaneous-release sinks → no cycle possible → deadlock-free.
 
 ---
 
