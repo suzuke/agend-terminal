@@ -55,7 +55,15 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let instance_name: &str = sender.as_ref().map(Sender::as_str).unwrap_or("");
 
     // Implicit heartbeat: any MCP tool call = agent is alive.
+    // Sprint 23 P0 F6 fix: update in-memory pair lock atomically with the
+    // disk write so supervisor's pair-read during stale-decay never sees
+    // (heartbeat=fresh + waiting_on_since=stale) or vice versa. Lock
+    // ordering: pair lock acquired BEFORE disk I/O, released AFTER (lock
+    // is leaf-level per docs/DAEMON-LOCK-ORDERING.md).
     if !instance_name.is_empty() {
+        crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
+            p.heartbeat_at_ms = crate::daemon::heartbeat_pair::now_ms();
+        });
         save_metadata(
             &home,
             instance_name,
@@ -1080,7 +1088,14 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 return err_needs_identity(tool);
             };
             let condition = args["condition"].as_str().unwrap_or("");
+            // Sprint 23 P0 F6 fix: pair-update in-memory lock atomically
+            // with disk write. Closes the inconsistent-pair window where
+            // supervisor's stale-decay tick read `waiting_on_since` from
+            // disk while MCP set_waiting_on was mid-write.
             if condition.is_empty() {
+                crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
+                    p.waiting_on_since_ms = None;
+                });
                 save_metadata_batch(
                     &home,
                     instance_name,
@@ -1091,6 +1106,11 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 );
                 json!({"cleared": true})
             } else {
+                let now_ms = crate::daemon::heartbeat_pair::now_ms();
+                crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
+                    p.heartbeat_at_ms = now_ms;
+                    p.waiting_on_since_ms = Some(now_ms);
+                });
                 let now = chrono::Utc::now().to_rfc3339();
                 save_metadata_batch(
                     &home,

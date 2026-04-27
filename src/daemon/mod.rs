@@ -3,9 +3,11 @@
 
 pub(crate) mod ci_watch;
 pub(crate) mod cron_tick;
+pub(crate) mod heartbeat_pair;
 pub(crate) mod lifecycle;
 pub(crate) mod poll_reminder;
 pub(crate) mod supervisor;
+pub(crate) mod ticker;
 mod tui_bridge;
 pub(crate) mod watchdog;
 

@@ -56,7 +56,22 @@ fn instance_exists(home: &Path, name: &str) -> bool {
 
 /// Check if caller is allowed to mutate a task (assignee or orchestrator).
 /// Unassigned tasks can be mutated by anyone.
-fn can_mutate_task(home: &Path, caller: &str, task: &Task) -> bool {
+///
+/// Sprint 23 P0: promoted from `fn` to `pub fn` to mirror
+/// `decisions::can_mutate_decision` (PR #220, Sprint 21 Phase 2 D1). Public
+/// visibility lets external auditors / tests verify the predicate without
+/// going through `mutate_versioned`. Race-free invocation requires calling
+/// from inside `mutate_versioned`'s locked closure (existing internal
+/// callers at the `done` / `update` arms already do this).
+///
+/// **TOCTOU caveat** (Sprint 23 P0 r2 M2 doc strengthening): external
+/// callers using read-only checks for diagnostics or tests are fine; callers
+/// wanting to **act on the result** MUST do so inside `mutate_versioned`'s
+/// locked closure to avoid time-of-check-to-time-of-use race on the
+/// `assignee` field. A separate process / thread can change `assignee`
+/// between an out-of-lock predicate call and a follow-up mutation, voiding
+/// the gate.
+pub fn can_mutate_task(home: &Path, caller: &str, task: &Task) -> bool {
     match &task.assignee {
         None => true,
         Some(assignee) => {
@@ -426,6 +441,121 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    /// Sprint 23 P0 r2 F2 helper — minimal Task with assignee for
+    /// `can_mutate_task` predicate tests. Mirrors decisions.rs
+    /// `make_test_decision` fixture pattern.
+    fn make_test_task(assignee: Option<&str>) -> Task {
+        Task {
+            id: "t-test-fixture".into(),
+            title: "fixture".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: "normal".into(),
+            assignee: assignee.map(String::from),
+            routed_to: None,
+            created_by: "test".into(),
+            depends_on: Vec::new(),
+            result: None,
+            created_at: "2026-04-27T00:00:00Z".into(),
+            updated_at: "2026-04-27T00:00:00Z".into(),
+            due_at: None,
+        }
+    }
+
+    // Sprint 23 P0 r2 F2 (dev-reviewer-2 most-material): mirror
+    // `decisions::can_mutate_decision` test coverage onto
+    // `tasks::can_mutate_task`. Decisions added 5 dedicated unit tests
+    // (PR #220 Sprint 21 Phase 2 D1); tasks shipped the predicate
+    // pub-promotion in Sprint 23 P0 with zero direct unit coverage —
+    // closed here. Behavioural mirror of the Phase 2 D1 operator-pitfall
+    // gate.
+
+    #[test]
+    fn can_mutate_task_assignee_match() {
+        let home = tmp_home("can_mutate_assignee");
+        let task = make_test_task(Some("dev-impl-2"));
+        assert!(can_mutate_task(&home, "dev-impl-2", &task));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Sprint 23 P0 r2 F2 helper — populate `teams.json` store directly
+    /// (bypassing `teams::create` which validates fleet membership). Mirrors
+    /// the in-memory shape `crate::teams::TeamStore` deserialises from disk.
+    fn write_teams_store(home: &std::path::Path, teams_json: &str) {
+        std::fs::write(home.join("teams.json"), teams_json).expect("write teams.json");
+    }
+
+    #[test]
+    fn can_mutate_task_orchestrator_of_assignee() {
+        // dev-lead is the orchestrator of the "dev" team; "dev-impl-2"
+        // belongs to that team. Cross-team orchestrator path → pass.
+        let home = tmp_home("can_mutate_orchestrator");
+        write_teams_store(
+            &home,
+            r#"{"schema_version":1,"teams":[{"name":"dev","members":["dev-lead","dev-impl-2"],"orchestrator":"dev-lead","description":null,"created_at":"2026-04-27T00:00:00Z"}]}"#,
+        );
+        let task = make_test_task(Some("dev-impl-2"));
+        assert!(
+            can_mutate_task(&home, "dev-lead", &task),
+            "orchestrator of assignee's team must be allowed to mutate"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn can_mutate_task_team_assignee_orchestrator() {
+        // Task-specific path absent in decisions: assignee is a team
+        // NAME (not an instance). The team's orchestrator must be
+        // allowed to mutate even though their name doesn't match
+        // `task.assignee`.
+        let home = tmp_home("can_mutate_team_assignee");
+        write_teams_store(
+            &home,
+            r#"{"schema_version":1,"teams":[{"name":"dev","members":["dev-lead","dev-impl-2"],"orchestrator":"dev-lead","description":null,"created_at":"2026-04-27T00:00:00Z"}]}"#,
+        );
+        let task = make_test_task(Some("dev")); // assignee = team name
+        assert!(
+            can_mutate_task(&home, "dev-lead", &task),
+            "team orchestrator must mutate task assigned to team name"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn can_mutate_task_unassigned_returns_true() {
+        // Task-specific branch absent in decisions: unassigned tasks
+        // (`assignee = None`) are open to mutation by anyone — the gate
+        // returns `true` regardless of caller. Lock the contract so
+        // future refactor doesn't accidentally tighten this.
+        let home = tmp_home("can_mutate_unassigned");
+        let task = make_test_task(None);
+        assert!(can_mutate_task(&home, "anyone", &task));
+        assert!(can_mutate_task(&home, "even-fleet-stranger", &task));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn can_mutate_task_string_compare_no_numeric_coerce() {
+        // Operator-pitfall regression mirror (decisions test of same
+        // name): caller string vs assignee. `Task.assignee` is
+        // `Option<String>` (e.g. "dev-impl-1"); the gate compares
+        // strings, never parses an int. Verify alphabetically-similar
+        // but non-equal callers do NOT pass, and that numeric-suffixed
+        // names compare verbatim.
+        let home = tmp_home("can_mutate_string_compare");
+        let task = make_test_task(Some("dev-impl-1"));
+        // Exact string match — passes.
+        assert!(can_mutate_task(&home, "dev-impl-1", &task));
+        // Suffix mismatch — rejects (no int coerce to "1 == 1").
+        assert!(!can_mutate_task(&home, "dev-impl-2", &task));
+        // Bare numeric caller — rejects (would only "match" under int
+        // coerce path, which we explicitly do not have).
+        assert!(!can_mutate_task(&home, "1", &task));
+        // Substring of assignee — rejects (no prefix-match path).
+        assert!(!can_mutate_task(&home, "dev-impl", &task));
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
