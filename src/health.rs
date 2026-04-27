@@ -46,6 +46,14 @@ pub enum HealthState {
     Failed,
     Hung,
     ErrorLoop,
+    /// Sprint 24 P1 (F-NEW-DAEMON-HEALTH-CLASSIFIER-1): agent is silent
+    /// past the hang threshold but **no input is pending past last
+    /// response** — typically `Ready` state waiting for next dispatch.
+    /// Cron escalation chains (`interrupt` / `tool_kill` / `replace`)
+    /// MUST NOT trigger on this state; only `Hung` is escalation-worthy.
+    /// Closes the operator 04:00 UTC false-alarm pattern where impl-1's
+    /// 30-min idle-waiting was mis-classified as `Hung`.
+    IdleLong,
 }
 
 impl HealthState {
@@ -57,6 +65,7 @@ impl HealthState {
             Self::Failed => "failed",
             Self::Hung => "hung",
             Self::ErrorLoop => "error_loop",
+            Self::IdleLong => "idle_long",
         }
     }
 }
@@ -187,7 +196,26 @@ impl HealthTracker {
     /// Takes `silent` as a plain `Duration` (rather than `Instant::elapsed()`
     /// internally) so tests can construct arbitrary durations without
     /// overflowing on platforms where `Instant` is boot-anchored (Windows).
-    pub fn check_hang(&mut self, agent_state: AgentState, silent: Duration) -> bool {
+    ///
+    /// **Sprint 24 P1 (F-NEW-DAEMON-HEALTH-CLASSIFIER-1)** added the
+    /// `last_input_at_ms` + `last_heartbeat_at_ms` parameters from the
+    /// per-instance [`crate::daemon::heartbeat_pair::HeartbeatPair`]
+    /// snapshot to discriminate "idle waiting (no input pending)" from
+    /// "hung unresponsive (input pending past last response)". Pass `0`
+    /// for both in test contexts where the caller only wants legacy
+    /// silence-based hang detection (back-compat with existing tests).
+    ///
+    /// Returns `true` ONLY when transitioning **into** [`HealthState::Hung`]
+    /// (the escalation-worthy state). [`HealthState::IdleLong`] transitions
+    /// return `false` so cron escalation consumers (interrupt / tool_kill
+    /// / replace) keep their existing semantics — they only act on `Hung`.
+    pub fn check_hang(
+        &mut self,
+        agent_state: AgentState,
+        silent: Duration,
+        last_input_at_ms: u64,
+        last_heartbeat_at_ms: u64,
+    ) -> bool {
         // Race mutex: skip hang check when agent is blocked for a known
         // reason that legitimately suppresses output.
         if let Some(ref reason) = self.current_reason {
@@ -201,19 +229,65 @@ impl HealthTracker {
             }
         }
 
-        let is_hang = match agent_state {
-            AgentState::Idle => false, // Waiting for input
+        let silence_exceeds_threshold = match agent_state {
+            AgentState::Idle => false, // Waiting for input — never hangs
             AgentState::Starting => silent > Duration::from_secs(120),
             AgentState::Thinking | AgentState::ToolUse => silent > Duration::from_secs(600),
             _ => silent > Duration::from_secs(120),
         };
 
-        if is_hang && self.state != HealthState::Hung {
-            self.state = HealthState::Hung;
-            return true; // First hang detection
+        if !silence_exceeds_threshold {
+            // Recovering from a previous Hung/IdleLong → back to Healthy.
+            if matches!(self.state, HealthState::Hung | HealthState::IdleLong) {
+                self.state = HealthState::Healthy;
+            }
+            return false;
         }
-        if !is_hang && self.state == HealthState::Hung {
-            self.state = HealthState::Healthy;
+
+        // Sprint 24 P1 discriminator: input pending past last response
+        // (heartbeat) → real Hung. Otherwise (no input pending OR input
+        // already responded to) → IdleLong (no escalation).
+        //
+        // Grace window prevents flapping when input arrives 1-tick before
+        // the heartbeat write completes. 5s mirrors typical MCP roundtrip
+        // upper-bound for a non-busy agent.
+        const INPUT_RESPONSE_GRACE_MS: u64 = 5_000;
+        let input_pending_past_response = last_input_at_ms > 0
+            && last_input_at_ms > last_heartbeat_at_ms.saturating_add(INPUT_RESPONSE_GRACE_MS);
+
+        if input_pending_past_response {
+            // Real hung: input was delivered but agent has not responded
+            // (no MCP call to refresh heartbeat). Operator-facing log
+            // includes delta diagnostic per self-diagnostic pattern (PR #241
+            // praise pattern transfer).
+            let delta_ms = last_input_at_ms.saturating_sub(last_heartbeat_at_ms);
+            tracing::warn!(
+                last_input_at_ms,
+                last_heartbeat_at_ms,
+                input_response_delta_ms = delta_ms,
+                silent_secs = silent.as_secs(),
+                agent_state = ?agent_state,
+                "agent classified Hung — input pending {delta_ms}ms past last heartbeat (escalation-worthy)"
+            );
+            if self.state != HealthState::Hung {
+                self.state = HealthState::Hung;
+                return true; // First hang detection — caller escalates
+            }
+            return false;
+        }
+
+        // No input pending past response → idle waiting (operator 04:00
+        // UTC false-alarm pattern). Mark IdleLong so consumers can
+        // distinguish from Hung but cron escalation MUST NOT trigger.
+        if self.state != HealthState::IdleLong {
+            tracing::debug!(
+                last_input_at_ms,
+                last_heartbeat_at_ms,
+                silent_secs = silent.as_secs(),
+                agent_state = ?agent_state,
+                "agent classified IdleLong — silent past threshold but no input pending (no escalation)"
+            );
+            self.state = HealthState::IdleLong;
         }
         false
     }
@@ -374,14 +448,16 @@ mod tests {
     #[test]
     fn test_hang_idle_exempt() {
         let mut h = HealthTracker::new();
-        assert!(!h.check_hang(AgentState::Idle, Duration::from_secs(300))); // Idle never hangs
+        assert!(!h.check_hang(AgentState::Idle, Duration::from_secs(300), 1_000_000, 0));
+        // Idle never hangs
     }
 
     #[test]
     fn test_hang_thinking_long_timeout() {
         let mut h = HealthTracker::new();
-        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(100))); // 100s < 600s
-        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700))); // 700s > 600s
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(100), 1_000_000, 0)); // 100s < 600s
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
+        // 700s > 600s
     }
 
     #[test]
@@ -476,22 +552,22 @@ mod tests {
             retry_after_secs: Some(60),
         });
         // Thinking + 700s silence would normally trigger hang
-        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
         assert_ne!(h.state, HealthState::Hung);
 
         // Also test QuotaExceeded and AwaitingOperator
         h.clear_blocked_reason();
         h.set_blocked_reason(BlockedReason::QuotaExceeded);
-        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
 
         h.clear_blocked_reason();
         h.set_blocked_reason(BlockedReason::AwaitingOperator);
-        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
 
         // PermissionPrompt does NOT suppress hang check
         h.clear_blocked_reason();
         h.set_blocked_reason(BlockedReason::PermissionPrompt);
-        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
     }
 
     #[test]
@@ -500,10 +576,10 @@ mod tests {
         h.set_blocked_reason(BlockedReason::RateLimit {
             retry_after_secs: None,
         });
-        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
 
         h.clear_blocked_reason();
-        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
         assert_eq!(h.state, HealthState::Hung);
     }
 
@@ -546,7 +622,7 @@ mod tests {
         );
 
         // check_hang should still fire (no reason set)
-        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
     }
 
     #[test]
@@ -564,7 +640,7 @@ mod tests {
             h.current_reason
         );
         // check_hang should be suppressed
-        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
     }
 
     #[test]
@@ -577,7 +653,7 @@ mod tests {
         assert!(reason.is_none(), "healthy output should not classify");
         assert!(h.current_reason.is_none());
         // check_hang still works normally
-        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700)));
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(700), 1_000_000, 0));
     }
 
     #[test]
@@ -590,5 +666,127 @@ mod tests {
             h.current_reason.is_none(),
             "reset must clear current_reason"
         );
+    }
+
+    // Sprint 24 P1 (F-NEW-DAEMON-HEALTH-CLASSIFIER-1) — IdleLong vs Hung
+    // discriminator tests. Closes operator 04:00 UTC false-alarm pattern.
+
+    #[test]
+    fn classifier_returns_hung_when_input_pending_past_response() {
+        // Real hung: input delivered at T+5s, agent has not responded
+        // (heartbeat still at T+0). Silence exceeds threshold. Classifier
+        // must return true (escalation-worthy) and set state = Hung.
+        let mut h = HealthTracker::new();
+        // last_input_at_ms past last_heartbeat_at_ms by > 5s grace.
+        let result = h.check_hang(
+            AgentState::Ready,
+            Duration::from_secs(180), // > 120s threshold
+            10_000,                   // input delivered at T+10s
+            0,                        // no heartbeat (or T-0)
+        );
+        assert!(result, "input pending past response → Hung, return true");
+        assert_eq!(h.state, HealthState::Hung);
+    }
+
+    #[test]
+    fn classifier_returns_idle_long_when_no_input_pending() {
+        // Operator 04:00 UTC pattern: agent silent past threshold but NO
+        // input was delivered (last_input_at_ms == 0). Classifier must
+        // mark IdleLong (no escalation) and return false.
+        let mut h = HealthTracker::new();
+        let result = h.check_hang(
+            AgentState::Ready,
+            Duration::from_secs(180), // > 120s threshold
+            0,                        // no input ever delivered
+            5_000,                    // heartbeat at T+5s (some past activity)
+        );
+        assert!(!result, "no input pending → IdleLong, no escalation");
+        assert_eq!(
+            h.state,
+            HealthState::IdleLong,
+            "must be IdleLong, NOT Hung — operator 04:00 UTC false-alarm pattern"
+        );
+    }
+
+    #[test]
+    fn classifier_returns_idle_long_when_input_already_responded_to() {
+        // Input delivered at T+0, agent responded at T+8s (heartbeat
+        // refreshed). Silence then accrues. Last_input < last_heartbeat
+        // → no input pending → IdleLong (NOT Hung).
+        let mut h = HealthTracker::new();
+        let result = h.check_hang(
+            AgentState::Ready,
+            Duration::from_secs(180),
+            0,     // input at T+0
+            8_000, // heartbeat at T+8s (already responded)
+        );
+        assert!(!result, "input already responded → IdleLong");
+        assert_eq!(h.state, HealthState::IdleLong);
+    }
+
+    #[test]
+    fn classifier_returns_healthy_when_silence_below_threshold() {
+        // Fresh agent: silent < threshold. Classifier returns Healthy
+        // regardless of input/heartbeat data.
+        let mut h = HealthTracker::new();
+        let result = h.check_hang(
+            AgentState::Ready,
+            Duration::from_secs(60), // < 120s threshold
+            10_000,
+            0,
+        );
+        assert!(!result);
+        assert_eq!(h.state, HealthState::Healthy);
+    }
+
+    #[test]
+    fn classifier_idle_long_recovers_to_healthy_when_activity_resumes() {
+        // Agent enters IdleLong at T+180s silent. Then activity resumes
+        // (silent drops below threshold). State must transition back to
+        // Healthy so future cron consumers don't see stale IdleLong.
+        let mut h = HealthTracker::new();
+        h.check_hang(AgentState::Ready, Duration::from_secs(180), 0, 5_000);
+        assert_eq!(h.state, HealthState::IdleLong);
+        // Activity resumes → silence < threshold.
+        let result = h.check_hang(AgentState::Ready, Duration::from_secs(30), 0, 5_000);
+        assert!(!result);
+        assert_eq!(
+            h.state,
+            HealthState::Healthy,
+            "IdleLong must recover to Healthy when silence drops"
+        );
+    }
+
+    #[test]
+    fn classifier_grace_window_prevents_flap() {
+        // last_input at T+5s, last_heartbeat at T+0. Delta = 5_000ms = exactly
+        // the grace window. Must NOT flag Hung — within grace.
+        let mut h = HealthTracker::new();
+        let result = h.check_hang(
+            AgentState::Ready,
+            Duration::from_secs(180),
+            5_000, // input
+            0,     // heartbeat — delta exactly 5_000ms
+        );
+        assert!(
+            !result,
+            "delta == grace window → not yet Hung (boundary inclusive)"
+        );
+        // delta = 5_001 > grace → Hung
+        let result2 = h.check_hang(AgentState::Ready, Duration::from_secs(180), 5_001, 0);
+        assert!(result2, "delta > grace → Hung");
+    }
+
+    #[test]
+    fn classifier_hung_state_returns_false_on_subsequent_calls() {
+        // First Hung detection returns true (caller escalates). Second
+        // call with same state must return false (already escalated;
+        // avoid duplicate escalation).
+        let mut h = HealthTracker::new();
+        assert!(h.check_hang(AgentState::Ready, Duration::from_secs(180), 10_000, 0));
+        assert_eq!(h.state, HealthState::Hung);
+        // Same conditions next tick → no re-escalation.
+        assert!(!h.check_hang(AgentState::Ready, Duration::from_secs(180), 10_000, 0));
+        assert_eq!(h.state, HealthState::Hung);
     }
 }

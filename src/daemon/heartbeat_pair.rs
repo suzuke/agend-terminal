@@ -39,14 +39,33 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Paired in-memory heartbeat state — readers see consistent snapshot at
 /// lock acquisition time.
+///
+/// Sprint 24 P1 (F-NEW-DAEMON-HEALTH-CLASSIFIER-1) extended the pair with
+/// `last_input_at_ms` so the daemon health classifier can distinguish
+/// "idle waiting (no input pending)" from "hung unresponsive (input
+/// pending but no response)". Operator 04:00 UTC false-alarm scenario:
+/// dev-impl-1 idle 30 min in `Ready` was flagged `Hung` because the
+/// classifier only knew silence — adding the input-vs-heartbeat delta
+/// fixes the discrimination without breaking existing `Hung`-state
+/// consumers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HeartbeatPair {
     /// Last heartbeat timestamp, epoch ms. `0` = never recorded (agent
-    /// just spawned, or pre-Sprint 23 backfill not applied).
+    /// just spawned, or pre-Sprint 23 backfill not applied). Updated by
+    /// every MCP tool call (implicit heartbeat) and by
+    /// `set_waiting_on` set-side.
     pub heartbeat_at_ms: u64,
     /// When the agent's current `waiting_on` started, epoch ms. `None` =
     /// not waiting (cleared OR never set).
     pub waiting_on_since_ms: Option<u64>,
+    /// Sprint 24 P1: last time the daemon delivered input/inbox
+    /// notification to this agent's PTY, epoch ms. `0` = never (agent
+    /// just spawned). Drives the
+    /// [`crate::health::HealthTracker::check_hang`] discriminator
+    /// between `IdleLong` (no input pending → not escalation-worthy)
+    /// and `Hung` (input pending past response → real hung). Updated by
+    /// `inbox::notify_agent` central inject site.
+    pub last_input_at_ms: u64,
 }
 
 /// Per-instance lock registry. Keys are agent names (per
