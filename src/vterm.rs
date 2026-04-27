@@ -10,6 +10,10 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+/// Fallback cell for snapshot out-of-bounds (should never happen, but
+/// defense-in-depth against arithmetic bugs in snapshot indexing).
+static DEFAULT_CELL: std::sync::OnceLock<Cell> = std::sync::OnceLock::new();
+
 /// Bounds-checked grid cell access. Returns a blank default cell when the
 /// column index exceeds the grid's current width — prevents panics during
 /// resize races where `self.cols` diverges from `grid.columns()`.
@@ -19,11 +23,7 @@ fn safe_cell(grid: &alacritty_terminal::grid::Grid<Cell>, line: Line, col: usize
     if col < grid.columns() && (line.0 as usize) < grid.screen_lines() {
         &grid[Point::new(line, Column(col))]
     } else {
-        // Leak a static default cell — this is a cold path (resize race).
-        // The alternative (returning Option) would require changing every
-        // call site's control flow.
-        static DEFAULT: std::sync::OnceLock<Cell> = std::sync::OnceLock::new();
-        DEFAULT.get_or_init(Cell::default)
+        DEFAULT_CELL.get_or_init(Cell::default)
     }
 }
 
@@ -198,15 +198,35 @@ impl VTerm {
         // index.
         let offset: i32 = scroll_offset.min(i32::MAX as usize) as i32;
 
+        // L1 atomic snapshot: copy visible cells into a local buffer so
+        // concurrent PTY resize cannot mutate the grid mid-render. This
+        // eliminates the TOCTOU temporal gap entirely — the snapshot is
+        // immutable for the duration of this frame. Cost: ~rows×cols Cell
+        // copies (typically 120×40 = 4800 cells, ~100KB). safe_cell (L0a)
+        // remains as defense-in-depth for the snapshot-build phase itself.
+        let snap_rows = rows as usize;
+        let snap_cols = cols as usize;
+        let mut snapshot: Vec<Cell> = Vec::with_capacity(snap_rows * snap_cols);
         for row in 0..rows {
-            // With scroll_offset, shift grid line index into scrollback.
-            // `row` is u16 (≤ self.rows, ≤ u16::MAX) so `row as i32` can't
-            // overflow; `saturating_sub` keeps the result in i32 range even
-            // if offset is near i32::MAX.
             let grid_line = Line((row as i32).saturating_sub(offset));
+            for c in 0..cols {
+                snapshot.push(safe_cell(grid, grid_line, c as usize).clone());
+            }
+        }
+
+        // Cursor snapshot for block cursor rendering (also TOCTOU-safe).
+        let cursor_snapshot = grid.cursor.point;
+
+        // From here on, only the snapshot is used — the live grid reference
+        // is no longer accessed, eliminating the TOCTOU window.
+
+        for row in 0..rows {
             let mut col = 0u16;
             while col < cols {
-                let cell = safe_cell(grid, grid_line, col as usize);
+                let idx = (row as usize) * snap_cols + (col as usize);
+                let cell = snapshot
+                    .get(idx)
+                    .unwrap_or_else(|| DEFAULT_CELL.get_or_init(Cell::default));
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     col += 1;
                     continue;
@@ -231,7 +251,7 @@ impl VTerm {
 
         // Reversed block cursor for unfocused panes (focused panes use terminal cursor)
         if show_block_cursor && scroll_offset == 0 {
-            let cursor = grid.cursor.point;
+            let cursor = cursor_snapshot;
             let cx = area.x + cursor.column.0 as u16;
             let cy = area.y + cursor.line.0 as u16;
             if cx < area.x + area.width && cy < area.y + area.height {
