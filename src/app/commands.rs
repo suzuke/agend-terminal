@@ -127,7 +127,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     );
                     let _ = crate::fleet::remove_instance_from_yaml(ctx.home, &fleet_name);
                 }
-                super::kill_agent(ctx.registry, name);
+                super::kill_agent(ctx.home, ctx.registry, name);
                 super::tui_events::remove_agent_pane(name, ctx.layout);
                 return true;
             }
@@ -174,7 +174,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                 }
 
                 if let Some((backend_cmd, work_dir, display_name, fleet_name)) = pane_info {
-                    super::kill_agent(ctx.registry, &name);
+                    super::kill_agent(ctx.home, ctx.registry, &name);
 
                     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
                     let pc = cols.saturating_sub(2);

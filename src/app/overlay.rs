@@ -369,7 +369,7 @@ pub(super) fn handle_key(
                     }
                     if let Some(tab) = ctx.layout.close_tab(idx) {
                         for name in tab.root().agent_names() {
-                            super::kill_agent(ctx.registry, &name);
+                            super::kill_agent(ctx.home, ctx.registry, &name);
                         }
                     }
                     for (name, wd) in &closed {
@@ -395,7 +395,7 @@ pub(super) fn handle_key(
                         let _ = crate::fleet::remove_instance_from_yaml(ctx.home, fleet_name);
                     }
                     if let Some(name) = tab.close_focused() {
-                        super::kill_agent(ctx.registry, &name);
+                        super::kill_agent(ctx.home, ctx.registry, &name);
                         outcome.needs_resize = true;
                     }
                     if let Some((name, Some(wd))) = closed {
@@ -800,7 +800,7 @@ pub(super) fn handle_key(
                 // overlay.
                 let name = pane.agent_name.clone();
                 *overlay = Overlay::None;
-                super::kill_agent(ctx.registry, &name);
+                super::kill_agent(ctx.home, ctx.registry, &name);
             }
             _ => {
                 let bytes = crate::tui::key_to_bytes(key.code, key.modifiers);

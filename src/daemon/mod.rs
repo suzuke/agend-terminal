@@ -3,6 +3,7 @@
 
 pub(crate) mod ci_watch;
 pub(crate) mod cron_tick;
+pub(crate) mod lifecycle;
 pub(crate) mod poll_reminder;
 pub(crate) mod supervisor;
 mod tui_bridge;
@@ -1077,9 +1078,25 @@ fn spawn_and_register_agent(
     let rdir = run_dir(home);
     let reg = Arc::clone(registry);
     let n = name.clone();
-    std::thread::Builder::new()
+    // fire-and-forget: serve_agent_tui blocks on UnixListener::accept and
+    // exits when the agent is removed from the registry. JoinHandle is
+    // discarded because shutdown is signalled implicitly by socket-file
+    // removal in delete_transaction.
+    if let Err(e) = std::thread::Builder::new()
         .name(format!("{n}_tui_server"))
-        .spawn(move || serve_agent_tui(&n, &rdir, &reg))?;
+        .spawn(move || serve_agent_tui(&n, &rdir, &reg))
+    {
+        // Sprint 20 F5 fix: previously a TUI server spawn failure left the
+        // agent registered + child running but with no attachable socket.
+        // Roll back the agent we just spawned so retries start clean.
+        tracing::warn!(
+            agent = %name,
+            error = %e,
+            "TUI server thread spawn failed — rolling back agent registration"
+        );
+        lifecycle::delete_transaction(home, name, registry, Some(configs));
+        return Err(e.into());
+    }
     Ok(())
 }
 

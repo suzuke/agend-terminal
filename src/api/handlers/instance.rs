@@ -94,20 +94,13 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
             return json!({"ok": true});
         }
     }
-    let mut reg = agent::lock_registry(ctx.registry);
-    if let Some(handle) = reg.get(name) {
-        let mut child = crate::sync::lock_poisoned(&handle.child, "api_child");
-        if let Some(pid) = child.process_id() {
-            crate::process::kill_process_tree(pid);
-        }
-        let _ = child.kill();
-        drop(child);
-    }
-    reg.remove(name);
-    drop(reg);
-    crate::sync::lock_poisoned(ctx.configs, "api_configs").remove(name);
-    crate::ipc::remove_port(&crate::daemon::run_dir(ctx.home), name);
-    crate::event_log::log(ctx.home, "delete", name, "deleted via API");
+    // delete_transaction kills the process tree, waits up to CHILD_EXIT_TIMEOUT
+    // for actual exit, then removes registry / drops Telegram binding /
+    // removes configs / removes IPC port / emits event log. Sprint 20 F2 fix:
+    // the previous implementation removed the registry entry before the OS
+    // had reaped the PID, exposing PID re-use + concurrent-spawn collision
+    // races.
+    crate::daemon::lifecycle::delete_transaction(ctx.home, name, ctx.registry, Some(ctx.configs));
     if let Some(n) = ctx.notifier {
         tracing::info!(agent = name, "DELETE emitting InstanceDeleted");
         n.notify(ApiEvent::InstanceDeleted {
