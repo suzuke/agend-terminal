@@ -377,6 +377,10 @@ async fn send_media(
 
 /// Start Telegram polling in a dedicated thread with its own tokio runtime.
 pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
+    // fire-and-forget: telegram polling thread runs the teloxide dispatcher
+    // for the daemon's lifetime. Stops when the bot's update stream errors
+    // (network drop / shutdown). No JoinHandle / shutdown signal needed —
+    // process exit reaps the thread.
     if let Err(e) = std::thread::Builder::new()
         .name("telegram".into())
         .spawn(move || {
@@ -1629,6 +1633,10 @@ fn notify_telegram_inner(
     let text = text.to_string();
     let home_owned = home.to_path_buf();
     let instance_owned = instance_name.to_string();
+    // fire-and-forget: per-call tg_notify spawns its own ephemeral runtime to
+    // ship one notify message, then exits. No JoinHandle / shutdown signal
+    // needed — losing one notification on shutdown is acceptable and the
+    // sender continues with subsequent calls.
     std::thread::Builder::new()
         .name("tg_notify".into())
         .spawn(move || {

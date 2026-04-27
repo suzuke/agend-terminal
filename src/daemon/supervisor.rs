@@ -26,6 +26,11 @@ const TAIL_LINES: usize = 40;
 /// Spawn the supervisor thread. Idempotent per process is the caller's
 /// responsibility — in practice each entry point calls it exactly once.
 pub fn spawn(home: PathBuf, registry: AgentRegistry) {
+    // fire-and-forget: supervisor tick loop runs for the process lifetime
+    // (per module-doc rationale at lines 6-8 — "shutdown is implicit: when
+    // the hosting process exits, this thread dies with it"). 10s tick
+    // cadence; no graceful-stop needed because supervisor is read-mostly
+    // (per-tick metadata read + occasional channel notify).
     let _ = thread::Builder::new()
         .name("supervisor".into())
         .spawn(move || run_loop(home, registry));

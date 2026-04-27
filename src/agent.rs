@@ -510,6 +510,10 @@ fn spawn_instructions_bootstrap(
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let thread_name = format!("{name}_instr_boot");
+    // fire-and-forget: instruction-bootstrap thread polls Ready then injects
+    // the snapshotted instructions content. Observes shutdown flag inside the
+    // poll loop (returns early on shutdown). JoinHandle dropped because the
+    // thread is short-lived and one missed bootstrap on shutdown is cosmetic.
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
         let deadline = std::time::Instant::now() + timeout;
         let poll_interval = std::time::Duration::from_millis(200);
@@ -812,6 +816,10 @@ pub fn try_dismiss_dialog(
             let writer = Arc::clone(pty_writer);
             let keys = key_seq.clone();
             let agent = name.to_string();
+            // fire-and-forget: dialog-dismiss keystroke writer is short-lived
+            // (sleep 300ms then write), no shutdown signal needed because the
+            // PTY closes on shutdown which surfaces as a write error inside
+            // the loop. Missing one auto-dismiss on shutdown is acceptable.
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 // Send keys in chunks split on \r/\n boundaries with delay between,
