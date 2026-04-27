@@ -1039,8 +1039,10 @@ mod tests {
     }
 
     /// Replay-determinism invariant #3 — back-compat: a v(N) reader
-    /// successfully parses v(N) envelopes (round-trip). When v2 ships,
-    /// extend this to assert the v2 reader still parses v1 envelopes.
+    /// successfully parses v(N) envelopes (round-trip). After PR3 the
+    /// canonical writer emits v2 envelopes, so the round-trip path
+    /// alone exercises v2 → v2; this test additionally covers the
+    /// promised v2-reader-parses-v1-envelope contract.
     #[test]
     fn invariant_3_back_compat_v1_reader_parses_v1_envelope() {
         let home = tmp_home("backcompat");
@@ -1048,6 +1050,55 @@ mod tests {
         let _ = append(&home, &inst, sample_event("t-BC")).unwrap();
         let state = replay(&home).unwrap();
         assert!(state.tasks.contains_key(&TaskId::from("t-BC")));
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// PR4 M2 (PR3 r1 dev-reviewer cross-vantage) — explicit v1 envelope
+    /// in a v2 reader's path. Hand-crafts the JSON line as a v1 emitter
+    /// would have written it (no `due_at` / `depends_on` / `routed_to` on
+    /// `Created`, `schema_version: 1`); asserts the v2 reader parses it
+    /// successfully via `#[serde(default)]` on the new fields. Defends
+    /// the silent migration regression — operator running a v2 binary
+    /// against an event log written entirely under v1 must observe state
+    /// identical to a v1 reader's view, not an error.
+    #[test]
+    fn invariant_3_v2_reader_parses_v1_envelope_explicit() {
+        let home = tmp_home("v1_explicit");
+        let log = home.join("task_events.jsonl");
+        // Hand-crafted v1 line: `Created` without v2 fields, `schema_version: 1`.
+        let v1_line = serde_json::json!({
+            "schema_version": 1,
+            "seq": 1,
+            "timestamp": "2026-04-26T00:00:00Z",
+            "instance": "v1-emitter",
+            "event": {
+                "kind": "Created",
+                "task_id": "t-V1",
+                "title": "v1-shaped task",
+                "description": "no v2 fields",
+                "priority": "normal",
+                "owner": null
+            }
+        });
+        fs::write(&log, format!("{v1_line}\n")).unwrap();
+        let state = replay(&home).unwrap();
+        let task = state
+            .tasks
+            .get(&TaskId::from("t-V1"))
+            .expect("v2 reader must parse v1 Created envelope via serde defaults");
+        assert_eq!(task.status, TaskStatus::Open);
+        assert!(
+            task.due_at.is_none(),
+            "v1 envelope's missing due_at → None default"
+        );
+        assert!(
+            task.depends_on.is_empty(),
+            "v1 envelope's missing depends_on → empty default"
+        );
+        assert!(
+            task.routed_to.is_none(),
+            "v1 envelope's missing routed_to → None default"
+        );
         fs::remove_dir_all(&home).ok();
     }
 
@@ -1365,6 +1416,10 @@ mod tests {
                     reason: "t".into(),
                     source_evidence: "t".into(),
                 },
+                "Released" => TaskEvent::Released {
+                    task_id: tid.clone(),
+                    reason: "t".into(),
+                },
                 _ => unreachable!(),
             };
             append(home, inst, event).unwrap();
@@ -1447,6 +1502,17 @@ mod tests {
             (TaskStatus::Blocked, "Blocked", TaskStatus::Blocked),
             (TaskStatus::Blocked, "Unblocked", TaskStatus::Open),
             (TaskStatus::Blocked, "Reopened", TaskStatus::Open),
+            // PR4 F3 (PR3 r1 reviewer-2 MEDIUM) — Released variant rows.
+            // Released always normalises to Open (clears owner; distinct
+            // from Reopened which preserves owner). Adding the 7 rows
+            // closes the F1 7×10 → 7×11 expansion gap.
+            (TaskStatus::Open, "Released", TaskStatus::Open),
+            (TaskStatus::Claimed, "Released", TaskStatus::Open),
+            (TaskStatus::InProgress, "Released", TaskStatus::Open),
+            (TaskStatus::Verified, "Released", TaskStatus::Open),
+            (TaskStatus::Done, "Released", TaskStatus::Open),
+            (TaskStatus::Cancelled, "Released", TaskStatus::Open),
+            (TaskStatus::Blocked, "Released", TaskStatus::Open),
         ];
 
         for (i, (start, evt, expected)) in table.iter().enumerate() {

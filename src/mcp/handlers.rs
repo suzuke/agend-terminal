@@ -1178,6 +1178,14 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // 5-min iteration, so changes propagate without daemon restart.
         "task_sweep_config" => crate::daemon::task_sweep::handle_task_sweep_config(&home, args),
 
+        // --- Legacy backfill (Sprint 24 P0 PR4) ---
+        // One-shot operator-driven dry-run / auto-apply against the 28
+        // legacy backlog tasks. Per-call: returns the full report with
+        // confidence sub-scores so the operator can audit decision tier.
+        "task_legacy_backfill_run" => {
+            crate::daemon::legacy_backfill::handle_task_legacy_backfill_run(&home, args)
+        }
+
         // --- Teams ---
         "create_team" => {
             // Route through the API so the handler emits a TeamCreated TUI

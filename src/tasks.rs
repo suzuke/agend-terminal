@@ -368,6 +368,31 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
     if !events.is_empty() {
         crate::task_events::append_batch(home, &migrator, events)?;
     }
+    // PR4 — retire tasks.json: rename the live file to a `.legacy_pre_v2`
+    // sidecar so the operator can archeologically inspect the
+    // pre-migration state, but the daemon's read path (now via
+    // `task_events::replay()`) no longer touches it. Idempotent: if the
+    // file is already absent the rename silently no-ops. Only triggers
+    // when the migration found legacy data — otherwise leaving the empty
+    // file in place avoids surprising the operator with sudden file
+    // disappearance.
+    if migrated > 0 {
+        let live = store_path(home);
+        if live.exists() {
+            let archive = live.with_extension("json.legacy_pre_v2");
+            if let Err(e) = std::fs::rename(&live, &archive) {
+                tracing::warn!(
+                    error = %e,
+                    "task_events: post-migration rename of tasks.json failed; legacy file remains in place"
+                );
+            } else {
+                tracing::info!(
+                    archive = %archive.display(),
+                    "task_events: legacy tasks.json archived to .legacy_pre_v2"
+                );
+            }
+        }
+    }
     Ok(MigrationReport { migrated, skipped })
 }
 
@@ -412,6 +437,18 @@ fn read_task_record(home: &Path, id: &str) -> Option<crate::task_events::TaskRec
 /// replay-derived record's `created_by` + `owner` fields. Behaviour
 /// matches the legacy [`can_mutate_task`] surface (caller is owner OR
 /// orchestrator-of-owner OR caller-is-orchestrator-and-owner-is-team).
+///
+/// **PR4 F2 absorbed (TOCTOU caveat, mirrors PR #235 r2 M2 doc on the
+/// legacy `can_mutate_task`)**: the predicate reads from a `replay()`
+/// snapshot taken **before** the read-out — there is no inherent lock on
+/// the event log between this check and a follow-up `task_events::append`
+/// emission. A separate process / thread can append a `Claimed` /
+/// `OwnerAssigned` / `Released` event between an out-of-lock predicate
+/// call and the caller's emission, voiding the gate. Production usage in
+/// `handle`'s mutation arms accepts this small TOCTOU window: the
+/// canonical authority is the event log itself, and conflicting emissions
+/// resolve at replay time with the later seq winning. Auditors / tests
+/// using this for diagnostic checks are fine.
 fn can_mutate_record(home: &Path, caller: &str, record: &crate::task_events::TaskRecord) -> bool {
     match record.owner.as_ref() {
         None => true,
@@ -621,6 +658,10 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     )
                 });
             }
+            // PR4 F1 — collect transitions into a Vec then emit via
+            // single `append_batch` so updates are atomic at the F7 batch
+            // level (all-or-nothing fsync window).
+            let mut pending_events: Vec<crate::task_events::TaskEvent> = Vec::new();
             // PR3 — explicit status transition emits the canonical event.
             // Priority / assignee changes without status change have no
             // event variant in v2; the change is observable only through
@@ -701,52 +742,46 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         }),
                         _ => None,
                     };
+                // PR4 F1 (PR3 r1 reviewer-2 LOW) — collect events into
+                // a Vec and emit via `append_batch` so all transitions
+                // produced by a single update call land under one fsync.
+                // F7 atomic-batch contract: either all land or none do
+                // (a partial-write window can't surface to readers).
                 if let Some(ev) = event_for_transition {
-                    if let Err(e) = crate::task_events::append(home, &emitter, ev) {
-                        return serde_json::json!({
-                            "error": format!("event log append failed: {e}")
-                        });
-                    }
+                    pending_events.push(ev);
                 }
             }
-            // Priority change without status transition: emit
+            // Priority change without status transition: queue
             // PriorityChanged so replay reflects the new value.
             if let Some(p) = new_priority {
-                if let Err(e) = crate::task_events::append(
-                    home,
-                    &emitter,
-                    crate::task_events::TaskEvent::PriorityChanged {
-                        task_id: crate::task_events::TaskId(id.clone()),
-                        by: crate::task_events::InstanceName::from(caller.as_str()),
-                        priority: p.to_string(),
-                    },
-                ) {
-                    return serde_json::json!({
-                        "error": format!("event log append failed: {e}")
-                    });
-                }
+                pending_events.push(crate::task_events::TaskEvent::PriorityChanged {
+                    task_id: crate::task_events::TaskId(id.clone()),
+                    by: crate::task_events::InstanceName::from(caller.as_str()),
+                    priority: p.to_string(),
+                });
             }
-            // Assignee change without status transition: emit
+            // Assignee change without status transition: queue
             // OwnerAssigned. Distinct from Claimed (status stays put).
             if let Some(ref new_owner) = new_assignee {
                 let routed_to = match crate::teams::resolve_team_orchestrator(home, new_owner) {
                     Ok(orch) => orch,
                     Err(e) => return serde_json::json!({"error": e}),
                 };
-                if let Err(e) = crate::task_events::append(
-                    home,
-                    &emitter,
-                    crate::task_events::TaskEvent::OwnerAssigned {
-                        task_id: crate::task_events::TaskId(id.clone()),
-                        by: crate::task_events::InstanceName::from(caller.as_str()),
-                        owner: Some(crate::task_events::InstanceName(new_owner.clone())),
-                        routed_to: routed_to
-                            .as_ref()
-                            .map(|s| crate::task_events::InstanceName(s.clone())),
-                    },
-                ) {
+                pending_events.push(crate::task_events::TaskEvent::OwnerAssigned {
+                    task_id: crate::task_events::TaskId(id.clone()),
+                    by: crate::task_events::InstanceName::from(caller.as_str()),
+                    owner: Some(crate::task_events::InstanceName(new_owner.clone())),
+                    routed_to: routed_to
+                        .as_ref()
+                        .map(|s| crate::task_events::InstanceName(s.clone())),
+                });
+            }
+            // F1: single atomic append_batch over all the update arm's
+            // queued events. Either all land or none do.
+            if !pending_events.is_empty() {
+                if let Err(e) = crate::task_events::append_batch(home, &emitter, pending_events) {
                     return serde_json::json!({
-                        "error": format!("event log append failed: {e}")
+                        "error": format!("event log append_batch failed: {e}")
                     });
                 }
             }
@@ -2135,12 +2170,24 @@ mod tests {
         assert_eq!(first.migrated, 1);
         assert_eq!(first.skipped, 0);
 
+        // PR4 — after a successful first migration the live `tasks.json`
+        // is archived to `tasks.json.legacy_pre_v2`. The second run sees
+        // an empty input store and reports zero work.
         let second = migrate_legacy_tasks_json_to_event_log(&home).unwrap();
         assert_eq!(
             second.migrated, 0,
-            "second run finds task_id in event log → no new emit"
+            "second run finds no live tasks.json → no new emit"
         );
-        assert_eq!(second.skipped, 1);
+        assert_eq!(second.skipped, 0);
+        // Archive sidecar should exist for archeology.
+        assert!(
+            home.join("tasks.json.legacy_pre_v2").exists(),
+            "PR4 retire: live tasks.json archived to .legacy_pre_v2"
+        );
+        assert!(
+            !home.join("tasks.json").exists(),
+            "PR4 retire: live tasks.json removed from daemon's read path"
+        );
 
         // Replay confirms exactly one TaskRecord (no duplicate Created
         // event accumulated across the two migration runs).
