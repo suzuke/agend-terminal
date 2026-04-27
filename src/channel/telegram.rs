@@ -905,6 +905,36 @@ pub(crate) fn handle_send_failure(
     true
 }
 
+/// Lightweight self-heal for a stale topic: strip the dead topic_id from
+/// the on-disk registry and fleet.yaml, create a fresh forum topic, and
+/// persist the new mapping. Does NOT delete the instance (unlike
+/// [`cleanup_deleted_topic`] which tears down the entire instance).
+///
+/// Returns `Some(new_tid)` on success so callers can retry the send with
+/// the fresh topic. Returns `None` when topic creation fails (no bot
+/// token, network error, etc.) — callers should log and give up.
+pub(crate) fn invalidate_and_recreate_topic(
+    home: &Path,
+    instance_name: &str,
+    stale_tid: i32,
+) -> Option<i32> {
+    tracing::info!(
+        instance = %instance_name,
+        stale_topic_id = stale_tid,
+        "invalidating stale topic and recreating"
+    );
+    unregister_topic(home, stale_tid);
+    // Clear the stale topic_id from fleet.yaml so create_topic_for_instance
+    // doesn't short-circuit on the old value.
+    let _ = crate::fleet::update_instance_field(
+        home,
+        instance_name,
+        "topic_id",
+        serde_yaml::Value::Null,
+    );
+    create_topic_for_instance(home, instance_name)
+}
+
 /// Read the current `agent_state` of `instance_name` from the in-process
 /// [`AgentRegistry`] and return true when the state expects raw keyboard
 /// input rather than inbox-wrapped prose — i.e. `awaiting_operator` (startup
@@ -1336,7 +1366,22 @@ fn try_telegram_reply_from(
     match telegram_reply_send_inner(&ch, instance_name, topic_id, text) {
         Ok(msg_id) => Ok((msg_id, ch.group_id)),
         Err(e) => {
-            handle_send_failure(&e, home, instance_name, topic_id, None);
+            if let Some(stale_tid) = topic_id {
+                if is_topic_deleted_error(&e) {
+                    if let Some(new_tid) =
+                        invalidate_and_recreate_topic(home, instance_name, stale_tid)
+                    {
+                        tracing::info!(
+                            instance = %instance_name,
+                            old_topic = stale_tid,
+                            new_topic = new_tid,
+                            "retrying send with recreated topic"
+                        );
+                        return telegram_reply_send_inner(&ch, instance_name, Some(new_tid), text)
+                            .map(|msg_id| (msg_id, ch.group_id));
+                    }
+                }
+            }
             Err(e)
         }
     }
@@ -1671,10 +1716,35 @@ fn notify_telegram_inner(
                 }
                 Ok::<(), anyhow::Error>(())
             }) {
-                let handled = handle_send_failure(&e, &home_owned, &instance_owned, topic_id, None);
-                if !handled {
-                    tracing::warn!(error = %e, "telegram notify failed");
+                if let Some(stale_tid) = topic_id {
+                    if is_topic_deleted_error(&e) {
+                        if let Some(new_tid) =
+                            invalidate_and_recreate_topic(&home_owned, &instance_owned, stale_tid)
+                        {
+                            tracing::info!(
+                                instance = %instance_owned,
+                                old_topic = stale_tid,
+                                new_topic = new_tid,
+                                "notify: retrying with recreated topic"
+                            );
+                            let _ = rt.block_on(async {
+                                use teloxide::payloads::SendMessageSetters;
+                                use teloxide::prelude::Requester;
+                                let bot = teloxide::Bot::new(&token);
+                                let chat_id = teloxide::types::ChatId(group_id);
+                                let mut req = bot.send_message(chat_id, &text).message_thread_id(
+                                    teloxide::types::ThreadId(teloxide::types::MessageId(new_tid)),
+                                );
+                                if disable_notification {
+                                    req = req.disable_notification(true);
+                                }
+                                req.await
+                            });
+                            return;
+                        }
+                    }
                 }
+                tracing::warn!(error = %e, "telegram notify failed");
             }
         })
         .ok();
@@ -3317,12 +3387,11 @@ instances:
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Sibling pin (baseline): confirms the cleanup path ACTUALLY
-    /// fires in the variant that still owns cleanup authority. Without
-    /// this, the no-cleanup pin above could pass vacuously if
-    /// `cleanup_deleted_topic` happened to be a no-op in the test
-    /// harness. Seeding the same state and calling the cleanup-variant
-    /// establishes the "bug shape" the no-cleanup pin is absent.
+    /// Sibling pin (baseline): confirms the invalidate-and-recreate path
+    /// fires on topic-deleted errors. `try_telegram_reply_from` now
+    /// invalidates the stale topic and attempts recreation (Sprint 23 P1)
+    /// instead of deleting the instance. The instance survives in
+    /// fleet.yaml but `topic_id` is cleared.
     #[test]
     fn try_telegram_reply_cleanup_variant_mutates_fleet_on_topic_deleted() {
         let _g = channel_env_test_guard();
@@ -3347,14 +3416,31 @@ instances:
         std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
         set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
 
-        // With cleanup: expect the fleet entry to be stripped.
+        // Sprint 23 P1: try_telegram_reply_from now invalidates the stale
+        // topic and attempts recreation instead of deleting the instance.
         let res = try_telegram_reply_from(&home, "B", "main-path send");
         assert!(res.is_err());
 
         let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        // Instance B must survive (not deleted).
         assert!(
-            !fleet_yaml.contains("B:"),
-            "baseline: cleanup-variant must strip B on topic-deleted; yaml was:\n{fleet_yaml}"
+            fleet_yaml.contains("B:"),
+            "Sprint 23 P1: instance must survive topic invalidation; yaml was:\n{fleet_yaml}"
+        );
+        // But topic_id must be cleared (invalidated).
+        let config =
+            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("load fleet.yaml");
+        let inst_b = config.instances.get("B").expect("B exists");
+        assert_eq!(
+            inst_b.topic_id, None,
+            "topic_id must be cleared after invalidation"
+        );
+
+        // Stale topic must be stripped from registry.
+        let reg = load_topic_registry(&home);
+        assert!(
+            !reg.contains_key(&42),
+            "stale topic 42 must be unregistered"
         );
 
         std::env::remove_var("PR57_ROUND2_FAKE_TOKEN");
@@ -3860,5 +3946,182 @@ instances:
             !body.contains("block_on"),
             "handle_message must not call block_on (nested runtime panic). Found block_on in body."
         );
+    }
+
+    // ─── Sprint 23 P1: Topic-cache validate-before-reuse tests ────────
+
+    /// `invalidate_and_recreate_topic` must strip the stale topic from
+    /// `topics.json` so `create_topic_for_instance` doesn't short-circuit
+    /// on the dead id. Without a live bot the creation step returns `None`,
+    /// but the invalidation side-effect is the load-bearing contract.
+    #[test]
+    fn invalidate_and_recreate_strips_stale_topic_from_registry() {
+        let home = tmp_home("invalidate-recreate-strip");
+        register_topic(&home, 42, "agent-x");
+        register_topic(&home, 99, "agent-y");
+
+        // No fleet.yaml / no bot → create_topic_for_instance returns None,
+        // but the stale entry must still be gone from the registry.
+        let result = invalidate_and_recreate_topic(&home, "agent-x", 42);
+        assert!(result.is_none(), "no bot → creation fails");
+
+        let reg = load_topic_registry(&home);
+        assert!(
+            !reg.contains_key(&42),
+            "stale topic 42 must be unregistered"
+        );
+        // Unrelated entry survives.
+        assert_eq!(reg.get(&99), Some(&"agent-y".to_string()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `invalidate_and_recreate_topic` must clear `topic_id` in fleet.yaml
+    /// so the stale value doesn't persist across daemon restarts.
+    #[test]
+    fn invalidate_and_recreate_clears_fleet_yaml_topic_id() {
+        let home = tmp_home("invalidate-recreate-yaml");
+        let yaml = "\
+instances:
+  agent-x:
+    command: /bin/true
+    topic_id: 42
+  agent-y:
+    command: /bin/true
+    topic_id: 99
+";
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        register_topic(&home, 42, "agent-x");
+
+        let _ = invalidate_and_recreate_topic(&home, "agent-x", 42);
+
+        // fleet.yaml must no longer have topic_id: 42 for agent-x.
+        let config =
+            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("load fleet.yaml");
+        let agent_x = config.instances.get("agent-x").expect("agent-x exists");
+        assert_eq!(
+            agent_x.topic_id, None,
+            "topic_id must be cleared after invalidation"
+        );
+        // agent-y untouched.
+        let agent_y = config.instances.get("agent-y").expect("agent-y exists");
+        assert_eq!(agent_y.topic_id, Some(99));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `invalidate_and_recreate_topic` must NOT delete the instance from
+    /// fleet.yaml — only the topic_id field is cleared. This is the key
+    /// difference from `cleanup_deleted_topic` which tears down the
+    /// entire instance.
+    #[test]
+    fn invalidate_and_recreate_preserves_instance_in_fleet_yaml() {
+        let home = tmp_home("invalidate-preserves-instance");
+        let yaml = "\
+instances:
+  agent-x:
+    command: /bin/true
+    topic_id: 42
+    role: important
+";
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        register_topic(&home, 42, "agent-x");
+
+        let _ = invalidate_and_recreate_topic(&home, "agent-x", 42);
+
+        let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        assert!(
+            fleet_yaml.contains("agent-x"),
+            "instance must survive invalidation; yaml:\n{fleet_yaml}"
+        );
+        assert!(
+            fleet_yaml.contains("important"),
+            "instance role must survive; yaml:\n{fleet_yaml}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// `try_telegram_reply_from` must retry with a recreated topic when
+    /// the first send hits a topic-deleted error. Since we can't create
+    /// a real topic in tests, the retry also fails — but the test pins
+    /// that the invalidation side-effect fires (stale topic stripped
+    /// from registry).
+    #[test]
+    fn try_telegram_reply_from_invalidates_on_topic_deleted() {
+        let _g = channel_env_test_guard();
+        let home = tmp_home("reply-retry-invalidate");
+        let yaml = "\
+channel:
+  type: telegram
+  bot_token_env: SPRINT23_P1_FAKE_TOKEN
+  group_id: -100999999
+  mode: topic
+instances:
+  agent-x:
+    command: /bin/true
+    topic_id: 42
+";
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        register_topic(&home, 42, "agent-x");
+        std::env::set_var("SPRINT23_P1_FAKE_TOKEN", "fake");
+
+        set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
+
+        let res = try_telegram_reply_from(&home, "agent-x", "hello");
+        // The retry also fails (no real bot), but the stale topic must
+        // be stripped from the registry.
+        assert!(res.is_err());
+
+        let reg = load_topic_registry(&home);
+        assert!(
+            !reg.contains_key(&42),
+            "stale topic 42 must be unregistered after retry; reg={reg:?}"
+        );
+
+        // Instance must still exist in fleet.yaml (not deleted).
+        let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        assert!(
+            fleet_yaml.contains("agent-x"),
+            "instance must survive topic invalidation; yaml:\n{fleet_yaml}"
+        );
+
+        std::env::remove_var("SPRINT23_P1_FAKE_TOKEN");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Non-topic-deleted errors must NOT trigger invalidation — only the
+    /// exact "message thread not found" marker should.
+    #[test]
+    fn try_telegram_reply_from_does_not_invalidate_on_unrelated_error() {
+        let _g = channel_env_test_guard();
+        let home = tmp_home("reply-no-invalidate");
+        let yaml = "\
+channel:
+  type: telegram
+  bot_token_env: SPRINT23_P1_FAKE_TOKEN2
+  group_id: -100999999
+  mode: topic
+instances:
+  agent-x:
+    command: /bin/true
+    topic_id: 42
+";
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        register_topic(&home, 42, "agent-x");
+        std::env::set_var("SPRINT23_P1_FAKE_TOKEN2", "fake");
+
+        set_forced_send_error(anyhow::anyhow!("Too Many Requests: retry after 5"));
+
+        let res = try_telegram_reply_from(&home, "agent-x", "hello");
+        assert!(res.is_err());
+
+        // Topic must still be in registry — no invalidation.
+        let reg = load_topic_registry(&home);
+        assert_eq!(
+            reg.get(&42),
+            Some(&"agent-x".to_string()),
+            "unrelated error must not invalidate topic"
+        );
+
+        std::env::remove_var("SPRINT23_P1_FAKE_TOKEN2");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
