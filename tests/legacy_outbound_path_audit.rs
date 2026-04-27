@@ -124,49 +124,73 @@ fn legacy_try_telegram_fns_unreachable_outside_telegram_impl() {
     );
 }
 
-/// Sprint 22 P0 reviewer-2 must-have — MCP instance-mutating handlers
-/// must NOT accept `outbound_capabilities` from agent-API args. Operator
-/// grants happen via fleet.yaml on disk; agent-API grants would defeat
-/// the per-instance capability gate.
+/// Sprint 22 P0 reviewer-2 must-have + Sprint 22 P2a M1 fold-in — MCP
+/// instance-mutating handlers AND their dispatch chain must NOT accept
+/// `outbound_capabilities` from agent-API args. Operator grants happen
+/// via fleet.yaml on disk; agent-API grants would defeat the per-instance
+/// capability gate.
 ///
-/// Grep-based check: scan `src/mcp/handlers.rs` for any reference to
-/// `args["outbound_capabilities"]` or `args.get("outbound_capabilities")`
-/// inside the four instance-mutating handler arms. Today: 0 hits expected.
-/// Future regression (someone wires through the arg): test fails-loud.
+/// Sprint 22 P0 dev-reviewer M1 finding (NON-BLOCKING): the original
+/// scope of this test only covered `src/mcp/handlers.rs`, missing the
+/// `deploy_template` arm at `handlers.rs:1201` which dispatches to
+/// `crate::deployments::deploy(...)`. Today's `src/deployments.rs` has
+/// 0 production hits (manually verified Sprint 22 P0 review), but a
+/// future regression there would not trip this test.
+///
+/// Sprint 22 P2a (this PR) extends the scan to cover the dispatch chain
+/// from each instance-mutating MCP arm — closes the M1 invariant gap.
 #[test]
 fn mcp_handlers_do_not_accept_outbound_capabilities_arg() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let handlers_path = src_root.join("mcp/handlers.rs");
-    let content = std::fs::read_to_string(&handlers_path).expect("src/mcp/handlers.rs must exist");
-
-    // Cut off at #[cfg(test)] so unit-test fixtures don't trip.
-    let cutoff_byte = content.find("#[cfg(test)]").unwrap_or(content.len());
-    let prod = &content[..cutoff_byte];
+    // Sprint 22 P2a M1 fold-in: extend scan to every file in the dispatch
+    // chain from instance-mutating MCP handlers. New entries here as the
+    // chain grows (e.g. future MCP handlers that dispatch into new
+    // sub-modules with instance-config mutation surfaces).
+    let scanned_files: &[&str] = &[
+        "mcp/handlers.rs", // top-level MCP dispatch (Sprint 22 P0 original scope)
+        "deployments.rs",  // `deploy_template` arm dispatches here (Sprint 22 P0 M1 finding)
+    ];
 
     let mut violations: Vec<String> = Vec::new();
-    for (idx, line) in prod.lines().enumerate() {
-        let trim = line.trim_start();
-        if trim.starts_with("//") || trim.starts_with("///") {
+    for rel_suffix in scanned_files {
+        let path = src_root.join(rel_suffix);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            // File missing — don't fail the test (allows the dispatch
+            // chain to evolve). The scanned_files list is a manual audit
+            // surface; missing files surface via PR review of this test.
             continue;
-        }
-        let lowered = line.to_ascii_lowercase();
-        // Match: `args["outbound_capabilities"]` / `args.get("outbound_capabilities")`
-        // / any direct extraction of the field from the MCP args bag.
-        if (lowered.contains("args[\"outbound_capabilities\"")
-            || lowered.contains("args.get(\"outbound_capabilities\")"))
-            && !lowered.contains("// allowed:")
-        {
-            violations.push(format!(
-                "  src/mcp/handlers.rs:{}: MCP handler extracts `outbound_capabilities` from agent args — defeats per-instance capability gate\n      offending line: {}",
-                idx + 1,
-                line.trim()
-            ));
+        };
+
+        // Cut off at #[cfg(test)] so unit-test fixtures don't trip.
+        let cutoff_byte = content.find("#[cfg(test)]").unwrap_or(content.len());
+        let prod = &content[..cutoff_byte];
+
+        for (idx, line) in prod.lines().enumerate() {
+            let trim = line.trim_start();
+            if trim.starts_with("//") || trim.starts_with("///") {
+                continue;
+            }
+            let lowered = line.to_ascii_lowercase();
+            // Match: `args["outbound_capabilities"]` / `args.get("outbound_capabilities")`
+            // / any direct extraction of the field from the MCP args bag
+            // OR from a downstream handler's args param.
+            if (lowered.contains("args[\"outbound_capabilities\"")
+                || lowered.contains("args.get(\"outbound_capabilities\")"))
+                && !lowered.contains("// allowed:")
+            {
+                violations.push(format!(
+                    "  src/{}:{}: handler extracts `outbound_capabilities` from agent args — defeats per-instance capability gate\n      offending line: {}",
+                    rel_suffix,
+                    idx + 1,
+                    line.trim()
+                ));
+            }
         }
     }
 
     assert!(
         violations.is_empty(),
-        "Sprint 22 P0 reviewer-2 must-have violations — {} MCP handler(s) accept `outbound_capabilities` from agent args.\n\nFix: remove the args extraction. Operator grants outbound capabilities ONLY via fleet.yaml on disk. Agent-API grants defeat the per-instance gate.\n\nIf this is intentional (operator-only caller), add `// allowed: <reason>` inline comment for documented exemption.\n\nViolations:\n{}",
+        "Sprint 22 P0 reviewer-2 must-have + P2a M1 fold-in violations — {} handler(s) accept `outbound_capabilities` from agent args across MCP dispatch chain.\n\nFix: remove the args extraction. Operator grants outbound capabilities ONLY via fleet.yaml on disk. Agent-API grants defeat the per-instance gate.\n\nIf this is intentional (operator-only caller), add `// allowed: <reason>` inline comment for documented exemption.\n\nIf a NEW dispatch-chain file is added (another sub-module that mutates instance config), extend the `scanned_files` list in this test.\n\nViolations:\n{}",
         violations.len(),
         violations.join("\n")
     );

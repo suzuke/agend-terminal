@@ -231,8 +231,24 @@ fn clear_waiting_on_if_stale(home: &std::path::Path, name: &str, is_stale: bool)
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty())
     {
-        crate::agent_ops::save_metadata(home, name, "waiting_on", serde_json::json!(null));
-        crate::agent_ops::save_metadata(home, name, "waiting_on_since", serde_json::json!(null));
+        // Sprint 22 P2a F7 fix (Sprint 20 DAEMON.md §1 Critical F7): single
+        // atomic write replaces two sequential `save_metadata` calls. The
+        // pre-fix code had a partial-write window where a daemon crash
+        // between the two writes left disk state inconsistent
+        // (waiting_on=null + waiting_on_since=set), and `set_waiting_on`'s
+        // freshness logic on restart would interpret a non-null `since`
+        // as "agent is currently waiting" without a `waiting_on` value —
+        // divergent state. `save_metadata_batch` (added Sprint 5
+        // commit 33135ee, regression tests added Sprint 21 PR #227) does
+        // one read-modify-write cycle.
+        crate::agent_ops::save_metadata_batch(
+            home,
+            name,
+            &[
+                ("waiting_on", serde_json::json!(null)),
+                ("waiting_on_since", serde_json::json!(null)),
+            ],
+        );
         tracing::info!(%name, "waiting_on cleared — heartbeat stale");
     }
 }
@@ -304,6 +320,102 @@ mod tests {
             "fresh heartbeat must NOT clear waiting_on"
         );
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Sprint 22 P2a F7 regression — both `waiting_on` and `waiting_on_since`
+    /// must land in a single atomic disk write so a crash mid-clear cannot
+    /// leave divergent state (waiting_on=null + waiting_on_since=set, which
+    /// `set_waiting_on` freshness logic interprets on restart as "agent is
+    /// currently waiting" without a `waiting_on` value).
+    ///
+    /// The pre-fix code had two sequential `save_metadata` calls; this test
+    /// pins the contract that the call site delegates to
+    /// `agent_ops::save_metadata_batch` (single read-modify-write cycle).
+    /// Source-grep verifies the two-call regression cannot reappear:
+    /// `clear_waiting_on_if_stale` must contain `save_metadata_batch` and
+    /// must NOT contain two adjacent `save_metadata(` calls.
+    #[test]
+    fn waiting_on_clear_uses_atomic_batch_write() {
+        // Source-grep guard: pin that the impl uses save_metadata_batch
+        // (closes F7 race window). Future regression to two-call form
+        // would fail-loud here.
+        let src = include_str!("supervisor.rs");
+        let body_start = src
+            .find("fn clear_waiting_on_if_stale(")
+            .expect("clear_waiting_on_if_stale must exist");
+        // Bound the search to the function body (next top-level fn).
+        let rest = &src[body_start..];
+        let body_end = rest
+            .find("\nfn ")
+            .or_else(|| rest.find("\npub fn "))
+            .or_else(|| rest.find("\n#[cfg(test)]"))
+            .unwrap_or(rest.len());
+        let body = &rest[..body_end];
+
+        assert!(
+            body.contains("save_metadata_batch("),
+            "clear_waiting_on_if_stale must use `save_metadata_batch` for atomic \
+             multi-field write (Sprint 22 P2a F7 fix). Found body:\n{body}"
+        );
+        // Sanity check: the legacy two-call pattern must NOT reappear.
+        // We check that the body contains at most ONE `save_metadata(`
+        // substring — `save_metadata_batch(` matches separately because
+        // we look for the open paren after `metadata` not `metadata_batch`.
+        let single_calls = body.matches("save_metadata(").count();
+        assert!(
+            single_calls == 0,
+            "clear_waiting_on_if_stale must NOT call individual `save_metadata` \
+             — F7 race fix requires `save_metadata_batch` (single atomic write). \
+             Found {single_calls} `save_metadata(` call(s) in body:\n{body}"
+        );
+    }
+
+    /// Sprint 22 P2a F7 behavioural regression — verify the atomic batch
+    /// write produces the expected on-disk state when both fields land
+    /// together. Pairs with the source-grep guard above; this test catches
+    /// a regression where the helper signature changes but the call site
+    /// still compiles.
+    #[test]
+    fn waiting_on_clear_writes_both_nulls_atomically() {
+        let home = tmp_home("f7_atomic");
+        let meta_dir = home.join("metadata");
+        std::fs::create_dir_all(&meta_dir).ok();
+        // Pre-populate with active wait state + an unrelated field that
+        // must survive the batch write (read-modify-write contract).
+        let meta = serde_json::json!({
+            "waiting_on": "review from at-dev-4",
+            "waiting_on_since": "2026-04-27T05:00:00Z",
+            "last_heartbeat": "2026-04-27T04:55:00Z",
+            "role": "dev-impl-2",
+        });
+        std::fs::write(
+            meta_dir.join("agent_atomic.json"),
+            serde_json::to_string_pretty(&meta).expect("serialize"),
+        )
+        .ok();
+
+        clear_waiting_on_if_stale(&home, "agent_atomic", true);
+
+        let raw = std::fs::read_to_string(meta_dir.join("agent_atomic.json"))
+            .expect("metadata file present");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert!(
+            v["waiting_on"].is_null(),
+            "waiting_on must be null after F7 atomic clear"
+        );
+        assert!(
+            v["waiting_on_since"].is_null(),
+            "waiting_on_since must be null after F7 atomic clear (paired with waiting_on)"
+        );
+        assert_eq!(
+            v["last_heartbeat"], "2026-04-27T04:55:00Z",
+            "unrelated `last_heartbeat` must survive the batch write"
+        );
+        assert_eq!(
+            v["role"], "dev-impl-2",
+            "unrelated `role` must survive the batch write"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
