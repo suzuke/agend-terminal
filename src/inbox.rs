@@ -766,6 +766,18 @@ pub fn format_notification_for_inject(
 }
 
 pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
+    // Sprint 24 P1 (F-NEW-DAEMON-HEALTH-CLASSIFIER-1): record this
+    // central inject point so the daemon health classifier can
+    // distinguish "idle waiting (no input pending)" from "hung
+    // unresponsive (input pending past last response)". This hook
+    // intentionally lives here — `notify_agent` is the single PTY-inject
+    // entry consumed by every input source (channel notify, agent send,
+    // inbox compose-aware inject). No-daemon-context callers (tests
+    // wiring `notify_agent` outside daemon mode) still pay a cheap
+    // mutex acquire but don't observe behavioural change.
+    crate::daemon::heartbeat_pair::update_with(agent_name, |p| {
+        p.last_input_at_ms = crate::daemon::heartbeat_pair::now_ms();
+    });
     let notification = format_notification_for_inject(pointer_only_inject(), source, text);
     compose_aware_inject(home, agent_name, &notification);
 }

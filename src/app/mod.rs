@@ -528,13 +528,22 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 crate::daemon::ci_watch::check_ci_watches(&home, &registry);
                 {
                     let reg = crate::agent::lock_registry(&registry);
-                    for (_name, handle) in reg.iter() {
+                    for (name, handle) in reg.iter() {
                         if let Ok(mut core) = handle.core.lock() {
                             core.health.maybe_decay();
                             core.state.tick();
                             let agent_state = core.state.current;
                             let silent = core.state.last_output.elapsed();
-                            core.health.check_hang(agent_state, silent);
+                            // Sprint 24 P1: pair snapshot for input-aware
+                            // hang discrimination (matches daemon/mod.rs
+                            // pattern).
+                            let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
+                            core.health.check_hang(
+                                agent_state,
+                                silent,
+                                pair.last_input_at_ms,
+                                pair.heartbeat_at_ms,
+                            );
                         }
                     }
                 }

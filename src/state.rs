@@ -1208,22 +1208,22 @@ mod tests {
     #[test]
     fn starting_hang_120s() {
         let mut h = HealthTracker::new();
-        assert!(!h.check_hang(AgentState::Starting, Duration::from_secs(119)));
-        assert!(h.check_hang(AgentState::Starting, Duration::from_secs(121)));
+        assert!(!h.check_hang(AgentState::Starting, Duration::from_secs(119), 1_000_000, 0));
+        assert!(h.check_hang(AgentState::Starting, Duration::from_secs(121), 1_000_000, 0));
     }
 
     #[test]
     fn idle_never_hangs() {
         let mut h = HealthTracker::new();
         // Even with 10000s of silence, Idle should never be considered hung.
-        assert!(!h.check_hang(AgentState::Idle, Duration::from_secs(10_000)));
+        assert!(!h.check_hang(AgentState::Idle, Duration::from_secs(10_000), 1_000_000, 0));
     }
 
     #[test]
     fn thinking_hang_600s() {
         let mut h = HealthTracker::new();
-        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(599)));
-        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(601)));
+        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(599), 1_000_000, 0));
+        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(601), 1_000_000, 0));
     }
 
     // ── P2: Pattern matching ────────────────────────────────────────────
