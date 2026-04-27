@@ -56,7 +56,15 @@ fn instance_exists(home: &Path, name: &str) -> bool {
 
 /// Check if caller is allowed to mutate a task (assignee or orchestrator).
 /// Unassigned tasks can be mutated by anyone.
-fn can_mutate_task(home: &Path, caller: &str, task: &Task) -> bool {
+///
+/// Sprint 23 P0: promoted from `fn` to `pub fn` to mirror
+/// `decisions::can_mutate_decision` (PR #220, Sprint 21 Phase 2 D1). Public
+/// visibility lets external auditors / tests verify the predicate without
+/// going through `mutate_versioned`. Race-free invocation requires calling
+/// from inside `mutate_versioned`'s locked closure (existing internal
+/// callers at the `done` / `update` arms already do this); external callers
+/// using the predicate for read-only checks are fine without the lock.
+pub fn can_mutate_task(home: &Path, caller: &str, task: &Task) -> bool {
     match &task.assignee {
         None => true,
         Some(assignee) => {

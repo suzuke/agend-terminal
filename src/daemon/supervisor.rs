@@ -66,10 +66,28 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
                 Err(poisoned) => poisoned.into_inner(),
             };
 
-            // Heartbeat: read last_heartbeat from metadata file and update
-            // StateTracker so gate_on_heartbeat can suppress false-positive
-            // PermissionPrompt when the agent is alive (A5 fix).
-            if let Some(age) = read_heartbeat_age(home, &name) {
+            // Sprint 23 P0 F6 fix: read heartbeat via in-memory pair lock
+            // for consistent snapshot. Pre-fix code did `read_heartbeat_age`
+            // (disk file read) which raced with MCP heartbeat write — between
+            // supervisor's heartbeat read and the subsequent
+            // `clear_waiting_on_if_stale` waiting_on_since read, MCP could
+            // write the pair → supervisor saw stale heartbeat with fresh
+            // waiting_on_since → spurious stale-decay firing. Pair lock
+            // serialises read/write so reader sees consistent snapshot.
+            //
+            // Disk read fallback retained for crash-recovery: pair is
+            // populated lazily on first MCP call after daemon start; if
+            // pair is empty (heartbeat_at_ms == 0), fall back to disk.
+            let pair = crate::daemon::heartbeat_pair::snapshot_for(&name);
+            let age_opt = if pair.heartbeat_at_ms > 0 {
+                let now = crate::daemon::heartbeat_pair::now_ms();
+                Some(Duration::from_millis(
+                    now.saturating_sub(pair.heartbeat_at_ms),
+                ))
+            } else {
+                read_heartbeat_age(home, &name)
+            };
+            if let Some(age) = age_opt {
                 core.state.update_heartbeat(age);
             }
 
@@ -231,16 +249,14 @@ fn clear_waiting_on_if_stale(home: &std::path::Path, name: &str, is_stale: bool)
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty())
     {
-        // Sprint 22 P2a F7 fix (Sprint 20 DAEMON.md §1 Critical F7): single
-        // atomic write replaces two sequential `save_metadata` calls. The
-        // pre-fix code had a partial-write window where a daemon crash
-        // between the two writes left disk state inconsistent
-        // (waiting_on=null + waiting_on_since=set), and `set_waiting_on`'s
-        // freshness logic on restart would interpret a non-null `since`
-        // as "agent is currently waiting" without a `waiting_on` value —
-        // divergent state. `save_metadata_batch` (added Sprint 5
-        // commit 33135ee, regression tests added Sprint 21 PR #227) does
-        // one read-modify-write cycle.
+        // Sprint 23 P0 F6 + Sprint 22 P2a F7 paired-write fix:
+        // in-memory pair update first (closes F6 race window), then disk
+        // atomic batch write (closes F7 partial-write window). Order
+        // matters per docs/DAEMON-LOCK-ORDERING.md — pair lock leaf-level,
+        // disk I/O outside the lock.
+        crate::daemon::heartbeat_pair::update_with(name, |p| {
+            p.waiting_on_since_ms = None;
+        });
         crate::agent_ops::save_metadata_batch(
             home,
             name,
