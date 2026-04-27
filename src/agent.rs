@@ -664,6 +664,24 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
     }
 }
 
+/// Sprint 21 F-NEW1: kill the process tree rooted at the agent's child PID,
+/// if still registered. Looks up the PID through the registry → child mutex
+/// chain, then delegates to [`crate::process::kill_process_tree`] (PR-U #158).
+///
+/// No-op if the agent is not in the registry (already cleaned up) or if the
+/// child has no live PID (already reaped). Idempotent on dead PIDs — safe to
+/// call multiple times during the same crash-detection sequence.
+fn sweep_child_tree(name: &str, registry: &AgentRegistry) {
+    let pid: Option<u32> = {
+        let reg = crate::sync::lock_poisoned(registry, "agent_registry");
+        reg.get(name)
+            .and_then(|h| h.child.lock().ok().and_then(|c| c.process_id()))
+    };
+    if let Some(pid) = pid {
+        crate::process::kill_process_tree(pid);
+    }
+}
+
 /// Handle PTY close: determine if crash, graceful exit, or daemon shutdown.
 fn handle_pty_close(
     name: &str,
@@ -732,6 +750,15 @@ fn handle_pty_close(
             true
         }
     };
+
+    // Sprint 21 F-NEW1: sweep the child process tree before respawn fires so
+    // any leaked grandchildren (kiro-cli's bun + acp etc.) don't survive across
+    // the respawn boundary and collide with the new process tree's port/file
+    // locks. PR-U #158 added kill_process_tree to handle_kill / handle_delete /
+    // run_core but missed this PTY-EOF crash-detection path. Covers both branches:
+    // try_wait succeeded (graceful or crash exit may still leave grandchildren
+    // orphaned to PID 1) and the 2s timeout (leader still alive).
+    sweep_child_tree(name, registry);
 
     // In daemon mode, ALL unexpected exits trigger respawn — even exit 0.
     // An agent exiting on its own (not via `kill` or shutdown) is unexpected.
@@ -1045,5 +1072,124 @@ mod tests {
         let screen = vt.tail_lines(24);
         let patterns = vec![("Do you trust".to_string(), b"\n".to_vec())];
         assert!(try_dismiss_dialog("t", &screen, &test_writer(), &patterns));
+    }
+
+    /// Sprint 21 F-NEW1: verify that `sweep_child_tree` reaches grandchild
+    /// processes spawned via the agent's PTY. Mirrors the kiro-cli pattern
+    /// where the leader shell forks bun/mcp/acp grandchildren — the regression
+    /// PR-U #158 fixed for explicit kill paths but missed for PTY-EOF crash
+    /// detection.
+    #[test]
+    #[cfg(unix)]
+    fn sweep_child_tree_kills_grandchild_via_process_group() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let pid_file =
+            std::env::temp_dir().join(format!("agend-sweep-test-{}.pid", std::process::id()));
+        let _ = std::fs::remove_file(&pid_file);
+        // sh forks `sleep` into the background; sleep PID is recorded so the
+        // test can verify it dies with the leader (group kill semantics).
+        let cmd_str = format!("sleep 60 & echo $! > {} && wait", pid_file.display());
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", &cmd_str]);
+        cmd.cwd(std::env::temp_dir());
+        let child = pair.slave.spawn_command(cmd).expect("spawn sh + sleep");
+        drop(pair.slave);
+        let shell_pid = child.process_id().expect("shell process_id");
+
+        // Build a minimal AgentHandle so sweep_child_tree's registry-lookup
+        // path is exercised end-to-end (not just kill_process_tree directly).
+        let pty_writer: PtyWriter =
+            Arc::new(Mutex::new(pair.master.take_writer().expect("take_writer")));
+        let pty_master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
+            Arc::new(Mutex::new(pair.master));
+        let core = Arc::new(Mutex::new(AgentCore {
+            vterm: crate::vterm::VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+            subscribers: Vec::new(),
+            state: StateTracker::new(None),
+            health: HealthTracker::new(),
+        }));
+        let handle = AgentHandle {
+            name: "sweep-test".to_string(),
+            backend_command: "sh".to_string(),
+            pty_writer,
+            pty_master,
+            core,
+            child: Arc::new(Mutex::new(child)),
+            submit_key: "\r".to_string(),
+            inject_prefix: String::new(),
+            typed_inject: false,
+        };
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        crate::sync::lock_poisoned(&registry, "test").insert("sweep-test".to_string(), handle);
+
+        // Wait for sleep grandchild to start and write its PID
+        for _ in 0..40 {
+            if pid_file.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let sleep_pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .expect("parse sleep grandchild PID");
+        assert!(
+            crate::process::is_pid_alive(shell_pid),
+            "shell leader must be alive before sweep"
+        );
+        assert!(
+            crate::process::is_pid_alive(sleep_pid),
+            "sleep grandchild must be alive before sweep"
+        );
+
+        // Invoke the new helper. Should kill the entire process group.
+        sweep_child_tree("sweep-test", &registry);
+
+        // Reap the shell child so kill(pid, 0) doesn't see it as a zombie.
+        // Without wait(), the shell shows as "alive" even after SIGKILL
+        // because we are its parent and never collected its exit status.
+        {
+            let reg = crate::sync::lock_poisoned(&registry, "test");
+            if let Some(h) = reg.get("sweep-test") {
+                if let Ok(mut c) = h.child.lock() {
+                    let _ = c.wait();
+                }
+            }
+        }
+
+        assert!(
+            !crate::process::is_pid_alive(shell_pid),
+            "shell leader must be dead (reaped) after sweep"
+        );
+        assert!(
+            !crate::process::is_pid_alive(sleep_pid),
+            "sleep grandchild must die with the group (kill_process_tree semantics)"
+        );
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    #[test]
+    fn sweep_child_tree_unregistered_name_is_no_op() {
+        // Sprint 21 F-NEW1: registry lookup miss must not panic. The PTY-EOF
+        // path may race against an explicit handle_delete that already cleaned
+        // up the registry entry — sweep should simply find nothing to kill.
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        // Should not panic, should not error.
+        sweep_child_tree("does-not-exist", &registry);
     }
 }
