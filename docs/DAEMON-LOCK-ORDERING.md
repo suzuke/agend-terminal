@@ -37,8 +37,10 @@ Level 1 (per-agent, accessed via root):
   agent_handle.pty_master   — Mutex<Box<dyn MasterPty>>
 
 Level 2 (storage / transactional):
-  task_store_lock           — file lock around `<home>/tasks.jsonl`
-                              (`crate::store::mutate_versioned`)
+  task_events_jsonl_lock    — file lock around `<home>/task_events.jsonl`
+                              (`crate::task_events::append`); anti-bypass
+                              invariant `tests/task_events_invariant.rs`
+                              enforces single-writer (Sprint 24 P0 PR #236)
   decision_store_lock       — file lock around `<home>/decisions.jsonl`
                               (`crate::decisions::with_decision_lock`)
   inbox_jsonl_lock          — implicit via atomic temp+rename
@@ -106,10 +108,16 @@ only as instantaneous-release sinks → no cycle possible → deadlock-free.
 
 ## Why heartbeat_pair is leaf-level (Sprint 23 P0 F6)
 
-The `heartbeat_pair` lock guards `(heartbeat_at_ms, waiting_on_since_ms)`
-for consistent pair read across the supervisor + main-loop + MCP heartbeat
-write race window (Sprint 20 DAEMON.md §1 F6). Per dev-reviewer-2 threat
-model synthesis (m-20260427064xxx-XX), the lock-around-pair design is
+The `heartbeat_pair` lock guards `(heartbeat_at_ms, waiting_on_since_ms,
+last_input_at_ms)` — a 3-field `Copy` struct — for consistent snapshot
+read across the supervisor + main-loop + MCP heartbeat write race window
+(Sprint 20 DAEMON.md §1 F6). Fields:
+
+- `heartbeat_at_ms: u64` — last MCP tool call timestamp (Sprint 23 P0 PR #235)
+- `waiting_on_since_ms: Option<u64>` — when current `waiting_on` started (Sprint 23 P0 PR #235)
+- `last_input_at_ms: u64` — last daemon→agent input delivery timestamp (Sprint 24 P1 PR #243)
+
+Per dev-reviewer-2 threat model synthesis, the lock-around-pair design is
 preferred over `AtomicU64` per-field because correctness-corruption
 (prompt-injection, capability bypass) is the actual fleet threat — atomic
 exposes inconsistent-pair window.
@@ -179,6 +187,19 @@ enforces:
   lock is unaffected by the join refactor — Mutex<HeartbeatPair> is
   thread-affinity-free.
 
+- **F1 heartbeat-spam cross-check (Sprint 24 P2 PR #249)**: the
+  `check_hang` classifier cross-checks `heartbeat_at_ms` freshness
+  against PTY silence. "Heartbeat fresh" means the agent recently called
+  MCP tools (implicit heartbeat via `notify_agent` hook). "PTY silent"
+  means no operator-visible output was produced. If heartbeat is fresh
+  but PTY is silent past the hang threshold, the classifier overrides
+  `IdleLong` → `Hung` — catching prompt-injected agents that suppress
+  escalation by spam-calling MCP tools without generating real output.
+  This cross-check reads `heartbeat_at_ms` from the pair snapshot
+  (Level 3 leaf) and `silent` from `HealthTracker::last_output`
+  (Level 1 core) — no lock-ordering violation because the pair snapshot
+  is taken after core lock is released (Rule 2).
+
 ---
 
 ## Related
@@ -191,3 +212,9 @@ enforces:
 - Sprint 21 PR #226: protocol §10.5 Rule 5 spawn site rationale (parallel
   doc-doc convention; this lock-ordering doc is the Sprint 23 analogue
   for shared-state primitives).
+- Sprint 24 P0: PR #236 (`task_events.jsonl` storage substrate), PR #239
+  (`tasks.json` retired to `.legacy_pre_v2` archive — Level 2 entry removed).
+- Sprint 24 P1: PR #243 (daemon health classifier — `HeartbeatPair`
+  extended with `last_input_at_ms` for `IdleLong` vs `Hung` discrimination).
+- Sprint 24 P2: PR #249 (F1 heartbeat-spam cross-check — `heartbeat_at_ms`
+  freshness vs PTY silence override).
