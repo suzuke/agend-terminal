@@ -320,6 +320,18 @@ pub struct TaskBoardState {
 impl TaskBoardState {
     /// Apply one envelope. Returns `false` if the envelope was a duplicate
     /// (already-applied seq for this instance) and was skipped.
+    ///
+    /// **F3 (PR1 r2 dev-reviewer-2)** — replay-side application is
+    /// intentionally permissive on illegal state transitions (e.g. a
+    /// `Done` arriving on a task that never saw `Created`, or `Verified`
+    /// after `Cancelled`). The sister emit layer — `tasks.rs` MCP handler
+    /// in PR2 + sweep daemon in PR3 — validates `(current_status, event)`
+    /// legitimacy BEFORE calling [`append`], so the log only ever holds
+    /// transitions that were valid at emit time. Replay must accept any
+    /// valid envelope from the log (including pre-validation history that
+    /// may exist if validation rules ever tighten), while emit can refuse
+    /// new transitions. The split is deliberate: replay determinism first,
+    /// state-machine policy later.
     fn apply(&mut self, env: &TaskEventEnvelope) -> bool {
         let prev = self
             .last_seq_per_instance
@@ -537,9 +549,24 @@ pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
     }
 
     // Cross-process-deterministic ordering: same input → same fold output.
+    // F2 (PR1 r2 dev-reviewer-2): RFC3339 strings are lexically-sortable
+    // ONLY when they share UTC offset format. Today every emitter goes
+    // through `chrono::Utc::now().to_rfc3339()` (Z suffix), so lexical
+    // would be safe — but a future emitter passing a non-UTC offset
+    // (e.g. `+09:00`) would silently drift state across replay readers,
+    // a worst-class bug. Parse to absolute nanoseconds-since-epoch so
+    // ordering is chronological regardless of source offset. Unparseable
+    // timestamps fold to 0 (placed first); they would also fail the
+    // strict reader, so reaching this branch implies a programmer-
+    // injected sentinel rather than on-disk data.
     envelopes.sort_by(|a, b| {
-        a.timestamp
-            .cmp(&b.timestamp)
+        let a_ts = chrono::DateTime::parse_from_rfc3339(&a.timestamp)
+            .map(|d| d.timestamp_nanos_opt().unwrap_or(0))
+            .unwrap_or(0);
+        let b_ts = chrono::DateTime::parse_from_rfc3339(&b.timestamp)
+            .map(|d| d.timestamp_nanos_opt().unwrap_or(0))
+            .unwrap_or(0);
+        a_ts.cmp(&b_ts)
             .then_with(|| a.instance.0.cmp(&b.instance.0))
             .then_with(|| a.seq.cmp(&b.seq))
     });
@@ -935,6 +962,59 @@ mod tests {
             assert_eq!(r, first, "concurrent readers must observe identical state");
         }
         fs::remove_dir_all(&*home).ok();
+    }
+
+    /// F2 (PR1 r2) — mixed-timezone envelopes must sort chronologically,
+    /// not lexically. `+09:00` carries an earlier absolute instant than
+    /// `Z`, even though the lexical comparison (`+` ≈ 0x2B vs `Z` ≈ 0x5A)
+    /// goes the other way. This test pins the regression: if the sort
+    /// ever reverts to string compare, the asserted Done-status flips.
+    #[test]
+    fn replay_sorts_chronologically_across_timezone_offsets() {
+        let home = tmp_home("tz");
+        let log = home.join("task_events.jsonl");
+        // Event A: 2026-04-27T01:00:00+09:00 == 2026-04-26T16:00:00Z
+        // Event B: 2026-04-27T00:00:00Z
+        // Chronological: A precedes B by 8 hours.
+        // Lexical (broken): "2026-04-27T00..." < "2026-04-27T01..." → B before A.
+        let env_a = TaskEventEnvelope {
+            schema_version: 1,
+            seq: 1,
+            timestamp: "2026-04-27T01:00:00+09:00".into(),
+            instance: InstanceName::from("u"),
+            event: sample_event("t-TZ"),
+        };
+        let env_b = TaskEventEnvelope {
+            schema_version: 1,
+            seq: 2,
+            timestamp: "2026-04-27T00:00:00Z".into(),
+            instance: InstanceName::from("u"),
+            event: TaskEvent::Done {
+                task_id: "t-TZ".into(),
+                by: "u".into(),
+                source: DoneSource::OperatorManual {
+                    authored_at: "2026-04-27T00:00:00Z".into(),
+                    result: None,
+                },
+            },
+        };
+        // Write in the wrong (lexical) order — replay must still produce
+        // the chronologically-correct fold (Created → Done).
+        let mut content = String::new();
+        content.push_str(&serde_json::to_string(&env_b).unwrap());
+        content.push('\n');
+        content.push_str(&serde_json::to_string(&env_a).unwrap());
+        content.push('\n');
+        fs::write(&log, content).unwrap();
+
+        let state = replay(&home).unwrap();
+        let task = state.tasks.get(&TaskId::from("t-TZ")).unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Done,
+            "chronological sort: Created (16:00Z) precedes Done (00:00Z next-UTC-day) → final Done"
+        );
+        fs::remove_dir_all(&home).ok();
     }
 
     #[test]
