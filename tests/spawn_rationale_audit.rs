@@ -108,10 +108,14 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn rel_path_str(path: &Path, root: &Path) -> String {
+    // Sprint 23 P1 r2 — normalize Windows backslash to forward-slash so
+    // the EXEMPTED_LEGACY_FILES suffix-match (Unix-shaped paths) works
+    // cross-platform. CI broadening to `cargo test --tests` (PR #240)
+    // first surfaced this latent path-separator bug on windows-latest.
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
-        .to_string()
+        .replace('\\', "/")
 }
 
 fn is_exempted_file(rel_path: &str) -> bool {
