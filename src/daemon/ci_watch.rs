@@ -619,8 +619,13 @@ async fn ci_check_repo(
                 ),
                 None => format!("[ci-warn] {repo}@{branch}: {message}"),
             };
+            // Outbound info-leak gate (Sprint 21 Phase 1): `notify_msg`
+            // carries CI run url + repo name; legacy `None`-allowlist
+            // deployments must opt in to receive these via
+            // `user_allowlist: [...]`.
             if let Some(ch) = crate::channel::active_channel() {
-                let _ = ch.notify(
+                let _ = crate::channel::gated_notify(
+                    ch.as_ref(),
                     instance,
                     crate::channel::NotifySeverity::Warn,
                     &notify_msg,

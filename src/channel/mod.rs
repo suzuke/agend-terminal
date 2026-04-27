@@ -30,6 +30,7 @@
 // on the `pub use` re-exports below.
 #![allow(dead_code, unused_imports)]
 
+pub mod auth;
 pub mod binding;
 pub mod caps;
 pub mod contract;
@@ -208,6 +209,53 @@ pub trait Channel: Send + Sync {
     ) -> std::result::Result<(), ChannelError> {
         Err(ChannelError::NotSupported("notify".into()))
     }
+
+    /// Outbound notify gate predicate: returns `true` iff the channel
+    /// has been configured with an explicit non-empty operator
+    /// allowlist (i.e. the operator has opted in to receiving
+    /// info-bearing notifications via this channel).
+    ///
+    /// Default: `false` (fail-closed for adapters without an allowlist
+    /// concept). Concrete adapters override to expose their
+    /// configuration state.
+    ///
+    /// Consumed by [`gated_notify`] — daemon notify call sites should
+    /// route through that helper rather than calling [`Self::notify`]
+    /// directly so the gate cannot be bypassed.
+    fn outbound_authorized(&self) -> bool {
+        false
+    }
+}
+
+/// Outbound notify gate — only forwards to [`Channel::notify`] when the
+/// channel reports [`Channel::outbound_authorized`] = `true`. When the
+/// channel is unauthorised (no allowlist configured), the call is
+/// dropped with a `tracing::debug!` log.
+///
+/// Closes the Sprint 20.5 cross-validation outbound info-leak finding:
+/// daemon stall / recovery / crash / CI notices were calling
+/// `ch.notify()` directly, which on Telegram pushes the message to the
+/// bound group regardless of allowlist state — leaking PTY tails (40
+/// lines per stall) to anyone added to an unconfigured group. The gate
+/// fails-closed so legacy deployments with `user_allowlist == None`
+/// stop emitting outbound info; operators must explicitly configure
+/// `user_allowlist: [...]` (a Phase-2-aligned action) to opt in.
+pub fn gated_notify(
+    channel: &dyn Channel,
+    instance: &str,
+    severity: NotifySeverity,
+    message: &str,
+    silent: bool,
+) -> std::result::Result<(), ChannelError> {
+    if !channel.outbound_authorized() {
+        tracing::debug!(
+            instance,
+            kind = channel.kind(),
+            "outbound notify dropped — channel not authorised (fail-closed; configure user_allowlist to opt in)"
+        );
+        return Ok(());
+    }
+    channel.notify(instance, severity, message, silent)
 }
 
 /// Options passed to `Channel::create_binding`. Platform-specific hints live
@@ -330,5 +378,115 @@ mod tests {
         assert_ne!(NotifySeverity::Info, NotifySeverity::Warn);
         assert_ne!(NotifySeverity::Warn, NotifySeverity::Error);
         assert_ne!(NotifySeverity::Info, NotifySeverity::Error);
+    }
+
+    /// Mock channel that records every `notify` call so tests can pin
+    /// the gate's pass / drop semantics. Used by the [`gated_notify`]
+    /// tests below.
+    struct RecordingChannel {
+        caps: ChannelCapabilities,
+        outbound_ok: bool,
+        notify_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingChannel {
+        fn new(outbound_ok: bool) -> Self {
+            Self {
+                caps: ChannelCapabilities::default(),
+                outbound_ok,
+                notify_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn count(&self) -> usize {
+            self.notify_count.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl Channel for RecordingChannel {
+        fn kind(&self) -> &'static str {
+            "recording"
+        }
+        fn caps(&self) -> &ChannelCapabilities {
+            &self.caps
+        }
+        fn poll_event(&self) -> Option<ChannelEvent> {
+            None
+        }
+        fn send(&self, _: &BindingRef, _: OutMsg) -> Result<MsgRef> {
+            anyhow::bail!("mock")
+        }
+        fn edit(&self, _: &MsgRef, _: OutMsg) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn delete(&self, _: &MsgRef) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn create_binding(&self, _: &str, _: BindingOpts) -> Result<BindingRef> {
+            anyhow::bail!("mock")
+        }
+        fn remove_binding(&self, _: &BindingRef) -> Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn has_binding(&self, _: &str) -> bool {
+            false
+        }
+        fn record_binding(&self, _: &str, _: BindingRef, _: String) {}
+        fn take_binding(&self, _: &str) -> Option<BindingRef> {
+            None
+        }
+        fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+        fn outbound_authorized(&self) -> bool {
+            self.outbound_ok
+        }
+        fn notify(
+            &self,
+            _instance: &str,
+            _severity: NotifySeverity,
+            _message: &str,
+            _silent: bool,
+        ) -> std::result::Result<(), ChannelError> {
+            self.notify_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn gated_notify_drops_when_channel_unauthorized() {
+        // Fail-closed default: trait method returns false, gate drops
+        // the call; underlying `notify` must NOT be invoked.
+        let ch = RecordingChannel::new(false);
+        let result = gated_notify(&ch, "agent1", NotifySeverity::Warn, "leak-bait", false);
+        assert!(matches!(result, Ok(())), "drop must be Ok, got {result:?}");
+        assert_eq!(
+            ch.count(),
+            0,
+            "unauthorized channel must NOT receive notify call"
+        );
+    }
+
+    #[test]
+    fn gated_notify_forwards_when_channel_authorized() {
+        // Operator opted in (allowlist configured) → channel reports
+        // outbound_authorized=true → gate forwards to notify.
+        let ch = RecordingChannel::new(true);
+        let result = gated_notify(&ch, "agent1", NotifySeverity::Info, "ok", true);
+        assert!(result.is_ok(), "authorised forward must succeed");
+        assert_eq!(
+            ch.count(),
+            1,
+            "authorised channel must receive exactly 1 notify call"
+        );
+    }
+
+    #[test]
+    fn default_outbound_authorized_is_fail_closed() {
+        // Trait default is `false` so an adapter forgetting to opt in
+        // doesn't accidentally pass the gate.
+        let ch = MockChannel::new();
+        assert!(
+            !ch.outbound_authorized(),
+            "default trait method must fail-closed"
+        );
     }
 }
