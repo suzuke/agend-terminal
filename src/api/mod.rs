@@ -251,6 +251,9 @@ pub fn serve(
         // Slow-client hardening: set read/write deadlines so a stalled peer
         // cannot pin a session thread indefinitely. 30s is generous for a
         // JSON request line; control-plane calls are never slow on purpose.
+        // Sprint 25 P1 F1: slow-loris defense is layered — 30s TCP read
+        // timeout catches partial-JSON attacks; per-tool timeout in
+        // mcp_proxy::handle_mcp_tool caps tool execution independently.
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         let reg = Arc::clone(&registry);
@@ -304,9 +307,18 @@ fn handle_session(
     // P1-10 gate: first NDJSON line must be `{"auth":"<hex>"}`. Read deadline
     // on the stream (set in `serve`) ensures a silent peer closes out in 30s
     // rather than pinning this worker thread.
-    if let Err(e) = crate::auth_cookie::server_handshake_ndjson(&mut reader, &mut writer, &cookie) {
-        tracing::warn!(error = %e, "API auth rejected");
-        return;
+    // Sprint 25 P1 F1: extract optional peer PID for telemetry.
+    let peer_pid =
+        match crate::auth_cookie::server_handshake_ndjson(&mut reader, &mut writer, &cookie) {
+            Ok(pid) => pid,
+            Err(e) => {
+                tracing::warn!(error = %e, "API auth rejected");
+                return;
+            }
+        };
+    // Telemetry only — see MCP-DAEMON-PROXY-CONTRACT §peer-PID-telemetry.
+    if let Some(pid) = peer_pid {
+        tracing::debug!(peer_pid = pid, "API session peer PID");
     }
 
     loop {

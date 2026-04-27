@@ -134,7 +134,7 @@ pub fn server_handshake_ndjson<R: BufRead, W: Write>(
     reader: &mut R,
     writer: &mut W,
     expected: &Cookie,
-) -> Result<()> {
+) -> Result<Option<u32>> {
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         return Err(anyhow!("auth: connection closed before handshake"));
@@ -155,7 +155,11 @@ pub fn server_handshake_ndjson<R: BufRead, W: Write>(
     }
     writeln!(writer, r#"{{"ok":true}}"#)?;
     writer.flush().ok();
-    Ok(())
+    // Sprint 25 P1 F1: extract optional peer PID for telemetry.
+    // Telemetry only: daemon does not poll this PID for liveness;
+    // see Sprint 25 P3 follow-up (active peer-process invalidation).
+    let peer_pid = parsed.get("pid").and_then(|v| v.as_u64()).map(|v| v as u32);
+    Ok(peer_pid)
 }
 
 /// Client-side NDJSON handshake: sends `{"auth":"<hex>"}`, reads one-line

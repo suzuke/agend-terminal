@@ -64,3 +64,35 @@ Enforced by `tests/mcp_subprocess_is_zero_state.rs`:
 - **Per-call overhead**: ~0.1ms TCP loopback + cookie auth (amortized over persistent connection)
 - **Connection setup**: ~1ms (TCP connect + cookie handshake, once per session)
 - **Short-circuit (daemon-internal)**: 0ms overhead (direct function call)
+
+## TCP Lifecycle Refinement (Sprint 25 P1 F1)
+
+### Per-tool timeout
+
+Tools are classified into 3 tiers:
+
+| Tier | Timeout | Tools |
+|------|---------|-------|
+| Fast | 5s | inbox, describe_message, list_instances, list_teams, list_decisions, etc. |
+| Default | 30s | send_to_instance, delegate_task, task, and all others |
+| Slow | 60s | create_instance, deploy_template, replace_instance, watch_ci, checkout_repo |
+
+Timeout is enforced in `handle_mcp_tool` via a scoped thread + `mpsc::recv_timeout`. A timed-out tool returns a structured error; the API session stays alive for subsequent calls.
+
+### Peer PID telemetry
+
+The bridge sends its PID in the auth handshake (`{"auth":"<hex>","pid":12345}`). The daemon extracts and logs the peer PID for observability (`tracing::debug!`). This is **telemetry only** — the daemon does not actively poll the PID for liveness.
+
+Dead-bridge detection relies on TCP read timeout (30s): when the bridge process exits, the OS sends FIN/RST, and the daemon session thread exits on the next read error. Per-tool timeout (5/30/60s) further limits thread blocking for in-flight tool calls.
+
+### Deferred: active peer-process invalidation
+
+**Not implemented** (Sprint 25 P3 backlog). Active `kill(pid, 0)` periodic polling would detect bridge crashes within <1s and proactively close the daemon session — faster than the 30s TCP read timeout fallback. Deferred because the single-operator threat model makes the 30s fallback acceptable for current deployments.
+
+### Slow-loris defense
+
+TCP read timeout (30s) catches partial-JSON attacks at the transport layer. Per-tool timeout (5-60s) caps tool execution independently. A slow-loris sending partial JSON occupies the session thread for at most 30s (TCP read timeout), not indefinitely.
+
+### Request budget
+
+The daemon API is sequential (NDJSON line-by-line). Each session thread processes one request at a time. A stuck tool blocks only its own session thread (via `recv_timeout`), not other sessions. The per-tool timeout ensures the thread is freed within the tool's timeout budget.
