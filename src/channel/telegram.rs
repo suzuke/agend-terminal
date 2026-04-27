@@ -195,12 +195,18 @@ impl TelegramState {
     }
 
     /// Return true if a sender is permitted by the allowlist.
-    /// `None` allowlist = accept (legacy). `Some` = must appear in the list.
+    ///
+    /// **Sprint 21 Phase 2 fail-closed swap (PR #216 + #217 cascade
+    /// auth)**: previously `None` allowlist returned `true` (legacy
+    /// accept-all); now it returns `false`. The implementation
+    /// delegates to `crate::channel::auth::is_authorized_recipient`,
+    /// which is the single source of truth shared with Phase 1's
+    /// outbound notify gate. Operators must configure
+    /// `user_allowlist: [user_id, ...]` in `fleet.yaml` to enable
+    /// inbound (and outbound) traffic — see `docs/USAGE.md` "Channel:
+    /// Telegram" section for the migration steps.
     pub fn is_user_allowed(&self, user_id: i64) -> bool {
-        match &self.user_allowlist {
-            None => true,
-            Some(list) => list.contains(&user_id),
-        }
+        crate::channel::auth::is_authorized_recipient(&self.user_allowlist, user_id)
     }
 
     /// Send a message to an instance's Telegram topic.
@@ -569,14 +575,18 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         .and_then(|u| u.username.as_deref())
         .unwrap_or("unknown");
 
-    // Authz: drop messages from senders not on the allowlist. Legacy
-    // deployments (user_allowlist = None) accept all; `Some([])` rejects
-    // all; `Some([...])` restricts to the listed IDs.
+    // Authz: drop messages from senders not on the allowlist (Sprint 21
+    // Phase 2 fail-closed cascade auth — combined with PR #216 outbound
+    // gate this closes the cascade attack chain inbound side).
+    //   - `Some([u1, u2])` → restricts to listed IDs (always was)
+    //   - `Some([])` → rejects all
+    //   - `None` → rejects all (Phase 2 inversion of legacy `accept-all`)
+    //   - sender_id `None` (anonymous) → fail-closed: rejected
     {
         let s = lock_state(state);
         let allowed = match sender_id {
             Some(id) => s.is_user_allowed(id),
-            None => s.user_allowlist.is_none(),
+            None => false,
         };
         if !allowed {
             tracing::warn!(
@@ -958,8 +968,10 @@ pub fn init_from_config(
     };
     match user_allowlist {
         None => tracing::warn!(
-            "telegram channel.user_allowlist is not set — any group member can command the fleet. \
-             Set `user_allowlist: [123, 456]` in fleet.yaml to lock this down."
+            "telegram channel.user_allowlist is not set — Sprint 21 Phase 2 fail-closed default: \
+             ALL inbound messages and outbound notifications are dropped. \
+             Set `user_allowlist: [123, 456]` in fleet.yaml to enable the channel \
+             (see docs/USAGE.md \"Channel: Telegram\" migration section)."
         ),
         Some(list) if list.is_empty() => {
             tracing::info!(
@@ -2171,7 +2183,12 @@ mod tests {
     }
 
     #[test]
-    fn is_user_allowed_none_means_open() {
+    fn is_user_allowed_none_rejects_all_after_phase2_fail_closed_swap() {
+        // Sprint 21 Phase 2 inversion: previously `None` allowlist
+        // accepted all (legacy fail-open). Now `None` rejects all
+        // (fail-closed) — operator must configure `user_allowlist:
+        // [user_id, ...]` to authorise senders. See PR #216 + Phase 2
+        // dispatch (cascade auth chain inbound side).
         let state = TelegramState::new(
             "tok",
             -1,
@@ -2180,9 +2197,14 @@ mod tests {
             HashMap::new(),
             None,
         );
-        // Legacy open mode: any id accepted.
-        assert!(state.is_user_allowed(1));
-        assert!(state.is_user_allowed(i64::MAX));
+        assert!(
+            !state.is_user_allowed(1),
+            "fail-closed: None must reject any user"
+        );
+        assert!(
+            !state.is_user_allowed(i64::MAX),
+            "fail-closed: None must reject even valid Telegram user_ids"
+        );
     }
 
     #[test]
@@ -2213,6 +2235,66 @@ mod tests {
         assert!(state.is_user_allowed(100));
         assert!(!state.is_user_allowed(41));
         assert!(!state.is_user_allowed(0));
+    }
+
+    #[test]
+    fn is_user_allowed_realistic_user_id_after_phase2() {
+        // Operator-pitfall regression: real Telegram user_ids are i64
+        // values in the 100-million-to-billion range (e.g.
+        // `1047180393`). YAML deserialisation via `serde_yaml` must
+        // round-trip these as i64, not String — and the predicate
+        // must compare i64 equality, not string equality. This pin
+        // catches any future schema drift that lossy-coerces user_id.
+        const REAL_USER_ID: i64 = 1_047_180_393;
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            Some(vec![REAL_USER_ID]),
+        );
+        assert!(state.is_user_allowed(REAL_USER_ID));
+        // Off-by-one user_id is rejected — confirms exact i64 compare.
+        assert!(!state.is_user_allowed(REAL_USER_ID + 1));
+        assert!(!state.is_user_allowed(REAL_USER_ID - 1));
+    }
+
+    #[test]
+    fn user_allowlist_yaml_round_trip_i64_realistic_values() {
+        // Operator-pitfall regression (per Phase 2 dispatch): YAML
+        // round-trip for both `user_allowlist: [<positive i64>]` and
+        // `group_id: <negative supergroup i64>` must preserve i64
+        // semantics. Without this, a future serde refactor that
+        // narrowed to i32 would silently truncate user_ids beyond 2^31.
+        //
+        // The values used are the real-world shape operator confirmed
+        // via telegram (positive 10-digit user_id; negative 13-digit
+        // supergroup chat id with `-100` prefix per Telegram Bot API).
+        let yaml = r#"
+group_id: -1003725098111
+user_allowlist:
+  - 1047180393
+"#;
+        #[derive(serde::Deserialize, Debug)]
+        struct PartialChannel {
+            group_id: i64,
+            user_allowlist: Vec<i64>,
+        }
+        let parsed: PartialChannel = serde_yaml::from_str(yaml).expect("yaml must deserialize");
+        assert_eq!(parsed.group_id, -1_003_725_098_111_i64);
+        assert_eq!(parsed.user_allowlist, vec![1_047_180_393_i64]);
+
+        // Round-trip back to YAML and re-parse to lock contract.
+        let serialized = serde_yaml::to_string(&serde_json::json!({
+            "group_id": parsed.group_id,
+            "user_allowlist": parsed.user_allowlist,
+        }))
+        .expect("yaml must serialize");
+        let reparsed: PartialChannel =
+            serde_yaml::from_str(&serialized).expect("yaml round-trip must deserialize");
+        assert_eq!(reparsed.group_id, parsed.group_id);
+        assert_eq!(reparsed.user_allowlist, parsed.user_allowlist);
     }
 
     #[test]
