@@ -48,10 +48,13 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn rel_path_str(path: &Path, root: &Path) -> String {
+    // Sprint 23 P1 r2 — normalize Windows backslash to forward-slash for
+    // cross-platform EXEMPTED-list / inline `ends_with("daemon/heartbeat_pair.rs")`
+    // suffix-match. See PR #240 r2.
     path.strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
-        .to_string()
+        .replace('\\', "/")
 }
 
 fn is_exempted(rel_path: &str) -> bool {
