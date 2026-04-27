@@ -350,11 +350,19 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         })
         .map_err(|e| anyhow::anyhow!("Failed to open PTY: {e}"))?;
 
+    // RAII guard arms the rollback for partial-failure between here and the
+    // commit() at the end of this fn. Sprint 20 F1: previously a take_writer /
+    // try_clone_reader / pty_read_loop spawn failure left an orphan PID (no
+    // registry entry) or a phantom registry entry (no read thread).
+    let mut rollback = crate::daemon::lifecycle::SpawnRollback::new(name, registry);
+
     let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| anyhow::anyhow!("Failed to spawn '{backend_command}': {e}"))?;
     drop(pair.slave);
+    let child_arc: Arc<Mutex<Box<dyn portable_pty::Child + Send>>> = Arc::new(Mutex::new(child));
+    rollback.mark_child_spawned(Arc::clone(&child_arc));
 
     let pty_writer: PtyWriter = Arc::new(Mutex::new(
         pair.master
@@ -385,7 +393,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                 pty_writer: Arc::clone(&pty_writer),
                 pty_master: Arc::clone(&pty_master),
                 core: Arc::clone(&core),
-                child: Arc::new(Mutex::new(child)),
+                child: Arc::clone(&child_arc),
                 submit_key: submit_key.to_string(),
                 inject_prefix: detected_backend
                     .as_ref()
@@ -398,6 +406,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             },
         );
     }
+    rollback.mark_registered();
 
     // PTY read thread — feeds VTerm + broadcasts + auto-dismiss trust dialog + session reaper
     let core2 = Arc::clone(&core);
@@ -427,6 +436,10 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         dismiss_patterns: dismiss,
         shutdown: shutdown_for_reaper,
     };
+    // fire-and-forget: pty_read_loop terminates on PTY EOF, which fires when
+    // the child process is killed during shutdown / delete. JoinHandle is
+    // discarded because the loop's exit is signalled via the OS-side PTY
+    // close, not via a stored handle.
     std::thread::Builder::new()
         .name(format!("{n}_pty_read"))
         .spawn(move || {
@@ -474,6 +487,9 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
             }
         }
     }
+
+    // Disarm the rollback guard — all ordered mutations succeeded.
+    rollback.commit();
 
     tracing::info!(agent = name, backend = backend_command, args = %config.args.join(" "), "spawned");
     Ok(())

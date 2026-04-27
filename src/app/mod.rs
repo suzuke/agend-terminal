@@ -325,7 +325,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             if !agent_is_alive(&registry, &pane.agent_name) {
                 let name = pane.agent_name.clone();
                 overlay = Overlay::None;
-                kill_agent(&registry, &name);
+                kill_agent(&home, &registry, &name);
             }
         }
         if needs_resize {
@@ -614,7 +614,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // Cleanup: kill all agents
         for tab in &layout.tabs {
             for name in tab.root().agent_names() {
-                kill_agent(&registry, &name);
+                kill_agent(&home, &registry, &name);
             }
         }
     }
@@ -855,14 +855,17 @@ fn scroll_focused(layout: &mut Layout, delta: i32) {
     }
 }
 
-/// Kill an agent and remove from both registry and fleet.yaml.
-fn kill_agent(registry: &AgentRegistry, name: &str) {
-    let mut reg = agent::lock_registry(registry);
-    if let Some(handle) = reg.get(name) {
-        let mut child = crate::sync::lock_poisoned(&handle.child, "app_child");
-        let _ = child.kill();
-    }
-    reg.remove(name);
+/// Kill an agent and remove from registry. Delegates to
+/// [`crate::daemon::lifecycle::delete_transaction`] so app-mode and
+/// daemon-mode share one tear-down path.
+///
+/// Sprint 20 F3 fix: previously called only `child.kill()` (leader-only,
+/// leaving subprocess trees alive on backends like kiro-cli) and skipped
+/// event_log + Telegram binding rollback. The shared transaction now does
+/// `kill_process_tree` + synchronous wait-for-exit + `take_binding` + event
+/// log, matching the API delete path.
+fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
+    crate::daemon::lifecycle::delete_transaction(home, name, registry, None);
 }
 
 /// Whether the agent's child process is still running.
