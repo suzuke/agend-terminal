@@ -255,9 +255,38 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Returns true if this process IS the daemon. When true, `handle_tool`
+/// can be called directly without TCP round-trip.
+///
+/// Detection: the daemon sets `AGEND_DAEMON_PID` env var during startup
+/// (see `daemon::run_core`). MCP subprocesses spawned by agent backends
+/// do NOT inherit this var (it's not in the agent env passthrough list).
+pub(crate) fn is_running_inside_daemon_process() -> bool {
+    use std::sync::OnceLock;
+    static IS_DAEMON: OnceLock<bool> = OnceLock::new();
+    *IS_DAEMON.get_or_init(|| {
+        // Primary signal: ACTIVE_CHANNEL is only registered in daemon process
+        crate::channel::active_channel().is_some()
+        // Fallback: check if we're the daemon by PID match
+        || std::env::var("AGEND_DAEMON_PID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|pid| pid == std::process::id())
+            .unwrap_or(false)
+    })
+}
+
 /// Try to proxy a tool call through the daemon API port.
 /// Falls back to local handling if the daemon is unavailable.
+/// Short-circuits to direct `handle_tool` when running inside the daemon.
 fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
+    // Short-circuit: if we're inside the daemon process, call handle_tool
+    // directly — no TCP round-trip needed. All process-global state
+    // (ACTIVE_CHANNEL, heartbeat_pair) is already available.
+    if is_running_inside_daemon_process() {
+        return handlers::handle_tool(tool, args, instance_name);
+    }
+
     let home = crate::home_dir();
 
     if let Ok(resp) = crate::api::call(

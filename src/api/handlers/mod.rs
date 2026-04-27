@@ -5,6 +5,7 @@
 
 pub(crate) mod external;
 pub(crate) mod instance;
+pub(crate) mod mcp_proxy;
 pub(crate) mod messaging;
 pub(crate) mod query;
 pub(crate) mod team;

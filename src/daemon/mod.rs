@@ -221,6 +221,11 @@ fn run_core(
     initial_digest: Option<HashMap<String, crate::bootstrap::reload::InstanceDigest>>,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
 ) -> anyhow::Result<()> {
+    // Sprint 25 P0 Option F: mark this process as the daemon so
+    // `mcp::is_running_inside_daemon_process()` can short-circuit
+    // tool calls without TCP round-trip.
+    std::env::set_var("AGEND_DAEMON_PID", std::process::id().to_string());
+
     // Sprint 24 P0 PR2 — bridge-phase legacy migration. Walks tasks.json
     // and emits canonical Created (+ status transition) events into
     // task_events.jsonl. Idempotent: re-run is a no-op via tail-scan
