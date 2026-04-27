@@ -35,6 +35,7 @@
   - **F-NEW-DAEMON-HEALTH-CLASSIFIER-1** (per general m-20260427040529383849-303): long-idle alive vs hung classifier 區分。Repro: 30+min idle agent → daemon flag hung 即使 state=ready。Fix: `last_input_responsive_at` 軌跡 OR `idle_long` vs `hung_unresponsive` 二態 split。Evidence: 04:00 dev-impl-1 false alarm。LOC est ~30-50 + tests。
   - **EXEMPTED_LEGACY_FILES sweep** (per PR #227): 15 files in `tests/spawn_rationale_audit.rs` allowlist 各帶 `TODO Sprint 22 sweep` marker, 一一 fix-or-justify 收掉。
   - **F1 cosmetic** (per PR #227 dev-reviewer): `tests/spawn_rationale_audit.rs` doc 5-line vs impl 10-line lookback 不一致, 對齊 "10 lines" canonical (impl-2 next-touch 順手即可)。
+  - **F-NEW-OUTBOUND-DROP-LOG-SEVERITY-1** (per ts-lead m-20260427041306634326-310 / dev-reviewer-2 Phase A audit): `src/channel/mod.rs:251-255` outbound `tracing::debug!` vs inbound `src/channel/telegram.rs:592` `tracing::warn!` severity 不一致。Operator default `RUST_LOG=info` 看不到 fail-closed gate firing → silent drop debugging issue。Fix: `debug!` → `warn!` (1-line change, no breaking)。LOC 1 + reasoning comment。
 - **Dispatch**: impl-1 OR impl-2 in parallel with P0。
 - **Reviewer**: dev-reviewer (single, per-condition variance allows single-pass)。
 
