@@ -22,6 +22,66 @@ pub enum TelegramStatus {
     Connected,
 }
 
+/// Clamp a desired overlay dimension by the available space minus padding,
+/// using saturating arithmetic so a tiny terminal renders a clipped overlay
+/// instead of underflow-panicking.
+///
+/// Closes Sprint 20 Track C R1 finding (5 sites at `area.{height,width} - N`
+/// in `render_rename` / `render_tab_list` / `render_move_pane_target` /
+/// `render_confirm` panic on resize below the padding threshold). Same
+/// failure class as PR #194 vterm OOB hotfix (`vterm.rs:140-143` already
+/// uses this pattern).
+fn clamp_overlay_dim(desired: u16, available: u16, pad: u16) -> u16 {
+    desired.min(available.saturating_sub(pad))
+}
+
+/// Centred coordinate for an overlay of `overlay_dim` within `area_dim`,
+/// using saturating arithmetic so the result is always non-negative even
+/// when overlay > area (which `clamp_overlay_dim` already prevents, but the
+/// saturating subtract here is defence in depth).
+fn center_overlay(area_dim: u16, overlay_dim: u16) -> u16 {
+    area_dim.saturating_sub(overlay_dim) / 2
+}
+
+/// Compute a centred overlay `Rect` with saturating arithmetic. Use for any
+/// overlay (menu / rename / tab list / confirm / etc.) that picks a
+/// content-driven size and centres it within the parent `area`.
+///
+/// Closes Sprint 20 Track C R1 finding by funnelling the previously-divergent
+/// 5 ad-hoc sites through one helper that cannot underflow.
+fn centered_overlay_rect(
+    area: Rect,
+    content_h: u16,
+    content_w: u16,
+    h_pad: u16,
+    w_pad: u16,
+) -> Rect {
+    let height = clamp_overlay_dim(content_h, area.height, h_pad);
+    let width = clamp_overlay_dim(content_w, area.width, w_pad);
+    let x = center_overlay(area.width, width);
+    let y = center_overlay(area.height, height);
+    Rect::new(x, y, width, height)
+}
+
+/// Sprint 20.5 Track 7 transient state badge (per dev-reviewer
+/// cross-validation B↔C peer-pass): for tab-bar agents in transient
+/// lifecycle states (Restarting / Crashed), surface a short text badge
+/// alongside the colour dot so the registry-vs-process divergence window
+/// is visually announced rather than silent.
+///
+/// Returns `None` for terminal / steady states — most ticks emit no badge,
+/// keeping the tab bar uncluttered. Restricted to states that signal a
+/// short-lived disagreement between TUI render (registry says agent
+/// exists) and the underlying process (Crashed: dead, Restarting:
+/// respawning). Not a new state machine — pure render-side derivation.
+fn transient_state_badge(state: AgentState) -> Option<&'static str> {
+    match state {
+        AgentState::Restarting => Some(" [respawning]"),
+        AgentState::Crashed => Some(" [crashed]"),
+        _ => None,
+    }
+}
+
 fn state_color(state: AgentState) -> Color {
     match state {
         AgentState::Starting => Color::White,
@@ -144,11 +204,21 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
         };
 
         let has_notif = tab.root().has_notification();
-        let badge = if has_notif && !is_active { " !" } else { "" };
-        let label = format!(" {}{badge} ", tab.name);
+        let notif_badge = if has_notif && !is_active { " !" } else { "" };
+        let label = format!(" {}{notif_badge} ", tab.name);
 
         spans.push(dot);
         spans.push(Span::styled(label, style));
+
+        // Sprint 21 Phase 4 transient state badge (per Sprint 20.5 Track 7
+        // B↔C cross-validation): surface registry-vs-process divergence
+        // window in the tab bar itself rather than leaving it silent.
+        // Yellow keeps the badge visually distinct from the agent name +
+        // matches the "transitioning" connotation; the leading space is
+        // already in the badge string.
+        if let Some(b) = transient_state_badge(state) {
+            spans.push(Span::styled(b, Style::default().fg(Color::Yellow)));
+        }
     }
 
     // `[+]` doubles as the "drop here to spawn a new tab" zone during a
@@ -820,17 +890,13 @@ fn render_status_bar(frame: &mut Frame, area: Rect, layout: &Layout, telegram: T
 
 pub fn render_menu(frame: &mut Frame, items: &[MenuItem], selected: usize) {
     let area = frame.area();
-    // `items.len() as u16` can silently truncate; `area.height - 2` panics
-    // if height < 2. Use saturating arithmetic throughout so a tiny
-    // terminal renders a (clipped) menu instead of underflow-panicking.
+    // Sprint 21 Phase 4 R1: route through `centered_overlay_rect` helper so
+    // tiny terminals (height < 2 / width < 4) render a clipped menu instead
+    // of underflow-panicking. Pre-existing fix in this fn was the seed for
+    // the helper extraction; replacing the inline math closes the propagation
+    // gap (Sprint 20 Track C L2).
     let item_count = u16::try_from(items.len()).unwrap_or(u16::MAX);
-    let menu_height = item_count
-        .saturating_add(4)
-        .min(area.height.saturating_sub(2));
-    let menu_width = 50u16.min(area.width.saturating_sub(4));
-    let x = (area.width.saturating_sub(menu_width)) / 2;
-    let y = (area.height.saturating_sub(menu_height)) / 2;
-    let menu_area = Rect::new(x, y, menu_width, menu_height);
+    let menu_area = centered_overlay_rect(area, item_count.saturating_add(4), 50, 2, 4);
     frame.render_widget(Clear, menu_area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -864,9 +930,13 @@ pub fn render_menu(frame: &mut Frame, items: &[MenuItem], selected: usize) {
 
 pub fn render_rename(frame: &mut Frame, input: &str) {
     let area = frame.area();
-    let w = 40u16.min(area.width - 4);
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = area.height / 2 - 1;
+    // Sprint 21 Phase 4 R1: saturating-arithmetic via helper. Rename overlay
+    // height is fixed at 3 lines so we use clamp_overlay_dim for width only,
+    // then derive y from height/2 with saturating_sub for the legacy " - 1"
+    // (height < 2 → y = 0 instead of underflow).
+    let w = clamp_overlay_dim(40, area.width, 4);
+    let x = center_overlay(area.width, w);
+    let y = (area.height / 2).saturating_sub(1);
     let ra = Rect::new(x, y, w, 3);
     frame.render_widget(Clear, ra);
     let block = Block::default()
@@ -893,11 +963,11 @@ pub fn render_rename(frame: &mut Frame, input: &str) {
 
 pub fn render_tab_list(frame: &mut Frame, layout: &Layout, selected: usize) {
     let area = frame.area();
-    let h = (layout.tabs.len() as u16 + 4).min(area.height - 2);
-    let w = 50u16.min(area.width - 4);
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 2;
-    let la = Rect::new(x, y, w, h);
+    // Sprint 21 Phase 4 R1: route through helper — was raw `area.height - 2`
+    // and `area.width - 4` which underflow-panic when terminal shrinks below
+    // padding threshold (Sprint 20 Track C R1 finding).
+    let content_h = (layout.tabs.len() as u16).saturating_add(4);
+    let la = centered_overlay_rect(area, content_h, 50, 2, 4);
     frame.render_widget(Clear, la);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -951,12 +1021,12 @@ pub fn render_move_pane_target(
     split_dir: crate::layout::SplitDir,
 ) {
     let area = frame.area();
-    let list_len = layout.tabs.len() + 1; // tabs + "New tab"
-    let h = (list_len as u16 + 4).min(area.height - 2);
-    let w = 54u16.min(area.width - 4);
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 2;
-    let la = Rect::new(x, y, w, h);
+    // Sprint 21 Phase 4 R1: route through helper — was raw `area.height - 2`
+    // and `area.width - 4` which underflow-panic when terminal shrinks below
+    // padding threshold (Sprint 20 Track C R1 finding).
+    let list_len = (layout.tabs.len() as u16).saturating_add(1); // tabs + "New tab"
+    let content_h = list_len.saturating_add(4);
+    let la = centered_overlay_rect(area, content_h, 54, 2, 4);
     frame.render_widget(Clear, la);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -970,7 +1040,7 @@ pub fn render_move_pane_target(
     let inner = block.inner(la);
     frame.render_widget(block, la);
 
-    let mut lines: Vec<Line> = Vec::with_capacity(list_len);
+    let mut lines: Vec<Line> = Vec::with_capacity(list_len.into());
     for (i, tab) in layout.tabs.iter().enumerate() {
         let is_sel = i == selected;
         let is_source = i == source_tab_idx;
@@ -1017,9 +1087,15 @@ pub fn render_move_pane_target(
 
 pub fn render_confirm(frame: &mut Frame, message: &str) {
     let area = frame.area();
-    let w = (message.len() as u16 + 4).min(area.width - 4);
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = area.height / 2 - 1;
+    // Sprint 21 Phase 4 R1: saturating-arithmetic via helper. Confirm overlay
+    // is fixed at 3 lines so we use clamp_overlay_dim for width only, and
+    // saturating_sub for the legacy " - 1" so height < 2 → y = 0.
+    let content_w = u16::try_from(message.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(4);
+    let w = clamp_overlay_dim(content_w, area.width, 4);
+    let x = center_overlay(area.width, w);
+    let y = (area.height / 2).saturating_sub(1);
     let ca = Rect::new(x, y, w, 3);
     frame.render_widget(Clear, ca);
     let block = Block::default()
@@ -2209,5 +2285,81 @@ mod tests {
             lines.iter().any(|l| l.contains("general")),
             "unassigned agent must appear: {lines:?}"
         );
+    }
+
+    // ─── Sprint 21 Phase 4: R1 overlay_dims helper + transient state badge ─
+
+    #[test]
+    fn clamp_overlay_dim_saturates_on_zero_area() {
+        // Sprint 20 Track C R1: tiny terminal (height 0 / 1 / pad-itself)
+        // must NOT panic. Clamp returns 0 when available < pad.
+        assert_eq!(clamp_overlay_dim(40, 0, 4), 0);
+        assert_eq!(clamp_overlay_dim(40, 1, 4), 0);
+        assert_eq!(clamp_overlay_dim(40, 4, 4), 0);
+        // Boundary: available = pad + 1 → 1 unit usable.
+        assert_eq!(clamp_overlay_dim(40, 5, 4), 1);
+    }
+
+    #[test]
+    fn clamp_overlay_dim_normal_case_returns_min_of_desired_and_available_minus_pad() {
+        // Happy path: large terminal, small content.
+        assert_eq!(clamp_overlay_dim(40, 200, 4), 40);
+        // Reverse: small terminal, large content — clamp by available.
+        assert_eq!(clamp_overlay_dim(200, 50, 4), 46);
+        // Equal: desired matches available - pad.
+        assert_eq!(clamp_overlay_dim(46, 50, 4), 46);
+    }
+
+    #[test]
+    fn center_overlay_saturates_when_overlay_exceeds_area() {
+        // Defence in depth: even if clamp_overlay_dim were bypassed and
+        // overlay > area, center_overlay returns 0 instead of underflowing.
+        assert_eq!(center_overlay(0, 10), 0);
+        assert_eq!(center_overlay(20, 50), 0);
+        assert_eq!(center_overlay(100, 50), 25);
+    }
+
+    #[test]
+    fn centered_overlay_rect_tiny_terminal_does_not_panic() {
+        // Sprint 20 Track C R1 invariant: 0×0 / 1×1 / pad-itself area must
+        // not panic, must return a Rect with 0-dim where appropriate.
+        let r0 = centered_overlay_rect(Rect::new(0, 0, 0, 0), 10, 50, 2, 4);
+        assert_eq!((r0.width, r0.height), (0, 0));
+
+        let r1 = centered_overlay_rect(Rect::new(0, 0, 1, 1), 10, 50, 2, 4);
+        assert_eq!((r1.width, r1.height), (0, 0));
+
+        // Available exactly = pad → still 0-dim.
+        let r2 = centered_overlay_rect(Rect::new(0, 0, 4, 2), 10, 50, 2, 4);
+        assert_eq!((r2.width, r2.height), (0, 0));
+    }
+
+    #[test]
+    fn centered_overlay_rect_centers_within_area() {
+        // Happy path: 100x40 area, content 50x10 + pad 4/2 → overlay 50x10
+        // (clamped by content), centred at (25, 15).
+        let r = centered_overlay_rect(Rect::new(0, 0, 100, 40), 10, 50, 2, 4);
+        assert_eq!((r.x, r.y, r.width, r.height), (25, 15, 50, 10));
+    }
+
+    #[test]
+    fn transient_state_badge_emits_for_restarting_and_crashed_only() {
+        // Sprint 20.5 Track 7 transient state badge: only Restarting +
+        // Crashed visibly announce a registry-vs-process divergence
+        // window. Other states render no badge (steady-state OR fast
+        // transitions whose badge would flicker more than help).
+        assert_eq!(
+            transient_state_badge(AgentState::Restarting),
+            Some(" [respawning]")
+        );
+        assert_eq!(
+            transient_state_badge(AgentState::Crashed),
+            Some(" [crashed]")
+        );
+        assert_eq!(transient_state_badge(AgentState::Idle), None);
+        assert_eq!(transient_state_badge(AgentState::Ready), None);
+        assert_eq!(transient_state_badge(AgentState::ToolUse), None);
+        assert_eq!(transient_state_badge(AgentState::Hang), None);
+        assert_eq!(transient_state_badge(AgentState::PermissionPrompt), None);
     }
 }
