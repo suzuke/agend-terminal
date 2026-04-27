@@ -58,8 +58,17 @@ jobs:
       - name: Unit tests (tray feature)
         run: cargo test --bin agend-terminal --features tray
 
-      - name: Integration tests
-        run: cargo test --test integration
+      # Sprint 23 P1 — anti-bypass invariant tests live in tests/*.rs but
+      # the previous `cargo test --test integration` only ran one file
+      # (integration.rs). Anti-bypass invariants (task_events /
+      # legacy_outbound / spawn_rationale / heartbeat_pair) and
+      # characterization tests (mcp_characterization / mcp_roundtrip /
+      # no_dual_track_drift / self_healing_supervisor) silently passed CI
+      # if their assertions broke. `--tests` covers every `tests/*.rs`
+      # file plus already-covered unit tests; the unit-test repeat is
+      # cheap (cached) and keeps the invariant net fail-loud.
+      - name: Integration tests + anti-bypass invariants
+        run: cargo test --tests
 
       - name: CLI smoke (Phase C.5)
         shell: bash
