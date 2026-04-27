@@ -1,67 +1,66 @@
-# Migration: `outbound_capabilities` (Sprint 22 P0 → Sprint 23 hard-cut)
+# Migration: `outbound_capabilities` (Sprint 22 P0 fail-closed → Sprint 23 P1 default-open reversal)
 
-**Status**: Sprint 22 P0 transition window — operators MUST add `outbound_capabilities` to user-authored instances in `fleet.yaml` before Sprint 23 ships, or `agend-terminal start` will refuse to load fleet.yaml.
+**Status (Sprint 23 P1)**: **default-open**. Missing `outbound_capabilities` field permits all ops; declare the field only if you want to opt out (`[]`) or restrict (selective list). The Sprint 22 P0 hard-cut described in earlier revisions of this doc is **reversed** per operator philosophy override.
 
-## TL;DR
+## TL;DR (Sprint 23 P1 onward)
 
-For every instance in your `fleet.yaml` that you authored (anything not auto-injected as `general`):
+You don't need to add `outbound_capabilities` to anything. Existing fleets work. If you want to restrict an instance:
 
 ```yaml
 instances:
   <your-instance-name>:
     backend: claude
-    outbound_capabilities: [reply, react, edit, inject_provenance]   # ← ADD THIS
-    # … other existing fields …
+    outbound_capabilities: [reply]      # only `reply` permitted; everything else rejected
 ```
 
-For inbound-only / relay agents that should NOT emit MCP→Channel ops:
+Or block all agent outbound (relay / read-only roles):
 
 ```yaml
-    outbound_capabilities: []                                          # ← explicit "no outbound"
+instances:
+  <your-instance-name>:
+    backend: claude
+    outbound_capabilities: []           # explicit "no agent outbound"
 ```
 
-## What changed
+## Sprint 23 P1 reversal — why
 
-`outbound_capabilities` is a per-instance gate for **agent-callable** outbound MCP→Channel operations (`reply` / `react` / `edit_message` / `delegate_task` provenance side-channel). The field shipped declaratively in [PR #223](https://github.com/suzuke/agend-terminal/pull/223) but defaulted to permissive when absent. Sprint 22 P0 (this sprint) starts the 2-stage hard-cut transition.
+**Original Sprint 22 P0 design**: fail-closed default with FATAL warn ("operator MUST declare outbound_capabilities or daemon refuses to load fleet.yaml"). The intent was to defend against a cascade attack chain where a compromised agent in the fleet could emit MCP→Channel ops freely.
 
-### Two-stage transition
+**Operator philosophy override (Sprint 23 P1)**: the cascade-attack-chain defence is over-spec for the actual single-operator threat model. The TUI is already full machine access; if an agent in the fleet is compromised, the operator already has bigger problems than gated MCP outbound ops. Operator explicitly accepts the security trade-off (telegram 11:00 UTC routed via `general` m-20260427115706155870-88, dispatch m-20260427115825059656-89, task t-20260427115754474312-3).
 
-| State | Sprint 22 P0 | Sprint 23 |
-|---|---|---|
-| `Some([reply, …])` | only listed ops permitted | same |
-| `Some([])` | fail-closed (no agent outbound; explicit) | same |
-| `None` (absent) | **FATAL warn-but-permit one daemon cycle** + migration template logged | **hard parse error** |
+**What changed in code**:
+- `src/channel/auth.rs::evaluate_outbound_capability` — `None` (missing field) now returns `OutboundCapabilityDecision::OpenDefault` instead of `PermissiveLegacyMissing`.
+- `OutboundCapabilityDecision::PermissiveLegacyMissing` variant renamed to `OpenDefault` (no longer a transitional grace).
+- `warn_once_outbound_capabilities_missing` helper retired entirely. Missing field is silent — no FATAL log, no operator-actionable migration template, no friction.
+- `bootstrap::fleet_normalize::auto_create_general` no longer auto-injects an explicit cap list onto `general`. Built-ins inherit default-open like operator-authored instances do.
 
-### Built-in instances
+**What stayed the same**:
+- `Some([reply, …])` — selective allow-list still works.
+- `Some([])` — explicit opt-out still rejects everything (operator can still actively block agent outbound).
+- `channel.user_allowlist` (PR #216) — **still fail-closed**. Different threat model: notification fan-out to the operator's bound group. Missing allowlist drops every daemon-driven notification (stall / crash / CI alerts) silently. The `warn_once_user_allowlist_unconfigured` helper from Sprint 22 P1.5 remains active and surfaces a FATAL log.
 
-`general` (and any future auto-created coordinator) get auto-injected `[reply, react, edit, inject_provenance]` via `bootstrap::fleet_normalize::auto_create_general` — operator never has to author this field for first-class fleet members.
+## Decision matrix (current contract)
 
-### Independence from `user_allowlist`
+| State | Behaviour |
+|---|---|
+| field absent | **all ops permitted** |
+| `[reply, react, edit, inject_provenance]` | only listed ops permitted |
+| `[reply]` | only `reply` permitted; `react`/`edit`/`inject_provenance` rejected |
+| `[]` (explicit empty) | **all ops rejected** (operator opt-out) |
 
-`outbound_capabilities` only gates **agent-callable** MCP→Channel ops (the four MCP tools above). The `channel.user_allowlist` field continues to gate inbound message acceptance + daemon-internal stall/recovery/CI notifications (per [PR #216](https://github.com/suzuke/agend-terminal/pull/216) outbound fail-closed default at the daemon notify call sites). The two gates compose — both must be satisfied for an agent's reply to actually reach the bound Telegram group.
+## Built-in instances
 
-## Why this matters (security)
+`general` (and any future auto-created coordinator) inherits default-open — no auto-injected list. The persisted `fleet.yaml` for a fresh `general` no longer carries an `outbound_capabilities:` line.
 
-Without the per-instance gate, any agent in the fleet could emit any MCP→Channel op to the bound Telegram group. The Sprint 20.5 cross-validation audit (see `docs/codebase-review-2026-04-27/SYNTHESIS.md`) flagged this as a per-instance authorization hole even after PR #216 closed the daemon-side outbound info-leak.
+## Migration from Sprint 22 P0
 
-The fix is to require operators to declare per-instance outbound intent explicitly. The Sprint 22 P0 transition window (warn-but-permit) gives operators time to update fleet.yaml without breaking running deployments; Sprint 23 closes the hole completely.
+If you previously added `outbound_capabilities: [reply, react, edit, inject_provenance]` to an instance to silence the FATAL log: you can remove that line and the instance still works. Or keep it — it's now equivalent to default-open.
 
-## What you'll see during the transition
+If you set `outbound_capabilities: []` to opt out: that still works as expected.
 
-On the first agent outbound call from an instance missing `outbound_capabilities`, daemon logs (at `error` level for visibility):
+## Independence from `user_allowlist` (unchanged)
 
-```
-ERROR: FATAL (warn-but-permit one daemon cycle): instance '<name>' \
-       outbound_capabilities NOT SET. Sprint 22 P0 grants this <op> call \
-       under gradual-migration grace. Sprint 23 will fail-closed (hard \
-       parse error on missing field). Add to fleet.yaml NOW:
-  instances.<name>.outbound_capabilities: [reply, react, edit, inject_provenance]
-See docs/USAGE.md "Channel: Telegram" + docs/MIGRATION-OUTBOUND-CAPS.md for details.
-```
-
-The op is permitted this cycle (no operator-visible breaking) but the warn is rate-limited to **once per instance per process lifetime** so you'll see one error per instance per daemon restart — not log spam.
-
-In Sprint 23, the same fleet.yaml will fail to load with a `serde` parse error pointing back to this migration doc.
+`outbound_capabilities` only gates **agent-callable** MCP→Channel ops (`reply` / `react` / `edit_message` / `delegate_task` provenance). The `channel.user_allowlist` field continues to gate inbound message acceptance + daemon-internal notifications. **It is still fail-closed**, and the `warn_once_user_allowlist_unconfigured` helper still emits a FATAL log when missing. The two gates compose independently.
 
 ## ChannelOpKind enum reference
 

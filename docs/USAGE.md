@@ -168,41 +168,35 @@ To restore outbound notifications, add your operator user_id(s) to `user_allowli
 
 If you previously relied on legacy "anyone in the group can command the fleet" behaviour, the inbound side still accepts all users until Phase 2 lands; configure `user_allowlist` now to close both sides simultaneously.
 
-### `outbound_capabilities` semantics (Sprint 22 P0 — 2-stage hard-cut)
+### `outbound_capabilities` semantics (Sprint 23 P1 — default-open)
 
-Per-instance gate for **agent-callable** outbound MCP→Channel ops (`reply` / `react` / `edit_message` / `delegate_task` provenance). Independent of `user_allowlist` (which gates inbound + daemon-internal notifications).
+Per-instance gate for **agent-callable** outbound MCP→Channel ops (`reply` / `react` / `edit_message` / `delegate_task` provenance). Independent of `user_allowlist` (which gates inbound + daemon-internal notifications and is still **fail-closed**).
 
-| `outbound_capabilities` value | Sprint 22 P0 behaviour | Sprint 23 (planned) |
-|---|---|---|
-| `[reply, react, edit, inject_provenance]` | Only listed ops permitted | Same |
-| `[]` (explicit empty) | Fail-closed — no agent outbound | Same |
-| field absent | **FATAL warn-but-permit one daemon cycle** + migration template logged | **Hard parse error** (daemon refuses to load fleet.yaml) |
+| `outbound_capabilities` value | Behaviour |
+|---|---|
+| field absent | **Default-open — all ops permitted** |
+| `[reply, react, edit, inject_provenance]` | Only listed ops permitted |
+| `[]` (explicit empty) | All ops rejected (operator opt-out, retained) |
 
-Built-in instances (`general` and any future auto-created coordinator) get auto-injected `[reply, react, edit, inject_provenance]` via `bootstrap::fleet_normalize` — operator never has to author this field for first-class fleet members.
+**Why default-open?** Single-operator threat model. The TUI is already full machine access; the cascade-attack-chain defence from Sprint 22 P0 was over-spec for the actual deployment shape. Operator explicitly accepts the security trade-off (Sprint 23 P1 reversal).
 
-### Migration: adding `outbound_capabilities` (Sprint 22 P0 → Sprint 23)
+Built-in instances (`general` and any future auto-created coordinator) inherit default-open — no auto-injected list needed (was the case in Sprint 22 P0 PR #230 and is now retired).
 
-For every **user-authored** instance in `fleet.yaml` (i.e. anything you spawned that isn't `general`), add an explicit `outbound_capabilities` field NOW. The Sprint 22 P0 transition window emits the following error log on first agent outbound call:
+### Restricting / opting out
 
-```
-ERROR: FATAL (warn-but-permit one daemon cycle): instance '<name>' \
-       outbound_capabilities NOT SET. Sprint 22 P0 grants this <op> call \
-       under gradual-migration grace. Sprint 23 will fail-closed (hard \
-       parse error on missing field). Add to fleet.yaml NOW:
-  instances.<name>.outbound_capabilities: [reply, react, edit, inject_provenance]
-```
+Default-open is the recommended posture for single-operator deployments. Two opt-out shapes if you want the gate active:
 
-Copy the suggested stanza into your `fleet.yaml`:
+**Restrict to a subset of ops** (e.g. allow `reply` only):
 
 ```yaml
 instances:
   my-worker:
     backend: claude
-    outbound_capabilities: [reply, react, edit, inject_provenance]
+    outbound_capabilities: [reply]
     # … other fields …
 ```
 
-For an instance that should be **inbound-only** (relay / read-only roles), set the field to an empty list:
+**Block all agent outbound** (relay / read-only roles):
 
 ```yaml
 instances:
@@ -211,7 +205,7 @@ instances:
     outbound_capabilities: []                # explicit "no agent outbound"
 ```
 
-See `docs/MIGRATION-OUTBOUND-CAPS.md` for the operator-facing transition guide and the full `ChannelOpKind` enum reference.
+See `docs/MIGRATION-OUTBOUND-CAPS.md` for the full transition guide (Sprint 22 P0 fail-closed → Sprint 23 P1 default-open reversal section) and the `ChannelOpKind` enum reference.
 
 ## Other Commands
 

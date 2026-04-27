@@ -10,24 +10,18 @@
 //! normalize in memory without touching disk.
 
 use crate::backend::Backend;
-use crate::channel::auth::ChannelOpKind;
 use crate::fleet::{self, FleetConfig, InstanceConfig, InstanceYamlEntry};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// Default outbound capability set granted to built-in (auto-injected)
-/// fleet instances. Sprint 22 P0 (Phase 5b): `general` and any future
-/// auto-created coordinator gets the full set so the operator never has
-/// to author outbound_capabilities for first-class fleet members.
-fn default_built_in_outbound_capabilities() -> Vec<ChannelOpKind> {
-    vec![
-        ChannelOpKind::Reply,
-        ChannelOpKind::React,
-        ChannelOpKind::Edit,
-        ChannelOpKind::InjectProvenance,
-    ]
-}
+// Sprint 23 P1 (default-open reversal) — `default_built_in_outbound_capabilities`
+// retired. Built-in instances (`general` + future auto-created coordinators)
+// no longer need an explicit cap list because the missing-field default is
+// now OPEN. Removing the explicit Vec keeps the auto-created entry minimal
+// (matches what an operator would typically write — i.e. nothing) and avoids
+// emitting noise in the persisted fleet.yaml. Operators can still opt out
+// or restrict via the standard `outbound_capabilities: []` / selective list.
 
 /// Normalize in-memory, optionally persisting fleet.yaml side effects.
 pub(super) fn normalize(config: &mut FleetConfig, home: &Path, persist: bool) {
@@ -51,12 +45,13 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
             backend: Some(default_backend),
             working_directory: None,
             topic_id: Some(1),
-            // Sprint 22 P0 (Phase 5b): built-in instances get auto-injected
-            // outbound capabilities so the operator never has to think about
-            // the field for first-class fleet members. User-yaml entries
-            // remain forced-explicit (the warn-then-permit / hard-cut
-            // transition applies only to operator-authored instances).
-            outbound_capabilities: Some(default_built_in_outbound_capabilities()),
+            // Sprint 23 P1 reversal: missing `outbound_capabilities` now
+            // means default-open (was Sprint 22 P0 fail-closed with FATAL
+            // warn). Auto-created built-ins inherit default-open the same
+            // way operator-authored instances do — no explicit list
+            // needed. The single-operator threat model (TUI = full machine
+            // access) makes the cascade-attack-chain defense irrelevant.
+            outbound_capabilities: None,
             ..Default::default()
         },
     );
