@@ -279,6 +279,32 @@ impl HealthTracker {
         // No input pending past response → idle waiting (operator 04:00
         // UTC false-alarm pattern). Mark IdleLong so consumers can
         // distinguish from Hung but cron escalation MUST NOT trigger.
+        //
+        // Sprint 24 P2 F1 cross-check: heartbeat fresh but PTY silent →
+        // agent is calling MCP tools (refreshing heartbeat) without
+        // producing PTY output. This is either a prompt-injected agent
+        // suppressing escalation via MCP spam, or a genuinely stuck agent
+        // in a tight MCP loop. Either way, operator should be notified.
+        let heartbeat_age_ms =
+            crate::daemon::heartbeat_pair::now_ms().saturating_sub(last_heartbeat_at_ms);
+        let heartbeat_fresh =
+            last_heartbeat_at_ms > 0 && heartbeat_age_ms < silent.as_millis() as u64;
+        if heartbeat_fresh {
+            let delta_ms = silent.as_millis() as u64;
+            tracing::warn!(
+                last_heartbeat_at_ms,
+                heartbeat_age_ms,
+                silent_ms = delta_ms,
+                agent_state = ?agent_state,
+                "agent classified Hung — heartbeat fresh but PTY silent (F1 heartbeat-spam cross-check)"
+            );
+            if self.state != HealthState::Hung {
+                self.state = HealthState::Hung;
+                return true;
+            }
+            return false;
+        }
+
         if self.state != HealthState::IdleLong {
             tracing::debug!(
                 last_input_at_ms,
@@ -788,5 +814,48 @@ mod tests {
         // Same conditions next tick → no re-escalation.
         assert!(!h.check_hang(AgentState::Ready, Duration::from_secs(180), 10_000, 0));
         assert_eq!(h.state, HealthState::Hung);
+    }
+
+    // Sprint 24 P2 F1 — heartbeat-spam attack mitigation tests.
+
+    #[test]
+    fn classifier_returns_hung_on_heartbeat_spam_with_pty_silent() {
+        // Adversarial scenario: agent calling MCP tools (heartbeat fresh)
+        // but producing no PTY output (silent past threshold). Classifier
+        // must return Hung (escalation-worthy), NOT IdleLong.
+        let mut h = HealthTracker::new();
+        let now = crate::daemon::heartbeat_pair::now_ms();
+        // Heartbeat very recent (1s ago), no input pending, PTY silent 180s.
+        let result = h.check_hang(
+            AgentState::Ready,
+            Duration::from_secs(180), // > 120s threshold
+            0,                        // no input pending
+            now - 1_000,              // heartbeat 1s ago (fresh)
+        );
+        assert!(
+            result,
+            "heartbeat fresh + PTY silent → Hung (F1 cross-check)"
+        );
+        assert_eq!(h.state, HealthState::Hung);
+    }
+
+    #[test]
+    fn classifier_returns_idle_long_on_normal_idle_no_heartbeat_spam() {
+        // Regression: pure idle without MCP spam. Heartbeat is stale
+        // (older than silence window). Must still classify as IdleLong.
+        let mut h = HealthTracker::new();
+        // Heartbeat 300s ago (stale — older than 180s silence window).
+        let now = crate::daemon::heartbeat_pair::now_ms();
+        let result = h.check_hang(
+            AgentState::Ready,
+            Duration::from_secs(180),
+            0,             // no input pending
+            now - 300_000, // heartbeat 300s ago (stale)
+        );
+        assert!(
+            !result,
+            "stale heartbeat + no input → IdleLong (no escalation)"
+        );
+        assert_eq!(h.state, HealthState::IdleLong);
     }
 }
