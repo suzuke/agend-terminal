@@ -168,11 +168,11 @@ fn spawn_rationale_present_at_every_in_scope_spawn_site() {
                 continue;
             }
             // Look back up to 10 lines for `fire-and-forget` rationale.
-            // 10 (not 5) accommodates multi-line rationale comments where
-            // the keyword opens the comment and the spawn line lives at the
-            // end of the block (e.g. `if let Err(e) = ...spawn(...)` blocks
-            // whose comment expands to 6+ lines explaining the shutdown
-            // contract).
+            // 10 lines accommodates multi-line rationale comments where
+            // the keyword opens the comment and the spawn line lives at
+            // the end of the block (e.g. `if let Err(e) = ...spawn(...)`
+            // blocks whose comment expands to 6+ lines explaining the
+            // shutdown contract).
             let start = idx.saturating_sub(10);
             let preceding = lines[start..idx].join("\n");
             if !preceding.contains("fire-and-forget") {
