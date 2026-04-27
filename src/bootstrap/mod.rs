@@ -14,6 +14,7 @@
 
 mod agent_resolve;
 pub mod daemon_spawn;
+pub(crate) mod doctor;
 mod fleet_normalize;
 pub mod reload;
 pub mod signals;
@@ -159,6 +160,13 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 
     let mut config = crate::fleet::FleetConfig::load(fleet_path)?;
     fleet_normalize::normalize(&mut config, home, opts.mutate_fleet_yaml);
+
+    // Doctor pre-flight: detect operator pitfalls in fleet.yaml and emit
+    // actionable diagnostics before any agents spawn. Sprint 23 P1 —
+    // deferred from Sprint 22 P0 PR #230.
+    let diags = doctor::validate_fleet_config(&config);
+    doctor::emit_diagnostics(&diags);
+
     let agents = if opts.resolve_agents {
         agent_resolve::resolve(&config)
     } else {
