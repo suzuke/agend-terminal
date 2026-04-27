@@ -251,7 +251,7 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<String>, Box<dyn std
 }
 
 fn write_message(stdout: &mut io::Stdout, json: &str) -> io::Result<()> {
-    write!(stdout, "Content-Length: {}\r\n\r\n{}", json.len(), json)?;
+    writeln!(stdout, "{json}")?;
     stdout.flush()
 }
 

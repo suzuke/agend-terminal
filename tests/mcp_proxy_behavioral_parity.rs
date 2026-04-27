@@ -14,7 +14,7 @@
 #![allow(clippy::unwrap_used)]
 
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -125,36 +125,22 @@ fn bridge_binary() -> PathBuf {
     path
 }
 
-/// Send an MCP JSON-RPC request via Content-Length framing and read the response.
+/// Send an MCP JSON-RPC request as NDJSON and read the NDJSON response.
+///
+/// Mirrors how Claude Code (the real client we ship for) frames messages:
+/// raw JSON terminated by a single newline. The bridge must respond in
+/// the same shape, otherwise the client hits its connection timeout.
 fn mcp_roundtrip(
     stdin: &mut std::process::ChildStdin,
     stdout: &mut BufReader<std::process::ChildStdout>,
     request: &Value,
 ) -> Value {
-    let body = request.to_string();
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write request");
+    writeln!(stdin, "{request}").expect("write request");
     stdin.flush().expect("flush");
 
-    // Read Content-Length header
-    let mut header = String::new();
-    stdout.read_line(&mut header).expect("read header");
-    let len: usize = header
-        .trim()
-        .strip_prefix("Content-Length:")
-        .or_else(|| header.trim().strip_prefix("Content-Length: "))
-        .expect("Content-Length header")
-        .trim()
-        .parse()
-        .expect("parse length");
-
-    // Read blank line separator
-    let mut sep = String::new();
-    stdout.read_line(&mut sep).expect("read separator");
-
-    // Read body
-    let mut body = vec![0u8; len];
-    stdout.read_exact(&mut body).expect("read body");
-    serde_json::from_slice(&body).expect("parse response")
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read response line");
+    serde_json::from_str(line.trim()).expect("parse NDJSON response")
 }
 
 /// Extract the tool result text from an MCP tools/call response.
@@ -202,10 +188,9 @@ fn bridge_tools_call_returns_expected_results_for_five_tools() {
         "initialize must return capabilities"
     );
 
-    // Send initialized notification (no response expected)
+    // Send initialized notification (no response expected) — NDJSON
     let notif = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-    let body = notif.to_string();
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write notif");
+    writeln!(stdin, "{notif}").expect("write notif");
     stdin.flush().expect("flush");
 
     // Test 5 tools
