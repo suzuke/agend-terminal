@@ -227,6 +227,39 @@ Expected output: VERIFIED | REJECTED | UNVERIFIED with evidence
 
 A second reviewer may narrow the audit surface, but must not omit the freshness boundary. A secondary `VERIFIED` does not replace the primary review.
 
+#### LOW docs-only single-reviewer exception
+
+Sprint 22 P3 amendment. Mid-scope and code-touching protocol PRs continue to require dual reviewer per the rules above. The exception below narrows the dual-review trigger so that genuinely docs-only protocol edits — the kind operators land routinely as protocol housekeeping — do not bottleneck on two reviewers.
+
+**A protocol PR qualifies for the single-reviewer exception when ALL of the following hold:**
+
+1. **LOW risk classification** — `docs/FLEET-DEV-PROTOCOL-v1.md` (or sibling protocol files) edit only.
+2. **Diff size ≤ 50 LOC** measured against `git diff origin/main...HEAD` (3-dot diff so the reviewer's freshness-boundary read is unaffected).
+3. **No production code change beyond `src/instructions.rs` template strings** — i.e., the only `src/` touch allowed is the agent-instructions template that mirrors the protocol prose. Any change to `src/agent.rs`, `src/daemon/`, `src/channel/`, `src/mcp/`, `src/api/`, `src/app/`, or `src/tasks.rs` (etc.) **disqualifies** the exception even if the docs portion is small.
+4. **No new rule that mid-scope+ PRs would inherit** — e.g., adding a new `§3.5.x` subsection that introduces an enforcement obligation for non-protocol PRs is mid-scope, not LOW. Pure clarifications, typo fixes, and example additions to existing rules qualify.
+
+**When the exception applies, the dispatch may select either:**
+
+- **Single reviewer** (default for the LOW-docs-only path) — primary reviewer alone covers the full Reviewer Contract v1.1 against the existing freshness boundary.
+- **Operator self-merge** — operator may merge directly without dispatching a reviewer when the operator authored or proof-read the diff. This matches the existing operator-author lifecycle for HOTFIX paths.
+
+The dispatch document or PR description must state which arm of the exception is invoked, e.g. `LOW docs-only protocol PR — single reviewer per §3.5.5` or `LOW docs-only protocol PR — operator self-merge per §3.5.5`. Reviewers and the orchestrator can audit the qualification by reading the diff against the four conditions above.
+
+**Mid-scope+ unchanged**: the rules in [Second reviewer exception](#second-reviewer-exception) above still trigger dual review for protocol or merge-gate changes outside this exception (high-risk shared behavior, repeated reject loops, primary-requested second opinion, operator-mandated dual review). The exception narrows the *default* dual-review obligation for docs-only edits; it does not change when the dispatch may explicitly opt in to dual review.
+
+**Amendment recursion** (this PR's own gate): the amendment PR that introduces this exception is itself dispatched under the *pre-amendment* §3.5.4 mandatory-dual-review rule (i.e., it walks dual reviewer). The exception only applies to PRs landing **after** this amendment merges. This avoids the bootstrap paradox of the amendment PR using its own exception to short-circuit its review.
+
+**Case study evidence** (PR #226 — Sprint 21 Phase 5a Q6 protocol amendment, `§10.5 Rule 5 spawn rationale`): operator self-merged at 2026-04-27 03:35 UTC after a single-reviewer VERIFIED + 3-platform CI green. The PR was 2 files (`docs/FLEET-DEV-PROTOCOL-v1.md` +44, `src/instructions.rs` +1), +45/-0 lines total — exemplifying *exactly* the LOW docs-only + `instructions.rs` template touch pattern that this exception's conditions #2-#3 carve out. Under the pre-amendment rule this technically required dual review; the operator's self-merge worked out (no regression, dev-reviewer Tier-1 verdict robust) but encoded the gap this exception now formalises. Future docs-only protocol PRs should cite this exception in the dispatch rather than relying on operator override.
+
+**Edge-case tightening** (Sprint 22 P3 r2 cross-vantage findings — anti-game protections):
+
+- **Sibling protocol files (condition #1) defined explicitly, not glob**: `docs/FLEET-DEV-PROTOCOL-*.md` and `docs/REVIEWER-CONTRACT-*.md` (currently `FLEET-DEV-PROTOCOL-v1.md` + `REVIEWER-CONTRACT-v0.1.md`). Adding a new sibling protocol file that did not exist when this exception merged disqualifies the exception until the protocol file list is explicitly extended in a later amendment.
+- **`src/instructions.rs` template-strings carve-out (condition #3) requires reviewer attestation**: the reviewer (or operator on self-merge) must explicitly verify that the change is to a literal prompt-content string with no logic side-effect — no new `format!`/template placeholders, no new conditional branches gated on the new content, no new agent-instruction clauses changing tool-use guidance. A template change that introduces new behavior (even one new conditional emit) disqualifies the exception.
+- **Stacked-PR aggregation guard against 50-LOC bypass**: if the same author lands more than one LOW docs-only protocol PR within a single sprint, every PR after the first reverts to dual review for the remainder of that sprint. Prevents a 200-LOC change being split into four ≤50-LOC PRs to dodge dual review.
+- **Test-file edits qualify only if pure-cosmetic**: edits to `tests/*.rs` qualify under condition #3 ONLY if the change is whitespace, comment rewording, or doc-comment alignment with no `assert!` / `expect_*` / fixture-data / behaviour-affecting change. Semantic test edits (new assertion, mutated fixture, removed gate) disqualify the exception even when LOC ≤ 50.
+
+**Cross-team coordination**: if `docs/FLEET-TS-PROTOCOL-*.md` or sibling cross-team protocol files mirror §3.5.4–§3.5.6, the `ts-lead` should be notified post-merge to evaluate a parallel amendment that keeps the cross-team review contract aligned (otherwise LOW docs-only protocol PRs in one team's protocol file may diverge from the other team's review obligation).
+
 #### Contract splitting
 
 Do not split Reviewer Contract v1.1 so that no reviewer owns the whole contract.
@@ -278,7 +311,7 @@ Reassign only when:
 
 A reassigned re-audit must reference the finding task ID and must not broaden scope unless the dispatch explicitly says so.
 
-#### 3.5.8 Cross-backend behavior claims
+#### 3.5.9 Cross-backend behavior claims
 
 Any PR body claim of cross-backend behavior—e.g. "All CLI backends do X", "supports Y across kiro/Codex/Claude/Gemini", "behavior consistent on Linux/macOS/Windows"—**must** be either:
 
@@ -505,7 +538,7 @@ Three rules to eliminate idle time. Operator-authorized 2026-04-26.
 | E2.2 | **CI green is necessary, not sufficient.** Reviewer verdict is authoritative regardless of CI color. CI green does not auto-approve; CI red does not auto-reject. |
 | E2.3 | **Force-push during review invalidates verdict.** Default: any push after review starts resets verdict. Exception: reviewer can verify commit-level patch hash matches via stack-base diff — but default invalidation is safer. |
 | E2.4 | **`reviewed_head` is a snapshot, not a contract.** VERIFIED applies to the exact SHA in `reviewed_head`. Any subsequent commit resets verdict state. Aligns with GitHub "dismiss stale review on push". |
-| E2.5 | **Dual reviewer (§3.5.5) not short-circuited.** Rule 2 does not override §3.5.5 mandatory dual review. Dev-lead must not auto-merge on single VERIFIED + CI green when dual review is required. |
+| E2.5 | **Dual reviewer (§3.5.4) not short-circuited.** Rule 2 does not override §3.5.4 mandatory dual review. Dev-lead must not auto-merge on single VERIFIED + CI green when dual review is required. (Sprint 22 P3 inserted §3.5.5 LOW docs-only exception; the §3.5.4 dual-review rule still governs all non-exception cases.) |
 | E2.6 | **Reviewer pipeline cap by backend.** Reviewers also pipeline. Claude: 3-4 concurrent reviews. Kiro-cli: 1-2. |
 | E2.7 | **Scope-creep priority over CI red.** REJECT primary reason is always scope violation. CI failure is secondary detail. |
 | E2.8 | **r2 dispatch must enumerate r1 findings.** Re-review dispatch template must list each r1 finding as fixed/deferred/withdrawn. Missing enumeration → reviewer falls back to `full_review`. |
