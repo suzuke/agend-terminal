@@ -183,6 +183,12 @@ fn task_tools() -> Vec<Value> {
             "pause": {"type": "boolean", "description": "Pause/resume the sweep tick"},
             "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"}
         }}}),
+        json!({"name": "task_legacy_backfill_run",
+            "description": "One-shot legacy-backfill sweep against `repo` for every open task. Computes confidence per (task, PR) candidate (Signal 1 exact-suffix branch + Signal 2 jaccard fuzzy + Signal 3 Closes marker) with 6 false-high attack defenses. Returns a structured report with per-task tier (auto-apply / propose / silent) + sub-scores.",
+            "inputSchema": {"type": "object", "properties": {
+                "repo": {"type": "string", "description": "GitHub `owner/repo` to scan"},
+                "dry_run": {"type": "boolean", "description": "Default true. False = emit Done events for auto-tier; true = TaskCloseProposed only."}
+            }, "required": ["repo"]}}),
     ]
 }
 
