@@ -251,10 +251,11 @@ channel:
   bot_token_env: AGEND_BOT_TOKEN
   group_id: {gid}
   mode: topic
+  user_allowlist: []  # add your Telegram user_id (message @userinfobot to get it)
 "#
         )
     } else {
-        "\n# channel:\n#   type: telegram\n#   bot_token_env: AGEND_BOT_TOKEN\n#   group_id: YOUR_GROUP_ID\n".to_string()
+        "\n# channel:\n#   type: telegram\n#   bot_token_env: AGEND_BOT_TOKEN\n#   group_id: YOUR_GROUP_ID\n#   user_allowlist: [YOUR_USER_ID]\n".to_string()
     };
 
     let workspace_dir = home.join("workspace").join("general");
@@ -387,5 +388,49 @@ mod tests {
         let backends = detect_backends();
         // Should return 0 or more backends without panicking
         assert!(backends.len() <= 5);
+    }
+
+    /// Snapshot test: emitted YAML with Telegram channel includes
+    /// `user_allowlist` (Sprint 21 fail-closed requirement).
+    #[test]
+    fn emitted_yaml_with_channel_includes_user_allowlist() {
+        let home =
+            std::env::temp_dir().join(format!("agend-quickstart-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let backend = Backend::all()[0].clone();
+        generate_fleet_yaml(&home, &backend, Some(-1001234567890), None).expect("test");
+        let yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("test");
+        assert!(
+            yaml.contains("user_allowlist"),
+            "emitted fleet.yaml must include user_allowlist for Sprint 21 fail-closed; got:\n{yaml}"
+        );
+        // Verify it parses as valid FleetConfig.
+        let config: crate::fleet::FleetConfig =
+            serde_yaml::from_str(&yaml).expect("emitted YAML must parse as FleetConfig");
+        assert!(config.channel.is_some(), "channel section must be present");
+        assert!(
+            config.instances.contains_key("general"),
+            "general instance must be present"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Snapshot test: commented-out channel section also mentions
+    /// user_allowlist so operators know to add it.
+    #[test]
+    fn emitted_yaml_without_channel_mentions_user_allowlist() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-quickstart-test-nogroup-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).ok();
+        let backend = Backend::all()[0].clone();
+        generate_fleet_yaml(&home, &backend, None, None).expect("test");
+        let yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("test");
+        assert!(
+            yaml.contains("user_allowlist"),
+            "commented-out channel section must mention user_allowlist; got:\n{yaml}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
