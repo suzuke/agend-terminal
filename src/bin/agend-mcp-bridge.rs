@@ -201,10 +201,12 @@ fn connect_daemon(
     let writer = stream.try_clone()?;
     let mut rdr = BufReader::new(stream);
 
-    // Cookie handshake
+    // Cookie handshake — include PID for daemon-side liveness tracking
+    // (Sprint 25 P1 F1 PID-watch invalidation)
     let hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
+    let pid = std::process::id();
     let mut w = writer.try_clone()?;
-    writeln!(w, r#"{{"auth":"{hex}"}}"#)?;
+    writeln!(w, r#"{{"auth":"{hex}","pid":{pid}}}"#)?;
     w.flush()?;
 
     let mut resp = String::new();

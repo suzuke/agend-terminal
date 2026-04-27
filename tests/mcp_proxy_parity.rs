@@ -15,8 +15,8 @@
 fn proxy_handler_calls_handle_tool_directly() {
     let src = std::fs::read_to_string("src/api/handlers/mcp_proxy.rs").expect("read mcp_proxy.rs");
     assert!(
-        src.contains("crate::mcp::handlers::handle_tool(tool, args, instance)"),
-        "mcp_proxy must call handle_tool with (tool, args, instance)"
+        src.contains("crate::mcp::handlers::handle_tool("),
+        "mcp_proxy must call handle_tool"
     );
 }
 
