@@ -196,9 +196,10 @@ enforces:
   `IdleLong` → `Hung` — catching prompt-injected agents that suppress
   escalation by spam-calling MCP tools without generating real output.
   This cross-check reads `heartbeat_at_ms` from the pair snapshot
-  (Level 3 leaf) and `silent` from `HealthTracker::last_output`
-  (Level 1 core) — no lock-ordering violation because the pair snapshot
-  is taken after core lock is released (Rule 2).
+  (Level 3 leaf) acquired UNDER the core lock (Level 1 → Level 3
+  top-down per Rule 1), with the pair lock acquired+released
+  synchronously by `snapshot_for` so it's not held during subsequent
+  `check_hang` execution (Rule 3).
 
 ---
 
