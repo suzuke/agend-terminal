@@ -225,6 +225,80 @@ pub trait Channel: Send + Sync {
     fn outbound_authorized(&self) -> bool {
         false
     }
+
+    /// Phase 5b unified entry for **agent-callable** outbound operations.
+    ///
+    /// Fan-in for the four MCP→Channel bridge surfaces (`reply`, `react`,
+    /// `edit_message`, `delegate_task` provenance side-channel) so the
+    /// per-instance `outbound_capabilities` gate cannot be bypassed.
+    /// Replaces the direct `try_telegram_*` calls at
+    /// `src/mcp/handlers.rs:74,88,102,399` (Sprint 21 Phase 2 third sub-PR
+    /// triangulation audit C1 finding).
+    ///
+    /// Implementations must:
+    /// 1. Check [`Self::outbound_authorized`] (PR #216 allowlist gate).
+    /// 2. Look up the per-agent `outbound_capabilities` config from
+    ///    `fleet.yaml` and consult
+    ///    [`auth::evaluate_outbound_capability`].
+    /// 3. On `PermissiveLegacyMissing`, call
+    ///    [`auth::warn_once_outbound_capabilities_missing`] (gradual
+    ///    migration: permit + warn; Sprint 22 hard-cut PR flips to
+    ///    reject).
+    /// 4. Dispatch to the platform-specific send.
+    ///
+    /// Default: `Err(NotSupported)` so adapters that haven't opted in
+    /// fail closed.
+    fn send_from_agent(
+        &self,
+        _agent: &str,
+        _op: AgentOutboundOp,
+    ) -> std::result::Result<MsgRef, ChannelError> {
+        Err(ChannelError::NotSupported("send_from_agent".into()))
+    }
+}
+
+/// Op-specific payload for [`Channel::send_from_agent`].
+///
+/// One variant per agent-callable bridge in `mcp/handlers.rs`:
+///
+/// - `Reply` — `reply` MCP tool (free-form text into bound topic)
+/// - `React` — `react` MCP tool (emoji on existing message)
+/// - `Edit` — `edit_message` MCP tool (replace text of bot-sent message)
+/// - `InjectProvenance` — `delegate_task` provenance side-channel
+///   (renders "@from delegated to @target" tag in target's topic)
+#[derive(Debug, Clone)]
+pub enum AgentOutboundOp {
+    /// Free-form reply into the agent's bound topic.
+    Reply { text: String },
+    /// Emoji reaction on a previously-observed message. `message_id` is
+    /// `None` when the agent reacts to its most recent inbound message
+    /// (resolved via `metadata/{instance}.json` `last_message_id`).
+    React {
+        emoji: String,
+        message_id: Option<String>,
+    },
+    /// Edit a bot-sent message in place.
+    Edit {
+        message_id: String,
+        new_text: String,
+    },
+    /// Side-channel provenance render — daemon-internal only.
+    /// `from` is the delegating agent's name; the trait method's `agent`
+    /// arg is the receiving agent (whose topic gets the tag).
+    InjectProvenance { from: String, task: String },
+}
+
+impl AgentOutboundOp {
+    /// Kind discriminator — used by `Channel::send_from_agent` impls to
+    /// look up the per-agent capability gate.
+    pub fn kind(&self) -> auth::ChannelOpKind {
+        match self {
+            Self::Reply { .. } => auth::ChannelOpKind::Reply,
+            Self::React { .. } => auth::ChannelOpKind::React,
+            Self::Edit { .. } => auth::ChannelOpKind::Edit,
+            Self::InjectProvenance { .. } => auth::ChannelOpKind::InjectProvenance,
+        }
+    }
 }
 
 /// Outbound notify gate — only forwards to [`Channel::notify`] when the
@@ -487,6 +561,74 @@ mod tests {
         assert!(
             !ch.outbound_authorized(),
             "default trait method must fail-closed"
+        );
+    }
+
+    // ---- Phase 5b: Channel::send_from_agent default + AgentOutboundOp ----
+
+    #[test]
+    fn default_send_from_agent_returns_not_supported() {
+        // Adapters that haven't implemented the Phase 5b agent-callable
+        // outbound surface fail closed by default. New adapters (e.g.
+        // Discord placeholder per dispatch) inherit `NotSupported`
+        // automatically until they explicitly opt in with their own
+        // gated impl.
+        let ch = MockChannel::new();
+        let err = ch
+            .send_from_agent(
+                "agent1",
+                AgentOutboundOp::Reply {
+                    text: "hi".to_string(),
+                },
+            )
+            .expect_err("default must be NotSupported");
+        assert!(
+            matches!(err, ChannelError::NotSupported(_)),
+            "expected NotSupported, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("send_from_agent"),
+            "error must name the missing method: {err}"
+        );
+    }
+
+    #[test]
+    fn agent_outbound_op_kind_discriminator_matches_variant() {
+        // `AgentOutboundOp::kind()` is consumed by the Phase 5b
+        // capability gate in adapter impls — the mapping must match
+        // the variant names so a future variant addition forces a
+        // compile error instead of silently bypassing the gate.
+        use auth::ChannelOpKind;
+        assert_eq!(
+            AgentOutboundOp::Reply {
+                text: "x".to_string()
+            }
+            .kind(),
+            ChannelOpKind::Reply
+        );
+        assert_eq!(
+            AgentOutboundOp::React {
+                emoji: "👀".to_string(),
+                message_id: None
+            }
+            .kind(),
+            ChannelOpKind::React
+        );
+        assert_eq!(
+            AgentOutboundOp::Edit {
+                message_id: "1".to_string(),
+                new_text: "x".to_string()
+            }
+            .kind(),
+            ChannelOpKind::Edit
+        );
+        assert_eq!(
+            AgentOutboundOp::InjectProvenance {
+                from: "a".to_string(),
+                task: "t".to_string()
+            }
+            .kind(),
+            ChannelOpKind::InjectProvenance
         );
     }
 }

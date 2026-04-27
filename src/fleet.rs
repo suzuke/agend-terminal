@@ -170,6 +170,18 @@ pub struct InstanceConfig {
     /// from knowing about peers); set to `false` on user-facing chat
     /// proxies like `general` where broadcast markers read as noise.
     pub receive_fleet_updates: Option<bool>,
+    /// Per-instance agent-callable outbound operations gate
+    /// (Sprint 21 Phase 5b). When `Some(list)`, the instance may emit
+    /// only the listed `ChannelOpKind` values via the MCP→Channel
+    /// bridge (`reply` / `react` / `edit_message` / delegate_task
+    /// provenance). `None` is the **gradual-migration permissive
+    /// default** — the call is permitted with a once-per-instance
+    /// deprecation warn so operators see the migration template
+    /// before Sprint 22's hard-cut. Set to `[]` to lock the instance
+    /// out of all agent-callable outbound while keeping daemon notify
+    /// (PR #216) intact.
+    #[serde(default)]
+    pub outbound_capabilities: Option<Vec<crate::channel::auth::ChannelOpKind>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

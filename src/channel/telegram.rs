@@ -2011,6 +2011,132 @@ impl crate::channel::Channel for TelegramChannel {
     fn outbound_authorized(&self) -> bool {
         crate::channel::auth::is_outbound_authorized(&lock_state(&self.state).user_allowlist)
     }
+
+    /// Phase 5b unified entry for agent-callable outbound. Routes the
+    /// four MCP→Channel bridge surfaces (`reply` / `react` / `edit` /
+    /// `inject_provenance`) through the per-instance
+    /// `outbound_capabilities` gate (gradual-migration permissive
+    /// default per Sprint 21 Phase 5b scope freeze
+    /// `d-20260427015616035999-10`).
+    ///
+    /// Order of checks:
+    /// 1. Adapter-level outbound gate ([`Self::outbound_authorized`]) —
+    ///    if the operator has not configured `user_allowlist`, drop
+    ///    everything (PR #216 contract).
+    /// 2. Per-agent capability lookup —
+    ///    [`crate::channel::auth::evaluate_outbound_capability`]:
+    ///    - `Allowed` → dispatch to internal `try_telegram_*_from`
+    ///    - `Rejected` → return `Err(ChannelError::Other)` with
+    ///      operator-readable message
+    ///    - `PermissiveLegacyMissing` → emit once-per-instance
+    ///      deprecation warn via
+    ///      [`crate::channel::auth::warn_once_outbound_capabilities_missing`],
+    ///      then proceed (Sprint 22 hard-cut PR will flip).
+    fn send_from_agent(
+        &self,
+        agent: &str,
+        op: crate::channel::AgentOutboundOp,
+    ) -> std::result::Result<crate::channel::MsgRef, crate::channel::ChannelError> {
+        use crate::channel::auth::{
+            evaluate_outbound_capability, warn_once_outbound_capabilities_missing,
+            OutboundCapabilityDecision,
+        };
+        use crate::channel::ChannelError;
+
+        // Step 1: adapter-level allowlist gate (PR #216 contract).
+        if !self.outbound_authorized() {
+            return Err(ChannelError::Other(anyhow::anyhow!(
+                "outbound disabled — channel.user_allowlist not configured \
+                 (see docs/USAGE.md \"Channel: Telegram\" migration section)"
+            )));
+        }
+
+        // Step 2: per-agent capability gate (Phase 5b gradual migration).
+        let kind = op.kind();
+        let home = lock_state(&self.state).home.clone();
+        let caps = lookup_outbound_capabilities(&home, agent);
+        match evaluate_outbound_capability(caps.as_deref(), kind) {
+            OutboundCapabilityDecision::Allowed => {}
+            OutboundCapabilityDecision::Rejected => {
+                return Err(ChannelError::Other(anyhow::anyhow!(
+                    "instance '{agent}' outbound_capabilities does not include '{op}' \
+                     — add to fleet.yaml or remove the explicit list to opt into the \
+                     gradual-migration permissive default",
+                    op = kind.as_str()
+                )));
+            }
+            OutboundCapabilityDecision::PermissiveLegacyMissing => {
+                warn_once_outbound_capabilities_missing(agent, kind);
+            }
+        }
+
+        // Step 3: dispatch to platform-specific send.
+        match op {
+            crate::channel::AgentOutboundOp::Reply { text } => {
+                let (msg_id, _chat_id) =
+                    try_telegram_reply_from(&home, agent, &text).map_err(ChannelError::Other)?;
+                Ok(crate::channel::MsgRef {
+                    binding: crate::channel::BindingRef::new(
+                        "telegram",
+                        Some(format!("TG#{agent}")),
+                        TelegramBindingPayload { topic_id: msg_id },
+                    ),
+                    id: msg_id.to_string(),
+                })
+            }
+            crate::channel::AgentOutboundOp::React { emoji, message_id } => {
+                try_telegram_react(&home, agent, &emoji, message_id.as_deref())
+                    .map_err(ChannelError::Other)?;
+                Ok(empty_msg_ref())
+            }
+            crate::channel::AgentOutboundOp::Edit {
+                message_id,
+                new_text,
+            } => {
+                try_telegram_edit(&home, agent, &message_id, &new_text)
+                    .map_err(ChannelError::Other)?;
+                Ok(crate::channel::MsgRef {
+                    binding: crate::channel::BindingRef::new("telegram", None, ()),
+                    id: message_id,
+                })
+            }
+            crate::channel::AgentOutboundOp::InjectProvenance { from, task } => {
+                // `inject_provenance` is the public entry that uses
+                // `crate::home_dir()` internally — matches the daemon
+                // process home used by the MCP handler that previously
+                // called this fn directly. The `home` we lock above is
+                // already the daemon home, so the two paths converge in
+                // production.
+                inject_provenance(agent, &from, &task).map_err(ChannelError::Other)?;
+                Ok(empty_msg_ref())
+            }
+        }
+    }
+}
+
+/// Look up `outbound_capabilities` for `instance` from `fleet.yaml`.
+/// Returns `None` when the file / instance / field is missing — caller
+/// treats `None` as the gradual-migration permissive default.
+fn lookup_outbound_capabilities(
+    home: &std::path::Path,
+    instance: &str,
+) -> Option<Vec<crate::channel::auth::ChannelOpKind>> {
+    crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+        .ok()
+        .and_then(|c| c.instances.get(instance).cloned())
+        .and_then(|inst| inst.outbound_capabilities)
+}
+
+/// Placeholder `MsgRef` returned when the underlying op (React /
+/// InjectProvenance) does not surface a usable platform message id.
+/// Maintains the trait contract that `send_from_agent` returns
+/// `MsgRef` uniformly without breaking the four bridge surfaces that
+/// historically returned `Result<()>`.
+fn empty_msg_ref() -> crate::channel::MsgRef {
+    crate::channel::MsgRef {
+        binding: crate::channel::BindingRef::new("telegram", None, ()),
+        id: "0".to_string(),
+    }
 }
 
 // ─── UxEventSink: capability-gated degradation ────────────────────────
@@ -3191,6 +3317,64 @@ instances:
         let dyn_channel: &dyn crate::channel::Channel = &channel;
         let _ = dyn_channel.create_topic("test");
         let _ = dyn_channel.notify("test", crate::channel::NotifySeverity::Warn, "msg", false);
+    }
+
+    /// Phase 5b: when the operator has not configured `user_allowlist`,
+    /// `send_from_agent` MUST reject all four `AgentOutboundOp` variants
+    /// at the adapter-level outbound gate (Step 1) — even if the
+    /// per-instance `outbound_capabilities` config is empty / missing.
+    /// Step 1 (allowlist) is the load-bearing gate; Step 2 (per-agent
+    /// caps) only runs when Step 1 passes.
+    #[test]
+    fn send_from_agent_rejects_when_user_allowlist_unconfigured() {
+        use crate::channel::Channel;
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp/agend-phase5b-test"),
+            HashMap::new(),
+            None, // user_allowlist=None → outbound_authorized=false
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+
+        // All four AgentOutboundOp variants must reject at Step 1
+        // (allowlist gate). They never reach Step 2 (capability gate)
+        // or Step 3 (platform dispatch).
+        let ops = [
+            crate::channel::AgentOutboundOp::Reply {
+                text: "leak".to_string(),
+            },
+            crate::channel::AgentOutboundOp::React {
+                emoji: "👀".to_string(),
+                message_id: None,
+            },
+            crate::channel::AgentOutboundOp::Edit {
+                message_id: "1".to_string(),
+                new_text: "x".to_string(),
+            },
+            crate::channel::AgentOutboundOp::InjectProvenance {
+                from: "a".to_string(),
+                task: "t".to_string(),
+            },
+        ];
+        for op in ops {
+            let kind = op.kind();
+            let result = channel.send_from_agent("agent1", op);
+            assert!(
+                result.is_err(),
+                "Step 1 outbound gate must reject {} when user_allowlist=None",
+                kind.as_str()
+            );
+            let err_str = format!(
+                "{}",
+                result.expect_err("Step 1 outbound gate must reject on user_allowlist=None")
+            );
+            assert!(
+                err_str.contains("user_allowlist not configured"),
+                "error must name the missing config for {}: {err_str}",
+                kind.as_str()
+            );
+        }
     }
 
     // ─── Outbound media helper tests (Phase 3 PR-AG) ──────────────────

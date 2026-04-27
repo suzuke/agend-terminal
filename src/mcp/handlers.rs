@@ -66,41 +66,67 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 
     match tool {
         // --- Channel ---
+        // Sprint 21 Phase 5b: 4 bridge fns (`reply` / `react` /
+        // `edit_message` / `delegate_task` provenance below at l~399)
+        // collapse to a single `Channel::send_from_agent` call so the
+        // per-instance `outbound_capabilities` gate cannot be bypassed.
+        // Closes triangulation audit C1 finding.
         "reply" => {
-            let text = args["text"].as_str().unwrap_or("");
+            let text = args["text"].as_str().unwrap_or("").to_string();
             tracing::info!(from = %instance_name, %text, "reply");
             let fleet_path = home.join("fleet.yaml");
-            if fleet_path.exists() {
-                match telegram::try_telegram_reply(instance_name, text) {
-                    Ok((msg_id, chat_id)) => json!({
-                        "message_id": msg_id.to_string(),
-                        "chat_id": chat_id.to_string(),
-                    }),
-                    Err(e) => json!({"error": format!("{e}")}),
-                }
-            } else {
-                json!({"error": "No fleet.yaml — cannot send reply"})
+            if !fleet_path.exists() {
+                return json!({"error": "No fleet.yaml — cannot send reply"});
+            }
+            let Some(ch) = crate::channel::active_channel() else {
+                return json!({"error": "no active channel"});
+            };
+            match ch.send_from_agent(
+                instance_name,
+                crate::channel::AgentOutboundOp::Reply { text },
+            ) {
+                Ok(msg) => json!({ "message_id": msg.id }),
+                Err(e) => json!({"error": format!("{e}")}),
             }
         }
         "react" => {
-            let emoji = args["emoji"].as_str().unwrap_or("");
-            let message_id = args["message_id"].as_str();
-            match telegram::try_telegram_react(&home, instance_name, emoji, message_id) {
-                Ok(()) => json!({"emoji": emoji}),
+            let emoji = args["emoji"].as_str().unwrap_or("").to_string();
+            let message_id = args["message_id"].as_str().map(String::from);
+            let Some(ch) = crate::channel::active_channel() else {
+                return json!({"error": "no active channel"});
+            };
+            match ch.send_from_agent(
+                instance_name,
+                crate::channel::AgentOutboundOp::React {
+                    emoji: emoji.clone(),
+                    message_id,
+                },
+            ) {
+                Ok(_) => json!({"emoji": emoji}),
                 Err(e) => json!({"error": format!("{e}")}),
             }
         }
         "edit_message" => {
             let message_id = match args["message_id"].as_str() {
-                Some(m) => m,
+                Some(m) => m.to_string(),
                 None => return json!({"error": "missing 'message_id'"}),
             };
             let text = match args["text"].as_str() {
-                Some(t) => t,
+                Some(t) => t.to_string(),
                 None => return json!({"error": "missing 'text'"}),
             };
-            match telegram::try_telegram_edit(&home, instance_name, message_id, text) {
-                Ok(()) => json!({"message_id": message_id}),
+            let Some(ch) = crate::channel::active_channel() else {
+                return json!({"error": "no active channel"});
+            };
+            let returned_id = message_id.clone();
+            match ch.send_from_agent(
+                instance_name,
+                crate::channel::AgentOutboundOp::Edit {
+                    message_id,
+                    new_text: text,
+                },
+            ) {
+                Ok(_) => json!({"message_id": returned_id}),
                 Err(e) => json!({"error": format!("{e}")}),
             }
         }
@@ -395,9 +421,28 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 // main result untouched. `warn!` (not silent debug) per
                 // DESIGN §4 Q4 — provenance failure may signal a real
                 // routing bug worth an operator's attention.
-                if let Err(e) =
-                    crate::channel::telegram::inject_provenance(target, sender.as_str(), task)
-                {
+                // Sprint 21 Phase 5b: provenance side-channel routes
+                // through `Channel::send_from_agent` so the per-instance
+                // `outbound_capabilities` gate covers it. Failure is
+                // logged but does NOT propagate (DESIGN §4 Q4 — main
+                // delegate_task path already succeeded above). The
+                // warn-on-failure preserves the failure-visibility pin
+                // (DESIGN §4 Q4: provenance failure may signal a real
+                // routing bug worth an operator's attention).
+                let provenance_result = match crate::channel::active_channel() {
+                    Some(ch) => ch
+                        .send_from_agent(
+                            target,
+                            crate::channel::AgentOutboundOp::InjectProvenance {
+                                from: sender.as_str().to_string(),
+                                task: task.to_string(),
+                            },
+                        )
+                        .map(|_| ())
+                        .map_err(|e| anyhow::anyhow!("{e}")),
+                    None => Err(anyhow::anyhow!("no active channel")),
+                };
+                if let Err(e) = provenance_result {
                     tracing::warn!(
                         %e,
                         target = %target,
