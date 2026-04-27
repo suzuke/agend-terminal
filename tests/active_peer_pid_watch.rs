@@ -15,7 +15,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 

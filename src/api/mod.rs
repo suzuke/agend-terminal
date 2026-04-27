@@ -321,6 +321,15 @@ fn handle_session(
         tracing::debug!(peer_pid = pid, "API session peer PID");
     }
 
+    // Sprint 25 P3: active peer PID watch — detect dead bridge within ~2s
+    // instead of waiting for 30s TCP read timeout. Spawn a background
+    // watcher that polls kill(pid, 0) and shuts down the stream on death.
+    if let Some(pid) = peer_pid {
+        if let Ok(shutdown_stream) = writer.try_clone() {
+            spawn_peer_pid_watcher(pid, shutdown_stream);
+        }
+    }
+
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -389,6 +398,52 @@ fn handle_session(
         let _ = writeln!(writer, "{}", response);
         let _ = writer.flush();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Active peer PID watch (Sprint 25 P3)
+// ---------------------------------------------------------------------------
+
+/// Check if a process is alive via `kill(pid, 0)` (Unix) or
+/// `OpenProcess` (Windows).
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    // SAFETY: kill(pid, 0) sends no signal; it only checks if the
+    // process exists and we have permission to signal it. ESRCH = dead.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_process_alive(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]));
+    sys.process(Pid::from_u32(pid)).is_some()
+}
+
+/// Spawn a background thread that polls peer PID liveness every ~2s.
+/// When the peer dies, shuts down the TCP stream so the session's
+/// `read_line` returns EOF immediately instead of waiting for the 30s
+/// TCP read timeout.
+///
+/// // fire-and-forget: watcher self-terminates when peer dies or stream
+/// // is already closed. No JoinHandle join needed — session thread
+/// // exits independently and the watcher's stream shutdown is idempotent.
+fn spawn_peer_pid_watcher(pid: u32, stream: std::net::TcpStream) {
+    // fire-and-forget: PID watcher polls until peer dies then self-exits.
+    // Stream shutdown is idempotent; if session already closed, shutdown
+    // returns an error that we silently ignore.
+    std::thread::Builder::new()
+        .name(format!("pid_watch_{pid}"))
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if !is_process_alive(pid) {
+                tracing::info!(peer_pid = pid, "peer process dead — closing API session");
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return;
+            }
+        })
+        .ok();
 }
 
 /// Spawn a single agent, register it, and start its TUI socket thread.
