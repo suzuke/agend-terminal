@@ -208,6 +208,9 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     // which happens once the event loop has shut down (`Quit` clicked).
     let poll_proxy = event_loop.create_proxy();
     let poll_home = home.clone();
+    // fire-and-forget: tray status poller; loop exits on `send_event` Err
+    // when the tao event loop has been closed (Quit clicked → process exit
+    // path). No graceful join because tao itself drives shutdown ordering.
     thread::spawn(move || loop {
         let kind = match api::call(&poll_home, &json!({"method": api::method::LIST})) {
             Ok(resp) => StatusKind::from_response(&resp),
