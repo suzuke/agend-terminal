@@ -563,3 +563,47 @@ git worktree add /tmp/agend-prNNN-review <branch-name>
 | E4.2 | **Cleanup after merge.** `git worktree remove <path>` + `git branch -d <branch>` after PR merge. Stale worktrees waste disk and confuse `git worktree list`. |
 | E4.3 | **Consistent with CLAUDE.md.** This rule formalizes the existing CLAUDE.md global rule "never commit directly to main; always use worktree + branch" into the fleet protocol. |
 | E4.4 | **Pipeline + worktree.** Rule 1 pipeline dispatch naturally requires worktrees — you cannot have two branches checked out in one working tree. Worktree mandatory is the mechanical prerequisite for pipeline to work safely. |
+
+### 10.5 Spawn site rationale (v1.2 amendment)
+
+**Rule:** Every `tokio::spawn` / `thread::spawn` / `std::thread::Builder::new().spawn(...)` site **MUST** carry a `// fire-and-forget: <reason>` comment at the call site OR explicitly store the `JoinHandle` for graceful join on shutdown. The choice between the two is design-conscious — fire-and-forget acknowledges the thread/task outlives the daemon shutdown path; stored-JoinHandle commits to a join order in the shutdown sequence.
+
+**Evidence:** Sprint 20 Track B (`docs/codebase-review-2026-04-27/DAEMON.md` JoinHandle inventory) found 11 spawn sites in daemon scope, **only 1** with explicit rationale (`supervisor.rs` module-doc). Sprint 20.5 Track 7 B↔C cross-validation extended this to **13–15+ fleet-wide spawn sites with 0 graceful-join handling** — `app/telegram_hooks.rs:56,76` added two more unnamed sites in Track C scope, confirming the pattern is systemic, not daemon-internal.
+
+This rule formalizes the v1.2 baseline so Sprint 22+ hardening (real graceful-join refactor) has an explicit pre-condition: every new spawn site explains itself, every refactor that adds a `JoinHandle` has a documented reason.
+
+**Naming convention** (rule applies to thread name + comment):
+
+```rust
+// fire-and-forget: <reason>; shutdown semantics: <how this thread exits>
+std::thread::Builder::new()
+    .name("agent_pty_read".into())
+    .spawn(move || pty_read_loop(...))
+    .ok();
+```
+
+OR (stored JoinHandle):
+
+```rust
+// joined-on-shutdown: <where the join happens>
+let handle = std::thread::Builder::new()
+    .name("daemon_tick".into())
+    .spawn(move || tick_loop(...))?;
+// ... join during graceful shutdown:
+let _ = handle.join();
+```
+
+**Exceptions:**
+- **`#[cfg(test)]` modules** (E5.2): test-only spawns inside `#[cfg(test)] mod tests { ... }` are exempt — test fixtures often spawn ephemeral threads that the test framework reaps automatically.
+- **Trait-method spawn that wraps a caller-provided closure** (E5.3): if the spawn is delegated by a trait method and the caller is responsible for the rationale (e.g. `Channel::send` internally spawns to send-and-forget per-channel), the trait-method site inherits the caller-site rationale. Document at the caller site, not at the trait-method site.
+
+**Edge case policies:**
+
+| ID | Policy |
+|---|---|
+| E5.1 | **Short-lived (<1s) spawns** can use a 1-line rationale. Full design rationale (pointing at architecture doc / module-level explanation) is only required when the thread/task lives for the full daemon process or longer than 1s. Example: `// fire-and-forget: short-lived (~300ms) cleanup of orphan binding; thread dies on completion` is acceptable for `app/telegram_hooks.rs:56`. |
+| E5.2 | **Test-only spawns exempt.** `#[cfg(test)] mod tests { ... }` spawn sites do not require this comment. Production-quality `tracing::warn!` etc. are still recommended for tests that exercise real spawn paths but not enforced. |
+| E5.3 | **Trait-method spawn inherits caller rationale.** When a trait method (e.g. `Channel::send`) spawns internally on behalf of a caller, the trait-method site carries a short pointer (`// see caller site for fire-and-forget rationale`) and the caller site carries the full rationale. This avoids stale duplication if multiple callers share a trait method. |
+| E5.4 | **Spawn allowlist invariant test (Phase 5b enforce).** Sprint 21 Phase 5b (impl-2) introduces a `cargo test` invariant that `rg "thread::spawn|tokio::spawn"` against an allowlist of explicitly-rationalised sites — test fails if a new spawn site lands without `// fire-and-forget: ` or `// joined-on-shutdown: ` comment in the same file. Forward-reference to the test (when it lands): `tests/spawn_rationale_audit.rs`. |
+
+**See also:** Sprint 20 SYNTHESIS.md JoinHandle inventory (counts + per-site doc status); Sprint 20.5 SYNTHESIS v2 fleet-wide extension; per-backend agent files (`.agend/<backend>.md`) for backend-specific spawn instructions; §10.4 Rule 4 (worktree mandatory) — sibling rule covering a different audit surface (worktree race vs spawn race).
