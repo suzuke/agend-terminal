@@ -186,3 +186,76 @@ Reading `mcp/handlers.rs` test section: `inject_provenance` failure-visibility p
 ---
 
 *End of primary audit. Time spent: ~1.5h within 2h hard cap. Awaiting cross-pass appendices.*
+
+---
+
+## TUI/render-angle co-primary findings (dev-reviewer)
+
+**Audit metadata** (per v1.2 §3 Tier-2 evidence chain — co-primary append)
+- co-auditor: dev-reviewer (Sprint 20 Track C + Sprint 20.5 Track 7 cross-validation hot context)
+- audit_mode: codebase_audit (collaborative co-primary, lead by reviewer-2)
+- audited_head: c929e4b (reviewer-2 push HEAD)
+- scope_source: dispatch task `t-20260427005707...` co-primary directive + reviewer-2 lead audit M1 reframe
+- commands_run:
+  - `rg -n "handle_tool|crate::mcp::|mcp::handlers|::handlers::" src/app/commands.rs src/app/dispatch.rs src/app/overlay.rs` → **0 hits**
+  - `rg -n "crate::api::call|api::call\(" src/app/commands.rs src/app/dispatch.rs src/app/overlay.rs` → **0 hits**
+  - `rg -n "crate::mcp::handlers::handle_tool|mcp::handlers::handle_tool|handle_tool\(" src/` → only `mcp/mod.rs:280` (stdio dispatcher) + `mcp/handlers.rs:1800+` (internal tests)
+  - `rg -n "fn execute|Command::|Cmd::" src/app/commands.rs` → 1 entry point `execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool` at line 27
+  - Read of `app/api_server.rs:40-130`, `app/commands.rs:1-90` (entry + first command arm)
+- files_scanned (from TUI angle, deep): `app/api_server.rs` (full read), `app/commands.rs` (entry + dispatch shape), `app/dispatch.rs` (entry surface grep only), `app/overlay.rs` (cross-ref only — Track C audit-of-record from Sprint 20)
+
+---
+
+### Confirm / dispute reviewer-2's M1 reframe — **CONFIRM, AND EXTEND**
+
+reviewer-2 reframe: *"`app/api_server.rs` is NOT TUI→MCP bridge — real bridge in `app/commands.rs/dispatch.rs/overlay.rs` (Track C scope)"*.
+
+From TUI angle: **`api_server.rs` is correctly framed as lifecycle wrapper, not bridge** ✅. But the second half of the reframe ("real bridge in commands/dispatch/overlay") **is also incorrect**. Direct grep of all three files for any of `handle_tool` / `crate::mcp::` / `mcp::handlers` / `crate::api::call` returns **0 hits**.
+
+**The TUI→MCP "bridge" does not exist as conceptualized.** TUI commands and overlay handlers operate on **local process state directly**: `commands.rs::execute` mutates `Layout` / `AgentRegistry` / `fleet.yaml` file in-process; `dispatch.rs::dispatch` mutates `Overlay` / `Layout` state; `overlay.rs::handle_key` mutates overlay enum variants. None of these go through `mcp::handlers::handle_tool`.
+
+The only `handle_tool` callers in the entire codebase are:
+1. `src/mcp/mod.rs:280` — stdio MCP server dispatcher (called by external Claude Code / kiro-cli backends via stdin/stdout protocol, not by TUI)
+2. `src/mcp/handlers.rs:1800+` — internal unit tests
+
+**Implication for my Sprint 20.5 Track 7 cross-validation finding (which originally proposed this triangulation audit)**: I conflated **MCP server lifecycle thread spawn** (which TUI does start, via `start_api_server`) with **MCP tool entry surface** (which TUI does NOT have). The "B+C+D triangulation joint audit" suggestion was based on a wrong mental model — there is no C↔D bridge attack surface to deep-audit because there is no C↔D direct call path. **I should own this mistake**: my Track 7 finding stated the gap one level too coarse (file-name level instead of call-graph level). The gap that *did* matter (C1 in this audit, agent→MCP reply→Telegram bypass) was inside Track D + A scope all along, not C↔D.
+
+Sprint 21 retro update for M1: not just "Track 7+8 misframed `app/api_server.rs`" but more precisely "Sprint 20.5 Track 7 cross-validation finding's framing of B+C+D triangulation was call-graph-level wrong; the genuine cross-area attack surface that mattered was MCP→Channel direct outbound (C1, surfaced this audit), entirely within D+A scope."
+
+### Sprint 20.5 Track 7 sub-finding disproved: TUI overlay panic does NOT cascade kill API server thread
+
+Track 7 cross-validation flagged: *"TUI overlay panic 是否 cascade kill API server thread (B/D coupling)"*.
+
+Verification (audit-time, this PR): `app/api_server.rs:54-66` spawns the API server in **`std::thread::Builder::new().name("app_api_server").spawn(...)`** — a named separate thread. TUI render runs on the main thread; overlay handlers also on main thread. Rust thread panics **do not propagate across thread boundaries** unless explicit (e.g., `JoinHandle::join().unwrap()` from another thread).
+
+`start_api_server` returns the `ApiGuard` immediately and **does not join the API server thread** (line 66: `.ok();` discards the JoinHandle). TUI main-thread panic → main thread unwinds → process exit signals OS to kill all threads (including API server) — but this is process termination semantics, not "panic cascade". The "cascade kill" failure mode I worried about does not exist as a separable risk; it's just normal process death.
+
+**Track 7 sub-finding closed**: not a real attack surface. The named thread isolation is correct + intentional + documented (line 68 tracing::info "in-process API server started").
+
+### TUI render trust-assumption observation (Low / informational)
+
+TUI's `render.rs::build_summary` (Sprint 20 Track C audit-of-record) renders MCP-tool-produced content (task descriptions, decision contents) into the operator's view directly. Post-PR #220 D1 gate, only the decision's `author` can mutate `decision.content` — but in the prompt-injection threat model the author **is** the prompt-injected agent. So an agent that's prompt-injected via PTY (after Telegram inbound passes PR #219's `is_user_allowed`, AND then content from another agent's `send_to_instance` carrying attacker text reaches the agent's PTY) can plant attacker-controlled content into a decision it owns; TUI render then displays this content to the operator unmodified.
+
+This is **not a code defect** — render fidelity is the design goal; sanitizing the rendered text would obscure legitimate technical content (e.g. code snippets in audit reports). But the **operator-side responsibility for visual sanitation** of MCP-rendered content should be documented somewhere (CONTRIBUTING / USAGE / threat model doc).
+
+Severity: Low / informational. Not a Phase 2 blocker, but a Sprint 22+ doc backlog candidate: *"document TUI render trust assumption: rendered task / decision content is from agent-author, not validated by TUI; operator visually sanitizes."*
+
+### Confirm reviewer-2's C1 from TUI angle — **NO MITIGATION IN TUI**
+
+C1's attack surface is agent→MCP-`reply`-tool→Telegram bot API direct call. TUI **plays no defensive role** in this chain:
+- TUI does not see / intercept MCP tool calls (they go via stdio between agent backend ↔ daemon, not via TUI)
+- TUI render only observes side-effects after-the-fact (e.g., agent's PTY shows "I sent reply to telegram" log line)
+- By the time TUI render shows anything, the leak has already happened
+- Operator detection-via-TUI is post-hoc forensics, not prevention
+
+**C1 verdict from TUI angle**: agree Critical, agree fix scope is Track A + Track D joint PR (gate primitive + call-site updates per reviewer-2's proposal). **No additional TUI-side fix surface exists.** The Sprint 21 Phase 5b extension reviewer-2 proposes is the only complete fix.
+
+### TUI angle Sprint 22 actionable additions
+
+5. **Document TUI render trust assumption** (informational) — append to USAGE.md or new threat model doc: rendered content from MCP tools (status_summary, decisions list, tasks list) is author-controlled, not TUI-validated. Operator responsible for visual sanitization. ~10 line doc PR.
+
+6. **Sprint 21 retro entry** — record the Track 7 cross-validation framing error: cross-validation findings should be at **call-graph granularity** (which fn calls which fn), not file-path granularity (which file might be a bridge). I'll volunteer to draft the retro entry from my own perspective post-merge.
+
+---
+
+*End of TUI/render-angle co-primary append. Confirms reviewer-2's C1 (Critical) end-to-end with no TUI mitigation; confirms M1 reframe AND extends it (the entire TUI→MCP "bridge" doesn't exist as conceptualized); disproves Track 7 cascade-kill sub-finding via thread isolation read; adds 1 informational TUI-render trust observation.*
