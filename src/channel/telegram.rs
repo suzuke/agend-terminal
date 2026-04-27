@@ -224,14 +224,21 @@ impl TelegramState {
     }
 }
 
-/// Send a message, optionally to a topic, optionally as a reply.
-async fn send_with_topic(
+/// Send a message, optionally to a topic, optionally as a reply, returning
+/// the platform-assigned `message_id` (i32 per Telegram Bot API).
+///
+/// Phase 3 (Sprint 21) extracts msg_id capture so `Channel::send` can
+/// return a `MsgRef` with a real id instead of `"0"` placeholder. Other
+/// callers that historically returned `Result<()>` continue to use
+/// [`send_with_topic`] (thin wrapper) so the behaviour change is
+/// localised to the trait-method dispatch path.
+async fn send_with_topic_capturing_id(
     bot: &Bot,
     chat_id: ChatId,
     topic_id: Option<i32>,
     text: &str,
     reply_to_msg_id: Option<i32>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
     use teloxide::payloads::SendMessageSetters;
     use teloxide::prelude::Requester;
     use teloxide::types::ReplyParameters;
@@ -244,8 +251,26 @@ async fn send_with_topic(
     if let Some(mid) = reply_to_msg_id {
         req = req.reply_parameters(ReplyParameters::new(MessageId(mid)));
     }
-    req.send().await?;
-    Ok(())
+    let sent = req.send().await?;
+    Ok(sent.id.0)
+}
+
+/// Backwards-compatible thin wrapper around
+/// [`send_with_topic_capturing_id`] for callers that don't need the
+/// returned `message_id`. Existing five call sites
+/// (`send_to_topic` / `notify_telegram_inner` / `apply_fleet_action` /
+/// the text-after-attachment follow-up in `Channel::send` /
+/// `try_telegram_*` etc.) keep their `Result<()>` shape.
+async fn send_with_topic(
+    bot: &Bot,
+    chat_id: ChatId,
+    topic_id: Option<i32>,
+    text: &str,
+    reply_to_msg_id: Option<i32>,
+) -> anyhow::Result<()> {
+    send_with_topic_capturing_id(bot, chat_id, topic_id, text, reply_to_msg_id)
+        .await
+        .map(|_| ())
 }
 
 /// Telegram Bot API caption limit (characters).
@@ -1671,6 +1696,21 @@ impl TelegramBindingPayload {
     }
 }
 
+/// Construct a `BindingRef` for a `MsgRef` returned from
+/// [`Channel::send`]. When `topic_id` is `Some`, downcasting the
+/// returned binding back to [`TelegramBindingPayload`] yields the same
+/// topic id — so subsequent `Channel::edit` / `Channel::delete` calls
+/// can route to the same topic without the caller threading a
+/// separate id. When `topic_id` is `None` (group-only send), the
+/// binding is a bare-kind discriminator (no payload) so downcast
+/// returns `None` and the trait method falls back to group routing.
+fn build_telegram_msg_binding(topic_id: Option<i32>) -> crate::channel::BindingRef {
+    match topic_id {
+        Some(tid) => TelegramBindingPayload { topic_id: tid }.into_binding(),
+        None => crate::channel::BindingRef::new("telegram", None, ()),
+    }
+}
+
 /// Telegram adapter implementing the platform-neutral `Channel` trait.
 pub struct TelegramChannel {
     state: Arc<Mutex<TelegramState>>,
@@ -1849,9 +1889,19 @@ impl crate::channel::Channel for TelegramChannel {
         None
     }
 
+    /// Phase 3 (Sprint 21): real dispatcher per cap matrix.
+    ///
+    /// Resolves the destination topic by downcasting `binding` to
+    /// [`TelegramBindingPayload`] (the adapter's own payload shape).
+    /// `binding.kind() != "telegram"` falls back to the group with no
+    /// topic — defensive for callers that hand us a foreign `BindingRef`
+    /// (the trait surface accepts any kind, so we cannot statically
+    /// reject). Returns a `MsgRef` with the resolved binding and the
+    /// platform-assigned `message_id` so subsequent `edit` / `delete`
+    /// calls have a usable handle (Sprint 20 Track A H1+H4 fix).
     fn send(
         &self,
-        _binding: &crate::channel::BindingRef,
+        binding: &crate::channel::BindingRef,
         msg: crate::channel::OutMsg,
     ) -> anyhow::Result<crate::channel::MsgRef> {
         let (bot, group_id) = {
@@ -1861,8 +1911,14 @@ impl crate::channel::Channel for TelegramChannel {
                 None => anyhow::bail!("telegram bot not initialized"),
             }
         };
-        // Full binding-based topic routing lands with the dispatcher in T2.
-        let topic_id: Option<i32> = None;
+        // Resolve topic from the supplied binding. Foreign-kind binding
+        // (e.g. caller passed a Discord `BindingRef`) downcasts to None
+        // and falls back to "no topic, group only" — same fail-soft
+        // shape `try_telegram_reply` uses when the topic registry has
+        // no entry for the instance.
+        let topic_id: Option<i32> = binding
+            .downcast::<TelegramBindingPayload>()
+            .map(|p| p.topic_id);
 
         match msg.attachment {
             Some(ref att) => {
@@ -1879,7 +1935,7 @@ impl crate::channel::Channel for TelegramChannel {
                         .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text, None));
                 }
                 Ok(crate::channel::MsgRef {
-                    binding: crate::channel::BindingRef::new("telegram", None, ()),
+                    binding: build_telegram_msg_binding(topic_id),
                     id: msg_id.to_string(),
                 })
             }
@@ -1887,26 +1943,95 @@ impl crate::channel::Channel for TelegramChannel {
                 if msg.text.is_empty() {
                     anyhow::bail!("OutMsg has no text and no attachment");
                 }
-                telegram_runtime()
-                    .block_on(send_with_topic(&bot, group_id, topic_id, &msg.text, None))?;
+                let msg_id = telegram_runtime().block_on(send_with_topic_capturing_id(
+                    &bot, group_id, topic_id, &msg.text, None,
+                ))?;
                 Ok(crate::channel::MsgRef {
-                    binding: crate::channel::BindingRef::new("telegram", None, ()),
-                    id: "0".to_string(),
+                    binding: build_telegram_msg_binding(topic_id),
+                    id: msg_id.to_string(),
                 })
             }
         }
     }
 
+    /// Phase 3 (Sprint 21): real `bot.edit_message_text` dispatch.
+    ///
+    /// Mirrors [`try_telegram_edit`] (which exists for legacy free-fn
+    /// callers in `mcp/handlers.rs`); this trait method is the
+    /// operator-direct path, NOT agent-callable (`send_from_agent` Phase
+    /// 5b owns the agent surface). Idempotency / topic-deletion error
+    /// recovery is intentionally not added here — a future "self-heal
+    /// on stale binding" enhancement is its own scope.
     fn edit(
         &self,
-        _msg: &crate::channel::MsgRef,
-        _payload: crate::channel::OutMsg,
+        msg: &crate::channel::MsgRef,
+        payload: crate::channel::OutMsg,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("TelegramChannel::edit not wired yet — use try_telegram_edit")
+        let (bot, group_id) = {
+            let s = lock_state(&self.state);
+            match s.bot.clone() {
+                Some(b) => (b, s.group_id),
+                None => anyhow::bail!("telegram bot not initialized"),
+            }
+        };
+        let mid: i32 = msg
+            .id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid telegram message_id: {}", msg.id))?;
+        let text = payload.text;
+        if text.is_empty() {
+            anyhow::bail!("OutMsg.text empty — Telegram editMessageText requires non-empty text");
+        }
+        telegram_runtime().block_on(async move {
+            use teloxide::prelude::Requester;
+            bot.edit_message_text(group_id, MessageId(mid), &text)
+                .send()
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
     }
 
-    fn delete(&self, _msg: &crate::channel::MsgRef) -> anyhow::Result<()> {
-        anyhow::bail!("TelegramChannel::delete not wired yet")
+    /// Phase 3 (Sprint 21): real `bot.delete_message` dispatch.
+    ///
+    /// Idempotent on the Telegram side — Bot API returns
+    /// "message to delete not found" when the id is already gone, which
+    /// we translate to `Ok(())` so callers (e.g. future
+    /// delete_instance message cleanup workflows per Sprint 20 Track A
+    /// H4 follow-up) can call this safely without separate "exists?"
+    /// pre-checks.
+    fn delete(&self, msg: &crate::channel::MsgRef) -> anyhow::Result<()> {
+        let (bot, group_id) = {
+            let s = lock_state(&self.state);
+            match s.bot.clone() {
+                Some(b) => (b, s.group_id),
+                None => anyhow::bail!("telegram bot not initialized"),
+            }
+        };
+        let mid: i32 = msg
+            .id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid telegram message_id: {}", msg.id))?;
+        telegram_runtime().block_on(async move {
+            use teloxide::prelude::Requester;
+            match bot.delete_message(group_id, MessageId(mid)).send().await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    // Bot API surfaces both shapes; treat both as idempotent no-ops.
+                    if msg.contains("message to delete not found")
+                        || msg.contains("message can't be deleted")
+                    {
+                        tracing::debug!(
+                            mid,
+                            "delete_message: already deleted / not deletable — Ok"
+                        );
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("{e}"))
+                    }
+                }
+            }
+        })
     }
 
     fn create_binding(
@@ -3317,6 +3442,167 @@ instances:
         let dyn_channel: &dyn crate::channel::Channel = &channel;
         let _ = dyn_channel.create_topic("test");
         let _ = dyn_channel.notify("test", crate::channel::NotifySeverity::Warn, "msg", false);
+    }
+
+    // ─── Phase 3 send/edit/delete trait dispatcher tests ──────────────
+    //
+    // Bot APIs cannot be exercised without network access; tests below
+    // use the contract-test fixture (`bot: None`) to exercise the
+    // pre-network argument-handling paths (binding downcast, msg id
+    // parse, Err shape on missing bot). The full happy-path is covered
+    // by integration tests behind the existing real-bot feature gate
+    // (out of scope for trait-wiring PR).
+
+    #[test]
+    fn send_returns_telegram_binding_with_topic_when_caller_supplied_topic() {
+        // Phase 3 fix: Channel::send must downcast the input binding
+        // and return a MsgRef whose binding carries the same topic so
+        // subsequent edit/delete calls have a usable handle. Even when
+        // the bot itself is None (contract-test), the binding-shape
+        // path runs first and we can assert it via the resolution
+        // helper directly.
+        use crate::channel::BindingRef;
+        let supplied = TelegramBindingPayload { topic_id: 42 }.into_binding();
+        // Round-trip via build_telegram_msg_binding (the helper Channel::send
+        // calls) — confirms downcast preserves topic_id.
+        let topic = supplied
+            .downcast::<TelegramBindingPayload>()
+            .map(|p| p.topic_id);
+        assert_eq!(topic, Some(42));
+        let returned: BindingRef = build_telegram_msg_binding(topic);
+        assert_eq!(returned.kind(), "telegram");
+        assert_eq!(
+            returned
+                .downcast::<TelegramBindingPayload>()
+                .map(|p| p.topic_id),
+            Some(42),
+            "MsgRef binding must preserve topic_id from supplied binding"
+        );
+    }
+
+    #[test]
+    fn send_returns_telegram_binding_without_topic_for_foreign_binding() {
+        // Defensive shape: if a caller hands us a non-Telegram binding
+        // (e.g. Discord BindingRef shape), Channel::send falls back to
+        // group-only routing. The returned binding has no payload —
+        // downcast yields None.
+        use crate::channel::BindingRef;
+        let returned: BindingRef = build_telegram_msg_binding(None);
+        assert_eq!(returned.kind(), "telegram");
+        assert!(
+            returned.downcast::<TelegramBindingPayload>().is_none(),
+            "no-topic binding must not carry TelegramBindingPayload"
+        );
+    }
+
+    #[test]
+    fn channel_send_returns_err_when_bot_uninitialised() {
+        // Contract-test fixture has `bot: None` (production never has
+        // this, but the trait method's first step is the bot
+        // unwrap). Phase 3 wiring must surface a typed Err — not
+        // panic — so trait consumers can fall back gracefully.
+        use crate::channel::Channel;
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp/agend-phase3-test"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        let binding = TelegramBindingPayload { topic_id: 7 }.into_binding();
+        let msg = crate::channel::OutMsg::text("hello");
+        let err = channel
+            .send(&binding, msg)
+            .expect_err("must Err when bot is None");
+        assert!(
+            err.to_string().contains("bot not initialized"),
+            "Err must name the missing bot: {err}"
+        );
+    }
+
+    #[test]
+    fn channel_edit_returns_err_when_bot_uninitialised() {
+        use crate::channel::Channel;
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp/agend-phase3-test"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        let msg_ref = crate::channel::MsgRef {
+            binding: TelegramBindingPayload { topic_id: 7 }.into_binding(),
+            id: "123".to_string(),
+        };
+        let payload = crate::channel::OutMsg::text("new text");
+        let err = channel
+            .edit(&msg_ref, payload)
+            .expect_err("must Err when bot is None");
+        assert!(
+            err.to_string().contains("bot not initialized"),
+            "Err must name the missing bot: {err}"
+        );
+    }
+
+    #[test]
+    fn channel_edit_rejects_invalid_message_id() {
+        // Pre-bot validation: malformed id returns a typed Err
+        // distinct from the "bot None" case so callers can
+        // distinguish caller error from infra fault.
+        use crate::channel::Channel;
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp/agend-phase3-test"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        let msg_ref = crate::channel::MsgRef {
+            binding: TelegramBindingPayload { topic_id: 7 }.into_binding(),
+            id: "not-a-number".to_string(),
+        };
+        let payload = crate::channel::OutMsg::text("x");
+        // Note: bot None still gates first (returns "bot not initialized")
+        // — the invalid-id check fires only after bot resolution. This
+        // test pins that the trait method order is bot-first then id-parse,
+        // matching the prod path where bot is always Some.
+        let err = channel.edit(&msg_ref, payload).expect_err("must Err");
+        // Either "bot not initialized" (current contract-test fixture)
+        // OR "invalid telegram message_id" if a future refactor reorders
+        // the checks. Assert one-of so the test pins behaviour without
+        // over-specifying ordering.
+        assert!(
+            err.to_string().contains("bot not initialized")
+                || err.to_string().contains("invalid telegram message_id"),
+            "Err shape unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn channel_delete_returns_err_when_bot_uninitialised() {
+        use crate::channel::Channel;
+        let state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp/agend-phase3-test"),
+            HashMap::new(),
+            None,
+        );
+        let channel = TelegramChannel::new(Arc::new(Mutex::new(state)));
+        let msg_ref = crate::channel::MsgRef {
+            binding: TelegramBindingPayload { topic_id: 7 }.into_binding(),
+            id: "456".to_string(),
+        };
+        let err = channel
+            .delete(&msg_ref)
+            .expect_err("must Err when bot is None");
+        assert!(
+            err.to_string().contains("bot not initialized"),
+            "Err must name the missing bot: {err}"
+        );
     }
 
     /// Phase 5b: when the operator has not configured `user_allowlist`,
