@@ -24,6 +24,30 @@ fn decisions_dir(home: &Path) -> std::path::PathBuf {
     home.join("decisions")
 }
 
+/// Check if `caller` is allowed to mutate `decision`.
+///
+/// Mirrors the `tasks::can_mutate_task` gate (Sprint 20 Track D Praise replicate
+/// pattern): the author of the decision can always mutate; an orchestrator of
+/// the author's team can mutate as admin override; everyone else is rejected.
+///
+/// Closes the cascade auth chain headline finding (Sprint 20 Track D MCP audit
+/// C1 + Sprint 20.5 Track 6 cross-validation): without this gate, a
+/// prompt-injected agent could silently archive operator strategic decisions.
+///
+/// `decision.author` is `String` (always present) and `caller` is `&str` —
+/// comparison is unambiguous string equality, no integer coercion path
+/// (operator-known-pitfall: caller string with numeric-looking suffix like
+/// `"dev-impl-1"` is not parsed as int when checking against `decision.author`).
+pub fn can_mutate_decision(home: &Path, caller: &str, decision: &Decision) -> bool {
+    if decision.author == caller {
+        return true;
+    }
+    if crate::teams::is_orchestrator_of(home, caller, &decision.author) {
+        return true;
+    }
+    false
+}
+
 fn load_all(home: &Path) -> Vec<Decision> {
     let dir = decisions_dir(home);
     let mut decisions = Vec::new();
@@ -181,7 +205,7 @@ pub fn list(home: &Path, args: &Value) -> Value {
     serde_json::json!({"decisions": filtered})
 }
 
-pub fn update(home: &Path, args: &Value) -> Value {
+pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
     let id = match args["id"].as_str() {
         Some(i) => i.to_string(),
         None => return serde_json::json!({"error": "missing 'id'"}),
@@ -204,6 +228,18 @@ pub fn update(home: &Path, args: &Value) -> Value {
                 return serde_json::json!({"error": format!("decision '{id}' corrupted: {e}")})
             }
         };
+
+        // Cascade auth gate (Sprint 21 Phase 2 D1) — reject non-author
+        // callers so prompt-injected agents cannot silently archive operator
+        // strategic decisions. Mirrors `tasks::can_mutate_task` ownership rule.
+        if !can_mutate_decision(home, caller, &decision) {
+            return serde_json::json!({
+                "error": format!(
+                    "decision '{id}' owned by '{}', caller '{caller}' not authorized",
+                    decision.author
+                )
+            });
+        }
 
         if let Some(content) = args["content"].as_str() {
             decision.content = content.to_string();
@@ -285,14 +321,14 @@ mod tests {
         );
         let id = result["id"].as_str().expect("id");
 
-        let upd = update(&home, &serde_json::json!({"id": id, "content": "v2"}));
+        let upd = update(&home, "a", &serde_json::json!({"id": id, "content": "v2"}));
         assert_eq!(upd["status"], "updated");
 
         let listed = list(&home, &serde_json::json!({}));
         assert_eq!(listed["decisions"][0]["content"], "v2");
 
         // Archive
-        update(&home, &serde_json::json!({"id": id, "archive": true}));
+        update(&home, "a", &serde_json::json!({"id": id, "archive": true}));
         let listed = list(&home, &serde_json::json!({}));
         assert!(listed["decisions"].as_array().expect("arr").is_empty());
 
@@ -306,7 +342,7 @@ mod tests {
     #[test]
     fn test_update_nonexistent() {
         let home = tmp_home("update_nonexistent");
-        let result = update(&home, &serde_json::json!({"id": "no-such-id"}));
+        let result = update(&home, "anyone", &serde_json::json!({"id": "no-such-id"}));
         assert!(result["error"].as_str().is_some());
         std::fs::remove_dir_all(&home).ok();
     }
@@ -373,6 +409,7 @@ mod tests {
                 for _ in 0..20 {
                     update(
                         &h,
+                        "a",
                         &serde_json::json!({"id": (*i).clone(), "content": "from_thread_1"}),
                     );
                 }
@@ -385,6 +422,7 @@ mod tests {
                 for _ in 0..20 {
                     update(
                         &h,
+                        "a",
                         &serde_json::json!({"id": (*i).clone(), "tags": ["from_thread_2"]}),
                     );
                 }
@@ -405,6 +443,131 @@ mod tests {
         // Final state: updated_at must be populated (both threads always
         // update it), tags/content are whichever thread wrote last.
         assert!(d["updated_at"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─── Sprint 21 Phase 2 D1: cascade auth gate (can_mutate_decision) ───
+    //
+    // Closes the cascade attack chain headline (Sprint 20 Track D MCP audit
+    // C1 + Sprint 20.5 Track 6 cross-validation): without this gate a
+    // prompt-injected agent could silently archive operator strategic
+    // decisions. Mirror the `tasks::can_mutate_task` ownership pattern
+    // (Sprint 20 Track D Praise replicate identification).
+
+    fn make_test_decision(author: &str) -> Decision {
+        Decision {
+            id: "d-test".into(),
+            title: "T".into(),
+            content: "c".into(),
+            scope: "fleet".into(),
+            author: author.into(),
+            tags: vec![],
+            ttl_days: None,
+            created_at: "2026-04-27T00:00:00Z".into(),
+            updated_at: "2026-04-27T00:00:00Z".into(),
+            archived: false,
+            supersedes: None,
+            working_directory: None,
+        }
+    }
+
+    #[test]
+    fn can_mutate_decision_owner_pass() {
+        let home = tmp_home("can_mutate_owner");
+        let decision = make_test_decision("dev-lead");
+        assert!(can_mutate_decision(&home, "dev-lead", &decision));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn can_mutate_decision_non_owner_reject() {
+        let home = tmp_home("can_mutate_reject");
+        let decision = make_test_decision("dev-lead");
+        // No teams configured → no orchestrator override path → caller
+        // mismatch must reject.
+        assert!(!can_mutate_decision(&home, "dev-impl-1", &decision));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn can_mutate_decision_string_compare_no_numeric_coerce() {
+        // Operator-known-pitfall (Telegram alert): caller string vs numeric
+        // user_id. Decision.author is `String` (e.g. "dev-impl-1"); the
+        // gate compares strings, never parses an int. Verify that an
+        // alphabetically-similar but non-equal caller does NOT pass, and
+        // that numeric-suffixed names compare verbatim.
+        let home = tmp_home("can_mutate_string_compare");
+        let decision = make_test_decision("dev-impl-1");
+        // Exact string match — passes.
+        assert!(can_mutate_decision(&home, "dev-impl-1", &decision));
+        // Suffix mismatch — rejects (no int coerce to "1 == 1").
+        assert!(!can_mutate_decision(&home, "dev-impl-2", &decision));
+        // Bare numeric caller — rejects (would only "match" under int coerce
+        // path, which we explicitly do not have).
+        assert!(!can_mutate_decision(&home, "1", &decision));
+        // Substring of author — rejects (no prefix-match path).
+        assert!(!can_mutate_decision(&home, "dev-impl", &decision));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_decision_non_owner_returns_authz_error() {
+        let home = tmp_home("update_non_owner");
+        let posted = post(
+            &home,
+            "dev-lead",
+            &serde_json::json!({"title": "Strategic", "content": "c"}),
+        );
+        let id = posted["id"].as_str().expect("id");
+
+        // dev-impl-1 (not the author, no orchestrator override) attempts to
+        // archive — must be rejected with descriptive error.
+        let result = update(
+            &home,
+            "dev-impl-1",
+            &serde_json::json!({"id": id, "archive": true}),
+        );
+        let err = result["error"].as_str().expect("error string");
+        assert!(
+            err.contains("not authorized"),
+            "expected authz rejection, got: {err}"
+        );
+        assert!(
+            err.contains("dev-lead"),
+            "error must surface decision.author for diagnostics, got: {err}"
+        );
+        assert!(
+            err.contains("dev-impl-1"),
+            "error must surface caller for diagnostics, got: {err}"
+        );
+
+        // Verify the decision was NOT mutated despite the attempt.
+        let listed = list(&home, &serde_json::json!({}));
+        let arr = listed["decisions"].as_array().expect("arr");
+        assert_eq!(arr.len(), 1, "decision still active (not archived)");
+        assert_eq!(arr[0]["archived"], false);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_decision_owner_succeeds() {
+        let home = tmp_home("update_owner");
+        let posted = post(
+            &home,
+            "dev-lead",
+            &serde_json::json!({"title": "T", "content": "v1"}),
+        );
+        let id = posted["id"].as_str().expect("id");
+
+        let result = update(
+            &home,
+            "dev-lead",
+            &serde_json::json!({"id": id, "content": "v2"}),
+        );
+        assert_eq!(result["status"], "updated");
+
+        let listed = list(&home, &serde_json::json!({}));
+        assert_eq!(listed["decisions"][0]["content"], "v2");
         std::fs::remove_dir_all(&home).ok();
     }
 }

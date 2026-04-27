@@ -1101,7 +1101,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             result
         }
         "list_decisions" => crate::decisions::list(&home, args),
-        "update_decision" => crate::decisions::update(&home, args),
+        "update_decision" => crate::decisions::update(&home, instance_name, args),
 
         // --- Task board ---
         "task" => crate::tasks::handle(&home, instance_name, args),
