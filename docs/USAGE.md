@@ -207,6 +207,14 @@ instances:
 
 See `docs/MIGRATION-OUTBOUND-CAPS.md` for the full transition guide (Sprint 22 P0 fail-closed → Sprint 23 P1 default-open reversal section) and the `ChannelOpKind` enum reference.
 
+### MCP channel ops bridge (Sprint 25 P0)
+
+When AI backends (Claude Code, Kiro, etc.) invoke MCP tools like `reply`, `react`, or `edit_message`, the tool runs in a **separate MCP subprocess** that has no direct access to the Telegram client. These channel operations are automatically relayed to the daemon process via the `proxy_channel_op` API endpoint, where the daemon performs the operation using its initialized channel client.
+
+This is transparent to the operator — no configuration needed. If the daemon is not running when an MCP subprocess tries a channel op, the tool returns an error with a diagnostic message.
+
+See `docs/ARCHITECTURE.md` for the full process model.
+
 ## Other Commands
 
 | Command | Purpose |

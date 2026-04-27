@@ -112,6 +112,19 @@ pub fn active_channel() -> Option<&'static Arc<dyn Channel>> {
     ACTIVE_CHANNEL.get()
 }
 
+/// Returns `true` when this process is the daemon (i.e. `ACTIVE_CHANNEL`
+/// has been registered via [`register_active_channel`]). MCP handlers use
+/// this to short-circuit channel ops in-process instead of paying the
+/// cross-process round-trip via `proxy_channel_op`.
+///
+/// Sprint 25 P0: daemon-internal MCP path (TUI's reply) bypasses the
+/// Unix domain socket IPC and dispatches directly to
+/// `Channel::send_from_agent`. MCP subprocesses (spawned by Claude Code)
+/// see `false` here and relay through the daemon API.
+pub fn is_running_inside_daemon_process() -> bool {
+    ACTIVE_CHANNEL.get().is_some()
+}
+
 /// Typed channel kind — replaces magic strings like `"telegram"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]

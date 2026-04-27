@@ -938,3 +938,58 @@ The module design above is aspirational and largely file-agnostic; the table bel
 ### Drift enforcement
 
 `tests/no_dual_track_drift.rs` extracts top-level fn bodies from `src/agent_ops.rs` and `src/mcp/handlers.rs` and asserts that any fn sharing a name has an identical body, preventing the kind of silent divergence between MCP and daemon paths that caused the `cleanup_working_dir` Kiro-cleanup gap (14-entry MCP copy vs 19-entry canonical) on main before Task #9 Option C. The detector is parser-hardened against raw-string literals and `extern "ABI" fn` (PR #31).
+
+---
+
+## MCP Subprocess Channel Ops Bridge (Sprint 25 P0)
+
+### Problem
+
+MCP subprocesses (spawned by Claude Code, Kiro, etc.) run as **separate processes** from the daemon. The Telegram/Discord client (`ACTIVE_CHANNEL`) is only initialized in the daemon process during bootstrap. MCP tools like `reply`, `react`, `edit_message` called `active_channel()` directly, which always returned `None` in the subprocess context → `"no active channel"` error.
+
+### Solution: `proxy_channel_op`
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  AI Backend (Claude Code / Kiro / etc.)                   │
+│    └─ spawns: agend-terminal mcp --instance dev-impl-1   │
+│         ↓ stdin/stdout JSON-RPC                           │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │ MCP subprocess (no ACTIVE_CHANNEL)                │    │
+│  │   reply/react/edit_message/delegate_task:         │    │
+│  │     → proxy_channel_op(instance, op, args)        │    │
+│  │       → api::call({method: "proxy_channel_op"})   │    │
+│  └──────────────────────────────────────────────────┘    │
+│              ↓ Unix domain socket                         │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │ Daemon process (ACTIVE_CHANNEL registered)        │    │
+│  │   handle_proxy_channel_op:                        │    │
+│  │     1. Look up active_channel()                   │    │
+│  │     2. Build AgentOutboundOp                      │    │
+│  │     3. Channel::send_from_agent(instance, op)     │    │
+│  │        (includes outbound_capabilities gate)      │    │
+│  │     4. Return result                              │    │
+│  └──────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────┘
+```
+
+### In-Process Short-Circuit
+
+When MCP tools run inside the daemon process (TUI path), `proxy_channel_op` detects this via `is_running_inside_daemon_process()` and dispatches directly — no IPC round-trip.
+
+### Security Model
+
+- **Bounded surface**: only 4 channel ops proxied (`reply`, `react`, `edit`, `inject_provenance`)
+- **Outbound capability gate**: daemon dispatches through `Channel::send_from_agent` → `gate_outbound_for_agent`
+- **Anti-bypass invariant**: `tests/channel_ops_via_daemon_api_only.rs` enforces single-path
+
+### Key Files
+
+| File | Role |
+|---|---|
+| `src/api/handlers/channel_op.rs` | Daemon-side `proxy_channel_op` handler |
+| `src/mcp/handlers.rs` | `proxy_channel_op()` helper (short-circuit + relay) |
+| `src/channel/mod.rs` | `is_running_inside_daemon_process()` helper |
+| `tests/channel_ops_via_daemon_api_only.rs` | Anti-bypass invariant test |
+
+See `docs/MCP-CHANNEL-OPS-BRIDGE-INVESTIGATION.md` for the full investigation report.

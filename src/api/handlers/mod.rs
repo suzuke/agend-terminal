@@ -3,6 +3,7 @@
 //! Each handler takes `(params, ctx)` and returns a `Value` response.
 //! `HandlerCtx` bundles the session-scoped state that handlers need.
 
+pub(crate) mod channel_op;
 pub(crate) mod external;
 pub(crate) mod instance;
 pub(crate) mod messaging;

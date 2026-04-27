@@ -203,6 +203,7 @@ pub mod method {
     pub const SET_BLOCKED_REASON: &str = "set_blocked_reason";
     pub const CLEAR_BLOCKED_REASON: &str = "clear_blocked_reason";
     pub const TOOL_KILL: &str = "tool_kill";
+    pub const PROXY_CHANNEL_OP: &str = "proxy_channel_op";
 }
 
 /// Start API socket server (blocks calling thread).
@@ -362,6 +363,7 @@ fn handle_session(
                 handlers::instance::handle_clear_blocked_reason(params, &ctx)
             }
             method::TOOL_KILL => handlers::instance::handle_tool_kill(params, &ctx),
+            method::PROXY_CHANNEL_OP => handlers::channel_op::handle_proxy_channel_op(params, &ctx),
             method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

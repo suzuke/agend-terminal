@@ -47,6 +47,81 @@ pub(crate) fn build_tool_kill_audit(reason: &str, pgid: i32) -> String {
     format!("reason={reason}, pgid={pgid}")
 }
 
+/// Sprint 25 P0: proxy a channel operation through the daemon API.
+///
+/// If running inside the daemon process (TUI path), short-circuits to
+/// `Channel::send_from_agent` directly — no IPC round-trip.
+/// If running as an MCP subprocess (Claude Code path), relays via
+/// `api::call` → daemon's `proxy_channel_op` handler.
+///
+/// Returns the daemon's response as a `Value`. On proxy failure, returns
+/// `{"error": "..."}` with a FATAL-level log for operator visibility.
+fn proxy_channel_op(instance_name: &str, op: &str, args: Value) -> Value {
+    // In-process short-circuit: daemon-internal MCP path.
+    if crate::channel::is_running_inside_daemon_process() {
+        let Some(ch) = crate::channel::active_channel() else {
+            return json!({"error": "no active channel"});
+        };
+        let outbound_op = match op {
+            "reply" => crate::channel::AgentOutboundOp::Reply {
+                text: args["text"].as_str().unwrap_or("").to_string(),
+            },
+            "react" => crate::channel::AgentOutboundOp::React {
+                emoji: args["emoji"].as_str().unwrap_or("").to_string(),
+                message_id: args["message_id"].as_str().map(String::from),
+            },
+            "edit" => crate::channel::AgentOutboundOp::Edit {
+                message_id: args["message_id"].as_str().unwrap_or("").to_string(),
+                new_text: args["text"].as_str().unwrap_or("").to_string(),
+            },
+            "inject_provenance" => crate::channel::AgentOutboundOp::InjectProvenance {
+                from: args["from"].as_str().unwrap_or("").to_string(),
+                task: args["task"].as_str().unwrap_or("").to_string(),
+            },
+            _ => return json!({"error": format!("unknown channel op: {op}")}),
+        };
+        return match ch.send_from_agent(instance_name, outbound_op) {
+            Ok(msg) => json!({"message_id": msg.id}),
+            Err(e) => json!({"error": format!("{e}")}),
+        };
+    }
+
+    // Cross-process path: MCP subprocess → daemon API.
+    let home = crate::home_dir();
+    match crate::api::call(
+        &home,
+        &json!({
+            "method": crate::api::method::PROXY_CHANNEL_OP,
+            "params": {
+                "instance": instance_name,
+                "op": op,
+                "args": args,
+            }
+        }),
+    ) {
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => resp["result"].clone(),
+        Ok(resp) => {
+            let err = resp["error"].as_str().unwrap_or("unknown error");
+            tracing::error!(
+                instance = %instance_name,
+                op = %op,
+                error = %err,
+                "FATAL: proxy_channel_op failed — daemon returned error"
+            );
+            json!({"error": err})
+        }
+        Err(e) => {
+            tracing::error!(
+                instance = %instance_name,
+                op = %op,
+                error = %e,
+                "FATAL: proxy_channel_op failed — daemon unreachable"
+            );
+            json!({"error": format!("daemon unreachable: {e}")})
+        }
+    }
+}
+
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let home = crate::home_dir();
     // Explicit arg beats env var. Cross-instance arms require `Some`;
@@ -74,11 +149,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 
     match tool {
         // --- Channel ---
-        // Sprint 21 Phase 5b: 4 bridge fns (`reply` / `react` /
-        // `edit_message` / `delegate_task` provenance below at l~399)
-        // collapse to a single `Channel::send_from_agent` call so the
-        // per-instance `outbound_capabilities` gate cannot be bypassed.
-        // Closes triangulation audit C1 finding.
+        // Sprint 25 P0: channel ops route through daemon API via
+        // proxy_channel_op. In-process short-circuit when running inside
+        // daemon (TUI path); cross-process relay when MCP subprocess.
         "reply" => {
             let text = args["text"].as_str().unwrap_or("").to_string();
             tracing::info!(from = %instance_name, %text, "reply");
@@ -86,32 +159,20 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             if !fleet_path.exists() {
                 return json!({"error": "No fleet.yaml — cannot send reply"});
             }
-            let Some(ch) = crate::channel::active_channel() else {
-                return json!({"error": "no active channel"});
-            };
-            match ch.send_from_agent(
-                instance_name,
-                crate::channel::AgentOutboundOp::Reply { text },
-            ) {
-                Ok(msg) => json!({ "message_id": msg.id }),
-                Err(e) => json!({"error": format!("{e}")}),
-            }
+            proxy_channel_op(instance_name, "reply", json!({"text": text}))
         }
         "react" => {
             let emoji = args["emoji"].as_str().unwrap_or("").to_string();
             let message_id = args["message_id"].as_str().map(String::from);
-            let Some(ch) = crate::channel::active_channel() else {
-                return json!({"error": "no active channel"});
-            };
-            match ch.send_from_agent(
+            let result = proxy_channel_op(
                 instance_name,
-                crate::channel::AgentOutboundOp::React {
-                    emoji: emoji.clone(),
-                    message_id,
-                },
-            ) {
-                Ok(_) => json!({"emoji": emoji}),
-                Err(e) => json!({"error": format!("{e}")}),
+                "react",
+                json!({"emoji": &emoji, "message_id": message_id}),
+            );
+            if result.get("error").is_none() {
+                json!({"emoji": emoji})
+            } else {
+                result
             }
         }
         "edit_message" => {
@@ -123,19 +184,15 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 Some(t) => t.to_string(),
                 None => return json!({"error": "missing 'text'"}),
             };
-            let Some(ch) = crate::channel::active_channel() else {
-                return json!({"error": "no active channel"});
-            };
-            let returned_id = message_id.clone();
-            match ch.send_from_agent(
+            let result = proxy_channel_op(
                 instance_name,
-                crate::channel::AgentOutboundOp::Edit {
-                    message_id,
-                    new_text: text,
-                },
-            ) {
-                Ok(_) => json!({"message_id": returned_id}),
-                Err(e) => json!({"error": format!("{e}")}),
+                "edit",
+                json!({"message_id": &message_id, "text": text}),
+            );
+            if result.get("error").is_none() {
+                json!({"message_id": message_id})
+            } else {
+                result
             }
         }
         "download_attachment" => {
@@ -428,31 +485,19 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
                 // if the provenance side-channel fails we keep the
                 // main result untouched. `warn!` (not silent debug) per
                 // DESIGN §4 Q4 — provenance failure may signal a real
-                // routing bug worth an operator's attention.
-                // Sprint 21 Phase 5b: provenance side-channel routes
-                // through `Channel::send_from_agent` so the per-instance
-                // `outbound_capabilities` gate covers it. Failure is
-                // logged but does NOT propagate (DESIGN §4 Q4 — main
-                // delegate_task path already succeeded above). The
-                // warn-on-failure preserves the failure-visibility pin
-                // (DESIGN §4 Q4: provenance failure may signal a real
-                // routing bug worth an operator's attention).
-                let provenance_result = match crate::channel::active_channel() {
-                    Some(ch) => ch
-                        .send_from_agent(
-                            target,
-                            crate::channel::AgentOutboundOp::InjectProvenance {
-                                from: sender.as_str().to_string(),
-                                task: task.to_string(),
-                            },
-                        )
-                        .map(|_| ())
-                        .map_err(|e| anyhow::anyhow!("{e}")),
-                    None => Err(anyhow::anyhow!("no active channel")),
-                };
-                if let Err(e) = provenance_result {
+                // Sprint 25 P0: provenance side-channel routes through
+                // proxy_channel_op (daemon API bridge). In-process
+                // short-circuit when running inside daemon; cross-process
+                // relay when MCP subprocess. Failure is logged but does
+                // NOT propagate (DESIGN §4 Q4).
+                let provenance_result = proxy_channel_op(
+                    target,
+                    "inject_provenance",
+                    json!({"from": sender.as_str(), "task": task}),
+                );
+                if let Some(err) = provenance_result.get("error") {
                     tracing::warn!(
-                        %e,
+                        error = %err,
                         target = %target,
                         from = %sender.as_str(),
                         "S2d provenance injection failed — routing may be broken"
