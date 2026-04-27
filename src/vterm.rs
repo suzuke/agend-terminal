@@ -139,6 +139,14 @@ impl VTerm {
         let grid = self.term.grid();
         let grid_cols = grid.columns() as u16;
         let grid_rows = grid.screen_lines() as u16;
+        // Sprint 21 Phase 4 Q7 sweep: this triple-`.min()` chain is the same
+        // saturating-arithmetic class as `render::clamp_overlay_dim` —
+        // intentionally caps render bounds by the smallest of {self-tracked,
+        // ratatui-passed, grid-actual} dimensions so a resize race where any
+        // pair disagrees cannot index past the alacritty grid (HOTFIX PR #194
+        // closed the panic; root-cause race deferred to backlog
+        // `t-20260426150432078733-1`). Audit-confirmed clean: no other
+        // panic-prone subtraction sites in this file.
         let rows = self.rows.min(area.height).min(grid_rows);
         let cols = self.cols.min(area.width).min(grid_cols);
         // `scroll_offset` is usize; `as i32` wraps on 64-bit hosts when the
