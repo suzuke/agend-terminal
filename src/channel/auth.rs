@@ -167,6 +167,69 @@ pub fn warn_once_outbound_capabilities_missing(instance: &str, op: ChannelOpKind
     }
 }
 
+/// Sprint 22 P1.5 (Candidate 4) — sibling of
+/// [`warn_once_outbound_capabilities_missing`] for the *channel-level*
+/// `user_allowlist` gate, fired by [`super::gated_notify`] when the
+/// channel reports `outbound_authorized() == false`.
+///
+/// Why a separate helper: `outbound_capabilities` is per-instance
+/// per-op (`ChannelOpKind`) gating; `user_allowlist` is per-channel
+/// (entire daemon-driven outbound surface). Different config, different
+/// op shape, different copy-paste fix. Keeping them as siblings — same
+/// once-per-process Mutex+HashSet pattern, different keying — beats
+/// shoehorning a single generic helper.
+///
+/// Pattern alignment: P0's
+/// [`warn_once_outbound_capabilities_missing`] established the FATAL
+/// visibility convention (per-instance Mutex<HashSet>, `error!` not
+/// `debug!`, copy-paste fleet.yaml stanza in the message body). This
+/// helper mirrors that shape so operators see the same operator-
+/// actionable shape regardless of which gate fired.
+///
+/// Backed by a global `Mutex<HashSet<String>>` keyed on
+/// `(channel_kind, instance)` so the once-per-process guarantee is
+/// per-channel-kind-per-instance-name (the gate fires per-instance per
+/// daemon cycle but a single FATAL line per restart is enough — repeats
+/// would spam without adding info).
+pub fn warn_once_user_allowlist_unconfigured(channel_kind: &str, instance: &str) {
+    use std::sync::Mutex;
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let key = format!("{channel_kind}:{instance}");
+    let first_time = match seen.lock() {
+        Ok(mut set) => set.insert(key),
+        // Poisoned lock — fall through to "log every time" rather than
+        // silently drop the visibility (mirrors the P0 helper's bias).
+        Err(_) => true,
+    };
+    if first_time {
+        // Sprint 22 P1.5 (Candidate 4 from PR #229 P1 dispatch): the
+        // existing `tracing::debug!` was invisible at default
+        // `RUST_LOG=info`, so operators couldn't see the gate firing
+        // when stall / crash / CI notices were silently dropped. The
+        // FATAL severity matches P0's outbound-caps helper — a fully
+        // unconfigured deployment is a noisy bring-up issue, not a
+        // background warning.
+        tracing::error!(
+            channel_kind,
+            instance,
+            "FATAL: channel '{channel_kind}' notify dropped for instance '{instance}' — \
+             user_allowlist NOT CONFIGURED. The channel cannot deliver outbound \
+             notifications (stall / recovery / crash / CI alerts) until the operator \
+             allowlist is set. Add to fleet.yaml NOW:\n  \
+             channel:\n    type: {channel_kind}\n    user_allowlist:\n      - <YOUR_TELEGRAM_USER_ID>\n\
+             See docs/USAGE.md \"Channel: Telegram\" section for details (PR #216 + Sprint 22 P0)."
+        );
+    } else {
+        tracing::debug!(
+            channel_kind,
+            instance,
+            "user_allowlist still not configured (already warned once for this channel:instance pair)"
+        );
+    }
+}
+
 /// Sprint 22 P0 — shared `gate_outbound_for_agent` helper consumed by every
 /// `Channel::send_from_agent` impl (Telegram + future Discord/Slack/Teams).
 ///
@@ -375,5 +438,24 @@ mod tests {
         warn_once_outbound_capabilities_missing("test_agent_phase5b", ChannelOpKind::Reply);
         warn_once_outbound_capabilities_missing("test_agent_phase5b", ChannelOpKind::React);
         warn_once_outbound_capabilities_missing("another_agent", ChannelOpKind::Edit);
+    }
+
+    #[test]
+    fn warn_once_user_allowlist_unconfigured_does_not_panic() {
+        // Smoke test (Sprint 22 P1.5 Candidate 4): sister helper for the
+        // user_allowlist gate must be re-entrant + survive concurrent
+        // calls, same shape as
+        // `warn_once_outbound_capabilities_missing`. Once-per-pair
+        // behaviour is observable in tracing output (operator-visible
+        // `error!` on first call per `(channel_kind, instance)` pair,
+        // `debug!` on subsequent calls); not verified at unit-test
+        // level because tracing-test fixture would couple this to the
+        // global subscriber.
+        warn_once_user_allowlist_unconfigured("telegram", "test_agent_p1_5");
+        warn_once_user_allowlist_unconfigured("telegram", "test_agent_p1_5");
+        warn_once_user_allowlist_unconfigured("telegram", "another_agent");
+        // Different channel_kind same instance is a distinct key — must
+        // also not panic (covers future Discord / Slack adapter shape).
+        warn_once_user_allowlist_unconfigured("discord", "test_agent_p1_5");
     }
 }
