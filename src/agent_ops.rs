@@ -395,6 +395,104 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // Sprint 21 Phase 5 — atomic multi-field metadata helper tests.
+    // Closes the F7 race window from Sprint 20 Track B audit (DAEMON.md
+    // §1 F7): two sequential `save_metadata` calls had a partial-write
+    // window where a daemon crash between the two writes left disk state
+    // inconsistent (waiting_on cleared but waiting_on_since stale).
+
+    #[test]
+    fn atomic_multi_field_save_metadata_writes_in_single_transaction() {
+        // Verify all fields land in the file together — the helper must
+        // not write one field, return, then write the next (which would
+        // expose the F7 race).
+        let home = tmp_home("meta_batch_atomic");
+        save_metadata_batch(
+            &home,
+            "agent_z",
+            &[
+                ("waiting_on", json!("review from at-dev-4")),
+                ("waiting_on_since", json!("2026-04-27T00:00:00Z")),
+                ("last_heartbeat", json!("2026-04-27T00:01:00Z")),
+            ],
+        );
+        let raw = std::fs::read_to_string(home.join("metadata/agent_z.json"))
+            .expect("metadata file written");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(v["waiting_on"], "review from at-dev-4");
+        assert_eq!(v["waiting_on_since"], "2026-04-27T00:00:00Z");
+        assert_eq!(v["last_heartbeat"], "2026-04-27T00:01:00Z");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn atomic_multi_field_save_metadata_clear_pair_no_corrupt_state() {
+        // Closes Sprint 20 F7 directly: clearing `waiting_on` + `waiting_on_since`
+        // must land both nulls in one write so a concurrent reader (e.g.
+        // supervisor tick) never sees the half-cleared state where
+        // waiting_on is null but waiting_on_since is still set.
+        let home = tmp_home("meta_batch_clear");
+        // Pre-populate with an active wait state.
+        save_metadata_batch(
+            &home,
+            "agent_y",
+            &[
+                ("waiting_on", json!("PR review")),
+                ("waiting_on_since", json!("2026-04-27T00:00:00Z")),
+            ],
+        );
+        // Now clear both atomically.
+        save_metadata_batch(
+            &home,
+            "agent_y",
+            &[
+                ("waiting_on", json!(null)),
+                ("waiting_on_since", json!(null)),
+            ],
+        );
+        let raw = std::fs::read_to_string(home.join("metadata/agent_y.json"))
+            .expect("metadata file present");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert!(
+            v["waiting_on"].is_null(),
+            "waiting_on must be null after batch clear"
+        );
+        assert!(
+            v["waiting_on_since"].is_null(),
+            "waiting_on_since must be null after batch clear"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn atomic_multi_field_save_metadata_preserves_unrelated_fields() {
+        // The helper does read-modify-write so unrelated keys must survive
+        // the batch update — guards against accidental field overwrite if
+        // an implementation regresses to "replace whole file".
+        let home = tmp_home("meta_batch_preserve");
+        save_metadata(&home, "agent_x", "role", json!("dev-impl-2"));
+        save_metadata(&home, "agent_x", "team", json!("dev"));
+        save_metadata_batch(
+            &home,
+            "agent_x",
+            &[
+                ("waiting_on", json!("review")),
+                ("waiting_on_since", json!("2026-04-27T00:00:00Z")),
+            ],
+        );
+        let raw = std::fs::read_to_string(home.join("metadata/agent_x.json"))
+            .expect("metadata file present");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(
+            v["role"], "dev-impl-2",
+            "unrelated `role` must survive batch"
+        );
+        assert_eq!(v["team"], "dev", "unrelated `team` must survive batch");
+        assert_eq!(v["waiting_on"], "review");
+        assert_eq!(v["waiting_on_since"], "2026-04-27T00:00:00Z");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // --- get_submit_key (1 from ops.rs) ---
 
     #[test]

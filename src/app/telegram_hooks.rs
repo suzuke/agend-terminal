@@ -53,6 +53,9 @@ pub(super) fn maybe_create_telegram_topic(
     };
     let tg = Arc::clone(tg);
     let fleet_name = fleet_name.clone();
+    // fire-and-forget: create_binding posts to Telegram + records into
+    // TelegramState (Arc-shared). Short-lived; tied to UI pane creation.
+    // No JoinHandle / shutdown signal needed — failed binding is logged.
     std::thread::spawn(
         move || match tg.create_binding(&fleet_name, BindingOpts::default()) {
             Ok(binding) => tg.record_binding(&fleet_name, binding, submit_key),
@@ -73,6 +76,10 @@ pub(super) fn maybe_delete_telegram_topic(
         return;
     };
     let tg = Arc::clone(tg);
+    // fire-and-forget: remove_binding posts to Telegram delete-topic API.
+    // Short-lived; tied to UI pane delete. State already updated synchronously
+    // (take_binding returned the binding). No JoinHandle needed — Telegram
+    // API failure is logged warn but doesn't block the UI pane teardown.
     std::thread::spawn(move || {
         if let Err(e) = tg.remove_binding(&binding) {
             tracing::warn!(error = %e, "remove_binding failed");

@@ -255,6 +255,11 @@ fn run_core(
     let api_shutdown = Arc::clone(&shutdown);
     let api_configs = Arc::clone(&configs);
     let api_externals = Arc::clone(&externals);
+    // fire-and-forget: api::serve runs the Unix socket accept loop for the
+    // daemon's lifetime. Loop observes shutdown via the cloned AtomicBool;
+    // the socket file is removed during daemon shutdown, which surfaces as a
+    // bind/accept error and exits the loop. JoinHandle dropped because no
+    // graceful join is needed — process exit reaps the thread.
     std::thread::Builder::new()
         .name("api_server".into())
         .spawn(move || {
@@ -334,6 +339,10 @@ fn run_core(
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
         let (tx, rx) = crossbeam::channel::bounded(1);
+        // fire-and-forget: tick producer terminates when the bounded(1) tx
+        // returns Err, which happens when the rx end (held by the main loop)
+        // is dropped during daemon shutdown. Self-terminating; no JoinHandle
+        // tracking needed.
         std::thread::Builder::new()
             .name("daemon_tick".into())
             .spawn(move || loop {
@@ -636,6 +645,11 @@ fn run_core(
                     .and_then(|h| h.core.lock().ok().map(|c| c.health.clone()))
             };
 
+            // fire-and-forget: respawn worker is short-lived (sleep delay then
+            // spawn_agent + restore health + start TUI server). Observes
+            // shutdown flag immediately after backoff to abort cleanly.
+            // JoinHandle dropped because Err is logged + crash counter handles
+            // accounting.
             if let Err(e) = std::thread::Builder::new()
                         .name(format!("{crashed_name}_respawn"))
                         .spawn(move || {
@@ -697,6 +711,12 @@ fn run_core(
                                     let n = config.name.clone();
                                     let n_err = n.clone();
                                     let reg2 = Arc::clone(&reg);
+                                    // fire-and-forget: respawn-time TUI server
+                                    // exits when the agent is removed from
+                                    // the registry (socket-file removal in
+                                    // delete_transaction). Same shutdown
+                                    // contract as the startup-time TUI server
+                                    // spawn at line 1103.
                                     if let Err(e) = std::thread::Builder::new()
                                         .name(format!("{n}_tui_server"))
                                         .spawn(move || serve_agent_tui(&n, &rdir, &reg2))
@@ -1128,6 +1148,10 @@ fn consume_upgrade_marker(home: PathBuf, registry: AgentRegistry) {
     if !marker_path.exists() {
         return;
     }
+    // fire-and-forget: upgrade-marker consumer is one-shot — reads marker,
+    // sleeps 2s, injects cosmetic "daemon upgraded" notice into each agent,
+    // deletes marker, exits. Failures are cosmetic; agents missing the
+    // notice is acceptable (no JoinHandle / shutdown signal needed).
     let _ = std::thread::Builder::new()
         .name("upgrade_marker".into())
         .spawn(move || {

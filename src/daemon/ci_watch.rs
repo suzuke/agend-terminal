@@ -398,6 +398,10 @@ fn check_ci_watches_with_provider(
                 continue;
             }
         };
+        // fire-and-forget: ci_check is one-shot per poll cycle. Builds a
+        // single-thread tokio runtime, blocks on one provider call, exits.
+        // No JoinHandle / shutdown signal needed because the tick loop will
+        // re-spawn next cycle if anything is still being watched.
         std::thread::Builder::new()
             .name("ci_check".into())
             .spawn(move || {
@@ -425,8 +429,10 @@ fn check_ci_watches_with_provider(
             })
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "ci_check: failed to spawn background thread");
-                // Return a dummy JoinHandle — thread::spawn always succeeds in
-                // practice, but if it doesn't we've logged the failure.
+                // fire-and-forget: dummy no-op JoinHandle returned only to
+                // satisfy the unwrap_or_else return type. The closure body
+                // does nothing — the real work was the failed spawn above.
+                // No shutdown semantics needed.
                 std::thread::spawn(|| {})
             });
     }

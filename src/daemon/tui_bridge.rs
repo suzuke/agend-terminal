@@ -84,6 +84,10 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
             Err(_) => continue,
         };
         let n = name.to_string();
+        // fire-and-forget: per-client TUI output forwarder. Loop exits when
+        // the broadcast subscriber rx drops (agent removed via
+        // delete_transaction) or when frame write fails (client disconnect).
+        // No graceful join needed — each client connection is independent.
         if let Err(e) = std::thread::Builder::new()
             .name(format!("{n}_tui_out"))
             .spawn(move || {
@@ -100,6 +104,9 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
         let read_stream = stream;
         let n = name.to_string();
         let n_err = n.clone();
+        // fire-and-forget: per-client TUI input forwarder. Loop exits on
+        // socket disconnect (read_tagged_frame returns Err). Mirror of
+        // tui_out above; same independent-per-client lifecycle.
         if let Err(e) = std::thread::Builder::new()
             .name(format!("{n}_tui_in"))
             .spawn(move || {

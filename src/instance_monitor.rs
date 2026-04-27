@@ -38,6 +38,10 @@ pub fn latest_metrics() -> Vec<InstanceMetrics> {
 /// Spawn a dedicated monitor collection thread at 5s interval.
 /// Independent from the supervisor 10s tick to meet operator Q7 spec.
 pub fn spawn_monitor_tick(home: std::path::PathBuf, registry: crate::agent::AgentRegistry) {
+    // fire-and-forget: monitor tick loop terminates on process exit. Sysinfo
+    // collection is read-only sampling — losing one tick on shutdown is
+    // harmless (next daemon start re-samples). Self-acknowledged Sprint 20
+    // Track B finding (PR-AZ author = dev-impl-2).
     let _ = std::thread::Builder::new()
         .name("monitor_tick".into())
         .spawn(move || loop {
