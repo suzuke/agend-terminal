@@ -426,13 +426,12 @@ fn run_core(
                     core.health.maybe_decay();
                     let agent_state = core.state.current;
                     let silent = core.state.last_output.elapsed();
-                    // Sprint 24 P1: snapshot heartbeat_pair OUTSIDE the
-                    // core lock-window to honor the leaf-level rule per
-                    // docs/DAEMON-LOCK-ORDERING.md (pair lock never held
-                    // while acquiring another lock). Pair lookup is
-                    // per-instance + cheap; safe to call here because
-                    // core lock is held but pair lock is acquired+released
-                    // synchronously.
+                    // Sprint 24 P1: snapshot heartbeat_pair UNDER the
+                    // core lock (Level 1 → Level 3 top-down per Rule 1
+                    // in docs/DAEMON-LOCK-ORDERING.md). Pair lock is
+                    // acquired+released synchronously by `snapshot_for`
+                    // so it's not held during subsequent `check_hang`
+                    // execution (Rule 3 leaf-level).
                     let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
                     if core.health.check_hang(
                         agent_state,
