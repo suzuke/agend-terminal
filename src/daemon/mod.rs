@@ -7,6 +7,7 @@ pub(crate) mod heartbeat_pair;
 pub(crate) mod lifecycle;
 pub(crate) mod poll_reminder;
 pub(crate) mod supervisor;
+pub(crate) mod task_sweep;
 pub(crate) mod ticker;
 mod tui_bridge;
 pub(crate) mod watchdog;
@@ -219,6 +220,24 @@ fn run_core(
     initial_digest: Option<HashMap<String, crate::bootstrap::reload::InstanceDigest>>,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
 ) -> anyhow::Result<()> {
+    // Sprint 24 P0 PR2 — bridge-phase legacy migration. Walks tasks.json
+    // and emits canonical Created (+ status transition) events into
+    // task_events.jsonl. Idempotent: re-run is a no-op via tail-scan
+    // against the existing event log. Runs synchronously BEFORE any MCP
+    // tool registration / agent spawn so operators never observe a "list
+    // empty" race. Fail-loud: any error aborts daemon startup so the
+    // operator sees the failure rather than silently inconsistent state.
+    match crate::tasks::migrate_legacy_tasks_json_to_event_log(home) {
+        Ok(rep) => tracing::info!(
+            migrated = rep.migrated,
+            skipped = rep.skipped,
+            "task_events: legacy tasks.json bridge migration complete"
+        ),
+        Err(e) => {
+            return Err(anyhow::anyhow!("task_events: legacy migration failed: {e}"));
+        }
+    }
+
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     if let Some(tg) = telegram.as_ref() {
         tg.attach_registry(Arc::clone(&registry));
@@ -287,6 +306,14 @@ fn run_core(
         &format!("{} agents", agents.len()),
     );
     tracing::info!("running, Ctrl+C or `agend-terminal stop` to stop");
+
+    // Sprint 24 P0 PR2 — task auto-close sweep daemon. Holds the
+    // ticker handle for the duration of run_core so the spawned thread
+    // observes the shared shutdown atomic; drop is a no-op per the
+    // current daemon fire-and-forget convention. Sweep no-ops until the
+    // operator configures `repo` via the `task_sweep_config` MCP tool.
+    let _task_sweep =
+        crate::daemon::task_sweep::TaskSweep::spawn(home.to_path_buf(), Arc::clone(&shutdown));
 
     // Ready ping → agend-supervisor (if we were started under one, i.e.
     // `AGEND_SUPERVISOR_SOCK` env is set). Must come after agents are up

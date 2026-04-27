@@ -176,6 +176,13 @@ fn task_tools() -> Vec<Value> {
                 "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
                 "duration": {"type": "string", "description": "Human duration until deadline (e.g. 30m, 1h, 2d)"}
             }, "required": ["action"]}}),
+        json!({"name": "task_sweep_config",
+        "description": "Configure GitHub-PR auto-close sweep daemon. Sweep polls merged PRs and emits Done events for `Closes t-XXX-N` markers (validated by 5-must-have pipeline).",
+        "inputSchema": {"type": "object", "properties": {
+            "repo": {"type": "string", "description": "GitHub `owner/repo` to sweep (empty string disables)"},
+            "pause": {"type": "boolean", "description": "Pause/resume the sweep tick"},
+            "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"}
+        }}}),
     ]
 }
 

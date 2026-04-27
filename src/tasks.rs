@@ -184,6 +184,123 @@ pub fn sweep_overdue_claimed(home: &Path) -> Vec<String> {
     unclaimed
 }
 
+/// Result of [`migrate_legacy_tasks_json_to_event_log`]. Reported back to
+/// daemon startup logs so operators see how many legacy tasks crossed the
+/// PR2 bridge into the canonical event log.
+#[derive(Debug, Clone)]
+pub struct MigrationReport {
+    pub migrated: usize,
+    pub skipped: usize,
+}
+
+/// Sprint 24 P0 PR2 — bridge-phase migration. Walks the legacy
+/// `tasks.json` and emits canonical `TaskEvent`s into `task_events.jsonl`
+/// for every task whose `task_id` doesn't already appear in the event
+/// log. Idempotent: re-running on already-migrated state is a no-op.
+///
+/// Runs synchronously at daemon startup before the first MCP tool call
+/// so operators never observe a "list empty during migration" race.
+///
+/// **Bridge phase note**: PR2 keeps `tasks.json` writes (via dual-write
+/// in [`handle`]). PR3 retires `tasks.json` entirely; this migration is
+/// the one-shot that ensures replay() at PR3 cutover sees every legacy
+/// task. Re-running after PR3 cutover (when `tasks.json` is gone) is a
+/// no-op via the empty-store branch.
+pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<MigrationReport> {
+    let store = load(home);
+    if store.tasks.is_empty() {
+        return Ok(MigrationReport {
+            migrated: 0,
+            skipped: 0,
+        });
+    }
+    let state = crate::task_events::replay(home).unwrap_or_default();
+    let migrator = crate::task_events::InstanceName::from("system:legacy_migration");
+    let mut events: Vec<crate::task_events::TaskEvent> = Vec::new();
+    let mut migrated = 0usize;
+    let mut skipped = 0usize;
+
+    for t in &store.tasks {
+        let tid = crate::task_events::TaskId(t.id.clone());
+        if state.tasks.contains_key(&tid) {
+            // Already in event log — idempotent skip.
+            skipped += 1;
+            continue;
+        }
+        events.push(crate::task_events::TaskEvent::Created {
+            task_id: tid.clone(),
+            title: t.title.clone(),
+            description: t.description.clone(),
+            priority: t.priority.clone(),
+            owner: t
+                .assignee
+                .as_ref()
+                .map(|s| crate::task_events::InstanceName(s.clone())),
+        });
+        // Emit the minimum status-transition events to bring the task to
+        // its current legacy status. The replay-derived view post-PR3
+        // cutover sees the same final state as the legacy tasks.json.
+        match t.status.as_str() {
+            "claimed" => {
+                if let Some(by) = &t.assignee {
+                    events.push(crate::task_events::TaskEvent::Claimed {
+                        task_id: tid.clone(),
+                        by: crate::task_events::InstanceName(by.clone()),
+                    });
+                }
+            }
+            "in_progress" => {
+                if let Some(by) = &t.assignee {
+                    events.push(crate::task_events::TaskEvent::Claimed {
+                        task_id: tid.clone(),
+                        by: crate::task_events::InstanceName(by.clone()),
+                    });
+                    events.push(crate::task_events::TaskEvent::InProgress {
+                        task_id: tid.clone(),
+                        by: crate::task_events::InstanceName(by.clone()),
+                    });
+                }
+            }
+            "done" => {
+                let by = t
+                    .assignee
+                    .as_deref()
+                    .unwrap_or(t.created_by.as_str())
+                    .to_string();
+                events.push(crate::task_events::TaskEvent::Done {
+                    task_id: tid.clone(),
+                    by: crate::task_events::InstanceName(by),
+                    source: crate::task_events::DoneSource::OperatorManual {
+                        authored_at: t.updated_at.clone(),
+                        result: t.result.clone(),
+                    },
+                });
+            }
+            "cancelled" => {
+                events.push(crate::task_events::TaskEvent::Cancelled {
+                    task_id: tid.clone(),
+                    by: crate::task_events::InstanceName(t.created_by.clone()),
+                    reason: "migrated from legacy tasks.json (status was cancelled)".to_string(),
+                });
+            }
+            "blocked" => {
+                events.push(crate::task_events::TaskEvent::Blocked {
+                    task_id: tid.clone(),
+                    reason: "migrated from legacy tasks.json (status was blocked)".to_string(),
+                });
+            }
+            // "open" or unknown: Created already left the task at Open.
+            _ => {}
+        }
+        migrated += 1;
+    }
+
+    if !events.is_empty() {
+        crate::task_events::append_batch(home, &migrator, events)?;
+    }
+    Ok(MigrationReport { migrated, skipped })
+}
+
 fn parse_due_at(args: &Value) -> Option<String> {
     if let Some(due) = args["due_at"].as_str() {
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(due) {
@@ -261,7 +378,26 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 updated_at: now,
                 due_at: parse_due_at(args),
             };
+            // Sprint 24 P0 PR2 — double-write bridge: canonical event log
+            // first, tasks.json second. PR3 cutover removes the tasks.json
+            // write (read path also moves to replay()). Emitting inside
+            // `mutate_versioned`'s closure means a failed event log write
+            // bails before the tasks.json mutation persists, preserving
+            // consistency on failure.
+            let event = crate::task_events::TaskEvent::Created {
+                task_id: crate::task_events::TaskId(id.clone()),
+                title: task.title.clone(),
+                description: task.description.clone(),
+                priority: task.priority.clone(),
+                owner: task
+                    .assignee
+                    .as_ref()
+                    .map(|s| crate::task_events::InstanceName(s.clone())),
+            };
+            let emitter = crate::task_events::InstanceName::from(instance_name);
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
+                crate::task_events::append(home, &emitter, event)
+                    .map_err(|e| anyhow::anyhow!("event log append failed: {e}"))?;
                 store.tasks.push(task);
                 Ok(())
             }) {
@@ -309,6 +445,8 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             if !instance_exists(home, &iname) {
                 return serde_json::json!({"error": format!("instance '{iname}' not found in fleet.yaml")});
             }
+            let emitter = crate::task_events::InstanceName::from(instance_name);
+            let event_id = crate::task_events::TaskId(id.clone());
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
@@ -321,6 +459,16 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                                 task.status
                             );
                         }
+                        // Canonical event log first; tasks.json second.
+                        crate::task_events::append(
+                            home,
+                            &emitter,
+                            crate::task_events::TaskEvent::Claimed {
+                                task_id: event_id,
+                                by: crate::task_events::InstanceName::from(iname.as_str()),
+                            },
+                        )
+                        .map_err(|e| anyhow::anyhow!("event log append failed: {e}"))?;
                         task.status = "claimed".to_string();
                         task.assignee = Some(iname.clone());
                         task.routed_to = None;
@@ -344,6 +492,9 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             let result_text = args["result"].as_str().map(String::from);
             let caller = instance_name.to_string();
+            let emitter = crate::task_events::InstanceName::from(instance_name);
+            let event_id = crate::task_events::TaskId(id.clone());
+            let result_for_event = result_text.clone();
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
@@ -353,6 +504,23 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                                 task.assignee.as_deref().unwrap_or("unassigned")
                             );
                         }
+                        // `by` field — the assignee at done-time is the
+                        // worker; if no assignee, fall back to caller (who
+                        // by `can_mutate_task` is the orchestrator).
+                        let by = task.assignee.clone().unwrap_or_else(|| caller.clone());
+                        crate::task_events::append(
+                            home,
+                            &emitter,
+                            crate::task_events::TaskEvent::Done {
+                                task_id: event_id,
+                                by: crate::task_events::InstanceName(by),
+                                source: crate::task_events::DoneSource::OperatorManual {
+                                    authored_at: chrono::Utc::now().to_rfc3339(),
+                                    result: result_for_event,
+                                },
+                            },
+                        )
+                        .map_err(|e| anyhow::anyhow!("event log append failed: {e}"))?;
                         task.status = "done".to_string();
                         task.result.clone_from(&result_text);
                         task.updated_at = chrono::Utc::now().to_rfc3339();
@@ -385,6 +553,8 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 None
             };
             let caller = instance_name.to_string();
+            let emitter = crate::task_events::InstanceName::from(instance_name);
+            let event_id = crate::task_events::TaskId(id.clone());
             match crate::store::mutate_versioned(&store_path(home), |store: &mut TaskStore| {
                 match store.tasks.iter_mut().find(|t| t.id == id) {
                     Some(task) => {
@@ -394,7 +564,66 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                                 task.assignee.as_deref().unwrap_or("unassigned")
                             );
                         }
+                        // Translate explicit status transition to a
+                        // canonical TaskEvent. Priority / assignee changes
+                        // without status change have no v1 event variant —
+                        // PR3 introduces a metadata event when the read
+                        // path also moves to replay(). For PR2 phase reads
+                        // come from tasks.json, so the gap doesn't surface.
                         if let Some(ref s) = new_status {
+                            let prev_status = task.status.clone();
+                            let event_for_transition = match (prev_status.as_str(), s.as_str()) {
+                                (_, "claimed") => Some(crate::task_events::TaskEvent::Claimed {
+                                    task_id: event_id.clone(),
+                                    by: crate::task_events::InstanceName::from(
+                                        task.assignee.as_deref().unwrap_or(caller.as_str()),
+                                    ),
+                                }),
+                                (_, "in_progress") => {
+                                    Some(crate::task_events::TaskEvent::InProgress {
+                                        task_id: event_id.clone(),
+                                        by: crate::task_events::InstanceName::from(
+                                            task.assignee.as_deref().unwrap_or(caller.as_str()),
+                                        ),
+                                    })
+                                }
+                                (_, "done") => Some(crate::task_events::TaskEvent::Done {
+                                    task_id: event_id.clone(),
+                                    by: crate::task_events::InstanceName::from(
+                                        task.assignee.as_deref().unwrap_or(caller.as_str()),
+                                    ),
+                                    source: crate::task_events::DoneSource::OperatorManual {
+                                        authored_at: chrono::Utc::now().to_rfc3339(),
+                                        result: task.result.clone(),
+                                    },
+                                }),
+                                (_, "cancelled") => {
+                                    Some(crate::task_events::TaskEvent::Cancelled {
+                                        task_id: event_id.clone(),
+                                        by: crate::task_events::InstanceName::from(caller.as_str()),
+                                        reason: "operator update".to_string(),
+                                    })
+                                }
+                                (_, "blocked") => Some(crate::task_events::TaskEvent::Blocked {
+                                    task_id: event_id.clone(),
+                                    reason: "operator update".to_string(),
+                                }),
+                                ("blocked", "open") => {
+                                    Some(crate::task_events::TaskEvent::Unblocked {
+                                        task_id: event_id.clone(),
+                                    })
+                                }
+                                (_, "open") => Some(crate::task_events::TaskEvent::Reopened {
+                                    task_id: event_id.clone(),
+                                    reason: "operator update".to_string(),
+                                    source_evidence: format!("status {prev_status} → open"),
+                                }),
+                                _ => None,
+                            };
+                            if let Some(ev) = event_for_transition {
+                                crate::task_events::append(home, &emitter, ev)
+                                    .map_err(|e| anyhow::anyhow!("event log append failed: {e}"))?;
+                            }
                             task.status = s.clone();
                             // Release claim: setting status=open clears ownership
                             if s == "open" {
@@ -1697,6 +1926,126 @@ mod tests {
         let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
         let tasks = listed["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 2, "non-done tasks must always appear");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 24 P0 PR2 — bridge-phase migration tests ─────────────
+
+    /// Migration helper imports every legacy `tasks.json` task into the
+    /// event log: open / claimed / done / cancelled / blocked all reach
+    /// the same final status under replay() that they had on disk.
+    #[test]
+    fn migration_imports_legacy_tasks_to_event_log() {
+        let home = tmp_home("migration_import");
+        // Seed a legacy tasks.json with one task per status branch.
+        crate::store::mutate_versioned(&store_path(&home), |store: &mut TaskStore| {
+            for (id, status, assignee) in [
+                ("t-mig-open", "open", None),
+                ("t-mig-claimed", "claimed", Some("agent-a")),
+                ("t-mig-in-prog", "in_progress", Some("agent-b")),
+                ("t-mig-done", "done", Some("agent-c")),
+                ("t-mig-cancelled", "cancelled", None),
+                ("t-mig-blocked", "blocked", None),
+            ] {
+                store.tasks.push(Task {
+                    id: id.into(),
+                    title: format!("title {id}"),
+                    description: "legacy".into(),
+                    status: status.into(),
+                    priority: "normal".into(),
+                    assignee: assignee.map(String::from),
+                    routed_to: None,
+                    created_by: "operator".into(),
+                    depends_on: Vec::new(),
+                    result: if status == "done" {
+                        Some("completed".into())
+                    } else {
+                        None
+                    },
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                    due_at: None,
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let report = migrate_legacy_tasks_json_to_event_log(&home).unwrap();
+        assert_eq!(report.migrated, 6, "all 6 legacy tasks imported");
+        assert_eq!(report.skipped, 0);
+
+        // Replay should observe 6 tasks at their pre-migration statuses.
+        let state = crate::task_events::replay(&home).unwrap();
+        assert_eq!(state.tasks.len(), 6);
+        let lookup = |id: &str| {
+            state
+                .tasks
+                .get(&crate::task_events::TaskId::from(id))
+                .map(|t| t.status)
+                .unwrap()
+        };
+        assert_eq!(lookup("t-mig-open"), crate::task_events::TaskStatus::Open);
+        assert_eq!(
+            lookup("t-mig-claimed"),
+            crate::task_events::TaskStatus::Claimed
+        );
+        assert_eq!(
+            lookup("t-mig-in-prog"),
+            crate::task_events::TaskStatus::InProgress
+        );
+        assert_eq!(lookup("t-mig-done"), crate::task_events::TaskStatus::Done);
+        assert_eq!(
+            lookup("t-mig-cancelled"),
+            crate::task_events::TaskStatus::Cancelled
+        );
+        assert_eq!(
+            lookup("t-mig-blocked"),
+            crate::task_events::TaskStatus::Blocked
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Migration is idempotent: re-running on already-migrated state is a
+    /// no-op (every task_id already in the event log → skipped).
+    #[test]
+    fn migration_idempotent_on_second_run() {
+        let home = tmp_home("migration_idempotent");
+        crate::store::mutate_versioned(&store_path(&home), |store: &mut TaskStore| {
+            store.tasks.push(Task {
+                id: "t-idp-1".into(),
+                title: "idem".into(),
+                description: String::new(),
+                status: "open".into(),
+                priority: "normal".into(),
+                assignee: None,
+                routed_to: None,
+                created_by: "op".into(),
+                depends_on: Vec::new(),
+                result: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                due_at: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let first = migrate_legacy_tasks_json_to_event_log(&home).unwrap();
+        assert_eq!(first.migrated, 1);
+        assert_eq!(first.skipped, 0);
+
+        let second = migrate_legacy_tasks_json_to_event_log(&home).unwrap();
+        assert_eq!(
+            second.migrated, 0,
+            "second run finds task_id in event log → no new emit"
+        );
+        assert_eq!(second.skipped, 1);
+
+        // Replay confirms exactly one TaskRecord (no duplicate Created
+        // event accumulated across the two migration runs).
+        let state = crate::task_events::replay(&home).unwrap();
+        assert_eq!(state.tasks.len(), 1);
         std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -1054,4 +1054,414 @@ mod tests {
         assert_eq!(task.status, TaskStatus::Claimed);
         fs::remove_dir_all(&home).ok();
     }
+
+    // ── Sprint 24 P0 PR2 — F1 (deferred from PR1 r2) + Invariant #5 ──
+
+    /// Build a fresh `(home, instance)` test fixture seeded with a single
+    /// `Created` event so subsequent transitions have a task to mutate.
+    fn fixture_with_seeded_task(tag: &str) -> (PathBuf, InstanceName, TaskId) {
+        let home = tmp_home(tag);
+        let inst = InstanceName::from("u");
+        let tid = TaskId::from("t-FIX");
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "fixture".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+            },
+        )
+        .unwrap();
+        (home, inst, tid)
+    }
+
+    /// **F1 (PR1 r2 deferred to PR2)** — exhaustive state-machine table.
+    /// 7 statuses × 10 events = 70 cells; not all are interesting (Created
+    /// on an existing task is a documented no-op via `or_insert_with`),
+    /// but the test covers every cell explicitly so a future apply()
+    /// regression on any status × event pair fails-loud.
+    #[test]
+    fn state_machine_exhaustive_transitions() {
+        // Helper: prime task into a target status by sequencing prior
+        // events. Returns (home, instance, task_id) post-priming.
+        fn prime(target: TaskStatus, tag: &str) -> (PathBuf, InstanceName, TaskId) {
+            let (home, inst, tid) = fixture_with_seeded_task(tag);
+            let priming: Vec<TaskEvent> = match target {
+                TaskStatus::Open => vec![],
+                TaskStatus::Claimed => vec![TaskEvent::Claimed {
+                    task_id: tid.clone(),
+                    by: inst.clone(),
+                }],
+                TaskStatus::InProgress => vec![TaskEvent::InProgress {
+                    task_id: tid.clone(),
+                    by: inst.clone(),
+                }],
+                TaskStatus::Verified => vec![TaskEvent::Verified {
+                    task_id: tid.clone(),
+                    by_reviewer: inst.clone(),
+                    verdict: "verified".into(),
+                }],
+                TaskStatus::Done => vec![TaskEvent::Done {
+                    task_id: tid.clone(),
+                    by: inst.clone(),
+                    source: DoneSource::OperatorManual {
+                        authored_at: chrono::Utc::now().to_rfc3339(),
+                        result: None,
+                    },
+                }],
+                TaskStatus::Cancelled => vec![TaskEvent::Cancelled {
+                    task_id: tid.clone(),
+                    by: inst.clone(),
+                    reason: "test".into(),
+                }],
+                TaskStatus::Blocked => vec![TaskEvent::Blocked {
+                    task_id: tid.clone(),
+                    reason: "test".into(),
+                }],
+            };
+            for e in priming {
+                append(&home, &inst, e).unwrap();
+            }
+            (home, inst, tid)
+        }
+
+        // Helper: emit one event for the candidate transition.
+        fn emit(home: &Path, inst: &InstanceName, tid: &TaskId, kind: &str) {
+            let event = match kind {
+                // Created on an existing task is a documented no-op via
+                // `entry().or_insert_with` — applying it doesn't mutate
+                // status. We still exercise the path here to pin the
+                // invariant.
+                "Created" => TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "dup".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                },
+                "Claimed" => TaskEvent::Claimed {
+                    task_id: tid.clone(),
+                    by: inst.clone(),
+                },
+                "InProgress" => TaskEvent::InProgress {
+                    task_id: tid.clone(),
+                    by: inst.clone(),
+                },
+                "Verified" => TaskEvent::Verified {
+                    task_id: tid.clone(),
+                    by_reviewer: inst.clone(),
+                    verdict: "v".into(),
+                },
+                "Done" => TaskEvent::Done {
+                    task_id: tid.clone(),
+                    by: inst.clone(),
+                    source: DoneSource::OperatorManual {
+                        authored_at: chrono::Utc::now().to_rfc3339(),
+                        result: None,
+                    },
+                },
+                "Cancelled" => TaskEvent::Cancelled {
+                    task_id: tid.clone(),
+                    by: inst.clone(),
+                    reason: "t".into(),
+                },
+                "Linked" => TaskEvent::Linked {
+                    task_id: tid.clone(),
+                    pr_id: PrId(1),
+                    source: LinkSource::Explicit {
+                        authored_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                    snapshot: PrSnapshot {
+                        pr_state: "merged".into(),
+                        merge_sha: Some("aaaa".into()),
+                        api_response_hash: "h".into(),
+                        captured_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                },
+                "Blocked" => TaskEvent::Blocked {
+                    task_id: tid.clone(),
+                    reason: "t".into(),
+                },
+                "Unblocked" => TaskEvent::Unblocked {
+                    task_id: tid.clone(),
+                },
+                "Reopened" => TaskEvent::Reopened {
+                    task_id: tid.clone(),
+                    reason: "t".into(),
+                    source_evidence: "t".into(),
+                },
+                _ => unreachable!(),
+            };
+            append(home, inst, event).unwrap();
+        }
+
+        // Full 7×10 expectation table. Each row asserts the post-event
+        // status. Created/Linked never change status. Unblocked only
+        // moves Blocked → Open. Reopened always normalises to Open.
+        // Other events overwrite to their own target status (replay-side
+        // is permissive per F3 contract).
+        let table: &[(TaskStatus, &str, TaskStatus)] = &[
+            // (current_status, event_kind, expected_next_status)
+            (TaskStatus::Open, "Created", TaskStatus::Open),
+            (TaskStatus::Open, "Claimed", TaskStatus::Claimed),
+            (TaskStatus::Open, "InProgress", TaskStatus::InProgress),
+            (TaskStatus::Open, "Verified", TaskStatus::Verified),
+            (TaskStatus::Open, "Done", TaskStatus::Done),
+            (TaskStatus::Open, "Cancelled", TaskStatus::Cancelled),
+            (TaskStatus::Open, "Linked", TaskStatus::Open),
+            (TaskStatus::Open, "Blocked", TaskStatus::Blocked),
+            (TaskStatus::Open, "Unblocked", TaskStatus::Open),
+            (TaskStatus::Open, "Reopened", TaskStatus::Open),
+            (TaskStatus::Claimed, "Created", TaskStatus::Claimed),
+            (TaskStatus::Claimed, "Claimed", TaskStatus::Claimed),
+            (TaskStatus::Claimed, "InProgress", TaskStatus::InProgress),
+            (TaskStatus::Claimed, "Verified", TaskStatus::Verified),
+            (TaskStatus::Claimed, "Done", TaskStatus::Done),
+            (TaskStatus::Claimed, "Cancelled", TaskStatus::Cancelled),
+            (TaskStatus::Claimed, "Linked", TaskStatus::Claimed),
+            (TaskStatus::Claimed, "Blocked", TaskStatus::Blocked),
+            (TaskStatus::Claimed, "Unblocked", TaskStatus::Claimed),
+            (TaskStatus::Claimed, "Reopened", TaskStatus::Open),
+            (TaskStatus::InProgress, "Created", TaskStatus::InProgress),
+            (TaskStatus::InProgress, "Claimed", TaskStatus::Claimed),
+            (TaskStatus::InProgress, "InProgress", TaskStatus::InProgress),
+            (TaskStatus::InProgress, "Verified", TaskStatus::Verified),
+            (TaskStatus::InProgress, "Done", TaskStatus::Done),
+            (TaskStatus::InProgress, "Cancelled", TaskStatus::Cancelled),
+            (TaskStatus::InProgress, "Linked", TaskStatus::InProgress),
+            (TaskStatus::InProgress, "Blocked", TaskStatus::Blocked),
+            (TaskStatus::InProgress, "Unblocked", TaskStatus::InProgress),
+            (TaskStatus::InProgress, "Reopened", TaskStatus::Open),
+            (TaskStatus::Verified, "Created", TaskStatus::Verified),
+            (TaskStatus::Verified, "Claimed", TaskStatus::Claimed),
+            (TaskStatus::Verified, "InProgress", TaskStatus::InProgress),
+            (TaskStatus::Verified, "Verified", TaskStatus::Verified),
+            (TaskStatus::Verified, "Done", TaskStatus::Done),
+            (TaskStatus::Verified, "Cancelled", TaskStatus::Cancelled),
+            (TaskStatus::Verified, "Linked", TaskStatus::Verified),
+            (TaskStatus::Verified, "Blocked", TaskStatus::Blocked),
+            (TaskStatus::Verified, "Unblocked", TaskStatus::Verified),
+            (TaskStatus::Verified, "Reopened", TaskStatus::Open),
+            (TaskStatus::Done, "Created", TaskStatus::Done),
+            (TaskStatus::Done, "Claimed", TaskStatus::Claimed),
+            (TaskStatus::Done, "InProgress", TaskStatus::InProgress),
+            (TaskStatus::Done, "Verified", TaskStatus::Verified),
+            (TaskStatus::Done, "Done", TaskStatus::Done),
+            (TaskStatus::Done, "Cancelled", TaskStatus::Cancelled),
+            (TaskStatus::Done, "Linked", TaskStatus::Done),
+            (TaskStatus::Done, "Blocked", TaskStatus::Blocked),
+            (TaskStatus::Done, "Unblocked", TaskStatus::Done),
+            (TaskStatus::Done, "Reopened", TaskStatus::Open),
+            (TaskStatus::Cancelled, "Created", TaskStatus::Cancelled),
+            (TaskStatus::Cancelled, "Claimed", TaskStatus::Claimed),
+            (TaskStatus::Cancelled, "InProgress", TaskStatus::InProgress),
+            (TaskStatus::Cancelled, "Verified", TaskStatus::Verified),
+            (TaskStatus::Cancelled, "Done", TaskStatus::Done),
+            (TaskStatus::Cancelled, "Cancelled", TaskStatus::Cancelled),
+            (TaskStatus::Cancelled, "Linked", TaskStatus::Cancelled),
+            (TaskStatus::Cancelled, "Blocked", TaskStatus::Blocked),
+            (TaskStatus::Cancelled, "Unblocked", TaskStatus::Cancelled),
+            (TaskStatus::Cancelled, "Reopened", TaskStatus::Open),
+            (TaskStatus::Blocked, "Created", TaskStatus::Blocked),
+            (TaskStatus::Blocked, "Claimed", TaskStatus::Claimed),
+            (TaskStatus::Blocked, "InProgress", TaskStatus::InProgress),
+            (TaskStatus::Blocked, "Verified", TaskStatus::Verified),
+            (TaskStatus::Blocked, "Done", TaskStatus::Done),
+            (TaskStatus::Blocked, "Cancelled", TaskStatus::Cancelled),
+            (TaskStatus::Blocked, "Linked", TaskStatus::Blocked),
+            (TaskStatus::Blocked, "Blocked", TaskStatus::Blocked),
+            (TaskStatus::Blocked, "Unblocked", TaskStatus::Open),
+            (TaskStatus::Blocked, "Reopened", TaskStatus::Open),
+        ];
+
+        for (i, (start, evt, expected)) in table.iter().enumerate() {
+            let (home, inst, tid) = prime(*start, &format!("sm_{i}"));
+            emit(&home, &inst, &tid, evt);
+            let state = replay(&home).unwrap();
+            let actual = state.tasks.get(&tid).unwrap().status;
+            assert_eq!(
+                actual, *expected,
+                "({:?}, {}) expected → {:?}, got {:?}",
+                start, evt, expected, actual
+            );
+            fs::remove_dir_all(&home).ok();
+        }
+    }
+
+    /// **Replay-determinism invariant #5 (PR1 r2 deferred to PR2)** —
+    /// sweep-replay associativity: applying sweep events on top of an
+    /// existing log produces the same fold as inserting them anywhere
+    /// chronologically before the rest. Defends the future "sweep
+    /// daemon emits Linked/Done events while the operator emits manual
+    /// transitions" interleaving.
+    #[test]
+    fn invariant_5_sweep_replay_associativity() {
+        let inst = InstanceName::from("u");
+        let sweep = InstanceName::from("system:task_sweep");
+
+        // Scenario A: replay(operator events) then add sweep events on top.
+        let home_a = tmp_home("assoc_a");
+        append(
+            &home_a,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-S1"),
+                title: "s1".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+            },
+        )
+        .unwrap();
+        append(
+            &home_a,
+            &inst,
+            TaskEvent::Claimed {
+                task_id: TaskId::from("t-S1"),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        // Sweep emits Linked + Done on top.
+        append(
+            &home_a,
+            &sweep,
+            TaskEvent::Linked {
+                task_id: TaskId::from("t-S1"),
+                pr_id: PrId(42),
+                source: LinkSource::SweepDiscovery {
+                    sweep_id: "sw1".into(),
+                },
+                snapshot: PrSnapshot {
+                    pr_state: "merged".into(),
+                    merge_sha: Some("abc".into()),
+                    api_response_hash: "h".into(),
+                    captured_at: chrono::Utc::now().to_rfc3339(),
+                },
+            },
+        )
+        .unwrap();
+        append(
+            &home_a,
+            &sweep,
+            TaskEvent::Done {
+                task_id: TaskId::from("t-S1"),
+                by: inst.clone(),
+                source: DoneSource::PrMerged {
+                    pr_id: PrId(42),
+                    merge_sha: "abc".into(),
+                    merged_at: chrono::Utc::now().to_rfc3339(),
+                    snapshot: PrSnapshot {
+                        pr_state: "merged".into(),
+                        merge_sha: Some("abc".into()),
+                        api_response_hash: "h".into(),
+                        captured_at: chrono::Utc::now().to_rfc3339(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+        let state_a = replay(&home_a).unwrap();
+
+        // Scenario B: same events but interleaved differently — sweep
+        // events appear in the middle, not at the end. Replay's
+        // chronological+seq sort canonicalises ordering, so the fold
+        // result must match scenario A.
+        let home_b = tmp_home("assoc_b");
+        let log_b = home_b.join("task_events.jsonl");
+        // Hand-craft the envelope sequence in a different file order:
+        let envs = vec![
+            TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq: 1,
+                timestamp: "2026-04-27T00:00:01Z".into(),
+                instance: inst.clone(),
+                event: TaskEvent::Created {
+                    task_id: TaskId::from("t-S1"),
+                    title: "s1".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                },
+            },
+            // Sweep Linked appears BEFORE operator Claimed in file order
+            // but with later timestamp — replay sort still applies it
+            // after Claimed because the sort key is timestamp.
+            TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq: 1,
+                timestamp: "2026-04-27T00:00:03Z".into(),
+                instance: sweep.clone(),
+                event: TaskEvent::Linked {
+                    task_id: TaskId::from("t-S1"),
+                    pr_id: PrId(42),
+                    source: LinkSource::SweepDiscovery {
+                        sweep_id: "sw1".into(),
+                    },
+                    snapshot: PrSnapshot {
+                        pr_state: "merged".into(),
+                        merge_sha: Some("abc".into()),
+                        api_response_hash: "h".into(),
+                        captured_at: "2026-04-27T00:00:03Z".into(),
+                    },
+                },
+            },
+            TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq: 2,
+                timestamp: "2026-04-27T00:00:02Z".into(),
+                instance: inst.clone(),
+                event: TaskEvent::Claimed {
+                    task_id: TaskId::from("t-S1"),
+                    by: inst.clone(),
+                },
+            },
+            TaskEventEnvelope {
+                schema_version: SCHEMA_VERSION,
+                seq: 2,
+                timestamp: "2026-04-27T00:00:04Z".into(),
+                instance: sweep.clone(),
+                event: TaskEvent::Done {
+                    task_id: TaskId::from("t-S1"),
+                    by: inst.clone(),
+                    source: DoneSource::PrMerged {
+                        pr_id: PrId(42),
+                        merge_sha: "abc".into(),
+                        merged_at: "2026-04-27T00:00:04Z".into(),
+                        snapshot: PrSnapshot {
+                            pr_state: "merged".into(),
+                            merge_sha: Some("abc".into()),
+                            api_response_hash: "h".into(),
+                            captured_at: "2026-04-27T00:00:04Z".into(),
+                        },
+                    },
+                },
+            },
+        ];
+        let mut content = String::new();
+        for e in &envs {
+            content.push_str(&serde_json::to_string(e).unwrap());
+            content.push('\n');
+        }
+        fs::write(&log_b, content).unwrap();
+        let state_b = replay(&home_b).unwrap();
+
+        // Final task status & linked PRs identical regardless of file
+        // order. Histories may differ in absolute timestamps but the
+        // ordered status transition is the invariant.
+        assert_eq!(
+            state_a.tasks.get(&TaskId::from("t-S1")).unwrap().status,
+            state_b.tasks.get(&TaskId::from("t-S1")).unwrap().status,
+            "associativity: operator-then-sweep == interleaved"
+        );
+        assert_eq!(
+            state_a.tasks.get(&TaskId::from("t-S1")).unwrap().linked_prs,
+            state_b.tasks.get(&TaskId::from("t-S1")).unwrap().linked_prs
+        );
+        fs::remove_dir_all(&home_a).ok();
+        fs::remove_dir_all(&home_b).ok();
+    }
 }
