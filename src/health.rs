@@ -282,9 +282,8 @@ impl HealthTracker {
         //
         // Sprint 24 P2 F1 cross-check: heartbeat fresh but PTY silent →
         // agent is calling MCP tools (refreshing heartbeat) without
-        // producing PTY output. This is either a prompt-injected agent
-        // suppressing escalation via MCP spam, or a genuinely stuck agent
-        // in a tight MCP loop. Either way, operator should be notified.
+        // producing PTY output. Indicates a stuck agent in a tight MCP
+        // loop — operator should be notified for diagnosis.
         let heartbeat_age_ms =
             crate::daemon::heartbeat_pair::now_ms().saturating_sub(last_heartbeat_at_ms);
         let heartbeat_fresh =
@@ -296,7 +295,7 @@ impl HealthTracker {
                 heartbeat_age_ms,
                 silent_ms = delta_ms,
                 agent_state = ?agent_state,
-                "agent classified Hung — heartbeat fresh but PTY silent (F1 heartbeat-spam cross-check)"
+                "agent classified Hung — heartbeat fresh but PTY silent (F1 cross-check)"
             );
             if self.state != HealthState::Hung {
                 self.state = HealthState::Hung;
@@ -816,11 +815,13 @@ mod tests {
         assert_eq!(h.state, HealthState::Hung);
     }
 
-    // Sprint 24 P2 F1 — heartbeat-spam attack mitigation tests.
+    // Sprint 24 P2 F1 — fresh-heartbeat-PTY-silent classifier tests.
+    // Catches stuck agents in tight MCP loops (heartbeat refreshing but
+    // PTY producing no output) that would otherwise misclassify as IdleLong.
 
     #[test]
-    fn classifier_returns_hung_on_heartbeat_spam_with_pty_silent() {
-        // Adversarial scenario: agent calling MCP tools (heartbeat fresh)
+    fn classifier_returns_hung_on_fresh_heartbeat_pty_silent() {
+        // Stuck-agent scenario: agent calling MCP tools (heartbeat fresh)
         // but producing no PTY output (silent past threshold). Classifier
         // must return Hung (escalation-worthy), NOT IdleLong.
         let mut h = HealthTracker::new();
@@ -840,9 +841,9 @@ mod tests {
     }
 
     #[test]
-    fn classifier_returns_idle_long_on_normal_idle_no_heartbeat_spam() {
-        // Regression: pure idle without MCP spam. Heartbeat is stale
-        // (older than silence window). Must still classify as IdleLong.
+    fn classifier_returns_idle_long_on_normal_idle_stale_heartbeat() {
+        // Regression: pure idle with stale heartbeat (older than silence
+        // window). Must still classify as IdleLong, not Hung.
         let mut h = HealthTracker::new();
         // Heartbeat 300s ago (stale — older than 180s silence window).
         let now = crate::daemon::heartbeat_pair::now_ms();
