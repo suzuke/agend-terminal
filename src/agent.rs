@@ -7,11 +7,12 @@ use crate::backend::Backend;
 use crate::health::HealthTracker;
 use crate::state::StateTracker;
 use crate::vterm::VTerm;
+use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -50,8 +51,8 @@ pub type ExternalRegistry = Arc<Mutex<HashMap<String, ExternalAgentHandle>>>;
 /// Lock the external registry, recovering from poison.
 pub fn lock_external(
     reg: &ExternalRegistry,
-) -> std::sync::MutexGuard<'_, HashMap<String, ExternalAgentHandle>> {
-    crate::sync::lock_poisoned(reg, "agent_registry")
+) -> parking_lot::MutexGuard<'_, HashMap<String, ExternalAgentHandle>> {
+    reg.lock()
 }
 
 /// Environment variable names that fleet.yaml-supplied `env:` maps are NOT
@@ -124,8 +125,8 @@ pub fn validate_name(name: &str) -> Result<&str, String> {
 /// Lock the agent registry, recovering from poison.
 pub fn lock_registry(
     reg: &AgentRegistry,
-) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
-    crate::sync::lock_poisoned(reg, "agent_registry")
+) -> parking_lot::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
+    reg.lock()
 }
 
 /// ANSI escape sequence stripper for dialog detection.
@@ -384,7 +385,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
 
     // Register in registry
     {
-        let mut reg = crate::sync::lock_poisoned(registry, "agent_registry");
+        let mut reg = registry.lock();
         reg.insert(
             name.to_string(),
             AgentHandle {
@@ -533,10 +534,10 @@ fn spawn_instructions_bootstrap(
             }
 
             let ready = {
-                let reg = crate::sync::lock_poisoned(&registry, "agent_registry");
+                let reg = &registry.lock();
                 match reg.get(&name) {
                     Some(h) => {
-                        let core = crate::sync::lock_poisoned(&h.core, "agent_core");
+                        let core = &h.core.lock();
                         core.state.get_state() == crate::state::AgentState::Ready
                     }
                     None => return, // agent gone
@@ -554,7 +555,7 @@ fn spawn_instructions_bootstrap(
         // longer widens an external-mutation window.
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        let reg = crate::sync::lock_poisoned(&registry, "agent_registry");
+        let reg = &registry.lock();
         if let Some(handle) = reg.get(&name) {
             if let Err(e) = inject_to_agent(handle, content.as_bytes()) {
                 tracing::warn!(agent = %name, error = %e, "instructions bootstrap inject failed");
@@ -639,7 +640,7 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
                 // Ink-style TUIs that draw char-by-char with cursor positioning
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
                 let screen = {
-                    let mut c = crate::sync::lock_poisoned(core, "agent_core");
+                    let mut c = core.lock();
                     c.vterm.process(data);
                     let rows = c.vterm.rows() as usize;
                     let screen = c.vterm.tail_lines(rows);
@@ -677,9 +678,8 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
 /// call multiple times during the same crash-detection sequence.
 fn sweep_child_tree(name: &str, registry: &AgentRegistry) {
     let pid: Option<u32> = {
-        let reg = crate::sync::lock_poisoned(registry, "agent_registry");
-        reg.get(name)
-            .and_then(|h| h.child.lock().ok().and_then(|c| c.process_id()))
+        let reg = registry.lock();
+        reg.get(name).and_then(|h| h.child.lock().process_id())
     };
     if let Some(pid) = pid {
         crate::process::kill_process_tree(pid);
@@ -702,7 +702,8 @@ fn handle_pty_close(
 
     if is_shutdown {
         tracing::info!(agent = name, "stopped (daemon shutdown)");
-        if let Ok(mut reg) = registry.lock() {
+        {
+            let mut reg = registry.lock();
             reg.remove(name);
         }
         if let Some(ref home) = home {
@@ -716,14 +717,15 @@ fn handle_pty_close(
     // Wait up to 2s for process to fully exit
     let mut exit_code: Option<i32> = None;
     for _ in 0..20 {
-        let reg = crate::sync::lock_poisoned(registry, "agent_registry");
+        let reg = registry.lock();
         // Agent removed from registry → shutdown or explicit delete. Not a crash.
         if reg.get(name).is_none() {
             tracing::debug!(agent = name, "not in registry, skipping crash handling");
             return;
         }
         if let Some(handle) = reg.get(name) {
-            if let Ok(mut c) = handle.child.lock() {
+            {
+                let mut c = handle.child.lock();
                 if let Ok(Some(status)) = c.try_wait() {
                     exit_code = Some(status.exit_code() as i32);
                     break;
@@ -776,11 +778,11 @@ fn handle_pty_close(
         );
     }
     // Set Restarting state (don't remove from registry)
-    if let Ok(reg) = registry.lock() {
+    {
+        let reg = registry.lock();
         if let Some(handle) = reg.get(name) {
-            if let Ok(mut core) = handle.core.lock() {
-                core.state.set_restarting();
-            }
+            let mut core = handle.core.lock();
+            core.state.set_restarting();
         }
     }
     if let Some(ref tx) = crash_tx {
@@ -824,7 +826,7 @@ pub fn try_dismiss_dialog(
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 // Send keys in chunks split on \r/\n boundaries with delay between,
                 // so TUI frameworks process navigation before confirmation.
-                let mut w = crate::sync::lock_poisoned(&writer, "pty_writer");
+                let mut w = writer.lock();
                 let mut start = 0;
                 for (i, &b) in keys.iter().enumerate() {
                     if b == b'\r' || b == b'\n' {
@@ -834,7 +836,7 @@ pub fn try_dismiss_dialog(
                             let _ = w.flush();
                             drop(w);
                             std::thread::sleep(std::time::Duration::from_millis(200));
-                            w = crate::sync::lock_poisoned(&writer, "pty_writer");
+                            w = writer.lock();
                         }
                         // Send the Enter
                         let _ = w.write_all(&keys[i..=i]);
@@ -857,7 +859,7 @@ pub fn try_dismiss_dialog(
 
 /// Write data to an agent's PTY (atomic write — for attach path).
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
+    let mut w = agent.pty_writer.lock();
     w.write_all(data)
         .map_err(crate::error::AgendError::PtyWrite)?;
     w.flush().map_err(crate::error::AgendError::PtyWrite)?;
@@ -867,7 +869,7 @@ pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<
 /// Write data to an agent's PTY byte-by-byte with small delays.
 #[allow(dead_code)]
 pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
+    let mut w = agent.pty_writer.lock();
     for byte in data {
         w.write_all(&[*byte])
             .map_err(crate::error::AgendError::PtyWrite)?;
@@ -884,7 +886,7 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
 pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result<()> {
     let prefix = agent.inject_prefix.as_bytes();
     let submit = agent.submit_key.as_bytes();
-    let mut w = crate::sync::lock_poisoned(&agent.pty_writer, "pty_writer");
+    let mut w = agent.pty_writer.lock();
 
     // Write prefix + text
     if agent.typed_inject {
@@ -954,7 +956,7 @@ pub fn broadcast_registry(
 pub fn subscribe_with_dump(
     agent: &AgentHandle,
 ) -> (crossbeam::channel::Receiver<Vec<u8>>, Vec<u8>) {
-    let mut core = crate::sync::lock_poisoned(&agent.core, "agent_core");
+    let mut core = agent.core.lock();
     let dump = core.vterm.dump_screen();
     let (tx, rx) = crossbeam::channel::unbounded();
     core.subscribers.push(tx);
@@ -1090,9 +1092,9 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn sweep_child_tree_kills_grandchild_via_process_group() {
+        use parking_lot::Mutex;
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::collections::HashMap;
-        use std::sync::Mutex;
 
         let pty = native_pty_system();
         let pair = pty
@@ -1140,7 +1142,7 @@ mod tests {
             typed_inject: false,
         };
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        crate::sync::lock_poisoned(&registry, "test").insert("sweep-test".to_string(), handle);
+        registry.lock().insert("sweep-test".to_string(), handle);
 
         // Wait for sleep grandchild to start and write its PID
         for _ in 0..40 {
@@ -1170,9 +1172,10 @@ mod tests {
         // Without wait(), the shell shows as "alive" even after SIGKILL
         // because we are its parent and never collected its exit status.
         {
-            let reg = crate::sync::lock_poisoned(&registry, "test");
+            let reg = &registry.lock();
             if let Some(h) = reg.get("sweep-test") {
-                if let Ok(mut c) = h.child.lock() {
+                {
+                    let mut c = h.child.lock();
                     let _ = c.wait();
                 }
             }
@@ -1194,8 +1197,8 @@ mod tests {
         // Sprint 21 F-NEW1: registry lookup miss must not panic. The PTY-EOF
         // path may race against an explicit handle_delete that already cleaned
         // up the registry entry — sweep should simply find nothing to kill.
+        use parking_lot::Mutex;
         use std::collections::HashMap;
-        use std::sync::Mutex;
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         // Should not panic, should not error.
         sweep_child_tree("does-not-exist", &registry);

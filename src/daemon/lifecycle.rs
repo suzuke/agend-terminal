@@ -17,9 +17,10 @@
 //!   configs + IPC port + emits event log.
 
 use crate::agent::AgentRegistry;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum time we wait for a child to actually transition to exited after
@@ -41,10 +42,7 @@ pub fn wait_for_child_exit(child: &ChildArc) -> bool {
     let deadline = std::time::Instant::now() + CHILD_EXIT_TIMEOUT;
     loop {
         {
-            let mut guard = match child.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
+            let mut guard = child.lock();
             if let Ok(Some(_status)) = guard.try_wait() {
                 return true;
             }
@@ -84,7 +82,7 @@ pub fn delete_transaction(
     // then release the registry lock before issuing the kill so concurrent
     // listings aren't blocked while we wait for exit.
     let child_arc = {
-        let reg = crate::sync::lock_poisoned(registry, "lifecycle_delete_lookup");
+        let reg = registry.lock();
         reg.get(name).map(|h| Arc::clone(&h.child))
     };
 
@@ -92,7 +90,7 @@ pub fn delete_transaction(
         // Step 2: kill process tree first (covers backend child trees like
         // kiro-cli's bun/mcp/acp), then PTY-side kill as fallback.
         {
-            let mut child = crate::sync::lock_poisoned(&child_arc, "lifecycle_delete_kill");
+            let mut child = child_arc.lock();
             if let Some(pid) = child.process_id() {
                 crate::process::kill_process_tree(pid);
             }
@@ -109,7 +107,7 @@ pub fn delete_transaction(
 
     // Step 4: registry remove (after child exit confirmed or timeout).
     {
-        let mut reg = crate::sync::lock_poisoned(registry, "lifecycle_delete_remove");
+        let mut reg = registry.lock();
         reg.remove(name);
     }
 
@@ -119,7 +117,7 @@ pub fn delete_transaction(
     // Step 6: configs cleanup (None when called from app-mode `kill_agent`,
     // which doesn't track an AgentConfig map — app fleet.yaml is the authority).
     if let Some(cfgs) = configs {
-        crate::sync::lock_poisoned(cfgs, "lifecycle_delete_configs").remove(name);
+        cfgs.lock().remove(name);
     }
 
     // Step 7: IPC port cleanup.
@@ -200,13 +198,13 @@ impl<'r> Drop for SpawnRollback<'r> {
         // Rollback in reverse insertion order so observers can't see a
         // half-cleaned state with a child but no registry entry, etc.
         if self.in_registry {
-            let mut reg = crate::sync::lock_poisoned(self.registry, "spawn_rollback_registry");
+            let mut reg = self.registry.lock();
             reg.remove(&self.name);
             drop(reg);
             drop_active_binding(&self.name);
         }
         if let Some(child_arc) = self.child.take() {
-            let mut child = crate::sync::lock_poisoned(&child_arc, "spawn_rollback_child");
+            let mut child = child_arc.lock();
             if let Some(pid) = child.process_id() {
                 crate::process::kill_process_tree(pid);
             }
@@ -222,8 +220,8 @@ impl<'r> Drop for SpawnRollback<'r> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
-    use std::sync::Mutex;
 
     fn empty_registry() -> AgentRegistry {
         Arc::new(Mutex::new(HashMap::new()))
@@ -254,9 +252,7 @@ mod tests {
         // Drop fires here; armed=false so registry untouched.
         // We pre-seeded nothing, so the registry should still be empty
         // (mark_registered is a recorder, not a mutator).
-        assert!(crate::sync::lock_poisoned(&reg, "test")
-            .get("alpha")
-            .is_none());
+        assert!(reg.lock().get("alpha").is_none());
     }
 
     #[test]
@@ -264,15 +260,13 @@ mod tests {
         // Insert a placeholder handle so we can observe the rollback removing it.
         let reg = empty_registry();
         let placeholder = make_placeholder_handle("beta");
-        crate::sync::lock_poisoned(&reg, "test").insert("beta".into(), placeholder);
+        reg.lock().insert("beta".into(), placeholder);
         {
             let mut guard = SpawnRollback::new("beta", &reg);
             guard.mark_registered();
             // No commit — Drop fires armed → registry entry removed.
         }
-        assert!(crate::sync::lock_poisoned(&reg, "test")
-            .get("beta")
-            .is_none());
+        assert!(reg.lock().get("beta").is_none());
     }
 
     #[test]
@@ -334,7 +328,7 @@ mod tests {
         let home = tmp_home("delete-exited");
         let reg = empty_registry();
         let handle = make_placeholder_handle("gamma");
-        crate::sync::lock_poisoned(&reg, "test").insert("gamma".into(), handle);
+        reg.lock().insert("gamma".into(), handle);
         // `true` exits immediately, so wait_for_child_exit should observe
         // the exit on the first try_wait.
         let observed_exit = delete_transaction(&home, "gamma", &reg, None);
@@ -343,9 +337,7 @@ mod tests {
             "exited child must be observed within timeout"
         );
         assert!(
-            crate::sync::lock_poisoned(&reg, "test")
-                .get("gamma")
-                .is_none(),
+            reg.lock().get("gamma").is_none(),
             "registry entry must be removed after delete"
         );
         std::fs::remove_dir_all(&home).ok();

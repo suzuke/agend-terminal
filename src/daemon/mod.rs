@@ -19,9 +19,10 @@ use ci_watch::check_ci_watches;
 use cron_tick::check_schedules;
 pub use tui_bridge::serve_agent_tui;
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Agent spawn config — stored for auto-respawn.
 #[derive(Clone)]
@@ -422,7 +423,8 @@ fn run_core(
         {
             let reg = agent::lock_registry(&registry);
             for (name, handle) in reg.iter() {
-                if let Ok(mut core) = handle.core.lock() {
+                {
+                    let mut core = handle.core.lock();
                     core.health.maybe_decay();
                     let agent_state = core.state.current;
                     let silent = core.state.last_output.elapsed();
@@ -458,7 +460,8 @@ fn run_core(
                     Some(b) => b,
                     None => continue,
                 };
-                if let Ok(mut core) = handle.core.lock() {
+                {
+                    let mut core = handle.core.lock();
                     let rows = core.vterm.rows() as usize;
                     let screen = core.vterm.tail_lines(rows);
                     watchdog::run_watchdog_pass(
@@ -489,20 +492,17 @@ fn run_core(
         // Periodic snapshot: save fleet state (only if changed)
         {
             let reg = agent::lock_registry(&registry);
-            let cfgs = crate::sync::lock_poisoned(&configs, "configs");
+            let cfgs = configs.lock();
             let snapshots: Vec<_> = reg
                 .iter()
                 .map(|(name, handle)| {
-                    let (agent_state, health_state) = handle
-                        .core
-                        .lock()
-                        .map(|c| {
-                            (
-                                c.state.get_state().display_name().to_string(),
-                                c.health.state.display_name().to_string(),
-                            )
-                        })
-                        .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
+                    let (agent_state, health_state) = {
+                        let c = handle.core.lock();
+                        (
+                            c.state.get_state().display_name().to_string(),
+                            c.health.state.display_name().to_string(),
+                        )
+                    };
                     let cfg = cfgs.get(name);
                     crate::snapshot::AgentSnapshot {
                         name: name.clone(),
@@ -543,7 +543,7 @@ fn run_core(
                 run_task_maintenance(home);
                 // Worktree auto-cleanup (runtime registry based)
                 {
-                    let cfgs = crate::sync::lock_poisoned(&configs, "configs");
+                    let cfgs = configs.lock();
                     let config_data: std::collections::HashMap<
                         String,
                         (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
@@ -627,9 +627,7 @@ fn run_core(
         crate::event_log::log(home, "crash", &crashed_name, "agent crashed");
 
         // Get config for respawn
-        let config = crate::sync::lock_poisoned(&configs, "configs")
-            .get(&crashed_name)
-            .cloned();
+        let config = configs.lock().get(&crashed_name).cloned();
         let config = match config {
             Some(c) => c,
             None => {
@@ -643,7 +641,7 @@ fn run_core(
             let reg = agent::lock_registry(&registry);
             match reg.get(&crashed_name) {
                 Some(handle) => {
-                    let mut core = crate::sync::lock_poisoned(&handle.core, "agent_core");
+                    let mut core = handle.core.lock();
                     core.health.record_crash()
                 }
                 None => {
@@ -657,7 +655,7 @@ fn run_core(
             let state = {
                 let reg = agent::lock_registry(&registry);
                 reg.get(&crashed_name)
-                    .and_then(|h| h.core.lock().ok().map(|c| c.health.state.display_name()))
+                    .map(|h| h.core.lock().health.state.display_name())
                     .unwrap_or("unknown")
             };
             tracing::warn!(agent = %crashed_name, %state, "notifying");
@@ -687,9 +685,8 @@ fn run_core(
 
             // Save health tracker from old handle before respawn replaces it
             let saved_health = {
-                let r = crate::sync::lock_poisoned(&registry, "registry");
-                r.get(&crashed_name)
-                    .and_then(|h| h.core.lock().ok().map(|c| c.health.clone()))
+                let r = registry.lock();
+                r.get(&crashed_name).map(|h| h.core.lock().health.clone())
             };
 
             // fire-and-forget: respawn worker is short-lived (sleep delay then
@@ -728,9 +725,9 @@ fn run_core(
 
                                     // Restore health tracker from old handle + mark respawn OK
                                     {
-                                        let r = crate::sync::lock_poisoned(&reg, "registry");
+                                        let r = reg.lock();
                                         if let Some(handle) = r.get(&config.name) {
-                                            let mut core = crate::sync::lock_poisoned(&handle.core, "agent_core");
+                                            let mut core = handle.core.lock();
                                             if let Some(ref old_health) = saved_health {
                                                 core.health = old_health.clone();
                                             }
@@ -741,11 +738,10 @@ fn run_core(
                                     // Inject system message
                                     std::thread::sleep(std::time::Duration::from_secs(2));
                                     {
-                                        let r = crate::sync::lock_poisoned(&reg, "registry");
+                                        let r = reg.lock();
                                         if let Some(handle) = r.get(&config.name) {
-                                            let reason = handle.core.lock().ok()
-                                                .map(|c| c.health.crash_reason().to_string())
-                                                .unwrap_or_else(|| "crash".into());
+                                            let reason = handle.core.lock()
+                                                .health.crash_reason().to_string();
                                             let msg = format!(
                                                 "[system] Agent restarted due to {reason}. Previous context was lost.\r"
                                             );
@@ -786,7 +782,7 @@ fn run_core(
 
     // Shutdown: print residual worktrees
     {
-        let cfgs = crate::sync::lock_poisoned(&configs, "configs");
+        let cfgs = configs.lock();
         let mut seen = std::collections::HashSet::new();
         for config in cfgs.values() {
             // Use worktree_source (original repo) if available, otherwise working_dir
@@ -815,7 +811,7 @@ fn run_core(
     // registry — if the agent is gone, they return silently instead of
     // sending crash events. This eliminates all shutdown race conditions.
     let agents_to_kill: Vec<_> = {
-        let mut reg = crate::sync::lock_poisoned(&registry, "registry");
+        let mut reg = registry.lock();
         let agents: Vec<_> = reg
             .drain()
             .map(|(name, handle)| (name, handle.child))
@@ -823,7 +819,7 @@ fn run_core(
         agents
     };
     for (name, child) in &agents_to_kill {
-        let mut c = crate::sync::lock_poisoned(child, "child_proc");
+        let mut c = child.lock();
         if let Some(pid) = c.process_id() {
             crate::process::kill_process_tree(pid);
         }
@@ -1111,7 +1107,7 @@ fn spawn_and_register_agent(
     let worktree_source = working_dir
         .as_ref()
         .and_then(|wd| crate::worktree::source_repo_of(wd));
-    crate::sync::lock_poisoned(configs, "configs").insert(
+    configs.lock().insert(
         name.clone(),
         AgentConfig {
             name: name.clone(),
@@ -1147,7 +1143,7 @@ fn spawn_and_register_agent(
         },
         registry,
     ) {
-        crate::sync::lock_poisoned(configs, "configs").remove(name);
+        configs.lock().remove(name);
         return Err(e);
     }
 
@@ -1226,7 +1222,7 @@ fn consume_upgrade_marker(home: PathBuf, registry: AgentRegistry) {
             // Give agents a moment to paint their prompts; matches the delay
             // used by the crash-respawn system message injection above.
             std::thread::sleep(std::time::Duration::from_secs(2));
-            let r = crate::sync::lock_poisoned(&registry, "registry");
+            let r = registry.lock();
             for handle in r.values() {
                 let _ = agent::write_to_agent(handle, msg.as_bytes());
             }

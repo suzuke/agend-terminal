@@ -120,8 +120,9 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn test_ctx(home: &std::path::Path) -> HandlerCtx<'_> {
         // Leak registries for 'static — acceptable in tests.
@@ -244,7 +245,7 @@ mod tests {
         // Cleanup
         let reg = agent::lock_registry(registry);
         if let Some(h) = reg.get("active-agent") {
-            let _ = crate::sync::lock_poisoned(&h.child, "test").kill();
+            let _ = h.child.lock().kill();
         }
         drop(reg);
         std::fs::remove_dir_all(&home).ok();

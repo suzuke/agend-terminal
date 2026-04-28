@@ -12,16 +12,13 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
     let mut agents: Vec<Value> = reg
         .iter()
         .map(|(name, handle)| {
-            let (agent_state, health_state) = handle
-                .core
-                .lock()
-                .map(|c| {
-                    (
-                        c.state.get_state().display_name().to_string(),
-                        c.health.state.display_name().to_string(),
-                    )
-                })
-                .unwrap_or_else(|_| ("unknown".into(), "unknown".into()));
+            let (agent_state, health_state) = {
+                let c = handle.core.lock();
+                (
+                    c.state.get_state().display_name().to_string(),
+                    c.health.state.display_name().to_string(),
+                )
+            };
             json!({
                 "name": name,
                 "backend": handle.backend_command,

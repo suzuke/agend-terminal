@@ -6,23 +6,20 @@
 use crate::agent::AgentRegistry;
 use crate::fleet::ChannelConfig;
 use crate::inbox::{self, InboxMessage};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{MessageId, ThreadId};
 
 /// Lock TelegramState, recovering from poison.
-/// Mutex poisoning can occur if a background thread panics while holding the lock.
-/// We recover rather than propagate the panic to keep the TUI responsive.
+/// With parking_lot::Mutex, lock never fails (no poisoning).
 pub(crate) fn lock_state(
     tg: &Arc<Mutex<TelegramState>>,
-) -> std::sync::MutexGuard<'_, TelegramState> {
-    tg.lock().unwrap_or_else(|e| {
-        tracing::warn!("TelegramState mutex poisoned, recovering");
-        e.into_inner()
-    })
+) -> parking_lot::MutexGuard<'_, TelegramState> {
+    tg.lock()
 }
 
 // ---------------------------------------------------------------------------
@@ -954,7 +951,7 @@ fn agent_wants_raw_keystrokes(registry: Option<&AgentRegistry>, instance_name: &
     // Drop the registry lock before grabbing the per-agent core lock; holding
     // both at once risks deadlocks against code paths that take core → registry.
     drop(reg);
-    let guard = crate::sync::lock_poisoned(&core, "agent_core");
+    let guard = core.lock();
     guard.state.current.wants_raw_keystrokes()
 }
 
@@ -2428,14 +2425,15 @@ mod tests {
     // network. Serialized through `fleet_test_guard` via the caller,
     // so the plain `Mutex<Option<_>>` is sufficient.
     // -----------------------------------------------------------------
-    static FORCED_SEND_ERROR: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    static FORCED_SEND_ERROR: parking_lot::Mutex<Option<anyhow::Error>> =
+        parking_lot::Mutex::new(None);
 
     pub(super) fn take_forced_send_error() -> Option<anyhow::Error> {
-        crate::sync::lock_poisoned(&FORCED_SEND_ERROR, "forced_send_error").take()
+        FORCED_SEND_ERROR.lock().take()
     }
 
     fn set_forced_send_error(err: anyhow::Error) {
-        *crate::sync::lock_poisoned(&FORCED_SEND_ERROR, "forced_send_error") = Some(err);
+        *FORCED_SEND_ERROR.lock() = Some(err);
     }
 
     #[test]
@@ -3199,7 +3197,8 @@ instances:
         // submit_keys entries must all be purged atomically. api::call and
         // fleet.yaml removal fail silently when there's no daemon/file — that
         // matches the production contract (we log and move on).
-        use std::sync::{Arc, Mutex};
+        use parking_lot::Mutex;
+        use std::sync::Arc;
         let home = tmp_home("cleanup-state");
         let mut topic_map = HashMap::new();
         topic_map.insert("agent1".to_string(), 42);
@@ -3217,7 +3216,7 @@ instances:
 
         cleanup_deleted_topic(&home, "agent1", 42, Some(&state));
 
-        let s = state.lock().expect("lock");
+        let s = state.lock();
         assert!(!s.topic_to_instance.contains_key(&42));
         assert!(!s.instance_to_topic.contains_key("agent1"));
         assert!(!s.submit_keys.contains_key("agent1"));
@@ -3296,9 +3295,9 @@ instances:
     /// Shared lock for tests that mutate `AGEND_HOME` / bot-token env
     /// and the `FORCED_SEND_ERROR` injector. Tests run in parallel by
     /// default; these env-touching tests must serialize.
-    fn channel_env_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        crate::sync::lock_poisoned(&GUARD, "channel_env_test_guard")
+    fn channel_env_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        GUARD.lock()
     }
 
     /// Round-2 reviewer finding on PR #57 (at-dev-4, blocking):

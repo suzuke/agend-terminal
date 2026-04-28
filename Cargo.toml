@@ -54,6 +54,7 @@ ratatui = "0.29"
 
 # Concurrency
 crossbeam = "0.8"
+parking_lot = "0.12"
 
 # Async (for Telegram + daemon UDS)
 tokio = { version = "1", features = ["rt", "net", "io-util", "fs", "macros", "time"] }

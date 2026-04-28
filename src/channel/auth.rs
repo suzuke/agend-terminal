@@ -175,17 +175,12 @@ pub fn evaluate_outbound_capability(
 /// daemon cycle but a single FATAL line per restart is enough — repeats
 /// would spam without adding info).
 pub fn warn_once_user_allowlist_unconfigured(channel_kind: &str, instance: &str) {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     static SEEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let key = format!("{channel_kind}:{instance}");
-    let first_time = match seen.lock() {
-        Ok(mut set) => set.insert(key),
-        // Poisoned lock — fall through to "log every time" rather than
-        // silently drop the visibility (mirrors the P0 helper's bias).
-        Err(_) => true,
-    };
+    let first_time = seen.lock().insert(key);
     if first_time {
         // Sprint 22 P1.5 (Candidate 4 from PR #229 P1 dispatch): the
         // existing `tracing::debug!` was invisible at default

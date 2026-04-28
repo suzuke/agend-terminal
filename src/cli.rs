@@ -33,7 +33,7 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     let name = format!("capture-{}", b.name());
     tracing::info!(backend = b.name(), command = preset.command, %seconds, "capture: spawning");
 
-    let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     agent::spawn_agent(
         &agent::SpawnConfig {
             name: &name,
@@ -56,12 +56,10 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     std::thread::sleep(std::time::Duration::from_secs(seconds));
 
     let stripped = {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         match reg.get(&name) {
             Some(handle) => {
-                let raw = crate::sync::lock_poisoned(&handle.core, "cli_core")
-                    .vterm
-                    .dump_screen();
+                let raw = handle.core.lock().vterm.dump_screen();
                 agent::strip_ansi_pub(&String::from_utf8_lossy(&raw))
             }
             None => {
@@ -72,9 +70,9 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
     };
 
     {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         if let Some(h) = reg.get(&name) {
-            let _ = crate::sync::lock_poisoned(&h.child, "cli_child").kill();
+            let _ = h.child.lock().kill();
         }
     }
 
@@ -112,7 +110,7 @@ pub fn run_tests(subcmd: &str, home: &Path) -> anyhow::Result<()> {
 #[allow(clippy::unwrap_used)]
 fn test_attach(_home: &Path) -> anyhow::Result<()> {
     tracing::info!("test:attach — spawning bash");
-    let registry = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     let args: Vec<String> = vec![];
 
     agent::spawn_agent(
@@ -137,7 +135,7 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
 
     tracing::info!("test:attach — injecting test command");
     {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         let handle = reg.get("test-attach").unwrap();
         agent::write_to_agent(handle, b"echo AGEND_TEST_OK\r")?;
     }
@@ -145,9 +143,9 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let output = {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         let handle = reg.get("test-attach").unwrap();
-        let core = crate::sync::lock_poisoned(&handle.core, "cli_core");
+        let core = handle.core.lock();
         let dump = core.vterm.dump_screen();
         String::from_utf8_lossy(&dump).to_string()
     };
@@ -160,9 +158,9 @@ fn test_attach(_home: &Path) -> anyhow::Result<()> {
     }
 
     {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         let handle = reg.get("test-attach").unwrap();
-        let mut child = crate::sync::lock_poisoned(&handle.child, "cli_child");
+        let mut child = handle.child.lock();
         let _ = child.kill();
     }
 
@@ -324,9 +322,10 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
 }
 
 pub fn run_demo() -> anyhow::Result<()> {
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     let registry: agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -377,7 +376,7 @@ pub fn run_demo() -> anyhow::Result<()> {
     for (i, (from, to, msg)) in conversation.iter().enumerate() {
         // Inject message into recipient's PTY (echo so it appears in VTerm)
         {
-            let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+            let reg = registry.lock();
             if let Some(handle) = reg.get(*to) {
                 let _ = agent::write_to_agent(handle, format!("echo '{msg}'\r").as_bytes());
             }
@@ -411,22 +410,18 @@ pub fn run_demo() -> anyhow::Result<()> {
     println!("  AgEnD Terminal — Crash Recovery Demo\n");
     println!("  Killing bob...");
     {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         if let Some(bob) = reg.get("bob") {
-            let mut child = crate::sync::lock_poisoned(&bob.child, "cli_child");
+            let mut child = bob.child.lock();
             let _ = child.kill();
         }
     }
     std::thread::sleep(Duration::from_millis(500));
 
     {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         if let Some(bob) = reg.get("bob") {
-            let state = bob
-                .core
-                .lock()
-                .map(|c| c.state.current.display_name().to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
+            let state = bob.core.lock().state.current.display_name().to_string();
             println!("  Bob's state: {state}");
         }
     }
@@ -440,7 +435,7 @@ pub fn run_demo() -> anyhow::Result<()> {
     println!();
 
     {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         if reg.get("bob").is_some() {
             println!("  ✓ Bob respawned automatically!\n");
         }
@@ -451,9 +446,9 @@ pub fn run_demo() -> anyhow::Result<()> {
     // Cleanup
     println!("\n  Cleaning up...");
     {
-        let reg = crate::sync::lock_poisoned(&registry, "cli_registry");
+        let reg = registry.lock();
         for (_, handle) in reg.iter() {
-            let mut child = crate::sync::lock_poisoned(&handle.child, "cli_child");
+            let mut child = handle.child.lock();
             let _ = child.kill();
         }
     }
@@ -471,7 +466,7 @@ pub fn run_demo() -> anyhow::Result<()> {
 }
 
 fn draw_split_screen(registry: &agent::AgentRegistry) {
-    let reg = crate::sync::lock_poisoned(registry, "cli_registry");
+    let reg = registry.lock();
 
     let alice_lines = get_screen_lines(&reg, "alice");
     let bob_lines = get_screen_lines(&reg, "bob");
@@ -496,11 +491,12 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 }
 
 fn get_screen_lines(
-    reg: &std::sync::MutexGuard<'_, std::collections::HashMap<String, agent::AgentHandle>>,
+    reg: &parking_lot::MutexGuard<'_, std::collections::HashMap<String, agent::AgentHandle>>,
     name: &str,
 ) -> Vec<String> {
     if let Some(handle) = reg.get(name) {
-        if let Ok(core) = handle.core.lock() {
+        {
+            let core = handle.core.lock();
             let dump = core.vterm.dump_screen();
             let output = String::from_utf8_lossy(&dump);
             let stripped = agent::strip_ansi_pub(&output);

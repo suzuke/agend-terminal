@@ -26,10 +26,11 @@ use overlay::{CloseTarget, Overlay, OverlayCtx};
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
+use parking_lot::Mutex;
 use ratatui::DefaultTerminal;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Run the terminal application.
 pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
@@ -50,7 +51,7 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     if let Some(file) = log_file {
         let _ = tracing_subscriber::fmt()
             .with_env_filter("agend_terminal=debug")
-            .with_writer(Mutex::new(file))
+            .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
             .with_target(false)
             .try_init();
@@ -529,7 +530,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 {
                     let reg = crate::agent::lock_registry(&registry);
                     for (name, handle) in reg.iter() {
-                        if let Ok(mut core) = handle.core.lock() {
+                        {
+                            let mut core = handle.core.lock();
                             core.health.maybe_decay();
                             core.state.tick();
                             let agent_state = core.state.current;
@@ -892,9 +894,9 @@ fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
     // Bind to a local so the child-lock's temporary MutexGuard drops
     // before `reg` does — returning the match expression directly trips
     // the borrow checker because temporaries outlive the registry lock.
-    let alive = match handle.child.lock() {
-        Ok(mut child) => !matches!(child.try_wait(), Ok(Some(_))),
-        Err(_) => true,
+    let alive = {
+        let mut child = handle.child.lock();
+        !matches!(child.try_wait(), Ok(Some(_)))
     };
     alive
 }
@@ -982,7 +984,7 @@ mod tests {
         // call check_schedules, verify it fires (auto-disabled).
         let home = tmp_home("sched-fire");
         let registry: crate::agent::AgentRegistry =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let past = (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
         let store_json = serde_json::json!({
             "schema_version": 2,

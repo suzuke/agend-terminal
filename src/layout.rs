@@ -4,8 +4,9 @@ use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
 use crate::bridge_client::BridgeClient;
 use crate::vterm::VTerm;
+use parking_lot::Mutex;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// How a pane's input/resize is delivered to the underlying process.
@@ -104,7 +105,7 @@ impl Pane {
                 }
             }
             PaneSource::Remote(client) => {
-                let mut c = crate::sync::lock_poisoned(client, "bridge_client");
+                let mut c = client.lock();
                 let _ = c.send_input(bytes);
             }
         }
@@ -116,18 +117,17 @@ impl Pane {
             PaneSource::Local => {
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(&self.agent_name) {
-                    if let Ok(master) = handle.pty_master.lock() {
-                        let _ = master.resize(portable_pty::PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
-                    }
+                    let master = handle.pty_master.lock();
+                    let _ = master.resize(portable_pty::PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
                 }
             }
             PaneSource::Remote(client) => {
-                let mut c = crate::sync::lock_poisoned(client, "bridge_client");
+                let mut c = client.lock();
                 let _ = c.send_resize(cols, rows);
             }
         }

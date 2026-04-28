@@ -17,9 +17,10 @@ use crate::layout::{Layout, Pane, Tab};
 use crate::vterm::VTerm;
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Spawn an agent/shell via spawn_agent and add as a new tab.
 #[allow(clippy::too_many_arguments)]

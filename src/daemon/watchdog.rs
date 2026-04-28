@@ -149,11 +149,11 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn test_watchdog_env_true_returns_true() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         for val in ["1", "true", "TRUE", "True"] {
             std::env::set_var("AGEND_WATCHDOG_DRY_RUN", val);
             assert!(
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_watchdog_env_false_returns_false() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         for val in ["0", "false", "FALSE", "no", ""] {
             std::env::set_var("AGEND_WATCHDOG_DRY_RUN", val);
             assert!(
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_watchdog_env_unset_returns_false() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock();
         std::env::remove_var("AGEND_WATCHDOG_DRY_RUN");
         assert!(
             !super::watchdog_dry_run_from_env(),

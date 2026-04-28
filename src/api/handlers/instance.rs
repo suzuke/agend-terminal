@@ -15,11 +15,7 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
     let reg = agent::lock_registry(ctx.registry);
     match reg.get(name) {
         Some(handle) => {
-            let is_restarting = handle
-                .core
-                .lock()
-                .map(|c| c.state.current.is_unavailable())
-                .unwrap_or(false);
+            let is_restarting = handle.core.lock().state.current.is_unavailable();
             if is_restarting {
                 json!({"ok": false, "error": format!("agent '{name}' is restarting, retry later")})
             } else {
@@ -53,10 +49,11 @@ pub(crate) fn handle_kill(params: &Value, ctx: &HandlerCtx) -> Value {
     let reg = agent::lock_registry(ctx.registry);
     match reg.get(name) {
         Some(handle) => {
-            if let Ok(mut core) = handle.core.lock() {
+            {
+                let mut core = handle.core.lock();
                 core.state.set_restarting();
             }
-            let mut child = crate::sync::lock_poisoned(&handle.child, "api_child");
+            let mut child = handle.child.lock();
             // Kill the process group (not just the leader) to propagate to
             // child subprocesses (kiro-cli spawns bun/mcp/acp children).
             if let Some(pid) = child.process_id() {
@@ -305,13 +302,10 @@ pub(crate) fn handle_set_blocked_reason(params: &Value, ctx: &HandlerCtx) -> Val
     let reg = agent::lock_registry(ctx.registry);
     match reg.get(name) {
         Some(handle) => {
-            if let Ok(mut core) = handle.core.lock() {
-                let state = core.state.get_state().display_name().to_string();
-                core.health.set_blocked_reason(reason);
-                json!({"ok": true, "status": "reason_set", "reason": reason_str, "current_state": state})
-            } else {
-                json!({"ok": false, "error": "agent core lock failed"})
-            }
+            let mut core = handle.core.lock();
+            let state = core.state.get_state().display_name().to_string();
+            core.health.set_blocked_reason(reason);
+            json!({"ok": true, "status": "reason_set", "reason": reason_str, "current_state": state})
         }
         None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
     }
@@ -326,34 +320,31 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
     let reg = agent::lock_registry(ctx.registry);
     match reg.get(name) {
         Some(handle) => {
-            if let Ok(mut core) = handle.core.lock() {
-                let was = core
-                    .health
-                    .current_reason
-                    .as_ref()
-                    .map(|r| serde_json::to_value(r).unwrap_or_default());
-                // If a reason filter is specified, only clear if it matches
-                if let Some(filter) = filter_reason {
-                    let matches = core.health.current_reason.as_ref().is_some_and(|r| {
-                        let kind = match r {
-                            crate::health::BlockedReason::RateLimit { .. } => "rate_limit",
-                            crate::health::BlockedReason::QuotaExceeded => "quota_exceeded",
-                            crate::health::BlockedReason::AwaitingOperator => "awaiting_operator",
-                            crate::health::BlockedReason::PermissionPrompt => "permission_prompt",
-                            crate::health::BlockedReason::Hang => "hang",
-                            crate::health::BlockedReason::Crash => "crash",
-                        };
-                        kind == filter
-                    });
-                    if !matches {
-                        return json!({"ok": false, "error": "reason mismatch", "current": was});
-                    }
+            let mut core = handle.core.lock();
+            let was = core
+                .health
+                .current_reason
+                .as_ref()
+                .map(|r| serde_json::to_value(r).unwrap_or_default());
+            // If a reason filter is specified, only clear if it matches
+            if let Some(filter) = filter_reason {
+                let matches = core.health.current_reason.as_ref().is_some_and(|r| {
+                    let kind = match r {
+                        crate::health::BlockedReason::RateLimit { .. } => "rate_limit",
+                        crate::health::BlockedReason::QuotaExceeded => "quota_exceeded",
+                        crate::health::BlockedReason::AwaitingOperator => "awaiting_operator",
+                        crate::health::BlockedReason::PermissionPrompt => "permission_prompt",
+                        crate::health::BlockedReason::Hang => "hang",
+                        crate::health::BlockedReason::Crash => "crash",
+                    };
+                    kind == filter
+                });
+                if !matches {
+                    return json!({"ok": false, "error": "reason mismatch", "current": was});
                 }
-                core.health.clear_blocked_reason();
-                json!({"ok": true, "status": "cleared", "instance": name, "was": was})
-            } else {
-                json!({"ok": false, "error": "agent core lock failed"})
             }
+            core.health.clear_blocked_reason();
+            json!({"ok": true, "status": "cleared", "instance": name, "was": was})
         }
         None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
     }
@@ -376,10 +367,7 @@ pub(crate) fn handle_tool_kill(params: &Value, ctx: &HandlerCtx) -> Value {
             Some(h) => h,
             None => return json!({"ok": false, "error": format!("instance '{name}' not found")}),
         };
-        let master = match handle.pty_master.lock() {
-            Ok(m) => m,
-            Err(_) => return json!({"ok": false, "error": "PTY master lock failed"}),
-        };
+        let master = handle.pty_master.lock();
         let fd = match master.as_raw_fd() {
             Some(fd) => fd,
             None => return json!({"ok": false, "error": "PTY master has no raw fd"}),
@@ -403,9 +391,10 @@ pub(crate) fn handle_tool_kill(params: &Value, ctx: &HandlerCtx) -> Value {
 mod tests {
     use super::*;
     use crate::agent;
+    use parking_lot::Mutex;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn test_ctx_with_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
         let home = Box::new(std::env::temp_dir().join(format!(
@@ -454,7 +443,7 @@ mod tests {
     fn cleanup_agent(ctx: &HandlerCtx, name: &str) {
         let reg = agent::lock_registry(ctx.registry);
         if let Some(h) = reg.get(name) {
-            let _ = crate::sync::lock_poisoned(&h.child, "test_child").kill();
+            let _ = h.child.lock().kill();
         }
     }
 
@@ -474,7 +463,7 @@ mod tests {
         // Verify the reason is actually set on the HealthTracker
         let reg = agent::lock_registry(ctx.registry);
         let handle = reg.get("health-set").expect("agent exists");
-        let core = handle.core.lock().expect("lock");
+        let core = handle.core.lock();
         assert!(core.health.current_reason.is_some());
         match &core.health.current_reason {
             Some(crate::health::BlockedReason::RateLimit { retry_after_secs }) => {
@@ -511,7 +500,7 @@ mod tests {
         // Verify it's actually cleared
         let reg = agent::lock_registry(ctx.registry);
         let handle = reg.get("health-clear").expect("agent exists");
-        let core = handle.core.lock().expect("lock");
+        let core = handle.core.lock();
         assert!(core.health.current_reason.is_none());
         drop(core);
         drop(reg);
