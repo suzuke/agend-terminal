@@ -249,12 +249,16 @@ pub fn serve(
     for stream in listener.incoming().flatten() {
         let _ = stream.set_nodelay(true);
         // Slow-client hardening: set read/write deadlines so a stalled peer
-        // cannot pin a session thread indefinitely. 30s is generous for a
-        // JSON request line; control-plane calls are never slow on purpose.
-        // Sprint 25 P1 F1: slow-loris defense is layered — 30s TCP read
-        // timeout catches partial-JSON attacks; per-tool timeout in
-        // mcp_proxy::handle_mcp_tool caps tool execution independently.
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        // cannot pin a session thread indefinitely. Default 5s is tight
+        // enough to drop drip-feed attacks (1 byte/sec partial JSON) within
+        // 5-6s while still allowing normal JSON request lines.
+        // Override via AGEND_API_READ_TIMEOUT_SECS for large-args payloads.
+        // Sprint 25 P3: tightened from 30s → 5s per slow-loris defense.
+        let read_timeout_secs: u64 = std::env::var("AGEND_API_READ_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(read_timeout_secs)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         let reg = Arc::clone(&registry);
         let home = home.to_path_buf();
@@ -1766,5 +1770,180 @@ mod tests {
             .map(|b| b.preset().submit_key)
             .unwrap_or("\r");
         assert_eq!(unknown, "\r");
+    }
+
+    // Sprint 25 P3 — real api::serve timeout behavioral tests.
+    // §3.5.10 wire-format: real TCP against production serve() code path.
+
+    use std::sync::atomic::Ordering;
+
+    /// Shared env-var guard for tests that set AGEND_API_READ_TIMEOUT_SECS.
+    fn timeout_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        crate::sync::lock_poisoned(&GUARD, "timeout_test_guard")
+    }
+
+    /// Spawn api::serve in-process with empty registries. Returns (port, cookie, shutdown, home_dir).
+    fn spawn_real_api_server(
+        env_timeout: Option<u64>,
+    ) -> (
+        u16,
+        crate::auth_cookie::Cookie,
+        Arc<AtomicBool>,
+        std::path::PathBuf,
+    ) {
+        let home = std::env::temp_dir().join(format!(
+            "agend-api-timeout-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&home).expect("create home");
+        // api::serve needs run_dir for port file + cookie
+        let run_dir = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&run_dir).expect("create run_dir");
+        let cookie = crate::auth_cookie::issue(&run_dir).expect("issue cookie");
+
+        if let Some(secs) = env_timeout {
+            std::env::set_var("AGEND_API_READ_TIMEOUT_SECS", secs.to_string());
+        } else {
+            std::env::remove_var("AGEND_API_READ_TIMEOUT_SECS");
+        }
+
+        let registry: AgentRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let configs: ConfigRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let externals: crate::agent::ExternalRegistry =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let home_clone = home.clone();
+
+        // fire-and-forget: test fixture server — shutdown flag terminates
+        std::thread::Builder::new()
+            .name("test_api_serve".into())
+            .spawn(move || {
+                serve(
+                    &home_clone,
+                    registry,
+                    shutdown_clone,
+                    configs,
+                    externals,
+                    None,
+                );
+            })
+            .expect("spawn api server");
+
+        // Poll for port file
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let port = loop {
+            if std::time::Instant::now() > deadline {
+                panic!("api server did not publish port within 5s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Ok(s) = std::fs::read_to_string(run_dir.join("api.port")) {
+                if let Ok(p) = s.trim().parse::<u16>() {
+                    break p;
+                }
+            }
+        };
+
+        (port, cookie, shutdown, home)
+    }
+
+    fn auth_connect(port: u16, cookie: &crate::auth_cookie::Cookie) -> std::net::TcpStream {
+        let stream = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+        let _ = stream.set_nodelay(true);
+        let mut w = stream.try_clone().expect("clone");
+        let hex: String = cookie.iter().map(|b| format!("{b:02x}")).collect();
+        writeln!(w, r#"{{"auth":"{hex}"}}"#).expect("write auth");
+        w.flush().expect("flush");
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+        let mut resp = String::new();
+        reader.read_line(&mut resp).expect("read auth resp");
+        stream
+    }
+
+    #[test]
+    fn real_serve_drip_feed_dropped_within_timeout() {
+        let _g = timeout_test_guard();
+        let (port, cookie, shutdown, home) = spawn_real_api_server(None); // default 5s
+
+        let stream = auth_connect(port, &cookie);
+        let mut w = stream.try_clone().expect("clone");
+        // Send partial JSON then go silent
+        w.write_all(b"{\"method\":\"lis").expect("write partial");
+        w.flush().expect("flush");
+
+        let start = std::time::Instant::now();
+        let mut reader = std::io::BufReader::new(stream);
+        let mut buf = String::new();
+        let _ = reader.read_line(&mut buf);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "real api::serve must drop stalled connection within ~5s, took {:.1}s",
+            elapsed.as_secs_f64()
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn real_serve_large_args_succeeds() {
+        let _g = timeout_test_guard();
+        let (port, cookie, shutdown, home) = spawn_real_api_server(None);
+
+        let stream = auth_connect(port, &cookie);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let mut w = stream.try_clone().expect("clone");
+
+        let padding = "x".repeat(100_000);
+        let req = format!("{{\"method\":\"list\",\"params\":{{\"data\":\"{padding}\"}}}}\n");
+        w.write_all(req.as_bytes()).expect("write");
+        w.flush().expect("flush");
+
+        let mut reader = std::io::BufReader::new(stream);
+        let mut resp = String::new();
+        let bytes = reader.read_line(&mut resp).unwrap_or(0);
+
+        assert!(bytes > 0, "real api::serve must respond to 100KB request");
+
+        shutdown.store(true, Ordering::Relaxed);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn real_serve_env_override_extends_timeout() {
+        let _g = timeout_test_guard();
+        let (port, cookie, shutdown, home) = spawn_real_api_server(Some(10)); // 10s override
+
+        let stream = auth_connect(port, &cookie);
+        let mut w = stream.try_clone().expect("clone");
+
+        // Partial JSON, wait 6s, then complete — within 10s override
+        w.write_all(b"{\"method\"").expect("write partial");
+        w.flush().expect("flush");
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        w.write_all(b":\"list\",\"params\":{}}\n")
+            .expect("complete");
+        w.flush().expect("flush");
+
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut reader = std::io::BufReader::new(stream);
+        let mut resp = String::new();
+        let bytes = reader.read_line(&mut resp).unwrap_or(0);
+
+        assert!(
+            bytes > 0,
+            "with 10s override, 6s pause must NOT trigger timeout"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        std::env::remove_var("AGEND_API_READ_TIMEOUT_SECS");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
