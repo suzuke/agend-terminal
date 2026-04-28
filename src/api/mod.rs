@@ -336,6 +336,23 @@ fn handle_session(
         }
     }
 
+    // Post-auth: lengthen the read deadline. The 5s default set in `serve`
+    // is the slow-loris defense for the *pre-auth* handshake — once the peer
+    // has presented a valid cookie they're trusted, and intermittent MCP
+    // tool calls over a long-lived bridge connection can easily idle past
+    // 5s between requests. Hitting the timeout here breaks the loop and
+    // closes the socket; the bridge's next write then sees broken pipe and
+    // every caller of an MCP tool ends up retrying. The PID watcher above
+    // is the real liveness check now, so we can safely extend this.
+    let post_auth_timeout: u64 = std::env::var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let _ = reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(post_auth_timeout)));
+    let _ = writer.set_read_timeout(Some(std::time::Duration::from_secs(post_auth_timeout)));
+
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
