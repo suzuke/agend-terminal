@@ -9,18 +9,14 @@ pub const TAG_DATA: u8 = 0;
 pub const TAG_RESIZE: u8 = 1;
 /// Protocol version for TUI socket handshake.
 pub const PROTOCOL_VERSION: u8 = 1;
-/// Maximum frame size. Override via AGEND_FRAME_LIMIT env var (bytes).
+/// Maximum frame size — 1MB hardcoded. Sufficient for MCP responses;
+/// not configurable since it is not a security defense. Sprint 29 audit
+/// #9 removed the AGEND_FRAME_LIMIT env override (single-user dev tool;
+/// recompile faster than maintaining the config surface).
 pub const DEFAULT_FRAME_LIMIT: usize = 1_000_000;
 
-fn frame_limit() -> usize {
-    std::env::var("AGEND_FRAME_LIMIT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_FRAME_LIMIT)
-}
-
 pub fn write_frame(w: &mut impl Write, data: &[u8]) -> std::io::Result<()> {
-    if data.len() > frame_limit() {
+    if data.len() > DEFAULT_FRAME_LIMIT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too large",
@@ -45,7 +41,7 @@ pub fn read_tagged_frame(r: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > frame_limit() {
+    if len > DEFAULT_FRAME_LIMIT {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "frame too large",
