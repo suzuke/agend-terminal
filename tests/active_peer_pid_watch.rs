@@ -69,7 +69,6 @@ fn spawn_pid_watcher(
 #[test]
 fn pid_watcher_detects_peer_death_within_5s() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    #[allow(unused_variables)]
     let port = listener.local_addr().unwrap().port();
 
     // Spawn a real child process that connects, sends auth, then exits
@@ -86,8 +85,14 @@ fn pid_watcher_detects_peer_death_within_5s() {
         .expect("spawn peer");
 
     #[cfg(not(unix))]
-    let mut peer = std::process::Command::new("cmd")
-        .args(["/C", "echo ok | more > nul & timeout /t 1 /nobreak > nul"])
+    let mut peer = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                r#"$c=New-Object System.Net.Sockets.TcpClient('127.0.0.1',{port});$s=$c.GetStream();$b=[System.Text.Encoding]::ASCII.GetBytes('{{"auth":"ok"}}'+"`n");$s.Write($b,0,$b.Length);$s.Flush();Start-Sleep -Seconds 1;$c.Close()"#
+            ),
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
