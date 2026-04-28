@@ -103,88 +103,24 @@ pub trait ApiNotifier: Send + Sync {
     fn notify(&self, event: ApiEvent);
 }
 
-/// Validate a caller-supplied `working_directory` against the AGEND_HOME and
-/// (optionally) `AGEND_ALLOWED_WORK_ROOTS` — a platform-native path list
-/// (`:`-separated on Unix, `;`-separated on Windows, same rules as `PATH`).
-///
-/// Rules:
-/// - Path must not contain `..` components (blocks relative escape regardless
-///   of whether the target exists).
-/// - After canonicalising the deepest existing ancestor, the resolved path
-///   must start with one of the allowed roots. This catches symlink escape
-///   inside an otherwise-legal prefix.
-///
-/// Returns the resolved `PathBuf` on success. The caller is responsible for
-/// creating the directory.
+/// Validate a caller-supplied `working_directory` — rejects paths containing
+/// `..` components. Sprint 29: canonicalize + allowed-roots removed per
+/// over-engineering audit (daemon runs as user, full filesystem access).
 pub fn validate_working_directory(
     path: &std::path::Path,
-    home: &std::path::Path,
+    _home: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
-    use std::path::{Component, PathBuf};
+    use std::path::Component;
+    // Sprint 29: simplified to bare `..` rejection per over-engineering audit
+    // (audit #4). Daemon runs as user — full filesystem access already.
+    // Canonicalize + ancestor walk + allowed roots removed.
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         anyhow::bail!("working_directory must not contain '..'");
     }
-    // Walk up to the deepest existing ancestor for canonicalisation. A path
-    // pointing into a not-yet-created subdirectory is legal as long as its
-    // existing prefix is inside an allowed root.
-    let mut existing = path.to_path_buf();
-    while !existing.as_os_str().is_empty() && !existing.exists() {
-        if !existing.pop() {
-            break;
-        }
-    }
-    let anchor = if existing.as_os_str().is_empty() {
-        PathBuf::from("/")
-    } else {
-        std::fs::canonicalize(&existing).unwrap_or(existing.clone())
-    };
-    let tail = path.strip_prefix(&existing).unwrap_or(path);
-    let resolved = anchor.join(tail);
-
-    let mut roots: Vec<PathBuf> = Vec::new();
-    roots.push(std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
-    if let Some(extra) = std::env::var_os("AGEND_ALLOWED_WORK_ROOTS") {
-        // `split_paths` uses the OS-native separator — `:` on Unix, `;` on
-        // Windows. Raw `split(':')` broke Windows because `C:\...` paths
-        // already contain a colon after the drive letter.
-        for pb in std::env::split_paths(&extra).filter(|p| !p.as_os_str().is_empty()) {
-            roots.push(std::fs::canonicalize(&pb).unwrap_or(pb));
-        }
-    }
-    for root in &roots {
-        if resolved.starts_with(root) {
-            return Ok(strip_verbatim_prefix(resolved));
-        }
-    }
-    anyhow::bail!(
-        "working_directory '{}' escapes allowed roots (set AGEND_ALLOWED_WORK_ROOTS to widen)",
-        resolved.display()
-    )
+    Ok(path.to_path_buf())
 }
 
-/// On Windows, `std::fs::canonicalize` returns `\\?\C:\...` (the Win32
-/// extended-length path form). PTY spawn hands this straight to `cmd.exe` as
-/// its cwd, and cmd bails with "UNC paths are not supported" before ever
-/// running — codex surfaces this as "default directory is Windows".
-/// Strip the verbatim prefix when it names a plain drive so the returned path
-/// is what cmd expects. UNC shares (`\\?\UNC\server\share`) are left alone —
-/// cmd can't cd into those regardless, and a caller that needs UNC semantics
-/// should see the failure explicitly rather than get a subtly-rewritten path.
-///
-/// No-op on Unix.
-fn strip_verbatim_prefix(path: std::path::PathBuf) -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        let s = path.to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            // `\\?\C:\...` → `C:\...`, but leave `\\?\UNC\...` alone.
-            if !rest.starts_with(r"UNC\") {
-                return std::path::PathBuf::from(rest.to_string());
-            }
-        }
-    }
-    path
-}
+// Sprint 29: strip_verbatim_prefix removed — canonicalize no longer called.
 
 /// API method name constants — single source of truth for the NDJSON protocol.
 pub mod method {
@@ -529,15 +465,6 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate `AGEND_ALLOWED_WORK_ROOTS` — env mutation
-    /// from parallel tests races otherwise.
-    fn env_guard() -> parking_lot::MutexGuard<'static, ()> {
-        use parking_lot::Mutex;
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock()
-    }
-
     fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -565,152 +492,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_work_dir_allows_under_home() {
-        let home = tmp_home("validate_home");
+    fn validate_work_dir_allows_normal_path() {
+        let home = tmp_home("validate_normal");
         let ok = home.join("workspace").join("agent");
-        let resolved =
-            validate_working_directory(&ok, &home).expect("path under home must validate");
-        // Returned path has any `\\?\` verbatim prefix stripped (see
-        // `strip_verbatim_prefix`), so compare against the stripped form
-        // of canonical home.
-        let home_simplified = strip_verbatim_prefix(std::fs::canonicalize(&home).unwrap());
-        assert!(
-            resolved.starts_with(&home_simplified),
-            "resolved {} should start with {}",
-            resolved.display(),
-            home_simplified.display()
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// Regression guard for the "cmd.exe: UNC paths are not supported" bug.
-    /// `std::fs::canonicalize` on Windows returns `\\?\C:\...` and handing
-    /// that to a PTY makes cmd.exe refuse to launch. `validate_working_directory`
-    /// must strip the verbatim prefix before returning so the resolved path
-    /// round-trips through a Command spawn.
-    #[test]
-    fn validate_work_dir_strips_verbatim_prefix_from_return() {
-        let home = tmp_home("validate_verbatim");
-        let ok = home.join("project");
-        let resolved = validate_working_directory(&ok, &home).expect("validate");
-        #[cfg(windows)]
-        {
-            let s = resolved.to_string_lossy();
-            assert!(
-                !s.starts_with(r"\\?\"),
-                "verbatim prefix must be stripped, got: {s}"
-            );
-        }
-        // On Unix strip_verbatim_prefix is a no-op — just sanity that the
-        // function still returns something that starts with home.
-        #[cfg(unix)]
-        {
-            let home_canon = std::fs::canonicalize(&home).unwrap();
-            assert!(resolved.starts_with(&home_canon));
-        }
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn strip_verbatim_prefix_handles_drive_and_leaves_unc() {
-        use std::path::PathBuf;
-        // `\\?\C:\...` → `C:\...`
-        assert_eq!(
-            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\alice")),
-            PathBuf::from(r"C:\Users\alice")
-        );
-        // `\\?\UNC\server\share` must be preserved — simplifying to
-        // `\\server\share` doesn't help cmd, and silently rewriting a share
-        // path would be surprising.
-        assert_eq!(
-            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\dir")),
-            PathBuf::from(r"\\?\UNC\server\share\dir")
-        );
-        // Regular drive path unaffected.
-        assert_eq!(
-            strip_verbatim_prefix(PathBuf::from(r"C:\plain\path")),
-            PathBuf::from(r"C:\plain\path")
-        );
-    }
-
-    #[test]
-    fn validate_work_dir_rejects_outside_home() {
-        let _g = env_guard();
-        let home = tmp_home("validate_outside");
-        // Pick a path that definitely exists and is not under home.
-        let outside = std::path::PathBuf::from("/tmp");
-        // Ensure AGEND_ALLOWED_WORK_ROOTS isn't accidentally opening this up.
-        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
-        std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS");
-        let err = validate_working_directory(&outside, &home).unwrap_err();
-        if let Some(v) = prev {
-            std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v);
-        }
-        assert!(
-            format!("{err}").contains("escapes"),
-            "expected escape rejection, got: {err}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn validate_work_dir_honors_allowed_roots_env() {
-        let _g = env_guard();
-        let home = tmp_home("validate_env_root");
-        let root = std::env::temp_dir().join(format!(
-            "agend-extra-root-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&root).expect("mkdir extra root");
-        let inside = root.join("agent");
-        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
-        std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", root.display().to_string());
-        let result = validate_working_directory(&inside, &home);
-        match prev {
-            Some(v) => std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v),
-            None => std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS"),
-        }
-        result.expect("path under AGEND_ALLOWED_WORK_ROOTS must validate");
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn validate_work_dir_rejects_symlink_escape() {
-        // Stage 4 P1-8 regression guard: a symlink inside an allowed root
-        // pointing OUT of all allowed roots must be rejected after canonicalisation.
-        let _g = env_guard();
-        let home = tmp_home("validate_symlink_escape");
-        // Create a symlink at `{home}/escape` → /tmp (outside any allowed root).
-        let target = std::path::PathBuf::from("/tmp");
-        let link = home.join("escape");
-        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
-
-        let prev = std::env::var("AGEND_ALLOWED_WORK_ROOTS").ok();
-        std::env::remove_var("AGEND_ALLOWED_WORK_ROOTS");
-        // Request a path *under* the symlink. After canonicalisation it should
-        // resolve outside `home` and be rejected.
-        let requested = link.join("agent");
-        let result = validate_working_directory(&requested, &home);
-        if let Some(v) = prev {
-            std::env::set_var("AGEND_ALLOWED_WORK_ROOTS", v);
-        }
-        match result {
-            Ok(resolved) => panic!(
-                "expected symlink escape rejection, but validated as {}",
-                resolved.display()
-            ),
-            Err(e) => assert!(
-                format!("{e}").contains("escapes"),
-                "expected escape rejection, got: {e}"
-            ),
-        }
+        let resolved = validate_working_directory(&ok, &home).expect("normal path must validate");
+        assert_eq!(resolved, ok);
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -1476,7 +1262,7 @@ mod tests {
         let resp = api_request(
             port,
             &home,
-            &json!({"method": "spawn", "params": {"name": "test-wd", "working_directory": "/etc/foo"}}),
+            &json!({"method": "spawn", "params": {"name": "test-wd", "working_directory": "/tmp/../etc/foo"}}),
         );
         assert_eq!(resp["ok"], false);
         assert!(resp["error"].as_str().is_some());
