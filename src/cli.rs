@@ -302,6 +302,16 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
         println!("    (none)");
     }
 
+    println!("\n  Thread census:");
+    let census = crate::thread_census::snapshot();
+    if census.is_empty() {
+        println!("    (no registered threads — daemon not running in this process)");
+    } else {
+        for (kind, count) in &census {
+            println!("    {kind}: {count}");
+        }
+    }
+
     println!("\n  Backend binaries:");
     for b in backend::Backend::all() {
         let (name, cmd) = (b.name(), b.preset().command);

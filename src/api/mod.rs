@@ -273,6 +273,7 @@ pub fn serve(
         std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
+                let _census = crate::thread_census::register("api_handler");
                 handle_session(
                     stream,
                     &reg,
@@ -440,12 +441,15 @@ fn spawn_peer_pid_watcher(pid: u32, stream: std::net::TcpStream) {
     // returns an error that we silently ignore.
     std::thread::Builder::new()
         .name(format!("pid_watch_{pid}"))
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            if !is_process_alive(pid) {
-                tracing::info!(peer_pid = pid, "peer process dead — closing API session");
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-                return;
+        .spawn(move || {
+            let _census = crate::thread_census::register("pid_watcher");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                if !is_process_alive(pid) {
+                    tracing::info!(peer_pid = pid, "peer process dead — closing API session");
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
             }
         })
         .ok();

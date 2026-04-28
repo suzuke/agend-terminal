@@ -45,6 +45,7 @@ mod sync;
 mod task_events;
 mod tasks;
 mod teams;
+mod thread_census;
 #[cfg(feature = "tray")]
 mod tray;
 mod tui;
