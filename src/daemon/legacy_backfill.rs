@@ -625,6 +625,7 @@ mod tests {
             created_at: "2026-04-26T00:00:00Z".into(),
             updated_at: "2026-04-26T00:00:00Z".into(),
             due_at: None,
+            branch: None,
         }
     }
 

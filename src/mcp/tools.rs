@@ -52,7 +52,8 @@ fn comm_tools() -> Vec<Value> {
                 "interrupt": {"type": "boolean", "description": "Deprecated: use 'force'. Override busy gate (requires reason)"},
                 "reason": {"type": "string", "description": "Deprecated: use 'force_reason'. Reason for interrupt"},
                 "second_reviewer": {"type": "boolean", "description": "Signal that this dispatch requests dual review (§3.5)"},
-                "second_reviewer_reason": {"type": "string", "description": "Reason for dual review (required when second_reviewer=true)"}
+                "second_reviewer_reason": {"type": "string", "description": "Reason for dual review (required when second_reviewer=true)"},
+                "branch": {"type": "string", "description": "Git branch the implementer should work on"}
             }, "required": ["target_instance", "task"]}}),
         json!({"name": "report_result", "description": "Report results back to the delegating instance.",
             "inputSchema": {"type": "object", "properties": {
@@ -174,7 +175,8 @@ fn task_tools() -> Vec<Value> {
                 "status": {"type": "string", "enum": ["open", "claimed", "in_progress", "blocked", "verified", "done", "cancelled"]},
                 "filter_assignee": {"type": "string"}, "filter_status": {"type": "string"},
                 "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
-                "duration": {"type": "string", "description": "Human duration until deadline (e.g. 30m, 1h, 2d)"}
+                "duration": {"type": "string", "description": "Human duration until deadline (e.g. 30m, 1h, 2d)"},
+                "branch": {"type": "string", "description": "Git branch the implementer should work on"}
             }, "required": ["action"]}}),
         json!({"name": "task_sweep_config",
         "description": "Configure GitHub-PR auto-close sweep daemon. Sweep polls merged PRs and emits Done events for `Closes t-XXX-N` markers (validated by 5-must-have pipeline).",

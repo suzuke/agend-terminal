@@ -2077,6 +2077,7 @@ mod tests {
             created_at: created_at.to_string(),
             updated_at: String::new(),
             due_at: None,
+            branch: None,
         }
     }
 
@@ -2181,6 +2182,7 @@ mod tests {
             created_by: "test".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
             due_at: None,
+            branch: None,
         }];
         terminal
             .draw(|frame| {
@@ -2247,6 +2249,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             due_at: None,
+            branch: None,
         }];
         let all_instances = vec![
             "dev-lead".to_string(),

@@ -202,6 +202,9 @@ pub enum TaskEvent {
         /// so replay reproduces team-routing visibility.
         #[serde(default)]
         routed_to: Option<InstanceName>,
+        /// **v2** — git branch the implementer should work on.
+        #[serde(default)]
+        branch: Option<String>,
     },
     Claimed {
         task_id: TaskId,
@@ -401,6 +404,7 @@ pub struct TaskRecord {
     pub depends_on: Vec<TaskId>,
     pub routed_to: Option<InstanceName>,
     pub result: Option<String>,
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -470,6 +474,7 @@ impl TaskBoardState {
                 due_at,
                 depends_on,
                 routed_to,
+                branch,
                 ..
             } => {
                 self.tasks
@@ -491,6 +496,7 @@ impl TaskBoardState {
                         depends_on: depends_on.clone(),
                         routed_to: routed_to.clone(),
                         result: None,
+                        branch: branch.clone(),
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -837,6 +843,7 @@ mod tests {
             due_at: None,
             depends_on: Vec::new(),
             routed_to: None,
+            branch: None,
         }
     }
 
@@ -1292,6 +1299,7 @@ mod tests {
                 due_at: None,
                 depends_on: Vec::new(),
                 routed_to: None,
+                branch: None,
             },
         )
         .unwrap();
@@ -1364,6 +1372,7 @@ mod tests {
                     due_at: None,
                     depends_on: Vec::new(),
                     routed_to: None,
+                    branch: None,
                 },
                 "Claimed" => TaskEvent::Claimed {
                     task_id: tid.clone(),
@@ -1554,6 +1563,7 @@ mod tests {
                 due_at: None,
                 depends_on: Vec::new(),
                 routed_to: None,
+                branch: None,
             },
         )
         .unwrap();
@@ -1629,6 +1639,7 @@ mod tests {
                     due_at: None,
                     depends_on: Vec::new(),
                     routed_to: None,
+                    branch: None,
                 },
             },
             // Sweep Linked appears BEFORE operator Claimed in file order
