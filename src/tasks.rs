@@ -22,6 +22,10 @@ pub struct Task {
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<String>,
+    /// Git branch the implementer should work on. Set by orchestrator at
+    /// dispatch; reviewer uses this to scope `checkout_repo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -173,6 +177,7 @@ fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         created_at: r.created_at.clone(),
         updated_at: r.updated_at.clone(),
         due_at: r.due_at.clone(),
+        branch: r.branch.clone(),
     }
 }
 
@@ -306,6 +311,7 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
                 .routed_to
                 .as_ref()
                 .map(|s| crate::task_events::InstanceName(s.clone())),
+            branch: t.branch.clone(),
         });
         // Emit the minimum status-transition events to bring the task to
         // its current legacy status. The replay-derived view post-PR3
@@ -522,6 +528,7 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 routed_to: routed_to
                     .as_ref()
                     .map(|s| crate::task_events::InstanceName(s.clone())),
+                branch: args["branch"].as_str().map(String::from),
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => serde_json::json!({"id": id, "status": "created"}),
@@ -828,6 +835,7 @@ mod tests {
             created_at: "2026-04-27T00:00:00Z".into(),
             updated_at: "2026-04-27T00:00:00Z".into(),
             due_at: None,
+            branch: None,
         }
     }
 
@@ -1380,6 +1388,7 @@ mod tests {
                 priority: "normal".into(),
                 owner: None,
                 due_at: None,
+                branch: None,
                 depends_on: vec![crate::task_events::TaskId("t-B".into())],
                 routed_to: None,
             },
@@ -1395,6 +1404,7 @@ mod tests {
                 priority: "normal".into(),
                 owner: None,
                 due_at: None,
+                branch: None,
                 depends_on: vec![crate::task_events::TaskId("t-A".into())],
                 routed_to: None,
             },
@@ -2100,6 +2110,7 @@ mod tests {
                     created_at: chrono::Utc::now().to_rfc3339(),
                     updated_at: chrono::Utc::now().to_rfc3339(),
                     due_at: None,
+                    branch: None,
                 });
             }
             Ok(())
@@ -2161,6 +2172,7 @@ mod tests {
                 created_at: chrono::Utc::now().to_rfc3339(),
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 due_at: None,
+                branch: None,
             });
             Ok(())
         })
@@ -2193,6 +2205,39 @@ mod tests {
         // event accumulated across the two migration runs).
         let state = crate::task_events::replay(&home).unwrap();
         assert_eq!(state.tasks.len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_task_create_with_branch() {
+        let home = tmp_home("branch");
+        let result = handle(
+            &home,
+            "dev-lead",
+            &serde_json::json!({"action": "create", "title": "Fix bug", "branch": "sprint-28-fix"}),
+        );
+        assert!(
+            result.get("error").is_none(),
+            "create must succeed: {result}"
+        );
+        let tasks = list_all(&home);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].branch.as_deref(), Some("sprint-28-fix"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_task_create_without_branch_defaults_none() {
+        let home = tmp_home("no-branch");
+        let result = handle(
+            &home,
+            "dev-lead",
+            &serde_json::json!({"action": "create", "title": "Fix bug"}),
+        );
+        assert!(result.get("error").is_none());
+        let tasks = list_all(&home);
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].branch.is_none());
         std::fs::remove_dir_all(&home).ok();
     }
 }

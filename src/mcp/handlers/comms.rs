@@ -200,6 +200,9 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     if let Some(ctx) = args["context"].as_str() {
         msg.push_str(&format!("\n\nContext: {ctx}"));
     }
+    if let Some(branch) = args["branch"].as_str() {
+        msg.push_str(&format!("\n\nBranch: {branch}"));
+    }
     let force_meta_json = if force {
         Some(json!({
             "forced": true,
