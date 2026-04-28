@@ -291,32 +291,6 @@ enum Commands {
         /// Shell type
         shell: clap_complete::Shell,
     },
-    /// Hot-upgrade the daemon to a new binary via the supervisor (Unix only).
-    ///
-    /// Flow: stage new binary → self-test → stop old daemon → start new →
-    /// wait for ready ping → stabilise for N seconds → commit (or rollback).
-    #[cfg(unix)]
-    Upgrade {
-        /// Path to the new daemon binary.
-        #[arg(long)]
-        binary: PathBuf,
-        /// Optional human-visible version label for the new binary
-        /// (falls back to `--version` output of the new binary).
-        #[arg(long)]
-        to_version: Option<String>,
-        /// Skip interactive confirmation. Required with `--install-supervisor`.
-        #[arg(long)]
-        yes: bool,
-        /// Bootstrap the supervisor layout on first upgrade (idempotent).
-        #[arg(long)]
-        install_supervisor: bool,
-        /// Stability window after switchover, seconds. 0 disables.
-        #[arg(long, default_value_t = 60)]
-        stability_secs: u64,
-        /// Ready-ping timeout, seconds. 0 disables.
-        #[arg(long, default_value_t = 60)]
-        ready_timeout_secs: u64,
-    },
 }
 
 #[derive(Subcommand)]
@@ -343,27 +317,6 @@ enum AdminCommands {
 
 fn main() -> anyhow::Result<()> {
     load_dotenv();
-
-    // Self-test mode: the supervisor execs this binary with AGEND_SELF_TEST=1
-    // before promoting it. Bypass clap (no subcommand required) and exit
-    // with a clear status the supervisor can key on. Unix-only — see
-    // `src/lib.rs` for the gating rationale.
-    #[cfg(unix)]
-    {
-        if agend_terminal::supervisor::self_test::requested() {
-            let home = home_dir();
-            match agend_terminal::supervisor::self_test::run(&home) {
-                Ok(()) => {
-                    eprintln!("agend-terminal self-test: OK");
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    eprintln!("agend-terminal self-test: FAIL: {e:#}");
-                    std::process::exit(1);
-                }
-            }
-        }
-    }
 
     let cli = Cli::parse();
 
@@ -681,27 +634,6 @@ fn main() -> anyhow::Result<()> {
                 "agend-terminal",
                 &mut std::io::stdout(),
             );
-        }
-        #[cfg(unix)]
-        Some(Commands::Upgrade {
-            binary,
-            to_version,
-            yes,
-            install_supervisor,
-            stability_secs,
-            ready_timeout_secs,
-        }) => {
-            agend_terminal::supervisor::cli::run(
-                &home,
-                agend_terminal::supervisor::cli::UpgradeOptions {
-                    new_binary: binary,
-                    to_version,
-                    assume_yes: yes,
-                    install_supervisor,
-                    stability_secs,
-                    ready_timeout_secs,
-                },
-            )?;
         }
     }
 
