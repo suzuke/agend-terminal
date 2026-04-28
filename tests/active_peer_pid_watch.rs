@@ -27,9 +27,6 @@ fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(not(unix))]
 fn is_process_alive(pid: u32) -> bool {
-    use std::os::windows::io::AsRawHandle;
-    // OpenProcess with SYNCHRONIZE access; if it fails, process is gone.
-    // Simplified: use sysinfo crate which is already a dependency.
     use sysinfo::{Pid, System};
     let mut sys = System::new();
     sys.refresh_processes();
@@ -72,6 +69,7 @@ fn spawn_pid_watcher(
 #[test]
 fn pid_watcher_detects_peer_death_within_5s() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    #[allow(unused_variables)]
     let port = listener.local_addr().unwrap().port();
 
     // Spawn a real child process that connects, sends auth, then exits
@@ -89,10 +87,7 @@ fn pid_watcher_detects_peer_death_within_5s() {
 
     #[cfg(not(unix))]
     let mut peer = std::process::Command::new("cmd")
-        .args([
-            "/C",
-            &format!("echo ok | more > nul & timeout /t 1 /nobreak > nul"),
-        ])
+        .args(["/C", "echo ok | more > nul & timeout /t 1 /nobreak > nul"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
