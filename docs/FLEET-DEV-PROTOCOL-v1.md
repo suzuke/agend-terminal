@@ -4,6 +4,18 @@
 **Version history:** v1.0 (2026-04-22), v1.1 (2026-04-23), v1.2 (2026-04-26).
 **Informed by:** implementer feedback, reviewer feedback, operator observations, 4-perspective challenge round.
 
+## 0. Foundational KISS principle (Sprint 29 amendment, operator m-41 #9)
+
+Every PR, amendment, or sprint proposal must answer two questions in the description or commit message: **"What real problem does this solve?"** and **"Would deletion break anyone?"** Reviewers MUST flag any change that lacks a concrete problem or whose deletion would be invisible to operators / agents / production users.
+
+Violation = `KISS-VIOLATION — UNVERIFIED unless the PR provides a concrete failure mode that the change prevents`. The reviewer's verdict body must cite the protected failure mode.
+
+**Why this rule exists**: Sprint 29 over-engineering audit (`docs/audit-over-engineering-2026-04-28.md`) found 9 paranoid-defense items totaling ~5400 LOC accumulated across Sprint 21-28 — each individually justified at write-time, none defending against a real threat in the localhost-single-user model. The 4-perspective challenge round on item #1 (RBAC removal) found 0 of 9 attempted counter-examples held; PR #285 deleted 858 LOC. The pattern: code that nobody can articulate the threat for is dead weight, not defense.
+
+**How to apply**: when writing a PR, lead the description with the concrete failure mode; when reviewing, refuse to accept "defense in depth" or "future-proofing" as standalone justification. Either there's a real failure mode being prevented, or the change is over-engineering.
+
+**Cross-references**: operator m-41 #9 ("把 KISS 寫入到所有人的遵守規則裡"); Sprint 29 audit doc; PR #285 RBAC removal; §3.5.12 deferred-defense gate.
+
 ## 1. Shared task board as single source of truth
 
 **Use daemon `task` tool, NOT per-agent local TaskCreate.**
@@ -470,9 +482,21 @@ Without both, the reviewer must issue **UNVERIFIED** on the deferral. The implem
 - **EMERGENCY hotfix** PRs (per §3.5.11 emergency exemption) may defer root-cause fixes with a 24-hour backfill SLA instead of the 2-sprint default, but the backfill item must still carry `due_at`.
 - **Cross-platform issues** where the root cause requires platform-specific investigation (e.g., Windows-only race) may extend `due_at` to 4 sprints with orchestrator approval.
 
+##### (d) Counter-example construction rule for over-engineering removal (Sprint 29 amendment, operator m-41 #8 + m-102)
+
+When a removal PR proposes deleting a defensive mechanism (RBAC layer, policy gate, paranoid validation, or any "defense in depth" code), the 4-perspective challenge round MUST include explicit attempts to construct counter-examples — concrete attacker-capability scenarios where the mechanism's removal would enable a real failure that the mechanism was preventing.
+
+**Rule**: if all 4 perspectives independently fail to construct any compelling counter-example, the absence of counter-examples is itself the §3.5.12 deferred-defense gate satisfaction. "找不到 counter-example = 證 X 真可砍" (operator m-41 #8 wording).
+
+**Reviewer attestation on removal PRs**: `counter-example construction attempted: <N> scenarios tried; <M> compelling cases found; verdict <GO/NO-GO>`. If M > 0, the removal must explicitly address the failure mode identified.
+
+**Canonical example**: PR #285 RBAC removal (Sprint 29). 4-perspective challenge round attempted 9 scenarios (prompt-injected agent floods telegram, less-trusted agent added to fleet, defense-in-depth-if-cookie-leaks, operator hardening, compliance audit logging, multi-user shared machine, untrusted CI environment, misconfiguration prevention, fine-grained per-agent permissions). 8 failed outright via attacker-capability reasoning (attacker pivots to non-RBAC-gated channels — `send_to_instance`, subprocess spawn, file I/O, process exit); 1 weakest case (#9 reviewer-only-reply convention enforcement) had lighter alternatives via instruction-prompt + PR review. 0 compelling counter-examples → §3.5.12 gate satisfied → 858 LOC deletion VERIFIED.
+
+**Cross-reference precedent**: §3.5.11 #6 pure-deletion exemption (PR #265 r2, PR #267 r3 d8ce15a, PR #285 RBAC removal canonical) — the deletion exemption mechanically allows a single-commit removal; this rule (d) substantively gates whether the removal SHOULD happen via counter-example failure analysis.
+
 ##### Self-amendment qualification
 
-This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. Cross-references the real incident chain (PR #194 → #225 → vterm L167 recurrence) as the motivating evidence.
+This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. Cross-references the real incident chain (PR #194 → #225 → vterm L167 recurrence) as the motivating evidence; rule (d) extends with Sprint 29 RBAC removal canonical (PR #285).
 
 #### 3.5.13 Verdict externalization — fleet-internal verdict MUST mirror to GH PR
 
@@ -639,6 +663,18 @@ Skipping cleanup accumulates branch + worktree sprawl. Canonical incident: 2026-
 
 Enforcement: a Sprint-end review that finds N+ stale merged-PR branches or worktrees flags `branch-sprawl regression — UNVERIFIED until cleaned`. Cross-reference: §3.6.3 (self-merge gate) — the cleanup pair is a post-condition of self-merge, not an independent task.
 
+#### 3.6.10 Orchestrator owns watch_ci for own-orchestrated PR branches (Sprint 29 amendment, operator m-91)
+
+`watch_ci` notification is injected into the **caller's** inbox. The orchestrator (typically `dev-lead`) MUST own `watch_ci` calls for every PR branch they orchestrated. `general` and the operator MUST NOT call `watch_ci` on dev-orchestrated branches except during emergency takeover (per operator m-181 protocol).
+
+For cross-team branches, the orchestrator of that team owns the call.
+
+**Why**: when `general` or the operator manually invokes `watch_ci`, the green/red notification arrives in the caller's inbox — `general` then has to relay it to the orchestrator, adding hops, latency, and operator confusion. Routing the call to the right owner from the start eliminates the relay path.
+
+**Reviewer attestation on dev-lead-orchestration PRs**: `watch_ci-ownership verified: dev-lead invoked watch_ci at <PR>; no operator/general manual call`.
+
+Cross-references: operator m-91 directive; §3.6.7 ScheduleWakeup auto-poll (paired discipline — both are dev-lead orchestration tools); §3.6.3 self-merge gate (watch_ci notification feeds the gate).
+
 ## 4. Communication rules
 
 ### Hop reduction
@@ -718,6 +754,33 @@ Level **(a) task state changes** (per at-dev-2/at-dev-4 consensus):
 
 - "進度？" → orchestrator runs `task list` + `list_decisions --tags current-track` and summarizes.
 - Active task count + blocked count + done count gives instant pulse.
+
+### 6.1 Instance lifecycle event broadcast (Sprint 29 amendment, operator m-41 #10)
+
+When the daemon detects an instance creation OR spawn that did NOT originate from the loaded `fleet.yaml` — manual `create_instance` MCP call, template deployment, scheduled-routine instantiation — it MUST broadcast an `instance-created` `<fleet-update>` event to:
+
+1. The chat-proxy instance (`general`)
+2. The team orchestrator (typically `dev-lead`) for the new instance's team
+
+The broadcast payload MUST include an `origin` field disambiguating the creation path:
+
+| `origin` value | Meaning |
+|---|---|
+| `manual` | Operator invoked `create_instance` MCP tool directly |
+| `fleet.yaml` | Instance defined in fleet.yaml at daemon bootstrap |
+| `template` | Instance materialized from a `deploy_template` call |
+| `schedule` | Instance spawned by a `create_schedule` cron tick |
+
+**Why**: prior to this rule, instances appearing outside fleet.yaml (e.g., `kiro-cli-ae9898` materializing during Sprint 27) had no traceable origin. Operator + orchestrator had to guess whether the agent was operator-deliberate, a routine misfire, or an externally-injected leak. Including `origin` in the broadcast eliminates the guesswork.
+
+**Format example**:
+```json
+<fleet-update>
+{"kind": "instance-created", "name": "kiro-cli-ae9898", "team": "dev", "origin": "template", "created_at": "2026-04-29T03:21:14Z"}
+</fleet-update>
+```
+
+**Cross-references**: operator m-41 #10; §3.6.4 (GH PR view = ground truth — same anti-mystery principle applied to GH artifacts); §6 fleet update emission (extends the existing telegram emission contract to cover instance lifecycle events).
 
 ## 7. Waiting and timeout
 
