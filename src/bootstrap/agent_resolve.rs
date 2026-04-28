@@ -44,12 +44,34 @@ pub(crate) fn resolve_one(config: &FleetConfig, name: &str) -> Option<AgentDef> 
 
     // Auto-create git worktree when working_directory is inside a repo.
     // Redirects `resolved.working_directory` to the worktree path for the
-    // rest of the pipeline.
-    if let Some(ref base_dir) = resolved.working_directory {
+    // rest of the pipeline. Skipped when `worktree: false` (Sprint 28).
+    if resolved.worktree != Some(false) {
+        if let Some(ref base_dir) = resolved.working_directory {
+            if crate::worktree::is_git_repo(base_dir) {
+                let custom_branch = resolved.git_branch.as_deref();
+                if let Some(info) = crate::worktree::create(base_dir, name, custom_branch) {
+                    resolved.working_directory = Some(info.path);
+                }
+            }
+        }
+    } else if let Some(ref base_dir) = resolved.working_directory {
+        // worktree: false — auto-prune existing worktree if present.
+        // Pre-flight: reject if uncommitted changes exist (protect work).
         if crate::worktree::is_git_repo(base_dir) {
-            let custom_branch = resolved.git_branch.as_deref();
-            if let Some(info) = crate::worktree::create(base_dir, name, custom_branch) {
-                resolved.working_directory = Some(info.path);
+            let wt_dir = base_dir.join(".worktrees").join(name);
+            if wt_dir.exists() {
+                if crate::worktree::has_uncommitted_changes(&wt_dir) {
+                    tracing::error!(
+                        instance = name,
+                        worktree = %wt_dir.display(),
+                        "FATAL: worktree opt-out rejected — uncommitted changes in worktree. \
+                         Commit or stash changes before setting worktree: false. \
+                         Instance will NOT start."
+                    );
+                    return None; // Refuse instance start — operator must resolve
+                } else if let Err(e) = crate::worktree::remove_worktree(base_dir, name) {
+                    tracing::warn!(instance = name, error = %e, "auto-prune worktree failed");
+                }
             }
         }
     }

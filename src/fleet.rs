@@ -161,6 +161,12 @@ pub struct InstanceConfig {
     /// Custom git branch name for worktree. TS version uses "worktree_source".
     #[serde(alias = "worktree_source")]
     pub git_branch: Option<String>,
+    /// Per-instance worktree opt-out. `None` or `Some(true)` = auto-create
+    /// worktree (default, per §10.4). `Some(false)` = skip worktree creation,
+    /// instance works in main repo working tree. Use for orchestrators and
+    /// reviewers who never commit.
+    #[serde(default)]
+    pub worktree: Option<bool>,
     /// Model override (e.g., "opus", "sonnet"). Passed as --model flag.
     pub model: Option<String>,
     /// Display name for UI/Telegram.
@@ -386,6 +392,7 @@ impl FleetConfig {
             topic_id: inst.topic_id,
             git_branch: inst.git_branch.clone(),
             model,
+            worktree: inst.worktree,
         })
     }
 
@@ -411,6 +418,7 @@ pub struct ResolvedInstance {
     pub topic_id: Option<i32>,
     pub git_branch: Option<String>,
     pub model: Option<String>,
+    pub worktree: Option<bool>,
 }
 
 fn dirs_home() -> Option<PathBuf> {

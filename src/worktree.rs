@@ -212,7 +212,48 @@ pub fn prune(repo_dir: &Path) {
     }
 }
 
-/// List worktree directories under {repo}/.worktrees/.
+/// Check if a worktree directory has uncommitted changes.
+/// Returns true if `git status --porcelain` produces non-empty output.
+pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree_dir)
+        .output();
+    match output {
+        Ok(o) => !o.stdout.is_empty(),
+        Err(_) => true, // fail-closed: assume dirty if we can't check
+    }
+}
+
+/// Remove a worktree and its tracking branch. Returns Ok(()) on success,
+/// Err with message on failure. Pre-flight: caller must check
+/// `has_uncommitted_changes` first.
+pub fn remove_worktree(repo_dir: &Path, worktree_name: &str) -> Result<(), String> {
+    let wt_dir = repo_dir.join(".worktrees").join(worktree_name);
+    if !wt_dir.exists() {
+        return Ok(()); // already gone
+    }
+    // git worktree remove --force <path>
+    let output = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force"])
+        .arg(&wt_dir)
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("git worktree remove failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git worktree remove: {}", stderr.trim()));
+    }
+    // Delete tracking branch agend/<name>
+    let branch = format!("agend/{worktree_name}");
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &branch])
+        .current_dir(repo_dir)
+        .output();
+    tracing::info!(worktree = worktree_name, "auto-pruned worktree + branch");
+    Ok(())
+}
+
 pub fn list_residual(repo_dir: &Path) -> Vec<String> {
     let wt_base = repo_dir.join(".worktrees");
     if !wt_base.exists() {
