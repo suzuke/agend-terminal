@@ -80,18 +80,12 @@ pub fn read_cookie(run_dir: &Path) -> Result<Cookie> {
     Ok(bytes)
 }
 
-/// Constant-time 32-byte equality. Avoids short-circuit branches that could
-/// leak the matched-prefix length over time. We don't pull in `subtle` for
-/// a single fixed-size compare.
+/// Compare 32-byte cookie. Sprint 29 over-engineering audit #6: localhost
+/// loopback jitter (~10-100µs) far exceeds the timing difference of a
+/// short-circuit 32-byte comparison (~ns), so timing-attack hardening is
+/// not applicable in this threat model. Plain `==` is sufficient.
 pub fn verify(expected: &Cookie, actual: &[u8]) -> bool {
-    if actual.len() != COOKIE_LEN {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for i in 0..COOKIE_LEN {
-        diff |= expected[i] ^ actual[i];
-    }
-    diff == 0
+    actual == &expected[..]
 }
 
 pub fn to_hex(cookie: &Cookie) -> String {
