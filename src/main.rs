@@ -275,6 +275,8 @@ enum Commands {
     },
     /// Health check
     Doctor,
+    /// Show behavioral vs regex state divergence report
+    StateDivergenceReport,
     /// Menu-bar / system-tray resident app (requires `--features tray`).
     #[cfg(feature = "tray")]
     Tray,
@@ -644,6 +646,28 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Test { suite }) => cli::run_tests(&suite, &home)?,
         Some(Commands::Verify { json, backend }) => verify::run(&home, json, backend.as_deref())?,
         Some(Commands::Doctor) => cli::run_doctor(&home)?,
+        Some(Commands::StateDivergenceReport) => {
+            let report = behavioral::divergence_report();
+            if report.is_empty() {
+                println!("No divergence data collected yet. Run the daemon with agents to accumulate data.");
+            } else {
+                println!(
+                    "{:<15} {:>10} {:>10} {:>10} {:>8}",
+                    "Backend", "Total", "Agree", "Diverge", "Rate%"
+                );
+                println!("{}", "-".repeat(58));
+                for (backend, stats) in &report {
+                    println!(
+                        "{:<15} {:>10} {:>10} {:>10} {:>7.1}%",
+                        backend,
+                        stats.total_ticks,
+                        stats.agree,
+                        stats.diverge,
+                        stats.divergence_rate()
+                    );
+                }
+            }
+        }
         #[cfg(feature = "tray")]
         Some(Commands::Tray) => tray::run(&home)?,
         Some(Commands::Demo) => cli::run_demo()?,

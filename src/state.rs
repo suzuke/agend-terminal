@@ -725,6 +725,12 @@ impl StateTracker {
                 self.current.display_name(),
                 signal,
             );
+            // Sprint 27 PR-B: accumulate divergence stats for dashboard
+            crate::behavioral::record_divergence(
+                &self.backend_name,
+                signal,
+                self.current.display_name(),
+            );
         }
     }
 

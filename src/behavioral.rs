@@ -156,8 +156,83 @@ pub fn log_shadow_telemetry(
     }
 }
 
-#[cfg(test)]
+// ---------------------------------------------------------------------------
+// Divergence dashboard — accumulates behavioral vs regex state comparisons
+// ---------------------------------------------------------------------------
+
+/// Per-backend divergence counter for shadow-mode telemetry.
+#[derive(Debug, Default)]
+pub struct DivergenceStats {
+    pub total_ticks: u64,
+    pub agree: u64,
+    pub diverge: u64,
+}
+
+impl DivergenceStats {
+    /// Divergence rate as percentage (0.0–100.0).
+    /// Sprint 27 condition #1: ≤5% gate for behavioral promotion.
+    pub fn divergence_rate(&self) -> f64 {
+        if self.total_ticks == 0 {
+            0.0
+        } else {
+            self.diverge as f64 / self.total_ticks as f64 * 100.0
+        }
+    }
+}
+
+/// Global divergence accumulator — keyed by backend name.
+static DIVERGENCE: parking_lot::Mutex<Option<std::collections::HashMap<String, DivergenceStats>>> =
+    parking_lot::Mutex::new(None);
+
+/// Record a tick where behavioral and regex states are compared.
+pub fn record_divergence(backend: &str, behavioral: BehavioralSignal, regex_state: &str) {
+    let mut guard = DIVERGENCE.lock();
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let stats = map.entry(backend.to_string()).or_default();
+    stats.total_ticks += 1;
+    // Divergence: behavioral says thinking/idle but regex says something else
+    let behavioral_implies = match behavioral {
+        BehavioralSignal::SilenceThinking => "thinking",
+        BehavioralSignal::SilenceIdle => "idle",
+        BehavioralSignal::None => regex_state, // no signal = agree by default
+    };
+    if behavioral_implies == regex_state {
+        stats.agree += 1;
+    } else {
+        stats.diverge += 1;
+    }
+}
+
+/// Get divergence report for all backends.
+/// Reset divergence stats (test isolation).
+#[allow(dead_code)]
+pub fn reset_divergence() {
+    *DIVERGENCE.lock() = None;
+}
+
+pub fn divergence_report() -> Vec<(String, DivergenceStats)> {
+    let guard = DIVERGENCE.lock();
+    match guard.as_ref() {
+        Some(map) => map
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    DivergenceStats {
+                        total_ticks: v.total_ticks,
+                        agree: v.agree,
+                        diverge: v.diverge,
+                    },
+                )
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+#[allow(dead_code)]
 #[allow(clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -363,6 +438,39 @@ mod tests {
     fn e2e_opencode_thinking() {
         e2e_fixture_behavioral("opencode-thinking.raw", &Backend::OpenCode);
     }
+    // Sprint 27 PR-B: extend e2e to all 13 fixtures
+    #[test]
+    fn e2e_claude_tooluse() {
+        e2e_fixture_behavioral("claude-tooluse.raw", &Backend::ClaudeCode);
+    }
+    #[test]
+    fn e2e_claude_perm() {
+        e2e_fixture_behavioral("claude-perm.raw", &Backend::ClaudeCode);
+    }
+    #[test]
+    fn e2e_codex_tooluse() {
+        e2e_fixture_behavioral("codex-tooluse.raw", &Backend::Codex);
+    }
+    #[test]
+    fn e2e_codex_update() {
+        e2e_fixture_behavioral("codex-update.raw", &Backend::Codex);
+    }
+    #[test]
+    fn e2e_codex_perm() {
+        e2e_fixture_behavioral("codex-perm.raw", &Backend::Codex);
+    }
+    #[test]
+    fn e2e_gemini_tooluse() {
+        e2e_fixture_behavioral("gemini-tooluse.raw", &Backend::Gemini);
+    }
+    #[test]
+    fn e2e_kiro_tooluse() {
+        e2e_fixture_behavioral("kiro-tooluse.raw", &Backend::KiroCli);
+    }
+    #[test]
+    fn e2e_opencode_tooluse() {
+        e2e_fixture_behavioral("opencode-tooluse.raw", &Backend::OpenCode);
+    }
 
     #[test]
     fn fixture_replay_claude_tooluse() {
@@ -515,6 +623,45 @@ mod tests {
         assert!(
             tracker.has_behavioral_config(),
             "StateTracker must have behavioral_config for managed backends"
+        );
+    }
+
+    // --- Sprint 27 PR-B: divergence dashboard tests ---
+
+    #[test]
+    fn divergence_record_and_report() {
+        // Record some ticks
+        record_divergence(
+            "test-backend",
+            BehavioralSignal::SilenceThinking,
+            "thinking",
+        );
+        record_divergence("test-backend", BehavioralSignal::SilenceThinking, "idle"); // diverge
+        record_divergence("test-backend", BehavioralSignal::None, "ready"); // agree (None = no signal)
+
+        let report = divergence_report();
+        let entry = report.iter().find(|(k, _)| k == "test-backend");
+        assert!(entry.is_some(), "report must contain test-backend");
+        let (_, stats) = entry.unwrap();
+        assert!(stats.total_ticks >= 3, "must have at least 3 ticks");
+        assert!(stats.diverge >= 1, "must have at least 1 divergence");
+    }
+
+    #[test]
+    fn divergence_e2e_through_state_tracker() {
+        // Feed a fixture through StateTracker → divergence accumulator should record
+        let fixture = std::fs::read("tests/fixtures/state-replay/claude-thinking.raw").unwrap();
+        let mut tracker = crate::state::StateTracker::new(Some(&Backend::ClaudeCode));
+        tracker.set_instance_name("test-divergence");
+        tracker.feed(&String::from_utf8_lossy(&fixture));
+        std::thread::sleep(Duration::from_millis(2200));
+        tracker.feed("_");
+
+        let report = divergence_report();
+        let entry = report.iter().find(|(k, _)| k == "claude");
+        assert!(
+            entry.is_some(),
+            "divergence report must contain claude after feed"
         );
     }
 }
