@@ -1471,4 +1471,12 @@ defaults:
         assert_eq!(config.defaults.backend, Some(Backend::Shell));
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn worktree_opt_out_parsed() {
+        let yaml = "instances:\n  lead:\n    backend: claude\n    worktree: false\n  impl:\n    backend: claude\n";
+        let config: FleetConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.instances["lead"].worktree, Some(false));
+        assert_eq!(config.instances["impl"].worktree, None);
+    }
 }
