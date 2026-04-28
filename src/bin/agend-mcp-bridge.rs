@@ -123,25 +123,11 @@ fn proxy_tool_call(
     args: &serde_json::Value,
     conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    ensure_connection(home, conn)?;
-    let (ref mut r, ref mut w) = conn
-        .as_mut()
-        .expect("connection established by ensure_connection");
-
     let envelope = serde_json::json!({
         "method": "mcp_tool",
         "params": {"tool": tool, "arguments": args, "instance": instance}
     });
-    writeln!(w, "{envelope}")?;
-    w.flush()?;
-
-    let mut line = String::new();
-    if r.read_line(&mut line)? == 0 {
-        *conn = None;
-        return Err("daemon closed connection".into());
-    }
-
-    let resp: serde_json::Value = serde_json::from_str(line.trim())?;
+    let resp = proxy_request(home, conn, &envelope)?;
     if resp["ok"].as_bool() == Some(true) {
         Ok(resp["result"].clone())
     } else {
@@ -154,26 +140,85 @@ fn proxy_tools_list(
     home: &Path,
     conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    ensure_connection(home, conn)?;
-    let (ref mut r, ref mut w) = conn
-        .as_mut()
-        .expect("connection established by ensure_connection");
-
     let envelope = serde_json::json!({"method": "mcp_tools_list", "params": {}});
-    writeln!(w, "{envelope}")?;
-    w.flush()?;
-
-    let mut line = String::new();
-    if r.read_line(&mut line)? == 0 {
-        *conn = None;
-        return Err("daemon closed connection".into());
-    }
-    let resp: serde_json::Value = serde_json::from_str(line.trim())?;
+    let resp = proxy_request(home, conn, &envelope)?;
     if resp["ok"].as_bool() == Some(true) {
         Ok(resp["result"].clone())
     } else {
         Err("daemon error on tools_list".into())
     }
+}
+
+/// Send one request envelope to the daemon and return the parsed response.
+///
+/// The persistent connection in `conn` may be silently closed by the daemon
+/// after idle (post-auth read timeout) or by intervening network state. The
+/// first attempt's transport failure is therefore not surfaced — the
+/// connection is dropped, reopened, and the request retried exactly once.
+/// A second failure propagates so genuine errors are not masked.
+fn proxy_request(
+    home: &Path,
+    conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
+    envelope: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut last_err: Option<Box<dyn std::error::Error>> = None;
+    for attempt in 0..2 {
+        match try_proxy_once(home, conn, envelope) {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt == 0 && is_retriable_io(&*e) => {
+                *conn = None;
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "proxy retry exhausted".into()))
+}
+
+fn try_proxy_once(
+    home: &Path,
+    conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
+    envelope: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    ensure_connection(home, conn)?;
+    let (ref mut r, ref mut w) = conn
+        .as_mut()
+        .expect("connection established by ensure_connection");
+
+    writeln!(w, "{envelope}")?;
+    w.flush()?;
+
+    let mut line = String::new();
+    if r.read_line(&mut line)? == 0 {
+        return Err("daemon closed connection".into());
+    }
+
+    Ok(serde_json::from_str(line.trim())?)
+}
+
+/// Identify transport-level failures that justify a transparent reconnect.
+/// Classification goes through `io::ErrorKind` so it's portable across
+/// macOS / Linux / Windows error message wording. Application-level errors
+/// (bad JSON shape, daemon ok=false, our `"daemon closed connection"`
+/// sentinel for clean EOF) are also retriable since each represents a
+/// dropped peer; everything else propagates so a real bug isn't masked.
+fn is_retriable_io(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io_err) = err.downcast_ref::<io::Error>() {
+        use io::ErrorKind::*;
+        return matches!(
+            io_err.kind(),
+            BrokenPipe
+                | ConnectionReset
+                | ConnectionAborted
+                | NotConnected
+                | UnexpectedEof
+                | WouldBlock
+                | TimedOut
+        );
+    }
+    // Our own EOF sentinel from `try_proxy_once`.
+    err.to_string().contains("daemon closed connection")
 }
 
 fn ensure_connection(
