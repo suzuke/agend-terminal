@@ -415,6 +415,7 @@ cargo test <test-name>          # MUST observe pass
 - **Dependency bumps** with no source-tree changes beyond `Cargo.toml` / lockfile.
 - **EMERGENCY hotfix** — production-down / data-loss-risk / security-breach scenarios may fast-track without test-first IF (a) the PR title carries an `[EMERGENCY]` tag with rationale, AND (b) a backfill PR adding the regression test merges within 24 hours. The orchestrator (typically dev-lead) approves the emergency tag at dispatch time; the reviewer notes the deferral in the verdict.
 - **Pure deletion PRs** — implementation removal + corresponding test rename/assertion-flip in the same commit; no new behavior asserted. Qualifies when (a) test changes ARE the only test deliverable (rename existing tests to assert new behavior, not new failing assertions), AND (b) deletion is grep-verifiable at code-review time (reviewer can confirm the removed code path has 0 hits in production). Reviewer attestation: `pure deletion verified: <grep-command> → 0 hits in production code path`. Canonical example: PR #262 `a3cfa09` KILL Content-Length fallback — tests renamed to assert NDJSON-only skip behavior, impl deleted CL parse path, `grep -rn "Content-Length" src/bin/agend-mcp-bridge.rs` → 0 hits.
+- **Empirical-revert exemption** (Sprint 26 amendment) — when the test is **architecturally un-runnable at a separate RED commit** because the test depends on an impl-provided fixture, type, function, or env-var configuration that lives in the same PR's impl. A literal RED commit would either fail-to-compile or have nothing to assert against. Reviewer-enforceable substitute: **empirical revert at HEAD** — reviewer reverts the impl portion (typically `git revert <impl-sha> --no-commit` or a single-step checkout that removes the impl), observes the test fails or fails-to-compile, restores impl, observes test passes. Conditions: (a) PR description must explicitly declare the architectural impossibility (e.g., "test depends on impl-provided fixture; no separate RED state possible"), AND (b) the revert sequence must be documented step-by-step in the PR description so reviewer can reproduce, AND (c) impl removal must be reproducible in a single revert/checkout step (no hand-edit gymnastics). Reviewer attestation: `empirical-revert verified: revert <impl-sha> → test failed/uncompilable; restore → test passes`. Canonical example: PR #267 r3 `d8ce15a` slow-loris timeout — test depended on the env-var-override impl present in HEAD; a separate RED commit would have nothing to assert against. Distinct from EMERGENCY hotfix exemption (this is architectural, not time-pressure).
 
 ##### Rationale
 
@@ -542,6 +543,57 @@ The 3 backfilled mirror comments serve as canonical format examples for future r
 ##### Self-amendment qualification
 
 This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. The amendment **applies to itself recursively**: the verdict on this PR (issued by dev-reviewer per Path A single-reviewer authority) must mirror to the GH PR comment thread before dev-lead self-merge. This is intentional dogfood — the rule's first application is the amendment that introduces it.
+
+### 3.6 Async pipeline — push-and-immediately-continue
+
+Sprint 26 amendment (operator m-177). To eliminate idle wait time across the impl/reviewer/dev-lead pipeline, the protocol adopts an **asynchronous-push model**: impl agents and reviewers push their work and **immediately move to the next task** without waiting for CI / dual-VERIFIED / merge confirmation. dev-lead persists the PR pending list, watches CI, and self-merges on dual-VERIFIED + green.
+
+#### 3.6.1 Impl push semantics
+
+After pushing a PR (whether r1 or r2), impl-agent:
+
+1. Posts a `kind=update` notification to dev-lead with PR URL + HEAD SHA + diff stat.
+2. **Immediately** picks up the next dispatched task from inbox.
+3. Does NOT poll CI status; does NOT wait for reviewer verdict; does NOT block on dev-lead merge.
+
+If the PR is later REJECTED or has CI failure, impl receives a return-to-fix dispatch via inbox (queue-priority message). Impl decides when to take it based on current task queue state.
+
+#### 3.6.2 Reviewer push semantics
+
+After issuing a verdict (`kind=report` inbox + §3.5.13 GH PR mirror), reviewer:
+
+1. **Immediately** picks up the next dispatched review task.
+2. Does NOT wait for the OTHER reviewer (cross-vantage or PRIMARY counterpart) to issue their verdict.
+3. Does NOT wait for dev-lead self-merge confirmation.
+
+If a r2 dispatch arrives later (impl pushed fix, dev-lead asks for re-review), reviewer takes it from inbox in priority order.
+
+#### 3.6.3 dev-lead orchestration
+
+dev-lead maintains the PR pending list (active reviews, pending CI, pending merge) as durable state. On each tick:
+
+1. Watch CI for in-flight PRs.
+2. Check inbox for verdicts.
+3. Self-merge when dual-VERIFIED + CI green.
+
+If both reviewers VERIFIED but dev-lead misses the convergence (e.g., bottleneck or context-shift), the **periodic active poll fallback** must detect within N minutes. Default N = 30 min; operator-tunable. Canonical evidence: PR #269 self-merge gap incident — dev-lead missed dual-VERIFIED convergence by ~1 hour, operator caught manually. The active-poll fallback prevents this category of stall.
+
+#### 3.6.4 Edge cases
+
+- **CI flaky** → manual `gh run rerun <run-id>` is the operator-authorized retry path; no auto-retry policy at this stage. dev-lead surfaces flake to operator if same test fails 2+ times across reruns.
+- **dev-lead bottleneck or context-exhaustion** → operator may direct-dispatch self-merge if dev-lead context-exhausted (per operator m-181 takeover protocol). Adjacent process pattern: see PR #268 r2 dev-lead takeover — async pipeline addresses normal flow; m-181 protocol addresses exception flow.
+- **GH PR view = ground truth** — when dev-lead memory and inbox state diverge (mid-merge crash, multi-day PRs, etc.), the GH PR comment thread + commit history are authoritative. §3.5.13 mirror enables this — operator/external viewers see verdicts on GH without inbox access.
+
+#### 3.6.5 Cross-references
+
+- **Operator m-177**: original directive for async pipeline adoption (eliminate idle wait time).
+- **PR #269 self-merge gap incident**: motivating evidence for the periodic active-poll fallback (§3.6.3).
+- **PR #268 r2 dev-lead takeover (operator m-181 protocol)**: adjacent process pattern when context-exhaustion blocks pipeline progress.
+- **§3.5.13 verdict externalization**: enables §3.6.4 "GH PR view = ground truth" — verdicts mirrored on GH allow recovery from dev-lead memory drift.
+
+#### 3.6.6 Self-amendment qualification (this PR — first §3.6 dogfood)
+
+This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. The amendment **applies to itself as the first canonical §3.6 test**: after I push this PR, dev-reviewer immediately picks up the review without waiting for CI; on VERIFIED, dev-lead self-merges; I do not wait for any of these and immediately pick up the next dispatch (Sprint 27 cost/benefit challenge). The async pipeline working end-to-end on this very PR is the first dogfood.
 
 ## 4. Communication rules
 
