@@ -10,7 +10,7 @@
 //! are handled locally — they don't need daemon state.
 //!
 //! Protocol:
-//! - stdin/stdout: Content-Length framed or NDJSON JSON-RPC (MCP spec)
+//! - stdin/stdout: NDJSON JSON-RPC (MCP spec, one JSON object per line)
 //! - daemon: NDJSON over TCP loopback with cookie auth
 
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -219,7 +219,7 @@ fn connect_daemon(
 }
 
 // ---------------------------------------------------------------------------
-// MCP framing (Content-Length + NDJSON auto-detect)
+// MCP framing (NDJSON-only)
 // ---------------------------------------------------------------------------
 
 fn read_message(reader: &mut impl BufRead) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -233,20 +233,16 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<String>, Box<dyn std
         if trimmed.is_empty() {
             continue;
         }
+        // NDJSON-only: all known MCP backends (Claude Code, Kiro CLI, Codex,
+        // Gemini, OpenCode) send NDJSON over stdio. Content-Length (LSP-style)
+        // fallback removed — it was an attack surface (drip-feed DoS via
+        // blocking read_exact, negative Content-Length crash, OOM via large
+        // Content-Length). See docs/MCP-FRAMING-PER-BACKEND.md.
         if trimmed.starts_with('{') {
             return Ok(Some(trimmed.to_string()));
         }
-        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-            let len: usize = val.trim().parse()?;
-            let mut sep = String::new();
-            reader.read_line(&mut sep)?;
-            if len == 0 {
-                continue;
-            }
-            let mut body = vec![0u8; len];
-            reader.read_exact(&mut body)?;
-            return Ok(Some(String::from_utf8(body)?));
-        }
+        // Non-JSON, non-empty line: log and skip (defensive)
+        eprintln!("agend-mcp-bridge: ignoring non-JSON input line");
     }
 }
 
