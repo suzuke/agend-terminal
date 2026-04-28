@@ -305,6 +305,65 @@ mod tests {
         );
     }
 
+    /// Helper: e2e behavioral telemetry capture for a fixture.
+    fn e2e_fixture_behavioral(file: &str, backend: &Backend) {
+        let buf = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        let buf_w = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || {
+                struct W(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+                impl std::io::Write for W {
+                    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                        self.0.lock().extend_from_slice(b);
+                        Ok(b.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                W(buf_w.clone())
+            })
+            .with_ansi(false)
+            .finish();
+        let path = format!("tests/fixtures/state-replay/{file}");
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let fixture = std::fs::read(&path).unwrap();
+        let mut tracker = crate::state::StateTracker::new(Some(backend));
+        tracker.set_instance_name("test-e2e");
+        tracker.feed(&String::from_utf8_lossy(&fixture));
+        std::thread::sleep(Duration::from_millis(3100));
+        tracker.feed("_");
+        drop(_guard);
+        let output = String::from_utf8(buf.lock().clone()).unwrap();
+        assert!(
+            output.contains("silence_thinking"),
+            "fixture {file} expected silence_thinking, got: {}",
+            if output.is_empty() {
+                "(empty)"
+            } else {
+                &output[..output.len().min(200)]
+            }
+        );
+    }
+
+    #[test]
+    fn e2e_kiro_thinking() {
+        e2e_fixture_behavioral("kiro-thinking.raw", &Backend::KiroCli);
+    }
+    #[test]
+    fn e2e_codex_thinking() {
+        e2e_fixture_behavioral("codex-thinking.raw", &Backend::Codex);
+    }
+    #[test]
+    fn e2e_gemini_thinking() {
+        e2e_fixture_behavioral("gemini-thinking.raw", &Backend::Gemini);
+    }
+    #[test]
+    fn e2e_opencode_thinking() {
+        e2e_fixture_behavioral("opencode-thinking.raw", &Backend::OpenCode);
+    }
+
     #[test]
     fn fixture_replay_claude_tooluse() {
         replay_fixture("claude-tooluse.raw", &Backend::ClaudeCode);
