@@ -327,22 +327,37 @@ fn handle_session(
         tracing::debug!(peer_pid = pid, "API session peer PID");
     }
 
-    // Sprint 25 P3: active peer PID watch — detect dead bridge within ~2s
-    // instead of waiting for 30s TCP read timeout. Spawn a background
-    // watcher that polls kill(pid, 0) and shuts down the stream on death.
+    // Liveness model post-auth (single-operator threat model):
+    //
+    // - The 5 s timeout from `serve` was a slow-loris defense for the
+    //   *pre-auth* handshake — anyone scanning the loopback port who
+    //   doesn't hold the cookie file gets dropped fast. It still applies
+    //   pre-auth.
+    // - Post-auth there is no realistic adversary: anyone holding the
+    //   owner-only cookie file already has shell access on this user
+    //   account and can do anything (kill the daemon, edit files, etc.)
+    //   without bothering to drip-feed bytes. So we do NOT keep a
+    //   slow-loris timeout against authenticated peers.
+    // - When the peer reports its PID at handshake, the active watcher
+    //   below detects a dead bridge in ~2 s; reads can wait indefinitely.
+    // - When no PID was reported (legacy / non-bridge clients) we keep a
+    //   generous finite ceiling so a vanished peer eventually frees the
+    //   worker — operationally a stuck thread, not a security control.
+    //
+    // `AGEND_API_POST_AUTH_READ_TIMEOUT_SECS` overrides for environments
+    // that disable the watcher or want a fixed ceiling.
+    let post_auth_timeout = post_auth_read_timeout(peer_pid);
+    // `reader` and `writer` are clones of the same socket — one
+    // SO_RCVTIMEO covers both directions of the loop's reads.
+    let _ = reader.get_ref().set_read_timeout(post_auth_timeout);
+
+    // Sprint 25 P3: active peer PID watch — the real liveness check
+    // (~2 s detection) for bridge sessions.
     if let Some(pid) = peer_pid {
         if let Ok(shutdown_stream) = writer.try_clone() {
             spawn_peer_pid_watcher(pid, shutdown_stream);
         }
     }
-    // Note: the per-line read timeout from `serve` (5 s default) deliberately
-    // stays in force post-auth. PID watcher and slow-loris defense are
-    // *orthogonal*: the watcher catches a peer that died, the read timeout
-    // catches a peer that is alive but drip-feeding (DoS via thread
-    // exhaustion). An authenticated client can still be malicious — auth
-    // gates *who* may speak, not *how slowly*. Idle bridges live with this
-    // by reconnecting transparently — see `proxy_request` in
-    // `src/bin/agend-mcp-bridge.rs`.
 
     loop {
         let mut line = String::new();
@@ -443,6 +458,32 @@ fn is_process_alive(pid: u32) -> bool {
 /// // fire-and-forget: watcher self-terminates when peer dies or stream
 /// // is already closed. No JoinHandle join needed — session thread
 /// // exits independently and the watcher's stream shutdown is idempotent.
+/// Resolve the post-auth read deadline for an authenticated session.
+///
+/// Single-operator threat model: anyone holding the owner-only cookie file
+/// already has shell access, so there's no realistic post-auth slow-loris
+/// adversary. The timeout exists only to free worker threads from peers
+/// that vanish without notice.
+///
+/// - `AGEND_API_POST_AUTH_READ_TIMEOUT_SECS` always wins (operator escape
+///   hatch for environments without the PID watcher).
+/// - PID known → `None`; the watcher detects death in ~2 s.
+/// - No PID → 60 s ceiling so a vanished legacy peer doesn't pin a thread
+///   indefinitely.
+fn post_auth_read_timeout(peer_pid: Option<u32>) -> Option<std::time::Duration> {
+    if let Some(secs) = std::env::var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    if peer_pid.is_some() {
+        None
+    } else {
+        Some(std::time::Duration::from_secs(60))
+    }
+}
+
 fn spawn_peer_pid_watcher(pid: u32, stream: std::net::TcpStream) {
     // fire-and-forget: PID watcher polls until peer dies then self-exits.
     // Stream shutdown is idempotent; if session already closed, shutdown
@@ -1879,15 +1920,22 @@ mod tests {
         stream
     }
 
+    /// Pre-auth slow-loris defense: a peer that connects without holding the
+    /// cookie file (e.g. another local user scanning loopback ports) must
+    /// be dropped within the pre-auth read timeout (5 s default in `serve`).
+    /// Post-auth there is no realistic adversary in the single-operator
+    /// threat model — anyone with the cookie already owns the account, so
+    /// this test deliberately stays on the pre-auth path.
     #[test]
-    fn real_serve_drip_feed_dropped_within_timeout() {
+    fn real_serve_pre_auth_drip_feed_dropped_within_timeout() {
         let _g = timeout_test_guard();
-        let (port, cookie, shutdown, home) = spawn_real_api_server(None); // default 5s
+        let (port, _cookie, shutdown, home) = spawn_real_api_server(None); // default 5s
 
-        let stream = auth_connect(port, &cookie);
+        let stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to real api");
         let mut w = stream.try_clone().expect("clone");
-        // Send partial JSON then go silent
-        w.write_all(b"{\"method\":\"lis").expect("write partial");
+        // Send partial auth handshake then go silent — never completes.
+        w.write_all(b"{\"auth\":\"deadbe").expect("write partial");
         w.flush().expect("flush");
 
         let start = std::time::Instant::now();
@@ -1898,7 +1946,7 @@ mod tests {
 
         assert!(
             elapsed < std::time::Duration::from_secs(8),
-            "real api::serve must drop stalled connection within ~5s, took {:.1}s",
+            "pre-auth drip-feed must be dropped within ~5s, took {:.1}s",
             elapsed.as_secs_f64()
         );
 
@@ -1930,15 +1978,20 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// Post-auth there is now no read deadline (PID watcher present) or a
+    /// 60 s ceiling (no PID), so a 6 s pause mid-line must succeed. Pinning
+    /// this with a real session catches any future regression that brings
+    /// back a tight post-auth slow-loris timeout against authenticated
+    /// peers — the threat model rejects that defense.
     #[test]
-    fn real_serve_env_override_extends_timeout() {
+    fn real_serve_post_auth_idle_does_not_drop_session() {
         let _g = timeout_test_guard();
-        let (port, cookie, shutdown, home) = spawn_real_api_server(Some(10)); // 10s override
+        let (port, cookie, shutdown, home) = spawn_real_api_server(None);
 
         let stream = auth_connect(port, &cookie);
         let mut w = stream.try_clone().expect("clone");
 
-        // Partial JSON, wait 6s, then complete — within 10s override
+        // Partial JSON, idle 6 s well past the pre-auth 5 s budget, complete.
         w.write_all(b"{\"method\"").expect("write partial");
         w.flush().expect("flush");
         std::thread::sleep(std::time::Duration::from_secs(6));
@@ -1953,11 +2006,58 @@ mod tests {
 
         assert!(
             bytes > 0,
-            "with 10s override, 6s pause must NOT trigger timeout"
+            "post-auth must not enforce slow-loris timeout against \
+             authenticated peers (single-operator threat model)"
         );
 
         shutdown.store(true, Ordering::Relaxed);
-        std::env::remove_var("AGEND_API_READ_TIMEOUT_SECS");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Liveness invariant: when the peer's PID is known the active watcher
+    /// detects death in ~2 s, so the per-line read timeout drops to `None`
+    /// and idle MCP sessions don't get killed by their own deadman switch.
+    /// Without a PID we still want a finite ceiling so vanished peers free
+    /// the worker thread.
+    #[test]
+    fn post_auth_timeout_with_pid_is_unbounded_without_pid_is_finite() {
+        let _g = env_guard();
+        // SAFETY: serialised by env_guard.
+        unsafe {
+            std::env::remove_var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS");
+        }
+        assert_eq!(
+            post_auth_read_timeout(Some(12345)),
+            None,
+            "PID watcher present → trust it, no read deadline"
+        );
+        let fallback = post_auth_read_timeout(None).expect("no-PID fallback must be finite");
+        assert!(
+            fallback >= std::time::Duration::from_secs(30),
+            "no-PID fallback must outlast typical idle gaps, got {fallback:?}"
+        );
+    }
+
+    /// `AGEND_API_POST_AUTH_READ_TIMEOUT_SECS` overrides both branches so an
+    /// operator can install a hard ceiling regardless of the watcher.
+    #[test]
+    fn post_auth_timeout_env_override_wins() {
+        let _g = env_guard();
+        // SAFETY: serialised by env_guard.
+        unsafe {
+            std::env::set_var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS", "7");
+        }
+        assert_eq!(
+            post_auth_read_timeout(Some(12345)),
+            Some(std::time::Duration::from_secs(7))
+        );
+        assert_eq!(
+            post_auth_read_timeout(None),
+            Some(std::time::Duration::from_secs(7))
+        );
+        // SAFETY: serialised by env_guard.
+        unsafe {
+            std::env::remove_var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS");
+        }
     }
 }

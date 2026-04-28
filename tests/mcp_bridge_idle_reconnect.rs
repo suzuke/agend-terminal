@@ -11,9 +11,11 @@
 //! request, then issues a second request and asserts the bridge succeeds
 //! without surfacing the transport error.
 //!
-//! The daemon's 5 s post-auth timeout is intentionally kept (slow-loris
-//! defense survives auth — an authenticated client can still drip-feed),
-//! so the bridge MUST handle the resulting idle-close transparently.
+//! r4 drops the post-auth read timeout entirely when the PID watcher is
+//! active (single-operator threat model rejects the slow-loris-against-
+//! authenticated-peer concern), so daemon-initiated idle close becomes
+//! rare. The bridge retry remains as defense in depth for daemon restart
+//! and genuine network blips.
 
 #![allow(clippy::unwrap_used)]
 
