@@ -343,7 +343,7 @@ fn no_dual_track_fn_drift_between_ops_and_mcp_handlers() {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let ops_src =
         std::fs::read_to_string(Path::new(manifest).join("src/ops.rs")).unwrap_or_default();
-    let handlers_src = std::fs::read_to_string(Path::new(manifest).join("src/mcp/handlers.rs"))
+    let handlers_src = std::fs::read_to_string(Path::new(manifest).join("src/mcp/handlers/mod.rs"))
         .unwrap_or_default();
 
     let (divergent, identical) = compare_fns_from_sources(&ops_src, &handlers_src);
