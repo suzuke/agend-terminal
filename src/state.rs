@@ -531,6 +531,12 @@ pub struct StateTracker {
     /// `None` before first heartbeat. Used by `gate_on_heartbeat` to suppress
     /// false-positive `PermissionPrompt` when the agent is alive (A5 fix).
     last_heartbeat: Option<Instant>,
+    /// Sprint 27: behavioral probe config for shadow-mode telemetry.
+    behavioral_config: Option<crate::behavioral::BehavioralConfig>,
+    /// Instance name for telemetry logging.
+    instance_name: String,
+    /// Backend name for telemetry logging.
+    backend_name: String,
 }
 
 fn hash_screen(text: &str) -> u64 {
@@ -581,7 +587,22 @@ impl StateTracker {
             interactive_prompt_pending_notice: false,
             interactive_recovery_pending_notice: false,
             last_heartbeat: None,
+            behavioral_config: backend.map(crate::behavioral::config_for),
+            instance_name: String::new(),
+            backend_name: backend.map(|b| b.name().to_string()).unwrap_or_default(),
         }
+    }
+
+    /// Set instance name for behavioral telemetry logging.
+    #[allow(dead_code)] // Called by daemon supervisor when wiring up agents
+    pub fn set_instance_name(&mut self, name: &str) {
+        self.instance_name = name.to_string();
+    }
+
+    /// Returns true if behavioral config is populated (managed backends).
+    #[allow(dead_code)] // Used by behavioral::tests::state_tracker_has_behavioral_config
+    pub fn has_behavioral_config(&self) -> bool {
+        self.behavioral_config.is_some()
     }
 
     /// Returns true at most once per entry into `InteractivePrompt`. The
@@ -661,6 +682,11 @@ impl StateTracker {
             return;
         }
         self.last_screen_hash = Some(hash);
+
+        // Sprint 27 shadow-mode: capture silence duration BEFORE updating
+        // last_output, so we measure time since previous feed (not current).
+        let silence_since_last_feed = self.last_output.elapsed();
+
         self.last_output = Instant::now();
 
         if let Some(ref patterns) = self.patterns {
@@ -686,6 +712,19 @@ impl StateTracker {
                     }
                 }
             }
+        }
+
+        // Sprint 27 shadow-mode: log behavioral signal alongside regex state.
+        // Zero state change — telemetry only. Phase 2 (Sprint 28+) promotes
+        // behavioral to tiebreaker/primary.
+        if let Some(ref config) = self.behavioral_config {
+            let signal = crate::behavioral::infer_from_silence(config, silence_since_last_feed);
+            crate::behavioral::log_shadow_telemetry(
+                &self.instance_name,
+                &self.backend_name,
+                self.current.display_name(),
+                signal,
+            );
         }
     }
 
