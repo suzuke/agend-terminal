@@ -70,16 +70,6 @@ pub enum FleetUpdate {
         added: Vec<String>,
         removed: Vec<String>,
     },
-    /// An instance's `role` field in fleet.yaml changed. Variant retained
-    /// for the broadcast format and tests; live producers were removed
-    /// alongside the fleet.yaml hot-reload path (Sprint 29 PR-6) — fleet.yaml
-    /// edits now require a daemon restart, at which point all agents
-    /// re-read role from fleet.yaml on respawn.
-    #[allow(dead_code)]
-    RoleChanged {
-        name: String,
-        new_role: Option<String>,
-    },
 }
 
 impl FleetUpdate {
@@ -131,11 +121,6 @@ impl FleetUpdate {
                 "team": team_name,
                 "added": added,
                 "removed": removed,
-            }),
-            FleetUpdate::RoleChanged { name, new_role } => json!({
-                "kind": "role-changed",
-                "name": name,
-                "role": new_role,
             }),
         }
     }
@@ -204,14 +189,14 @@ pub fn compute_targets(
             }
             all.into_iter().collect()
         }
-        // Fleet-wide events: everyone currently registered. RoleChanged
+        // Fleet-wide events: everyone currently registered.
         // also goes fleet-wide — the subject's own agend.md already
         // carries the new role (we re-read fleet.yaml at spawn), but
         // every *other* agent has a stale `<peer> — <old role>` line
         // that the marker lets them update.
-        FleetUpdate::InstanceCreated { .. }
-        | FleetUpdate::InstanceDeleted { .. }
-        | FleetUpdate::RoleChanged { .. } => registered_names.to_vec(),
+        FleetUpdate::InstanceCreated { .. } | FleetUpdate::InstanceDeleted { .. } => {
+            registered_names.to_vec()
+        }
     };
 
     // Self-exclusion. For InstanceCreated the new agent's own agend.md
@@ -441,89 +426,6 @@ instances:
             targets,
             vec!["a".to_string(), "b".to_string(), "c".to_string()],
             "InstanceDeleted must reach every survivor, got {targets:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn render_marker_role_changed_includes_new_role() {
-        let u = FleetUpdate::RoleChanged {
-            name: "dev-lead".into(),
-            new_role: Some("Senior architect".into()),
-        };
-        let s = u.render_marker();
-        let inner = s
-            .trim_start_matches("<fleet-update>\n")
-            .trim_end_matches("</fleet-update>\n")
-            .trim();
-        let v: serde_json::Value = serde_json::from_str(inner).unwrap();
-        assert_eq!(v["kind"], "role-changed");
-        assert_eq!(v["name"], "dev-lead");
-        assert_eq!(v["role"], "Senior architect");
-    }
-
-    #[test]
-    fn render_marker_role_changed_serialises_null_role() {
-        // Clearing a role in fleet.yaml (removing the field) lands as
-        // new_role=None — the marker must faithfully carry null so
-        // agents know to drop the Role line, not emit "null" as a role.
-        let u = FleetUpdate::RoleChanged {
-            name: "dev-lead".into(),
-            new_role: None,
-        };
-        let s = u.render_marker();
-        let inner = s
-            .trim_start_matches("<fleet-update>\n")
-            .trim_end_matches("</fleet-update>\n")
-            .trim();
-        let v: serde_json::Value = serde_json::from_str(inner).unwrap();
-        assert!(v["role"].is_null());
-    }
-
-    #[test]
-    fn compute_targets_role_changed_hits_all_including_subject() {
-        // Unlike InstanceCreated (subject's agend.md already covers its
-        // own existence), RoleChanged must also reach the subject —
-        // the subject's own Identity line was stamped at spawn with the
-        // old role, so they need the marker too.
-        let home = tempdir();
-        let registered: Vec<String> = vec!["dev-lead".into(), "dev-impl-1".into()];
-        let update = FleetUpdate::RoleChanged {
-            name: "dev-lead".into(),
-            new_role: Some("Senior architect".into()),
-        };
-        let mut targets = compute_targets(&home, &registered, &update);
-        targets.sort();
-        assert_eq!(
-            targets,
-            vec!["dev-impl-1".to_string(), "dev-lead".to_string()],
-            "RoleChanged must reach both subject and peers, got {targets:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn compute_targets_role_changed_honours_opt_out() {
-        let home = tempdir();
-        let fleet_yaml = r#"
-instances:
-  general:
-    backend: claude
-    receive_fleet_updates: false
-  dev-lead:
-    backend: claude
-"#;
-        std::fs::write(home.join("fleet.yaml"), fleet_yaml).unwrap();
-        let registered: Vec<String> = vec!["general".into(), "dev-lead".into()];
-        let update = FleetUpdate::RoleChanged {
-            name: "dev-lead".into(),
-            new_role: Some("Senior architect".into()),
-        };
-        let targets = compute_targets(&home, &registered, &update);
-        assert_eq!(
-            targets,
-            vec!["dev-lead".to_string()],
-            "opt-out agents must be excluded from role-changed broadcast too"
         );
         std::fs::remove_dir_all(&home).ok();
     }

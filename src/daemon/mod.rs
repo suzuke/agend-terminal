@@ -318,10 +318,9 @@ fn run_core(
     let _task_sweep =
         crate::daemon::task_sweep::TaskSweep::spawn(home.to_path_buf(), Arc::clone(&shutdown));
 
-    // Ready ping → agend-supervisor (if we were started under one, i.e.
-    // `AGEND_SUPERVISOR_SOCK` env is set). Must come after agents are up
-    // and API is bound — supervisor treats this as "upgrade succeeded".
-    // Fire-and-forget: supervisor crashes shouldn't stop the daemon.
+    // Per-agent stall detector — see daemon::supervisor module-doc.
+    // Pushes vterm tail to channel topic when an agent stalls pre-ready.
+    // Fire-and-forget: detector tick loop runs for the daemon process lifetime.
     // Unix-only (the supervisor itself is Unix-only).
     #[cfg(unix)]
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
