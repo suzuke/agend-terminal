@@ -32,7 +32,7 @@ fn is_process_alive(pid: u32) -> bool {
     // Simplified: use sysinfo crate which is already a dependency.
     use sysinfo::{Pid, System};
     let mut sys = System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]));
+    sys.refresh_processes();
     sys.process(Pid::from_u32(pid)).is_some()
 }
 
