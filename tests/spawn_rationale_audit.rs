@@ -39,21 +39,12 @@ const EXEMPTED_LEGACY_FILES: &[(&str, &str)] = &[
     //     `// fire-and-forget: <reason>` comments; no longer need
     //     file-level exemption): tray/mod.rs, app/api_server.rs.
     //
-    // Remaining 7 entries are pre-existing legacy where the spawn semantics
-    // need owner-judgement (separate supervisor binary; daemon API socket;
-    // MCP handler internals; verify subprocess; TUI lifecycle). Each retains
-    // the per-file owner-handoff hint so a future Sprint 22+ sub-PR can
-    // sweep with the correct shutdown reasoning. NOT inline-rationaled in
-    // P1 because phrasing the comment correctly requires reading the
-    // shutdown contract — out of channel-author hot context.
+    // Remaining entries are pre-existing legacy where the spawn semantics
+    // need owner-judgement (daemon API socket; MCP handler internals;
+    // verify subprocess; TUI lifecycle). Each retains the per-file
+    // owner-handoff hint so a future Sprint 22+ sub-PR can sweep with
+    // the correct shutdown reasoning.
     //
-    // TODO Sprint 22 sweep — agend-supervisor (separate process supervisor;
-    // owner: daemon team. Spawn sites at lines 97/162/885 each tied to
-    // distinct supervisor lifecycles — needs supervisor-author rationale).
-    (
-        "supervisor/server.rs",
-        "out of daemon scope; separate supervisor binary",
-    ),
     // TODO Sprint 22 sweep — daemon-side API server worker threads (owner:
     // daemon team. Sites 263/421 are socket-accept + per-request workers
     // bound to daemon process lifetime; comment exists at site but lacks
@@ -212,7 +203,6 @@ fn dispatch_scoped_sweep_sites_have_rationale() {
         ("instance_monitor.rs", "std::thread::Builder::new()"),
         ("agent.rs", "std::thread::Builder::new()"),
         ("daemon/mod.rs", "std::thread::Builder::new()"),
-        ("daemon/supervisor.rs", "thread::Builder::new()"),
         ("daemon/ci_watch.rs", "std::thread::Builder::new()"),
         ("daemon/tui_bridge.rs", "std::thread::Builder::new()"),
         ("channel/telegram.rs", "std::thread::Builder::new()"),

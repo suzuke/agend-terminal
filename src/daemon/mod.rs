@@ -328,22 +328,6 @@ fn run_core(
     // Fire-and-forget: supervisor crashes shouldn't stop the daemon.
     // Unix-only (the supervisor itself is Unix-only).
     #[cfg(unix)]
-    {
-        let pid = std::process::id();
-        let version = env!("CARGO_PKG_VERSION");
-        if let Err(e) = agend_terminal::supervisor::client::notify_ready(pid, version) {
-            tracing::warn!(error = %e, "supervisor ready ping failed (continuing)");
-        }
-    }
-
-    // If the supervisor just upgraded us, it dropped an upgrade-marker with
-    // from/to versions. Consume it asynchronously: wait for agent prompts to
-    // settle, inject a single "daemon upgraded" notice into each, then delete
-    // the marker. Spawned so we don't delay the main loop; errors are logged
-    // and otherwise ignored (agents missing the message is a cosmetic loss).
-    #[cfg(unix)]
-    consume_upgrade_marker(home.to_path_buf(), Arc::clone(&registry));
-
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
     crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&registry));
 
@@ -1170,72 +1154,6 @@ fn spawn_and_register_agent(
         return Err(e.into());
     }
     Ok(())
-}
-
-/// If `$AGEND_HOME/run/upgrade-marker` exists, we were just (re)launched by
-/// the supervisor as part of a hot-upgrade. Wait briefly for agents to be
-/// ready to accept input, inject a single "daemon upgraded" notice into each
-/// PTY, then delete the marker so a subsequent crash-respawn won't repeat it.
-///
-/// The marker format is the JSON blob supervisor writes in `write_upgrade_marker`:
-/// `{ "from_version": "...", "to_version": "...", "new_hash": "...", "prev_hash": "...", "at": "..." }`.
-///
-/// Failures are logged but never propagated — this is a cosmetic notice;
-/// missing it must not abort daemon startup.
-///
-/// Unix-only: consumes output of `agend_terminal::supervisor::paths::upgrade_marker`,
-/// which is itself gated behind `#[cfg(unix)]` in `src/lib.rs`.
-#[cfg(unix)]
-fn consume_upgrade_marker(home: PathBuf, registry: AgentRegistry) {
-    let marker_path = agend_terminal::supervisor::paths::upgrade_marker(&home);
-    if !marker_path.exists() {
-        return;
-    }
-    // fire-and-forget: upgrade-marker consumer is one-shot — reads marker,
-    // sleeps 2s, injects cosmetic "daemon upgraded" notice into each agent,
-    // deletes marker, exits. Failures are cosmetic; agents missing the
-    // notice is acceptable (no JoinHandle / shutdown signal needed).
-    let _ = std::thread::Builder::new()
-        .name("upgrade_marker".into())
-        .spawn(move || {
-            let raw = match std::fs::read_to_string(&marker_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(path = %marker_path.display(), error = %e, "read upgrade-marker failed");
-                    let _ = std::fs::remove_file(&marker_path);
-                    return;
-                }
-            };
-            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-            let from = parsed
-                .get("from_version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown)");
-            let to = parsed
-                .get("to_version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown)");
-            let msg = format!(
-                "[system] Daemon upgraded from {from} to {to}. All agents restarted.\r"
-            );
-
-            // Give agents a moment to paint their prompts; matches the delay
-            // used by the crash-respawn system message injection above.
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let r = registry.lock();
-            for handle in r.values() {
-                let _ = agent::write_to_agent(handle, msg.as_bytes());
-            }
-            drop(r);
-            if let Err(e) = std::fs::remove_file(&marker_path) {
-                tracing::warn!(
-                    path = %marker_path.display(),
-                    error = %e,
-                    "remove upgrade-marker failed (daemon will keep running)"
-                );
-            }
-            tracing::info!(from, to, "upgrade-marker consumed, agents notified");
-        });
 }
 
 #[cfg(test)]
