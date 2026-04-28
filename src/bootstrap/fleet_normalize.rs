@@ -15,13 +15,8 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-// Sprint 23 P1 (default-open reversal) — `default_built_in_outbound_capabilities`
-// retired. Built-in instances (`general` + future auto-created coordinators)
-// no longer need an explicit cap list because the missing-field default is
-// now OPEN. Removing the explicit Vec keeps the auto-created entry minimal
-// (matches what an operator would typically write — i.e. nothing) and avoids
-// emitting noise in the persisted fleet.yaml. Operators can still opt out
-// or restrict via the standard `outbound_capabilities: []` / selective list.
+// Sprint 29: RBAC outbound capability layer removed. Built-in instances
+// no longer need any outbound_capabilities declaration.
 
 /// Normalize in-memory, optionally persisting fleet.yaml side effects.
 pub(super) fn normalize(config: &mut FleetConfig, home: &Path, persist: bool) {
@@ -45,13 +40,6 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
             backend: Some(default_backend),
             working_directory: None,
             topic_id: Some(1),
-            // Sprint 23 P1 reversal: missing `outbound_capabilities` now
-            // means default-open (was Sprint 22 P0 fail-closed with FATAL
-            // warn). Auto-created built-ins inherit default-open the same
-            // way operator-authored instances do — no explicit list
-            // needed. The single-operator threat model (TUI = full machine
-            // access) makes the cascade-attack-chain defense irrelevant.
-            outbound_capabilities: None,
             ..Default::default()
         },
     );

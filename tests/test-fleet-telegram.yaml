@@ -17,17 +17,8 @@ instances:
     role: "Fleet coordinator"
     working_directory: ~/Documents/Hack/agend
     topic_id: 1
-    # Sprint 22 P0 (Phase 5b) — `general` is auto-injected the full set by
-    # `bootstrap::fleet_normalize::auto_create_general` when not present;
-    # explicit here to demonstrate the migration pattern for user-authored
-    # instances.
-    outbound_capabilities: [reply, react, edit, inject_provenance]
 
   blog-writer:
     role: "Blog content writer"
     working_directory: ~/Documents/Hack/blog
     topic_id: 42
-    # Operator-authored — must declare explicit outbound capabilities.
-    # Sprint 23 will require this field on every user-yaml instance
-    # (hard parse error if absent). See docs/MIGRATION-OUTBOUND-CAPS.md.
-    outbound_capabilities: [reply, react, edit, inject_provenance]

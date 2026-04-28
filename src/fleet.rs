@@ -176,38 +176,12 @@ pub struct InstanceConfig {
     /// from knowing about peers); set to `false` on user-facing chat
     /// proxies like `general` where broadcast markers read as noise.
     pub receive_fleet_updates: Option<bool>,
-    /// Per-instance agent-callable outbound operations gate
-    /// (Sprint 21 Phase 5b → Sprint 22 P0 hard-cut → **Sprint 23 P1
-    /// default-open reversal** per operator philosophy override).
-    ///
-    /// **Current contract** (Sprint 23 P1):
-    ///
-    /// | State | Behaviour |
-    /// |---|---|
-    /// | `Some([reply, …])` | only listed ops permitted |
-    /// | `Some([])` | all ops rejected (explicit opt-out, retained) |
-    /// | `None` (absent) | **default-open: all ops permitted** |
-    ///
-    /// **Why default-open**: single-operator threat model. The TUI is
-    /// already full machine access; the cascade-attack-chain defence
-    /// from Sprint 22 P0 was over-spec for the actual deployment shape.
-    /// Operator explicitly accepts the security trade-off (telegram 11:00
-    /// UTC routed via general m-20260427115706155870-88 →
-    /// `t-20260427115754474312-3`).
-    ///
-    /// **Migration**: see `docs/MIGRATION-OUTBOUND-CAPS.md` for the
-    /// operator-facing transition guide (now includes the Sprint 23 P1
-    /// reversal section) and `docs/USAGE.md` "Channel: Telegram"
-    /// section for fleet.yaml stanza examples (opt-out / restrict).
-    ///
-    /// **Daemon notify** (PR #216 fail-closed gate at supervisor.rs /
-    /// ci_watch.rs notify call sites) remains fail-closed — different
-    /// threat model: notification fan-out to operator. Missing
-    /// `user_allowlist` still drops every notification, surfacing as a
-    /// silent operator regression unless `warn_once_user_allowlist_unconfigured`
-    /// fires.
-    #[serde(default)]
-    pub outbound_capabilities: Option<Vec<crate::channel::auth::ChannelOpKind>>,
+    /// Legacy field — retained only to gracefully absorb old fleet.yaml
+    /// files that still declare `outbound_capabilities`. Not used at
+    /// runtime; skipped on serialization.
+    #[allow(dead_code)]
+    #[serde(default, skip_serializing)]
+    pub outbound_capabilities: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
