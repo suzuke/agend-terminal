@@ -21,7 +21,8 @@ static DEFAULT_CELL: std::sync::OnceLock<Cell> = std::sync::OnceLock::new();
 ///
 /// Sprint 25 P0 HOTFIX: replaces all 5 raw `grid[Point::new(...)]` sites.
 fn safe_cell(grid: &alacritty_terminal::grid::Grid<Cell>, line: Line, col: usize) -> &Cell {
-    if col < grid.columns() && (line.0 as usize) < grid.screen_lines() {
+    use alacritty_terminal::grid::Dimensions;
+    if col < grid.columns() && line >= grid.topmost_line() && line <= grid.bottommost_line() {
         &grid[Point::new(line, Column(col))]
     } else {
         DEFAULT_CELL.get_or_init(Cell::default)
