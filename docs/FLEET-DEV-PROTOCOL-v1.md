@@ -391,6 +391,10 @@ When reviewing a PR with scope-listed file changes, reviewer **must** identify w
 
 Refactor PRs that demonstrably preserve byte-output / lock structure / persistence schema (e.g. moving framing code between modules without changing wire format; refactoring lock acquisition order without changing concurrency semantics; renaming persistence fields without changing on-disk shape) may waive external-fixture if they include a regression test asserting equivalence against the pre-refactor output (byte-equivalence for wire-format; race-free invariant for concurrent-state; round-trip-equivalence for persistence-replay).
 
+##### Sanctioned-tool decline policy (Sprint 27 amendment)
+
+When `Cargo.toml` (or sibling design doc) flags a tool as the **sanctioned approach** for a category — typical comment shape `# <design-doc> §X names \`<crate>\` as the sanctioned approach for <purpose>` — declining that tool in favor of a rolled-own implementation requires (a) explicit declaration in the PR description naming the sanctioned tool being declined, AND (b) narrow-scope architectural rationale (capability gap, scope-filter limitation, etc.) that distinguishes the use case from the design-doc's assumed use case. Without (a)+(b) the decline is silent and reviewer-unverifiable; future maintainers see only the rolled-own and cannot judge whether to migrate. Canonical example: PR #273 r4 declined `tracing-test = "0.2"` because `tracing_test::logs_contain` is scope-filtered and doesn't capture custom `target = "behavioral_shadow"`; rolled-own `tracing_subscriber::fmt().with_writer(parking_lot::Mutex<Vec<u8>>)` captures all targets unconditionally. r1-r6 silent decline cycle (6 cycles) caught by reviewer-2 m-236 NIT 2 + dev-reviewer m-237 strict reading. Parallel pattern to §3.5.11 r3 empirical-revert (architectural rationale required to bypass the default rule).
+
 #### 3.5.11 Test-first verification for feature/fix PRs
 
 Sprint 25 P0 amendment. Feature PRs and bug-fix PRs **must** be authored test-first: the failing test commit MUST land in the PR's commit history BEFORE the implementation commit that makes it pass.
@@ -544,6 +548,14 @@ The 3 backfilled mirror comments serve as canonical format examples for future r
 
 This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. The amendment **applies to itself recursively**: the verdict on this PR (issued by dev-reviewer per Path A single-reviewer authority) must mirror to the GH PR comment thread before dev-lead self-merge. This is intentional dogfood — the rule's first application is the amendment that introduces it.
 
+#### 3.5.14 UX regression prevention (telemetry log-level changes)
+
+Sprint 27 amendment. Telemetry log-level changes (`tracing::debug!` ↔ `tracing::info!` ↔ `tracing::warn!` etc.) directly affect operator default-visible noise: most operators run with default-INFO subscribers, so a `debug!` → `info!` bump silently converts opt-in observability into opt-out spam. Reviewer **must** flag any unexplained level change as `LEVEL-CHANGE-RATIONALE-ABSENT — UNVERIFIED` unless the PR carries (a) inline code comment at the call site stating the new level's rationale, AND (b) reviewer attestation that the change matches operator-visibility intent (opt-in stays at DEBUG; default-visible alarm moves to WARN). Canonical example: PR #273 r4 bumped shadow telemetry `debug!` → `info!` with no rationale — would have spammed all default-INFO operators with shadow noise; reviewer-2 m-236 NIT 3 caught + r5 reverted to `debug!` (correct opt-in semantics).
+
+#### 3.5.15 Observability PR e2e requirement
+
+Sprint 27 amendment. Shadow-mode and observability PRs (telemetry, metrics, divergence dashboards, anything where the deliverable is a *signal-emit* the operator later reads) **must** include at least one end-to-end integration test that exercises the production hook path before VERIFIED. Unit-level tests that call the emit function directly, OR fixture-replay tests that assert state-machine transitions without observing the emitted signal, are insufficient — they pass while the production wire-up is dead code. Reviewer attestation: `e2e-through-production-hook verified: <test-name> exercises <production-path>`. Canonical example: PR #273 r5 silently shipped a timing bug where `last_output.elapsed()` was measured AFTER `last_output = Instant::now()` in `state.rs::feed()`, so behavioral telemetry always saw silence ≈ 0 and never emitted — the entire feature was dead code in production. Detected only when r6 added an e2e test that fed a fixture, slept past the silence threshold, fed again, and asserted the captured tracing output contained `silence_thinking`. r1-r5 (5 cycles) of unit-level + isolated-fixture tests passed without exposing the bug. reviewer-2 m-250 self-correction memorialized the heuristic: structural test compliance ≠ functional correctness. Defends against the same isolation-masks-integration trap class regardless of feature.
+
 ### 3.6 Async pipeline — push-and-immediately-continue
 
 Sprint 26 amendment (operator m-177). To eliminate idle wait time across the impl/reviewer/dev-lead pipeline, the protocol adopts an **asynchronous-push model**: impl agents and reviewers push their work and **immediately move to the next task** without waiting for CI / dual-VERIFIED / merge confirmation. dev-lead persists the PR pending list, watches CI, and self-merges on dual-VERIFIED + green.
@@ -594,6 +606,38 @@ If both reviewers VERIFIED but dev-lead misses the convergence (e.g., bottleneck
 #### 3.6.6 Self-amendment qualification (this PR — first §3.6 dogfood)
 
 This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. The amendment **applies to itself as the first canonical §3.6 test**: after I push this PR, dev-reviewer immediately picks up the review without waiting for CI; on VERIFIED, dev-lead self-merges; I do not wait for any of these and immediately pick up the next dispatch (Sprint 27 cost/benefit challenge). The async pipeline working end-to-end on this very PR is the first dogfood.
+
+#### 3.6.7 ScheduleWakeup auto-poll (Sprint 27 amendment)
+
+The §3.6.3 periodic active-poll fallback ("default N = 30 min") is a *requirement*, not a *mechanism*. dev-lead's backend (Claude Code) provides the `ScheduleWakeup` tool; **every PR entering dev-lead's pending list MUST be paired with a `ScheduleWakeup` call at CI ETA + N min slack** (default N = 5 min). Wakeup fires re-poll PR list mergeable + dual-VERIFIED → auto-merge per §3.6.3. Do **not** depend on "remembering to poll" in working memory — operator m-5 directive cites three recurring instances where dev-lead missed dual-VERIFIED convergence (PR #269 self-merge gap, PR-A r3-r7 chain, PR-B). Memory-rule reinforcement failed three times; the structural fix is mechanical scheduling. Reviewer attestation on dev-lead-orchestration PRs: `ScheduleWakeup-paired with pending-list entry: verified at <PR>`.
+
+#### 3.6.8 Takeover 4-criteria independent verify (operator m-7)
+
+The dev-lead takeover protocol (m-181 — when impl context-exhausted, dev-lead may complete the PR) requires **all four criteria independently verified by dev-lead** before invocation:
+
+1. `last_heartbeat` stale ≥ 1 hour
+2. `last_input` frozen multiple hours
+3. `agent_state` idle non-tool_use
+4. Zero git / task / description activity for the same window
+
+**"Impl self-reports context near limit" is NOT a trigger** — dev-lead must independently verify the 4 criteria using `describe_instance` / git log / task board. Self-reported context-pressure is unreliable: the canonical evidence is PR-B m-5 takeover plan (initially GO based on silent-freeze assumption) where impl-2 self-flagged context-near-limit but `describe_instance` later showed 49% remaining — NOT near-limit, takeover would have been wrong. Reviewer attestation on takeover-invocation PRs: `4-criteria independently verified: heartbeat=<ts>, last_input=<ts>, state=<state>, activity=0 events in <window>`. Adjacent to §3.6.4 dev-lead bottleneck edge case — formalizes the gating.
+
+#### 3.6.9 Git auto-cleanup on merge (operator m-2)
+
+dev-lead (or operator) self-merging a PR **must** treat the cleanup pair as part of the same atomic step:
+
+```bash
+git worktree remove --force <wt-path>   # the worktree paired with the PR branch
+git branch -D <pr-branch>                # the local branch paired with the PR
+```
+
+Skipping cleanup accumulates branch + worktree sprawl. Canonical incident: 2026-04-28 14:00Z operator manually cleaned **94 local branches + 74 worktrees** that had accumulated across Sprint 25-27 (5/5 manually pruned). The atomic-step formulation prevents recurrence — self-merge without cleanup is incomplete, not "deferrable". Recommended implementations (any one suffices):
+
+- `scripts/git-cleanup-merged.sh` — fetch + list merged-PR-branches + corresponding worktrees + prune
+- Git `post-merge` hook auto-trigger
+- §3.6.3 self-merge orchestration treats cleanup as part of the same step (no separate "remember later")
+
+Enforcement: a Sprint-end review that finds N+ stale merged-PR branches or worktrees flags `branch-sprawl regression — UNVERIFIED until cleaned`. Cross-reference: §3.6.3 (self-merge gate) — the cleanup pair is a post-condition of self-merge, not an independent task.
 
 ## 4. Communication rules
 
