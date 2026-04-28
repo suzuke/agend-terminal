@@ -469,6 +469,80 @@ Without both, the reviewer must issue **UNVERIFIED** on the deferral. The implem
 
 This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. Cross-references the real incident chain (PR #194 → #225 → vterm L167 recurrence) as the motivating evidence.
 
+#### 3.5.13 Verdict externalization — fleet-internal verdict MUST mirror to GH PR
+
+Sprint 25 closeout amendment. Every fleet-internal review verdict (VERIFIED / REJECTED / UNVERIFIED) delivered via inbox `kind=report` **must** be mirrored as a GitHub PR comment via `gh pr comment <N> --body "..."` so the operator's cron view + manual GH-UI review can see the verdict without inbox access.
+
+##### Rule
+
+After every Tier-1 / Tier-2 fleet review verdict (PRIMARY or cross-vantage) delivered via inbox `kind=report`, the reviewer (or dev-lead synthesizing) **must** post a GH PR comment summarizing:
+
+- **Reviewer name + tier** (e.g. `dev-reviewer-2 cross-vantage Tier-2` / `dev-reviewer Tier-1 PRIMARY` / `single-reviewer LOW per §3.5.5`)
+- **Verdict** (VERIFIED / REJECTED / UNVERIFIED)
+- **`reviewed_head` SHA**
+- **Main findings**, categorized as BLOCKING / NIT / RECOMMEND
+- **Pipeline next-step** (r2 dispatch / self-merge / dual VERIFY collected / etc.)
+
+##### Self-merge gate
+
+**dev-lead self-merge MUST be preceded by the mirror comment posted.** If self-merge happens before mirror, the merge is treated as **UNVERIFIED** until the mirror comment is retroactively posted (and the reviewer flags the missing mirror in the next dispatch).
+
+##### Why this rule exists
+
+Inbox-only verdicts are a fleet-internal channel — only fleet members + operator-via-`inbox` MCP tool see them. Operator's cron view, manual GH-UI PR review, and external collaborators all rely on the GH PR comment thread. **Un-mirrored verdict = operator sees nothing on GitHub = enforcement leaves no public trace = effectively undone.**
+
+The fix is purely process-level: the verdict already exists in the inbox; mirror reproduces it on GH. No additional code, no new MCP tool, no new infrastructure — just one `gh pr comment` per verdict.
+
+##### Format example
+
+```bash
+gh pr comment <N> --body "$(cat <<'EOF'
+## Tier-2 cross-vantage review — VERIFIED
+
+- **Reviewer**: dev-reviewer-2 cross-vantage
+- **reviewed_head**: <SHA>
+- **Verdict**: VERIFIED with N findings
+
+### Findings
+
+- **BLOCKING**: (none)
+- **NIT**: (list)
+- **RECOMMEND**: (list)
+
+### Pipeline next-step
+
+dev-reviewer Tier-2 PRIMARY pending. Both VERIFIED → dev-lead self-merge.
+
+EOF
+)"
+```
+
+##### Cross-references — incident chain
+
+This rule was operator-mandated permanently per **operator m-84** (telegram 2026-04-27) after observing fleet-internal verdicts not surfacing on GitHub during Sprint 25 P3 review wave:
+
+- **PR #262** (MCP framing KILL Content-Length) — r1 UNVERIFIED + r2 VERIFIED; both verdicts initially inbox-only; mirror backfilled retroactively after operator m-84 directive.
+- **PR #263** (active peer PID watch) — VERIFIED verdict mirrored after backfill.
+- **PR #264** (slow-loris timeout, Sprint 25 P3 closeout) — VERIFIED verdict mirrored after backfill.
+
+The 3 backfilled mirror comments serve as canonical format examples for future reviewers. Operator's directive is permanent — applies to all PRs going forward, not just Sprint 25 P3 wave.
+
+##### Explicit exemptions
+
+- **§3.5.5 LOW docs-only single-reviewer exception PRs**: still subject to mirror requirement — single-reviewer verdict mirrors as `single-reviewer LOW per §3.5.5` reviewer-tier label. The exception narrows reviewer count, not verdict-externalization scope.
+- **Operator self-merge of operator-authored PRs**: operator's own PRs may be merged without fleet-reviewer verdict mirror IF the PR description itself documents the rationale (operator's own statement is the public trace). Fleet-reviewer-issued verdicts on operator PRs still require mirror.
+- **kind=update notifications** (status pings, queue announcements): NOT subject to mirror — only `kind=report` verdicts.
+
+##### Anti-game coverage
+
+- **"I'll mirror after merge"** → §3.5.13 self-merge gate explicitly forbids; pre-merge mirror required.
+- **"My inbox verdict was clear"** → still required to mirror; inbox is fleet-internal channel, not public trace.
+- **"Mirror is just duplication"** → operator visibility / external collaborator visibility / cron-view visibility all rely on GH; fleet-internal-only is invisible to those audiences.
+
+##### Self-amendment qualification
+
+This amendment ships as docs-only and qualifies under §3.5.5 LOW docs-only single-reviewer exception. The amendment **applies to itself recursively**: the verdict on this PR (issued by dev-reviewer per Path A single-reviewer authority) must mirror to the GH PR comment thread before dev-lead self-merge. This is intentional dogfood — the rule's first application is the amendment that introduces it.
+
 ## 4. Communication rules
 
 ### Hop reduction
