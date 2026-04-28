@@ -198,20 +198,27 @@ fn try_proxy_once(
 }
 
 /// Identify transport-level failures that justify a transparent reconnect.
-/// Application-level errors (bad JSON shape, daemon ok=false) are not
-/// retriable — they would just repeat.
-fn is_retriable_io(err: &dyn std::error::Error) -> bool {
-    let s = err.to_string();
-    s.contains("Broken pipe")
-        || s.contains("broken pipe")
-        || s.contains("os error 32")
-        || s.contains("Connection reset")
-        || s.contains("connection reset")
-        || s.contains("Resource temporarily unavailable")
-        || s.contains("os error 35")
-        || s.contains("daemon closed connection")
-        || s.contains("UnexpectedEof")
-        || s.contains("unexpected end of file")
+/// Classification goes through `io::ErrorKind` so it's portable across
+/// macOS / Linux / Windows error message wording. Application-level errors
+/// (bad JSON shape, daemon ok=false, our `"daemon closed connection"`
+/// sentinel for clean EOF) are also retriable since each represents a
+/// dropped peer; everything else propagates so a real bug isn't masked.
+fn is_retriable_io(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io_err) = err.downcast_ref::<io::Error>() {
+        use io::ErrorKind::*;
+        return matches!(
+            io_err.kind(),
+            BrokenPipe
+                | ConnectionReset
+                | ConnectionAborted
+                | NotConnected
+                | UnexpectedEof
+                | WouldBlock
+                | TimedOut
+        );
+    }
+    // Our own EOF sentinel from `try_proxy_once`.
+    err.to_string().contains("daemon closed connection")
 }
 
 fn ensure_connection(
