@@ -1,4 +1,4 @@
-//! MCP stdio server — Content-Length framed JSON-RPC 2.0.
+//! MCP stdio server — NDJSON JSON-RPC 2.0.
 //!
 //! Translates MCP tool calls to agent PTY writes via TUI socket.
 //! Runs synchronously (no tokio needed).
@@ -88,8 +88,12 @@ struct JsonRpcRequest {
     params: Value,
 }
 
-/// Read a message from stdin — supports both NDJSON (Claude Code) and Content-Length framing.
-/// Auto-detects format: if first non-empty char is '{', it's NDJSON. Otherwise Content-Length.
+/// Read a message from stdin — NDJSON only.
+///
+/// All known MCP backends (Claude Code, Kiro CLI, Codex, Gemini, OpenCode)
+/// send NDJSON over stdio. Content-Length (LSP-style) fallback removed per
+/// Sprint 25 P3 framing audit — it was an attack surface (drip-feed DoS,
+/// negative Content-Length crash, OOM). See docs/MCP-FRAMING-PER-BACKEND.md.
 fn read_message(reader: &mut impl BufRead) -> anyhow::Result<Option<String>> {
     let mut line = String::new();
     loop {
@@ -101,46 +105,11 @@ fn read_message(reader: &mut impl BufRead) -> anyhow::Result<Option<String>> {
         if trimmed.is_empty() {
             continue;
         }
-        // NDJSON: line starts with '{'
         if trimmed.starts_with('{') {
             return Ok(Some(trimmed.to_string()));
         }
-        // Content-Length framing
-        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
-            // Prior behaviour `val.parse().unwrap_or(0)` silently collapsed
-            // garbage headers to len=0 and then `continue`d without
-            // consuming the empty separator line, leaving the stream
-            // desynced against the next frame. Handle the parse error
-            // explicitly: log it, skip the separator to resync on the
-            // following header, and drop this frame.
-            let len: usize = match val.trim().parse() {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(
-                        value = %val.trim(),
-                        error = %e,
-                        "invalid Content-Length; frame discarded"
-                    );
-                    let mut empty = String::new();
-                    if reader.read_line(&mut empty)? == 0 {
-                        return Ok(None); // EOF while resync
-                    }
-                    continue;
-                }
-            };
-            // Empty separator line is part of the frame — consume it
-            // unconditionally so len==0 doesn't leave the stream pointing
-            // at the separator on the next iteration.
-            let mut empty = String::new();
-            reader.read_line(&mut empty)?;
-            if len == 0 {
-                continue;
-            }
-            // Read body
-            let mut body = vec![0u8; len];
-            reader.read_exact(&mut body)?;
-            return Ok(Some(String::from_utf8(body)?));
-        }
+        // Non-JSON, non-empty line: warn and skip
+        tracing::warn!(line = %trimmed.chars().take(80).collect::<String>(), "ignoring non-JSON input line");
     }
 }
 
@@ -360,15 +329,18 @@ mod tests {
     }
 
     #[test]
-    fn read_message_eof_during_bad_content_length_resync() {
+    fn read_message_non_json_line_skipped_then_eof() {
+        // Non-JSON lines (like Content-Length headers) are skipped.
+        // EOF after non-JSON → None.
         let input = b"Content-Length: garbage\n";
         let mut reader = io::BufReader::new(&input[..]);
         let result = read_message(&mut reader).expect("should not error");
-        assert!(result.is_none(), "expected None on EOF during resync");
+        assert!(result.is_none(), "expected None on EOF after non-JSON line");
     }
 
     #[test]
-    fn read_message_resync_after_bad_content_length() {
+    fn read_message_non_json_lines_skipped_json_parsed() {
+        // Non-JSON lines skipped, JSON line parsed.
         let input = b"Content-Length: xyz\n\n{\"ok\":true}\n";
         let mut reader = io::BufReader::new(&input[..]);
         let result = read_message(&mut reader).expect("should not error");

@@ -201,7 +201,10 @@ fn test_tool_call_post_decision() {
 }
 
 #[test]
-fn test_content_length_framing() {
+fn test_content_length_input_gracefully_skipped() {
+    // Sprint 25 P3: Content-Length input fallback removed (NDJSON-only).
+    // Verify that Content-Length lines are skipped and subsequent NDJSON
+    // requests still work.
     let home = std::env::temp_dir().join(format!("agend-mcp-cl-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
 
@@ -218,9 +221,12 @@ fn test_content_length_framing() {
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
 
-    // Send Content-Length framed request
+    // Send Content-Length header (skipped as non-JSON) + empty line (skipped)
+    writeln!(stdin, "Content-Length: 999").expect("write cl header");
+    writeln!(stdin).expect("write separator");
+    // Now send the real request as NDJSON (should work)
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
-    write!(stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body).expect("write");
+    writeln!(stdin, "{body}").expect("write ndjson");
     stdin.flush().expect("flush");
     drop(stdin);
 
@@ -235,9 +241,12 @@ fn test_content_length_framing() {
     child.wait().ok();
     let _ = std::fs::remove_dir_all(&home);
 
+    // The Content-Length header line is skipped; the body line starts with
+    // '{' so it's parsed as NDJSON. Then the explicit NDJSON line also
+    // parses. We should get at least 1 response.
     assert!(
         !responses.is_empty(),
-        "should get response from Content-Length framed request"
+        "NDJSON request after Content-Length header should still work"
     );
     assert_eq!(
         responses[0]["result"]["serverInfo"]["name"],
@@ -246,11 +255,9 @@ fn test_content_length_framing() {
 }
 
 #[test]
-fn test_content_length_zero_skips_frame_without_desync() {
-    // Content-Length: 0 is valid (empty body) — it must consume the
-    // separator and continue. If the server mishandled it by `continue`ing
-    // without eating the empty line, the following NDJSON request would
-    // be read at an offset and lost, hanging the caller.
+fn test_content_length_zero_skipped_ndjson_still_works() {
+    // Sprint 25 P3: Content-Length removed. CL header lines are now
+    // skipped as non-JSON. Verify NDJSON after CL lines still works.
     let home = std::env::temp_dir().join(format!("agend-mcp-cl0-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
 
@@ -267,9 +274,7 @@ fn test_content_length_zero_skips_frame_without_desync() {
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
 
-    // Send an empty-body CL=0 frame, then a real NDJSON ping. If framing
-    // is right we get exactly one response (ping); if not, the server
-    // mis-parses the ping bytes as headers and we get none.
+    // Send CL header (skipped) + empty line (skipped) + NDJSON ping
     write!(stdin, "Content-Length: 0\r\n\r\n").expect("write cl0");
     writeln!(
         stdin,
@@ -292,19 +297,16 @@ fn test_content_length_zero_skips_frame_without_desync() {
     assert_eq!(
         responses.len(),
         1,
-        "CL=0 frame must not desync stream; expected 1 ping response, got {}",
+        "NDJSON ping after CL header must still work; got {} responses",
         responses.len()
     );
     assert_eq!(responses[0]["id"], 1);
-    assert!(responses[0]["result"].is_object());
 }
 
 #[test]
-fn test_invalid_content_length_resyncs_to_next_frame() {
-    // A garbage Content-Length previously fell through to len=0 via
-    // unwrap_or(0) and then `continue`d without consuming the separator,
-    // scrambling the stream. With the fix, the malformed frame is
-    // discarded and a following NDJSON request is still served.
+fn test_invalid_content_length_skipped_ndjson_recovers() {
+    // Sprint 25 P3: Content-Length removed. Garbage CL header is now
+    // just a non-JSON line that gets skipped. NDJSON after it works.
     let home = std::env::temp_dir().join(format!("agend-mcp-clbad-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
 
@@ -321,9 +323,7 @@ fn test_invalid_content_length_resyncs_to_next_frame() {
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
 
-    // Malformed header, followed by an empty separator, followed by a
-    // real NDJSON request. The server must skip the bad frame cleanly
-    // and respond to the ping.
+    // Garbage non-JSON lines followed by a real NDJSON request
     write!(stdin, "Content-Length: not-a-number\r\n\r\n").expect("write bad");
     writeln!(
         stdin,
@@ -345,7 +345,7 @@ fn test_invalid_content_length_resyncs_to_next_frame() {
 
     assert!(
         responses.iter().any(|r| r["id"] == 7),
-        "server must resync and serve the following ping, got {responses:?}"
+        "NDJSON ping after garbage lines must still work, got {responses:?}"
     );
 }
 
