@@ -465,15 +465,6 @@ pub fn call(home: &Path, request: &Value) -> anyhow::Result<Value> {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate `AGEND_ALLOWED_WORK_ROOTS` — env mutation
-    /// from parallel tests races otherwise.
-    fn env_guard() -> parking_lot::MutexGuard<'static, ()> {
-        use parking_lot::Mutex;
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock()
-    }
-
     fn tmp_home(name: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
