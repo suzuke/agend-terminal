@@ -515,6 +515,7 @@ fn spawn_instructions_bootstrap(
     // poll loop (returns early on shutdown). JoinHandle dropped because the
     // thread is short-lived and one missed bootstrap on shutdown is cosmetic.
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
+        let _census = crate::thread_census::register("pty_reader");
         let deadline = std::time::Instant::now() + timeout;
         let poll_interval = std::time::Duration::from_millis(200);
 

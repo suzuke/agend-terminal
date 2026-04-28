@@ -384,6 +384,7 @@ pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
     if let Err(e) = std::thread::Builder::new()
         .name("telegram".into())
         .spawn(move || {
+            let _census = crate::thread_census::register("telegram_poll");
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1685,6 +1686,7 @@ fn notify_telegram_inner(
     std::thread::Builder::new()
         .name("tg_notify".into())
         .spawn(move || {
+            let _census = crate::thread_census::register("tg_notify");
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

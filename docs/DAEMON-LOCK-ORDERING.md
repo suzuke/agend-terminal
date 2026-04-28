@@ -57,6 +57,11 @@ Level 3 (leaf-level):
                               (`crate::channel::telegram::lock_state`)
   channel sink registry      — `Mutex<Vec<Arc<dyn UxEventSink>>>`
                               (`crate::channel::sink_registry`)
+  thread census              — `Mutex<HashMap<&'static str, AtomicU32>>`
+                              (`crate::thread_census::census`).
+                              Sprint 26 PR-B counter-only registry; brief
+                              acquire on register/Drop/snapshot, never held
+                              during nested acquisitions.
 ```
 
 ## Hierarchy rules

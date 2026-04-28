@@ -1,22 +1,49 @@
 //! Thread census — lightweight counter-only thread lifecycle tracking.
 //!
 //! Sprint 26 PR-B: per operator pick A (counter-only, not JoinHandle root).
+//! Doctor/bugreport reports active thread counts by kind.
 
-// Stub — impl lands in next commit.
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+fn census() -> &'static Mutex<HashMap<&'static str, AtomicU32>> {
+    static CENSUS: OnceLock<Mutex<HashMap<&'static str, AtomicU32>>> = OnceLock::new();
+    CENSUS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Register a thread of the given kind. Returns a guard that decrements
-/// the count on drop.
-pub fn register(_kind: &'static str) -> ThreadGuard {
-    todo!("thread census register not yet implemented")
+/// the count on drop. Call at the start of a spawned thread's body.
+pub fn register(kind: &'static str) -> ThreadGuard {
+    let mut map = census().lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(kind)
+        .or_insert_with(|| AtomicU32::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+    ThreadGuard { kind }
 }
 
 /// Snapshot of current thread counts by kind.
 pub fn snapshot() -> Vec<(&'static str, u32)> {
-    todo!("thread census snapshot not yet implemented")
+    let map = census().lock().unwrap_or_else(|e| e.into_inner());
+    map.iter()
+        .map(|(k, v)| (*k, v.load(Ordering::Relaxed)))
+        .filter(|(_, count)| *count > 0)
+        .collect()
 }
 
 /// RAII guard — decrements the census count for its kind on drop.
-pub struct ThreadGuard;
+pub struct ThreadGuard {
+    kind: &'static str,
+}
+
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        let map = census().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(counter) = map.get(self.kind) {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -50,11 +77,11 @@ mod tests {
             let b = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 let _guard = register("test_multi");
-                b.wait();
-                b.wait();
+                b.wait(); // all 3 threads alive
+                b.wait(); // wait for main to snapshot
             }));
         }
-        barrier.wait();
+        barrier.wait(); // all 3 alive
         let snap = snapshot();
         let count = snap
             .iter()
@@ -62,7 +89,7 @@ mod tests {
             .map(|(_, v)| *v)
             .unwrap_or(0);
         assert_eq!(count, 3, "3 threads registered");
-        barrier.wait();
+        barrier.wait(); // release threads
         for h in handles {
             h.join().expect("join");
         }
