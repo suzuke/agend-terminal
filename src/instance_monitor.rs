@@ -1,7 +1,8 @@
 //! Instance monitor — collects per-instance OS-level metrics (RSS, CPU%, uptime)
 //! and exposes them for the TUI Monitor tab.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Collection interval — operator Q7 ack'd 5 seconds.
@@ -32,7 +33,7 @@ fn cache() -> &'static Arc<Mutex<Vec<InstanceMetrics>>> {
 
 /// Read the latest metrics snapshot. Returns empty vec if no collection has run.
 pub fn latest_metrics() -> Vec<InstanceMetrics> {
-    cache().lock().unwrap_or_else(|e| e.into_inner()).clone()
+    cache().lock().clone()
 }
 
 /// Spawn a dedicated monitor collection thread at 5s interval.
@@ -64,7 +65,7 @@ pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
         let reg = crate::agent::lock_registry(registry);
         reg.iter()
             .map(|(name, handle)| {
-                let pid = handle.child.lock().ok().and_then(|c| c.process_id());
+                let pid = handle.child.lock().process_id();
                 (name.clone(), pid)
             })
             .collect()
@@ -75,13 +76,12 @@ pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
         let (agent_state, health_state) = {
             let reg = crate::agent::lock_registry(registry);
             reg.get(&name)
-                .and_then(|h| {
-                    h.core.lock().ok().map(|c| {
-                        (
-                            c.state.get_state().display_name().to_string(),
-                            c.health.state.display_name().to_string(),
-                        )
-                    })
+                .map(|h| {
+                    let c = h.core.lock();
+                    (
+                        c.state.get_state().display_name().to_string(),
+                        c.health.state.display_name().to_string(),
+                    )
                 })
                 .unwrap_or_else(|| ("unknown".into(), "unknown".into()))
         };
@@ -118,7 +118,7 @@ pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
     }
 
     metrics.sort_by(|a, b| a.name.cmp(&b.name));
-    *cache().lock().unwrap_or_else(|e| e.into_inner()) = metrics;
+    *cache().lock() = metrics;
 }
 
 /// Recursively sum RSS for a process and all its descendants.

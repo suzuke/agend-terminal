@@ -7,8 +7,9 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{self, Config};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use parking_lot::Mutex;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Fallback cell for snapshot out-of-bounds (should never happen, but
 /// defense-in-depth against arithmetic bugs in snapshot indexing).
@@ -54,7 +55,8 @@ impl EventListener for PtyWriteListener {
     fn send_event(&self, event: Event) {
         let Event::PtyWrite(text) = event else { return };
         let Some(writer) = &self.writer else { return };
-        if let Ok(mut w) = writer.lock() {
+        {
+            let mut w = writer.lock();
             let _ = w.write_all(text.as_bytes());
             let _ = w.flush();
         }

@@ -34,8 +34,9 @@
 //! Violations risk deadlocks under concurrent supervisor tick + MCP
 //! handler load.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 /// Paired in-memory heartbeat state — readers see consistent snapshot at
 /// lock acquisition time.
@@ -80,7 +81,7 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<Mutex<HeartbeatPair>>>> {
 /// the same name return the same `Arc` so writers and readers share the
 /// same `Mutex`.
 pub fn pair_for(name: &str) -> Arc<Mutex<HeartbeatPair>> {
-    let mut map = crate::sync::lock_poisoned(registry(), "heartbeat_pair_registry");
+    let mut map = registry().lock();
     map.entry(name.to_string()).or_default().clone()
 }
 
@@ -88,7 +89,7 @@ pub fn pair_for(name: &str) -> Arc<Mutex<HeartbeatPair>> {
 /// `Copy` struct, releases. Use when the caller only needs a read view.
 pub fn snapshot_for(name: &str) -> HeartbeatPair {
     let pair = pair_for(name);
-    let g = crate::sync::lock_poisoned(&pair, "heartbeat_pair");
+    let g = pair.lock();
     *g
 }
 
@@ -101,7 +102,7 @@ where
     F: FnOnce(&mut HeartbeatPair),
 {
     let pair = pair_for(name);
-    let mut g = crate::sync::lock_poisoned(&pair, "heartbeat_pair");
+    let mut g = pair.lock();
     f(&mut g);
 }
 

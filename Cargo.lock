@@ -31,6 +31,7 @@ dependencies = [
  "hex",
  "iana-time-zone",
  "libc",
+ "parking_lot",
  "portable-pty",
  "ratatui",
  "regex",

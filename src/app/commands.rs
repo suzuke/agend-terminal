@@ -297,7 +297,8 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
         "status" => {
             let reg = agent::lock_registry(ctx.registry);
             for (name, handle) in reg.iter() {
-                if let Ok(core) = handle.core.lock() {
+                {
+                    let core = handle.core.lock();
                     tracing::info!(agent = name, state = ?core.state.get_state(), "status");
                 }
             }

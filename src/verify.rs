@@ -3,10 +3,11 @@
 //! `agend-terminal verify` runs all tests with auto daemon lifecycle.
 
 use crate::{agent, api, backend, daemon, inbox, instructions};
+use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct TestResult {
     name: String,
@@ -135,8 +136,8 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
             .name("verify_api".into())
             .spawn(move || {
                 let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let configs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-                let externals = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+                let externals = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
                 api::serve(&api_home, api_reg, shutdown, configs, externals, None)
             })
             .ok();
@@ -170,9 +171,9 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
     // --- Cleanup ---
     // Kill test agents
     {
-        let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
+        let reg = registry.lock();
         for (_, handle) in reg.iter() {
-            let mut child = crate::sync::lock_poisoned(&handle.child, "verify_child");
+            let mut child = handle.child.lock();
             let _ = child.kill();
         }
     }
@@ -248,27 +249,20 @@ fn test_attach(_home: &Path) -> TestResult {
     }
     std::thread::sleep(std::time::Duration::from_secs(1));
     {
-        let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
+        let reg = registry.lock();
         let _ = agent::write_to_agent(reg.get("verify-attach").unwrap(), b"echo VERIFY_OK\r");
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let output = {
-        let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
-        let core =
-            crate::sync::lock_poisoned(&reg.get("verify-attach").unwrap().core, "verify_core");
+        let reg = registry.lock();
+        let core = reg.get("verify-attach").unwrap().core.lock();
         String::from_utf8_lossy(&core.vterm.dump_screen()).to_string()
     };
     let ok = output.contains("VERIFY_OK");
 
-    let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
-    let _ = reg
-        .get("verify-attach")
-        .unwrap()
-        .child
-        .lock()
-        .unwrap()
-        .kill();
+    let reg = registry.lock();
+    let _ = reg.get("verify-attach").unwrap().child.lock().kill();
 
     TestResult::from_bool(
         "attach",
@@ -503,21 +497,19 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(preset.ready_timeout_secs);
             let ready = poll_until(deadline, || {
-                let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
+                let reg = registry.lock();
                 reg.get(&agent_name)
                     .map(|h| {
-                        let core = crate::sync::lock_poisoned(&h.core, "verify_core");
+                        let core = h.core.lock();
                         re.is_match(&String::from_utf8_lossy(&core.vterm.dump_screen()))
                     })
                     .unwrap_or(false) // Agent reaped
             });
 
             if !ready {
-                let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
+                let reg = registry.lock();
                 if let Some(handle) = reg.get(&agent_name) {
-                    let dump = crate::sync::lock_poisoned(&handle.core, "verify_core")
-                        .vterm
-                        .dump_screen();
+                    let dump = handle.core.lock().vterm.dump_screen();
                     let stripped = crate::agent::strip_ansi_pub(&String::from_utf8_lossy(&dump));
                     tracing::debug!(%name, "VTerm at timeout:");
                     for (i, line) in stripped.lines().enumerate() {
@@ -542,7 +534,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             // 4. Inject + submit test (only if ready)
             if ready {
                 let inject_ok = {
-                    let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
+                    let reg = registry.lock();
                     reg.get(&agent_name)
                         .map(|h| {
                             agent::write_to_agent(
@@ -565,7 +557,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             // 5. Graceful quit — try quit command, then Ctrl+C/D, then force kill
             std::thread::sleep(std::time::Duration::from_secs(2));
             {
-                let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
+                let reg = registry.lock();
                 if let Some(h) = reg.get(&agent_name) {
                     let _ = agent::write_to_agent(
                         h,
@@ -574,9 +566,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
                 }
             }
 
-            let is_gone = || {
-                !crate::sync::lock_poisoned(&registry, "verify_registry").contains_key(&agent_name)
-            };
+            let is_gone = || !registry.lock().contains_key(&agent_name);
             let mut quit_ok = poll_until(
                 std::time::Instant::now() + std::time::Duration::from_secs(5),
                 &is_gone,
@@ -584,7 +574,7 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
 
             if !quit_ok {
                 {
-                    let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
+                    let reg = registry.lock();
                     if let Some(h) = reg.get(&agent_name) {
                         let _ = agent::write_to_agent(h, &[0x03]); // Ctrl+C
                         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -598,9 +588,9 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
             }
 
             if !quit_ok {
-                let reg = crate::sync::lock_poisoned(&registry, "verify_registry");
+                let reg = registry.lock();
                 if let Some(h) = reg.get(&agent_name) {
-                    let _ = crate::sync::lock_poisoned(&h.child, "verify_child").kill();
+                    let _ = h.child.lock().kill();
                 }
             }
 

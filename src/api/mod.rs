@@ -5,13 +5,14 @@
 //! registry and loopback-binding rules.
 
 use crate::agent::{self, AgentRegistry, ExternalRegistry};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 mod handlers;
 
@@ -533,10 +534,11 @@ mod tests {
 
     /// Serializes tests that mutate `AGEND_ALLOWED_WORK_ROOTS` — env mutation
     /// from parallel tests races otherwise.
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
+    fn env_guard() -> parking_lot::MutexGuard<'static, ()> {
+        use parking_lot::Mutex;
+        use std::sync::OnceLock;
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        crate::sync::lock_poisoned(LOCK.get_or_init(|| Mutex::new(())), "api_env_guard")
+        LOCK.get_or_init(|| Mutex::new(())).lock()
     }
 
     fn tmp_home(name: &str) -> std::path::PathBuf {
@@ -735,23 +737,23 @@ mod tests {
 
     /// Test-only notifier that records every event for later assertion.
     struct RecordingNotifier {
-        events: std::sync::Mutex<Vec<ApiEvent>>,
+        events: parking_lot::Mutex<Vec<ApiEvent>>,
     }
 
     impl RecordingNotifier {
         fn new() -> Self {
             Self {
-                events: std::sync::Mutex::new(Vec::new()),
+                events: parking_lot::Mutex::new(Vec::new()),
             }
         }
         fn take(&self) -> Vec<ApiEvent> {
-            std::mem::take(&mut *self.events.lock().expect("recording lock"))
+            std::mem::take(&mut *self.events.lock())
         }
     }
 
     impl ApiNotifier for RecordingNotifier {
         fn notify(&self, event: ApiEvent) {
-            self.events.lock().expect("recording lock").push(event);
+            self.events.lock().push(event);
         }
     }
 
@@ -940,11 +942,11 @@ mod tests {
         crate::auth_cookie::issue(&run_dir).unwrap();
 
         let registry: AgentRegistry =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let configs: ConfigRegistry =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let externals: crate::agent::ExternalRegistry =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let h = home.clone();
@@ -1778,9 +1780,9 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     /// Shared env-var guard for tests that set AGEND_API_READ_TIMEOUT_SECS.
-    fn timeout_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        crate::sync::lock_poisoned(&GUARD, "timeout_test_guard")
+    fn timeout_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+        static GUARD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        GUARD.lock()
     }
 
     /// Spawn api::serve in-process with empty registries. Returns (port, cookie, shutdown, home_dir).
@@ -1812,10 +1814,10 @@ mod tests {
             std::env::remove_var("AGEND_API_READ_TIMEOUT_SECS");
         }
 
-        let registry: AgentRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let configs: ConfigRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let configs: ConfigRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let externals: crate::agent::ExternalRegistry =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
         let home_clone = home.clone();

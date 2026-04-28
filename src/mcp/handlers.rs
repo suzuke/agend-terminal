@@ -1821,33 +1821,33 @@ instances:
 
     use crate::channel::sink_registry::registry as ux_sink_registry;
     use crate::channel::ux_event::{FleetEvent, UxEvent, UxEventSink};
-    use crate::sync::lock_poisoned;
-    use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+    use parking_lot::{Mutex, MutexGuard};
+    use std::sync::Arc;
 
     fn fleet_test_guard() -> MutexGuard<'static, ()> {
-        static GUARD: StdMutex<()> = StdMutex::new(());
-        lock_poisoned(&GUARD, "fleet_test_guard")
+        static GUARD: Mutex<()> = Mutex::new(());
+        GUARD.lock()
     }
 
     struct Recorder {
-        events: StdMutex<Vec<UxEvent>>,
+        events: Mutex<Vec<UxEvent>>,
     }
 
     impl Recorder {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                events: StdMutex::new(Vec::new()),
+                events: Mutex::new(Vec::new()),
             })
         }
 
         fn snapshot(&self) -> Vec<UxEvent> {
-            lock_poisoned(&self.events, "recorder").clone()
+            self.events.lock().clone()
         }
     }
 
     impl UxEventSink for Recorder {
         fn emit(&self, event: &UxEvent) {
-            lock_poisoned(&self.events, "recorder").push(event.clone());
+            self.events.lock().push(event.clone());
         }
     }
 

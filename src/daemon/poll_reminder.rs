@@ -2,9 +2,9 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::state::AgentState;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
 
 /// Per-agent de-dup state: last notified unread count.
 static LAST_NOTIFIED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
@@ -12,10 +12,7 @@ static LAST_NOTIFIED: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
 /// Atomic check-and-record: returns true if count changed (should notify),
 /// and records the new count in the same lock scope.
 fn should_notify_and_record(name: &str, count: usize) -> bool {
-    let mut guard = match LAST_NOTIFIED.lock() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
+    let mut guard = LAST_NOTIFIED.lock();
     let map = guard.get_or_insert_with(HashMap::new);
     let prev = map.get(name).copied().unwrap_or(0);
     if prev == count {
@@ -31,10 +28,7 @@ pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(Str
     let mut result = Vec::new();
     let reg = agent::lock_registry(registry);
     for (name, handle) in reg.iter() {
-        let agent_state = match handle.core.lock() {
-            Ok(c) => c.state.current,
-            Err(_) => continue,
-        };
+        let agent_state = handle.core.lock().state.current;
         if agent_state != AgentState::Idle {
             continue;
         }
@@ -79,8 +73,9 @@ mod tests {
     use super::*;
     use crate::agent::{AgentCore, AgentHandle};
     use crate::state::StateTracker;
+    use parking_lot::Mutex;
     use portable_pty::native_pty_system;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Arc;
 
     fn tmp_home(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -148,22 +143,22 @@ mod tests {
         let handle = AgentHandle {
             name: name.to_string(),
             backend_command: "test".to_string(),
-            pty_writer: Arc::new(StdMutex::new(writer)),
-            pty_master: Arc::new(StdMutex::new(pair.master)),
-            core: Arc::new(StdMutex::new(core)),
-            child: Arc::new(StdMutex::new(child)),
+            pty_writer: Arc::new(Mutex::new(writer)),
+            pty_master: Arc::new(Mutex::new(pair.master)),
+            core: Arc::new(Mutex::new(core)),
+            child: Arc::new(Mutex::new(child)),
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),
             typed_inject: false,
         };
-        let reg: AgentRegistry = Arc::new(StdMutex::new(HashMap::new()));
-        reg.lock().unwrap().insert(name.to_string(), handle);
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        reg.lock().insert(name.to_string(), handle);
         reg
     }
 
     /// Reset dedup state for a specific agent to allow fresh test runs.
     fn reset_dedup(name: &str) {
-        let mut guard = LAST_NOTIFIED.lock().unwrap();
+        let mut guard = LAST_NOTIFIED.lock();
         if let Some(map) = guard.as_mut() {
             map.remove(name);
         }

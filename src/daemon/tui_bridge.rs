@@ -114,25 +114,21 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
                 loop {
                     match framing::read_tagged_frame(&mut reader) {
                         Ok((TAG_DATA, data)) => {
-                            if crate::sync::lock_poisoned(&pty_writer, "pty_writer")
-                                .write_all(&data)
-                                .is_err()
-                            {
+                            if pty_writer.lock().write_all(&data).is_err() {
                                 break;
                             }
                         }
                         Ok((TAG_RESIZE, data)) if data.len() == 4 => {
                             let cols = u16::from_be_bytes([data[0], data[1]]);
                             let rows = u16::from_be_bytes([data[2], data[3]]);
-                            let _ = crate::sync::lock_poisoned(&pty_master, "pty_master").resize(
-                                PtySize {
-                                    rows,
-                                    cols,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                },
-                            );
-                            if let Ok(mut c) = core.lock() {
+                            let _ = pty_master.lock().resize(PtySize {
+                                rows,
+                                cols,
+                                pixel_width: 0,
+                                pixel_height: 0,
+                            });
+                            {
+                                let mut c = core.lock();
                                 c.vterm.resize(cols, rows);
                             }
                         }

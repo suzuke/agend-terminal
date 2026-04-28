@@ -151,10 +151,11 @@ pub fn run(
             }),
         );
     };
-    let cleanup_for_handler = std::sync::Arc::new(std::sync::Mutex::new(Some(cleanup)));
+    let cleanup_for_handler = std::sync::Arc::new(parking_lot::Mutex::new(Some(cleanup)));
     let handler_ref = cleanup_for_handler.clone();
     ctrlc::set_handler(move || {
-        if let Ok(mut guard) = handler_ref.lock() {
+        {
+            let mut guard = handler_ref.lock();
             if let Some(f) = guard.take() {
                 f();
             }
@@ -168,7 +169,8 @@ pub fn run(
 
     // 12. Deregister from daemon (normal exit path — handler not triggered)
     // Consume the handler so it won't run again
-    if let Ok(mut guard) = cleanup_for_handler.lock() {
+    {
+        let mut guard = cleanup_for_handler.lock();
         guard.take();
     }
     let _ = crate::api::call(

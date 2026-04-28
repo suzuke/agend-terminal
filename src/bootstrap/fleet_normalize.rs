@@ -11,9 +11,9 @@
 
 use crate::backend::Backend;
 use crate::fleet::{self, FleetConfig, InstanceConfig, InstanceYamlEntry};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 // Sprint 23 P1 (default-open reversal) — `default_built_in_outbound_capabilities`
 // retired. Built-in instances (`general` + future auto-created coordinators)
@@ -106,7 +106,7 @@ fn walk_resolved_dirs(config: &FleetConfig) {
 /// per directory so hot-reloads don't spam the log with the same warning.
 fn warn_shared_cwd_once(dir: &Path, names: &[String]) {
     static WARNED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
-    let mut guard = crate::sync::lock_poisoned(&WARNED, "shared_cwd_warned");
+    let mut guard = WARNED.lock();
     let set = guard.get_or_insert_with(HashSet::new);
     if !set.insert(dir.to_path_buf()) {
         return;

@@ -26,10 +26,10 @@
 //! production runs see zero registered sinks and emissions are
 //! effectively no-ops.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 
 use super::ux_event::{UxEvent, UxEventSink};
-use crate::sync::lock_poisoned;
 
 /// Crate-level singleton. Lazily initialized on first access so neither
 /// the daemon nor tests need an explicit init step.
@@ -45,7 +45,7 @@ pub fn registry() -> &'static UxSinkRegistry {
 /// Fan-out container for [`UxEventSink`] impls. Registration is
 /// bootstrap-only in production code paths (Telegram adapter registers
 /// itself once) and emit is fire-and-forget, so a plain `Mutex` matches
-/// the rest of the crate's locking style (`src/sync.rs::lock_poisoned`)
+/// the rest of the crate's locking style (`parking_lot::Mutex`)
 /// — no reason to reach for `RwLock` when there's no contention.
 #[derive(Default)]
 pub struct UxSinkRegistry {
@@ -57,7 +57,7 @@ impl UxSinkRegistry {
     /// Registration order is preserved. Adapters typically register
     /// themselves once during bootstrap and never deregister.
     pub fn register(&self, sink: Arc<dyn UxEventSink>) {
-        lock_poisoned(&self.sinks, "ux_sink_registry").push(sink);
+        self.sinks.lock().push(sink);
     }
 
     /// Fan out `event` to every registered sink in insertion order.
@@ -68,8 +68,7 @@ impl UxSinkRegistry {
         // Snapshot under the lock, then release before invoking sinks
         // so a slow sink can't block registration or other emits. The
         // `Arc` clone is cheap.
-        let snapshot: Vec<Arc<dyn UxEventSink>> =
-            lock_poisoned(&self.sinks, "ux_sink_registry").clone();
+        let snapshot: Vec<Arc<dyn UxEventSink>> = self.sinks.lock().clone();
         for sink in &snapshot {
             sink.emit(event);
         }
@@ -79,7 +78,7 @@ impl UxSinkRegistry {
     /// need to assert registration state without reaching into
     /// internals.
     pub fn len(&self) -> usize {
-        lock_poisoned(&self.sinks, "ux_sink_registry").len()
+        self.sinks.lock().len()
     }
 
     /// True when no sinks are registered. Production callers never
@@ -96,7 +95,7 @@ impl UxSinkRegistry {
     /// not call it.
     #[cfg(test)]
     pub fn clear_for_test(&self) {
-        lock_poisoned(&self.sinks, "ux_sink_registry").clear();
+        self.sinks.lock().clear();
     }
 }
 
@@ -122,7 +121,7 @@ mod tests {
 
     impl UxEventSink for RecordingSink {
         fn emit(&self, event: &UxEvent) {
-            lock_poisoned(&self.events, "recording_sink").push(event.clone());
+            self.events.lock().push(event.clone());
         }
     }
 
@@ -143,7 +142,7 @@ mod tests {
         let sink = super::tests::RecordingSink::new();
         reg.register(sink.clone() as Arc<dyn UxEventSink>);
         reg.emit(&make_fleet_event());
-        assert_eq!(lock_poisoned(&sink.events, "test").len(), 1);
+        assert_eq!(sink.events.lock().len(), 1);
     }
 
     /// Multiple sinks all see every emission in insertion order.
@@ -156,8 +155,8 @@ mod tests {
         reg.register(s2.clone() as Arc<dyn UxEventSink>);
         reg.emit(&make_fleet_event());
         reg.emit(&make_fleet_event());
-        assert_eq!(lock_poisoned(&s1.events, "test").len(), 2);
-        assert_eq!(lock_poisoned(&s2.events, "test").len(), 2);
+        assert_eq!(s1.events.lock().len(), 2);
+        assert_eq!(s2.events.lock().len(), 2);
     }
 
     /// An emit into an empty registry is a harmless no-op. This is

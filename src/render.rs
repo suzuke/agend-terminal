@@ -101,8 +101,7 @@ fn state_color(state: AgentState) -> Color {
 fn get_agent_state(registry: &AgentRegistry, name: &str) -> AgentState {
     let reg = agent::lock_registry(registry);
     reg.get(name)
-        .and_then(|h| h.core.lock().ok())
-        .map(|c| c.state.get_state())
+        .map(|h| h.core.lock().state.get_state())
         .unwrap_or(AgentState::Idle)
 }
 

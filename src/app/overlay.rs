@@ -818,8 +818,9 @@ pub(super) fn handle_key(
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use parking_lot::Mutex;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())

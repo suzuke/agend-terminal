@@ -869,8 +869,8 @@ where
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
     use std::fs;
-    use std::sync::Mutex;
 
     /// Serializes tests that touch the global DISK_READONLY flag or rely on
     /// enqueue not being blocked by it. Without this, `test_readonly_on_disk_full`
@@ -1388,7 +1388,7 @@ mod tests {
 
     #[test]
     fn test_readonly_on_disk_full() {
-        let _guard = READONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = READONLY_TEST_LOCK.lock();
         // When DISK_READONLY is set, enqueue must fail and drain must still work.
         let home = tmp_home("readonly");
         enqueue(&home, "agent1", make_msg("a", "before")).ok();
@@ -1629,7 +1629,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_concurrent_same_agent() {
-        let _guard = READONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = READONLY_TEST_LOCK.lock();
         let home = tmp_home("concurrent-same");
         let home_arc = std::sync::Arc::new(home.clone());
         let mut handles = vec![];
@@ -1658,7 +1658,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_vs_drain_no_lost_msg() {
-        let _guard = READONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = READONLY_TEST_LOCK.lock();
         // Thread A enqueues 10 messages; thread B drains after each.
         // Total drained must equal 10 — no lost messages.
         let home = tmp_home("enqueue-vs-drain");
@@ -1704,7 +1704,7 @@ mod tests {
 
     #[test]
     fn test_concurrent_drain_no_duplicate_recovery() {
-        let _guard = READONLY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = READONLY_TEST_LOCK.lock();
         // Pre-write a stale .draining file with 3 messages.
         // Spawn 2 threads that both call drain simultaneously.
         // Total recovered messages must be exactly 3 (no duplicates).
@@ -2256,11 +2256,11 @@ mod tests {
     }
 
     /// Serialize tests that mutate AGEND_POINTER_ONLY_INJECT env var.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn test_pointer_only_feature_flag() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         std::env::set_var("AGEND_POINTER_ONLY_INJECT", "1");
         assert!(pointer_only_inject(), "flag=1 must enable pointer-only");
         std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
@@ -2268,7 +2268,7 @@ mod tests {
 
     #[test]
     fn test_pointer_only_disabled_default() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         std::env::remove_var("AGEND_POINTER_ONLY_INJECT");
         assert!(!pointer_only_inject(), "unset flag must default to false");
         std::env::set_var("AGEND_POINTER_ONLY_INJECT", "0");

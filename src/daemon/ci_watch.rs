@@ -1307,7 +1307,7 @@ mod tests {
 
         // Run check — should remove the watch
         let registry: AgentRegistry =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         check_ci_watches(&dir, &registry);
 
         assert!(!watch_path.exists(), "expired watch must be removed");
@@ -1340,7 +1340,7 @@ mod tests {
         std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
 
         let registry: AgentRegistry =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         check_ci_watches(&dir, &registry);
 
         assert!(watch_path.exists(), "fresh watch must be preserved");
@@ -1365,7 +1365,7 @@ mod tests {
         std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
 
         let registry: AgentRegistry =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         check_ci_watches(&dir, &registry);
 
         assert!(
@@ -1393,7 +1393,7 @@ mod tests {
         std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
 
         let registry: AgentRegistry =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         check_ci_watches(&dir, &registry);
 
         assert!(
@@ -1443,7 +1443,7 @@ mod tests {
         std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).unwrap();
 
         let registry: AgentRegistry =
-            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         check_ci_watches(&dir, &registry);
 
         assert!(
@@ -1455,7 +1455,7 @@ mod tests {
 
     // --- MockCiProvider + state machine tests ---
 
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     /// Mock CI provider for testing ci_check_repo state machine without HTTP.
     struct MockCiProvider {
@@ -1486,7 +1486,7 @@ mod tests {
         }
 
         fn with_pr_terminal(self) -> Self {
-            *self.pr_state.lock().unwrap() = PrState::Terminal { merged: true };
+            *self.pr_state.lock() = PrState::Terminal { merged: true };
             self
         }
     }
@@ -1494,14 +1494,14 @@ mod tests {
     #[async_trait::async_trait]
     impl CiProvider for MockCiProvider {
         async fn poll_runs(&self, _repo: &str, _branch: &str) -> anyhow::Result<CiPollResult> {
-            Ok(self.poll_result.lock().unwrap().take().unwrap())
+            Ok(self.poll_result.lock().take().unwrap())
         }
         async fn check_pr_terminal(&self, _repo: &str, _branch: &str) -> PrState {
-            let mut guard = self.pr_state.lock().unwrap();
+            let mut guard = self.pr_state.lock();
             std::mem::replace(&mut *guard, PrState::Open)
         }
         async fn fetch_failure_summary(&self, _repo: &str, _run_id: u64) -> String {
-            self.failure_summary.lock().unwrap().clone()
+            self.failure_summary.lock().clone()
         }
         fn token_warning(&self) -> Option<&'static str> {
             None
@@ -1528,7 +1528,7 @@ mod tests {
         .unwrap();
 
         let registry: AgentRegistry =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1635,7 +1635,7 @@ mod tests {
         let provider = MockCiProvider::with_runs(vec![]).with_pr_terminal();
 
         let registry: AgentRegistry =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1736,7 +1736,7 @@ mod tests {
         let watch_path = ci_dir.join(&filename);
         std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
         let registry: AgentRegistry =
-            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         check_ci_watches(&dir, &registry);
         assert!(watch_path.exists(), "backoff watch must be preserved");
         std::fs::remove_dir_all(&dir).ok();

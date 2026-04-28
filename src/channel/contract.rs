@@ -186,8 +186,9 @@ fn assert_display_tag_is_stable(make_binding: &impl Fn(&str) -> BindingRef) {
 
 fn assert_attach_registry_is_repeatable<C: Channel>(ch: &C) {
     use crate::agent::AgentRegistry;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     let r1: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let r2: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     ch.attach_registry(r1);
@@ -208,9 +209,10 @@ fn assert_attach_registry_is_repeatable<C: Channel>(ch: &C) {
 mod tests {
     use super::*;
     use crate::channel::telegram::{TelegramBindingPayload, TelegramChannel, TelegramState};
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     /// Construct a `BindingRef` shaped for the Telegram adapter without
     /// hitting the teloxide runtime — mirrors what

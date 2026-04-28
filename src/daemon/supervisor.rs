@@ -61,10 +61,7 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
         // allocates a fresh String, so the lock window is bounded by the
         // vterm copy — no async IO or string formatting held against it.
         let action: Option<NoticeAction> = {
-            let mut core = match core.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut core = core.lock();
 
             // Sprint 23 P0 F6 fix: read heartbeat via in-memory pair lock
             // for consistent snapshot. Pre-fix code did `read_heartbeat_age`

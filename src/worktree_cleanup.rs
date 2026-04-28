@@ -173,7 +173,7 @@ pub fn sweep_from_registry(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -208,14 +208,14 @@ mod tests {
 
     #[test]
     fn test_flag_disabled_default() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         assert!(!auto_cleanup_enabled());
     }
 
     #[test]
     fn test_flag_enabled() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
         assert!(auto_cleanup_enabled());
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_sweep_noop_when_flag_disabled() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         let configs = HashMap::new();
         let removed = sweep_from_registry(&configs, &[]);
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_v2_merged_worktree_removed() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("v2-merged");
         git_in(&repo, &["branch", "feat/done"]);
         let wt = repo.join("wt-done");
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_v2_dirty_worktree_preserved() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("v2-dirty");
         git_in(&repo, &["branch", "feat/dirty"]);
         let wt = repo.join("wt-dirty");
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn test_v2_unmerged_worktree_preserved() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("v2-unmerged");
         git_in(&repo, &["branch", "feat/wip"]);
         let wt = repo.join("wt-wip");
@@ -314,7 +314,7 @@ mod tests {
     fn test_v2_active_runtime_worktree_not_removed_under_bootstrap_redirect() {
         // Production shape: agent's working_dir is <repo>/.worktrees/<agent>,
         // worktree_source is <repo>. Sweep must NOT remove the active worktree.
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock();
         let repo = setup_test_repo("v2-active");
         git_in(&repo, &["branch", "feat/active"]);
         let wt = repo.join("wt-active");

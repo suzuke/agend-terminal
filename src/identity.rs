@@ -64,7 +64,7 @@ mod tests {
         // SAFETY: env mutation in tests is racy; serialize via a mutex.
         // `set_var`/`remove_var` are unsafe in 2024 because they mutate
         // process-global state.
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock().lock();
         unsafe {
             std::env::set_var("AGEND_INSTANCE_NAME", "dev-1");
         }
@@ -75,8 +75,9 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        use std::sync::{Mutex, OnceLock};
+    fn env_lock() -> &'static parking_lot::Mutex<()> {
+        use parking_lot::Mutex;
+        use std::sync::OnceLock;
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
