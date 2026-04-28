@@ -11,8 +11,10 @@
 //! request, then issues a second request and asserts the bridge succeeds
 //! without surfacing the transport error.
 //!
-//! Pair with the daemon-side fix that lengthens the post-auth read timeout
-//! (`AGEND_API_POST_AUTH_READ_TIMEOUT_SECS`, default 300s).
+//! Pair with the daemon-side fix that drops the post-auth read deadline
+//! when the active peer PID watcher (PR #263) is the real liveness check.
+//! Override via `AGEND_API_POST_AUTH_READ_TIMEOUT_SECS` for environments
+//! that disable the watcher or want a hard ceiling.
 
 #![allow(clippy::unwrap_used)]
 
