@@ -2214,26 +2214,15 @@ impl crate::channel::Channel for TelegramChannel {
         crate::channel::auth::is_outbound_authorized(&lock_state(&self.state).user_allowlist)
     }
 
-    /// Phase 5b unified entry for agent-callable outbound. Routes the
+    /// Unified entry for agent-callable outbound. Routes the
     /// four MCP→Channel bridge surfaces (`reply` / `react` / `edit` /
-    /// `inject_provenance`) through the per-instance
-    /// `outbound_capabilities` gate (gradual-migration permissive
-    /// default per Sprint 21 Phase 5b scope freeze
-    /// `d-20260427015616035999-10`).
+    /// `inject_provenance`) through the adapter-level allowlist gate.
     ///
     /// Order of checks:
     /// 1. Adapter-level outbound gate ([`Self::outbound_authorized`]) —
     ///    if the operator has not configured `user_allowlist`, drop
     ///    everything (PR #216 contract).
-    /// 2. Per-agent capability lookup —
-    ///    [`crate::channel::auth::gate_outbound_for_agent`]:
-    ///    - `OutboundCapabilityDecision::Allowed` → dispatch
-    ///    - `OutboundCapabilityDecision::Rejected` → typed error
-    ///    - `OutboundCapabilityDecision::OpenDefault` → dispatch (Sprint
-    ///      23 P1 default-open: missing `outbound_capabilities` is the
-    ///      canonical posture for the single-operator threat model;
-    ///      operator declares the field only to opt out via `[]` or
-    ///      restrict via selective list).
+    /// 2. Dispatch to platform-specific send.
     fn send_from_agent(
         &self,
         agent: &str,
@@ -2249,14 +2238,8 @@ impl crate::channel::Channel for TelegramChannel {
             )));
         }
 
-        // Step 2: per-agent capability gate via shared helper (Sprint 22 P0
-        // Phase 5b — `gate_outbound_for_agent` centralises the policy so
-        // future Discord/Slack adapters can't accidentally bypass).
-        let kind = op.kind();
+        // Step 2: dispatch to platform-specific send.
         let home = lock_state(&self.state).home.clone();
-        crate::channel::auth::gate_outbound_for_agent(&home, agent, kind)?;
-
-        // Step 3: dispatch to platform-specific send.
         match op {
             crate::channel::AgentOutboundOp::Reply { text } => {
                 let (msg_id, _chat_id) =
@@ -2299,10 +2282,6 @@ impl crate::channel::Channel for TelegramChannel {
         }
     }
 }
-
-// (Sprint 22 P0) `lookup_outbound_capabilities` moved to
-// `crate::channel::auth` so all `Channel::send_from_agent` impls share
-// one fleet.yaml lookup path. See `auth::gate_outbound_for_agent`.
 
 /// Placeholder `MsgRef` returned when the underlying op (React /
 /// InjectProvenance) does not surface a usable platform message id.
@@ -3677,10 +3656,8 @@ instances:
 
     /// Phase 5b: when the operator has not configured `user_allowlist`,
     /// `send_from_agent` MUST reject all four `AgentOutboundOp` variants
-    /// at the adapter-level outbound gate (Step 1) — even if the
-    /// per-instance `outbound_capabilities` config is empty / missing.
-    /// Step 1 (allowlist) is the load-bearing gate; Step 2 (per-agent
-    /// caps) only runs when Step 1 passes.
+    /// at the adapter-level outbound gate when `user_allowlist` is not
+    /// configured. The allowlist is the load-bearing gate.
     #[test]
     fn send_from_agent_rejects_when_user_allowlist_unconfigured() {
         use crate::channel::Channel;
@@ -3696,39 +3673,48 @@ instances:
         // All four AgentOutboundOp variants must reject at Step 1
         // (allowlist gate). They never reach Step 2 (capability gate)
         // or Step 3 (platform dispatch).
-        let ops = [
-            crate::channel::AgentOutboundOp::Reply {
-                text: "leak".to_string(),
-            },
-            crate::channel::AgentOutboundOp::React {
-                emoji: "👀".to_string(),
-                message_id: None,
-            },
-            crate::channel::AgentOutboundOp::Edit {
-                message_id: "1".to_string(),
-                new_text: "x".to_string(),
-            },
-            crate::channel::AgentOutboundOp::InjectProvenance {
-                from: "a".to_string(),
-                task: "t".to_string(),
-            },
+        let ops: Vec<(&str, crate::channel::AgentOutboundOp)> = vec![
+            (
+                "reply",
+                crate::channel::AgentOutboundOp::Reply {
+                    text: "leak".to_string(),
+                },
+            ),
+            (
+                "react",
+                crate::channel::AgentOutboundOp::React {
+                    emoji: "👀".to_string(),
+                    message_id: None,
+                },
+            ),
+            (
+                "edit",
+                crate::channel::AgentOutboundOp::Edit {
+                    message_id: "1".to_string(),
+                    new_text: "x".to_string(),
+                },
+            ),
+            (
+                "inject_provenance",
+                crate::channel::AgentOutboundOp::InjectProvenance {
+                    from: "a".to_string(),
+                    task: "t".to_string(),
+                },
+            ),
         ];
-        for op in ops {
-            let kind = op.kind();
+        for (label, op) in ops {
             let result = channel.send_from_agent("agent1", op);
             assert!(
                 result.is_err(),
-                "Step 1 outbound gate must reject {} when user_allowlist=None",
-                kind.as_str()
+                "outbound gate must reject {label} when user_allowlist=None",
             );
             let err_str = format!(
                 "{}",
-                result.expect_err("Step 1 outbound gate must reject on user_allowlist=None")
+                result.expect_err("outbound gate must reject on user_allowlist=None")
             );
             assert!(
                 err_str.contains("user_allowlist not configured"),
-                "error must name the missing config for {}: {err_str}",
-                kind.as_str()
+                "error must name the missing config for {label}: {err_str}",
             );
         }
     }

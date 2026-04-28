@@ -226,23 +226,14 @@ pub trait Channel: Send + Sync {
         false
     }
 
-    /// Phase 5b unified entry for **agent-callable** outbound operations.
+    /// Unified entry for **agent-callable** outbound operations.
     ///
     /// Fan-in for the four MCP→Channel bridge surfaces (`reply`, `react`,
-    /// `edit_message`, `delegate_task` provenance side-channel) so the
-    /// per-instance `outbound_capabilities` gate cannot be bypassed.
-    /// Replaces the direct `try_telegram_*` calls at
-    /// `src/mcp/handlers.rs:74,88,102,399` (Sprint 21 Phase 2 third sub-PR
-    /// triangulation audit C1 finding).
+    /// `edit_message`, `delegate_task` provenance side-channel).
     ///
     /// Implementations must:
     /// 1. Check [`Self::outbound_authorized`] (PR #216 allowlist gate).
-    /// 2. Call [`auth::gate_outbound_for_agent`] which loads per-agent
-    ///    `outbound_capabilities` from fleet.yaml and resolves the
-    ///    decision (Allowed / Rejected / OpenDefault per Sprint 23 P1
-    ///    default-open semantics — missing field permits all ops, `[]`
-    ///    rejects all, selective list permits only listed).
-    /// 3. Dispatch to the platform-specific send.
+    /// 2. Dispatch to the platform-specific send.
     ///
     /// Default: `Err(NotSupported)` so adapters that haven't opted in
     /// fail closed.
@@ -284,19 +275,6 @@ pub enum AgentOutboundOp {
     /// `from` is the delegating agent's name; the trait method's `agent`
     /// arg is the receiving agent (whose topic gets the tag).
     InjectProvenance { from: String, task: String },
-}
-
-impl AgentOutboundOp {
-    /// Kind discriminator — used by `Channel::send_from_agent` impls to
-    /// look up the per-agent capability gate.
-    pub fn kind(&self) -> auth::ChannelOpKind {
-        match self {
-            Self::Reply { .. } => auth::ChannelOpKind::Reply,
-            Self::React { .. } => auth::ChannelOpKind::React,
-            Self::Edit { .. } => auth::ChannelOpKind::Edit,
-            Self::InjectProvenance { .. } => auth::ChannelOpKind::InjectProvenance,
-        }
-    }
 }
 
 /// Outbound notify gate — only forwards to [`Channel::notify`] when the
@@ -594,46 +572,6 @@ mod tests {
         assert!(
             err.to_string().contains("send_from_agent"),
             "error must name the missing method: {err}"
-        );
-    }
-
-    #[test]
-    fn agent_outbound_op_kind_discriminator_matches_variant() {
-        // `AgentOutboundOp::kind()` is consumed by the Phase 5b
-        // capability gate in adapter impls — the mapping must match
-        // the variant names so a future variant addition forces a
-        // compile error instead of silently bypassing the gate.
-        use auth::ChannelOpKind;
-        assert_eq!(
-            AgentOutboundOp::Reply {
-                text: "x".to_string()
-            }
-            .kind(),
-            ChannelOpKind::Reply
-        );
-        assert_eq!(
-            AgentOutboundOp::React {
-                emoji: "👀".to_string(),
-                message_id: None
-            }
-            .kind(),
-            ChannelOpKind::React
-        );
-        assert_eq!(
-            AgentOutboundOp::Edit {
-                message_id: "1".to_string(),
-                new_text: "x".to_string()
-            }
-            .kind(),
-            ChannelOpKind::Edit
-        );
-        assert_eq!(
-            AgentOutboundOp::InjectProvenance {
-                from: "a".to_string(),
-                task: "t".to_string()
-            }
-            .kind(),
-            ChannelOpKind::InjectProvenance
         );
     }
 }
