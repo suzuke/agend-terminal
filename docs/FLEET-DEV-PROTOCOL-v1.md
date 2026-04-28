@@ -414,6 +414,7 @@ cargo test <test-name>          # MUST observe pass
 - **Test-only PRs** (the test IS the deliverable; no separate impl).
 - **Dependency bumps** with no source-tree changes beyond `Cargo.toml` / lockfile.
 - **EMERGENCY hotfix** — production-down / data-loss-risk / security-breach scenarios may fast-track without test-first IF (a) the PR title carries an `[EMERGENCY]` tag with rationale, AND (b) a backfill PR adding the regression test merges within 24 hours. The orchestrator (typically dev-lead) approves the emergency tag at dispatch time; the reviewer notes the deferral in the verdict.
+- **Pure deletion PRs** — implementation removal + corresponding test rename/assertion-flip in the same commit; no new behavior asserted. Qualifies when (a) test changes ARE the only test deliverable (rename existing tests to assert new behavior, not new failing assertions), AND (b) deletion is grep-verifiable at code-review time (reviewer can confirm the removed code path has 0 hits in production). Reviewer attestation: `pure deletion verified: <grep-command> → 0 hits in production code path`. Canonical example: PR #262 `a3cfa09` KILL Content-Length fallback — tests renamed to assert NDJSON-only skip behavior, impl deleted CL parse path, `grep -rn "Content-Length" src/bin/agend-mcp-bridge.rs` → 0 hits.
 
 ##### Rationale
 
