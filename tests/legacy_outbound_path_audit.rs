@@ -149,8 +149,8 @@ fn mcp_handlers_do_not_accept_outbound_capabilities_arg() {
     // chain grows (e.g. future MCP handlers that dispatch into new
     // sub-modules with instance-config mutation surfaces).
     let scanned_files: &[&str] = &[
-        "mcp/handlers.rs", // top-level MCP dispatch (Sprint 22 P0 original scope)
-        "deployments.rs",  // `deploy_template` arm dispatches here (Sprint 22 P0 M1 finding)
+        "mcp/handlers/mod.rs", // top-level MCP dispatch (Sprint 22 P0 original scope)
+        "deployments.rs",      // `deploy_template` arm dispatches here (Sprint 22 P0 M1 finding)
     ];
 
     let mut violations: Vec<String> = Vec::new();

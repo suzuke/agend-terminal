@@ -66,7 +66,10 @@ const EXEMPTED_LEGACY_FILES: &[(&str, &str)] = &[
     // TODO Sprint 22 sweep — MCP handler-internal worker threads (owner:
     // MCP / dev-reviewer-2. Sites 809/1572 inside specific MCP tool
     // handlers — shutdown semantics depend on tool's own lifecycle).
-    ("mcp/handlers.rs", "MCP handler-internal worker threads"),
+    (
+        "mcp/handlers/instance.rs",
+        "MCP handler-internal worker threads",
+    ),
     // TODO Sprint 22 sweep — verify subprocess driver (owner: daemon /
     // verify subsystem. Sites 125/134 drive subprocess lifecycle —
     // owner-judgement needed for the "subprocess died" branch).

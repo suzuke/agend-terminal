@@ -49,7 +49,7 @@ fn bridge_unwraps_daemon_response_for_tools_call() {
 /// This ensures the proxy path covers the same tools as direct invocation.
 #[test]
 fn five_tool_sample_all_routed_through_handle_tool() {
-    let src = std::fs::read_to_string("src/mcp/handlers.rs").expect("read handlers.rs");
+    let src = std::fs::read_to_string("src/mcp/handlers/mod.rs").expect("read handlers mod.rs");
     let tools = [
         "list_instances",
         "reply",
