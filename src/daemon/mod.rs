@@ -190,7 +190,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
     }
 
-    run_core(home, agents, None, None)
+    run_core(home, agents, None)
 }
 
 /// Start daemon with a fleet already prepared by [`crate::bootstrap::prepare`].
@@ -206,20 +206,16 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     // scope so flock / cookie / telegram / config persist for the full run.
     let home = prepared.home.clone();
     let agents = std::mem::take(&mut prepared.agents);
-    // Reuse the already-parsed FleetConfig for the initial reload digest;
-    // avoids re-reading + re-parsing fleet.yaml inside run_core.
-    let initial_digest = crate::bootstrap::reload::digest_from_config(&prepared.config);
     let telegram = prepared.telegram.clone();
     // Reconcile fleet.yaml teams: section → teams.json (additive only)
     crate::teams::reconcile_teams(&home, &prepared.config);
     let _owned = prepared;
-    run_core(&home, agents, Some(initial_digest), telegram)
+    run_core(&home, agents, telegram)
 }
 
 fn run_core(
     home: &Path,
     agents: Vec<AgentDef>,
-    initial_digest: Option<HashMap<String, crate::bootstrap::reload::InstanceDigest>>,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
 ) -> anyhow::Result<()> {
     // Sprint 25 P0 Option F: mark this process as the daemon so
@@ -357,20 +353,6 @@ fn run_core(
     replay_missed_at_startup(home, &registry);
 
     let mut last_snapshot_json = String::new();
-
-    // Hot-reload watcher: poll fleet.yaml mtime on each tick. `known_digest`
-    // starts from the initial fleet (so a reload detects only real changes,
-    // not startup state) and advances as added agents materialize. Removed /
-    // command-changed / args-changed / working_dir-changed are warn-only; see
-    // `bootstrap::reload` docs for policy.
-    let fleet_path = home.join("fleet.yaml");
-    let mut fleet_watcher = crate::bootstrap::reload::FleetWatcher::new(fleet_path.clone());
-    let mut known_digest = initial_digest.unwrap_or_else(|| {
-        crate::fleet::FleetConfig::load(&fleet_path)
-            .ok()
-            .map(|c| crate::bootstrap::reload::digest_from_config(&c))
-            .unwrap_or_default()
-    });
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -594,20 +576,6 @@ fn run_core(
             {
                 poll_reminder::poll_reminder_pass(home, &registry);
             }
-        }
-
-        // Hot-reload: poll fleet.yaml; spawn newly-added instances, warn on
-        // changes we can't safely apply in-flight.
-        if let Some(new_cfg) = fleet_watcher.check() {
-            apply_fleet_reload(
-                home,
-                &new_cfg,
-                &mut known_digest,
-                &registry,
-                &configs,
-                &crash_tx,
-                &shutdown,
-            );
         }
 
         // Handle crash event (if any)
@@ -835,117 +803,6 @@ fn run_core(
     Ok(())
 }
 
-/// Apply a newly-loaded fleet.yaml to the running daemon.
-///
-/// Policy:
-/// - **added**: resolve via `bootstrap::resolve_one` and spawn in-place. The
-///   new agent gets the same `AgentConfig` registration (for respawn) and
-///   per-agent TUI server as any startup agent.
-/// - **removed / command_changed / args_changed / working_dir_changed**: log
-///   a warn. Tearing down a live PTY to realign fleet.yaml risks destroying
-///   in-progress user work, so the operator has to explicitly `delete` /
-///   `restart` the agent.
-/// - **role_changed / topic_id_changed**: log. These fields only matter at
-///   spawn time for instructions generation and Telegram routing; a safe
-///   in-place swap needs more plumbing (instructions files are read by the
-///   agent process, routing tables are cached elsewhere).
-///
-/// `known_digest` is advanced to the new fleet's digest on successful apply
-/// so the next tick's diff is computed relative to the just-applied state.
-#[allow(clippy::too_many_arguments)]
-fn apply_fleet_reload(
-    home: &Path,
-    new_config: &crate::fleet::FleetConfig,
-    known_digest: &mut HashMap<String, crate::bootstrap::reload::InstanceDigest>,
-    registry: &AgentRegistry,
-    configs: &Arc<Mutex<HashMap<String, AgentConfig>>>,
-    crash_tx: &crossbeam::channel::Sender<String>,
-    shutdown: &Arc<std::sync::atomic::AtomicBool>,
-) {
-    let new_digest = crate::bootstrap::reload::digest_from_config(new_config);
-    let diff = crate::bootstrap::reload::compute_diff(known_digest, &new_digest);
-    if diff.is_empty() {
-        return;
-    }
-
-    tracing::info!(
-        added = ?diff.added,
-        removed = ?diff.removed,
-        command_changed = ?diff.command_changed,
-        args_changed = ?diff.args_changed,
-        role_changed = ?diff.role_changed,
-        topic_id_changed = ?diff.topic_id_changed,
-        working_dir_changed = ?diff.working_dir_changed,
-        "fleet.yaml reload",
-    );
-
-    for name in &diff.removed {
-        tracing::warn!(agent = %name, "fleet.yaml removed agent — left running; use `delete` to tear down");
-    }
-    for name in &diff.command_changed {
-        tracing::warn!(agent = %name, "fleet.yaml command changed — requires manual restart (would kill live session)");
-    }
-    for name in &diff.args_changed {
-        tracing::warn!(agent = %name, "fleet.yaml args changed — requires manual restart");
-    }
-    for name in &diff.working_dir_changed {
-        tracing::warn!(agent = %name, "fleet.yaml working_directory changed — requires manual restart");
-    }
-    // Role changes get a live broadcast — every running agent has the
-    // old role in its `## Fleet Peers` (or `## Team`) block, so the
-    // `<fleet-update kind="role-changed">` marker lets them update
-    // their mental model without waiting for a respawn. The subject
-    // itself also receives the marker so its own `## Identity` Role
-    // line stays accurate. Closes the "log-and-skip" TODO in
-    // bootstrap/reload.rs line 10-14.
-    for name in &diff.role_changed {
-        let new_role = new_config.instances.get(name).and_then(|c| c.role.clone());
-        tracing::info!(
-            agent = %name,
-            new_role = ?new_role,
-            "fleet.yaml role changed — broadcasting to running agents"
-        );
-        crate::fleet_broadcast::broadcast(
-            home,
-            registry,
-            &crate::fleet_broadcast::FleetUpdate::RoleChanged {
-                name: name.clone(),
-                new_role,
-            },
-        );
-    }
-    for name in &diff.topic_id_changed {
-        tracing::info!(agent = %name, "fleet.yaml topic_id changed — won't be reflected until agent respawns");
-    }
-
-    let added_count = diff.added.len();
-    for (idx, name) in diff.added.iter().enumerate() {
-        let Some(agent_def) = crate::bootstrap::resolve_one(new_config, name) else {
-            tracing::warn!(agent = %name, "failed to resolve newly-added instance");
-            continue;
-        };
-        let added_name = agent_def.0.clone();
-        if let Err(e) =
-            spawn_and_register_agent(home, &agent_def, registry, configs, crash_tx, shutdown)
-        {
-            tracing::warn!(agent = %added_name, error = %e, "failed to spawn reload-added agent");
-            continue;
-        }
-        crate::event_log::log(
-            home,
-            "reload_add",
-            &added_name,
-            "agent added via fleet.yaml reload",
-        );
-        tracing::info!(agent = %added_name, "spawned via fleet.yaml reload");
-        if added_count > 1 && idx + 1 < added_count {
-            std::thread::sleep(spawn_stagger());
-        }
-    }
-
-    *known_digest = new_digest;
-}
-
 /// Replay missed one-shot schedules on daemon startup.
 /// Calls `schedules::replay_missed_oneshots` and fires each returned
 /// schedule through the same path as `cron_tick::check_schedules`.
@@ -1081,8 +938,8 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
     }
 }
 
-/// Staggered-spawn delay — rate-limits PTY init during multi-agent bursts
-/// (startup or hot-reload). Tunable via `AGEND_SPAWN_STAGGER_MS`.
+/// Staggered-spawn delay — rate-limits PTY init during multi-agent startup
+/// bursts. Tunable via `AGEND_SPAWN_STAGGER_MS`.
 fn spawn_stagger() -> std::time::Duration {
     let ms: u64 = std::env::var("AGEND_SPAWN_STAGGER_MS")
         .ok()
@@ -1092,9 +949,9 @@ fn spawn_stagger() -> std::time::Duration {
 }
 
 /// Shared "spawn one agent + register respawn config + start per-agent TUI
-/// server" path. Used by startup (run_core), hot-reload (apply_fleet_reload),
-/// and any future add-agent call site. Rolls back the `configs` entry on
-/// spawn failure so retries start clean.
+/// server" path. Used by startup (run_core) and any future add-agent call
+/// site. Rolls back the `configs` entry on spawn failure so retries start
+/// clean.
 fn spawn_and_register_agent(
     home: &Path,
     def: &crate::bootstrap::AgentDef,

@@ -185,18 +185,14 @@ pub struct ManagedSession {
 - **`fleet start`**: Parse config → spawn all instances → wait for ready patterns.
 - **`fleet stop`**: Graceful shutdown all (quit command → grace → kill).
 - **`fleet restart <name>`**: Kill + respawn single instance, preserve session ID.
-- **Hot reload**: `notify` crate watches `fleet.yaml`. On change:
-  - New instances → spawn
-  - Removed instances → kill
-  - Changed config → restart affected instances
-  - Unchanged → no-op
+- **fleet.yaml edits require a daemon restart** (Sprint 29 PR-6). The hot-reload diff engine was removed — KISS for a single-user dev tool where daemon restart costs ~5 seconds. Operators edit `fleet.yaml`, then stop and re-launch the daemon. All agents respawn with the new config on next start.
 
 ### vs Node.js
 
 | Node.js | Rust |
 |---|---|
 | FleetManager creates tmux windows | FleetManager spawns PTY sessions directly |
-| Config reload requires manual restart | `notify` crate watches file, hot reload |
+| Config reload requires manual restart | Same — fleet.yaml edits need daemon restart |
 | Sequential shutdown to avoid race | Parallel shutdown, no races |
 
 ---

@@ -70,11 +70,12 @@ pub enum FleetUpdate {
         added: Vec<String>,
         removed: Vec<String>,
     },
-    /// An instance's `role` field in fleet.yaml was edited. Emitted by
-    /// the daemon hot-reload path (`apply_fleet_reload` consuming
-    /// `ReloadDiff::role_changed`) — operators editing fleet.yaml
-    /// directly previously left running agents unaware of the change
-    /// until respawn.
+    /// An instance's `role` field in fleet.yaml changed. Variant retained
+    /// for the broadcast format and tests; live producers were removed
+    /// alongside the fleet.yaml hot-reload path (Sprint 29 PR-6) — fleet.yaml
+    /// edits now require a daemon restart, at which point all agents
+    /// re-read role from fleet.yaml on respawn.
+    #[allow(dead_code)]
     RoleChanged {
         name: String,
         new_role: Option<String>,

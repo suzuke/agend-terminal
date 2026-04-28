@@ -221,7 +221,7 @@ Adversary writes `Closes t-victim-N` in PR body → step 2 fails (author ≠ tas
 | 1 | PR closed-without-merge (rejected/withdrawn) | Sweep emits NO event; task stays open per E3.1 owner-mutation expectation |
 | 2 | PR merged via revert-merge | Sweep emits `Done` then potentially `Reopened` event chain on revert detection |
 | 3 | Force-pushed past auto-close commit | Sweep validates current main HEAD; immutable JSONL log preserves prior `PrMerged` event for audit |
-| 4 | Hot-reload `fleet.yaml` mid-sweep | Sweep uses snapshot of fleet.yaml at sweep-start; FleetWatcher events queue until next sweep |
+| 4 | ~~Hot-reload `fleet.yaml` mid-sweep~~ | N/A as of Sprint 29 PR-6 — hot-reload removed; fleet.yaml edits require daemon restart |
 | 5 | Operator manual `task done` while sweep in-flight | Append-only naturally handles via timestamp ordering; idempotency check in `task_events::append()` (re-close = no-op + log) |
 | 6 | Legacy 28 replay determinism | Events ordered by PR mergedAt timestamp, deterministic replay regardless of sweep run order |
 | 7 | Sweep failure (network, GitHub 5xx, panic) | Heartbeat event missing in next tick → operator sees gap → manual `task list --diagnose` runs ad-hoc sweep |

@@ -16,11 +16,9 @@ mod agent_resolve;
 pub mod daemon_spawn;
 pub(crate) mod doctor;
 mod fleet_normalize;
-pub mod reload;
 pub mod signals;
 mod telegram_init;
 
-pub(crate) use agent_resolve::resolve_one;
 pub use agent_resolve::AgentDef;
 
 use anyhow::{anyhow, Context, Result};
@@ -46,11 +44,12 @@ pub enum BootstrapOutcome {
 /// us. Fleet is normalized and every instance is resolved into a spawn-ready
 /// [`AgentDef`].
 ///
-/// Some fields are scaffolding for follow-on work (e.g. hot-reload of
-/// fleet.yaml needs `fleet_path`, `cookie` is read by tests + may be read by
-/// callers that want to avoid re-reading the cookie file per connection).
-/// `#[allow(dead_code)]` is applied per-field so genuinely new unused fields
-/// still trip `-D warnings` in CI.
+/// Some fields are scaffolding for follow-on work — `fleet_path` is retained
+/// for diagnostics and operator-facing tools that need to surface the active
+/// fleet config; `cookie` is read by tests + may be read by callers that want
+/// to avoid re-reading the cookie file per connection. `#[allow(dead_code)]`
+/// is applied per-field so genuinely new unused fields still trip `-D warnings`
+/// in CI.
 pub struct OwnedFleet {
     pub home: PathBuf,
     #[allow(dead_code)]
