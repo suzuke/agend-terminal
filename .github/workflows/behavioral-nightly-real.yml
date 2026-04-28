@@ -1,0 +1,33 @@
+name: Behavioral Nightly (Real Backend)
+
+on:
+  workflow_dispatch:
+    inputs:
+      backends:
+        description: 'Comma-separated backends to test (claude,kiro-cli,codex,gemini,opencode)'
+        required: false
+        default: 'claude'
+
+# Real-backend tests require CLI binaries installed on the runner.
+# Use workflow_dispatch to trigger manually on a machine with backends.
+#
+# Prerequisites:
+#   - Install target backend CLIs (claude, kiro-cli, codex, etc.)
+#   - Ensure AGEND_TELEGRAM_BOT_TOKEN is NOT set (avoids real Telegram traffic)
+#   - Run: gh workflow run behavioral-nightly-real.yml --field backends=claude,kiro-cli
+#
+# Tests run:
+#   cargo test -- --ignored backend_harness
+#   (requires real CLI binaries in PATH)
+
+jobs:
+  real-backend:
+    name: Real backend spawn (${{ github.event.inputs.backends }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run backend harness tests
+        run: cargo test -- --ignored backend_harness
+        env:
+          RUST_LOG: debug

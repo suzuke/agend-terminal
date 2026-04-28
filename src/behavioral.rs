@@ -168,6 +168,18 @@ pub struct DivergenceStats {
     pub diverge: u64,
 }
 
+impl DivergenceStats {
+    /// Divergence rate as percentage (0.0–100.0).
+    /// Sprint 27 condition #1: ≤5% gate for behavioral promotion.
+    pub fn divergence_rate(&self) -> f64 {
+        if self.total_ticks == 0 {
+            0.0
+        } else {
+            self.diverge as f64 / self.total_ticks as f64 * 100.0
+        }
+    }
+}
+
 /// Global divergence accumulator — keyed by backend name.
 static DIVERGENCE: parking_lot::Mutex<Option<std::collections::HashMap<String, DivergenceStats>>> =
     parking_lot::Mutex::new(None);
@@ -184,7 +196,7 @@ pub fn record_divergence(backend: &str, behavioral: BehavioralSignal, regex_stat
         BehavioralSignal::SilenceIdle => "idle",
         BehavioralSignal::None => regex_state, // no signal = agree by default
     };
-    if behavioral_implies == regex_state || behavioral == BehavioralSignal::None {
+    if behavioral_implies == regex_state {
         stats.agree += 1;
     } else {
         stats.diverge += 1;
@@ -192,7 +204,12 @@ pub fn record_divergence(backend: &str, behavioral: BehavioralSignal, regex_stat
 }
 
 /// Get divergence report for all backends.
-#[allow(dead_code)] // Used by tests + future CLI command
+/// Reset divergence stats (test isolation).
+#[allow(dead_code)]
+pub fn reset_divergence() {
+    *DIVERGENCE.lock() = None;
+}
+
 pub fn divergence_report() -> Vec<(String, DivergenceStats)> {
     let guard = DIVERGENCE.lock();
     match guard.as_ref() {
@@ -213,8 +230,9 @@ pub fn divergence_report() -> Vec<(String, DivergenceStats)> {
     }
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 #[allow(clippy::unwrap_used)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
