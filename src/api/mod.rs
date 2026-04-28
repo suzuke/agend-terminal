@@ -327,36 +327,22 @@ fn handle_session(
         tracing::debug!(peer_pid = pid, "API session peer PID");
     }
 
-    // Liveness model post-auth:
-    //
-    // - Authenticated peers are trusted; the 5 s slow-loris timeout from
-    //   `serve` was the pre-handshake gate, and applying it to subsequent
-    //   reads broke long-lived bridge sessions whenever the gap between two
-    //   MCP calls exceeded 5 s.
-    // - When the peer reported its PID at handshake, the active watcher
-    //   below detects a dead bridge in ~2 s and tears down the stream, so
-    //   the read can wait indefinitely without risk of stuck threads.
-    // - When no PID was reported (legacy clients), fall back to a finite
-    //   read deadline so a vanished peer eventually frees the worker.
-    //
-    // The exact post-auth deadline is overridable via
-    // `AGEND_API_POST_AUTH_READ_TIMEOUT_SECS` for environments that disable
-    // the watcher or want a hard ceiling.
-    let post_auth_timeout = post_auth_read_timeout(peer_pid);
-    // `reader` and `writer` are clones of the same underlying socket, so
-    // a single SO_RCVTIMEO covers both directions of the loop's reads.
-    let _ = reader.get_ref().set_read_timeout(post_auth_timeout);
-
     // Sprint 25 P3: active peer PID watch — detect dead bridge within ~2s
-    // instead of waiting for the read timeout. Spawn a background watcher
-    // that polls kill(pid, 0) and shuts down the stream on death. Must run
-    // AFTER the timeout adjustment above so the watcher's `shutdown_stream`
-    // clone inherits the right deadline.
+    // instead of waiting for 30s TCP read timeout. Spawn a background
+    // watcher that polls kill(pid, 0) and shuts down the stream on death.
     if let Some(pid) = peer_pid {
         if let Ok(shutdown_stream) = writer.try_clone() {
             spawn_peer_pid_watcher(pid, shutdown_stream);
         }
     }
+    // Note: the per-line read timeout from `serve` (5 s default) deliberately
+    // stays in force post-auth. PID watcher and slow-loris defense are
+    // *orthogonal*: the watcher catches a peer that died, the read timeout
+    // catches a peer that is alive but drip-feeding (DoS via thread
+    // exhaustion). An authenticated client can still be malicious — auth
+    // gates *who* may speak, not *how slowly*. Idle bridges live with this
+    // by reconnecting transparently — see `proxy_request` in
+    // `src/bin/agend-mcp-bridge.rs`.
 
     loop {
         let mut line = String::new();
@@ -457,29 +443,6 @@ fn is_process_alive(pid: u32) -> bool {
 /// // fire-and-forget: watcher self-terminates when peer dies or stream
 /// // is already closed. No JoinHandle join needed — session thread
 /// // exits independently and the watcher's stream shutdown is idempotent.
-/// Resolve the post-auth read deadline for an authenticated session.
-///
-/// - When `AGEND_API_POST_AUTH_READ_TIMEOUT_SECS` is set, that value wins
-///   regardless of whether the peer reports a PID — gives operators a hard
-///   ceiling for environments that disable the watcher.
-/// - When the peer reports a PID, return `None` so reads block indefinitely;
-///   `spawn_peer_pid_watcher` is the real liveness check (~2 s detection).
-/// - Otherwise fall back to a generous finite deadline so a vanished
-///   no-PID peer eventually frees the worker thread.
-fn post_auth_read_timeout(peer_pid: Option<u32>) -> Option<std::time::Duration> {
-    if let Some(secs) = std::env::var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        return Some(std::time::Duration::from_secs(secs));
-    }
-    if peer_pid.is_some() {
-        None
-    } else {
-        Some(std::time::Duration::from_secs(60))
-    }
-}
-
 fn spawn_peer_pid_watcher(pid: u32, stream: std::net::TcpStream) {
     // fire-and-forget: PID watcher polls until peer dies then self-exits.
     // Stream shutdown is idempotent; if session already closed, shutdown
@@ -588,53 +551,6 @@ mod tests {
         use std::sync::OnceLock;
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock()
-    }
-
-    /// Liveness invariant: when the peer's PID is known the active watcher
-    /// detects death in ~2 s, so the per-line read timeout drops to `None`
-    /// and idle MCP sessions don't get killed by their own deadman switch.
-    /// Without a PID we still want a finite ceiling so vanished peers free
-    /// the worker thread.
-    #[test]
-    fn post_auth_timeout_with_pid_is_unbounded_without_pid_is_finite() {
-        let _g = env_guard();
-        // SAFETY: serialised by env_guard.
-        unsafe {
-            std::env::remove_var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS");
-        }
-        assert_eq!(
-            post_auth_read_timeout(Some(12345)),
-            None,
-            "PID watcher present → trust it, no read deadline"
-        );
-        let fallback = post_auth_read_timeout(None).expect("no-PID fallback must be finite");
-        assert!(
-            fallback >= std::time::Duration::from_secs(30),
-            "no-PID fallback must outlast typical idle gaps, got {fallback:?}"
-        );
-    }
-
-    /// `AGEND_API_POST_AUTH_READ_TIMEOUT_SECS` overrides both branches so an
-    /// operator can install a hard ceiling regardless of the watcher.
-    #[test]
-    fn post_auth_timeout_env_override_wins() {
-        let _g = env_guard();
-        // SAFETY: serialised by env_guard.
-        unsafe {
-            std::env::set_var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS", "7");
-        }
-        assert_eq!(
-            post_auth_read_timeout(Some(12345)),
-            Some(std::time::Duration::from_secs(7))
-        );
-        assert_eq!(
-            post_auth_read_timeout(None),
-            Some(std::time::Duration::from_secs(7))
-        );
-        // SAFETY: serialised by env_guard.
-        unsafe {
-            std::env::remove_var("AGEND_API_POST_AUTH_READ_TIMEOUT_SECS");
-        }
     }
 
     fn tmp_home(name: &str) -> std::path::PathBuf {
