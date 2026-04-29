@@ -1060,4 +1060,33 @@ mod tests {
         let text = vt.read_scrollback(100);
         assert!(text.is_empty(), "empty terminal must return empty string");
     }
+
+    #[test]
+    fn read_scrollback_trims_leading_blanks_then_windows() {
+        // Gemini-banner case: content at top, then 120+ blank padding rows.
+        // With a 50-line window, the old code captures the last 50 rows
+        // (all blank) and returns empty despite real content above.
+        let mut vt = VTerm::new(80, 10);
+        // Content first
+        for i in 1..=5 {
+            vt.process(format!("TESTLINE{i}\r\n").as_bytes());
+        }
+        // Then push 120 blank lines (simulates gemini padding)
+        for _ in 0..120 {
+            vt.process(b"\r\n");
+        }
+        let text = vt.read_scrollback(50);
+        assert!(
+            text.contains("TESTLINE1"),
+            "content above blank padding must surface, got: '{text}'"
+        );
+    }
+
+    #[test]
+    fn read_scrollback_empty_pty_still_returns_empty() {
+        // Regression guard: empty PTY must still return empty string
+        let vt = VTerm::new(80, 24);
+        let text = vt.read_scrollback(100);
+        assert!(text.is_empty(), "empty PTY must return empty string");
+    }
 }
