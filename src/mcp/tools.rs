@@ -363,4 +363,23 @@ mod tests {
             );
         }
     }
+
+    /// §3.5.10 invariant: tool count must match Sprint 30 wave-1 final state.
+    /// Update this assertion when adding/removing tools.
+    #[test]
+    fn tool_definitions_count_invariant_post_sprint_30() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        assert_eq!(
+            tools.len(),
+            26,
+            "Sprint 30 wave-1 final tool count = 26 unified. \
+             Adding/removing a tool requires updating this assertion. \
+             Current tools: {:?}",
+            tools
+                .iter()
+                .filter_map(|t| t["name"].as_str())
+                .collect::<Vec<_>>()
+        );
+    }
 }
