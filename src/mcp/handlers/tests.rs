@@ -1584,9 +1584,8 @@ fn resolve_team_layout_caller_override_preserved() {
 fn consolidated_decision_routes_correctly() {
     let home = tmp_home("decision-route");
     let r = super::handle_tool("decision", &json!({"action": "list"}), "test");
-    // list_decisions returns tasks array (may be empty)
     assert!(
-        r.get("error").is_none() || r["error"].as_str().unwrap_or("").contains(""),
+        r.get("error").is_none(),
         "decision list must not error: {r}"
     );
     std::fs::remove_dir_all(&home).ok();
@@ -1619,17 +1618,69 @@ fn consolidated_deployment_routes_list() {
 #[test]
 fn consolidated_ci_unknown_action_errors() {
     let r = super::handle_tool("ci", &json!({"action": "bogus"}), "test");
-    assert!(r.get("error").is_some(), "unknown ci action must error");
+    let err = r["error"].as_str().expect("must have error");
+    assert!(
+        err.contains("unknown ci action"),
+        "error must name the tool: {err}"
+    );
 }
 
 #[test]
 fn consolidated_health_unknown_action_errors() {
     let r = super::handle_tool("health", &json!({"action": "bogus"}), "test");
-    assert!(r.get("error").is_some(), "unknown health action must error");
+    let err = r["error"].as_str().expect("must have error");
+    assert!(
+        err.contains("unknown health action"),
+        "error must name the tool: {err}"
+    );
 }
 
 #[test]
 fn consolidated_repo_unknown_action_errors() {
     let r = super::handle_tool("repo", &json!({"action": "bogus"}), "test");
-    assert!(r.get("error").is_some(), "unknown repo action must error");
+    let err = r["error"].as_str().expect("must have error");
+    assert!(
+        err.contains("unknown repo action"),
+        "error must name the tool: {err}"
+    );
+}
+
+#[test]
+fn consolidated_decision_unknown_action_errors() {
+    let r = super::handle_tool("decision", &json!({"action": "bogus"}), "test");
+    let err = r["error"].as_str().expect("must have error");
+    assert!(
+        err.contains("unknown decision action"),
+        "error must name the tool: {err}"
+    );
+}
+
+#[test]
+fn consolidated_team_unknown_action_errors() {
+    let r = super::handle_tool("team", &json!({"action": "bogus"}), "test");
+    let err = r["error"].as_str().expect("must have error");
+    assert!(
+        err.contains("unknown team action"),
+        "error must name the tool: {err}"
+    );
+}
+
+#[test]
+fn consolidated_schedule_unknown_action_errors() {
+    let r = super::handle_tool("schedule", &json!({"action": "bogus"}), "test");
+    let err = r["error"].as_str().expect("must have error");
+    assert!(
+        err.contains("unknown schedule action"),
+        "error must name the tool: {err}"
+    );
+}
+
+#[test]
+fn consolidated_deployment_unknown_action_errors() {
+    let r = super::handle_tool("deployment", &json!({"action": "bogus"}), "test");
+    let err = r["error"].as_str().expect("must have error");
+    assert!(
+        err.contains("unknown deployment action"),
+        "error must name the tool: {err}"
+    );
 }
