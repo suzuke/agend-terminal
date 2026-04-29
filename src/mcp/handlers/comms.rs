@@ -612,11 +612,7 @@ mod tests {
     #[test]
     fn send_routes_to_broadcast_when_targets_present() {
         let args = json!({"targets": ["a", "b"], "message": "hello"});
-        let result = handle_unified_send(
-            &std::env::temp_dir(),
-            &args,
-            &None,
-        );
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
         // Broadcast without sender returns identity error
         assert!(result.get("error").is_some() || result.get("target").is_some());
     }
@@ -624,11 +620,7 @@ mod tests {
     #[test]
     fn send_routes_to_delegate_task_when_request_kind_task() {
         let args = json!({"target_instance": "dev", "message": "do X", "request_kind": "task"});
-        let result = handle_unified_send(
-            &std::env::temp_dir(),
-            &args,
-            &None,
-        );
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
         // delegate_task without sender returns identity error
         assert!(result.get("error").is_some());
     }
@@ -636,33 +628,21 @@ mod tests {
     #[test]
     fn send_routes_to_report_result_when_request_kind_report() {
         let args = json!({"target_instance": "lead", "message": "done", "request_kind": "report"});
-        let result = handle_unified_send(
-            &std::env::temp_dir(),
-            &args,
-            &None,
-        );
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
         assert!(result.get("error").is_some());
     }
 
     #[test]
     fn send_routes_to_request_information_when_request_kind_query() {
         let args = json!({"target_instance": "lead", "message": "what?", "request_kind": "query"});
-        let result = handle_unified_send(
-            &std::env::temp_dir(),
-            &args,
-            &None,
-        );
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
         assert!(result.get("error").is_some());
     }
 
     #[test]
     fn send_routes_to_send_to_instance_default() {
         let args = json!({"target_instance": "dev", "message": "hi"});
-        let result = handle_unified_send(
-            &std::env::temp_dir(),
-            &args,
-            &None,
-        );
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
         // send_to_instance without sender returns identity error
         assert!(result.get("error").is_some());
     }
