@@ -70,10 +70,7 @@ pub struct DiscordChannel {
 impl DiscordChannel {
     /// Production constructor. `event_rx` is the receiving end of the
     /// mpsc channel fed by the gateway reader task.
-    pub fn new(
-        event_rx: mpsc::Receiver<ChannelEvent>,
-        user_allowlist: Option<Vec<i64>>,
-    ) -> Self {
+    pub fn new(event_rx: mpsc::Receiver<ChannelEvent>, user_allowlist: Option<Vec<i64>>) -> Self {
         Self {
             state: Mutex::new(DiscordState {
                 instance_to_channel: HashMap::new(),
