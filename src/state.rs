@@ -174,7 +174,7 @@ impl StatePatterns {
                 // the completion banner — covered by the alternation below.
                 (
                     AgentState::ToolUse,
-                    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●⏺].*(Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)",
+                    r"(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●⏺]\s+(Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)\b",
                 ),
                 // [measured] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
@@ -1330,7 +1330,8 @@ mod tests {
     #[test]
     fn claude_tooluse_spinner_match() {
         let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-        let detected = patterns.detect("⠋Read file.txt");
+        // Real claude format: spinner glyph + space + tool name
+        let detected = patterns.detect("⠋ Read file.txt");
         assert_eq!(detected, Some(AgentState::ToolUse));
     }
 
