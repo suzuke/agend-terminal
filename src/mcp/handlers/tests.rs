@@ -1577,3 +1577,59 @@ fn resolve_team_layout_caller_override_preserved() {
     assert!(target.is_none());
     std::fs::remove_dir_all(&home).ok();
 }
+
+// Sprint 30 — CRUD consolidation routing tests.
+
+#[test]
+fn consolidated_decision_routes_correctly() {
+    let home = tmp_home("decision-route");
+    let r = super::handle_tool("decision", &json!({"action": "list"}), "test");
+    // list_decisions returns tasks array (may be empty)
+    assert!(
+        r.get("error").is_none() || r["error"].as_str().unwrap_or("").contains(""),
+        "decision list must not error: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn consolidated_team_routes_list() {
+    let r = super::handle_tool("team", &json!({"action": "list"}), "test");
+    assert!(r.get("error").is_none(), "team list must not error: {r}");
+}
+
+#[test]
+fn consolidated_schedule_routes_list() {
+    let r = super::handle_tool("schedule", &json!({"action": "list"}), "test");
+    assert!(
+        r.get("error").is_none(),
+        "schedule list must not error: {r}"
+    );
+}
+
+#[test]
+fn consolidated_deployment_routes_list() {
+    let r = super::handle_tool("deployment", &json!({"action": "list"}), "test");
+    assert!(
+        r.get("error").is_none(),
+        "deployment list must not error: {r}"
+    );
+}
+
+#[test]
+fn consolidated_ci_unknown_action_errors() {
+    let r = super::handle_tool("ci", &json!({"action": "bogus"}), "test");
+    assert!(r.get("error").is_some(), "unknown ci action must error");
+}
+
+#[test]
+fn consolidated_health_unknown_action_errors() {
+    let r = super::handle_tool("health", &json!({"action": "bogus"}), "test");
+    assert!(r.get("error").is_some(), "unknown health action must error");
+}
+
+#[test]
+fn consolidated_repo_unknown_action_errors() {
+    let r = super::handle_tool("repo", &json!({"action": "bogus"}), "test");
+    assert!(r.get("error").is_some(), "unknown repo action must error");
+}

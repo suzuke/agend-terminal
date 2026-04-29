@@ -124,8 +124,21 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "move_pane" => instance::handle_move_pane(&home, args),
         "report_health" => instance::handle_report_health(&home, args, instance_name, &sender),
         "clear_blocked_reason" => instance::handle_clear_blocked_reason(&home, args),
+        // Consolidated: health action=report/clear
+        "health" => match args["action"].as_str().unwrap_or("") {
+            "report" => instance::handle_report_health(&home, args, instance_name, &sender),
+            "clear" => instance::handle_clear_blocked_reason(&home, args),
+            other => json!({"error": format!("unknown health action: {other}")}),
+        },
 
-        // --- Decisions ---
+        // --- Decisions (consolidated: decision action=post/list/update) ---
+        "decision" => match args["action"].as_str().unwrap_or("") {
+            "post" => task::handle_post_decision(&home, args, instance_name, &sender),
+            "list" => task::handle_list_decisions(&home, args),
+            "update" => task::handle_update_decision(&home, args, instance_name),
+            other => json!({"error": format!("unknown decision action: {other}")}),
+        },
+        // Aliases (1-sprint migration window)
         "post_decision" => task::handle_post_decision(&home, args, instance_name, &sender),
         "list_decisions" => task::handle_list_decisions(&home, args),
         "update_decision" => task::handle_update_decision(&home, args, instance_name),
@@ -136,28 +149,63 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // --- Task sweep config ---
         "task_sweep_config" => task::handle_task_sweep_config(&home, args),
 
-        // --- Teams ---
+        // --- Teams (consolidated: team action=create/delete/list/update) ---
+        "team" => match args["action"].as_str().unwrap_or("") {
+            "create" => task::handle_create_team(&home, args),
+            "delete" => task::handle_delete_team(&home, args),
+            "list" => task::handle_list_teams(&home),
+            "update" => task::handle_update_team(&home, args),
+            other => json!({"error": format!("unknown team action: {other}")}),
+        },
+        // Aliases
         "create_team" => task::handle_create_team(&home, args),
         "delete_team" => task::handle_delete_team(&home, args),
         "list_teams" => task::handle_list_teams(&home),
         "update_team" => task::handle_update_team(&home, args),
 
-        // --- Scheduling ---
+        // --- Scheduling (consolidated: schedule action=create/list/update/delete) ---
+        "schedule" => match args["action"].as_str().unwrap_or("") {
+            "create" => schedule::handle_create_schedule(&home, args, instance_name),
+            "list" => schedule::handle_list_schedules(&home, args),
+            "update" => schedule::handle_update_schedule(&home, args),
+            "delete" => schedule::handle_delete_schedule(&home, args),
+            other => json!({"error": format!("unknown schedule action: {other}")}),
+        },
+        // Aliases
         "create_schedule" => schedule::handle_create_schedule(&home, args, instance_name),
         "list_schedules" => schedule::handle_list_schedules(&home, args),
         "update_schedule" => schedule::handle_update_schedule(&home, args),
         "delete_schedule" => schedule::handle_delete_schedule(&home, args),
 
-        // --- Deployments ---
+        // --- Deployments (consolidated: deployment action=deploy/teardown/list) ---
+        "deployment" => match args["action"].as_str().unwrap_or("") {
+            "deploy" => schedule::handle_deploy_template(&home, args, instance_name),
+            "teardown" => schedule::handle_teardown_deployment(&home, args),
+            "list" => schedule::handle_list_deployments(&home),
+            other => json!({"error": format!("unknown deployment action: {other}")}),
+        },
+        // Aliases
         "deploy_template" => schedule::handle_deploy_template(&home, args, instance_name),
         "teardown_deployment" => schedule::handle_teardown_deployment(&home, args),
         "list_deployments" => schedule::handle_list_deployments(&home),
 
-        // --- Repo access ---
+        // --- Repo access (consolidated: repo action=checkout/release) ---
+        "repo" => match args["action"].as_str().unwrap_or("") {
+            "checkout" => ci::handle_checkout_repo(&home, args, instance_name),
+            "release" => ci::handle_release_repo(args),
+            other => json!({"error": format!("unknown repo action: {other}")}),
+        },
+        // Aliases
         "checkout_repo" => ci::handle_checkout_repo(&home, args, instance_name),
         "release_repo" => ci::handle_release_repo(args),
 
-        // --- CI watch ---
+        // --- CI watch (consolidated: ci action=watch/unwatch) ---
+        "ci" => match args["action"].as_str().unwrap_or("") {
+            "watch" => ci::handle_watch_ci(&home, args, instance_name),
+            "unwatch" => ci::handle_unwatch_ci(&home, args),
+            other => json!({"error": format!("unknown ci action: {other}")}),
+        },
+        // Aliases
         "watch_ci" => ci::handle_watch_ci(&home, args, instance_name),
         "unwatch_ci" => ci::handle_unwatch_ci(&home, args),
 
