@@ -254,6 +254,34 @@ pub fn remove_worktree(repo_dir: &Path, worktree_name: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Checkout a branch in a worktree directory. Creates the branch from
+/// current HEAD if it doesn't exist. Best-effort: returns Ok on success,
+/// Err with message on failure.
+pub fn checkout_branch(worktree_dir: &Path, branch: &str) -> Result<(), String> {
+    // Try switching to existing branch first
+    let switch = std::process::Command::new("git")
+        .args(["switch", branch])
+        .current_dir(worktree_dir)
+        .output()
+        .map_err(|e| format!("git switch: {e}"))?;
+    if switch.status.success() {
+        tracing::info!(branch, dir = %worktree_dir.display(), "checked out branch");
+        return Ok(());
+    }
+    // Branch doesn't exist — create from current HEAD
+    let create = std::process::Command::new("git")
+        .args(["switch", "-c", branch])
+        .current_dir(worktree_dir)
+        .output()
+        .map_err(|e| format!("git switch -c: {e}"))?;
+    if create.status.success() {
+        tracing::info!(branch, dir = %worktree_dir.display(), "created and checked out branch");
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&create.stderr);
+    Err(format!("git switch -c {branch}: {}", stderr.trim()))
+}
+
 pub fn list_residual(repo_dir: &Path) -> Vec<String> {
     let wt_base = repo_dir.join(".worktrees");
     if !wt_base.exists() {
@@ -429,4 +457,35 @@ mod tests {
     // to `src/agent_ops.rs::tests` as part of Task #9 Option C epilogue — the
     // `validate_branch` fn itself lives in `agent_ops.rs` now, so tests are
     // colocated with their subject.
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn checkout_branch_creates_new_branch() {
+        let dir = std::env::temp_dir().join(format!("agend-wt-checkout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Checkout a new branch
+        assert!(checkout_branch(&dir, "feat/test-branch").is_ok());
+
+        // Verify we're on the new branch
+        let output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(branch, "feat/test-branch");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
