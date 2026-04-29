@@ -31,45 +31,31 @@ fn channel_tools() -> Vec<Value> {
 
 fn comm_tools() -> Vec<Value> {
     vec![
-        json!({"name": "send_to_instance", "description": "Send a message to another instance.",
+        // --- Unified send (Sprint 30: 5→1 consolidation) ---
+        json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast.",
             "inputSchema": {"type": "object", "properties": {
-                "instance_name": {"type": "string"}, "message": {"type": "string"},
-                "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"]},
-                "requires_reply": {"type": "boolean"}, "task_summary": {"type": "string"},
-                "correlation_id": {"type": "string"}, "working_directory": {"type": "string"}, "branch": {"type": "string"},
-                "thread_id": {"type": "string"}, "parent_id": {"type": "string"}
-            }, "required": ["instance_name", "message"]}}),
-        json!({"name": "delegate_task", "description": "Delegate a task to another instance (expects result report back).",
-            "inputSchema": {"type": "object", "properties": {
-                "target_instance": {"type": "string"}, "task": {"type": "string"},
-                "success_criteria": {"type": "string"}, "context": {"type": "string"},
+                "target_instance": {"type": "string", "description": "Target instance name (single recipient)"},
+                "targets": {"type": "array", "items": {"type": "string"}, "description": "Multiple targets (broadcast mode)"},
+                "team": {"type": "string", "description": "Team name (broadcast to team)"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
+                "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query)"},
+                "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior)"},
+                "requires_reply": {"type": "boolean"},
+                "task_summary": {"type": "string"},
+                "success_criteria": {"type": "string", "description": "For task delegation"},
+                "context": {"type": "string"},
                 "task_id": {"type": "string", "description": "Task board ID for correlation"},
-                "thread_id": {"type": "string"}, "parent_id": {"type": "string"},
+                "correlation_id": {"type": "string"},
+                "parent_id": {"type": "string"},
+                "thread_id": {"type": "string"},
                 "force": {"type": "boolean", "description": "Override busy gate (requires force_reason)"},
-                "force_reason": {"type": "string", "description": "Reason for force override (required when force=true)"},
-                "interrupt": {"type": "boolean", "description": "Deprecated: use 'force'. Override busy gate (requires reason)"},
-                "reason": {"type": "string", "description": "Deprecated: use 'force_reason'. Reason for interrupt"},
-                "second_reviewer": {"type": "boolean", "description": "Signal that this dispatch requests dual review (§3.5)"},
-                "second_reviewer_reason": {"type": "string", "description": "Reason for dual review (required when second_reviewer=true)"},
-                "branch": {"type": "string", "description": "Git branch the implementer should work on"}
-            }, "required": ["target_instance", "task"]}}),
-        json!({"name": "report_result", "description": "Report results back to the delegating instance.",
-            "inputSchema": {"type": "object", "properties": {
-                "target_instance": {"type": "string"}, "summary": {"type": "string"},
-                "correlation_id": {"type": "string"}, "artifacts": {"type": "string"},
+                "force_reason": {"type": "string"},
+                "second_reviewer": {"type": "boolean", "description": "Signal dual review (§3.5)"},
+                "second_reviewer_reason": {"type": "string"},
                 "reviewed_head": {"type": "string", "description": "Git HEAD SHA at time of review"},
-                "thread_id": {"type": "string"}, "parent_id": {"type": "string"}
-            }, "required": ["target_instance", "summary"]}}),
-        json!({"name": "request_information", "description": "Ask another instance a question (expects reply).",
-            "inputSchema": {"type": "object", "properties": {
-                "target_instance": {"type": "string"}, "question": {"type": "string"}, "context": {"type": "string"}
-            }, "required": ["target_instance", "question"]}}),
-        json!({"name": "broadcast", "description": "Send a message to multiple instances. Priority: team > targets > tags > all.",
-            "inputSchema": {"type": "object", "properties": {
-                "message": {"type": "string"}, "targets": {"type": "array", "items": {"type": "string"}},
-                "team": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}},
-                "task_summary": {"type": "string"}, "request_kind": {"type": "string", "enum": ["query", "task", "update"]},
-                "requires_reply": {"type": "boolean"}
+                "artifacts": {"type": "string"},
+                "branch": {"type": "string"},
+                "working_directory": {"type": "string"}
             }, "required": ["message"]}}),
         json!({"name": "inbox", "description": "Check pending messages.",
             "inputSchema": {"type": "object", "properties": {}}}),

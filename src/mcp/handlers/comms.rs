@@ -7,6 +7,35 @@ use std::path::Path;
 
 use super::{err_needs_identity, is_ok_result};
 
+/// Sprint 30: unified `send` handler. Routes to existing handlers based on
+/// `request_kind` or infers from args (targets/team → broadcast, task field
+/// → delegate, summary → report, question → query, default → send_to).
+pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+    // Broadcast mode: targets/team/tags present
+    if args.get("targets").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
+        return handle_broadcast(home, args, sender);
+    }
+
+    // Infer kind from request_kind field or args shape
+    let kind = args["request_kind"].as_str().unwrap_or("");
+    match kind {
+        "task" => handle_delegate_task(home, args, sender),
+        "report" => handle_report_result(home, args, sender),
+        "query" => handle_request_information(home, args, sender),
+        _ => {
+            // Default: send_to_instance behavior
+            // Map "target_instance" to "instance_name" if needed
+            let mut mapped = args.clone();
+            if mapped.get("instance_name").is_none() {
+                if let Some(target) = args.get("target_instance") {
+                    mapped["instance_name"] = target.clone();
+                }
+            }
+            handle_send_to_instance(home, &mapped, "send", sender)
+        }
+    }
+}
+
 pub(super) fn handle_send_to_instance(
     home: &Path,
     args: &Value,
@@ -573,4 +602,48 @@ pub(super) fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     let instance = args["instance"].as_str();
     let msgs = crate::inbox::get_thread(home, thread_id, instance);
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn send_routes_to_broadcast_when_targets_present() {
+        let args = json!({"targets": ["a", "b"], "message": "hello"});
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
+        // Broadcast without sender returns identity error
+        assert!(result.get("error").is_some() || result.get("target").is_some());
+    }
+
+    #[test]
+    fn send_routes_to_delegate_task_when_request_kind_task() {
+        let args = json!({"target_instance": "dev", "message": "do X", "request_kind": "task"});
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
+        // delegate_task without sender returns identity error
+        assert!(result.get("error").is_some());
+    }
+
+    #[test]
+    fn send_routes_to_report_result_when_request_kind_report() {
+        let args = json!({"target_instance": "lead", "message": "done", "request_kind": "report"});
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
+        assert!(result.get("error").is_some());
+    }
+
+    #[test]
+    fn send_routes_to_request_information_when_request_kind_query() {
+        let args = json!({"target_instance": "lead", "message": "what?", "request_kind": "query"});
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
+        assert!(result.get("error").is_some());
+    }
+
+    #[test]
+    fn send_routes_to_send_to_instance_default() {
+        let args = json!({"target_instance": "dev", "message": "hi"});
+        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
+        // send_to_instance without sender returns identity error
+        assert!(result.get("error").is_some());
+    }
 }

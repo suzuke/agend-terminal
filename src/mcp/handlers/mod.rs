@@ -97,8 +97,10 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "react" => channel::handle_react(args, instance_name),
         "download_attachment" => channel::handle_download_attachment(&home, args, instance_name),
 
-        // --- Cross-instance communication ---
-        "send_to_instance" | "send" => comms::handle_send_to_instance(&home, args, tool, &sender),
+        // --- Cross-instance communication (Sprint 30: unified send + aliases) ---
+        "send" => comms::handle_unified_send(&home, args, &sender),
+        // 1-sprint alias retention for backward compat
+        "send_to_instance" => comms::handle_send_to_instance(&home, args, tool, &sender),
         "delegate_task" => comms::handle_delegate_task(&home, args, &sender),
         "report_result" => comms::handle_report_result(&home, args, &sender),
         "request_information" => comms::handle_request_information(&home, args, &sender),

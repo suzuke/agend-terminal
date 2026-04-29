@@ -149,7 +149,7 @@ fn test_tools_list_count() {
     // Verify key tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(tool_names.contains(&"reply"));
-    assert!(tool_names.contains(&"delegate_task"));
+    assert!(tool_names.contains(&"send")); // Sprint 30: replaces delegate_task/report_result/etc
     assert!(tool_names.contains(&"post_decision"));
     assert!(tool_names.contains(&"task"));
     assert!(tool_names.contains(&"delete_team"));
