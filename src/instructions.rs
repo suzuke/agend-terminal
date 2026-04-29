@@ -1142,4 +1142,33 @@ mod tests {
             "BUSY format must include can_take_after field"
         );
     }
+
+    /// §3.5.10 production-path fixture: build_instructions_body (the
+    /// production code that generates PTY-injected system prompts) must
+    /// NOT contain `<fleet-update>` markers after Sprint 35 removal.
+    ///
+    /// §3.5.11 r3 empirical-revert: reverting the Fleet Updates section
+    /// removal in instructions.rs makes this test fail (inject reappears).
+    #[test]
+    fn instructions_body_does_not_contain_fleet_update_markers() {
+        let ctx = AgentContext {
+            name: "test-agent",
+            role: None,
+            team: None,
+            fleet_peers: &[],
+        };
+        let body = build_instructions_body(Some(&ctx), Some("/tmp/protocol.md"));
+        assert!(
+            !body.contains("<fleet-update>"),
+            "instructions must not contain <fleet-update> marker after Sprint 35 removal"
+        );
+        assert!(
+            !body.contains("</fleet-update>"),
+            "instructions must not contain </fleet-update> marker"
+        );
+        assert!(
+            !body.contains("Fleet Updates"),
+            "instructions must not contain Fleet Updates section header"
+        );
+    }
 }
