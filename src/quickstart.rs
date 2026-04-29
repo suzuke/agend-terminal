@@ -50,7 +50,7 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     let fleet_path = home.join("fleet.yaml");
     let existing_group_id = std::fs::read_to_string(&fleet_path)
         .ok()
-        .and_then(|content| serde_yaml::from_str::<serde_yaml::Value>(&content).ok())
+        .and_then(|content| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content).ok())
         .and_then(|config| config["channel"]["group_id"].as_i64());
 
     let (token, group_id) = if existing_token.is_some() && existing_group_id.is_some() {
@@ -313,7 +313,7 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
 }
 
 fn check_compatibility(yaml_content: &str, new_backend: &Backend, new_group_id: Option<i64>) {
-    if let Ok(config) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content) {
+    if let Ok(config) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml_content) {
         // Check backend
         let existing_backend = config["defaults"]["backend"].as_str().unwrap_or("");
         if !existing_backend.is_empty() && existing_backend != new_backend.name() {
@@ -406,7 +406,7 @@ mod tests {
         );
         // Verify it parses as valid FleetConfig.
         let config: crate::fleet::FleetConfig =
-            serde_yaml::from_str(&yaml).expect("emitted YAML must parse as FleetConfig");
+            serde_yaml_ng::from_str(&yaml).expect("emitted YAML must parse as FleetConfig");
         assert!(config.channel.is_some(), "channel section must be present");
         assert!(
             config.instances.contains_key("general"),

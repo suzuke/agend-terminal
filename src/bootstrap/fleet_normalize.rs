@@ -64,7 +64,7 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
         home,
         "general",
         "topic_id",
-        serde_yaml::Value::Number(serde_yaml::Number::from(1)),
+        serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(1)),
     );
     tracing::info!("auto-created 'general' instance for channel");
 }

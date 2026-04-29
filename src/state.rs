@@ -2344,7 +2344,7 @@ mod tests {
         let raw = std::fs::read_to_string(&manifest_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
         let manifest: ReplayManifest =
-            serde_yaml::from_str(&raw).unwrap_or_else(|e| panic!("parse MANIFEST.yaml: {e}"));
+            serde_yaml_ng::from_str(&raw).unwrap_or_else(|e| panic!("parse MANIFEST.yaml: {e}"));
 
         assert!(
             !manifest.fixtures.is_empty(),

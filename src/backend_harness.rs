@@ -92,7 +92,7 @@ impl CapabilityMatrix {
     }
 
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        std::fs::write(path, serde_yaml::to_string(self)?)?;
+        std::fs::write(path, serde_yaml_ng::to_string(self)?)?;
         Ok(())
     }
 }
