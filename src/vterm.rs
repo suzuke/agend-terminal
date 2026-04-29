@@ -972,4 +972,44 @@ mod tests {
         let tail = vt.tail_lines(3);
         assert!(tail.contains("After erase"));
     }
+
+    #[test]
+    fn read_scrollback_returns_visible_and_history() {
+        let mut vt = VTerm::new(80, 5);
+        // Write 10 lines into a 5-row terminal — first 5 scroll into history
+        for i in 1..=10 {
+            vt.process(format!("line{i}\r\n").as_bytes());
+        }
+        let text = vt.read_scrollback(100);
+        assert!(
+            text.contains("line1"),
+            "scrollback must include history line1, got: {text}"
+        );
+        assert!(
+            text.contains("line10"),
+            "scrollback must include visible line10, got: {text}"
+        );
+    }
+
+    #[test]
+    fn read_scrollback_limits_to_n_lines() {
+        let mut vt = VTerm::new(80, 5);
+        for i in 1..=20 {
+            vt.process(format!("line{i}\r\n").as_bytes());
+        }
+        let text = vt.read_scrollback(3);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.len() <= 3,
+            "read_scrollback(3) must return at most 3 lines, got {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn read_scrollback_empty_terminal() {
+        let vt = VTerm::new(80, 24);
+        let text = vt.read_scrollback(100);
+        assert!(text.is_empty(), "empty terminal must return empty string");
+    }
 }

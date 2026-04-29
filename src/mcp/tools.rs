@@ -377,4 +377,15 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    #[test]
+    fn pane_snapshot_tool_registered() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(
+            names.contains(&"pane_snapshot"),
+            "pane_snapshot tool must be registered, got: {names:?}"
+        );
+    }
 }
