@@ -338,16 +338,11 @@ impl VTerm {
         let cols = grid.columns();
         let top = grid.topmost_line();
         let bot = grid.bottommost_line();
-        let total = (bot.0 - top.0 + 1) as usize;
 
-        let start = if total > max_lines {
-            Line(bot.0 - max_lines as i32 + 1)
-        } else {
-            top
-        };
-
-        let mut lines: Vec<String> = Vec::with_capacity(max_lines.min(total));
-        let mut row = start;
+        // Read ALL lines first (trim blanks before windowing so content
+        // above trailing blank padding is not lost — gemini-banner case).
+        let mut lines: Vec<String> = Vec::new();
+        let mut row = top;
         while row <= bot {
             let mut line = String::with_capacity(cols);
             let mut col = 0;
@@ -365,7 +360,7 @@ impl VTerm {
             row += 1;
         }
 
-        // Trim blank lines at both ends
+        // Trim blank lines at both ends BEFORE windowing
         let first = lines
             .iter()
             .position(|l| !l.is_empty())
@@ -375,7 +370,15 @@ impl VTerm {
             .rposition(|l| !l.is_empty())
             .map(|i| i + 1)
             .unwrap_or(first);
-        lines[first..last].join("\n")
+        let trimmed = &lines[first..last];
+
+        // Window to last max_lines
+        let result = if trimmed.len() > max_lines {
+            &trimmed[trimmed.len() - max_lines..]
+        } else {
+            trimmed
+        };
+        result.join("\n")
     }
 
     /// Return the last `n` visible rows of the screen as plain text,
@@ -1059,5 +1062,34 @@ mod tests {
         let vt = VTerm::new(80, 24);
         let text = vt.read_scrollback(100);
         assert!(text.is_empty(), "empty terminal must return empty string");
+    }
+
+    #[test]
+    fn read_scrollback_trims_leading_blanks_then_windows() {
+        // Gemini-banner case: content at top, then 120+ blank padding rows.
+        // With a 50-line window, the old code captures the last 50 rows
+        // (all blank) and returns empty despite real content above.
+        let mut vt = VTerm::new(80, 10);
+        // Content first
+        for i in 1..=5 {
+            vt.process(format!("TESTLINE{i}\r\n").as_bytes());
+        }
+        // Then push 120 blank lines (simulates gemini padding)
+        for _ in 0..120 {
+            vt.process(b"\r\n");
+        }
+        let text = vt.read_scrollback(50);
+        assert!(
+            text.contains("TESTLINE1"),
+            "content above blank padding must surface, got: '{text}'"
+        );
+    }
+
+    #[test]
+    fn read_scrollback_empty_pty_still_returns_empty() {
+        // Regression guard: empty PTY must still return empty string
+        let vt = VTerm::new(80, 24);
+        let text = vt.read_scrollback(100);
+        assert!(text.is_empty(), "empty PTY must return empty string");
     }
 }
