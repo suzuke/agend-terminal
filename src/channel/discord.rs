@@ -138,20 +138,20 @@ fn discord_caps() -> ChannelCapabilities {
 /// Used by the gateway reader to dispatch on frame type before
 /// deserializing the inner `d` payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GatewayFrame {
-    pub op: u8,
+pub(crate) struct GatewayFrame {
+    pub(crate) op: u8,
 }
 
 /// Parse the opcode from a raw gateway JSON frame.
 /// Returns `None` if the frame is not valid JSON or lacks an `op` field.
-pub fn parse_gateway_opcode(raw: &str) -> Option<GatewayFrame> {
+pub(crate) fn parse_gateway_opcode(raw: &str) -> Option<GatewayFrame> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let op = v.get("op")?.as_u64()? as u8;
     Some(GatewayFrame { op })
 }
 
 /// Parse a HELLO frame (opcode 10) and return the heartbeat interval in ms.
-pub fn parse_hello_interval(raw: &str) -> Option<u64> {
+pub(crate) fn parse_hello_interval(raw: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let d = v.get("d")?;
     let hello: twilight_model::gateway::payload::incoming::Hello =
@@ -161,7 +161,7 @@ pub fn parse_hello_interval(raw: &str) -> Option<u64> {
 
 /// Build the IDENTIFY payload our adapter sends to the gateway.
 /// Returns the full JSON frame (op=2 + d={token, intents, properties}).
-pub fn build_identify_payload(
+pub(crate) fn build_identify_payload(
     token: &str,
     intents: twilight_model::gateway::Intents,
 ) -> serde_json::Value {
@@ -180,12 +180,12 @@ pub fn build_identify_payload(
 }
 
 /// Returns `true` if the frame is a HEARTBEAT_ACK (opcode 11).
-pub fn is_heartbeat_ack(raw: &str) -> bool {
+pub(crate) fn is_heartbeat_ack(raw: &str) -> bool {
     parse_gateway_opcode(raw).map_or(false, |f| f.op == 11)
 }
 
 /// Map a twilight `Ready` payload to `ChannelEvent::Connected`.
-pub fn map_ready_to_connected(
+pub(crate) fn map_ready_to_connected(
     ready: &twilight_model::gateway::payload::incoming::Ready,
 ) -> ChannelEvent {
     ChannelEvent::Connected {
