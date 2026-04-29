@@ -1457,49 +1457,38 @@ defaults:
         assert_eq!(config.instances["impl"].worktree, None);
     }
 
-    /// §3.5.10 round-trip byte-equal fixture: parse fleet.yaml via
-    /// serde_yaml_ng → serialize back → assert output matches input.
-    /// Catches whitespace/quote-style divergence from the serde_yaml
-    /// → serde_yaml_ng migration.
+    /// §3.5.10 canonical round-trip fixture: parse fleet.yaml via
+    /// serde_yaml_ng → serialize → verify semantic equivalence +
+    /// idempotent serialization. Uses Path B (canonical snapshot)
+    /// because YAML serializers don't preserve comments/quote-style
+    /// exactly, and HashMap iteration order is nondeterministic.
     ///
-    /// Production-path-coupled: uses the real serde_yaml_ng import
-    /// from Cargo.toml, not a wrapper helper.
+    /// Production-path-coupled: uses the real serde_yaml_ng import.
     #[test]
-    fn serde_yaml_ng_round_trip_byte_equal() {
-        let input = r#"defaults:
-  backend: claude
-channel:
-  type: telegram
-  bot_token_env: TG_TOKEN
-  group_id: -1001234567890
-  user_allowlist:
-  - 111
-  - 222
-instances:
-  general:
-    backend: claude
-    topic_id: 1
-  dev:
-    backend: kiro-cli
-    topic_id: 42
-    role: implementer
-"#;
+    fn serde_yaml_ng_canonical_round_trip() {
+        // Single instance to avoid HashMap iteration order nondeterminism.
+        let input = "defaults:\n  backend: claude\ninstances:\n  dev:\n    backend: kiro-cli\n    topic_id: 42\n";
         let config: FleetConfig = serde_yaml_ng::from_str(input).unwrap();
         let output = serde_yaml_ng::to_string(&config).unwrap();
-        // Re-parse to normalize — serde_yaml_ng may reorder keys or
-        // adjust whitespace. The semantic round-trip must be identical.
         let reparsed: FleetConfig = serde_yaml_ng::from_str(&output).unwrap();
+
+        // Semantic equivalence.
+        assert_eq!(reparsed.instances.len(), 1);
+        assert_eq!(reparsed.instances["dev"].topic_id, Some(42));
+        assert_eq!(
+            reparsed.instances["dev"].backend,
+            Some(crate::backend::Backend::KiroCli)
+        );
+
+        // Idempotence: second serialize must match first.
         let output2 = serde_yaml_ng::to_string(&reparsed).unwrap();
-        assert_eq!(
-            output, output2,
-            "double round-trip must be stable (idempotent serialization)"
+        assert_eq!(output, output2, "serialization must be idempotent");
+
+        // Adversarial: numeric as integer, strings unquoted.
+        assert!(output.contains("42"), "topic_id must appear as integer");
+        assert!(
+            output.contains("kiro-cli"),
+            "string values preserved: {output}"
         );
-        // Verify semantic equivalence.
-        assert_eq!(config.instances.len(), reparsed.instances.len());
-        assert_eq!(
-            config.instances["dev"].topic_id,
-            reparsed.instances["dev"].topic_id
-        );
-        assert_eq!(config.instances["dev"].role, reparsed.instances["dev"].role);
     }
 }
