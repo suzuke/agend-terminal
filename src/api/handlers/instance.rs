@@ -156,6 +156,11 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .filter(|s| !s.is_empty());
     super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role);
 
+    // Sprint 34 PR-5: clear stale metadata from a previous instance with
+    // the same name. No legitimate pause/resume case exists for metadata
+    // surviving across instance lifetimes (structural review confirmed).
+    let _ = std::fs::remove_file(ctx.home.join("metadata").join(format!("{name}.json")));
+
     match crate::api::spawn_one(
         ctx.home,
         ctx.registry,
@@ -501,5 +506,80 @@ mod tests {
         assert!(pos1 < pos5, "lines must be in order");
 
         cleanup_agent(&ctx, "snap-shape");
+    }
+
+    /// §3.5.10 persistence-replay: spawn clears stale metadata for same name.
+    #[test]
+    fn spawn_clears_stale_metadata_for_same_name() {
+        let (ctx, home) = test_ctx_with_agent("meta-stale");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Kill the agent so we can re-spawn with the same name
+        cleanup_agent(&ctx, "meta-stale");
+        {
+            let mut reg = agent::lock_registry(ctx.registry);
+            reg.remove("meta-stale");
+        }
+
+        // Pre-seed stale metadata
+        let meta_dir = home.join("metadata");
+        std::fs::create_dir_all(&meta_dir).ok();
+        let meta_path = meta_dir.join("meta-stale.json");
+        std::fs::write(
+            &meta_path,
+            r#"{"last_heartbeat":"2026-01-01T00:00:00Z","pending_pickup_ids":["m-stale-1"]}"#,
+        )
+        .expect("write stale metadata");
+        assert!(meta_path.exists(), "stale metadata must exist before spawn");
+
+        // Re-spawn with same name — should clear stale metadata
+        let result = handle_spawn(
+            &json!({"name": "meta-stale", "backend": crate::default_shell()}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        // Assert stale metadata is gone
+        if meta_path.exists() {
+            let content = std::fs::read_to_string(&meta_path).unwrap_or_default();
+            assert!(
+                !content.contains("2026-01-01"),
+                "stale last_heartbeat must be cleared, got: {content}"
+            );
+            assert!(
+                !content.contains("m-stale-1"),
+                "stale pending_pickup_ids must be cleared, got: {content}"
+            );
+        }
+        // Either file is absent (deleted) or has fresh content — both OK
+
+        cleanup_agent(&ctx, "meta-stale");
+    }
+
+    #[test]
+    fn spawn_with_no_prior_metadata_does_not_panic() {
+        let (ctx, home) = test_ctx_with_agent("meta-fresh");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        cleanup_agent(&ctx, "meta-fresh");
+        {
+            let mut reg = agent::lock_registry(ctx.registry);
+            reg.remove("meta-fresh");
+        }
+
+        // Ensure no metadata file exists
+        let meta_path = home.join("metadata").join("meta-fresh.json");
+        let _ = std::fs::remove_file(&meta_path);
+
+        // Spawn should work fine without prior metadata
+        let result = handle_spawn(
+            &json!({"name": "meta-fresh", "backend": crate::default_shell()}),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], true,
+            "spawn without prior metadata must succeed: {result}"
+        );
+
+        cleanup_agent(&ctx, "meta-fresh");
     }
 }
