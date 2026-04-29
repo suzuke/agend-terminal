@@ -153,7 +153,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     std::fs::create_dir_all(home)?;
     let lock_path = home.join(".daemon.lock");
     let lock_file = std::fs::File::create(&lock_path)?;
-    use fs2::FileExt;
+    use fs4::fs_std::FileExt;
     lock_file
         .try_lock_exclusive()
         .map_err(|e| anyhow::anyhow!("Another daemon is already running (lock held): {e}"))?;

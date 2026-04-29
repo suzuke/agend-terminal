@@ -29,9 +29,8 @@ pub type Cookie = [u8; COOKIE_LEN];
 /// caller can keep an in-memory copy rather than re-reading on each connect.
 pub fn issue(run_dir: &Path) -> Result<Cookie> {
     let mut cookie = [0u8; COOKIE_LEN];
-    // `getrandom::Error` does not implement `std::error::Error` in 0.2, so
-    // `.context()` can't decorate it — map through anyhow! manually.
-    getrandom::getrandom(&mut cookie).map_err(|e| anyhow!("getrandom: {e}"))?;
+    // `getrandom::Error` implements `std::error::Error` in 0.3+.
+    getrandom::fill(&mut cookie).map_err(|e| anyhow!("getrandom: {e}"))?;
     let path = run_dir.join(COOKIE_FILE);
     let tmp = run_dir.join(format!(".{COOKIE_FILE}.tmp"));
     write_restricted(&tmp, &cookie).context("write api.cookie tmp")?;
