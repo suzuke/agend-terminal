@@ -884,6 +884,46 @@ mod tests {
     //      dismissing a transient banner — the state never recovered
     //      because hash-dedup suppressed re-detection.
 
+    // Sprint 31+ #4: rate-limit regex false-positive on benign tokens.
+    // Operator m-2 quick fix (Option A): word-boundary the `429` token to
+    // avoid matching substrings like "build #4290" / "request id: 4291abc"
+    // / "response time: 4290ms". `\b429\b` ensures `429` is a standalone
+    // token (preceded + followed by non-word boundary).
+    #[test]
+    fn rate_limit_regex_does_not_misfire_on_build_number_4290() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("CI: build #4290 succeeded in 12s");
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "benign build number `4290` must not trigger RateLimit"
+        );
+    }
+
+    #[test]
+    fn rate_limit_regex_does_not_misfire_on_request_id_4291abc() {
+        let mut t = tracker_at(&Backend::Codex, AgentState::Idle, 0);
+        t.feed("request id: 4291abcdef");
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "benign request id starting with `4291` must not trigger RateLimit"
+        );
+    }
+
+    #[test]
+    fn rate_limit_regex_still_matches_real_429_token() {
+        // Regression guard: word-boundary fix must NOT break the canonical
+        // "Error: 429" detection. Same scenario as `error_state_instant_transition`.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("API error: 429 Too Many Requests");
+        assert_eq!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "canonical `429` standalone token must still trigger RateLimit"
+        );
+    }
+
     #[test]
     fn shell_backend_starts_in_ready_not_starting() {
         // Regression: Shell/Raw have no state pattern catalog, so `detect()`
