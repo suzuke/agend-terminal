@@ -582,4 +582,53 @@ mod tests {
 
         cleanup_agent(&ctx, "meta-fresh");
     }
+
+    /// §3.5.10: spawn_one (team-spawn path) also clears stale metadata.
+    #[test]
+    fn spawn_one_clears_stale_metadata_for_team_path() {
+        let (ctx, home) = test_ctx_with_agent("team-meta");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        cleanup_agent(&ctx, "team-meta");
+        {
+            let mut reg = agent::lock_registry(ctx.registry);
+            reg.remove("team-meta");
+        }
+
+        // Pre-seed stale metadata
+        let meta_dir = home.join("metadata");
+        std::fs::create_dir_all(&meta_dir).ok();
+        let meta_path = meta_dir.join("team-meta.json");
+        std::fs::write(
+            &meta_path,
+            r#"{"last_heartbeat":"2025-01-01T00:00:00Z","stale":true}"#,
+        )
+        .expect("write stale metadata");
+
+        // Call spawn_one directly (team-spawn path bypasses handle_spawn)
+        let size = (80u16, 24u16);
+        let work_dir = home.join("workspace").join("team-meta");
+        std::fs::create_dir_all(&work_dir).ok();
+        let result = crate::api::spawn_one(
+            ctx.home,
+            ctx.registry,
+            "team-meta",
+            crate::default_shell(),
+            &[],
+            crate::backend::SpawnMode::Fresh,
+            &work_dir,
+            size,
+        );
+        assert!(result.is_ok(), "spawn_one must succeed: {result:?}");
+
+        // Assert stale metadata is gone
+        if meta_path.exists() {
+            let content = std::fs::read_to_string(&meta_path).unwrap_or_default();
+            assert!(
+                !content.contains("2025-01-01"),
+                "stale metadata must be cleared via spawn_one, got: {content}"
+            );
+        }
+
+        cleanup_agent(&ctx, "team-meta");
+    }
 }
