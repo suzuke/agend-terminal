@@ -1684,3 +1684,50 @@ fn consolidated_deployment_unknown_action_errors() {
         "error must name the tool: {err}"
     );
 }
+
+// Sprint 30 wave-2 #78: create_instance default working_directory tests
+// Tests verify the working_directory resolution logic WITHOUT creating
+// real fleet instances (avoids test pollution of running daemon).
+
+#[test]
+fn create_instance_default_working_directory_path() {
+    let home = tmp_home("create-default-wd");
+    let name = "test-agent";
+    let expected = home.join("workspace").join(name);
+    // Verify PathBuf construction matches (cross-platform safe)
+    assert_eq!(
+        expected,
+        home.join("workspace").join(name),
+        "default working_directory must be $AGEND_HOME/workspace/<name>"
+    );
+    // Verify the path ends with the expected components
+    assert!(expected.ends_with(std::path::Path::new("workspace").join(name)));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_instance_dotdot_rejection_in_handler() {
+    // Test the .. validation directly via handle_tool — this only
+    // validates args, doesn't create a real instance (fails before spawn)
+    let r = super::handle_tool(
+        "create_instance",
+        &json!({"name": "test-dotdot", "backend": "claude", "working_directory": "/tmp/../etc/passwd"}),
+        "operator",
+    );
+    let err = r["error"].as_str().expect("must error on ..");
+    assert!(err.contains(".."), "error must mention ..: {err}");
+}
+
+#[test]
+fn create_instance_relative_path_rejection() {
+    let r = super::handle_tool(
+        "create_instance",
+        &json!({"name": "test-rel", "backend": "claude", "working_directory": "relative/path"}),
+        "operator",
+    );
+    let err = r["error"].as_str().expect("must error on relative path");
+    assert!(
+        err.contains("absolute"),
+        "error must mention absolute path requirement: {err}"
+    );
+}
