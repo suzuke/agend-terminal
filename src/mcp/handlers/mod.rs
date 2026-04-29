@@ -95,7 +95,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // --- Channel ---
         "reply" => channel::handle_reply(&home, args, instance_name),
         "react" => channel::handle_react(args, instance_name),
-        "edit_message" => channel::handle_edit_message(args, instance_name),
         "download_attachment" => channel::handle_download_attachment(&home, args, instance_name),
 
         // --- Cross-instance communication ---
@@ -134,9 +133,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 
         // --- Task sweep config ---
         "task_sweep_config" => task::handle_task_sweep_config(&home, args),
-
-        // --- Legacy backfill ---
-        "task_legacy_backfill_run" => task::handle_task_legacy_backfill_run(&home, args),
 
         // --- Teams ---
         "create_team" => task::handle_create_team(&home, args),

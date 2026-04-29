@@ -158,8 +158,6 @@ const MISSING_PARAM_CASES: &[(&str, &str, &str)] = &[
     ("broadcast", r#"{}"#, "missing"),
     ("delete_instance", r#"{}"#, "missing"),
     ("start_instance", r#"{}"#, "missing"),
-    ("edit_message", r#"{}"#, "missing"),
-    ("edit_message", r#"{"message_id":"1"}"#, "missing"),
     ("download_attachment", r#"{}"#, "missing"),
     ("checkout_repo", r#"{}"#, "missing"),
     ("release_repo", r#"{}"#, "missing"),
