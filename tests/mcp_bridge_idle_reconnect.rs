@@ -136,6 +136,7 @@ fn bridge_retries_after_idle_close_so_caller_sees_no_failure() {
     let (run_dir, daemon_handle) = spawn_idle_close_daemon();
 
     let mut child = Command::new(bridge_binary())
+        .env("AGEND_TEST_ISOLATION", "1")
         .env("AGEND_HOME", &run_dir)
         .env("AGEND_INSTANCE_NAME", "test-reconnect")
         .stdin(Stdio::piped())
@@ -272,6 +273,7 @@ fn bridge_does_not_retry_application_errors() {
     });
 
     let mut child = Command::new(bridge_binary())
+        .env("AGEND_TEST_ISOLATION", "1")
         .env("AGEND_HOME", &run_dir)
         .env("AGEND_INSTANCE_NAME", "test-no-retry")
         .stdin(Stdio::piped())
