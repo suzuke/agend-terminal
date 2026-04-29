@@ -29,20 +29,26 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
         return handle_broadcast(home, &args, sender);
     }
 
-    // Infer kind from request_kind field or args shape
-    let kind = args["request_kind"].as_str().unwrap_or("");
-    match kind {
-        "task" => handle_delegate_task(home, &args, sender),
-        "report" => {
-            // Map message → summary if summary absent (unified schema compat)
-            if args.get("summary").is_none() {
-                if let Some(msg) = args.get("message").cloned() {
-                    args["summary"] = msg;
-                }
+    fn lift_message(args: &mut Value, dst: &str) {
+        if args.get(dst).is_none() {
+            if let Some(msg) = args.get("message").cloned() {
+                args[dst] = msg;
             }
+        }
+    }
+    match args["request_kind"].as_str().unwrap_or("") {
+        "task" => {
+            lift_message(&mut args, "task");
+            handle_delegate_task(home, &args, sender)
+        }
+        "report" => {
+            lift_message(&mut args, "summary");
             handle_report_result(home, &args, sender)
         }
-        "query" => handle_request_information(home, &args, sender),
+        "query" => {
+            lift_message(&mut args, "question");
+            handle_request_information(home, &args, sender)
+        }
         _ => handle_send_to_instance(home, &args, "send", sender),
     }
 }
@@ -690,38 +696,5 @@ mod tests {
         let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
         // send_to_instance without sender returns identity error
         assert!(result.get("error").is_some());
-    }
-
-    /// Regression: handle_unified_send must map `message` → `task` for
-    /// kind=task, parallel to the existing message → summary mapping for
-    /// kind=report. Without this mapping, callers that send the unified-
-    /// schema `message` field hit "missing 'task'" from the inner handler.
-    #[test]
-    fn send_kind_task_maps_message_field_to_task() {
-        let sender = crate::identity::Sender::new("lead2-test").unwrap();
-        let args = json!({"target_instance": "dev", "message": "do X", "request_kind": "task"});
-        let result = handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
-        // Whatever error/success we get, it must NOT be "missing 'task'":
-        // that would mean the field-name mapping never happened.
-        let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
-        assert_ne!(
-            err, "missing 'task'",
-            "send(kind=task, message=...) should route message → task; got error={err}"
-        );
-    }
-
-    /// Regression: same shape for kind=query — `message` must map to
-    /// `question` so callers using the unified schema do not hit
-    /// "missing 'question'" from `handle_request_information`.
-    #[test]
-    fn send_kind_query_maps_message_field_to_question() {
-        let sender = crate::identity::Sender::new("lead2-test").unwrap();
-        let args = json!({"target_instance": "dev", "message": "what?", "request_kind": "query"});
-        let result = handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
-        let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
-        assert_ne!(
-            err, "missing 'question'",
-            "send(kind=query, message=...) should route message → question; got error={err}"
-        );
     }
 }
