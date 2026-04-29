@@ -498,7 +498,6 @@ impl crate::channel::Channel for DiscordChannel {
         name: &str,
         opts: crate::channel::BindingOpts,
     ) -> anyhow::Result<BindingRef> {
-        anyhow::bail!("stub");
         let (http, guild_id) = {
             let s = self.state.lock();
             let http = s
