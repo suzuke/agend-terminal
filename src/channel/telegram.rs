@@ -60,13 +60,21 @@ fn save_topic_registry(home: &Path, registry: &HashMap<i32, String>) {
 }
 
 fn register_topic(home: &Path, topic_id: i32, instance_name: &str) {
-    // Writes to topics.json (disk registry). Callers are responsible for
-    // also updating in-memory state (topic_to_instance / instance_to_topic)
-    // and fleet.yaml (update_instance_field). See create_topic_for_instance
-    // which writes all three.
+    // Write-side unification (Fix B): all three sources updated atomically.
+    // 1. topics.json (disk registry)
     let mut reg = load_topic_registry(home);
     reg.insert(topic_id, instance_name.to_string());
     save_topic_registry(home, &reg);
+    // 2. fleet.yaml topic_id field
+    let _ = crate::fleet::update_instance_field(
+        home,
+        instance_name,
+        "topic_id",
+        serde_yaml::Value::Number(serde_yaml::Number::from(topic_id)),
+    );
+    // 3. in-memory state is updated by the caller (Channel trait methods
+    //    that hold &self.state). Free-function callers without state access
+    //    rely on resolve_topic's topics.json fallback as defense-in-depth.
 }
 
 fn unregister_topic(home: &Path, topic_id: i32) {
@@ -1589,12 +1597,6 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     }) {
         Ok(tid) => {
             tracing::info!(instance = %instance_name, topic_id = tid, "created topic");
-            let _ = crate::fleet::update_instance_field(
-                home,
-                instance_name,
-                "topic_id",
-                serde_yaml::Value::Number(serde_yaml::Number::from(tid)),
-            );
             register_topic(home, tid, instance_name);
             Some(tid)
         }
@@ -3089,7 +3091,11 @@ instances:
     fn resolve_topic_falls_back_to_topics_json() {
         let home = tmp_home("resolve_topics_json");
         // No fleet.yaml — topic only exists in topics.json.
-        register_topic(&home, 2474, "test-gemini");
+        // Use save_topic_registry directly (not register_topic, which
+        // now writes fleet.yaml too — we want to test the read fallback).
+        let mut reg = HashMap::new();
+        reg.insert(2474, "test-gemini".to_string());
+        save_topic_registry(&home, &reg);
         let mut state = TelegramState::new_for_contract_test(
             -1,
             HashMap::new(),
@@ -3097,14 +3103,38 @@ instances:
             HashMap::new(),
             None,
         );
-        // Before fix: returns "general". After fix: returns "test-gemini".
         assert_eq!(
             resolve_topic(&mut state, Some(2474)),
             "test-gemini",
             "topic in topics.json must resolve, not fall through to general"
         );
-        // Verify it was cached in memory for subsequent calls.
         assert_eq!(resolve_topic(&mut state, Some(2474)), "test-gemini");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Fix B write-side: register_topic writes fleet.yaml topic_id.
+    /// §3.5.11: on main HEAD (before fix), register_topic does NOT
+    /// write fleet.yaml — this test would fail.
+    #[test]
+    fn register_topic_writes_fleet_yaml() {
+        let home = tmp_home("register_writes_yaml");
+        // Create a minimal fleet.yaml with the instance but no topic_id.
+        let yaml = "defaults:\n  backend: claude\ninstances:\n  alice:\n    backend: claude\n";
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+
+        register_topic(&home, 42, "alice");
+
+        // Verify fleet.yaml now contains topic_id: 42 for alice.
+        let content =
+            std::fs::read_to_string(home.join("fleet.yaml")).expect("fleet.yaml must exist");
+        assert!(
+            content.contains("topic_id"),
+            "fleet.yaml must contain topic_id after register_topic: {content}"
+        );
+        // Also verify topics.json was written.
+        let reg = load_topic_registry(&home);
+        assert_eq!(reg.get(&42), Some(&"alice".to_string()));
+
         std::fs::remove_dir_all(&home).ok();
     }
 
