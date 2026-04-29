@@ -1,0 +1,29 @@
+{
+  "op": 0,
+  "s": 3,
+  "t": "MESSAGE_CREATE",
+  "d": {
+    "id": "334385199974967042",
+    "channel_id": "290926798999357250",
+    "author": {
+      "id": "82198898841029460",
+      "username": "testoperator",
+      "discriminator": "0",
+      "avatar": null,
+      "bot": false,
+      "global_name": "Test Operator"
+    },
+    "content": "hello from discord",
+    "timestamp": "2026-04-29T12:00:00.000000+00:00",
+    "edited_timestamp": null,
+    "tts": false,
+    "mention_everyone": false,
+    "mentions": [],
+    "mention_roles": [],
+    "attachments": [],
+    "embeds": [],
+    "pinned": false,
+    "type": 0,
+    "guild_id": "987654321098765432"
+  }
+}

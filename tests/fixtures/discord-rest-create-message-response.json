@@ -1,0 +1,24 @@
+{
+  "id": "444385199974967099",
+  "channel_id": "290926798999357250",
+  "author": {
+    "id": "123456789012345678",
+    "username": "agend-bot",
+    "discriminator": "0",
+    "avatar": null,
+    "bot": true,
+    "global_name": "agend-bot"
+  },
+  "content": "reply from agent",
+  "timestamp": "2026-04-29T12:00:01.000000+00:00",
+  "edited_timestamp": null,
+  "tts": false,
+  "mention_everyone": false,
+  "mentions": [],
+  "mention_roles": [],
+  "attachments": [],
+  "embeds": [],
+  "pinned": false,
+  "type": 0,
+  "guild_id": "987654321098765432"
+}

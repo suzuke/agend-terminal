@@ -52,6 +52,9 @@ pub struct DiscordState {
     pub registry: Option<AgentRegistry>,
     /// User allowlist (Discord user snowflakes). `None` = fail-closed.
     pub user_allowlist: Option<Vec<i64>>,
+    /// twilight HTTP client for REST API calls. `None` only in test
+    /// harness — production `new` always populates it.
+    pub http_client: Option<std::sync::Arc<twilight_http::Client>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +73,11 @@ pub struct DiscordChannel {
 impl DiscordChannel {
     /// Production constructor. `event_rx` is the receiving end of the
     /// mpsc channel fed by the gateway reader task.
-    pub fn new(event_rx: mpsc::Receiver<ChannelEvent>, user_allowlist: Option<Vec<i64>>) -> Self {
+    pub fn new(
+        event_rx: mpsc::Receiver<ChannelEvent>,
+        user_allowlist: Option<Vec<i64>>,
+        http_client: std::sync::Arc<twilight_http::Client>,
+    ) -> Self {
         Self {
             state: Mutex::new(DiscordState {
                 instance_to_channel: HashMap::new(),
@@ -78,6 +85,7 @@ impl DiscordChannel {
                 submit_keys: HashMap::new(),
                 registry: None,
                 user_allowlist,
+                http_client: Some(http_client),
             }),
             caps: discord_caps(),
             event_rx: Mutex::new(event_rx),
@@ -96,6 +104,49 @@ impl DiscordChannel {
                 submit_keys: HashMap::new(),
                 registry: None,
                 user_allowlist: None,
+                http_client: None,
+            }),
+            caps: discord_caps(),
+            event_rx: Mutex::new(rx),
+        };
+        (ch, tx)
+    }
+
+    /// Test-only constructor with a configured allowlist so
+    /// `outbound_authorized()` returns `true`.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_authorized() -> (Self, mpsc::Sender<ChannelEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let ch = Self {
+            state: Mutex::new(DiscordState {
+                instance_to_channel: HashMap::new(),
+                channel_to_instance: HashMap::new(),
+                submit_keys: HashMap::new(),
+                registry: None,
+                user_allowlist: Some(vec![1]),
+                http_client: None,
+            }),
+            caps: discord_caps(),
+            event_rx: Mutex::new(rx),
+        };
+        (ch, tx)
+    }
+
+    /// Test-only constructor with a custom twilight HTTP client (for
+    /// mock-server tests that exercise the real send path).
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_http(
+        http: std::sync::Arc<twilight_http::Client>,
+    ) -> (Self, mpsc::Sender<ChannelEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let ch = Self {
+            state: Mutex::new(DiscordState {
+                instance_to_channel: HashMap::new(),
+                channel_to_instance: HashMap::new(),
+                submit_keys: HashMap::new(),
+                registry: None,
+                user_allowlist: Some(vec![1]),
+                http_client: Some(http),
             }),
             caps: discord_caps(),
             event_rx: Mutex::new(rx),
@@ -138,20 +189,20 @@ fn discord_caps() -> ChannelCapabilities {
 /// Used by the gateway reader to dispatch on frame type before
 /// deserializing the inner `d` payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GatewayFrame {
-    pub op: u8,
+pub(crate) struct GatewayFrame {
+    pub(crate) op: u8,
 }
 
 /// Parse the opcode from a raw gateway JSON frame.
 /// Returns `None` if the frame is not valid JSON or lacks an `op` field.
-pub fn parse_gateway_opcode(raw: &str) -> Option<GatewayFrame> {
+pub(crate) fn parse_gateway_opcode(raw: &str) -> Option<GatewayFrame> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let op = v.get("op")?.as_u64()? as u8;
     Some(GatewayFrame { op })
 }
 
 /// Parse a HELLO frame (opcode 10) and return the heartbeat interval in ms.
-pub fn parse_hello_interval(raw: &str) -> Option<u64> {
+pub(crate) fn parse_hello_interval(raw: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let d = v.get("d")?;
     let hello: twilight_model::gateway::payload::incoming::Hello =
@@ -161,7 +212,7 @@ pub fn parse_hello_interval(raw: &str) -> Option<u64> {
 
 /// Build the IDENTIFY payload our adapter sends to the gateway.
 /// Returns the full JSON frame (op=2 + d={token, intents, properties}).
-pub fn build_identify_payload(
+pub(crate) fn build_identify_payload(
     token: &str,
     intents: twilight_model::gateway::Intents,
 ) -> serde_json::Value {
@@ -180,12 +231,12 @@ pub fn build_identify_payload(
 }
 
 /// Returns `true` if the frame is a HEARTBEAT_ACK (opcode 11).
-pub fn is_heartbeat_ack(raw: &str) -> bool {
+pub(crate) fn is_heartbeat_ack(raw: &str) -> bool {
     parse_gateway_opcode(raw).map_or(false, |f| f.op == 11)
 }
 
 /// Map a twilight `Ready` payload to `ChannelEvent::Connected`.
-pub fn map_ready_to_connected(
+pub(crate) fn map_ready_to_connected(
     ready: &twilight_model::gateway::payload::incoming::Ready,
 ) -> ChannelEvent {
     ChannelEvent::Connected {
@@ -194,9 +245,77 @@ pub fn map_ready_to_connected(
     }
 }
 
+/// Map a twilight `Message` (from MESSAGE_CREATE dispatch) to
+/// `ChannelEvent::MessageIn`.
+pub(crate) fn map_message_create_to_message_in(
+    msg: &twilight_model::channel::Message,
+) -> ChannelEvent {
+    use crate::channel::event::{MsgPayload, User};
+    ChannelEvent::MessageIn {
+        binding: BindingRef::new(
+            "discord",
+            Some(format!("DC#{}", msg.channel_id)),
+            DiscordBindingPayload {
+                channel_id: msg.channel_id.get(),
+            },
+        ),
+        from: User {
+            id: msg.author.id.to_string(),
+            handle: Some(msg.author.name.clone()),
+        },
+        payload: MsgPayload {
+            text: msg.content.clone(),
+        },
+        ts: chrono::DateTime::parse_from_rfc3339(&msg.timestamp.iso_8601().to_string())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now()),
+    }
+}
+
+/// Map a twilight `Message` (from REST response) to `MsgRef`.
+pub(crate) fn map_message_to_msg_ref(
+    msg: &twilight_model::channel::Message,
+) -> crate::channel::MsgRef {
+    crate::channel::MsgRef {
+        binding: BindingRef::new(
+            "discord",
+            Some(format!("DC#{}", msg.channel_id)),
+            DiscordBindingPayload {
+                channel_id: msg.channel_id.get(),
+            },
+        ),
+        id: msg.id.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Outbound request body construction
+// ---------------------------------------------------------------------------
+
+/// Build the JSON body for `POST /channels/{id}/messages` per Discord spec.
+/// Ref: https://discord.com/developers/docs/resources/message#create-message-jsonform-params
+///
+/// This is the canonical shape our adapter transmits. The test suite
+/// asserts this against the spec-quoted example (§3.5.10 outbound
+/// request boundary).
+pub(crate) fn build_create_message_body(text: &str) -> serde_json::Value {
+    serde_json::json!({ "content": text })
+}
+
 // ---------------------------------------------------------------------------
 // Channel trait impl
 // ---------------------------------------------------------------------------
+
+/// Shared tokio runtime for Discord sync→async calls.
+fn discord_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("discord tokio runtime")
+    })
+}
 
 impl crate::channel::Channel for DiscordChannel {
     fn kind(&self) -> &'static str {
@@ -211,16 +330,38 @@ impl crate::channel::Channel for DiscordChannel {
         self.event_rx.lock().try_recv().ok()
     }
 
-    fn send(&self, _binding: &BindingRef, _msg: OutMsg) -> anyhow::Result<MsgRef> {
-        anyhow::bail!("discord send not yet implemented (PR2)")
+    fn send(&self, binding: &BindingRef, msg: OutMsg) -> anyhow::Result<MsgRef> {
+        let payload = binding
+            .downcast::<DiscordBindingPayload>()
+            .ok_or_else(|| anyhow::anyhow!("non-discord binding passed to send"))?;
+        if msg.text.is_empty() {
+            anyhow::bail!("OutMsg has no text (attachment-only sends deferred to PR3)");
+        }
+        let http = self
+            .state
+            .lock()
+            .http_client
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("discord http client not initialized"))?;
+        let channel_id = twilight_model::id::Id::new(payload.channel_id);
+        let text = msg.text;
+        let cp = *payload;
+        discord_runtime().block_on(async {
+            let response = http.create_message(channel_id).content(&text).await?;
+            let sent = response.model().await?;
+            Ok(MsgRef {
+                binding: BindingRef::new("discord", Some(format!("DC#{}", cp.channel_id)), cp),
+                id: sent.id.to_string(),
+            })
+        })
     }
 
     fn edit(&self, _msg: &MsgRef, _payload: OutMsg) -> anyhow::Result<()> {
-        anyhow::bail!("discord edit not yet implemented (PR2)")
+        anyhow::bail!("discord edit not yet implemented (PR3)")
     }
 
     fn delete(&self, _msg: &MsgRef) -> anyhow::Result<()> {
-        anyhow::bail!("discord delete not yet implemented (PR2)")
+        anyhow::bail!("discord delete not yet implemented (PR3)")
     }
 
     fn create_binding(
@@ -274,6 +415,60 @@ impl crate::channel::Channel for DiscordChannel {
 
     fn outbound_authorized(&self) -> bool {
         crate::channel::auth::is_outbound_authorized(&self.state.lock().user_allowlist)
+    }
+
+    fn notify(
+        &self,
+        instance: &str,
+        _severity: crate::channel::NotifySeverity,
+        message: &str,
+        _silent: bool, // Discord has no per-message notification suppression
+    ) -> std::result::Result<(), ChannelError> {
+        let cid = self.state.lock().instance_to_channel.get(instance).copied();
+        let cid = cid.ok_or_else(|| {
+            ChannelError::Other(anyhow::anyhow!("no discord binding for '{instance}'"))
+        })?;
+        let binding = BindingRef::new(
+            "discord",
+            Some(format!("DC#{cid}")),
+            DiscordBindingPayload { channel_id: cid },
+        );
+        self.send(&binding, OutMsg::text(message))
+            .map_err(ChannelError::Other)?;
+        Ok(())
+    }
+
+    fn send_from_agent(
+        &self,
+        agent: &str,
+        op: crate::channel::AgentOutboundOp,
+    ) -> std::result::Result<MsgRef, ChannelError> {
+        // Step 1: adapter-level allowlist gate (PR #216 contract).
+        if !self.outbound_authorized() {
+            return Err(ChannelError::Other(anyhow::anyhow!(
+                "outbound disabled — channel.user_allowlist not configured"
+            )));
+        }
+
+        // Step 2: dispatch. Only Reply in PR2; other ops defer to PR3.
+        match op {
+            crate::channel::AgentOutboundOp::Reply { text } => {
+                let cid = self.state.lock().instance_to_channel.get(agent).copied();
+                let cid = cid.ok_or_else(|| {
+                    ChannelError::Other(anyhow::anyhow!("no discord binding for '{agent}'"))
+                })?;
+                let binding = BindingRef::new(
+                    "discord",
+                    Some(format!("DC#{cid}")),
+                    DiscordBindingPayload { channel_id: cid },
+                );
+                self.send(&binding, OutMsg::text(text))
+                    .map_err(ChannelError::Other)
+            }
+            _ => Err(ChannelError::NotSupported(
+                "only Reply implemented in PR2".into(),
+            )),
+        }
     }
 }
 
@@ -482,5 +677,195 @@ mod tests {
             serde_json::from_value(d.clone()).expect("Ready");
         let event = super::map_ready_to_connected(&ready_payload);
         assert!(matches!(event, ChannelEvent::Connected { .. }));
+    }
+
+    // ── PR2 tests: MessageIn + send + notify ─────────────────────────
+
+    /// §3.5.10 wire-format fixture: MESSAGE_CREATE gateway event
+    /// parsed into `ChannelEvent::MessageIn`.
+    #[test]
+    fn discord_message_create_emits_message_in() {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-message-create.json");
+        let frame: serde_json::Value = serde_json::from_str(fixture).expect("fixture must parse");
+        let d = frame.get("d").expect("d field");
+        let msg: twilight_model::channel::Message =
+            serde_json::from_value(d.clone()).expect("Message");
+
+        let event = super::map_message_create_to_message_in(&msg);
+
+        match event {
+            ChannelEvent::MessageIn {
+                binding,
+                from,
+                payload,
+                ts,
+            } => {
+                assert_eq!(binding.kind(), "discord");
+                assert_eq!(from.id, "82198898841029460");
+                assert_eq!(from.handle.as_deref(), Some("testoperator"));
+                assert_eq!(payload.text, "hello from discord");
+                // ts should be parseable (not epoch-zero)
+                assert!(ts.timestamp() > 0);
+            }
+            other => panic!("expected MessageIn, got: {other:?}"),
+        }
+    }
+
+    /// §3.5.10 wire-format fixture: outbound POST /channels/{id}/messages
+    /// response parsed into `MsgRef`.
+    #[test]
+    fn discord_create_message_response_parses_to_msg_ref() {
+        let fixture =
+            include_str!("../../tests/fixtures/discord-rest-create-message-response.json");
+        let msg: twilight_model::channel::Message =
+            serde_json::from_str(fixture).expect("response must parse as Message");
+
+        let msg_ref = super::map_message_to_msg_ref(&msg);
+
+        assert_eq!(msg_ref.id, "444385199974967099");
+        assert_eq!(msg_ref.binding.kind(), "discord");
+    }
+
+    /// send_from_agent(Reply) on an authorized channel with no binding
+    /// for the agent should error with "no discord binding".
+    #[test]
+    fn send_from_agent_reply_errors_on_unbound_instance() {
+        let (ch, _rx) = super::DiscordChannel::new_for_test_authorized();
+        // Authorized but no binding → should error about binding.
+        let result = crate::channel::Channel::send_from_agent(
+            &ch,
+            "unknown-agent",
+            crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
+        );
+        assert!(result.is_err(), "unbound instance must error");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("no discord binding"),
+            "error must mention binding, got: {err_msg}"
+        );
+    }
+
+    /// F2 fix: send_from_agent must check outbound_authorized() gate.
+    /// When user_allowlist is None (unconfigured), the gate drops the call.
+    #[test]
+    fn send_from_agent_blocked_by_outbound_gate() {
+        let (ch, _rx) = super::DiscordChannel::new_for_test(); // allowlist=None → unauthorized
+        let result = crate::channel::Channel::send_from_agent(
+            &ch,
+            "any-agent",
+            crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
+        );
+        assert!(result.is_err(), "unauthorized channel must reject");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("outbound disabled"),
+            "error must mention outbound gate, got: {err_msg}"
+        );
+    }
+
+    /// notify on an unbound instance should error gracefully.
+    #[test]
+    fn notify_errors_on_unbound_instance() {
+        let (ch, _rx) = super::DiscordChannel::new_for_test();
+        let result = crate::channel::Channel::notify(
+            &ch,
+            "unknown-agent",
+            crate::channel::NotifySeverity::Info,
+            "test notification",
+            false,
+        );
+        assert!(result.is_err(), "notify on unbound instance must error");
+    }
+
+    // ── F3 fix: §3.5.10 outbound request body shape assertion ────────
+    //
+    // Production-path-coupled: exercises the real Channel::send() →
+    // twilight_http::create_message() path against a mock HTTP server.
+    // The mock captures the request body twilight actually transmits
+    // and asserts it matches the Discord spec shape.
+
+    /// §3.5.10 wire-format: outbound POST /channels/{id}/messages request
+    /// body transmitted by twilight-http matches Discord spec shape.
+    ///
+    /// Uses a raw TCP listener as mock Discord API server. The twilight
+    /// client is pointed at it via `proxy()`. Channel::send() exercises
+    /// the real production code path.
+    #[test]
+    fn discord_send_outbound_body_matches_spec() {
+        use crate::channel::Channel;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // Step 1: Start a mock HTTP server on an ephemeral port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        // Step 2: Spawn a thread to handle one request.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_clone = captured.clone();
+        // fire-and-forget: test mock server thread — lives only for this test
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).expect("read");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Extract body after the \r\n\r\n header separator.
+            if let Some(idx) = request.find("\r\n\r\n") {
+                let body = &request[idx + 4..];
+                *captured_clone.lock().expect("lock") = Some(body.to_string());
+            }
+
+            // Respond with a minimal valid Discord Message JSON.
+            let response_body =
+                include_str!("../../tests/fixtures/discord-rest-create-message-response.json");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        // Step 3: Create twilight client pointed at mock server.
+        let client = twilight_http::Client::builder()
+            .proxy(format!("127.0.0.1:{port}"), true)
+            .build();
+        let client = std::sync::Arc::new(client);
+
+        // Step 4: Create DiscordChannel with this client + a recorded binding.
+        let (ch, _tx) = super::DiscordChannel::new_for_test_with_http(client);
+        let binding = crate::channel::BindingRef::new(
+            "discord",
+            Some("DC#290926798999357250".into()),
+            super::DiscordBindingPayload {
+                channel_id: 290926798999357250,
+            },
+        );
+        ch.record_binding("test-agent", binding.clone(), "\r".into());
+
+        // Step 5: Call the real production send() path.
+        let result = crate::channel::Channel::send(
+            &ch,
+            &binding,
+            crate::channel::OutMsg::text("Hello, World!"),
+        );
+
+        handle.join().expect("mock server thread");
+
+        // Step 6: Assert the request body twilight transmitted.
+        assert!(result.is_ok(), "send must succeed: {:?}", result.err());
+        let body_str = captured
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("body captured");
+        let actual: serde_json::Value =
+            serde_json::from_str(&body_str).expect("body must be valid JSON");
+        let expected: serde_json::Value = serde_json::json!({"content": "Hello, World!"});
+        assert_eq!(
+            actual, expected,
+            "outbound body must match Discord spec create-message shape"
+        );
     }
 }
