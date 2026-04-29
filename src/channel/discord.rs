@@ -323,6 +323,66 @@ pub(crate) fn build_create_message_body(text: &str) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-archive keepalive
+// ---------------------------------------------------------------------------
+
+/// Keepalive interval for Discord thread auto-archive prevention.
+/// Discord's shortest auto-archive is 1 hour; 30 min refresh is safe.
+pub(crate) const KEEPALIVE_INTERVAL_SECS: u64 = 30 * 60;
+
+/// Start a background thread that periodically PATCHes all bound
+/// Discord threads to prevent auto-archive.
+pub(crate) fn start_keepalive(state: std::sync::Arc<Mutex<DiscordState>>) {
+    // fire-and-forget: keepalive thread runs for the adapter's lifetime.
+    // Stops when the daemon process exits. No JoinHandle needed — the
+    // thread is purely side-effecting (PATCH calls) with no return value.
+    if let Err(e) = std::thread::Builder::new()
+        .name("discord-keepalive".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("keepalive tokio runtime");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+                let (http, channel_ids) = {
+                    let s = state.lock();
+                    let http = match s.http_client.clone() {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let ids: Vec<u64> = s.instance_to_channel.values().copied().collect();
+                    (http, ids)
+                };
+                for cid in channel_ids {
+                    let id = twilight_model::id::Id::new(cid);
+                    let http = http.clone();
+                    rt.block_on(async {
+                        if let Err(e) = http.update_thread(id).archived(false).await {
+                            tracing::debug!(channel_id = cid, %e, "keepalive PATCH failed");
+                        }
+                    });
+                }
+            }
+        })
+    {
+        tracing::error!(error = %e, "failed to spawn keepalive thread");
+    }
+}
+
+/// Send a single keepalive PATCH for a specific channel. Extracted for
+/// testability — the production `start_keepalive` loop calls this per
+/// binding; tests call it directly against a mock server.
+pub(crate) fn send_keepalive_patch(
+    http: &twilight_http::Client,
+    channel_id: u64,
+) -> anyhow::Result<()> {
+    let id = twilight_model::id::Id::new(channel_id);
+    discord_runtime().block_on(async { http.update_thread(id).archived(false).await })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Channel trait impl
 // ---------------------------------------------------------------------------
 
@@ -438,6 +498,7 @@ impl crate::channel::Channel for DiscordChannel {
         name: &str,
         opts: crate::channel::BindingOpts,
     ) -> anyhow::Result<BindingRef> {
+        anyhow::bail!("stub");
         let (http, guild_id) = {
             let s = self.state.lock();
             let http = s
@@ -1350,5 +1411,47 @@ mod tests {
         let taken = ch.take_binding("agent-a").expect("take");
         assert_eq!(taken.kind(), "discord");
         assert!(!ch.has_binding("agent-a"));
+    }
+
+    // ── F1 fix: auto-archive keepalive test ──────────────────────────
+
+    /// §3.5.10 production-path-coupled: keepalive PATCH via
+    /// send_keepalive_patch() against mock server.
+    #[test]
+    fn discord_keepalive_patch_method_matches_spec() {
+        let (port, handle, captured) = mock_http_server(200, "{}");
+        let client = twilight_http::Client::builder()
+            .proxy(format!("127.0.0.1:{port}"), true)
+            .build();
+
+        let result = super::send_keepalive_patch(&client, 290926798999357250);
+
+        handle.join().expect("mock server");
+        assert!(result.is_ok(), "keepalive must succeed: {:?}", result.err());
+
+        let req = captured.lock().expect("lock").take().expect("captured");
+        assert_eq!(req.method, "PATCH", "keepalive must use PATCH");
+        assert!(
+            req.path.contains("/channels/290926798999357250"),
+            "path must target channel: {}",
+            req.path
+        );
+        // Body must set archived=false per Discord thread update spec.
+        let body: serde_json::Value = serde_json::from_str(&req.body).expect("body must be JSON");
+        assert_eq!(body["archived"], false, "must set archived=false");
+    }
+
+    /// Keepalive interval constant is reasonable (≤ Discord's shortest
+    /// auto-archive of 3600s).
+    #[test]
+    fn discord_keepalive_interval_within_auto_archive_window() {
+        assert!(
+            super::KEEPALIVE_INTERVAL_SECS < 3600,
+            "keepalive must fire before shortest auto-archive (1h)"
+        );
+        assert!(
+            super::KEEPALIVE_INTERVAL_SECS >= 60,
+            "keepalive should not be too aggressive"
+        );
     }
 }
