@@ -398,6 +398,10 @@ fn spawn_one(
     size: (u16, u16),
 ) -> anyhow::Result<crate::backend::SpawnMode> {
     std::fs::create_dir_all(work_dir).ok();
+    // Sprint 34: clear stale metadata from a previous instance with the
+    // same name. spawn_one is the true choke point — both handle_spawn
+    // (direct) and team.rs (team-spawn) flow through here.
+    let _ = std::fs::remove_file(home.join("metadata").join(format!("{name}.json")));
     let preset_submit_key = crate::backend::Backend::from_command(backend)
         .map(|b| b.preset().submit_key)
         .unwrap_or("\r");
