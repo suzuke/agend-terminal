@@ -323,6 +323,16 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 status: "pending".to_string(),
             },
         );
+        // Sprint 30: log branch hint for operator visibility when
+        // delegate_task carries branch metadata.
+        if let Some(branch) = args["branch"].as_str() {
+            tracing::info!(
+                target = %target,
+                branch = %branch,
+                task_id = ?task_id_str,
+                "delegate_task branch hint — implementer should work on this branch"
+            );
+        }
         ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
             from: sender.as_str().to_string(),
             to: target.to_string(),

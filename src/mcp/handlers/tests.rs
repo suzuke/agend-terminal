@@ -1733,3 +1733,24 @@ fn create_instance_relative_path_rejection() {
         "error must mention absolute path requirement: {err}"
     );
 }
+
+#[test]
+fn create_instance_explicit_working_directory_used() {
+    let _g = fleet_test_guard();
+    let (_rec, _home) = setup_recorder("explicit-wd");
+    // Use AGEND_TEST_ISOLATION to prevent real instance creation
+    std::env::set_var("AGEND_TEST_ISOLATION", "1");
+    let r = super::handle_tool(
+        "create_instance",
+        &json!({"name": "test-explicit", "backend": "claude", "working_directory": "/tmp/my-workspace"}),
+        "operator",
+    );
+    std::env::remove_var("AGEND_TEST_ISOLATION");
+    // Explicit valid path must pass validation (.. and absolute checks)
+    if let Some(err) = r.get("error").and_then(|e| e.as_str()) {
+        assert!(
+            !err.contains("must not contain") && !err.contains("must be an absolute"),
+            "explicit valid path must pass validation: {err}"
+        );
+    }
+}
