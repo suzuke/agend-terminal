@@ -421,6 +421,12 @@ PRs that change the wire-format surface — including consolidation / aliasing /
 
 **Reviewer attestation**: `wire-format invariant test verified: <test_name> at <file:line> pins <invariant>`. Required for any PR matching §3.5.10 wire-format scope. Parallel to existing wire-format / concurrent-state / persistence-replay categories — invariant tests are a FOURTH category for surface-pinning (vs the first three's behavior-pinning).
 
+##### Production-path-coupled fixture rule (Sprint 32 amendment)
+
+Wire-format fixtures must invoke the trait method / production code path directly, not call a helper function that mimics the production code shape. If you write a parallel helper to make the test simpler, you've created a **tests-testing-tests** anti-pattern that defeats the purpose of external-fixture validation.
+
+**Canonical example**: PR #317 (Sprint 32 PR2) r3 added `build_create_message_body()` test helper; tests asserted the helper produced spec-shaped JSON, but production `Channel::send()` invoked twilight directly without going through the helper. Tests passed against the helper while the production wire shape was unverified. r4 fixed by replacing the helper with a raw TCP listener intercepting twilight's actual outbound bytes. **Mock-server-captures-real-bytes** pattern is the canonical resolution.
+
 #### 3.5.11 Test-first verification for feature/fix PRs
 
 Sprint 25 P0 amendment. Feature PRs and bug-fix PRs **must** be authored test-first: the failing test commit MUST land in the PR's commit history BEFORE the implementation commit that makes it pass.
@@ -445,7 +451,7 @@ cargo test <test-name>          # MUST observe pass
 - **Dependency bumps** with no source-tree changes beyond `Cargo.toml` / lockfile.
 - **EMERGENCY hotfix** — production-down / data-loss-risk / security-breach scenarios may fast-track without test-first IF (a) the PR title carries an `[EMERGENCY]` tag with rationale, AND (b) a backfill PR adding the regression test merges within 24 hours. The orchestrator (typically dev-lead) approves the emergency tag at dispatch time; the reviewer notes the deferral in the verdict.
 - **Pure deletion PRs** — implementation removal + corresponding test rename/assertion-flip in the same commit; no new behavior asserted. Qualifies when (a) test changes ARE the only test deliverable (rename existing tests to assert new behavior, not new failing assertions), AND (b) deletion is grep-verifiable at code-review time (reviewer can confirm the removed code path has 0 hits in production). Reviewer attestation: `pure deletion verified: <grep-command> → 0 hits in production code path`. Canonical example: PR #262 `a3cfa09` KILL Content-Length fallback — tests renamed to assert NDJSON-only skip behavior, impl deleted CL parse path, `grep -rn "Content-Length" src/bin/agend-mcp-bridge.rs` → 0 hits.
-- **Empirical-revert exemption** (Sprint 26 amendment) — when the test is **architecturally un-runnable at a separate RED commit** because the test depends on an impl-provided fixture, type, function, or env-var configuration that lives in the same PR's impl. A literal RED commit would either fail-to-compile or have nothing to assert against. Reviewer-enforceable substitute: **empirical revert at HEAD** — reviewer reverts the impl portion (typically `git revert <impl-sha> --no-commit` or a single-step checkout that removes the impl), observes the test fails or fails-to-compile, restores impl, observes test passes. Conditions: (a) PR description must explicitly declare the architectural impossibility (e.g., "test depends on impl-provided fixture; no separate RED state possible"), AND (b) the revert sequence must be documented step-by-step in the PR description so reviewer can reproduce, AND (c) impl removal must be reproducible in a single revert/checkout step (no hand-edit gymnastics). Reviewer attestation: `empirical-revert verified: revert <impl-sha> → test failed/uncompilable; restore → test passes`. Canonical example: PR #267 r3 `d8ce15a` slow-loris timeout — test depended on the env-var-override impl present in HEAD; a separate RED commit would have nothing to assert against. Distinct from EMERGENCY hotfix exemption (this is architectural, not time-pressure).
+- **Empirical-revert exemption** (Sprint 26 amendment) — when the test is **architecturally un-runnable at a separate RED commit** because the test depends on an impl-provided fixture, type, function, or env-var configuration that lives in the same PR's impl. A literal RED commit would either fail-to-compile or have nothing to assert against. Reviewer-enforceable substitute: **empirical revert at HEAD** — reviewer reverts the impl portion (typically `git revert <impl-sha> --no-commit` or a single-step checkout that removes the impl), observes the test fails or fails-to-compile, restores impl, observes test passes. Conditions: (a) PR description must explicitly declare the architectural impossibility (e.g., "test depends on impl-provided fixture; no separate RED state possible"), AND (b) the revert sequence must be documented step-by-step in the PR description so reviewer can reproduce, AND (c) impl removal must be reproducible in a single revert/checkout step (no hand-edit gymnastics), AND **(d) post-revert duplicate-body check** — after empirical-revert verification, dev MUST verify exactly one impl body exists per fn before declaring the fix complete. Recommended verification: `grep -c 'fn <name>' src/...` returns expected count and full test suite passes via `cargo test` to completion locally. The empirical-revert process can leave a duplicate fn body shadowing the real impl if the restore step accidentally appends instead of replacing. Reviewer attestation: `empirical-revert verified: revert <impl-sha> → test failed/uncompilable; restore → test passes`. **Canonical example (r3 exemption)**: PR #267 r3 `d8ce15a` slow-loris timeout — test depended on the env-var-override impl present in HEAD; a separate RED commit would have nothing to assert against. **Canonical example (d) duplicate-body)**: PR #319 (Sprint 32 PR4) r2 — dev's r2 verification of F2 empirical-revert left a duplicate `create_binding` body that hard-stubbed `bail!("stub")`, regressing the trait method's deliverable. r3 restored real impl via single-line removal of the shadow. The duplicate-body check would have caught this pre-push. Distinct from EMERGENCY hotfix exemption (this is architectural, not time-pressure).
 
 ##### Rationale
 
@@ -603,8 +609,12 @@ Sprint 26 amendment (operator m-177). To eliminate idle wait time across the imp
 After pushing a PR (whether r1 or r2), impl-agent:
 
 1. Posts a `kind=update` notification to dev-lead with PR URL + HEAD SHA + diff stat.
-2. **Immediately** picks up the next dispatched task from inbox.
-3. Does NOT poll CI status; does NOT wait for reviewer verdict; does NOT block on dev-lead merge.
+2. **Scope statement** (Sprint 32 amendment): push notification MUST explicitly state one of:
+   (a) "scope follows dispatch spec X" — confirming no deviation from orchestrator's dispatch
+   (b) "deviated to Y because Z" — explicit scope-shift call-out for orchestrator approval BEFORE review dispatched.
+   Scope deviations caught only at review burn an extra cycle. The orchestrator-spec'd scope is the authoritative truth; dev simplifications must surface for orchestrator review at push time. **Canonical examples**: PR #319 (Sprint 32 PR4) r1 omitted auto-archive keepalive; PR #325 r1 deviated from operator-spec'd write-side unification to read-side fallback. Both UNVERIFIED; cycles cost.
+3. **Immediately** picks up the next dispatched task from inbox.
+4. Does NOT poll CI status; does NOT wait for reviewer verdict; does NOT block on dev-lead merge.
 
 If the PR is later REJECTED or has CI failure, impl receives a return-to-fix dispatch via inbox (queue-priority message). Impl decides when to take it based on current task queue state.
 
@@ -855,6 +865,8 @@ One-shot schedules auto-disable after firing. Use for:
 | 20 min, no response to ping | **Escalate.** `replace_instance` and re-dispatch task. |
 | Agent state `permission` + heartbeat fresh | Heartbeat gate suppresses false positive (A5 fix). Trust heartbeat. |
 | Agent state `permission` + heartbeat stale | May be genuinely stuck. Ping first, then escalate. |
+
+**Sprint 34 transitional SOP** (until Sprint 34 classifier fix lands): daemon classifier currently misclassifies idle prompt for codex / kiro backends as `agent_state=rate_limit` / `health_state=idle_long`. The agent is actually alive and pickup-ready. Do NOT wait for literal rate_limit "recovery" — dispatch the message and verify pickup via state transition (`rate_limit` → `tool_use` / heartbeat advance). Use `interrupt` only after dispatched message has not been picked up within reasonable window (≥5 min). Remove this transitional note when Sprint 34 classifier fix lands.
 
 ### Liveness check procedure
 
