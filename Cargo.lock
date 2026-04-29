@@ -4180,6 +4180,7 @@ dependencies = [
  "futures-sink",
  "http 1.4.0",
  "httparse",
+ "ring",
  "rustls-native-certs",
  "rustls-pki-types",
  "sha1_smol",

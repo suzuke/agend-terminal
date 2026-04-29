@@ -108,8 +108,8 @@ toml = { version = "0.8", optional = true }
 # WS shard lifecycle, http for REST, model for typed Discord API structs.
 # Pin to 0.16 series (Discord API v10). rustls-native-roots avoids
 # macOS SecureTransport flakiness (same rationale as teloxide rustls).
-twilight-gateway = { version = "0.16", optional = true, default-features = false, features = ["rustls-native-roots"] }
-twilight-http = { version = "0.16", optional = true, default-features = false, features = ["rustls-native-roots"] }
+twilight-gateway = { version = "0.16", optional = true, default-features = false, features = ["rustls-native-roots", "rustls-ring"] }
+twilight-http = { version = "0.16", optional = true, default-features = false, features = ["rustls-native-roots", "rustls-ring"] }
 twilight-model = { version = "0.16", optional = true }
 
 [target.'cfg(unix)'.dependencies]

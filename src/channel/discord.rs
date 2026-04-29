@@ -131,6 +131,28 @@ impl DiscordChannel {
         };
         (ch, tx)
     }
+
+    /// Test-only constructor with a custom twilight HTTP client (for
+    /// mock-server tests that exercise the real send path).
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_http(
+        http: std::sync::Arc<twilight_http::Client>,
+    ) -> (Self, mpsc::Sender<ChannelEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let ch = Self {
+            state: Mutex::new(DiscordState {
+                instance_to_channel: HashMap::new(),
+                channel_to_instance: HashMap::new(),
+                submit_keys: HashMap::new(),
+                registry: None,
+                user_allowlist: Some(vec![1]),
+                http_client: Some(http),
+            }),
+            caps: discord_caps(),
+            event_rx: Mutex::new(rx),
+        };
+        (ch, tx)
+    }
 }
 
 /// Build the Discord capability matrix (pinned by S5 analysis).
@@ -756,40 +778,94 @@ mod tests {
     }
 
     // ── F3 fix: §3.5.10 outbound request body shape assertion ────────
+    //
+    // Production-path-coupled: exercises the real Channel::send() →
+    // twilight_http::create_message() path against a mock HTTP server.
+    // The mock captures the request body twilight actually transmits
+    // and asserts it matches the Discord spec shape.
 
     /// §3.5.10 wire-format: outbound POST /channels/{id}/messages request
-    /// body matches Discord spec JSON/Form Params shape.
-    /// Ref: https://discord.com/developers/docs/resources/message#create-message-jsonform-params
+    /// body transmitted by twilight-http matches Discord spec shape.
     ///
-    /// The spec-quoted minimal payload is `{"content": "<text>"}`.
-    /// Our `build_create_message_body` must produce exactly this shape.
+    /// Uses a raw TCP listener as mock Discord API server. The twilight
+    /// client is pointed at it via `proxy()`. Channel::send() exercises
+    /// the real production code path.
     #[test]
-    fn discord_create_message_request_body_matches_spec() {
-        let body = super::build_create_message_body("Hello, World!");
+    fn discord_send_outbound_body_matches_spec() {
+        use crate::channel::Channel;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
 
-        // Spec-quoted from Discord API docs — the minimal JSON body for
-        // POST /channels/{id}/messages with text content only.
-        let spec_quoted: serde_json::Value =
-            serde_json::from_str(r#"{"content": "Hello, World!"}"#)
-                .expect("spec fixture must parse");
+        // Step 1: Start a mock HTTP server on an ephemeral port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
 
-        assert_eq!(
-            body, spec_quoted,
-            "outbound request body must match Discord spec shape"
+        // Step 2: Spawn a thread to handle one request.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_clone = captured.clone();
+        // fire-and-forget: test mock server thread — lives only for this test
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).expect("read");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Extract body after the \r\n\r\n header separator.
+            if let Some(idx) = request.find("\r\n\r\n") {
+                let body = &request[idx + 4..];
+                *captured_clone.lock().expect("lock") = Some(body.to_string());
+            }
+
+            // Respond with a minimal valid Discord Message JSON.
+            let response_body =
+                include_str!("../../tests/fixtures/discord-rest-create-message-response.json");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        // Step 3: Create twilight client pointed at mock server.
+        let client = twilight_http::Client::builder()
+            .proxy(format!("127.0.0.1:{port}"), true)
+            .build();
+        let client = std::sync::Arc::new(client);
+
+        // Step 4: Create DiscordChannel with this client + a recorded binding.
+        let (ch, _tx) = super::DiscordChannel::new_for_test_with_http(client);
+        let binding = crate::channel::BindingRef::new(
+            "discord",
+            Some("DC#290926798999357250".into()),
+            super::DiscordBindingPayload {
+                channel_id: 290926798999357250,
+            },
+        );
+        ch.record_binding("test-agent", binding.clone(), "\r".into());
+
+        // Step 5: Call the real production send() path.
+        let result = crate::channel::Channel::send(
+            &ch,
+            &binding,
+            crate::channel::OutMsg::text("Hello, World!"),
         );
 
-        // Verify field-level: only "content" key present (no extra fields).
-        let obj = body.as_object().expect("body must be object");
-        assert_eq!(obj.len(), 1, "minimal body has exactly 1 field");
-        assert!(obj.contains_key("content"), "must have 'content' key");
-    }
+        handle.join().expect("mock server thread");
 
-    /// Edge case: empty text produces `{"content": ""}` — still valid
-    /// per Discord spec (though our send() rejects empty text before
-    /// reaching the HTTP call).
-    #[test]
-    fn discord_create_message_request_body_empty_text() {
-        let body = super::build_create_message_body("");
-        assert_eq!(body["content"], "");
+        // Step 6: Assert the request body twilight transmitted.
+        assert!(result.is_ok(), "send must succeed: {:?}", result.err());
+        let body_str = captured
+            .lock()
+            .expect("lock")
+            .take()
+            .expect("body captured");
+        let actual: serde_json::Value =
+            serde_json::from_str(&body_str).expect("body must be valid JSON");
+        let expected: serde_json::Value = serde_json::json!({"content": "Hello, World!"});
+        assert_eq!(
+            actual, expected,
+            "outbound body must match Discord spec create-message shape"
+        );
     }
 }
