@@ -614,3 +614,118 @@ fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let _ = std::fs::remove_dir_all(&test_dir);
     results
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_result_ok_sets_passed_true() {
+        let r = TestResult::ok("test", "detail");
+        assert!(r.passed);
+        assert_eq!(r.name, "test");
+        assert_eq!(r.detail, "detail");
+    }
+
+    #[test]
+    fn test_result_fail_sets_passed_false() {
+        let r = TestResult::fail("test", "reason");
+        assert!(!r.passed);
+        assert_eq!(r.detail, "reason");
+    }
+
+    #[test]
+    fn test_result_from_bool_true() {
+        let r = TestResult::from_bool("t", true, "pass", "fail");
+        assert!(r.passed);
+        assert_eq!(r.detail, "pass");
+    }
+
+    #[test]
+    fn test_result_from_bool_false() {
+        let r = TestResult::from_bool("t", false, "pass", "fail");
+        assert!(!r.passed);
+        assert_eq!(r.detail, "fail");
+    }
+
+    #[test]
+    fn test_spawn_config_defaults() {
+        let cfg = test_spawn_config("agent1", None);
+        assert_eq!(cfg.name, "agent1");
+        assert_eq!(cfg.cols, 80);
+        assert_eq!(cfg.rows, 24);
+        assert_eq!(cfg.submit_key, "\r");
+        assert!(cfg.home.is_none());
+    }
+
+    #[test]
+    fn test_spawn_config_with_home() {
+        let home = std::path::PathBuf::from("/tmp/test");
+        let cfg = test_spawn_config("agent2", Some(&home));
+        assert_eq!(cfg.home, Some(home.as_path()));
+    }
+
+    #[test]
+    fn poll_until_returns_true_immediately() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(poll_until(deadline, || true));
+    }
+
+    #[test]
+    fn poll_until_returns_false_on_timeout() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        assert!(!poll_until(deadline, || false));
+    }
+
+    #[test]
+    fn poll_until_succeeds_after_retries() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let counter = std::sync::atomic::AtomicU32::new(0);
+        let result = poll_until(deadline, || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2
+        });
+        assert!(result);
+    }
+
+    #[test]
+    fn test_mcp_framing_returns_result() {
+        let home = std::env::temp_dir().join(format!("verify-mcp-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let r = test_mcp_framing();
+        // Should pass (tests MCP framing logic)
+        assert!(r.passed, "mcp_framing: {}", r.detail);
+    }
+
+    #[test]
+    fn test_backend_config_returns_result() {
+        let home = std::env::temp_dir().join(format!("verify-backend-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let r = test_backend_config(&home);
+        assert!(r.passed, "backend_config: {}", r.detail);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_instructions_returns_result() {
+        let home = std::env::temp_dir().join(format!("verify-instr-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let r = test_instructions(&home);
+        // May fail if backends not installed — that's expected in CI
+        assert!(
+            r.passed || r.detail.contains("false"),
+            "instructions unexpected failure: {}",
+            r.detail
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_inbox_returns_result() {
+        let home = std::env::temp_dir().join(format!("verify-inbox-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let r = test_inbox(&home);
+        assert!(r.passed, "inbox: {}", r.detail);
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
