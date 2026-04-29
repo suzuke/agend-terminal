@@ -304,6 +304,12 @@ impl StatePatterns {
                 // [docs] HTTP error handling
                 // Sprint 31+ #4: word-boundary `429` per Claude pattern.
                 (AgentState::RateLimit, r"rate.?limit|\b429\b"),
+                // [measured] Provider-side validation errors (e.g. MiniMax
+                // M2.5 rejecting eager_input_streaming in tool spec).
+                (
+                    AgentState::ApiError,
+                    r"Error from provider:|request validation errors",
+                ),
                 // [docs] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [docs] Permission UI
@@ -2636,6 +2642,33 @@ mod tests {
             t.get_state(),
             AgentState::RateLimit,
             "RateLimit must stay sticky before 300s window"
+        );
+    }
+
+    // --- Sprint 34 PR-4: OpenCode provider error tests ---
+
+    #[test]
+    fn opencode_provider_error_triggers_error_state() {
+        let patterns = StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect("Error from provider: Anthropic API error: 39 validation errors"),
+            Some(AgentState::ApiError),
+            "provider error must trigger ApiError state"
+        );
+        assert_eq!(
+            patterns.detect("request validation errors for tools[0]"),
+            Some(AgentState::ApiError),
+            "request validation errors must trigger ApiError state"
+        );
+    }
+
+    #[test]
+    fn opencode_normal_pane_does_not_trigger_error() {
+        let patterns = StatePatterns::for_backend(&Backend::OpenCode);
+        assert_ne!(
+            patterns.detect("Ask anything  tab agents"),
+            Some(AgentState::ApiError),
+            "normal opencode pane must not trigger ApiError"
         );
     }
 }
