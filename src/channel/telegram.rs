@@ -60,6 +60,10 @@ fn save_topic_registry(home: &Path, registry: &HashMap<i32, String>) {
 }
 
 fn register_topic(home: &Path, topic_id: i32, instance_name: &str) {
+    // Writes to topics.json (disk registry). Callers are responsible for
+    // also updating in-memory state (topic_to_instance / instance_to_topic)
+    // and fleet.yaml (update_instance_field). See create_topic_for_instance
+    // which writes all three.
     let mut reg = load_topic_registry(home);
     reg.insert(topic_id, instance_name.to_string());
     save_topic_registry(home, &reg);
@@ -429,6 +433,19 @@ fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) -> String {
                 }
             }
         }
+        // Fix B: check topics.json as third source (runtime-created topics
+        // may exist there but not in fleet.yaml or in-memory state).
+        let reg = load_topic_registry(&state.home);
+        if let Some(inst_name) = reg.get(&tid) {
+            state.topic_to_instance.insert(tid, inst_name.clone());
+            state.instance_to_topic.insert(inst_name.clone(), tid);
+            return inst_name.clone();
+        }
+        // Fix C: warn before fallback so operator sees misroute.
+        tracing::warn!(
+            thread_id = tid,
+            "resolve_topic: topic_id not found in memory, fleet.yaml, or topics.json — falling back to \"general\""
+        );
     }
     "general".to_string()
 }
@@ -1065,6 +1082,21 @@ pub fn init_from_config(
         .iter()
         .filter_map(|(name, inst)| inst.topic_id.map(|tid| (name.clone(), tid)))
         .collect();
+
+    // Fix B: merge topics.json entries not already in fleet.yaml.
+    // topics.json is the runtime registry (written by register_topic on
+    // create_instance); fleet.yaml is the declarative config. Fleet.yaml
+    // wins on conflict (same instance, different topic_id).
+    for (tid, inst_name) in &reg {
+        if *tid != 1 && inst_name != FLEET_BINDING_SENTINEL && !topic_map.contains_key(inst_name) {
+            tracing::info!(
+                instance = %inst_name,
+                topic_id = tid,
+                "merging topic from topics.json (not in fleet.yaml)"
+            );
+            topic_map.insert(inst_name.clone(), *tid);
+        }
+    }
 
     // Auto-create topics for instances without topic_id
     for (name, inst) in &config.instances {
@@ -3046,6 +3078,33 @@ instances:
         std::fs::remove_file(home.join("fleet.yaml")).ok();
         assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Fix B: resolve_topic checks topics.json as third source when
+    /// topic_id is not in memory or fleet.yaml. Before this fix,
+    /// runtime-created instances (registered only in topics.json)
+    /// would misroute to "general".
+    #[test]
+    fn resolve_topic_falls_back_to_topics_json() {
+        let home = tmp_home("resolve_topics_json");
+        // No fleet.yaml — topic only exists in topics.json.
+        register_topic(&home, 2474, "test-gemini");
+        let mut state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        );
+        // Before fix: returns "general". After fix: returns "test-gemini".
+        assert_eq!(
+            resolve_topic(&mut state, Some(2474)),
+            "test-gemini",
+            "topic in topics.json must resolve, not fall through to general"
+        );
+        // Verify it was cached in memory for subsequent calls.
+        assert_eq!(resolve_topic(&mut state, Some(2474)), "test-gemini");
         std::fs::remove_dir_all(&home).ok();
     }
 
