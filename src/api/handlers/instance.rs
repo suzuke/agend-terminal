@@ -350,6 +350,24 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
     }
 }
 
+pub(crate) fn handle_pane_snapshot(params: &Value, ctx: &HandlerCtx) -> Value {
+    let name = match params["name"].as_str() {
+        Some(n) => n,
+        None => return json!({"ok": false, "error": "missing 'name'"}),
+    };
+    let lines = params["lines"].as_u64().unwrap_or(100) as usize;
+    let reg = agent::lock_registry(ctx.registry);
+    let handle = match reg.get(name) {
+        Some(h) => h,
+        None => return json!({"ok": false, "error": format!("instance '{name}' not found")}),
+    };
+    let core = handle.core.lock();
+    let text = core.vterm.read_scrollback(lines);
+    drop(core);
+    drop(reg);
+    json!({"ok": true, "text": text})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

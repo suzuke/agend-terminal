@@ -330,6 +330,54 @@ impl VTerm {
         text
     }
 
+    /// Read scrollback history + visible screen as plain text (ANSI stripped).
+    /// Returns the last `max_lines` lines. Walks from `topmost_line()` to
+    /// `bottommost_line()` via `safe_cell` — same pattern as `tail_lines`.
+    pub fn read_scrollback(&self, max_lines: usize) -> String {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let top = grid.topmost_line();
+        let bot = grid.bottommost_line();
+        let total = (bot.0 - top.0 + 1) as usize;
+
+        let start = if total > max_lines {
+            Line(bot.0 - max_lines as i32 + 1)
+        } else {
+            top
+        };
+
+        let mut lines: Vec<String> = Vec::with_capacity(max_lines.min(total));
+        let mut row = start;
+        while row <= bot {
+            let mut line = String::with_capacity(cols);
+            let mut col = 0;
+            while col < cols {
+                let cell = safe_cell(grid, row, col);
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    col += 1;
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                line.push(ch);
+                col += 1;
+            }
+            lines.push(line.trim_end().to_string());
+            row += 1;
+        }
+
+        // Trim blank lines at both ends
+        let first = lines
+            .iter()
+            .position(|l| !l.is_empty())
+            .unwrap_or(lines.len());
+        let last = lines
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map(|i| i + 1)
+            .unwrap_or(first);
+        lines[first..last].join("\n")
+    }
+
     /// Return the last `n` visible rows of the screen as plain text,
     /// stripped of ANSI attributes and trailing spaces. Leading blank
     /// rows are omitted so short output doesn't look padded.

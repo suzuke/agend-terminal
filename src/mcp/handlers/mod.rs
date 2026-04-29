@@ -105,6 +105,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "interrupt" => instance::handle_interrupt(&home, args),
         "set_waiting_on" => instance::handle_set_waiting_on(&home, args, instance_name, &sender),
         "move_pane" => instance::handle_move_pane(&home, args),
+        "pane_snapshot" => instance::handle_pane_snapshot(&home, args),
         // Consolidated: health action=report/clear
         "health" => match args["action"].as_str().unwrap_or("") {
             "report" => instance::handle_report_health(&home, args, instance_name, &sender),

@@ -368,6 +368,30 @@ pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
     }
 }
 
+pub(super) fn handle_pane_snapshot(home: &Path, args: &Value) -> Value {
+    let target = match args["target"].as_str() {
+        Some(t) => t,
+        None => return json!({"error": "missing 'target'"}),
+    };
+    if let Err(e) = crate::agent::validate_name(target) {
+        return json!({"error": e});
+    }
+    let lines = args["lines"].as_u64().unwrap_or(100) as usize;
+    if lines > 10000 {
+        return json!({"error": "lines must be <= 10000 (scrolling_history limit)"});
+    }
+    match crate::api::call(
+        home,
+        &json!({"method": crate::api::method::PANE_SNAPSHOT, "params": {"name": target, "lines": lines}}),
+    ) {
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+            json!({"ok": true, "text": resp["text"]})
+        }
+        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("pane_snapshot failed")}),
+        Err(e) => json!({"error": format!("pane_snapshot: {e}")}),
+    }
+}
+
 pub(super) fn handle_report_health(
     home: &Path,
     args: &Value,
