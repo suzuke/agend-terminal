@@ -2141,6 +2141,32 @@ mod tests {
     }
 
     #[test]
+    fn pane_title_no_state_suffix() {
+        let pane = Pane {
+            agent_name: "agent".to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam::channel::bounded(1).1,
+            id: 1,
+            backend: Some(crate::backend::Backend::ClaudeCode),
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        };
+        let segments = pane_title_segments(&pane, AgentState::Idle, Style::default());
+        let joined: String = segments.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            !joined.contains("[idle]"),
+            "pane title must not contain state suffix, got: {joined}"
+        );
+    }
+
+    #[test]
     fn main_tui_footer_shows_help_hint() {
         let backend = ratatui::backend::TestBackend::new(100, 3);
         let mut terminal =
