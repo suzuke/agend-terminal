@@ -8,22 +8,36 @@
 
 ---
 
+## Metric definitions (read first)
+
+This audit reports **two distinct metrics** that must not be conflated:
+
+- **Inline unit test count** — number of `#[test]` functions defined IN the source file under `mod tests { … }` or sibling. Measures whether the file ships its own test guards (caught by file-local refactor regressions).
+- **Line coverage %** — fraction of executable lines hit by ANY test (inline OR external integration test). Measured via `cargo llvm-cov`.
+
+A file can have **0 inline tests AND >70 % line coverage** when integration tests in `tests/` exercise it indirectly. Both metrics can be true simultaneously; one does not refute the other.
+
+The predecessor `audit-tests-2026-04-29.md` reported **inline unit test count**. This audit adds **line coverage %** as supplemental context, plus forensic patterns. Where this audit corrects a predecessor *factual* claim (e.g. `verify.rs` "0 tests" was actually 13), the correction stands. Where the predecessor's claim was about inline tests and this audit measured line coverage, the two are complementary, not contradictory.
+
 ## TL;DR
 
-| Metric | Predecessor audit (`102e6ad`) | This audit (`eea15f2`, measured) |
+| Metric | Predecessor audit (`102e6ad`, inline-test count) | This audit (`eea15f2`, line coverage % + patterns) |
 |---|---|---|
 | Risk ranking method | LOC × inline-test-count | Line coverage % via `cargo llvm-cov` + forensic patterns |
 | Overall coverage | not measured | **72.8 %** (28 068 / 38 553 lines, 105 files) |
-| `verify.rs` | claimed "0 tests, HIGH" | **34.8 %** measured + 13 inline tests, ~10 tautological |
-| `mcp/handlers/instance.rs` | claimed "0 tests, HIGH" | **46.8 %** measured (integration coverage) |
-| `agend-mcp-bridge.rs` | claimed "0 tests, HIGH retry" | **73.7 %** measured (integration coverage) |
+| `verify.rs` | claimed "0 tests, HIGH" — **factually wrong** | 13 inline tests (~10 tautological); 34.8 % line cov; effectively untested per §3.1 |
+| `mcp/handlers/instance.rs` | "0 tests, HIGH" — **correct** (0 inline) | 0 inline confirmed; 46.8 % line cov from integration; **predecessor's add-tests recommendation stands** |
+| `agend-mcp-bridge.rs` | "0 unit, HIGH retry" — **correct** (predecessor explicitly noted "integration 間接覆蓋但無 unit tests") | 0 inline confirmed; 73.7 % line cov from integration; **predecessor's add-tests recommendation stands** (KISS judgment whether to act on it deferred to §3.3) |
 | Ignored tests in tree | 8 cited | **6 actual** (2 already deleted in `df27e83`) |
 | Tautology count | "good test quality" hand-wave | **6 named coupling/tautology sites** + 14 assertion-light + 4 unwrap-only + 3 let-only |
 | Sprint-29-30 deletion residue | not checked | **clean** — no orphan tests |
 
-**Headline correction**: the predecessor audit's three "HIGH risk, 0 tests" calls (`verify.rs`, `instance.rs`, `agend-mcp-bridge.rs`) all turn out to have meaningful integration coverage when measured. The real concern at `eea15f2` is not gaps but **test quality** — specifically `verify.rs`'s tautological inline tests and a small cluster of mock-pair / confirmation-bias coupling in `channel/mod.rs` + `framing.rs` + `backend_harness.rs`.
+**Headline observations**:
 
-The single under-covered surface that **does** warrant attention: `src/mcp/handlers/channel.rs` at **10.3 %** (4 / 39 lines) — small file, MCP-handler scope, low coverage; either write meaningful tests or delete dead code per KISS.
+1. **Predecessor's only factual error** is the `verify.rs` "0 tests" claim — it actually has 13 inline tests. But ~10 of those are tautological (constructor `ok()` asserts `passed=true`, etc.) so the *operational* conclusion (effectively untested) holds.
+2. **Predecessor's `instance.rs` and `agend-mcp-bridge.rs` calls are correct on inline-test count**. This audit's line-coverage % is supplemental context — it shows integration tests reach those modules — but does not retire predecessor's "add tests" recommendation. Whether to act on it is a separate KISS judgment.
+3. **New finding the predecessor did not surface**: `src/mcp/handlers/channel.rs` at **10.3 %** (4 / 39 lines). Small file, MCP-handler scope; either write a meaningful test or delete dead code per KISS / §3.5.12 (d).
+4. **New finding on test quality, not gaps**: 6 named mock-pair / confirmation-bias / tautological sites in `channel/mod.rs` + `framing.rs` + `backend_harness.rs` — fake tests pass without exercising behaviour.
 
 ---
 
@@ -81,7 +95,7 @@ These are visible-immediately to the single operator (TUI, CLI, bootstrap). KISS
 | `mcp/handlers/schedule.rs` | 21 | 28.6 | small file, 15 uncovered lines |
 | `mcp/handlers/ci.rs` | 105 | 32.4 | non-trivial gap |
 | `verify.rs` | 549 | 34.8 | inline tests are 10 / 13 tautological — see §3.1 |
-| `mcp/handlers/instance.rs` | 570 | 46.8 | integration coverage; predecessor audit overstated risk |
+| `mcp/handlers/instance.rs` | 570 | 46.8 | 0 inline tests; line cov from integration. Predecessor's add-tests recommendation stands |
 | `api/handlers/mcp_proxy.rs` | 51 | 47.1 | small file |
 | `backend_harness.rs` | 311 | 43.4 | mostly ignored (require real CLIs) |
 | `daemon/legacy_backfill.rs` | 510 | 53.5 | migration helper; cov reflects migration paths exercised |
@@ -92,12 +106,14 @@ Healthy modules ≥94 % — `decisions.rs`, `auth_cookie.rs`, `mcp_config.rs`, `
 
 ### 1.5 Cross-reference with predecessor audit gap claims
 
-| Predecessor claim | Measured | Verdict |
-|---|---|---|
-| `verify.rs` "0 tests, HIGH" | 34.8 % (191 / 549), **13 inline tests exist** | Claim factually wrong; conclusion partly stands (low cov + tautology — see §3.1) |
-| `mcp/handlers/instance.rs` "0 tests, HIGH" | 46.8 % (267 / 570) via integration | Claim collapses two states; coverage moderate, not crisis |
-| `agend-mcp-bridge.rs` "0 unit, HIGH retry" | **73.7 % (168 / 228)** via `mcp_bridge_idle_reconnect` etc. | Claim refuted; recommendation already implemented |
-| `api/handlers/instance.rs` (not flagged) | 69.7 % (264 / 379) | n/a — confirms HTTP layer well-tested |
+Two columns intentionally separate the metrics: predecessor measured **inline-test count** (file ships its own guards), this audit measured **line coverage %** (any test reaches the lines). Both can be true simultaneously.
+
+| File | Predecessor (inline-test count) | This audit (line cov %) | Verdict on predecessor recommendation |
+|---|---|---|---|
+| `verify.rs` | "0 tests" — **factually wrong** | 13 inline tests; 34.8 % cov; ~10 tautological | Predecessor's premise wrong; the ask "needs tests" still has a nuance — delete tautologies, write 1–2 real ones (§3.1) |
+| `mcp/handlers/instance.rs` | "0 tests" — **correct** (0 inline) | 0 inline confirmed; 46.8 % from integration | **Predecessor's add-inline-tests recommendation stands** — line coverage is supplemental context, not refutation |
+| `agend-mcp-bridge.rs` | "0 unit, integration 間接覆蓋" — **correct on both halves** | 0 inline confirmed; 73.7 % from `mcp_bridge_*` integration | **Predecessor's add-unit-tests-for-retry recommendation stands**; whether to act is a §3.5.12 (d) KISS judgment (§3.3) |
+| `api/handlers/instance.rs` (not flagged by predecessor) | n/a | 69.7 % | confirms HTTP layer well-tested via integration |
 
 ### 1.6 Weak-assertion grep (dev2)
 
@@ -199,9 +215,14 @@ This perspective answers: given operator's KISS philosophy and §0 "what real pr
 
 reviewer2's archaeology (§2.3) confirms `df27e83` (PR #300 wave-2 refactor) deleted both. Drop the recommendation from forward tracking.
 
-### 3.3 `instance.rs` and `agend-mcp-bridge.rs` claims refuted
+### 3.3 `instance.rs` and `agend-mcp-bridge.rs` — supplemental measurement context
 
-`instance.rs` 46.8 %, bridge 73.7 % (§1.2, §1.5). Predecessor's "needs unit tests" framing for both modules misreads integration coverage as absence. Bridge's "zero crate dependencies" architecture (`audit-over-engineering-2026-04-28.md` finding #5) makes integration the right test layer; do not promote to backlog.
+Predecessor's "0 inline tests" claim is **correct** for both files. This audit's line coverage % (`instance.rs` 46.8 %, bridge 73.7 %) is **supplemental context**, not a refutation: it shows integration tests exercise these modules without retiring the recommendation that they ship their own inline-test guards.
+
+Whether to **act** on the predecessor recommendation is a separate KISS judgment per §3.5.12 (d) counter-example construction:
+
+- `mcp/handlers/instance.rs` — instance lifecycle (create / delete / replace) is core daemon behaviour. **Counter-example for skipping inline tests**: a refactor of the create-instance code path that reorders steps, breaks an invariant, but happens to keep the integration test passing because the test asserts the post-state and not the intermediate steps. Inline unit tests would have caught the broken invariant. **Verdict**: predecessor's recommendation stands → backlog item B5.
+- `agend-mcp-bridge.rs` — bridge's "zero crate dependencies" architecture (`audit-over-engineering-2026-04-28.md` finding #5) is what makes inline unit tests structurally awkward (no library boundary to mock against). The integration tests `mcp_bridge_idle_reconnect` + `mcp_bridge_client_handshake` exercise the retry/handshake paths the predecessor was concerned about. **Counter-example attempt**: a retry-logic refactor that breaks the underlying timer arithmetic but keeps the integration test green because the timer values aren't observed externally — plausible but not strongly evidenced. **Verdict**: B6 below at lower priority; the §3.5.10 wire-format invariant test (B4) is the higher-leverage win for this file.
 
 ### 3.4 `mcp/handlers/channel.rs` 10.3 % is the real gap
 
@@ -241,6 +262,13 @@ Each item: priority · LOC estimate (negative = net deletion) · rationale (the 
 | **B2** | `mcp/handlers/channel.rs`: investigate 10.3 % coverage — either delete dead handler code or write 1 real test | ±50 | Smallest non-UI low-coverage file; either dead code (KISS-delete per §3.5.12 (d)) or live MCP handler that warrants ≥1 behavioural test | §3.4 · `src/mcp/handlers/channel.rs` |
 | **B3** | Delete `channel/mod.rs` mock-pair / coupling cluster + `framing.rs` constant tautology + `backend_harness.rs:456-460` | **−60** | Six tests that assert what they wire up — pass-but-don't-test by reviewer2 forensics. Deleting breaks no real coverage; each was authored in the same commit as its impl (§3.5.11 anti-pattern residue) | §2.2, §3.5 · 6 sites in §2.2 |
 | **B4** | §3.5.10 wire-format invariant test for `agend-mcp-bridge.rs` — verify presence; add if absent (parallel to `tests/mcp_tools_count.rs`) | 0 or +30 | Sprint-30 amendment compliance; bridge is canonical wire-format surface. Catches silent regression of supported methods / handshake bytes | §3.6 · `docs/FLEET-DEV-PROTOCOL-v1.md` §3.5.10, PR #299 |
+| **B5** | `mcp/handlers/instance.rs`: write inline unit tests for create / delete / replace lifecycle invariants | +60–100 | Predecessor recommendation upheld (§3.3); integration tests assert post-state, not intermediate invariants of a 570-LOC core handler. Inline guards catch refactors that pass integration but break invariants | §3.3 · predecessor `audit-tests-2026-04-29.md` row "instance.rs"  |
+
+### P1 — secondary (lower-leverage but predecessor-acknowledged)
+
+| ID | Title | Δ LOC | Rationale | References |
+|---|---|---|---|---|
+| **B6** | `agend-mcp-bridge.rs`: explore inline unit tests for retry/timer arithmetic that integration tests don't externally observe | +30–60 | Predecessor recommendation upheld (§3.3); structural awkwardness (zero-deps architecture) makes this lower-priority than B4. Defer until B4 lands and we know whether the wire-format invariant catches the same regressions | §3.3 · predecessor `audit-tests-2026-04-29.md` row "agend-mcp-bridge.rs" |
 
 ### P2 — hygiene / docs
 
