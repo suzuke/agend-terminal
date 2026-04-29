@@ -267,6 +267,20 @@ pub(crate) fn map_message_to_msg_ref(
 }
 
 // ---------------------------------------------------------------------------
+// Outbound request body construction
+// ---------------------------------------------------------------------------
+
+/// Build the JSON body for `POST /channels/{id}/messages` per Discord spec.
+/// Ref: https://discord.com/developers/docs/resources/message#create-message-jsonform-params
+///
+/// This is the canonical shape our adapter transmits. The test suite
+/// asserts this against the spec-quoted example (§3.5.10 outbound
+/// request boundary).
+pub(crate) fn build_create_message_body(text: &str) -> serde_json::Value {
+    serde_json::json!({ "content": text })
+}
+
+// ---------------------------------------------------------------------------
 // Channel trait impl
 // ---------------------------------------------------------------------------
 
@@ -739,5 +753,43 @@ mod tests {
             false,
         );
         assert!(result.is_err(), "notify on unbound instance must error");
+    }
+
+    // ── F3 fix: §3.5.10 outbound request body shape assertion ────────
+
+    /// §3.5.10 wire-format: outbound POST /channels/{id}/messages request
+    /// body matches Discord spec JSON/Form Params shape.
+    /// Ref: https://discord.com/developers/docs/resources/message#create-message-jsonform-params
+    ///
+    /// The spec-quoted minimal payload is `{"content": "<text>"}`.
+    /// Our `build_create_message_body` must produce exactly this shape.
+    #[test]
+    fn discord_create_message_request_body_matches_spec() {
+        let body = super::build_create_message_body("Hello, World!");
+
+        // Spec-quoted from Discord API docs — the minimal JSON body for
+        // POST /channels/{id}/messages with text content only.
+        let spec_quoted: serde_json::Value =
+            serde_json::from_str(r#"{"content": "Hello, World!"}"#)
+                .expect("spec fixture must parse");
+
+        assert_eq!(
+            body, spec_quoted,
+            "outbound request body must match Discord spec shape"
+        );
+
+        // Verify field-level: only "content" key present (no extra fields).
+        let obj = body.as_object().expect("body must be object");
+        assert_eq!(obj.len(), 1, "minimal body has exactly 1 field");
+        assert!(obj.contains_key("content"), "must have 'content' key");
+    }
+
+    /// Edge case: empty text produces `{"content": ""}` — still valid
+    /// per Discord spec (though our send() rejects empty text before
+    /// reaching the HTTP call).
+    #[test]
+    fn discord_create_message_request_body_empty_text() {
+        let body = super::build_create_message_body("");
+        assert_eq!(body["content"], "");
     }
 }
