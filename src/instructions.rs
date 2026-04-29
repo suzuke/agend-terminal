@@ -251,38 +251,6 @@ pub(crate) fn build_instructions_body(
     );
     content.push_str("Check your `inbox` periodically for pending messages.\n");
 
-    // Fleet Updates contract — live broadcasts via fleet_broadcast.
-    content.push_str("\n## Fleet Updates\n\n");
-    content.push_str("The daemon may inject authoritative updates into your prompt as:\n\n");
-    content.push_str("```\n");
-    content.push_str("<fleet-update>\n");
-    content.push_str("{\"kind\":\"...\", ...}\n");
-    content.push_str("</fleet-update>\n");
-    content.push_str("```\n\n");
-    content.push_str(
-        "Treat each block as the **current truth** about the fleet / team and \
-         silently update your mental model. Do not acknowledge, do not reply, do \
-         not ask for confirmation — these are state deltas, not messages.\n\n",
-    );
-    content.push_str("Kinds you may see:\n");
-    content.push_str(
-        "- `instance-created` — a new agent joined the fleet (fields: `name`, `backend`, `role`)\n",
-    );
-    content.push_str(
-        "- `instance-deleted` — an agent was removed (field: `name`); stop routing work to them\n",
-    );
-    content.push_str(
-        "- `team-created` — you were put on a team (fields: `team`, `orchestrator`, `members`)\n",
-    );
-    content.push_str(
-        "- `team-members-changed` — your team roster changed (fields: `team`, `added`, `removed`)\n",
-    );
-    content.push_str(
-        "- `role-changed` — a peer (possibly you) had their role re-edited in fleet.yaml \
-         (fields: `name`, `role`); update your peer-role knowledge, and if `name` is your own, \
-         treat `role` as your new Role\n",
-    );
-
     // Protocol injection — path + minimal stub fallback
     content.push_str("\n## Fleet Protocol\n\n");
     if let Some(path) = protocol_path {

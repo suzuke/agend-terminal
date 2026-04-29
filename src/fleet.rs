@@ -171,11 +171,6 @@ pub struct InstanceConfig {
     pub model: Option<String>,
     /// Display name for UI/Telegram.
     pub display_name: Option<String>,
-    /// Opt-out from `fleet_broadcast` `<fleet-update>` marker injections.
-    /// `None` defaults to receive (conservative — most agents benefit
-    /// from knowing about peers); set to `false` on user-facing chat
-    /// proxies like `general` where broadcast markers read as noise.
-    pub receive_fleet_updates: Option<bool>,
     /// Legacy field — retained only to gracefully absorb old fleet.yaml
     /// files that still declare `outbound_capabilities`. Not used at
     /// runtime; skipped on serialization.
