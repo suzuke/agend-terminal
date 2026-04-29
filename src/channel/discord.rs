@@ -483,4 +483,84 @@ mod tests {
         let event = super::map_ready_to_connected(&ready_payload);
         assert!(matches!(event, ChannelEvent::Connected { .. }));
     }
+
+    // ── PR2 tests: MessageIn + send + notify ─────────────────────────
+
+    /// §3.5.10 wire-format fixture: MESSAGE_CREATE gateway event
+    /// parsed into `ChannelEvent::MessageIn`.
+    #[test]
+    fn discord_message_create_emits_message_in() {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-message-create.json");
+        let frame: serde_json::Value =
+            serde_json::from_str(fixture).expect("fixture must parse");
+        let d = frame.get("d").expect("d field");
+        let msg: twilight_model::channel::Message =
+            serde_json::from_value(d.clone()).expect("Message");
+
+        let event = super::map_message_create_to_message_in(&msg);
+
+        match event {
+            ChannelEvent::MessageIn {
+                binding,
+                from,
+                payload,
+                ts,
+            } => {
+                assert_eq!(binding.kind(), "discord");
+                assert_eq!(from.id, "82198898841029460");
+                assert_eq!(from.handle.as_deref(), Some("testoperator"));
+                assert_eq!(payload.text, "hello from discord");
+                // ts should be parseable (not epoch-zero)
+                assert!(ts.timestamp() > 0);
+            }
+            other => panic!("expected MessageIn, got: {other:?}"),
+        }
+    }
+
+    /// §3.5.10 wire-format fixture: outbound POST /channels/{id}/messages
+    /// response parsed into `MsgRef`.
+    #[test]
+    fn discord_create_message_response_parses_to_msg_ref() {
+        let fixture =
+            include_str!("../../tests/fixtures/discord-rest-create-message-response.json");
+        let msg: twilight_model::channel::Message =
+            serde_json::from_str(fixture).expect("response must parse as Message");
+
+        let msg_ref = super::map_message_to_msg_ref(&msg);
+
+        assert_eq!(msg_ref.id, "444385199974967099");
+        assert_eq!(msg_ref.binding.kind(), "discord");
+    }
+
+    /// send_from_agent(Reply) on an authorized channel with a recorded
+    /// binding should call the send path. We test the dispatch logic
+    /// without hitting the network by verifying the method routes
+    /// correctly and returns the expected error for unbound instances.
+    #[test]
+    fn send_from_agent_reply_errors_on_unbound_instance() {
+        let (ch, _rx) = super::DiscordChannel::new_for_test();
+        // No binding recorded for "unknown-agent" → should error.
+        let result = crate::channel::Channel::send_from_agent(
+            &ch,
+            "unknown-agent",
+            crate::channel::AgentOutboundOp::Reply {
+                text: "hi".into(),
+            },
+        );
+        assert!(result.is_err(), "unbound instance must error");
+    }
+
+    /// notify on an unbound instance should error gracefully.
+    #[test]
+    fn notify_errors_on_unbound_instance() {
+        let (ch, _rx) = super::DiscordChannel::new_for_test();
+        let result = crate::channel::Channel::notify(
+            &ch,
+            "unknown-agent",
+            crate::channel::NotifySeverity::Info,
+            "test notification",
+            false,
+        );
+        assert!(result.is_err(), "notify on unbound instance must error");
+    }
 }
