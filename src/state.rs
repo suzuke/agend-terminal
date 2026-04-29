@@ -574,6 +574,11 @@ impl StateTracker {
     /// operator-reported `dev-reviewer 卡在互動 prompt` false positive.
     const INTERACTIVE_EXPIRY: Duration = Duration::from_secs(120);
 
+    /// Max time `RateLimit` may stay latched. Real rate limits typically
+    /// clear in seconds to minutes; 5 min covers aggressive throttling
+    /// while preventing hours-long false positives (PR #319 incident).
+    const RATE_LIMIT_EXPIRY: Duration = Duration::from_secs(300);
+
     /// If the last MCP heartbeat is within this window, the agent is
     /// considered alive and `PermissionPrompt` detection is suppressed.
     const HEARTBEAT_FRESH_WINDOW: Duration = Duration::from_secs(120);
@@ -772,6 +777,13 @@ impl StateTracker {
         // LATCHED_STATE_EXPIRY is almost always stale.
         let short_expiring = matches!(self.current, AgentState::Thinking | AgentState::ToolUse);
         if short_expiring && self.since.elapsed() >= Self::LATCHED_STATE_EXPIRY {
+            self.transition(AgentState::Ready);
+            return;
+        }
+        // RateLimit expires on its own 5-minute window. Real rate limits
+        // clear in seconds-to-minutes; stuck for hours is a false positive.
+        let rate_limit_expiring = matches!(self.current, AgentState::RateLimit);
+        if rate_limit_expiring && self.since.elapsed() >= Self::RATE_LIMIT_EXPIRY {
             self.transition(AgentState::Ready);
             return;
         }
