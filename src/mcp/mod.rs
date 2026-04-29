@@ -250,9 +250,15 @@ pub(crate) fn is_running_inside_daemon_process() -> bool {
 /// Short-circuits to direct `handle_tool` when running inside the daemon.
 fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
     // Short-circuit: if we're inside the daemon process, call handle_tool
-    // directly — no TCP round-trip needed. All process-global state
-    // (ACTIVE_CHANNEL, heartbeat_pair) is already available.
+    // directly — no TCP round-trip needed.
     if is_running_inside_daemon_process() {
+        return handlers::handle_tool(tool, args, instance_name);
+    }
+
+    // Sprint 31 P0: test isolation — when AGEND_TEST_ISOLATION=1, never
+    // try the daemon API. Prevents cargo test from polluting the real
+    // fleet via env::set_var race conditions in parallel test threads.
+    if std::env::var("AGEND_TEST_ISOLATION").as_deref() == Ok("1") {
         return handlers::handle_tool(tool, args, instance_name);
     }
 

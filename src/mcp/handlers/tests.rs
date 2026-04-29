@@ -220,6 +220,8 @@ fn setup_recorder(tag: &str) -> (Arc<Recorder>, std::path::PathBuf) {
     // Safe: fleet_test_guard serializes these tests, and the cross-module
     // racers (instructions.rs, telegram.rs) no longer set AGEND_HOME.
     std::env::set_var("AGEND_HOME", &home);
+    // Sprint 31 P0: prevent daemon API pollution during tests
+    std::env::set_var("AGEND_TEST_ISOLATION", "1");
     // Minimal fleet so send_to's `get_submit_key` lookup resolves
     // (fallback path on unreachable daemon still needs submit_key).
     let yaml = "defaults:\n  backend: claude\ninstances:\n  target:\n    role: Test\n  sender:\n    role: Test\n";

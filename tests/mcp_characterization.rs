@@ -78,6 +78,7 @@ fn mcp_session_in(home: &std::path::Path, instance_name: &str, requests: &[&str]
     let mut child = Command::new(binary())
         .args(["mcp"])
         .env("AGEND_HOME", home)
+        .env("AGEND_TEST_ISOLATION", "1")
         .env("AGEND_INSTANCE_NAME", instance_name)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
