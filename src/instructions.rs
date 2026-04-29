@@ -251,38 +251,6 @@ pub(crate) fn build_instructions_body(
     );
     content.push_str("Check your `inbox` periodically for pending messages.\n");
 
-    // Fleet Updates contract — live broadcasts via fleet_broadcast.
-    content.push_str("\n## Fleet Updates\n\n");
-    content.push_str("The daemon may inject authoritative updates into your prompt as:\n\n");
-    content.push_str("```\n");
-    content.push_str("<fleet-update>\n");
-    content.push_str("{\"kind\":\"...\", ...}\n");
-    content.push_str("</fleet-update>\n");
-    content.push_str("```\n\n");
-    content.push_str(
-        "Treat each block as the **current truth** about the fleet / team and \
-         silently update your mental model. Do not acknowledge, do not reply, do \
-         not ask for confirmation — these are state deltas, not messages.\n\n",
-    );
-    content.push_str("Kinds you may see:\n");
-    content.push_str(
-        "- `instance-created` — a new agent joined the fleet (fields: `name`, `backend`, `role`)\n",
-    );
-    content.push_str(
-        "- `instance-deleted` — an agent was removed (field: `name`); stop routing work to them\n",
-    );
-    content.push_str(
-        "- `team-created` — you were put on a team (fields: `team`, `orchestrator`, `members`)\n",
-    );
-    content.push_str(
-        "- `team-members-changed` — your team roster changed (fields: `team`, `added`, `removed`)\n",
-    );
-    content.push_str(
-        "- `role-changed` — a peer (possibly you) had their role re-edited in fleet.yaml \
-         (fields: `name`, `role`); update your peer-role knowledge, and if `name` is your own, \
-         treat `role` as your new Role\n",
-    );
-
     // Protocol injection — path + minimal stub fallback
     content.push_str("\n## Fleet Protocol\n\n");
     if let Some(path) = protocol_path {
@@ -1172,6 +1140,35 @@ mod tests {
         assert!(
             body.contains("can_take_after:"),
             "BUSY format must include can_take_after field"
+        );
+    }
+
+    /// §3.5.10 production-path fixture: build_instructions_body (the
+    /// production code that generates PTY-injected system prompts) must
+    /// NOT contain `<fleet-update>` markers after Sprint 35 removal.
+    ///
+    /// §3.5.11 r3 empirical-revert: reverting the Fleet Updates section
+    /// removal in instructions.rs makes this test fail (inject reappears).
+    #[test]
+    fn instructions_body_does_not_contain_fleet_update_markers() {
+        let ctx = AgentContext {
+            name: "test-agent",
+            role: None,
+            team: None,
+            fleet_peers: &[],
+        };
+        let body = build_instructions_body(Some(&ctx), Some("/tmp/protocol.md"));
+        assert!(
+            !body.contains("<fleet-update>"),
+            "instructions must not contain <fleet-update> marker after Sprint 35 removal"
+        );
+        assert!(
+            !body.contains("</fleet-update>"),
+            "instructions must not contain </fleet-update> marker"
+        );
+        assert!(
+            !body.contains("Fleet Updates"),
+            "instructions must not contain Fleet Updates section header"
         );
     }
 }

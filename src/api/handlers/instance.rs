@@ -104,16 +104,6 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
             name: name.to_string(),
         });
     }
-    // Announce the removal to every survivor. Must run AFTER the target
-    // is removed from `ctx.registry` above, so compute_targets doesn't
-    // try to inject the marker back into the dying agent's PTY.
-    crate::fleet_broadcast::broadcast(
-        ctx.home,
-        ctx.registry,
-        &crate::fleet_broadcast::FleetUpdate::InstanceDeleted {
-            name: name.to_string(),
-        },
-    );
     json!({"ok": true})
 }
 
@@ -176,7 +166,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         &work_dir,
         size,
     ) {
-        Ok(spawn_mode) => {
+        Ok(_spawn_mode) => {
             // Every API-level spawn gets a channel topic (no-op when
             // no channel is configured). Routes through the Channel trait
             // so this handler is channel-agnostic.
@@ -212,22 +202,6 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
             // fleet joiner — peers already know about it from their own
             // agend.md snapshots, so broadcasting would just generate
             // noise on every daemon restart).
-            if matches!(spawn_mode, crate::backend::SpawnMode::Fresh) {
-                let role_owned = explicit_role.map(str::to_string).or_else(|| {
-                    crate::fleet::FleetConfig::load(&ctx.home.join("fleet.yaml"))
-                        .ok()
-                        .and_then(|f| f.instances.get(name).and_then(|c| c.role.clone()))
-                });
-                crate::fleet_broadcast::broadcast(
-                    ctx.home,
-                    ctx.registry,
-                    &crate::fleet_broadcast::FleetUpdate::InstanceCreated {
-                        name: name.to_string(),
-                        backend: command.to_string(),
-                        role: role_owned,
-                    },
-                );
-            }
             let mut result = json!({"name": name});
             if let Some(tid) = topic_id {
                 result["topic_id"] = json!(tid);
