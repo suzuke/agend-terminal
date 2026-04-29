@@ -627,7 +627,7 @@ After pushing a PR (whether r1 or r2), impl-agent:
    Scope deviations caught only at review burn an extra cycle. The orchestrator-spec'd scope is the authoritative truth; dev simplifications must surface for orchestrator review at push time. **Canonical examples**: PR #319 (Sprint 32 PR4) r1 omitted auto-archive keepalive; PR #325 r1 deviated from operator-spec'd write-side unification to read-side fallback. Both UNVERIFIED; cycles cost.
 3. **Orchestrator pre-dispatch verification** (2026-04-30 backlog amendment): Orchestrator MUST cross-check that dev's claim language reflects the actual artifact — for example, a "byte-equal verified" claim must be confirmed by reading the test, not by trusting the form text alone. If the claim and artifact diverge, orchestrator returns the dispatch to dev for clarification BEFORE forwarding to reviewer. **Incident source**: PR-B r1 incident, week of 2026-04-29 — dev push notification claimed "round-trip byte-equal verified" but the test was mislabeled and broken; reviewer caught it during review and r1 was REJECTED, costing a full review round.
 4. **Immediately** picks up the next dispatched task from inbox.
-4. Does NOT poll CI status; does NOT wait for reviewer verdict; does NOT block on dev-lead merge.
+5. Does NOT poll CI status; does NOT wait for reviewer verdict; does NOT block on dev-lead merge.
 
 If the PR is later REJECTED or has CI failure, impl receives a return-to-fix dispatch via inbox (queue-priority message). Impl decides when to take it based on current task queue state.
 
