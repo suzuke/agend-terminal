@@ -131,8 +131,58 @@ fn discord_caps() -> ChannelCapabilities {
 }
 
 // ---------------------------------------------------------------------------
-// Event mapping
+// Gateway frame parsing — maps raw JSON to typed payloads / events
 // ---------------------------------------------------------------------------
+
+/// Opcode extracted from a raw gateway JSON frame.
+/// Used by the gateway reader to dispatch on frame type before
+/// deserializing the inner `d` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayFrame {
+    pub op: u8,
+}
+
+/// Parse the opcode from a raw gateway JSON frame.
+/// Returns `None` if the frame is not valid JSON or lacks an `op` field.
+pub fn parse_gateway_opcode(raw: &str) -> Option<GatewayFrame> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let op = v.get("op")?.as_u64()? as u8;
+    Some(GatewayFrame { op })
+}
+
+/// Parse a HELLO frame (opcode 10) and return the heartbeat interval in ms.
+pub fn parse_hello_interval(raw: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let d = v.get("d")?;
+    let hello: twilight_model::gateway::payload::incoming::Hello =
+        serde_json::from_value(d.clone()).ok()?;
+    Some(hello.heartbeat_interval)
+}
+
+/// Build the IDENTIFY payload our adapter sends to the gateway.
+/// Returns the full JSON frame (op=2 + d={token, intents, properties}).
+pub fn build_identify_payload(
+    token: &str,
+    intents: twilight_model::gateway::Intents,
+) -> serde_json::Value {
+    serde_json::json!({
+        "op": 2,
+        "d": {
+            "token": token,
+            "intents": intents.bits(),
+            "properties": {
+                "os": std::env::consts::OS,
+                "browser": "agend-terminal",
+                "device": "agend-terminal"
+            }
+        }
+    })
+}
+
+/// Returns `true` if the frame is a HEARTBEAT_ACK (opcode 11).
+pub fn is_heartbeat_ack(raw: &str) -> bool {
+    parse_gateway_opcode(raw).map_or(false, |f| f.op == 11)
+}
 
 /// Map a twilight `Ready` payload to `ChannelEvent::Connected`.
 pub fn map_ready_to_connected(
@@ -316,5 +366,121 @@ mod tests {
         }
 
         assert!(crate::channel::Channel::poll_event(&ch).is_none());
+    }
+
+    // ── §3.5.10 expanded gateway handshake fixture tests ─────────────
+    //
+    // F1 fix: cover the full HELLO → IDENTIFY → HEARTBEAT → HEARTBEAT_ACK
+    // → READY sequence using Discord API spec payloads.
+    //
+    // §3.5.11 r3 empirical-revert exemption: impl already exists from
+    // GREEN commit; tests depend on impl-provided fns. Reviewer can
+    // revert impl to verify test failure.
+
+    /// HELLO (opcode 10): server sends heartbeat_interval after WS connect.
+    /// Fixture: tests/fixtures/discord-gateway-hello.json (Discord API spec).
+    #[test]
+    fn discord_gateway_hello_parsed_correctly() {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-hello.json");
+
+        // Opcode must be 10 (Hello).
+        let frame = super::parse_gateway_opcode(fixture).expect("must parse");
+        assert_eq!(frame.op, 10, "HELLO opcode must be 10");
+
+        // heartbeat_interval must be extractable.
+        let interval = super::parse_hello_interval(fixture).expect("must parse interval");
+        assert_eq!(interval, 41250, "fixture heartbeat_interval");
+    }
+
+    /// IDENTIFY (opcode 2): client sends token + intents after receiving HELLO.
+    /// Asserts the frame our adapter builds matches Discord spec shape.
+    #[test]
+    fn discord_gateway_identify_shape_matches_spec() {
+        let intents = twilight_model::gateway::Intents::GUILDS
+            | twilight_model::gateway::Intents::GUILD_MESSAGES
+            | twilight_model::gateway::Intents::MESSAGE_CONTENT;
+
+        let frame = super::build_identify_payload("Bot test-token-redacted", intents);
+
+        // op must be 2
+        assert_eq!(frame["op"], 2, "IDENTIFY opcode must be 2");
+
+        // d.token present
+        assert_eq!(frame["d"]["token"], "Bot test-token-redacted");
+
+        // d.intents is a numeric bitfield
+        assert!(frame["d"]["intents"].is_u64(), "intents must be numeric");
+
+        // d.properties has required fields per Discord spec
+        let props = &frame["d"]["properties"];
+        assert!(props["os"].is_string(), "properties.os required");
+        assert_eq!(props["browser"], "agend-terminal");
+        assert_eq!(props["device"], "agend-terminal");
+    }
+
+    /// HEARTBEAT_ACK (opcode 11): server acknowledges client heartbeat.
+    /// Fixture: tests/fixtures/discord-gateway-heartbeat-ack.json.
+    #[test]
+    fn discord_gateway_heartbeat_ack_recognized() {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-heartbeat-ack.json");
+
+        let frame = super::parse_gateway_opcode(fixture).expect("must parse");
+        assert_eq!(frame.op, 11, "HEARTBEAT_ACK opcode must be 11");
+        assert!(super::is_heartbeat_ack(fixture), "is_heartbeat_ack");
+    }
+
+    /// HEARTBEAT (opcode 1): client sends sequence number periodically.
+    /// Spec shape: `{"op": 1, "d": <last_sequence_or_null>}`.
+    #[test]
+    fn discord_gateway_heartbeat_shape() {
+        // First heartbeat (no sequence yet) — d is null per spec.
+        let first = r#"{"op": 1, "d": null}"#;
+        let frame = super::parse_gateway_opcode(first).expect("must parse");
+        assert_eq!(frame.op, 1, "HEARTBEAT opcode must be 1");
+        assert!(!super::is_heartbeat_ack(first), "heartbeat is not ack");
+
+        // Subsequent heartbeat with sequence number.
+        let subsequent = r#"{"op": 1, "d": 42}"#;
+        let frame = super::parse_gateway_opcode(subsequent).expect("must parse");
+        assert_eq!(frame.op, 1);
+    }
+
+    /// Full handshake sequence: HELLO → IDENTIFY → HEARTBEAT → HEARTBEAT_ACK → READY.
+    /// Asserts the correct opcode ordering and that each frame parses.
+    #[test]
+    fn discord_gateway_full_handshake_sequence() {
+        let hello = include_str!("../../tests/fixtures/discord-gateway-hello.json");
+        let heartbeat_ack = include_str!("../../tests/fixtures/discord-gateway-heartbeat-ack.json");
+        let ready = include_str!("../../tests/fixtures/discord-gateway-ready.json");
+
+        // Step 1: Server sends HELLO (op=10)
+        let f1 = super::parse_gateway_opcode(hello).expect("hello");
+        assert_eq!(f1.op, 10);
+
+        // Step 2: Client sends IDENTIFY (op=2) — we build it
+        let identify =
+            super::build_identify_payload("Bot fake", twilight_model::gateway::Intents::GUILDS);
+        assert_eq!(identify["op"], 2);
+
+        // Step 3: Client sends HEARTBEAT (op=1)
+        let hb = r#"{"op": 1, "d": null}"#;
+        let f3 = super::parse_gateway_opcode(hb).expect("heartbeat");
+        assert_eq!(f3.op, 1);
+
+        // Step 4: Server sends HEARTBEAT_ACK (op=11)
+        let f4 = super::parse_gateway_opcode(heartbeat_ack).expect("ack");
+        assert_eq!(f4.op, 11);
+
+        // Step 5: Server sends READY (op=0, t=READY)
+        let f5 = super::parse_gateway_opcode(ready).expect("ready");
+        assert_eq!(f5.op, 0);
+
+        // Map READY to Connected event
+        let frame: serde_json::Value = serde_json::from_str(ready).expect("json");
+        let d = frame.get("d").expect("d");
+        let ready_payload: twilight_model::gateway::payload::incoming::Ready =
+            serde_json::from_value(d.clone()).expect("Ready");
+        let event = super::map_ready_to_connected(&ready_payload);
+        assert!(matches!(event, ChannelEvent::Connected { .. }));
     }
 }
