@@ -2602,4 +2602,28 @@ mod tests {
             "chat content with glyph + distant tool name must NOT trigger ToolUse"
         );
     }
+
+    // --- Sprint 34 PR-3: RateLimit expiry tests ---
+
+    #[test]
+    fn rate_limit_expires_after_300s_window() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::RateLimit, 301);
+        t.tick();
+        assert_eq!(
+            t.get_state(),
+            AgentState::Ready,
+            "RateLimit must expire to Ready after 300s"
+        );
+    }
+
+    #[test]
+    fn rate_limit_remains_sticky_before_300s() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::RateLimit, 250);
+        t.tick();
+        assert_eq!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "RateLimit must stay sticky before 300s window"
+        );
+    }
 }
