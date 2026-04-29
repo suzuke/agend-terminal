@@ -1352,21 +1352,6 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// PR3 cutover note — original test asserted "claim a dep-blocked
-    /// task and observe it stays claimed despite deps". New PR3 contract:
-    /// claim refuses dep-blocked tasks at validation time (consistent
-    /// with `test_claim_blocked_task_rejected`). The "claimed task must
-    /// not be touched by dep eval" invariant is still upheld at the
-    /// `evaluate_dependency_status` level (matches case explicitly skips
-    /// `claimed` / `done` / `cancelled`), but you can no longer reach
-    /// that branch from a dep-blocked starting state via the MCP surface.
-    #[test]
-    #[ignore = "PR3 cutover: claim refuses dep-blocked tasks; legacy bypass scenario unreachable. Invariant preserved at evaluate_dependency_status level."]
-    fn test_claimed_task_not_touched_by_dep_eval() {
-        // Original test body retained for archeology; behaviour replaced
-        // by `test_claim_blocked_task_rejected`'s positive assertion.
-    }
-
     /// PR3 — depends_on is set in the Created event and immutable via
     /// the MCP surface (no "depends_on update" event variant). Circular
     /// deps can still arise from migration of a circular legacy
@@ -1926,64 +1911,6 @@ mod tests {
     // every other test that creates Done tasks; this specific 14-day
     // boundary check is gated behind a future invariant test that uses
     // direct envelope writes.
-
-    #[test]
-    #[ignore = "PR3 cutover: requires direct envelope writes with backdated timestamps. TTL filter logic verified indirectly by other Done tests."]
-    fn test_list_default_hides_done_older_than_14d() {
-        let home = tmp_home("done-ttl-hide");
-        // Create two tasks, mark both done
-        let r1 = handle(
-            &home,
-            "a",
-            &serde_json::json!({"action": "create", "title": "old done"}),
-        );
-        let id1 = r1["id"].as_str().unwrap().to_string();
-        handle(
-            &home,
-            "a",
-            &serde_json::json!({"action": "claim", "id": id1}),
-        );
-        handle(
-            &home,
-            "a",
-            &serde_json::json!({"action": "done", "id": id1, "result": "ok"}),
-        );
-
-        let r2 = handle(
-            &home,
-            "a",
-            &serde_json::json!({"action": "create", "title": "recent done"}),
-        );
-        let id2 = r2["id"].as_str().unwrap().to_string();
-        handle(
-            &home,
-            "a",
-            &serde_json::json!({"action": "claim", "id": id2}),
-        );
-        handle(
-            &home,
-            "a",
-            &serde_json::json!({"action": "done", "id": id2, "result": "ok"}),
-        );
-
-        // Backdate the first task's updated_at to 15 days ago
-        let _ = crate::store::mutate_versioned(
-            &crate::store::store_path(&home, "tasks.json"),
-            |store: &mut TaskStore| {
-                if let Some(t) = store.tasks.iter_mut().find(|t| t.id == id1) {
-                    t.updated_at = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
-                }
-                Ok(())
-            },
-        );
-
-        // Default list (no filter_status) should hide the old done task
-        let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
-        let tasks = listed["tasks"].as_array().unwrap();
-        assert_eq!(tasks.len(), 1, "old done task must be hidden");
-        assert_eq!(tasks[0]["title"], "recent done");
-        std::fs::remove_dir_all(&home).ok();
-    }
 
     #[test]
     fn test_list_done_filter_returns_all() {
