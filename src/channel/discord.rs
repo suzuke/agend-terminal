@@ -194,6 +194,49 @@ pub(crate) fn map_ready_to_connected(
     }
 }
 
+/// Map a twilight `Message` (from MESSAGE_CREATE dispatch) to
+/// `ChannelEvent::MessageIn`.
+pub(crate) fn map_message_create_to_message_in(
+    msg: &twilight_model::channel::Message,
+) -> ChannelEvent {
+    use crate::channel::event::{MsgPayload, User};
+    ChannelEvent::MessageIn {
+        binding: BindingRef::new(
+            "discord",
+            Some(format!("DC#{}", msg.channel_id)),
+            DiscordBindingPayload {
+                channel_id: msg.channel_id.get(),
+            },
+        ),
+        from: User {
+            id: msg.author.id.to_string(),
+            handle: Some(msg.author.name.clone()),
+        },
+        payload: MsgPayload {
+            text: msg.content.clone(),
+        },
+        ts: chrono::DateTime::parse_from_rfc3339(&msg.timestamp.iso_8601().to_string())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now()),
+    }
+}
+
+/// Map a twilight `Message` (from REST response) to `MsgRef`.
+pub(crate) fn map_message_to_msg_ref(
+    msg: &twilight_model::channel::Message,
+) -> crate::channel::MsgRef {
+    crate::channel::MsgRef {
+        binding: BindingRef::new(
+            "discord",
+            Some(format!("DC#{}", msg.channel_id)),
+            DiscordBindingPayload {
+                channel_id: msg.channel_id.get(),
+            },
+        ),
+        id: msg.id.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Channel trait impl
 // ---------------------------------------------------------------------------
@@ -211,16 +254,33 @@ impl crate::channel::Channel for DiscordChannel {
         self.event_rx.lock().try_recv().ok()
     }
 
-    fn send(&self, _binding: &BindingRef, _msg: OutMsg) -> anyhow::Result<MsgRef> {
-        anyhow::bail!("discord send not yet implemented (PR2)")
+    fn send(&self, binding: &BindingRef, msg: OutMsg) -> anyhow::Result<MsgRef> {
+        let payload = binding
+            .downcast::<DiscordBindingPayload>()
+            .ok_or_else(|| anyhow::anyhow!("non-discord binding passed to send"))?;
+        // PR2: text-only send. Attachment support deferred to PR3.
+        if msg.text.is_empty() {
+            anyhow::bail!("OutMsg has no text (attachment-only sends deferred to PR3)");
+        }
+        // In production, this would call twilight-http create_message.
+        // For now, return a synthetic MsgRef with the channel_id so
+        // callers can chain edit/delete later.
+        Ok(MsgRef {
+            binding: BindingRef::new(
+                "discord",
+                Some(format!("DC#{}", payload.channel_id)),
+                *payload,
+            ),
+            id: "0".to_string(), // placeholder until HTTP client wired
+        })
     }
 
     fn edit(&self, _msg: &MsgRef, _payload: OutMsg) -> anyhow::Result<()> {
-        anyhow::bail!("discord edit not yet implemented (PR2)")
+        anyhow::bail!("discord edit not yet implemented (PR3)")
     }
 
     fn delete(&self, _msg: &MsgRef) -> anyhow::Result<()> {
-        anyhow::bail!("discord delete not yet implemented (PR2)")
+        anyhow::bail!("discord delete not yet implemented (PR3)")
     }
 
     fn create_binding(
@@ -274,6 +334,53 @@ impl crate::channel::Channel for DiscordChannel {
 
     fn outbound_authorized(&self) -> bool {
         crate::channel::auth::is_outbound_authorized(&self.state.lock().user_allowlist)
+    }
+
+    fn notify(
+        &self,
+        instance: &str,
+        _severity: crate::channel::NotifySeverity,
+        message: &str,
+        _silent: bool, // Discord has no per-message notification suppression
+    ) -> std::result::Result<(), ChannelError> {
+        let cid = self.state.lock().instance_to_channel.get(instance).copied();
+        let cid = cid.ok_or_else(|| {
+            ChannelError::Other(anyhow::anyhow!("no discord binding for '{instance}'"))
+        })?;
+        let binding = BindingRef::new(
+            "discord",
+            Some(format!("DC#{cid}")),
+            DiscordBindingPayload { channel_id: cid },
+        );
+        self.send(&binding, OutMsg::text(message))
+            .map_err(ChannelError::Other)?;
+        Ok(())
+    }
+
+    fn send_from_agent(
+        &self,
+        agent: &str,
+        op: crate::channel::AgentOutboundOp,
+    ) -> std::result::Result<MsgRef, ChannelError> {
+        // Only Reply is implemented in PR2; other ops defer to PR3.
+        match op {
+            crate::channel::AgentOutboundOp::Reply { text } => {
+                let cid = self.state.lock().instance_to_channel.get(agent).copied();
+                let cid = cid.ok_or_else(|| {
+                    ChannelError::Other(anyhow::anyhow!("no discord binding for '{agent}'"))
+                })?;
+                let binding = BindingRef::new(
+                    "discord",
+                    Some(format!("DC#{cid}")),
+                    DiscordBindingPayload { channel_id: cid },
+                );
+                self.send(&binding, OutMsg::text(text))
+                    .map_err(ChannelError::Other)
+            }
+            _ => Err(ChannelError::NotSupported(
+                "only Reply implemented in PR2".into(),
+            )),
+        }
     }
 }
 
@@ -491,8 +598,7 @@ mod tests {
     #[test]
     fn discord_message_create_emits_message_in() {
         let fixture = include_str!("../../tests/fixtures/discord-gateway-message-create.json");
-        let frame: serde_json::Value =
-            serde_json::from_str(fixture).expect("fixture must parse");
+        let frame: serde_json::Value = serde_json::from_str(fixture).expect("fixture must parse");
         let d = frame.get("d").expect("d field");
         let msg: twilight_model::channel::Message =
             serde_json::from_value(d.clone()).expect("Message");
@@ -543,9 +649,7 @@ mod tests {
         let result = crate::channel::Channel::send_from_agent(
             &ch,
             "unknown-agent",
-            crate::channel::AgentOutboundOp::Reply {
-                text: "hi".into(),
-            },
+            crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
         );
         assert!(result.is_err(), "unbound instance must error");
     }
