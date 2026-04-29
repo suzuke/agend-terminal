@@ -338,16 +338,11 @@ impl VTerm {
         let cols = grid.columns();
         let top = grid.topmost_line();
         let bot = grid.bottommost_line();
-        let total = (bot.0 - top.0 + 1) as usize;
 
-        let start = if total > max_lines {
-            Line(bot.0 - max_lines as i32 + 1)
-        } else {
-            top
-        };
-
-        let mut lines: Vec<String> = Vec::with_capacity(max_lines.min(total));
-        let mut row = start;
+        // Read ALL lines first (trim blanks before windowing so content
+        // above trailing blank padding is not lost — gemini-banner case).
+        let mut lines: Vec<String> = Vec::new();
+        let mut row = top;
         while row <= bot {
             let mut line = String::with_capacity(cols);
             let mut col = 0;
@@ -365,7 +360,7 @@ impl VTerm {
             row += 1;
         }
 
-        // Trim blank lines at both ends
+        // Trim blank lines at both ends BEFORE windowing
         let first = lines
             .iter()
             .position(|l| !l.is_empty())
@@ -375,7 +370,15 @@ impl VTerm {
             .rposition(|l| !l.is_empty())
             .map(|i| i + 1)
             .unwrap_or(first);
-        lines[first..last].join("\n")
+        let trimmed = &lines[first..last];
+
+        // Window to last max_lines
+        let result = if trimmed.len() > max_lines {
+            &trimmed[trimmed.len() - max_lines..]
+        } else {
+            trimmed
+        };
+        result.join("\n")
     }
 
     /// Return the last `n` visible rows of the screen as plain text,
