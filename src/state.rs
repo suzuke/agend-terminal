@@ -2638,4 +2638,31 @@ mod tests {
             "RateLimit must stay sticky before 300s window"
         );
     }
+
+    // --- Sprint 34 PR-4: OpenCode provider error tests ---
+
+    #[test]
+    fn opencode_provider_error_triggers_error_state() {
+        let patterns = StatePatterns::for_backend(&Backend::OpenCode);
+        assert_eq!(
+            patterns.detect("Error from provider: Anthropic API error: 39 validation errors"),
+            Some(AgentState::ApiError),
+            "provider error must trigger ApiError state"
+        );
+        assert_eq!(
+            patterns.detect("request validation errors for tools[0]"),
+            Some(AgentState::ApiError),
+            "request validation errors must trigger ApiError state"
+        );
+    }
+
+    #[test]
+    fn opencode_normal_pane_does_not_trigger_error() {
+        let patterns = StatePatterns::for_backend(&Backend::OpenCode);
+        assert_ne!(
+            patterns.detect("Ask anything  tab agents"),
+            Some(AgentState::ApiError),
+            "normal opencode pane must not trigger ApiError"
+        );
+    }
 }
