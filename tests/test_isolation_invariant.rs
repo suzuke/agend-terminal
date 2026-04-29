@@ -40,30 +40,6 @@ fn proxy_or_local_checks_test_isolation() {
     );
 }
 
-// --- #82: Behavioral assertions (not source-grep) ---
-
-/// Verify proxy_or_local respects AGEND_TEST_ISOLATION at runtime.
-#[test]
-fn proxy_or_local_skips_daemon_when_isolation_set() {
-    // Set isolation env var
-    std::env::set_var("AGEND_TEST_ISOLATION", "1");
-    std::env::set_var(
-        "AGEND_HOME",
-        std::env::temp_dir().join("agend-isolation-test"),
-    );
-    // If proxy_or_local tried the daemon API, it would fail (no daemon at temp dir).
-    // With isolation, it goes straight to local handle_tool which returns
-    // a structured response (not a connection error).
-    // We can't call proxy_or_local directly (binary-internal), but we verify
-    // the env var is set correctly.
-    assert_eq!(
-        std::env::var("AGEND_TEST_ISOLATION").as_deref(),
-        Ok("1"),
-        "AGEND_TEST_ISOLATION must be set to 1"
-    );
-    std::env::remove_var("AGEND_TEST_ISOLATION");
-}
-
 // --- #83: Walk-and-grep — catch future test files missing isolation ---
 
 /// Walk tests/ directory and verify every file that spawns Command::new
