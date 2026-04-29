@@ -52,6 +52,9 @@ pub struct DiscordState {
     pub registry: Option<AgentRegistry>,
     /// User allowlist (Discord user snowflakes). `None` = fail-closed.
     pub user_allowlist: Option<Vec<i64>>,
+    /// twilight HTTP client for REST API calls. `None` only in test
+    /// harness — production `new` always populates it.
+    pub http_client: Option<std::sync::Arc<twilight_http::Client>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +73,11 @@ pub struct DiscordChannel {
 impl DiscordChannel {
     /// Production constructor. `event_rx` is the receiving end of the
     /// mpsc channel fed by the gateway reader task.
-    pub fn new(event_rx: mpsc::Receiver<ChannelEvent>, user_allowlist: Option<Vec<i64>>) -> Self {
+    pub fn new(
+        event_rx: mpsc::Receiver<ChannelEvent>,
+        user_allowlist: Option<Vec<i64>>,
+        http_client: std::sync::Arc<twilight_http::Client>,
+    ) -> Self {
         Self {
             state: Mutex::new(DiscordState {
                 instance_to_channel: HashMap::new(),
@@ -78,6 +85,7 @@ impl DiscordChannel {
                 submit_keys: HashMap::new(),
                 registry: None,
                 user_allowlist,
+                http_client: Some(http_client),
             }),
             caps: discord_caps(),
             event_rx: Mutex::new(event_rx),
@@ -96,6 +104,27 @@ impl DiscordChannel {
                 submit_keys: HashMap::new(),
                 registry: None,
                 user_allowlist: None,
+                http_client: None,
+            }),
+            caps: discord_caps(),
+            event_rx: Mutex::new(rx),
+        };
+        (ch, tx)
+    }
+
+    /// Test-only constructor with a configured allowlist so
+    /// `outbound_authorized()` returns `true`.
+    #[cfg(test)]
+    pub(crate) fn new_for_test_authorized() -> (Self, mpsc::Sender<ChannelEvent>) {
+        let (tx, rx) = mpsc::channel();
+        let ch = Self {
+            state: Mutex::new(DiscordState {
+                instance_to_channel: HashMap::new(),
+                channel_to_instance: HashMap::new(),
+                submit_keys: HashMap::new(),
+                registry: None,
+                user_allowlist: Some(vec![1]),
+                http_client: None,
             }),
             caps: discord_caps(),
             event_rx: Mutex::new(rx),
@@ -241,6 +270,17 @@ pub(crate) fn map_message_to_msg_ref(
 // Channel trait impl
 // ---------------------------------------------------------------------------
 
+/// Shared tokio runtime for Discord sync→async calls.
+fn discord_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("discord tokio runtime")
+    })
+}
+
 impl crate::channel::Channel for DiscordChannel {
     fn kind(&self) -> &'static str {
         "discord"
@@ -258,20 +298,25 @@ impl crate::channel::Channel for DiscordChannel {
         let payload = binding
             .downcast::<DiscordBindingPayload>()
             .ok_or_else(|| anyhow::anyhow!("non-discord binding passed to send"))?;
-        // PR2: text-only send. Attachment support deferred to PR3.
         if msg.text.is_empty() {
             anyhow::bail!("OutMsg has no text (attachment-only sends deferred to PR3)");
         }
-        // In production, this would call twilight-http create_message.
-        // For now, return a synthetic MsgRef with the channel_id so
-        // callers can chain edit/delete later.
-        Ok(MsgRef {
-            binding: BindingRef::new(
-                "discord",
-                Some(format!("DC#{}", payload.channel_id)),
-                *payload,
-            ),
-            id: "0".to_string(), // placeholder until HTTP client wired
+        let http = self
+            .state
+            .lock()
+            .http_client
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("discord http client not initialized"))?;
+        let channel_id = twilight_model::id::Id::new(payload.channel_id);
+        let text = msg.text;
+        let cp = *payload;
+        discord_runtime().block_on(async {
+            let response = http.create_message(channel_id).content(&text).await?;
+            let sent = response.model().await?;
+            Ok(MsgRef {
+                binding: BindingRef::new("discord", Some(format!("DC#{}", cp.channel_id)), cp),
+                id: sent.id.to_string(),
+            })
         })
     }
 
@@ -362,7 +407,14 @@ impl crate::channel::Channel for DiscordChannel {
         agent: &str,
         op: crate::channel::AgentOutboundOp,
     ) -> std::result::Result<MsgRef, ChannelError> {
-        // Only Reply is implemented in PR2; other ops defer to PR3.
+        // Step 1: adapter-level allowlist gate (PR #216 contract).
+        if !self.outbound_authorized() {
+            return Err(ChannelError::Other(anyhow::anyhow!(
+                "outbound disabled — channel.user_allowlist not configured"
+            )));
+        }
+
+        // Step 2: dispatch. Only Reply in PR2; other ops defer to PR3.
         match op {
             crate::channel::AgentOutboundOp::Reply { text } => {
                 let cid = self.state.lock().instance_to_channel.get(agent).copied();
@@ -638,20 +690,41 @@ mod tests {
         assert_eq!(msg_ref.binding.kind(), "discord");
     }
 
-    /// send_from_agent(Reply) on an authorized channel with a recorded
-    /// binding should call the send path. We test the dispatch logic
-    /// without hitting the network by verifying the method routes
-    /// correctly and returns the expected error for unbound instances.
+    /// send_from_agent(Reply) on an authorized channel with no binding
+    /// for the agent should error with "no discord binding".
     #[test]
     fn send_from_agent_reply_errors_on_unbound_instance() {
-        let (ch, _rx) = super::DiscordChannel::new_for_test();
-        // No binding recorded for "unknown-agent" → should error.
+        let (ch, _rx) = super::DiscordChannel::new_for_test_authorized();
+        // Authorized but no binding → should error about binding.
         let result = crate::channel::Channel::send_from_agent(
             &ch,
             "unknown-agent",
             crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
         );
         assert!(result.is_err(), "unbound instance must error");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("no discord binding"),
+            "error must mention binding, got: {err_msg}"
+        );
+    }
+
+    /// F2 fix: send_from_agent must check outbound_authorized() gate.
+    /// When user_allowlist is None (unconfigured), the gate drops the call.
+    #[test]
+    fn send_from_agent_blocked_by_outbound_gate() {
+        let (ch, _rx) = super::DiscordChannel::new_for_test(); // allowlist=None → unauthorized
+        let result = crate::channel::Channel::send_from_agent(
+            &ch,
+            "any-agent",
+            crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
+        );
+        assert!(result.is_err(), "unauthorized channel must reject");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("outbound disabled"),
+            "error must mention outbound gate, got: {err_msg}"
+        );
     }
 
     /// notify on an unbound instance should error gracefully.
