@@ -407,6 +407,20 @@ Refactor PRs that demonstrably preserve byte-output / lock structure / persisten
 
 When `Cargo.toml` (or sibling design doc) flags a tool as the **sanctioned approach** for a category — typical comment shape `# <design-doc> §X names \`<crate>\` as the sanctioned approach for <purpose>` — declining that tool in favor of a rolled-own implementation requires (a) explicit declaration in the PR description naming the sanctioned tool being declined, AND (b) narrow-scope architectural rationale (capability gap, scope-filter limitation, etc.) that distinguishes the use case from the design-doc's assumed use case. Without (a)+(b) the decline is silent and reviewer-unverifiable; future maintainers see only the rolled-own and cannot judge whether to migrate. Canonical example: PR #273 r4 declined `tracing-test = "0.2"` because `tracing_test::logs_contain` is scope-filtered and doesn't capture custom `target = "behavioral_shadow"`; rolled-own `tracing_subscriber::fmt().with_writer(parking_lot::Mutex<Vec<u8>>)` captures all targets unconditionally. r1-r6 silent decline cycle (6 cycles) caught by reviewer-2 m-236 NIT 2 + dev-reviewer m-237 strict reading. Parallel pattern to §3.5.11 r3 empirical-revert (architectural rationale required to bypass the default rule).
 
+##### Wire-format invariant test pattern (Sprint 30 amendment, operator m-19 + PR #299 canonical)
+
+PRs that change the wire-format surface — including consolidation / aliasing / deletion of MCP tools, JSON-RPC method names, schema fields, or any external-callable contract — MUST include an **invariant test** that pins the post-change shape. Examples:
+
+- **Count invariant**: `assert_eq!(tool_definitions().len(), N)` after consolidation. Catches accidental re-introduction of deleted names AND accidental deletion of intended tools.
+- **Schema-shape invariant**: `assert!(schema["properties"].as_object().unwrap().contains_key("X"))` for canonical fields of a unified tool. Locks the public schema against silent regression.
+- **Routing-table invariant**: `assert_eq!(handlers.iter().filter(|n| n.starts_with("send_")).count(), 0)` after alias removal. Grep-equivalent assertion guarding alias re-creep.
+
+**Why**: wire-format surface drift is the most common silent regression class — a refactor reintroduces a deleted alias (passes existing tests because aliases were tested separately) or a consolidation accidentally drops a tool (no test asserts the count). Invariant tests pin the SHAPE of the wire-format surface so any drift is a hard test failure, not a silent re-emergence.
+
+**Canonical example**: PR #299 (Sprint 30) added `tool_definitions_count_invariant_post_sprint_30` invariant test post-Sprint-30 consolidation. Without it, future PRs could silently introduce a 27th tool and pass all behavior tests. The invariant is the only test that catches "did we accidentally add a tool".
+
+**Reviewer attestation**: `wire-format invariant test verified: <test_name> at <file:line> pins <invariant>`. Required for any PR matching §3.5.10 wire-format scope. Parallel to existing wire-format / concurrent-state / persistence-replay categories — invariant tests are a FOURTH category for surface-pinning (vs the first three's behavior-pinning).
+
 #### 3.5.11 Test-first verification for feature/fix PRs
 
 Sprint 25 P0 amendment. Feature PRs and bug-fix PRs **must** be authored test-first: the failing test commit MUST land in the PR's commit history BEFORE the implementation commit that makes it pass.
@@ -781,6 +795,24 @@ The broadcast payload MUST include an `origin` field disambiguating the creation
 ```
 
 **Cross-references**: operator m-41 #10; §3.6.4 (GH PR view = ground truth — same anti-mystery principle applied to GH artifacts); §6 fleet update emission (extends the existing telegram emission contract to cover instance lifecycle events).
+
+### 6.2 `create_instance` default working_directory + shared-checkout warning (Sprint 30 amendment, operator m-39)
+
+When `create_instance(name=X)` is called without a `working_directory` argument, the daemon MUST default to `~/.agend-terminal/workspace/X` — an isolated per-instance directory under the agend home. Operator-explicit override of `working_directory` remains respected.
+
+**Required warning** when an operator explicitly passes a shared / main-checkout path as `working_directory`:
+
+> **Warning**: If you explicitly pass `working_directory` pointing at a shared checkout (main repo / another instance's working tree), you MUST ensure no uncommitted changes exist in that directory. All instances pointing at the same `working_directory` will see each other's modifications and risk overwriting each other's work — there is NO file-locking or change-isolation across instances sharing a directory.
+
+The daemon SHOULD emit this warning to the operator at `create_instance` time when `working_directory` resolves to a path NOT under `~/.agend-terminal/workspace/<X>` (i.e., explicitly external / shared). The warning is operator-facing — it does NOT block the call, but surfaces the risk so the operator can decline if they didn't intend it.
+
+**Why**: pre-Sprint-30, a pattern emerged where operators / agents created instances with `working_directory` pointing at the main agend-terminal checkout to "share state" — instances would then mutate each other's files in flight, creating subtle reverse-merge bugs (one instance's commit reverted by another's git-restore, file edits silently overwritten). The default-isolated-dir + explicit shared-dir warning makes the risk surface explicit at creation time.
+
+**Canonical incident**: 2026-04-29 main worktree pollution (operator m-39) — multiple instances writing to the same checkout caused agend-terminal's own source tree to get partial uncommitted changes from multiple agents. Per-instance isolated workspace + shared-dir warning prevents recurrence.
+
+**Reviewer attestation on PRs touching `create_instance` defaults**: `default-wd verified: handler routes `working_directory: None` to `~/.agend-terminal/workspace/<name>`; shared-dir override emits operator warning when path NOT under per-instance default`.
+
+**Cross-references**: operator m-39 (main worktree pollution incident); §3.6.9 git auto-cleanup (deletion happens at merge; this rule complements creation); §6.1 instance lifecycle event broadcast (the create event surfaces the resolved `working_directory` for operator visibility).
 
 ## 7. Waiting and timeout
 
