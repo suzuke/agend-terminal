@@ -159,8 +159,13 @@ impl StatePatterns {
                     r"Esc to cancel · Tab to amend|Do you want to |allow all edits during this session|Allow once|Allow always|approve",
                 ),
                 // [estimated] Ink render during processing
-                (AgentState::Thinking, r"Thinking"),
-                // [measured] Completion glyph `⏺` (U+23FA RECORD) prefixes
+                // [measured] Claude spinner uses random verbs (Cogitating,
+                // Bloviating, Transmuting, etc.) — not "Thinking". The
+                // `thought for Ns` anchor catches post-thinking summary.
+                (
+                    AgentState::Thinking,
+                    r"(?i)(Bloviating|Transmuting|Cogitating|Cooked|Brewed|Worked|Cogitated|Crunched|Brewing)|thought for [0-9]+s",
+                ),
                 // tool-name banners like `⏺ Write(...)` in 2.1.98. Previously
                 // only `●` (U+25CF) was in the class, so `⏺ Write(...)` lines
                 // never matched — see docs/archived/FOLLOWUP-tooluse-pattern-gaps.md.
@@ -220,10 +225,10 @@ impl StatePatterns {
                     AgentState::ToolUse,
                     r"●\s+(Read|Write|Edit|Bash|Grep|Glob|Task|List|Search)\b|execute_bash|fs_read|fs_write",
                 ),
-                // [measured] Kiro prints the word "Thinking" during generation
-                // (captured live 2026-04-20, 23 occurrences in a short session).
-                // Earlier pattern "Generating" never matched real output.
-                (AgentState::Thinking, r"Thinking"),
+                // [measured] Kiro shows "Kiro is working" + "esc to cancel"
+                // during generation. Earlier "Thinking" pattern no longer
+                // matches current kiro-cli versions.
+                (AgentState::Thinking, r"Kiro is working|esc to cancel"),
                 // [measured] Idle prompt
                 (
                     AgentState::Idle,
@@ -285,8 +290,10 @@ impl StatePatterns {
                     AgentState::ToolUse,
                     r"└\s+(Read|Write|Edit|List|Bash|Search|Apply|Ran)\b|•\s+(Explored|Edited|Ran)\b|apply_patch",
                 ),
-                // [estimated] Processing state
-                (AgentState::Thinking, r"Thinking"),
+                // [measured] Codex shows "◦ Working (Ns • esc to interrupt)"
+                // during generation. Both "Working" and "esc to interrupt"
+                // are stable anchors.
+                (AgentState::Thinking, r"Working|esc to interrupt"),
                 // [measured] Prompt symbol + model info in status
                 (AgentState::Idle, r"›"),
                 // [measured] Version + model display
@@ -1994,13 +2001,13 @@ mod tests {
 
     #[test]
     fn pipeline_kiro_thinking_via_vterm() {
-        // Regression for BUG 3: kiro-cli prints the literal word "Thinking"
-        // during generation. The old pattern "Generating" never fired.
+        // Sprint 34 PR-1: kiro-cli now shows "Kiro is working" during
+        // generation, not "Thinking". Updated from old pattern.
         let mut vt = VTerm::new(80, 24);
         let mut st = StateTracker::new(Some(&Backend::KiroCli));
         drive(&mut vt, &mut st, b"ask a question or describe a task\r\n");
         assert_eq!(st.get_state(), AgentState::Idle);
-        drive(&mut vt, &mut st, b"Thinking...\r\n");
+        drive(&mut vt, &mut st, b"Kiro is working\r\n");
         assert_eq!(st.get_state(), AgentState::Thinking);
     }
 
@@ -2474,5 +2481,83 @@ mod tests {
                 "fixture {file}: expected {expected:?}, got {result:?}"
             );
         }
+    }
+
+    // --- Sprint 34 PR-1: thinking pattern fixture tests ---
+
+    #[test]
+    fn claude_spinner_verb_triggers_thinking() {
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+        drive(&mut vt, &mut st, b"bypass permissions\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+        // Claude spinner uses random verbs, not "Thinking"
+        drive(&mut vt, &mut st, b"Cogitating\xe2\x80\xa6\r\n");
+        assert_eq!(
+            st.get_state(),
+            AgentState::Thinking,
+            "claude spinner verb 'Cogitating' must trigger Thinking"
+        );
+    }
+
+    #[test]
+    fn claude_thought_for_triggers_thinking() {
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+        drive(&mut vt, &mut st, b"bypass permissions\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+        // Post-thinking summary line
+        drive(&mut vt, &mut st, b"thought for 12s\r\n");
+        assert_eq!(
+            st.get_state(),
+            AgentState::Thinking,
+            "claude 'thought for Ns' must trigger Thinking"
+        );
+    }
+
+    #[test]
+    fn kiro_working_triggers_thinking() {
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::KiroCli));
+        drive(&mut vt, &mut st, b"Trust All Tools active\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+        // Kiro shows "Kiro is working" during generation
+        drive(&mut vt, &mut st, b"Kiro is working\r\n  esc to cancel\r\n");
+        assert_eq!(
+            st.get_state(),
+            AgentState::Thinking,
+            "kiro 'Kiro is working' must trigger Thinking"
+        );
+    }
+
+    #[test]
+    fn codex_working_triggers_thinking() {
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::Codex));
+        drive(&mut vt, &mut st, b"OpenAI Codex gpt-4.1 left\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+        // Codex shows "Working (Ns • esc to interrupt)"
+        drive(
+            &mut vt,
+            &mut st,
+            b"\xc2\xb7 Working (3s \xe2\x80\xa2 esc to interrupt)\r\n",
+        );
+        assert_eq!(
+            st.get_state(),
+            AgentState::Thinking,
+            "codex 'Working' or 'esc to interrupt' must trigger Thinking"
+        );
+    }
+
+    #[test]
+    fn kiro_literal_thinking_in_chat_does_not_trigger() {
+        // After pattern change, "Thinking" alone should NOT trigger on kiro
+        let patterns = StatePatterns::for_backend(&Backend::KiroCli);
+        let detected = patterns.detect("The agent was Thinking about the problem");
+        assert_ne!(
+            detected,
+            Some(AgentState::Thinking),
+            "literal 'Thinking' in chat must not trigger Thinking on kiro"
+        );
     }
 }
