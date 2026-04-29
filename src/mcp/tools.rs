@@ -73,18 +73,12 @@ fn comm_tools() -> Vec<Value> {
                 "task_summary": {"type": "string"}, "request_kind": {"type": "string", "enum": ["query", "task", "update"]},
                 "requires_reply": {"type": "boolean"}
             }, "required": ["message"]}}),
-        json!({"name": "inbox", "description": "Check pending messages.",
-            "inputSchema": {"type": "object", "properties": {}}}),
-        json!({"name": "describe_message", "description": "Look up an inbox message status by ID. Returns ReadAt (with timestamp), UnreadExpired, or NotFound.",
-            "inputSchema": {"type": "object", "properties": {
-                "message_id": {"type": "string", "description": "The message ID to look up"},
-                "instance": {"type": "string", "description": "Target instance name (defaults to caller)"}
-            }, "required": ["message_id"]}}),
-        json!({"name": "describe_thread", "description": "Get all messages in a conversation thread, ordered by timestamp.",
-            "inputSchema": {"type": "object", "properties": {
-                "thread_id": {"type": "string", "description": "The thread ID to look up"},
-                "instance": {"type": "string", "description": "Filter to a specific instance's inbox (optional, scans all if omitted)"}
-            }, "required": ["thread_id"]}}),
+        json!({"name": "inbox", "description": "Check pending messages, OR look up a single message by ID, OR fetch a thread's messages. No params = drain pending. With message_id = describe message status (read/unread/expired/notfound). With thread_id = fetch all messages in thread ordered by timestamp.",
+        "inputSchema": {"type": "object", "properties": {
+            "message_id": {"type": "string", "description": "Look up message status by ID"},
+            "thread_id": {"type": "string", "description": "Fetch all messages in a thread"},
+            "instance": {"type": "string", "description": "For message_id: target instance (defaults to caller). For thread_id: filter to a specific instance's inbox (optional, scans all if omitted)"}
+        }}}),
     ]
 }
 
