@@ -198,13 +198,39 @@ pub(crate) fn build_instructions_body(
 
     content.push_str("## Communication (v3-mcp)\n\n");
     content.push_str("Use these MCP tools to collaborate:\n\n");
-    content.push_str("- `send_to_instance` — send a message to a specific agent\n");
-    content.push_str("- `broadcast` — send to multiple agents\n");
-    content.push_str("- `inbox` — check your inbox for unread messages\n");
-    content.push_str("- `delegate_task` — assign work to another agent\n");
-    content.push_str("- `report_result` — reply with task results\n");
-    content.push_str("- `request_information` — ask another agent a question\n");
-    content.push_str("- `list_instances` — see all running agents\n\n");
+    content.push_str("**Primary inter-agent communication**:\n");
+    content
+        .push_str("- `send` — unified send to one or many agents. Required: `message`. Routing:\n");
+    content.push_str("  - `target_instance` (single recipient) OR `targets` / `team` / `tags` (broadcast mode)\n");
+    content.push_str("  - `request_kind`: `task` (delegation, expects report back) / `report` (results back) / `query` (question, expects reply) / `update` (status) / omit (plain message)\n");
+    content.push_str("  - Task-mode optional fields: `success_criteria`, `task_id`, `force` + `force_reason`, `second_reviewer` + `second_reviewer_reason`, `branch`, `working_directory`\n");
+    content.push_str(
+        "  - Report-mode optional fields: `correlation_id`, `reviewed_head`, `artifacts`\n",
+    );
+    content.push_str("  - Threading: `thread_id`, `parent_id`\n");
+    content.push_str("- `inbox` — check pending OR query specific. No params = drain pending. With `message_id` = describe message status. With `thread_id` = fetch thread messages.\n");
+    content.push_str("- `react` — emoji reaction on a previously-observed message (lightweight ack, no inbox message on recipient)\n");
+    content.push_str("- `reply` — reply to operator/user via the active channel (NOT for inter-agent — use `send`)\n");
+    content.push_str("- `list_instances` — see all running agents\n");
+    content.push_str("- `download_attachment` — download a telegram multimedia attachment (images / audio / documents) by `file_id`. Use when an inbox message contains `attachments=[...]` and you need the actual media bytes.\n\n");
+    content.push_str("**Action-based CRUD tools** (each takes `action` param):\n");
+    content.push_str("- `decision` — actions: `post` / `list` / `update` (record scope decisions and corrections)\n");
+    content.push_str(
+        "- `task` — actions: `create` / `list` / `claim` / `update` / `done` (shared task board)\n",
+    );
+    content.push_str("- `team` — actions: `create` / `delete` / `list` / `update`\n");
+    content.push_str(
+        "- `schedule` — actions: `create` / `list` / `update` / `delete` (cron-style routines)\n",
+    );
+    content.push_str(
+        "- `deployment` — actions: `deploy` / `teardown` / `list` (template deployments)\n",
+    );
+    content.push_str("- `repo` — actions: `checkout` / `release` (repo mounts)\n");
+    content.push_str("- `ci` — actions: `watch` / `unwatch` (GitHub Actions monitoring)\n");
+    content.push_str(
+        "- `health` — actions: `report` / `clear_blocked_reason` (instance health state)\n\n",
+    );
+    content.push_str("**Migration note (Sprint 30)**: old tool names from before consolidation are retained as 1-sprint aliases — `send_to_instance`, `delegate_task`, `report_result`, `request_information`, `broadcast` route to `send`; `describe_message` + `describe_thread` route to `inbox`; the 17 CRUD aliases (e.g. `post_decision`, `create_team`, `watch_ci`) still work. Prefer the new unified names; aliases will be removed in Sprint 31.\n\n");
     content.push_str(
         "Reply obligation depends on `kind`:\n\
          - `query` — requires reply (other instance is waiting)\n\
@@ -212,11 +238,11 @@ pub(crate) fn build_instructions_body(
          - `report` / `update` — do NOT reply unless you have new information to add\n\n\
          For acknowledgement without triggering a reply loop, use the `react` MCP tool \
          (emoji reaction; no inbox message on recipient side). \
-         Pure ack messages (\"收到\", \"OK\", \"👍\") should use `react`, not `send_to_instance`.\n\
+         Pure ack messages (\"收到\", \"OK\", \"👍\") should use `react`, not `send`.\n\
          When sending kind=report, include `parent_id` (the message you're replying to) \
          and `correlation_id` (the task board ID) for correlation tracking.\n\
-         If you receive a delegate_task while already working on an active review or task, \
-         respond with a structured BUSY message:\n\
+         If you receive a `send` with kind=task while already working on an active review \
+         or task, respond with a structured BUSY message:\n\
          ```\n\
          BUSY\n\
          current: <task id or message id you are working on>\n\
@@ -269,7 +295,7 @@ pub(crate) fn build_instructions_body(
     content.push_str(
         "- Use `task` board for all work tracking (create/claim/done), not local task lists\n",
     );
-    content.push_str("- Use `post_decision` to record scope decisions and corrections\n");
+    content.push_str("- Use `decision` (action: post) to record scope decisions and corrections — old name `post_decision` still works as alias\n");
     content.push_str("- Use `set_waiting_on` to declare blockers\n");
     content.push_str(
         "- Review dispatch expects: source of truth, scope boundary, freshness boundary\n",
@@ -287,7 +313,7 @@ pub(crate) fn build_instructions_body(
     content.push_str(
         "Reply via the same channel the input arrived on. Look at the message prefix:\n\
          - If message has `[user:NAME via telegram]` prefix → use the `reply` MCP tool\n\
-         - If message has `[from:AGENT_NAME]` prefix → use `send_to_instance`\n\
+         - If message has `[from:AGENT_NAME]` prefix → use `send` (alias `send_to_instance` also works)\n\
          - If **neither prefix present** (operator typed in TUI directly) → respond with **direct text**, do NOT use any tool\n\n\
          The daemon also appends a parenthetical hint after the prefix (e.g. `(Reply using the reply tool — do NOT respond with direct text)`) — this is supplemental confirmation, but the prefix is the authoritative signal.\n\n\
          Mixing channels (e.g. telegram reply when operator typed in TUI directly) makes the response appear in the wrong place — the operator-typed TUI input has no associated channel binding, so a `reply` MCP call returns \"no active channel\" error.\n",
@@ -303,7 +329,8 @@ pub(crate) fn build_instructions_body(
     content.push_str("- Parse the header fields: `id=` is the message id; `kind=` is the message kind (task/query/report/update).\n");
     content.push_str("- The header always includes `size=`; the full body is in your inbox, not in the terminal. Call the MCP tool `inbox` to fetch full content.\n");
     content.push_str("- If the header contains `attachments=[path1,path2,...]`, the message includes media files. Call `inbox` for full metadata, then use your file-reading tools to inspect the files.\n");
-    content.push_str("- ACK obligation depends on `kind`: `query` requires reply via `send_to_instance`; `task` may require reply after work; `report`/`update` may skip ACK (see fleet protocol §4 ack absorption).\n");
+    content.push_str("- If the header contains `attachments=[...]` of telegram media types, call `download_attachment` with the relevant `file_id` to retrieve the bytes locally before processing.\n");
+    content.push_str("- ACK obligation depends on `kind`: `query` requires reply via `send` (kind=report); `task` may require reply after work; `report`/`update` may skip ACK (see fleet protocol §4 ack absorption).\n");
 
     content
 }
