@@ -99,11 +99,6 @@ fn instance_tools() -> Vec<Value> {
                 "target": {"type": "string", "description": "Target instance name"},
                 "reason": {"type": "string", "description": "Optional follow-up message to inject after ESC"}
             }, "required": ["target"]}}),
-        json!({"name": "tool_kill", "description": "Send SIGINT to target agent's PTY foreground process group, cancelling active tool subprocess while preserving agent session. Unix only.",
-            "inputSchema": {"type": "object", "properties": {
-                "target": {"type": "string", "description": "Target instance name"},
-                "reason": {"type": "string", "description": "Optional reason for audit log"}
-            }, "required": ["target"]}}),
         json!({"name": "set_display_name", "description": "Set your display name.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
         json!({"name": "set_description", "description": "Set a description for this instance.",
@@ -372,8 +367,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            26,
-            "Sprint 30 wave-1 final tool count = 26 unified. \
+            25,
+            "Sprint 33 tool count = 25. \
              Adding/removing a tool requires updating this assertion. \
              Current tools: {:?}",
             tools
