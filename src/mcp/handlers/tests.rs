@@ -236,8 +236,8 @@ fn delegate_task_emits_fleet_event() {
     let (rec, home) = setup_recorder("fleet_delegate");
 
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "do the thing"}),
+        "send",
+        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "message": "do the thing", "request_kind": "task"}),
         "sender",
     );
     // Must have succeeded (API-path or fallback); both populate "target".
@@ -278,10 +278,10 @@ fn report_result_emits_with_correlation_id() {
     // any other string field. Use a distinctive value so a stray
     // field aliasing bug would fail the assert below.
     let result = handle_tool(
-        "report_result",
+        "send",
         &json!({
             "target_instance": "target",
-            "summary": "done",
+            "message": "done", "request_kind": "report", "summary": "done",
             "correlation_id": "AGD-42",
         }),
         "sender",
@@ -325,10 +325,10 @@ fn report_result_empty_correlation_id_maps_to_none() {
     // renderer omits the id rather than showing "()" — filter-empty
     // is the specified normalization.
     let _ = handle_tool(
-        "report_result",
+        "send",
         &json!({
             "target_instance": "target",
-            "summary": "done",
+            "message": "done", "request_kind": "report", "summary": "done",
             "correlation_id": "",
         }),
         "sender",
@@ -356,8 +356,8 @@ fn post_decision_with_sender_emits_fleet_event() {
     let (rec, home) = setup_recorder("fleet_decision");
 
     let result = handle_tool(
-        "post_decision",
-        &json!({"title": "use X over Y", "content": "because Z"}),
+        "decision",
+        &json!({"action": "post", "title": "use X over Y", "content": "because Z"}),
         "sender",
     );
     let posted_id = result["id"]
@@ -402,8 +402,8 @@ fn post_decision_anonymous_does_not_emit_fleet_event() {
     // Decisions module itself must still succeed (anonymous contract),
     // only fleet mirroring is suppressed. Pin: absence of emission.
     let result = handle_tool(
-        "post_decision",
-        &json!({"title": "anon call", "content": "no author"}),
+        "decision",
+        &json!({"action": "post", "title": "anon call", "content": "no author"}),
         "",
     );
     assert!(
@@ -431,7 +431,7 @@ fn broadcast_emits_with_resolved_recipients() {
     // emitted `recipients` field comes from the filtered `sent`
     // vec, NOT from the raw `args["targets"]`.
     let result = handle_tool(
-        "broadcast",
+        "send",
         &json!({
             "message": "heads up",
             "targets": ["target", "sender"],
@@ -473,7 +473,7 @@ fn broadcast_empty_targets_does_not_emit() {
     // so the self-filter leaves `sent` empty. Pin: skip-emit on
     // empty fan-out so fleet_binding isn't spammed with "a → *0".
     let result = handle_tool(
-        "broadcast",
+        "send",
         &json!({
             "message": "alone",
             "targets": ["sender"],
@@ -505,7 +505,7 @@ fn send_to_instance_does_not_emit_fleet_event() {
     // `target_instance` — use the real arg shape so the negative
     // pin actually exercises the success path.
     let result = handle_tool(
-        "send_to_instance",
+        "send",
         &json!({"instance_name": "target", "message": "hi"}),
         "sender",
     );
@@ -580,8 +580,8 @@ fn delegate_task_main_response_clean_when_provenance_fails() {
     let (rec, home) = setup_recorder("fleet_prov_main_clean");
 
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "do the thing"}),
+        "send",
+        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "message": "do the thing", "request_kind": "task"}),
         "sender",
     );
 
@@ -642,8 +642,8 @@ fn delegate_task_provenance_failure_logs_tracing_warn() {
     let (_rec, home) = setup_recorder("fleet_prov_warn");
 
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "do the thing"}),
+        "send",
+        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "message": "do the thing", "request_kind": "task"}),
         "sender",
     );
     assert!(is_ok_result(&result), "handler must succeed: {result}");
@@ -1004,7 +1004,7 @@ fn test_send_to_nonexistent_target_returns_error_and_no_inbox() {
     std::env::set_var("AGEND_HOME", &home);
     // No fleet.yaml → target doesn't exist anywhere.
     let result = handle_tool(
-        "send_to_instance",
+        "send",
         &json!({"instance_name": "ghost-agent", "message": "hello"}),
         "sender",
     );
@@ -1042,8 +1042,8 @@ fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
     std::env::set_var("AGEND_HOME", &home);
 
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "dev", "task": "test task"}),
+        "send",
+        &json!({"target_instance": "dev", "task": "test task", "message": "test task", "request_kind": "task", "message": "test task", "request_kind": "task"}),
         "dev-impl",
     );
     // Should not error — team resolved to dev-lead.
@@ -1082,7 +1082,7 @@ fn test_send_to_inbox_fallback_mode() {
     .ok();
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
-        "send_to_instance",
+        "send",
         &json!({"instance_name": "receiver", "message": "test"}),
         "sender",
     );
@@ -1130,7 +1130,7 @@ fn test_describe_message_shows_delivery_mode() {
     )
     .ok();
     let result = handle_tool(
-        "describe_message",
+        "inbox",
         &json!({"message_id": "m-dm-test", "instance": "agent1"}),
         "agent1",
     );
@@ -1167,8 +1167,8 @@ fn test_delegate_task_busy_returns_structured_response() {
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "new work"}),
+        "send",
+        &json!({"target_instance": "target", "task": "new work", "message": "new work", "request_kind": "task", "message": "new work", "request_kind": "task"}),
         "sender",
     );
     assert_eq!(result["busy"], true, "must return busy: {result}");
@@ -1205,8 +1205,8 @@ fn test_delegate_task_force_true_bypasses_busy_gate() {
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "urgent", "force": true, "force_reason": "critical bug"}),
+        "send",
+        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "force": true, "force_reason": "critical bug"}),
         "sender",
     );
     assert!(
@@ -1254,8 +1254,8 @@ fn test_delegate_task_force_true_without_reason_rejected() {
     crate::tasks::handle(&home, "target", &json!({"action": "claim", "id": tid}));
 
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "urgent", "force": true}),
+        "send",
+        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "force": true}),
         "sender",
     );
     assert!(
@@ -1278,8 +1278,8 @@ fn test_delegate_task_idle_target_normal_delivery() {
     std::env::set_var("AGEND_HOME", &home);
     // No claimed tasks for target
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "normal work"}),
+        "send",
+        &json!({"target_instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "message": "normal work", "request_kind": "task"}),
         "sender",
     );
     assert!(
@@ -1303,8 +1303,8 @@ fn test_delegate_task_second_reviewer_flag_requires_reason() {
     .ok();
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "review PR", "second_reviewer": true}),
+        "send",
+        &json!({"target_instance": "target", "task": "review PR", "message": "review PR", "request_kind": "task", "second_reviewer": true}),
         "sender",
     );
     assert!(
@@ -1329,7 +1329,7 @@ fn test_delegate_task_second_reviewer_with_reason_ok() {
     .ok();
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
-        "delegate_task",
+        "send",
         &json!({
             "target_instance": "target",
             "task": "review PR",
@@ -1361,8 +1361,8 @@ fn test_delegate_task_no_second_reviewer_flag_default_behavior() {
     .ok();
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "normal work"}),
+        "send",
+        &json!({"target_instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "message": "normal work", "request_kind": "task"}),
         "sender",
     );
     // No second_reviewer flag → no error related to it
@@ -1455,8 +1455,8 @@ fn test_delegate_task_old_interrupt_true_still_works() {
 
     // Use OLD names: interrupt + reason
     let result = handle_tool(
-        "delegate_task",
-        &json!({"target_instance": "target", "task": "urgent", "interrupt": true, "reason": "legacy caller"}),
+        "send",
+        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "interrupt": true, "reason": "legacy caller"}),
         "sender",
     );
     // Should bypass busy gate (backwards-compat) + emit deprecation warning

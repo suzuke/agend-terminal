@@ -230,7 +230,6 @@ pub(crate) fn build_instructions_body(
     content.push_str(
         "- `health` — actions: `report` / `clear_blocked_reason` (instance health state)\n\n",
     );
-    content.push_str("**Migration note (Sprint 30)**: old tool names from before consolidation are retained as 1-sprint aliases — `send_to_instance`, `delegate_task`, `report_result`, `request_information`, `broadcast` route to `send`; `describe_message` + `describe_thread` route to `inbox`; the 17 CRUD aliases (e.g. `post_decision`, `create_team`, `watch_ci`) still work. Prefer the new unified names; aliases will be removed in Sprint 31.\n\n");
     content.push_str(
         "Reply obligation depends on `kind`:\n\
          - `query` — requires reply (other instance is waiting)\n\
@@ -295,7 +294,7 @@ pub(crate) fn build_instructions_body(
     content.push_str(
         "- Use `task` board for all work tracking (create/claim/done), not local task lists\n",
     );
-    content.push_str("- Use `decision` (action: post) to record scope decisions and corrections — old name `post_decision` still works as alias\n");
+    content.push_str("- Use `decision` (action: post) to record scope decisions and corrections — use action: post\n");
     content.push_str("- Use `set_waiting_on` to declare blockers\n");
     content.push_str(
         "- Review dispatch expects: source of truth, scope boundary, freshness boundary\n",
@@ -313,7 +312,7 @@ pub(crate) fn build_instructions_body(
     content.push_str(
         "Reply via the same channel the input arrived on. Look at the message prefix:\n\
          - If message has `[user:NAME via telegram]` prefix → use the `reply` MCP tool\n\
-         - If message has `[from:AGENT_NAME]` prefix → use `send` (alias `send_to_instance` also works)\n\
+         - If message has `[from:AGENT_NAME]` prefix → use `send` (alias `send` also works)\n\
          - If **neither prefix present** (operator typed in TUI directly) → respond with **direct text**, do NOT use any tool\n\n\
          The daemon also appends a parenthetical hint after the prefix (e.g. `(Reply using the reply tool — do NOT respond with direct text)`) — this is supplemental confirmation, but the prefix is the authoritative signal.\n\n\
          Mixing channels (e.g. telegram reply when operator typed in TUI directly) makes the response appear in the wrong place — the operator-typed TUI input has no associated channel binding, so a `reply` MCP call returns \"no active channel\" error.\n",
@@ -482,10 +481,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("v3-mcp"), "missing v3-mcp");
         assert!(content.contains("reply"), "missing reply reference");
-        assert!(
-            content.contains("send_to_instance"),
-            "missing send_to_instance"
-        );
+        assert!(content.contains("send"), "missing send");
         assert!(content.contains("inbox"), "missing inbox");
         assert!(content.contains("dev"), "missing agent name");
         assert!(content.contains("developer"), "missing role");
@@ -574,7 +570,7 @@ mod tests {
             "user content lost: {after}"
         );
         assert!(after.contains(AGEND_BLOCK_START));
-        assert!(after.contains("send_to_instance"));
+        assert!(after.contains("send"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -586,7 +582,7 @@ mod tests {
         generate(&dir, "gemini");
         let after = std::fs::read_to_string(dir.join("GEMINI.md")).unwrap();
         assert!(after.contains("Keep me."), "user content lost: {after}");
-        assert!(after.contains("send_to_instance"));
+        assert!(after.contains("send"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -940,10 +936,7 @@ mod tests {
         let path = dir.join(".kiro").join("steering").join("agend.md");
         assert!(path.exists(), "missing kiro agend.md");
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            content.contains("send_to_instance"),
-            "missing communication guide"
-        );
+        assert!(content.contains("send"), "missing communication guide");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -974,8 +967,8 @@ mod tests {
             "instructions must explain [AGEND-MSG] is a system event"
         );
         assert!(
-            body.contains("describe_message") || body.contains("inbox"),
-            "instructions must mention inbox/describe_message for size= headers"
+            body.contains("inbox") || body.contains("inbox"),
+            "instructions must mention inbox/inbox for size= headers"
         );
     }
 
@@ -1063,7 +1056,7 @@ mod tests {
             // Agent peer: prefix shape token.
             assert!(
                 content.contains("[from:AGENT_NAME]"),
-                "{backend_cmd} instructions must mention `[from:AGENT_NAME]` prefix → send_to_instance, path={}",
+                "{backend_cmd} instructions must mention `[from:AGENT_NAME]` prefix → send, path={}",
                 instr_path.display()
             );
             // TUI direct: explicit no-prefix branch wording.
