@@ -156,6 +156,11 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .filter(|s| !s.is_empty());
     super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role);
 
+    // Sprint 34 PR-5: clear stale metadata from a previous instance with
+    // the same name. No legitimate pause/resume case exists for metadata
+    // surviving across instance lifetimes (structural review confirmed).
+    let _ = std::fs::remove_file(ctx.home.join("metadata").join(format!("{name}.json")));
+
     match crate::api::spawn_one(
         ctx.home,
         ctx.registry,
