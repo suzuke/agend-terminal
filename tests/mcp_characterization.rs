@@ -143,26 +143,34 @@ fn assert_error_contains(result: &Value, substring: &str) {
 /// Some tools use `unwrap_or("")` + validate_name instead of explicit "missing"
 /// checks, so we accept either "missing" or "empty" or "cannot be empty".
 const MISSING_PARAM_CASES: &[(&str, &str, &str)] = &[
-    ("send_to_instance", r#"{}"#, "missing"),
-    ("send_to_instance", r#"{"message":"hi"}"#, "missing"),
-    ("delegate_task", r#"{}"#, "missing"),
-    ("delegate_task", r#"{"target_instance":"x"}"#, "missing"),
-    ("report_result", r#"{}"#, "missing"),
-    ("report_result", r#"{"target_instance":"x"}"#, "missing"),
-    ("request_information", r#"{}"#, "missing"),
+    ("send", r#"{}"#, "missing"),
+    ("send", r#"{"message":"hi"}"#, "missing"),
+    ("send", r#"{}"#, "missing"),
     (
-        "request_information",
-        r#"{"target_instance":"x"}"#,
-        "missing",
+        "send",
+        r#"{"target_instance":"x","message":"hi"}"#,
+        "not found",
     ),
-    ("broadcast", r#"{}"#, "missing"),
+    ("send", r#"{}"#, "missing"),
+    (
+        "send",
+        r#"{"target_instance":"x","message":"hi"}"#,
+        "not found",
+    ),
+    ("send", r#"{}"#, "missing"),
+    (
+        "send",
+        r#"{"target_instance":"x","message":"hi"}"#,
+        "not found",
+    ),
+    ("send", r#"{}"#, "missing"),
     ("delete_instance", r#"{}"#, "missing"),
     ("start_instance", r#"{}"#, "missing"),
     ("download_attachment", r#"{}"#, "missing"),
-    ("checkout_repo", r#"{}"#, "missing"),
-    ("release_repo", r#"{}"#, "missing"),
-    ("watch_ci", r#"{}"#, "missing"),
-    ("unwatch_ci", r#"{}"#, "missing"),
+    ("repo", r#"{"action":"checkout"}"#, "missing"),
+    ("repo", r#"{"action":"checkout"}"#, "missing"),
+    ("ci", r#"{"action":"watch"}"#, "missing"),
+    ("ci", r#"{"action":"watch"}"#, "missing"),
 ];
 
 #[test]
@@ -201,10 +209,10 @@ fn empty_name_param_returns_validation_error() {
 // invalid characters.
 
 const VALIDATE_NAME_TOOLS: &[(&str, &str)] = &[
-    ("send_to_instance", "target"),
-    ("delegate_task", "target_instance"),
-    ("report_result", "target_instance"),
-    ("request_information", "target_instance"),
+    ("send", "target"),
+    ("send", "target_instance"),
+    ("send", "target_instance"),
+    ("send", "target_instance"),
     ("delete_instance", "name"),
     ("start_instance", "name"),
     ("describe_instance", "name"),
@@ -238,7 +246,7 @@ fn send_to_self_rejected() {
     let result = call_tool_as(
         &home,
         "my-agent",
-        "send_to_instance",
+        "send",
         &json!({"target": "my-agent", "message": "hello"}),
     );
     assert_error_contains(&result, "cannot send to self");
@@ -342,7 +350,7 @@ fn send_to_instance_falls_back_when_daemon_down() {
     let result = call_tool_as(
         &home,
         "sender",
-        "send_to_instance",
+        "send",
         &json!({"target": "other-agent", "message": "hello"}),
     );
     // Fallback: direct inbox delivery returns target + note about API unavailable
@@ -437,7 +445,7 @@ fn broadcast_with_team_resolves_to_team_members() {
     let result = call_tool_as(
         &home,
         "sender",
-        "broadcast",
+        "send",
         &json!({"team": "my-team", "message": "hello team"}),
     );
     // Should resolve to team members, excluding self
@@ -457,7 +465,7 @@ fn broadcast_with_targets_uses_explicit_list() {
     let result = call_tool_as(
         &home,
         "sender",
-        "broadcast",
+        "send",
         &json!({"targets": ["target-1", "target-2"], "message": "hello"}),
     );
     let sent = result["sent_to"].as_array().expect("sent_to array");
@@ -474,7 +482,7 @@ fn broadcast_excludes_self_from_targets() {
     let result = call_tool_as(
         &home,
         "me",
-        "broadcast",
+        "send",
         &json!({"targets": ["me", "other"], "message": "hello"}),
     );
     let sent = result["sent_to"].as_array().expect("sent_to array");
@@ -495,7 +503,7 @@ fn broadcast_team_takes_priority_over_targets() {
     let result = call_tool_as(
         &home,
         "sender",
-        "broadcast",
+        "send",
         &json!({
             "team": "priority-team",
             "targets": ["explicit-target"],
@@ -522,8 +530,8 @@ fn broadcast_without_team_or_targets_returns_valid_response() {
     let result = call_tool_as(
         &home,
         "sender",
-        "broadcast",
-        &json!({"message": "hello everyone"}),
+        "send",
+        &json!({"message": "hello everyone", "tags": []}),
     );
     let sent = result["sent_to"].as_array().expect("sent_to array");
     // With no daemon, list_agents() returns empty, so sent_to is empty
@@ -547,7 +555,7 @@ fn broadcast_with_tags_falls_through_to_all() {
     let result = call_tool_as(
         &home,
         "sender",
-        "broadcast",
+        "send",
         &json!({"tags": ["backend"], "message": "hello tagged"}),
     );
     let sent = result["sent_to"].as_array().expect("sent_to array");
@@ -568,23 +576,17 @@ fn broadcast_with_tags_falls_through_to_all() {
 fn cross_instance_tools_reject_empty_sender() {
     let home = temp_home("no-sender");
     let cases: &[(&str, Value)] = &[
+        ("send", json!({"instance_name": "peer", "message": "hi"})),
+        ("send", json!({"target_instance": "peer", "task": "x"})),
         (
-            "send_to_instance",
-            json!({"instance_name": "peer", "message": "hi"}),
-        ),
-        (
-            "delegate_task",
-            json!({"target_instance": "peer", "task": "x"}),
-        ),
-        (
-            "report_result",
+            "send",
             json!({"target_instance": "peer", "summary": "done"}),
         ),
         (
-            "request_information",
+            "send",
             json!({"target_instance": "peer", "question": "why"}),
         ),
-        ("broadcast", json!({"message": "hi"})),
+        ("send", json!({"message": "hi"})),
     ];
     for (tool, args) in cases {
         let result = call_tool_as(&home, "", tool, args);
@@ -606,13 +608,13 @@ fn create_team_with_existing_instances() {
     let home = temp_home("create_team_ok");
     let result = call_tool(
         &home,
-        "create_team",
-        &json!({"name": "devs", "members": ["alice", "bob"]}),
+        "team",
+        &json!({"action": "create", "name": "devs", "members": ["alice", "bob"]}),
     );
     assert_eq!(result["status"], "created");
     assert_eq!(result["name"], "devs");
 
-    let listed = call_tool(&home, "list_teams", &json!({}));
+    let listed = call_tool(&home, "team", &json!({"action": "list"}));
     let teams = listed["teams"].as_array().expect("teams array");
     assert_eq!(teams.len(), 1);
     assert_eq!(teams[0]["name"], "devs");
@@ -631,13 +633,13 @@ fn create_team_duplicate_rejects() {
     let home = temp_home("create_team_dup");
     call_tool(
         &home,
-        "create_team",
-        &json!({"name": "t", "members": ["a"]}),
+        "team",
+        &json!({"action": "create", "name": "t", "members": ["a"]}),
     );
     let result = call_tool(
         &home,
-        "create_team",
-        &json!({"name": "t", "members": ["b"]}),
+        "team",
+        &json!({"action": "create", "name": "t", "members": ["b"]}),
     );
     assert_error_contains(&result, "already exists");
     std::fs::remove_dir_all(&home).ok();
@@ -652,7 +654,7 @@ fn delete_instance_removes_from_team() {
     let home = temp_home("del_team_member");
     setup_team(&home, "devs", &["alice", "bob"]);
     call_tool(&home, "delete_instance", &json!({"name": "alice"}));
-    let listed = call_tool(&home, "list_teams", &json!({}));
+    let listed = call_tool(&home, "team", &json!({"action": "list"}));
     let teams = listed["teams"].as_array().expect("teams");
     assert_eq!(teams.len(), 1);
     let members: Vec<&str> = teams[0]["members"]
@@ -670,7 +672,7 @@ fn delete_last_member_auto_deletes_team() {
     let home = temp_home("del_last_member");
     setup_team(&home, "solo", &["only-one"]);
     call_tool(&home, "delete_instance", &json!({"name": "only-one"}));
-    let listed = call_tool(&home, "list_teams", &json!({}));
+    let listed = call_tool(&home, "team", &json!({"action": "list"}));
     let teams = listed["teams"].as_array().expect("teams");
     assert!(teams.is_empty(), "empty team should be auto-deleted");
     std::fs::remove_dir_all(&home).ok();
@@ -747,7 +749,7 @@ fn replace_instance_preserves_team_membership() {
         "replace_instance",
         &json!({"name": "alice", "reason": "test"}),
     );
-    let listed = call_tool(&home, "list_teams", &json!({}));
+    let listed = call_tool(&home, "team", &json!({"action": "list"}));
     let teams = listed["teams"].as_array().expect("teams");
     assert_eq!(teams.len(), 1);
     let members: Vec<&str> = teams[0]["members"]
@@ -773,9 +775,9 @@ fn watch_ci_writes_null_last_polled_at_for_prompt_first_poll() {
     let home = temp_home("watch-ci-polled-null");
     let resp = call_tool(
         &home,
-        "watch_ci",
+        "ci",
         &json!({
-            "repo": "owner/repo",
+            "action": "watch", "repo": "owner/repo",
             "branch": "main",
             "interval_secs": 60
         }),

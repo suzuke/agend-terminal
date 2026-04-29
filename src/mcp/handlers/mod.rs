@@ -97,18 +97,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "react" => channel::handle_react(args, instance_name),
         "download_attachment" => channel::handle_download_attachment(&home, args, instance_name),
 
-        // --- Cross-instance communication (Sprint 30: unified send + aliases) ---
+        // --- Cross-instance communication ---
         "send" => comms::handle_unified_send(&home, args, &sender),
-        // 1-sprint alias retention for backward compat
-        "send_to_instance" => comms::handle_send_to_instance(&home, args, tool, &sender),
-        "delegate_task" => comms::handle_delegate_task(&home, args, &sender),
-        "report_result" => comms::handle_report_result(&home, args, &sender),
-        "request_information" => comms::handle_request_information(&home, args, &sender),
-        "broadcast" => comms::handle_broadcast(&home, args, &sender),
-        // Sprint 30 PR-4: inbox subsumes describe_message + describe_thread.
-        // Old names kept as aliases for 1-sprint migration window per
-        // operator m-203 #4 (consolidation alias retention pattern).
-        "inbox" | "describe_message" | "describe_thread" => {
+        "inbox" => {
             if args.get("message_id").and_then(|v| v.as_str()).is_some() {
                 comms::handle_describe_message(&home, args, instance_name)
             } else if args.get("thread_id").and_then(|v| v.as_str()).is_some() {
@@ -131,8 +122,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "tool_kill" => instance::handle_tool_kill(&home, args),
         "set_waiting_on" => instance::handle_set_waiting_on(&home, args, instance_name, &sender),
         "move_pane" => instance::handle_move_pane(&home, args),
-        "report_health" => instance::handle_report_health(&home, args, instance_name, &sender),
-        "clear_blocked_reason" => instance::handle_clear_blocked_reason(&home, args),
         // Consolidated: health action=report/clear
         "health" => match args["action"].as_str().unwrap_or("") {
             "report" => instance::handle_report_health(&home, args, instance_name, &sender),
@@ -147,10 +136,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             "update" => task::handle_update_decision(&home, args, instance_name),
             other => json!({"error": format!("unknown decision action: {other}")}),
         },
-        // Aliases (1-sprint migration window)
-        "post_decision" => task::handle_post_decision(&home, args, instance_name, &sender),
-        "list_decisions" => task::handle_list_decisions(&home, args),
-        "update_decision" => task::handle_update_decision(&home, args, instance_name),
 
         // --- Task board ---
         "task" => task::handle_task(&home, args, instance_name),
@@ -166,11 +151,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             "update" => task::handle_update_team(&home, args),
             other => json!({"error": format!("unknown team action: {other}")}),
         },
-        // Aliases
-        "create_team" => task::handle_create_team(&home, args),
-        "delete_team" => task::handle_delete_team(&home, args),
-        "list_teams" => task::handle_list_teams(&home),
-        "update_team" => task::handle_update_team(&home, args),
 
         // --- Scheduling (consolidated: schedule action=create/list/update/delete) ---
         "schedule" => match args["action"].as_str().unwrap_or("") {
@@ -180,11 +160,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             "delete" => schedule::handle_delete_schedule(&home, args),
             other => json!({"error": format!("unknown schedule action: {other}")}),
         },
-        // Aliases
-        "create_schedule" => schedule::handle_create_schedule(&home, args, instance_name),
-        "list_schedules" => schedule::handle_list_schedules(&home, args),
-        "update_schedule" => schedule::handle_update_schedule(&home, args),
-        "delete_schedule" => schedule::handle_delete_schedule(&home, args),
 
         // --- Deployments (consolidated: deployment action=deploy/teardown/list) ---
         "deployment" => match args["action"].as_str().unwrap_or("") {
@@ -193,10 +168,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             "list" => schedule::handle_list_deployments(&home),
             other => json!({"error": format!("unknown deployment action: {other}")}),
         },
-        // Aliases
-        "deploy_template" => schedule::handle_deploy_template(&home, args, instance_name),
-        "teardown_deployment" => schedule::handle_teardown_deployment(&home, args),
-        "list_deployments" => schedule::handle_list_deployments(&home),
 
         // --- Repo access (consolidated: repo action=checkout/release) ---
         "repo" => match args["action"].as_str().unwrap_or("") {
@@ -204,9 +175,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             "release" => ci::handle_release_repo(args),
             other => json!({"error": format!("unknown repo action: {other}")}),
         },
-        // Aliases
-        "checkout_repo" => ci::handle_checkout_repo(&home, args, instance_name),
-        "release_repo" => ci::handle_release_repo(args),
 
         // --- CI watch (consolidated: ci action=watch/unwatch) ---
         "ci" => match args["action"].as_str().unwrap_or("") {
@@ -214,9 +182,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             "unwatch" => ci::handle_unwatch_ci(&home, args),
             other => json!({"error": format!("unknown ci action: {other}")}),
         },
-        // Aliases
-        "watch_ci" => ci::handle_watch_ci(&home, args, instance_name),
-        "unwatch_ci" => ci::handle_unwatch_ci(&home, args),
 
         _ => json!({"error": format!("unknown tool: {tool}")}),
     }

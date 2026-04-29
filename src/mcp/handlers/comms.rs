@@ -11,28 +11,39 @@ use super::{err_needs_identity, is_ok_result};
 /// `request_kind` or infers from args (targets/team → broadcast, task field
 /// → delegate, summary → report, question → query, default → send_to).
 pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+    // Normalize: map instance_name ↔ target_instance for cross-compat
+    let mut args = args.clone();
+    if args.get("target_instance").is_none() {
+        if let Some(name) = args.get("instance_name").cloned() {
+            args["target_instance"] = name;
+        }
+    }
+    if args.get("instance_name").is_none() {
+        if let Some(target) = args.get("target_instance").cloned() {
+            args["instance_name"] = target;
+        }
+    }
+
     // Broadcast mode: targets/team/tags present
     if args.get("targets").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
-        return handle_broadcast(home, args, sender);
+        return handle_broadcast(home, &args, sender);
     }
 
     // Infer kind from request_kind field or args shape
     let kind = args["request_kind"].as_str().unwrap_or("");
     match kind {
-        "task" => handle_delegate_task(home, args, sender),
-        "report" => handle_report_result(home, args, sender),
-        "query" => handle_request_information(home, args, sender),
-        _ => {
-            // Default: send_to_instance behavior
-            // Map "target_instance" to "instance_name" if needed
-            let mut mapped = args.clone();
-            if mapped.get("instance_name").is_none() {
-                if let Some(target) = args.get("target_instance") {
-                    mapped["instance_name"] = target.clone();
+        "task" => handle_delegate_task(home, &args, sender),
+        "report" => {
+            // Map message → summary if summary absent (unified schema compat)
+            if args.get("summary").is_none() {
+                if let Some(msg) = args.get("message").cloned() {
+                    args["summary"] = msg;
                 }
             }
-            handle_send_to_instance(home, &mapped, "send", sender)
+            handle_report_result(home, &args, sender)
         }
+        "query" => handle_request_information(home, &args, sender),
+        _ => handle_send_to_instance(home, &args, "send", sender),
     }
 }
 

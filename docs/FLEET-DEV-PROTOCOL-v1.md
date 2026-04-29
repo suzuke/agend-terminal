@@ -43,7 +43,7 @@ See §10.3 for full rules and edge cases.
 | New PR planned | `task create --title "PR-1: set_waiting_on" --priority high --assignee at-dev-2 --depends_on []` |
 | Review finding (REJECTED) | `task create --title "PR59-F2: anonymous caller gate" --priority high --assignee at-dev-2` |
 | Follow-up identified | `task create --title "Followup: set_display_name anon gap" --priority low` |
-| Design decision needed | Use `post_decision` instead (see §2) |
+| Design decision needed | Use `decision(action: post)` instead (see §2) |
 
 ### Querying
 
@@ -62,7 +62,7 @@ task list --filter_status blocked      # what's stuck
 
 ## 2. Decisions panel for scope + corrections
 
-**Use `post_decision` to freeze anything that defines scope or changes ground truth.**
+**Use `decision(action: post)` to freeze anything that defines scope or changes ground truth.**
 
 ### When to post decisions
 
@@ -78,7 +78,7 @@ task list --filter_status blocked      # what's stuck
 - `tags` must include track name + PR number for filterability.
 - `scope: fleet` for cross-track decisions; `scope: project` for track-specific.
 - `ttl_days: 30` default (decisions auto-archive; can be refreshed).
-- Reviewer should trust latest `post_decision` over reconstructing intent from multiple artifacts.
+- Reviewer should trust latest `decision(action: post)` over reconstructing intent from multiple artifacts.
 - `supersedes` field links corrections to original decision.
 
 ## 3. Review cycle protocol (Reviewer Contract v1.1)
@@ -193,7 +193,7 @@ The orchestrator may then reassign the review instead of waiting.
 
 A reviewer may have at most one active review task unless an incoming task is explicitly marked `interrupt=true` with a reason.
 
-A review task becomes active when the reviewer reads or accepts the delegate_task, and remains active until `report_result` is sent.
+A review task becomes active when the reviewer reads or accepts the delegate_task, and remains active until `send(request_kind: report)` is sent.
 
 New review dispatches to an active reviewer are queued, not implicitly preemptive. The reviewer must finish and report the active task before starting another, unless:
 
@@ -463,7 +463,7 @@ Every deferred backlog item created from a PR review finding or a known producti
 
 When `due_at` expires without resolution, the orchestrator must either:
 1. Escalate to P0 and dispatch immediately, OR
-2. Extend `due_at` with explicit operator approval and a `post_decision` recording the extension rationale.
+2. Extend `due_at` with explicit operator approval and a `decision(action: post)` recording the extension rationale.
 
 Backlog items without `due_at` that match deferred-from-PR patterns are flagged by the orchestrator during sprint planning.
 
@@ -471,7 +471,7 @@ Backlog items without `due_at` that match deferred-from-PR patterns are flagged 
 
 When the **same root cause** is deferred for the **second time** (i.e., a PR defers a bug that was already deferred in a prior PR), the second deferral requires:
 1. **Mandatory dual reviewer** (even if the PR would otherwise qualify for single reviewer), AND
-2. **Operator sign-off** via `post_decision` with explicit acknowledgment of the repeated deferral.
+2. **Operator sign-off** via `decision(action: post)` with explicit acknowledgment of the repeated deferral.
 
 Without both, the reviewer must issue **UNVERIFIED** on the deferral. The implementation fix itself may still be VERIFIED — only the deferral decision is gated.
 
@@ -490,7 +490,7 @@ When a removal PR proposes deleting a defensive mechanism (RBAC layer, policy ga
 
 **Reviewer attestation on removal PRs**: `counter-example construction attempted: <N> scenarios tried; <M> compelling cases found; verdict <GO/NO-GO>`. If M > 0, the removal must explicitly address the failure mode identified.
 
-**Canonical example**: PR #285 RBAC removal (Sprint 29). 4-perspective challenge round attempted 9 scenarios (prompt-injected agent floods telegram, less-trusted agent added to fleet, defense-in-depth-if-cookie-leaks, operator hardening, compliance audit logging, multi-user shared machine, untrusted CI environment, misconfiguration prevention, fine-grained per-agent permissions). 8 failed outright via attacker-capability reasoning (attacker pivots to non-RBAC-gated channels — `send_to_instance`, subprocess spawn, file I/O, process exit); 1 weakest case (#9 reviewer-only-reply convention enforcement) had lighter alternatives via instruction-prompt + PR review. 0 compelling counter-examples → §3.5.12 gate satisfied → 858 LOC deletion VERIFIED.
+**Canonical example**: PR #285 RBAC removal (Sprint 29). 4-perspective challenge round attempted 9 scenarios (prompt-injected agent floods telegram, less-trusted agent added to fleet, defense-in-depth-if-cookie-leaks, operator hardening, compliance audit logging, multi-user shared machine, untrusted CI environment, misconfiguration prevention, fine-grained per-agent permissions). 8 failed outright via attacker-capability reasoning (attacker pivots to non-RBAC-gated channels — `send`, subprocess spawn, file I/O, process exit); 1 weakest case (#9 reviewer-only-reply convention enforcement) had lighter alternatives via instruction-prompt + PR review. 0 compelling counter-examples → §3.5.12 gate satisfied → 858 LOC deletion VERIFIED.
 
 **Cross-reference precedent**: §3.5.11 #6 pure-deletion exemption (PR #265 r2, PR #267 r3 d8ce15a, PR #285 RBAC removal canonical) — the deletion exemption mechanically allows a single-commit removal; this rule (d) substantively gates whether the removal SHOULD happen via counter-example failure analysis.
 
@@ -709,7 +709,7 @@ Every agent must reply via the same channel the input arrived on:
 | Source signal | Reply mechanism |
 |---|---|
 | `(Reply using the reply tool, NOT direct text)` system hint | `reply` MCP tool (telegram) |
-| `[from:OTHER_AGENT_NAME]` prefix | `send_to_instance` MCP tool |
+| `[from:OTHER_AGENT_NAME]` prefix | `send` MCP tool |
 | **Neither of the above** (operator typed in TUI) | **direct text** — do not use any tool |
 
 **Why**: the daemon does not intercept TUI stdin, so there is no hint. If the agent uses `reply` (telegram) when the operator typed in TUI, the response appears in telegram instead of the terminal — the operator waits forever in TUI. The reverse (direct text when input came from telegram) is equally broken.
@@ -819,7 +819,7 @@ One-shot schedules auto-disable after firing. Use for:
 |---|---|
 | < 20 min | Normal. Check `describe_instance` — `last_heartbeat` fresh = agent active. |
 | 20 min, agent `last_heartbeat` fresh | Agent is working. Extend wait. |
-| 20 min, agent `last_heartbeat` stale (> 120s) | **Ping to verify liveness.** `send_to_instance` with a direct question. |
+| 20 min, agent `last_heartbeat` stale (> 120s) | **Ping to verify liveness.** `send` with a direct question. |
 | 20 min, no response to ping | **Escalate.** `replace_instance` and re-dispatch task. |
 | Agent state `permission` + heartbeat fresh | Heartbeat gate suppresses false positive (A5 fix). Trust heartbeat. |
 | Agent state `permission` + heartbeat stale | May be genuinely stuck. Ping first, then escalate. |
@@ -842,7 +842,7 @@ replace_instance --name at-dev-2 --reason "unresponsive after timeout"
 
 ### After task completion
 
-1. Implementer: `report_result` → `task done --result "PR #N merged"`
+1. Implementer: `send(request_kind: report)` → `task done --result "PR #N merged"`
 2. Orchestrator: picks up from inbox (or scheduled check-in fires)
 3. Clean up: `delete_schedule --id <check-in-schedule-id>` if one was set
 
@@ -863,9 +863,9 @@ Clean up immediately. Don't accumulate stale worktrees.
 | Need | Tool | NOT this |
 |---|---|---|
 | Track work items | `task create/list/claim/done` | Claude Code TaskCreate |
-| Record decisions | `post_decision` | Markdown files |
-| Assign work | `delegate_task` (rich context) + `task create` (persistent) | Only one of them |
-| Report results | `report_result` | Free-text send_to_instance |
+| Record decisions | `decision(action: post)` | Markdown files |
+| Assign work | `send(request_kind: task)` (rich context) + `task create` (persistent) | Only one of them |
+| Report results | `send(request_kind: report)` | Free-text send_to_instance |
 | Watch CI | `watch_ci` | Manual `gh pr checks` |
 | Declare wait state | `set_waiting_on` | Prose in messages |
 | Check agent health | `describe_instance` (has `last_heartbeat`) | Guessing from pane |
