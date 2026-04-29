@@ -29,20 +29,26 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
         return handle_broadcast(home, &args, sender);
     }
 
-    // Infer kind from request_kind field or args shape
-    let kind = args["request_kind"].as_str().unwrap_or("");
-    match kind {
-        "task" => handle_delegate_task(home, &args, sender),
-        "report" => {
-            // Map message → summary if summary absent (unified schema compat)
-            if args.get("summary").is_none() {
-                if let Some(msg) = args.get("message").cloned() {
-                    args["summary"] = msg;
-                }
+    fn lift_message(args: &mut Value, dst: &str) {
+        if args.get(dst).is_none() {
+            if let Some(msg) = args.get("message").cloned() {
+                args[dst] = msg;
             }
+        }
+    }
+    match args["request_kind"].as_str().unwrap_or("") {
+        "task" => {
+            lift_message(&mut args, "task");
+            handle_delegate_task(home, &args, sender)
+        }
+        "report" => {
+            lift_message(&mut args, "summary");
             handle_report_result(home, &args, sender)
         }
-        "query" => handle_request_information(home, &args, sender),
+        "query" => {
+            lift_message(&mut args, "question");
+            handle_request_information(home, &args, sender)
+        }
         _ => handle_send_to_instance(home, &args, "send", sender),
     }
 }

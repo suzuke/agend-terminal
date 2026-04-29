@@ -1766,3 +1766,37 @@ fn test_isolation_active_after_setup_recorder() {
         "setup_recorder must set AGEND_TEST_ISOLATION=1"
     );
 }
+
+// --- Sprint 33 Bonus PR-B: handle_unified_send field-name mapping ---
+
+/// Regression: handle_unified_send must map `message` → `task` for
+/// kind=task, parallel to the existing message → summary mapping for
+/// kind=report. Without this mapping, callers using the unified-schema
+/// `message` field hit "missing 'task'" from `handle_delegate_task`.
+#[test]
+fn send_kind_task_maps_message_field_to_task() {
+    let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
+    let args = json!({"target_instance": "dev", "message": "do X", "request_kind": "task"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    // Whatever error/success we observe, it must NOT be the field-name bug:
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert_ne!(
+        err, "missing 'task'",
+        "send(kind=task, message=...) should route message → task; got error={err}"
+    );
+}
+
+/// Regression: same shape for kind=query — `message` must map to
+/// `question` so callers using the unified schema do not hit
+/// "missing 'question'" from `handle_request_information`.
+#[test]
+fn send_kind_query_maps_message_field_to_question() {
+    let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
+    let args = json!({"target_instance": "dev", "message": "what?", "request_kind": "query"});
+    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
+    let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    assert_ne!(
+        err, "missing 'question'",
+        "send(kind=query, message=...) should route message → question; got error={err}"
+    );
+}
