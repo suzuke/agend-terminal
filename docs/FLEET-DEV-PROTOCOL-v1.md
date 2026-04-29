@@ -427,6 +427,18 @@ Wire-format fixtures must invoke the trait method / production code path directl
 
 **Canonical example**: PR #317 (Sprint 32 PR2) r3 added `build_create_message_body()` test helper; tests asserted the helper produced spec-shaped JSON, but production `Channel::send()` invoked twilight directly without going through the helper. Tests passed against the helper while the production wire shape was unverified. r4 fixed by replacing the helper with a raw TCP listener intercepting twilight's actual outbound bytes. **Mock-server-captures-real-bytes** pattern is the canonical resolution.
 
+##### Fixture commit vs inline wording (2026-04-30 backlog amendment)
+
+Fixtures fall into two legitimate shapes — (1) **committed snapshot file** — a fixture file checked into the repo (typically under `tests/fixtures/`), exercised by reading from disk; (2) **inline test string** — a fixture string embedded directly in the test source. Both are acceptable. Reviewers MUST verify that the test author's claim language matches the actual shape (e.g., a "snapshot file committed" claim against an inline string is a wording mismatch and should be flagged as RECOMMEND/NIT). **Incident source**: PR-B r2 NIT #3, fixture wording mismatch.
+
+##### Multi-instance canonicalization (2026-04-30 backlog amendment)
+
+For determinism-critical fixtures (round-trip serialisation tests, hash-order assertions, time-formatting tests), invoke the same fixture across N≥3 instances or processes in CI. Single-process inline tests cannot expose process-cross nondeterminism (e.g., HashMap key-order, allocator-driven address printing, system-time precision drift) that real-world drift will exhibit. Reviewers should flag determinism-critical fixtures that lack multi-instance coverage as RECOMMEND. **Incident source**: PR-B r2 RECOMMEND #1, HashMap key-order nondeterminism not exposed by single-process test.
+
+##### Adversarial fixture coverage (2026-04-30 backlog amendment)
+
+Fixtures should include adversarial test cases — quoted strings (single, double, nested), special / control characters, multi-line content, numeric format edge cases (very small / very large / negative zero / NaN where applicable), Unicode boundary cases. Happy-path-only fixtures don't catch real-world drift; reviewers should flag fixture suites that test only nominal cases as RECOMMEND. **Incident source**: PR-B r2 RECOMMEND #2, fixture only covered happy-path.
+
 #### 3.5.11 Test-first verification for feature/fix PRs
 
 Sprint 25 P0 amendment. Feature PRs and bug-fix PRs **must** be authored test-first: the failing test commit MUST land in the PR's commit history BEFORE the implementation commit that makes it pass.
@@ -613,7 +625,8 @@ After pushing a PR (whether r1 or r2), impl-agent:
    (a) "scope follows dispatch spec X" — confirming no deviation from orchestrator's dispatch
    (b) "deviated to Y because Z" — explicit scope-shift call-out for orchestrator approval BEFORE review dispatched.
    Scope deviations caught only at review burn an extra cycle. The orchestrator-spec'd scope is the authoritative truth; dev simplifications must surface for orchestrator review at push time. **Canonical examples**: PR #319 (Sprint 32 PR4) r1 omitted auto-archive keepalive; PR #325 r1 deviated from operator-spec'd write-side unification to read-side fallback. Both UNVERIFIED; cycles cost.
-3. **Immediately** picks up the next dispatched task from inbox.
+3. **Orchestrator pre-dispatch verification** (2026-04-30 backlog amendment): Orchestrator MUST cross-check that dev's claim language reflects the actual artifact — for example, a "byte-equal verified" claim must be confirmed by reading the test, not by trusting the form text alone. If the claim and artifact diverge, orchestrator returns the dispatch to dev for clarification BEFORE forwarding to reviewer. **Incident source**: PR-B r1 incident, week of 2026-04-29 — dev push notification claimed "round-trip byte-equal verified" but the test was mislabeled and broken; reviewer caught it during review and r1 was REJECTED, costing a full review round.
+4. **Immediately** picks up the next dispatched task from inbox.
 4. Does NOT poll CI status; does NOT wait for reviewer verdict; does NOT block on dev-lead merge.
 
 If the PR is later REJECTED or has CI failure, impl receives a return-to-fix dispatch via inbox (queue-priority message). Impl decides when to take it based on current task queue state.
@@ -889,6 +902,17 @@ replace_instance --name at-dev-2 --reason "unresponsive after timeout"
 1. Implementer: `send(request_kind: report)` → `task done --result "PR #N merged"`
 2. Orchestrator: picks up from inbox (or scheduled check-in fires)
 3. Clean up: `delete_schedule --id <check-in-schedule-id>` if one was set
+
+### Backend-specific staircase modifiers (2026-04-30 backlog amendment)
+
+The timeout policy above applies as baseline. The following backend-specific modifiers override the default staircase windows:
+
+- **kiro-cli**: baseline 1-2 hour wait before `replace_instance`; longer staircase. kiro's `tool_use` + stale-heartbeat + non-responsive-to-ping pattern is COMPATIBLE with context-compaction (which self-recovers). `replace_instance` is the nuclear option; do NOT invoke when compaction-suspected.
+- **Other backends** (claude / codex / gemini / opencode): retain existing staircase windows per the timeout policy table above.
+- **Wedge vs compaction heuristic**: differentiate by whether the instance is mid-large-tool-work (cargo build / cargo test / git rebase / long subprocess). If yes, compaction is likely; wait. If no live tool-work signal AND truly silent, wedge is more likely.
+- **Operator action preference**: for kiro, operator typing ESC at the keyboard is more effective than orchestrator-issued MCP `interrupt` (which kiro may not process during compaction). Orchestrator should escalate to operator rather than firing `interrupt` repeatedly.
+
+**Incident source**: PR-C dev wedge incident, 2026-04-29 — dev (kiro-cli) appeared wedged 3+ hours; compaction-recovered on its own.
 
 ## 8. Git workflow
 
