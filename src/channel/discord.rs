@@ -356,12 +356,61 @@ impl crate::channel::Channel for DiscordChannel {
         })
     }
 
-    fn edit(&self, _msg: &MsgRef, _payload: OutMsg) -> anyhow::Result<()> {
-        anyhow::bail!("discord edit not yet implemented (PR3)")
+    fn edit(&self, msg: &MsgRef, payload: OutMsg) -> anyhow::Result<()> {
+        if payload.text.is_empty() {
+            anyhow::bail!("OutMsg.text empty — Discord editMessage requires non-empty text");
+        }
+        let http = self
+            .state
+            .lock()
+            .http_client
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("discord http client not initialized"))?;
+        let channel_id: u64 = msg
+            .binding
+            .downcast::<DiscordBindingPayload>()
+            .map(|p| p.channel_id)
+            .ok_or_else(|| anyhow::anyhow!("non-discord binding in MsgRef"))?;
+        let mid: u64 = msg
+            .id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid discord message_id: {}", msg.id))?;
+        let text = payload.text;
+        discord_runtime().block_on(async {
+            http.update_message(
+                twilight_model::id::Id::new(channel_id),
+                twilight_model::id::Id::new(mid),
+            )
+            .content(Some(&text))
+            .await?;
+            Ok(())
+        })
     }
 
-    fn delete(&self, _msg: &MsgRef) -> anyhow::Result<()> {
-        anyhow::bail!("discord delete not yet implemented (PR3)")
+    fn delete(&self, msg: &MsgRef) -> anyhow::Result<()> {
+        let http = self
+            .state
+            .lock()
+            .http_client
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("discord http client not initialized"))?;
+        let channel_id: u64 = msg
+            .binding
+            .downcast::<DiscordBindingPayload>()
+            .map(|p| p.channel_id)
+            .ok_or_else(|| anyhow::anyhow!("non-discord binding in MsgRef"))?;
+        let mid: u64 = msg
+            .id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid discord message_id: {}", msg.id))?;
+        discord_runtime().block_on(async {
+            http.delete_message(
+                twilight_model::id::Id::new(channel_id),
+                twilight_model::id::Id::new(mid),
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     fn create_binding(
@@ -450,7 +499,7 @@ impl crate::channel::Channel for DiscordChannel {
             )));
         }
 
-        // Step 2: dispatch. Only Reply in PR2; other ops defer to PR3.
+        // Step 2: dispatch.
         match op {
             crate::channel::AgentOutboundOp::Reply { text } => {
                 let cid = self.state.lock().instance_to_channel.get(agent).copied();
@@ -465,8 +514,35 @@ impl crate::channel::Channel for DiscordChannel {
                 self.send(&binding, OutMsg::text(text))
                     .map_err(ChannelError::Other)
             }
+            crate::channel::AgentOutboundOp::Edit {
+                message_id,
+                new_text,
+            } => {
+                let cid = self.state.lock().instance_to_channel.get(agent).copied();
+                let cid = cid.ok_or_else(|| {
+                    ChannelError::Other(anyhow::anyhow!("no discord binding for '{agent}'"))
+                })?;
+                let msg_ref = MsgRef {
+                    binding: BindingRef::new(
+                        "discord",
+                        Some(format!("DC#{cid}")),
+                        DiscordBindingPayload { channel_id: cid },
+                    ),
+                    id: message_id.clone(),
+                };
+                self.edit(&msg_ref, OutMsg::text(new_text))
+                    .map_err(ChannelError::Other)?;
+                Ok(MsgRef {
+                    binding: BindingRef::new(
+                        "discord",
+                        None,
+                        DiscordBindingPayload { channel_id: cid },
+                    ),
+                    id: message_id,
+                })
+            }
             _ => Err(ChannelError::NotSupported(
-                "only Reply implemented in PR2".into(),
+                "React/InjectProvenance deferred to TIER-C".into(),
             )),
         }
     }
@@ -867,5 +943,185 @@ mod tests {
             actual, expected,
             "outbound body must match Discord spec create-message shape"
         );
+    }
+
+    // ── PR3 tests: edit + delete production-path-coupled ─────────────
+
+    /// Captured HTTP request from the mock server: method, path, body.
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    /// Reusable mock HTTP server that captures one request and responds
+    /// with a canned response. Returns (port, join_handle, captured_arc).
+    fn mock_http_server(
+        response_status: u16,
+        response_body: &str,
+    ) -> (
+        u16,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Option<CapturedRequest>>>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<CapturedRequest>));
+        let captured_clone = captured.clone();
+        let resp_body = response_body.to_string();
+        let status = response_status;
+
+        // fire-and-forget: test mock server thread — lives only for this test
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).expect("read");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            // Parse method + path from first line.
+            let first_line = request.lines().next().unwrap_or("");
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            let method = parts.first().unwrap_or(&"").to_string();
+            let path = parts.get(1).unwrap_or(&"").to_string();
+
+            // Extract body after \r\n\r\n.
+            let body = request
+                .find("\r\n\r\n")
+                .map(|idx| request[idx + 4..].to_string())
+                .unwrap_or_default();
+
+            *captured_clone.lock().expect("lock") = Some(CapturedRequest { method, path, body });
+
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        (port, handle, captured)
+    }
+
+    fn make_test_channel_with_mock(
+        port: u16,
+    ) -> (super::DiscordChannel, std::sync::mpsc::Sender<ChannelEvent>) {
+        let client = twilight_http::Client::builder()
+            .proxy(format!("127.0.0.1:{port}"), true)
+            .build();
+        super::DiscordChannel::new_for_test_with_http(std::sync::Arc::new(client))
+    }
+
+    fn test_binding(channel_id: u64) -> crate::channel::BindingRef {
+        crate::channel::BindingRef::new(
+            "discord",
+            Some(format!("DC#{channel_id}")),
+            super::DiscordBindingPayload { channel_id },
+        )
+    }
+
+    fn test_msg_ref(channel_id: u64, msg_id: &str) -> crate::channel::MsgRef {
+        crate::channel::MsgRef {
+            binding: test_binding(channel_id),
+            id: msg_id.to_string(),
+        }
+    }
+
+    /// §3.5.10 wire-format: PATCH /channels/{cid}/messages/{mid} request
+    /// body transmitted by twilight-http matches Discord edit-message spec.
+    /// Ref: https://discord.com/developers/docs/resources/message#edit-message
+    #[test]
+    fn discord_edit_outbound_body_matches_spec() {
+        use crate::channel::Channel;
+
+        // Edit response is the updated message — reuse create-message fixture.
+        let response_body =
+            include_str!("../../tests/fixtures/discord-rest-create-message-response.json");
+        let (port, handle, captured) = mock_http_server(200, response_body);
+        let (ch, _tx) = make_test_channel_with_mock(port);
+
+        let msg_ref = test_msg_ref(290926798999357250, "444385199974967099");
+        let result = ch.edit(&msg_ref, crate::channel::OutMsg::text("edited text"));
+
+        handle.join().expect("mock server");
+        assert!(result.is_ok(), "edit must succeed: {:?}", result.err());
+
+        let req = captured.lock().expect("lock").take().expect("captured");
+        assert_eq!(req.method, "PATCH", "edit must use PATCH method");
+        assert!(
+            req.path.contains("/messages/444385199974967099"),
+            "path must contain message id: {}",
+            req.path
+        );
+        let body: serde_json::Value = serde_json::from_str(&req.body).expect("body must be JSON");
+        assert_eq!(
+            body["content"], "edited text",
+            "edit body must contain updated content"
+        );
+    }
+
+    /// §3.5.10 wire-format: DELETE /channels/{cid}/messages/{mid}
+    /// Ref: https://discord.com/developers/docs/resources/message#delete-message
+    #[test]
+    fn discord_delete_outbound_method_matches_spec() {
+        use crate::channel::Channel;
+
+        // DELETE returns 204 No Content with empty body per spec.
+        let (port, handle, captured) = mock_http_server(204, "");
+        let (ch, _tx) = make_test_channel_with_mock(port);
+
+        let msg_ref = test_msg_ref(290926798999357250, "444385199974967099");
+        let result = ch.delete(&msg_ref);
+
+        handle.join().expect("mock server");
+        assert!(result.is_ok(), "delete must succeed: {:?}", result.err());
+
+        let req = captured.lock().expect("lock").take().expect("captured");
+        assert_eq!(req.method, "DELETE", "delete must use DELETE method");
+        assert!(
+            req.path.contains("/messages/444385199974967099"),
+            "path must contain message id: {}",
+            req.path
+        );
+        assert!(
+            req.body.is_empty() || req.body.trim().is_empty(),
+            "DELETE body must be empty per spec, got: '{}'",
+            req.body
+        );
+    }
+
+    /// send_from_agent(Edit) wires through edit() with gate check.
+    #[test]
+    fn send_from_agent_edit_wires_through_edit() {
+        use crate::channel::Channel;
+
+        let response_body =
+            include_str!("../../tests/fixtures/discord-rest-create-message-response.json");
+        let (port, handle, captured) = mock_http_server(200, response_body);
+        let (ch, _tx) = make_test_channel_with_mock(port);
+
+        // Record a binding so the agent lookup succeeds.
+        ch.record_binding("test-agent", test_binding(290926798999357250), "\r".into());
+
+        let result = ch.send_from_agent(
+            "test-agent",
+            crate::channel::AgentOutboundOp::Edit {
+                message_id: "444385199974967099".into(),
+                new_text: "updated".into(),
+            },
+        );
+
+        handle.join().expect("mock server");
+        assert!(
+            result.is_ok(),
+            "send_from_agent Edit must succeed: {:?}",
+            result.err()
+        );
+
+        let req = captured.lock().expect("lock").take().expect("captured");
+        assert_eq!(req.method, "PATCH");
     }
 }
