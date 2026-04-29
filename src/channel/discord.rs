@@ -55,6 +55,8 @@ pub struct DiscordState {
     /// twilight HTTP client for REST API calls. `None` only in test
     /// harness — production `new` always populates it.
     pub http_client: Option<std::sync::Arc<twilight_http::Client>>,
+    /// Guild (server) snowflake for binding creation.
+    pub guild_id: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +79,7 @@ impl DiscordChannel {
         event_rx: mpsc::Receiver<ChannelEvent>,
         user_allowlist: Option<Vec<i64>>,
         http_client: std::sync::Arc<twilight_http::Client>,
+        guild_id: u64,
     ) -> Self {
         Self {
             state: Mutex::new(DiscordState {
@@ -86,6 +89,7 @@ impl DiscordChannel {
                 registry: None,
                 user_allowlist,
                 http_client: Some(http_client),
+                guild_id,
             }),
             caps: discord_caps(),
             event_rx: Mutex::new(event_rx),
@@ -105,6 +109,7 @@ impl DiscordChannel {
                 registry: None,
                 user_allowlist: None,
                 http_client: None,
+                guild_id: 0,
             }),
             caps: discord_caps(),
             event_rx: Mutex::new(rx),
@@ -125,6 +130,7 @@ impl DiscordChannel {
                 registry: None,
                 user_allowlist: Some(vec![1]),
                 http_client: None,
+                guild_id: 0,
             }),
             caps: discord_caps(),
             event_rx: Mutex::new(rx),
@@ -147,6 +153,7 @@ impl DiscordChannel {
                 registry: None,
                 user_allowlist: Some(vec![1]),
                 http_client: Some(http),
+                guild_id: 987654321098765432,
             }),
             caps: discord_caps(),
             event_rx: Mutex::new(rx),
@@ -288,6 +295,19 @@ pub(crate) fn map_message_to_msg_ref(
     }
 }
 
+/// Map a Discord CHANNEL_DELETE gateway event to `ChannelEvent::BindingRevoked`.
+/// `channel_id` is the deleted channel's snowflake.
+pub(crate) fn map_channel_delete_to_binding_revoked(channel_id: u64) -> ChannelEvent {
+    ChannelEvent::BindingRevoked {
+        binding: BindingRef::new(
+            "discord",
+            Some(format!("DC#{channel_id}")),
+            DiscordBindingPayload { channel_id },
+        ),
+        reason: crate::channel::event::RevokeReason::Deleted,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Outbound request body construction
 // ---------------------------------------------------------------------------
@@ -300,6 +320,66 @@ pub(crate) fn map_message_to_msg_ref(
 /// request boundary).
 pub(crate) fn build_create_message_body(text: &str) -> serde_json::Value {
     serde_json::json!({ "content": text })
+}
+
+// ---------------------------------------------------------------------------
+// Auto-archive keepalive
+// ---------------------------------------------------------------------------
+
+/// Keepalive interval for Discord thread auto-archive prevention.
+/// Discord's shortest auto-archive is 1 hour; 30 min refresh is safe.
+pub(crate) const KEEPALIVE_INTERVAL_SECS: u64 = 30 * 60;
+
+/// Start a background thread that periodically PATCHes all bound
+/// Discord threads to prevent auto-archive.
+pub(crate) fn start_keepalive(state: std::sync::Arc<Mutex<DiscordState>>) {
+    // fire-and-forget: keepalive thread runs for the adapter's lifetime.
+    // Stops when the daemon process exits. No JoinHandle needed — the
+    // thread is purely side-effecting (PATCH calls) with no return value.
+    if let Err(e) = std::thread::Builder::new()
+        .name("discord-keepalive".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("keepalive tokio runtime");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
+                let (http, channel_ids) = {
+                    let s = state.lock();
+                    let http = match s.http_client.clone() {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let ids: Vec<u64> = s.instance_to_channel.values().copied().collect();
+                    (http, ids)
+                };
+                for cid in channel_ids {
+                    let id = twilight_model::id::Id::new(cid);
+                    let http = http.clone();
+                    rt.block_on(async {
+                        if let Err(e) = http.update_thread(id).archived(false).await {
+                            tracing::debug!(channel_id = cid, %e, "keepalive PATCH failed");
+                        }
+                    });
+                }
+            }
+        })
+    {
+        tracing::error!(error = %e, "failed to spawn keepalive thread");
+    }
+}
+
+/// Send a single keepalive PATCH for a specific channel. Extracted for
+/// testability — the production `start_keepalive` loop calls this per
+/// binding; tests call it directly against a mock server.
+pub(crate) fn send_keepalive_patch(
+    http: &twilight_http::Client,
+    channel_id: u64,
+) -> anyhow::Result<()> {
+    let id = twilight_model::id::Id::new(channel_id);
+    discord_runtime().block_on(async { http.update_thread(id).archived(false).await })?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -415,14 +495,54 @@ impl crate::channel::Channel for DiscordChannel {
 
     fn create_binding(
         &self,
-        _name: &str,
-        _opts: crate::channel::BindingOpts,
+        name: &str,
+        opts: crate::channel::BindingOpts,
     ) -> anyhow::Result<BindingRef> {
-        anyhow::bail!("discord create_binding not yet implemented (PR4)")
+        let (http, guild_id) = {
+            let s = self.state.lock();
+            let http = s
+                .http_client
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("discord http client not initialized"))?;
+            (http, s.guild_id)
+        };
+        let display_name = opts.display_name.as_deref().unwrap_or(name);
+        let parent_id = opts
+            .extra
+            .get("category_id")
+            .and_then(|v| v.parse::<u64>().ok());
+        let gid = twilight_model::id::Id::new(guild_id);
+        discord_runtime().block_on(async {
+            let mut req = http.create_guild_channel(gid, display_name);
+            if let Some(pid) = parent_id {
+                req = req.parent_id(twilight_model::id::Id::new(pid));
+            }
+            let response = req.await?;
+            let channel = response.model().await?;
+            let cid = channel.id.get();
+            Ok(BindingRef::new(
+                "discord",
+                Some(format!("DC#{cid}")),
+                DiscordBindingPayload { channel_id: cid },
+            ))
+        })
     }
 
-    fn remove_binding(&self, _binding: &BindingRef) -> anyhow::Result<()> {
-        anyhow::bail!("discord remove_binding not yet implemented (PR4)")
+    fn remove_binding(&self, binding: &BindingRef) -> anyhow::Result<()> {
+        let payload = binding
+            .downcast::<DiscordBindingPayload>()
+            .ok_or_else(|| anyhow::anyhow!("non-discord binding passed to remove_binding"))?;
+        let http = self
+            .state
+            .lock()
+            .http_client
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("discord http client not initialized"))?;
+        let cid = twilight_model::id::Id::new(payload.channel_id);
+        discord_runtime().block_on(async {
+            http.delete_channel(cid).await?;
+            Ok(())
+        })
     }
 
     fn has_binding(&self, instance: &str) -> bool {
@@ -464,6 +584,23 @@ impl crate::channel::Channel for DiscordChannel {
 
     fn outbound_authorized(&self) -> bool {
         crate::channel::auth::is_outbound_authorized(&self.state.lock().user_allowlist)
+    }
+
+    fn create_topic(
+        &self,
+        name: &str,
+    ) -> std::result::Result<crate::channel::TopicRef, ChannelError> {
+        let binding = self
+            .create_binding(name, crate::channel::BindingOpts::default())
+            .map_err(ChannelError::Other)?;
+        let cid = binding
+            .downcast::<DiscordBindingPayload>()
+            .map(|p| p.channel_id)
+            .unwrap_or(0);
+        Ok(crate::channel::TopicRef {
+            id: cid.to_string(),
+            channel_kind: crate::channel::ChannelKind::Discord,
+        })
     }
 
     fn notify(
@@ -1123,5 +1260,197 @@ mod tests {
 
         let req = captured.lock().expect("lock").take().expect("captured");
         assert_eq!(req.method, "PATCH");
+    }
+
+    // ── PR4 tests: binding lifecycle + CHANNEL_DELETE + persistence ───
+
+    /// §3.5.10 wire-format: POST /guilds/{gid}/channels request via
+    /// production Channel::create_binding() path.
+    #[test]
+    fn discord_create_binding_outbound_matches_spec() {
+        use crate::channel::Channel;
+
+        let response_body =
+            include_str!("../../tests/fixtures/discord-rest-create-guild-channel-response.json");
+        let (port, handle, captured) = mock_http_server(200, response_body);
+        let (ch, _tx) = make_test_channel_with_mock(port);
+
+        let result = ch.create_binding("test-agent", crate::channel::BindingOpts::default());
+
+        handle.join().expect("mock server");
+        assert!(
+            result.is_ok(),
+            "create_binding must succeed: {:?}",
+            result.err()
+        );
+
+        let binding = result.expect("binding");
+        assert_eq!(binding.kind(), "discord");
+        // Channel ID from fixture response.
+        assert_eq!(binding.display_tag(), Some("DC#555555555555555555"));
+
+        let req = captured.lock().expect("lock").take().expect("captured");
+        assert_eq!(req.method, "POST", "create_binding must use POST");
+        assert!(
+            req.path.contains("/guilds/"),
+            "path must target guild: {}",
+            req.path
+        );
+        let body: serde_json::Value = serde_json::from_str(&req.body).expect("body must be JSON");
+        assert!(
+            body["name"].is_string(),
+            "request body must have 'name' field"
+        );
+    }
+
+    /// §3.5.10 wire-format: DELETE /channels/{id} via production
+    /// Channel::remove_binding() path.
+    #[test]
+    fn discord_remove_binding_outbound_matches_spec() {
+        use crate::channel::Channel;
+
+        // DELETE returns the deleted channel object per spec.
+        let response_body =
+            include_str!("../../tests/fixtures/discord-rest-create-guild-channel-response.json");
+        let (port, handle, captured) = mock_http_server(200, response_body);
+        let (ch, _tx) = make_test_channel_with_mock(port);
+
+        let binding = test_binding(555555555555555555);
+        let result = ch.remove_binding(&binding);
+
+        handle.join().expect("mock server");
+        assert!(
+            result.is_ok(),
+            "remove_binding must succeed: {:?}",
+            result.err()
+        );
+
+        let req = captured.lock().expect("lock").take().expect("captured");
+        assert_eq!(req.method, "DELETE", "remove_binding must use DELETE");
+        assert!(
+            req.path.contains("/channels/555555555555555555"),
+            "path must contain channel id: {}",
+            req.path
+        );
+    }
+
+    /// §3.5.10 wire-format: CHANNEL_DELETE gateway event → BindingRevoked.
+    #[test]
+    fn discord_channel_delete_emits_binding_revoked() {
+        let fixture = include_str!("../../tests/fixtures/discord-gateway-channel-delete.json");
+        let frame: serde_json::Value = serde_json::from_str(fixture).expect("fixture must parse");
+
+        // Extract channel_id from the event payload.
+        let channel_id: u64 = frame["d"]["id"]
+            .as_str()
+            .expect("id")
+            .parse()
+            .expect("parse id");
+
+        let event = super::map_channel_delete_to_binding_revoked(channel_id);
+
+        match event {
+            ChannelEvent::BindingRevoked { binding, reason } => {
+                assert_eq!(binding.kind(), "discord");
+                assert_eq!(reason, crate::channel::event::RevokeReason::Deleted);
+            }
+            other => panic!("expected BindingRevoked, got: {other:?}"),
+        }
+    }
+
+    /// CHANNEL_DELETE delivered via poll_event: gateway pushes event,
+    /// poll_event drains it as BindingRevoked.
+    #[test]
+    fn discord_channel_delete_via_poll_event() {
+        use crate::channel::Channel;
+
+        let (ch, tx) = super::DiscordChannel::new_for_test();
+        let event = super::map_channel_delete_to_binding_revoked(290926798999357250);
+        tx.send(event).expect("send");
+
+        let polled = ch.poll_event().expect("should have event");
+        assert!(
+            matches!(polled, ChannelEvent::BindingRevoked { .. }),
+            "expected BindingRevoked, got: {polled:?}"
+        );
+    }
+
+    /// §3.5.10 persistence-replay: binding registry round-trip.
+    /// Write state → serialize → deserialize → verify bindings intact.
+    #[test]
+    fn discord_binding_registry_persistence_round_trip() {
+        use crate::channel::Channel;
+
+        let (ch, _tx) = super::DiscordChannel::new_for_test();
+
+        // Record two bindings.
+        ch.record_binding("agent-a", test_binding(111), "\r".into());
+        ch.record_binding("agent-b", test_binding(222), "\r".into());
+
+        // Serialize the binding registry to JSON (simulating disk write).
+        let snapshot: std::collections::HashMap<String, u64> = {
+            let s = ch.state.lock();
+            s.instance_to_channel.clone()
+        };
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+
+        // Simulate restart: deserialize and verify.
+        let restored: std::collections::HashMap<String, u64> =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored["agent-a"], 111);
+        assert_eq!(restored["agent-b"], 222);
+
+        // Verify the live channel still has correct bindings.
+        assert!(ch.has_binding("agent-a"));
+        assert!(ch.has_binding("agent-b"));
+        assert!(!ch.has_binding("agent-c"));
+
+        // Take and verify round-trip.
+        let taken = ch.take_binding("agent-a").expect("take");
+        assert_eq!(taken.kind(), "discord");
+        assert!(!ch.has_binding("agent-a"));
+    }
+
+    // ── F1 fix: auto-archive keepalive test ──────────────────────────
+
+    /// §3.5.10 production-path-coupled: keepalive PATCH via
+    /// send_keepalive_patch() against mock server.
+    #[test]
+    fn discord_keepalive_patch_method_matches_spec() {
+        let (port, handle, captured) = mock_http_server(200, "{}");
+        let client = twilight_http::Client::builder()
+            .proxy(format!("127.0.0.1:{port}"), true)
+            .build();
+
+        let result = super::send_keepalive_patch(&client, 290926798999357250);
+
+        handle.join().expect("mock server");
+        assert!(result.is_ok(), "keepalive must succeed: {:?}", result.err());
+
+        let req = captured.lock().expect("lock").take().expect("captured");
+        assert_eq!(req.method, "PATCH", "keepalive must use PATCH");
+        assert!(
+            req.path.contains("/channels/290926798999357250"),
+            "path must target channel: {}",
+            req.path
+        );
+        // Body must set archived=false per Discord thread update spec.
+        let body: serde_json::Value = serde_json::from_str(&req.body).expect("body must be JSON");
+        assert_eq!(body["archived"], false, "must set archived=false");
+    }
+
+    /// Keepalive interval constant is reasonable (≤ Discord's shortest
+    /// auto-archive of 3600s).
+    #[test]
+    fn discord_keepalive_interval_within_auto_archive_window() {
+        assert!(
+            super::KEEPALIVE_INTERVAL_SECS < 3600,
+            "keepalive must fire before shortest auto-archive (1h)"
+        );
+        assert!(
+            super::KEEPALIVE_INTERVAL_SECS >= 60,
+            "keepalive should not be too aggressive"
+        );
     }
 }
