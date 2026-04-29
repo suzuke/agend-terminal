@@ -70,7 +70,7 @@ fn register_topic(home: &Path, topic_id: i32, instance_name: &str) {
         home,
         instance_name,
         "topic_id",
-        serde_yaml::Value::Number(serde_yaml::Number::from(topic_id)),
+        serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(topic_id)),
     );
     // 3. in-memory state is updated by the caller (Channel trait methods
     //    that hold &self.state). Free-function callers without state access
@@ -953,7 +953,7 @@ pub(crate) fn invalidate_and_recreate_topic(
         home,
         instance_name,
         "topic_id",
-        serde_yaml::Value::Null,
+        serde_yaml_ng::Value::Null,
     );
     create_topic_for_instance(home, instance_name)
 }
@@ -1133,7 +1133,7 @@ pub fn init_from_config(
                 home,
                 name,
                 "topic_id",
-                serde_yaml::Value::Number(serde_yaml::Number::from(*tid)),
+                serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(*tid)),
             );
             reg.insert(*tid, name.clone());
         }
@@ -2560,7 +2560,7 @@ mod tests {
     fn is_user_allowed_realistic_user_id_after_phase2() {
         // Operator-pitfall regression: real Telegram user_ids are i64
         // values in the 100-million-to-billion range (e.g.
-        // `1047180393`). YAML deserialisation via `serde_yaml` must
+        // `1047180393`). YAML deserialisation via `serde_yaml_ng` must
         // round-trip these as i64, not String — and the predicate
         // must compare i64 equality, not string equality. This pin
         // catches any future schema drift that lossy-coerces user_id.
@@ -2600,18 +2600,18 @@ user_allowlist:
             group_id: i64,
             user_allowlist: Vec<i64>,
         }
-        let parsed: PartialChannel = serde_yaml::from_str(yaml).expect("yaml must deserialize");
+        let parsed: PartialChannel = serde_yaml_ng::from_str(yaml).expect("yaml must deserialize");
         assert_eq!(parsed.group_id, -1_003_725_098_111_i64);
         assert_eq!(parsed.user_allowlist, vec![1_047_180_393_i64]);
 
         // Round-trip back to YAML and re-parse to lock contract.
-        let serialized = serde_yaml::to_string(&serde_json::json!({
+        let serialized = serde_yaml_ng::to_string(&serde_json::json!({
             "group_id": parsed.group_id,
             "user_allowlist": parsed.user_allowlist,
         }))
         .expect("yaml must serialize");
         let reparsed: PartialChannel =
-            serde_yaml::from_str(&serialized).expect("yaml round-trip must deserialize");
+            serde_yaml_ng::from_str(&serialized).expect("yaml round-trip must deserialize");
         assert_eq!(reparsed.group_id, parsed.group_id);
         assert_eq!(reparsed.user_allowlist, parsed.user_allowlist);
     }

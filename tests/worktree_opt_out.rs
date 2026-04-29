@@ -31,7 +31,7 @@ instances:
   dev-impl:
     backend: claude
 "#;
-    let config: TestFleetConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: TestFleetConfig = serde_yaml_ng::from_str(yaml).unwrap();
     let lead = config.instances.get("dev-lead").unwrap();
     assert_eq!(
         lead.worktree,
@@ -53,7 +53,7 @@ instances:
     backend: claude
     worktree: true
 "#;
-    let config: TestFleetConfig = serde_yaml::from_str(yaml).unwrap();
+    let config: TestFleetConfig = serde_yaml_ng::from_str(yaml).unwrap();
     assert_eq!(config.instances.get("worker").unwrap().worktree, Some(true));
 }
 

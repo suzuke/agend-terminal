@@ -822,28 +822,28 @@ mod tests {
     #[test]
     fn serde_roundtrip_bare_string() {
         // Preset variant serializes as bare name.
-        let yaml = serde_yaml::to_string(&Backend::ClaudeCode).unwrap();
+        let yaml = serde_yaml_ng::to_string(&Backend::ClaudeCode).unwrap();
         assert_eq!(yaml.trim(), "claude");
 
         // Shell → "shell"
-        let yaml = serde_yaml::to_string(&Backend::Shell).unwrap();
+        let yaml = serde_yaml_ng::to_string(&Backend::Shell).unwrap();
         assert_eq!(yaml.trim(), "shell");
 
         // Raw → literal path (no enum tagging like `!Raw`).
-        let yaml = serde_yaml::to_string(&Backend::Raw("/opt/x".to_string())).unwrap();
+        let yaml = serde_yaml_ng::to_string(&Backend::Raw("/opt/x".to_string())).unwrap();
         assert_eq!(yaml.trim(), "/opt/x");
 
         // Deserialize back to the same value.
         assert_eq!(
-            serde_yaml::from_str::<Backend>("claude").unwrap(),
+            serde_yaml_ng::from_str::<Backend>("claude").unwrap(),
             Backend::ClaudeCode
         );
         assert_eq!(
-            serde_yaml::from_str::<Backend>("shell").unwrap(),
+            serde_yaml_ng::from_str::<Backend>("shell").unwrap(),
             Backend::Shell
         );
         assert_eq!(
-            serde_yaml::from_str::<Backend>("/opt/x").unwrap(),
+            serde_yaml_ng::from_str::<Backend>("/opt/x").unwrap(),
             Backend::Raw("/opt/x".to_string())
         );
     }

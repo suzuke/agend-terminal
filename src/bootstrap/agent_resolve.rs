@@ -133,7 +133,7 @@ mod tests {
         if let Some(wt) = worktree {
             yaml.push_str(&format!("    worktree: {wt}\n"));
         }
-        serde_yaml::from_str(&yaml).unwrap()
+        serde_yaml_ng::from_str(&yaml).unwrap()
     }
 
     #[test]

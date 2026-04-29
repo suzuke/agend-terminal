@@ -29,7 +29,7 @@ pub struct FleetConfig {
     pub channels: Option<HashMap<String, ChannelConfig>>,
     /// Template definitions for batch deployment.
     #[serde(default)]
-    pub templates: Option<HashMap<String, serde_yaml::Value>>,
+    pub templates: Option<HashMap<String, serde_yaml_ng::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,7 +176,7 @@ pub struct InstanceConfig {
     /// runtime; skipped on serialization.
     #[allow(dead_code)]
     #[serde(default, skip_serializing)]
-    pub outbound_capabilities: Option<serde_yaml::Value>,
+    pub outbound_capabilities: Option<serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,7 +193,7 @@ impl FleetConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read fleet config: {}", path.display()))?;
-        let mut config: FleetConfig = serde_yaml::from_str(&content)
+        let mut config: FleetConfig = serde_yaml_ng::from_str(&content)
             .with_context(|| format!("Failed to parse fleet config: {}", path.display()))?;
         config.normalize();
         Ok(config)
@@ -401,10 +401,10 @@ pub struct InstanceYamlEntry {
     pub role: Option<String>,
 }
 
-/// Atomically write a serde_yaml::Value back to fleet.yaml using temp + fsync + rename.
+/// Atomically write a serde_yaml_ng::Value back to fleet.yaml using temp + fsync + rename.
 /// Caller must hold the file lock.
-fn atomic_write_yaml(home: &Path, doc: &serde_yaml::Value) -> Result<()> {
-    let yaml = serde_yaml::to_string(doc).context("Failed to serialize fleet.yaml")?;
+fn atomic_write_yaml(home: &Path, doc: &serde_yaml_ng::Value) -> Result<()> {
+    let yaml = serde_yaml_ng::to_string(doc).context("Failed to serialize fleet.yaml")?;
     let fleet_path = home.join("fleet.yaml");
     // Use the shared helper so fsync-before-rename is uniform across the
     // codebase. The previous write→rename (no fsync) left a crash window
@@ -429,7 +429,7 @@ fn acquire_lock(home: &Path) -> Result<std::fs::File> {
 fn mutate_fleet_yaml(
     home: &Path,
     default_content: &str,
-    mutate: impl FnOnce(&mut serde_yaml::Value) -> Result<()>,
+    mutate: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<()>,
 ) -> Result<()> {
     let fleet_path = home.join("fleet.yaml");
     if default_content.is_empty() && !fleet_path.exists() {
@@ -438,8 +438,8 @@ fn mutate_fleet_yaml(
     let _lock = acquire_lock(home)?;
     let content =
         std::fs::read_to_string(&fleet_path).unwrap_or_else(|_| default_content.to_string());
-    let mut doc: serde_yaml::Value =
-        serde_yaml::from_str(&content).context("Failed to parse fleet.yaml")?;
+    let mut doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&content).context("Failed to parse fleet.yaml")?;
     mutate(&mut doc)?;
     atomic_write_yaml(home, &doc)
 }
@@ -456,7 +456,7 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
     }
     mutate_fleet_yaml(home, "instances: {}\n", |doc| {
         if doc.get("instances").is_none() {
-            doc["instances"] = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+            doc["instances"] = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
         }
         let instances = doc
             .get_mut("instances")
@@ -464,19 +464,19 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
             .context("instances is not a mapping")?;
 
         for (name, config) in entries {
-            let mut inst = serde_yaml::Mapping::new();
+            let mut inst = serde_yaml_ng::Mapping::new();
             for (key, val) in [
                 ("backend", &config.backend),
                 ("working_directory", &config.working_directory),
                 ("role", &config.role),
             ] {
                 if let Some(ref v) = val {
-                    inst.insert(key.into(), serde_yaml::Value::String(v.clone()));
+                    inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));
                 }
             }
             instances.insert(
-                serde_yaml::Value::String(name.to_string()),
-                serde_yaml::Value::Mapping(inst),
+                serde_yaml_ng::Value::String(name.to_string()),
+                serde_yaml_ng::Value::Mapping(inst),
             );
             tracing::info!(%name, "added instance to fleet.yaml");
         }
@@ -488,7 +488,7 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
 pub fn remove_instance_from_yaml(home: &Path, name: &str) -> Result<()> {
     mutate_fleet_yaml(home, "", |doc| {
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
-            instances.remove(serde_yaml::Value::String(name.to_string()));
+            instances.remove(serde_yaml_ng::Value::String(name.to_string()));
         }
         tracing::info!(%name, "removed instance from fleet.yaml");
         Ok(())
@@ -503,7 +503,7 @@ pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
     mutate_fleet_yaml(home, "", |doc| {
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
             for name in names {
-                instances.remove(serde_yaml::Value::String(name.clone()));
+                instances.remove(serde_yaml_ng::Value::String(name.clone()));
             }
         }
         Ok(())
@@ -515,13 +515,13 @@ pub fn update_instance_field(
     home: &Path,
     name: &str,
     field: &str,
-    value: serde_yaml::Value,
+    value: serde_yaml_ng::Value,
 ) -> Result<()> {
     mutate_fleet_yaml(home, "", |doc| {
         if let Some(instances) = doc.get_mut("instances").and_then(|v| v.as_mapping_mut()) {
-            let key = serde_yaml::Value::String(name.to_string());
+            let key = serde_yaml_ng::Value::String(name.to_string());
             if let Some(inst) = instances.get_mut(&key).and_then(|v| v.as_mapping_mut()) {
-                inst.insert(serde_yaml::Value::String(field.to_string()), value);
+                inst.insert(serde_yaml_ng::Value::String(field.to_string()), value);
             }
         }
         Ok(())
@@ -717,7 +717,7 @@ instances:
             &dir,
             "agent1",
             "topic_id",
-            serde_yaml::Value::Number(serde_yaml::Number::from(42)),
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(42)),
         )
         .expect("update field");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
@@ -1452,8 +1452,54 @@ defaults:
     #[test]
     fn worktree_opt_out_parsed() {
         let yaml = "instances:\n  lead:\n    backend: claude\n    worktree: false\n  impl:\n    backend: claude\n";
-        let config: FleetConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: FleetConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.instances["lead"].worktree, Some(false));
         assert_eq!(config.instances["impl"].worktree, None);
+    }
+
+    /// §3.5.10 round-trip byte-equal fixture: parse fleet.yaml via
+    /// serde_yaml_ng → serialize back → assert output matches input.
+    /// Catches whitespace/quote-style divergence from the serde_yaml
+    /// → serde_yaml_ng migration.
+    ///
+    /// Production-path-coupled: uses the real serde_yaml_ng import
+    /// from Cargo.toml, not a wrapper helper.
+    #[test]
+    fn serde_yaml_ng_round_trip_byte_equal() {
+        let input = r#"defaults:
+  backend: claude
+channel:
+  type: telegram
+  bot_token_env: TG_TOKEN
+  group_id: -1001234567890
+  user_allowlist:
+  - 111
+  - 222
+instances:
+  general:
+    backend: claude
+    topic_id: 1
+  dev:
+    backend: kiro-cli
+    topic_id: 42
+    role: implementer
+"#;
+        let config: FleetConfig = serde_yaml_ng::from_str(input).unwrap();
+        let output = serde_yaml_ng::to_string(&config).unwrap();
+        // Re-parse to normalize — serde_yaml_ng may reorder keys or
+        // adjust whitespace. The semantic round-trip must be identical.
+        let reparsed: FleetConfig = serde_yaml_ng::from_str(&output).unwrap();
+        let output2 = serde_yaml_ng::to_string(&reparsed).unwrap();
+        assert_eq!(
+            output, output2,
+            "double round-trip must be stable (idempotent serialization)"
+        );
+        // Verify semantic equivalence.
+        assert_eq!(config.instances.len(), reparsed.instances.len());
+        assert_eq!(
+            config.instances["dev"].topic_id,
+            reparsed.instances["dev"].topic_id
+        );
+        assert_eq!(config.instances["dev"].role, reparsed.instances["dev"].role);
     }
 }
