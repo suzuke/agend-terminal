@@ -174,7 +174,7 @@ impl StatePatterns {
                 // the completion banner — covered by the alternation below.
                 (
                     AgentState::ToolUse,
-                    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●⏺].*(Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)",
+                    r"(?m)^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏✓●⏺]\s+(Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)\b",
                 ),
                 // [measured] Prompt symbol in idle state
                 (AgentState::Idle, r"❯"),
@@ -1330,7 +1330,8 @@ mod tests {
     #[test]
     fn claude_tooluse_spinner_match() {
         let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-        let detected = patterns.detect("⠋Read file.txt");
+        // Real claude format: spinner glyph + space + tool name
+        let detected = patterns.detect("⠋ Read file.txt");
         assert_eq!(detected, Some(AgentState::ToolUse));
     }
 
@@ -2558,6 +2559,47 @@ mod tests {
             detected,
             Some(AgentState::Thinking),
             "literal 'Thinking' in chat must not trigger Thinking on kiro"
+        );
+    }
+
+    // --- Sprint 34 PR-2: ToolUse anchor fixture tests ---
+
+    #[test]
+    fn claude_tool_banner_at_line_start_triggers_tooluse() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        assert_eq!(
+            patterns.detect("⏺ Bash(echo hi)"),
+            Some(AgentState::ToolUse),
+            "line-start tool banner must trigger ToolUse"
+        );
+        assert_eq!(
+            patterns.detect("⏺ Read(README.md)"),
+            Some(AgentState::ToolUse),
+            "line-start Read banner must trigger ToolUse"
+        );
+        assert_eq!(
+            patterns.detect("● Listing files..."),
+            Some(AgentState::ToolUse),
+            "spinner + in-flight verb must trigger ToolUse"
+        );
+    }
+
+    #[test]
+    fn claude_chat_with_glyph_does_not_trigger_tooluse() {
+        let mut vt = VTerm::new(80, 24);
+        let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+        drive(&mut vt, &mut st, b"bypass permissions\r\n");
+        assert_eq!(st.get_state(), AgentState::Ready);
+        // Chat content with glyph + tool name elsewhere on the line
+        drive(
+            &mut vt,
+            &mut st,
+            "⏺ 已拒絕 general 的請求並回報原因：該指令違反 Bash 工具規範\r\n".as_bytes(),
+        );
+        assert_ne!(
+            st.get_state(),
+            AgentState::ToolUse,
+            "chat content with glyph + distant tool name must NOT trigger ToolUse"
         );
     }
 }
