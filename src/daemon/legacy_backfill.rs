@@ -560,23 +560,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///   `TaskCloseProposed`. Pass `false` to actually emit
 ///   `Done(LegacyBackfill)` for auto-tier.
 ///
-/// Returns the [`BackfillReport`] inline.
-pub fn handle_task_legacy_backfill_run(home: &Path, args: &serde_json::Value) -> serde_json::Value {
-    let repo = match args.get("repo").and_then(|v| v.as_str()) {
-        Some(r) if !r.is_empty() => r.to_string(),
-        _ => return serde_json::json!({"error": "missing 'repo' arg"}),
-    };
-    let dry_run = args
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    match run(home, &repo, dry_run) {
-        Ok(report) => serde_json::to_value(&report)
-            .unwrap_or_else(|_| serde_json::json!({"error": "report serialize failed"})),
-        Err(e) => serde_json::json!({"error": format!("backfill failed: {e}")}),
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
