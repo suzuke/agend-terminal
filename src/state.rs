@@ -136,7 +136,9 @@ impl StatePatterns {
                     r"API key|authentication failed|unauthorized",
                 ),
                 // [docs] SDK retry logic for 429/overloaded
-                (AgentState::RateLimit, r"overloaded|rate.?limit|429"),
+                // Sprint 31+ #4: word-boundary `429` to avoid false-positive
+                // on substrings like "build #4290" / "request id: 4291...".
+                (AgentState::RateLimit, r"overloaded|rate.?limit|\b429\b"),
                 // [docs] Auto-compaction on context limit
                 (
                     AgentState::ContextFull,
@@ -187,9 +189,10 @@ impl StatePatterns {
                     r"ServiceQuotaExceeded|InsufficientModelCapacity",
                 ),
                 // [docs] HTTP 429 handling
+                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
                 (
                     AgentState::RateLimit,
-                    r"Too Many Requests|ThrottlingError|429",
+                    r"Too Many Requests|ThrottlingError|\b429\b",
                 ),
                 // [docs] Context overflow triggers compaction
                 // `/compact` was previously included but matches the slash-
@@ -236,7 +239,8 @@ impl StatePatterns {
                 // [実測 v0.118.0] Quota exhausted message
                 (AgentState::UsageLimit, r"hit your usage limit|try again at"),
                 // [docs] HTTP 429 handling
-                (AgentState::RateLimit, r"rate.?limit|429"),
+                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
+                (AgentState::RateLimit, r"rate.?limit|\b429\b"),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [measured] Codex 0.120.0 renders approval dialogs with
@@ -291,7 +295,8 @@ impl StatePatterns {
             // OpenCode v1.4.0
             Backend::OpenCode => vec![
                 // [docs] HTTP error handling
-                (AgentState::RateLimit, r"rate.?limit|429"),
+                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
+                (AgentState::RateLimit, r"rate.?limit|\b429\b"),
                 // [docs] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [docs] Permission UI
@@ -338,7 +343,8 @@ impl StatePatterns {
                     r"Usage limit reached|Access resets at",
                 ),
                 // [docs] API resource exhaustion
-                (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|429"),
+                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
+                (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|\b429\b"),
                 // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
                 // [docs] Permission select options
@@ -426,7 +432,8 @@ pub fn classify_pty_output(
             {
                 return Some(BlockedReason::QuotaExceeded);
             }
-            if regex::Regex::new(r"(?i)overloaded|rate.?limit|429")
+            // Sprint 31+ #4: word-boundary `429` per state-pattern fix.
+            if regex::Regex::new(r"(?i)overloaded|rate.?limit|\b429\b")
                 .ok()?
                 .is_match(output)
             {
@@ -883,6 +890,46 @@ mod tests {
     //   2. `dev-reviewer` (Codex) flagged with "卡在互動 prompt" after
     //      dismissing a transient banner — the state never recovered
     //      because hash-dedup suppressed re-detection.
+
+    // Sprint 31+ #4: rate-limit regex false-positive on benign tokens.
+    // Operator m-2 quick fix (Option A): word-boundary the `429` token to
+    // avoid matching substrings like "build #4290" / "request id: 4291abc"
+    // / "response time: 4290ms". `\b429\b` ensures `429` is a standalone
+    // token (preceded + followed by non-word boundary).
+    #[test]
+    fn rate_limit_regex_does_not_misfire_on_build_number_4290() {
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("CI: build #4290 succeeded in 12s");
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "benign build number `4290` must not trigger RateLimit"
+        );
+    }
+
+    #[test]
+    fn rate_limit_regex_does_not_misfire_on_request_id_4291abc() {
+        let mut t = tracker_at(&Backend::Codex, AgentState::Idle, 0);
+        t.feed("request id: 4291abcdef");
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "benign request id starting with `4291` must not trigger RateLimit"
+        );
+    }
+
+    #[test]
+    fn rate_limit_regex_still_matches_real_429_token() {
+        // Regression guard: word-boundary fix must NOT break the canonical
+        // "Error: 429" detection. Same scenario as `error_state_instant_transition`.
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed("API error: 429 Too Many Requests");
+        assert_eq!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "canonical `429` standalone token must still trigger RateLimit"
+        );
+    }
 
     #[test]
     fn shell_backend_starts_in_ready_not_starting() {
