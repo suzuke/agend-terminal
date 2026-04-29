@@ -121,23 +121,16 @@ fn instance_tools() -> Vec<Value> {
 
 fn decision_tools() -> Vec<Value> {
     vec![
-        json!({"name": "post_decision", "description": "Record a decision. scope='fleet' visible to all, 'project' to same working dir.",
+        json!({"name": "decision", "description": "Manage decisions. Actions: post, list, update.",
             "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["post", "list", "update"]},
                 "title": {"type": "string"}, "content": {"type": "string"},
                 "scope": {"type": "string", "enum": ["project", "fleet"]},
                 "tags": {"type": "array", "items": {"type": "string"}},
-                "ttl_days": {"type": "number"}, "supersedes": {"type": "string"}
-            }, "required": ["title", "content"]}}),
-        json!({"name": "list_decisions", "description": "List active decisions.",
-        "inputSchema": {"type": "object", "properties": {
-            "include_archived": {"type": "boolean"}, "tags": {"type": "array", "items": {"type": "string"}}
-        }}}),
-        json!({"name": "update_decision", "description": "Update or archive a decision.",
-            "inputSchema": {"type": "object", "properties": {
-                "id": {"type": "string"}, "content": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
-                "ttl_days": {"type": "number"}, "archive": {"type": "boolean"}
-            }, "required": ["id"]}}),
+                "ttl_days": {"type": "number"}, "supersedes": {"type": "string"},
+                "id": {"type": "string"}, "archive": {"type": "boolean"},
+                "include_archived": {"type": "boolean"}
+            }, "required": ["action"]}}),
     ]
 }
 
@@ -168,111 +161,80 @@ fn task_tools() -> Vec<Value> {
 
 fn team_tools() -> Vec<Value> {
     vec![
-        json!({"name": "create_team", "description": "Create a named team from existing instances.",
+        json!({"name": "team", "description": "Manage teams. Actions: create, delete, list, update.",
             "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["create", "delete", "list", "update"]},
                 "name": {"type": "string"}, "members": {"type": "array", "items": {"type": "string"}},
-                "orchestrator": {"type": "string", "description": "Team orchestrator — must be a member. Receives team-level task routing."},
-                "description": {"type": "string"}
-            }, "required": ["name", "members"]}}),
-        json!({"name": "delete_team", "description": "Delete a team.",
-            "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
-        json!({"name": "list_teams", "description": "List all teams.",
-            "inputSchema": {"type": "object", "properties": {}}}),
-        json!({"name": "update_team", "description": "Add or remove team members.",
-            "inputSchema": {"type": "object", "properties": {
-                "name": {"type": "string"}, "add": {"type": "array", "items": {"type": "string"}},
-                "remove": {"type": "array", "items": {"type": "string"}},
-                "orchestrator": {"type": "string", "description": "Change team orchestrator — must be a current member."}
-            }, "required": ["name"]}}),
+                "orchestrator": {"type": "string", "description": "Team orchestrator — must be a member."},
+                "description": {"type": "string"},
+                "add": {"type": "array", "items": {"type": "string"}},
+                "remove": {"type": "array", "items": {"type": "string"}}
+            }, "required": ["action"]}}),
     ]
 }
 
 fn schedule_tools() -> Vec<Value> {
     vec![
-        json!({"name": "create_schedule", "description": "Create a schedule to inject messages. Supply 'cron' for recurring or 'run_at' for one-shot (mutually exclusive). A one-shot auto-disables after firing or being detected as missed.",
+        json!({"name": "schedule", "description": "Manage schedules. Actions: create, list, update, delete.",
             "inputSchema": {"type": "object", "properties": {
-                "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring)."},
-                "run_at": {"type": "string", "description": "ISO 8601 one-shot instant. Either with offset ('2026-04-21T15:30:00+08:00') or naive ('2026-04-21T15:30:00') combined with 'timezone'. Must be in the future."},
-                "message": {"type": "string"},
-                "target": {"type": "string"},
-                "label": {"type": "string"},
-                "timezone": {"type": "string", "description": "IANA zone name. Defaults to the detected system timezone."}
-            }, "required": ["message"]}}),
-        json!({"name": "list_schedules", "description": "List all schedules. Each row carries a 'trigger' object: {kind:'cron',expr} or {kind:'once',at}.",
-            "inputSchema": {"type": "object", "properties": {"target": {"type": "string"}}}}),
-        json!({"name": "update_schedule", "description": "Update a schedule. 'cron' and 'run_at' remain mutually exclusive; supplying either replaces the trigger kind.",
-            "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["create", "list", "update", "delete"]},
                 "id": {"type": "string"},
-                "cron": {"type": "string"},
-                "run_at": {"type": "string"},
-                "message": {"type": "string"},
-                "target": {"type": "string"},
+                "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring)."},
+                "run_at": {"type": "string", "description": "ISO 8601 one-shot instant."},
+                "message": {"type": "string"}, "target": {"type": "string"},
                 "label": {"type": "string"},
-                "timezone": {"type": "string"},
+                "timezone": {"type": "string", "description": "IANA zone name."},
                 "enabled": {"type": "boolean"}
-            }, "required": ["id"]}}),
-        json!({"name": "delete_schedule", "description": "Delete a schedule.",
-            "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}}),
+            }, "required": ["action"]}}),
     ]
 }
 
 fn deploy_tools() -> Vec<Value> {
     vec![
-        json!({"name": "deploy_template", "description": "Deploy a fleet template — creates instances and optionally a team.",
+        json!({"name": "deployment", "description": "Manage deployments. Actions: deploy, teardown, list.",
             "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["deploy", "teardown", "list"]},
                 "template": {"type": "string", "description": "Template name from fleet.yaml"},
                 "directory": {"type": "string", "description": "Working directory for instances"},
-                "name": {"type": "string", "description": "Deployment name (defaults to template name)"},
+                "name": {"type": "string", "description": "Deployment name"},
                 "branch": {"type": "string", "description": "Git branch — each instance gets its own worktree"}
-            }, "required": ["template", "directory"]}}),
-        json!({"name": "teardown_deployment", "description": "Tear down a deployment — stops instances and team.",
-            "inputSchema": {"type": "object", "properties": {
-                "name": {"type": "string"}
-            }, "required": ["name"]}}),
-        json!({"name": "list_deployments", "description": "List active template deployments.",
-            "inputSchema": {"type": "object", "properties": {}}}),
+            }, "required": ["action"]}}),
     ]
 }
 
 fn ci_tools() -> Vec<Value> {
     vec![
-        json!({"name": "watch_ci", "description": "Watch GitHub Actions CI for a repo. When CI completes (success, failure, or any terminal state), a notification is automatically injected to this agent. If GITHUB_TOKEN is not set in the daemon's environment, the response includes a `warning` field — the daemon is falling back to unauthenticated polling (60 req/hr, shared by all watches) and notifications will silently drop once the cap is hit.",
+        json!({"name": "ci", "description": "Manage CI watching. Actions: watch, unwatch.",
             "inputSchema": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["watch", "unwatch"]},
                 "repo": {"type": "string", "description": "GitHub repo (owner/repo)"},
                 "branch": {"type": "string", "description": "Branch to watch (default: main)"},
                 "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"}
-            }, "required": ["repo"]}}),
-        json!({"name": "unwatch_ci", "description": "Stop watching CI for a repo.",
-            "inputSchema": {"type": "object", "properties": {
-                "repo": {"type": "string"}
-            }, "required": ["repo"]}}),
+            }, "required": ["action", "repo"]}}),
     ]
 }
 
 fn health_tools() -> Vec<Value> {
     vec![
-        json!({"name": "report_health", "description": "Report a health condition (rate limit, quota exceeded, etc.) on the calling agent. Prevents false hang detection.",
+        json!({"name": "health", "description": "Manage health state. Actions: report, clear.",
             "inputSchema": {"type": "object", "properties": {
-                "reason": {"type": "string", "enum": ["rate_limit", "quota_exceeded", "awaiting_operator"], "description": "Blocked reason kind"},
+                "action": {"type": "string", "enum": ["report", "clear"]},
+                "reason": {"type": "string", "enum": ["rate_limit", "quota_exceeded", "awaiting_operator"], "description": "Blocked reason kind (for report)"},
                 "retry_after_secs": {"type": "integer", "description": "Seconds until retry (for rate_limit)"},
-                "note": {"type": "string", "description": "Optional human-readable note"}
-            }, "required": ["reason"]}}),
-        json!({"name": "clear_blocked_reason", "description": "Clear a blocked reason on a specific instance. Used by operators to resume after quota refill etc.",
-            "inputSchema": {"type": "object", "properties": {
-                "instance": {"type": "string", "description": "Target instance name"},
-                "reason": {"type": "string", "description": "Only clear if current reason matches (optional)"}
-            }, "required": ["instance"]}}),
+                "note": {"type": "string", "description": "Optional human-readable note"},
+                "instance": {"type": "string", "description": "Target instance name (for clear)"}
+            }, "required": ["action"]}}),
     ]
 }
 
 fn repo_tools() -> Vec<Value> {
     vec![
-        json!({"name": "checkout_repo", "description": "Mount another repo as read-only worktree.",
+        json!({"name": "repo", "description": "Manage repo worktrees. Actions: checkout, release.",
             "inputSchema": {"type": "object", "properties": {
-                "source": {"type": "string"}, "branch": {"type": "string"}
-            }, "required": ["source"]}}),
-        json!({"name": "release_repo", "description": "Remove a checked-out repo worktree.",
-            "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}),
+                "action": {"type": "string", "enum": ["checkout", "release"]},
+                "source": {"type": "string"}, "branch": {"type": "string"},
+                "path": {"type": "string"}
+            }, "required": ["action"]}}),
     ]
 }
 
@@ -383,8 +345,8 @@ mod tests {
         let defs = tool_definitions();
         let tools = defs["tools"].as_array().expect("tools array");
         assert!(
-            tools.len() >= 35,
-            "expected at least 35 tools, got {}",
+            tools.len() >= 21,
+            "expected at least 21 tools (post-consolidation), got {}",
             tools.len()
         );
     }

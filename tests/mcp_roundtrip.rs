@@ -141,21 +141,21 @@ fn test_tools_list_count() {
         .as_array()
         .expect("tools array");
     assert!(
-        tools.len() >= 34,
-        "should have at least 34 tools, got {}",
+        tools.len() >= 25,
+        "should have at least 25 tools (post-consolidation), got {}",
         tools.len()
     );
 
     // Verify key tools exist
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(tool_names.contains(&"reply"));
-    assert!(tool_names.contains(&"send")); // Sprint 30: replaces delegate_task/report_result/etc
-    assert!(tool_names.contains(&"post_decision"));
+    assert!(tool_names.contains(&"send"));
+    assert!(tool_names.contains(&"decision"));
     assert!(tool_names.contains(&"task"));
-    assert!(tool_names.contains(&"delete_team"));
-    assert!(tool_names.contains(&"create_schedule"));
-    assert!(tool_names.contains(&"checkout_repo"));
-    assert!(tool_names.contains(&"deploy_template"));
+    assert!(tool_names.contains(&"team"));
+    assert!(tool_names.contains(&"schedule"));
+    assert!(tool_names.contains(&"repo"));
+    assert!(tool_names.contains(&"deployment"));
 }
 
 #[test]
