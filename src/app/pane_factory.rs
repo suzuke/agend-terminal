@@ -37,7 +37,7 @@ pub(super) fn spawn_pane_tab(
     submit_key: &str,
     cols: u16,
     rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
 ) -> Result<()> {
     let pane = create_pane(
@@ -76,7 +76,7 @@ pub(super) fn create_pane(
     submit_key: &str,
     cols: u16,
     rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
 ) -> Result<Pane> {
     // Auto-dedup name
@@ -137,7 +137,7 @@ pub(super) fn create_pane(
     let pane_id = layout.next_pane_id();
     let tx = wakeup_tx.clone();
     let pane_rx = {
-        let (fwd_tx, fwd_rx) = crossbeam::channel::unbounded::<Vec<u8>>();
+        let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         std::thread::Builder::new()
             .name(format!("{name}_fwd"))
             .spawn(move || {
@@ -179,7 +179,7 @@ pub(super) fn attach_pane(
     registry: &AgentRegistry,
     cols: u16,
     rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
     layout: &mut Layout,
 ) -> Result<Pane> {
     let (rx, dump, backend_command) = {
@@ -198,7 +198,7 @@ pub(super) fn attach_pane(
     let tx = wakeup_tx.clone();
     let pane_rx = {
         let n = name.to_string();
-        let (fwd_tx, fwd_rx) = crossbeam::channel::unbounded::<Vec<u8>>();
+        let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
         std::thread::Builder::new()
             .name(format!("{n}_fwd"))
             .spawn(move || {
@@ -250,7 +250,7 @@ pub(super) fn create_pane_from_resolved(
     home: &Path,
     cols: u16,
     rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
     spawn_mode: crate::backend::SpawnMode,
 ) -> Result<Pane> {
@@ -327,7 +327,7 @@ pub(super) fn create_remote_pane(
     layout: &mut Layout,
     cols: u16,
     rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) -> Result<Pane> {
     let mut client = BridgeClient::connect(home, name, cols, rows)?;
     let mut reader = client
@@ -335,7 +335,7 @@ pub(super) fn create_remote_pane(
         .ok_or_else(|| anyhow::anyhow!("bridge_client reader already taken"))?;
 
     let pane_id = layout.next_pane_id();
-    let (fwd_tx, pane_rx) = crossbeam::channel::unbounded::<Vec<u8>>();
+    let (fwd_tx, pane_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let tx = wakeup_tx.clone();
     let thread_name = format!("{name}_remote_fwd");
     std::thread::Builder::new()

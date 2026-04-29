@@ -19,7 +19,7 @@ pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Core state for one agent — protected by a single Mutex for atomic operations.
 pub struct AgentCore {
     pub vterm: VTerm,
-    pub subscribers: Vec<crossbeam::channel::Sender<Vec<u8>>>,
+    pub subscribers: Vec<crossbeam_channel::Sender<Vec<u8>>>,
     pub state: StateTracker,
     pub health: HealthTracker,
 }
@@ -176,7 +176,7 @@ fn strip_ansi(s: &str) -> String {
 
 /// Spawn an agent with PTY and register in registry.
 /// Channel for crash events from reaper to daemon.
-pub type CrashChannel = crossbeam::channel::Sender<String>;
+pub type CrashChannel = crossbeam_channel::Sender<String>;
 
 /// Configuration for spawning an agent.
 ///
@@ -954,12 +954,10 @@ pub fn broadcast_registry(
 
 /// Get atomic subscribe + screen dump (under core lock — no output gap).
 /// Creates a new per-subscriber channel. Each subscriber gets ALL output (broadcast).
-pub fn subscribe_with_dump(
-    agent: &AgentHandle,
-) -> (crossbeam::channel::Receiver<Vec<u8>>, Vec<u8>) {
+pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<Vec<u8>>, Vec<u8>) {
     let mut core = agent.core.lock();
     let dump = core.vterm.dump_screen();
-    let (tx, rx) = crossbeam::channel::unbounded();
+    let (tx, rx) = crossbeam_channel::unbounded();
     core.subscribers.push(tx);
     (rx, dump)
 }
@@ -1203,5 +1201,44 @@ mod tests {
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         // Should not panic, should not error.
         sweep_child_tree("does-not-exist", &registry);
+    }
+
+    /// §3.5.10 concurrent-state fixture: multi-threaded producer/consumer
+    /// through crossbeam_channel (the production import). Asserts message
+    /// ordering invariant — bounded channel preserves FIFO order.
+    /// Production-path-coupled: uses real crossbeam_channel::bounded.
+    #[test]
+    fn crossbeam_channel_concurrent_ordering() {
+        let (tx, rx) = crossbeam_channel::bounded::<usize>(16);
+        let n = 100;
+
+        // Producer thread sends 0..n in order.
+        let handle = std::thread::spawn(move || {
+            for i in 0..n {
+                tx.send(i).expect("send");
+            }
+            // tx drops here, closing the channel.
+        });
+
+        // Consumer drains concurrently (bounded channel blocks producer
+        // after 16 items, so consumer must run in parallel).
+        let mut received = Vec::with_capacity(n);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(v) => received.push(v),
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    panic!("recv timed out after 5s — deadlock?");
+                }
+            }
+        }
+
+        handle.join().expect("producer");
+
+        // FIFO ordering preserved.
+        assert_eq!(received.len(), n);
+        for (i, &v) in received.iter().enumerate() {
+            assert_eq!(v, i, "message {i} out of order");
+        }
     }
 }

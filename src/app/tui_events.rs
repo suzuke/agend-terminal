@@ -59,7 +59,7 @@ pub(crate) enum LayoutHint {
     SplitBelow,
 }
 
-pub(crate) type TuiEventSender = crossbeam::channel::Sender<TuiEvent>;
+pub(crate) type TuiEventSender = crossbeam_channel::Sender<TuiEvent>;
 
 /// Adapter that converts [`crate::api::ApiEvent`] into [`TuiEvent`] and
 /// forwards it over the crossbeam channel to the TUI event loop.
@@ -128,7 +128,7 @@ pub(super) fn handle_tui_event(
     event: TuiEvent,
     layout: &mut Layout,
     registry: &AgentRegistry,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) {
     tracing::info!(event = ?event, tabs = layout.tabs.len(), "handle_tui_event");
     match event {
@@ -267,7 +267,7 @@ fn handle_instance_created(
     target_pane: Option<&str>,
     layout: &mut Layout,
     registry: &AgentRegistry,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) {
     tracing::info!(
         agent = name,
@@ -344,7 +344,7 @@ fn handle_team_created(
     members: &[String],
     layout: &mut Layout,
     registry: &AgentRegistry,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) {
     tracing::info!(team = team_name, members = ?members, tabs_before = layout.tabs.len(), "handle_team_created begin");
 
@@ -394,7 +394,7 @@ fn ingest_members_into_team_tab(
     members: &[&str],
     layout: &mut Layout,
     registry: &AgentRegistry,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let pane_rows = rows.saturating_sub(4);
@@ -489,7 +489,7 @@ fn handle_team_members_changed(
     removed: &[String],
     layout: &mut Layout,
     registry: &AgentRegistry,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) {
     tracing::info!(
         team = team_name,
@@ -586,7 +586,7 @@ mod tests {
         Pane {
             agent_name: agent.to_string(),
             vterm: VTerm::new(10, 10),
-            rx: crossbeam::channel::bounded(1).1,
+            rx: crossbeam_channel::bounded(1).1,
             id,
             backend: None,
             working_dir: None,

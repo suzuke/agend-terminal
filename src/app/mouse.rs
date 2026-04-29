@@ -453,7 +453,7 @@ mod tests {
         Pane {
             agent_name: agent.to_string(),
             vterm: VTerm::new(10, 10),
-            rx: crossbeam::channel::bounded(1).1,
+            rx: crossbeam_channel::bounded(1).1,
             id,
             backend: None,
             working_dir: None,

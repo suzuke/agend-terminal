@@ -21,7 +21,7 @@ pub(super) struct DispatchCtx<'a> {
     pub home: &'a Path,
     pub fleet_path: &'a Path,
     pub last_tab: &'a mut usize,
-    pub wakeup_tx: &'a crossbeam::channel::Sender<usize>,
+    pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
 }
 

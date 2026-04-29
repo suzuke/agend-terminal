@@ -97,7 +97,7 @@ pub(super) fn auto_start_fleet(
     home: &Path,
     cols: u16,
     rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
 ) -> bool {
     let fleet = match crate::fleet::FleetConfig::load(fleet_path) {
