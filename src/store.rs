@@ -72,7 +72,7 @@ pub fn acquire_file_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    use fs2::FileExt;
+    use fs4::fs_std::FileExt;
     f.lock_exclusive()
         .map_err(|e| anyhow::anyhow!("flock failed on {}: {e}", lock_path.display()))?;
     Ok(f)
@@ -300,7 +300,7 @@ mod tests {
     fn test_acquire_file_lock_is_exclusive_same_process() {
         // On the same process, a second lock_exclusive on a different File
         // handle for the same path blocks; try_lock should refuse.
-        use fs2::FileExt;
+        use fs4::fs_std::FileExt;
         let dir = tmp_dir("flock");
         let lock_path = dir.join("my.lock");
         let guard = acquire_file_lock(&lock_path).expect("first lock");

@@ -25,8 +25,8 @@ const LOW_DISK_THRESHOLD: f64 = 0.05;
 
 /// Check available disk space at `path`. Returns true if below threshold.
 fn is_disk_low(path: &Path) -> bool {
-    use fs2::available_space;
-    use fs2::total_space;
+    use fs4::available_space;
+    use fs4::total_space;
     let avail = match available_space(path) {
         Ok(s) => s,
         Err(_) => return false, // can't check → assume OK

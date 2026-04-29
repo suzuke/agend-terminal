@@ -2,6 +2,7 @@
 name = "agend-terminal"
 version = "0.4.1"
 edition = "2021"
+rust-version = "1.87"
 description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 35 MCP tools"
 license = "MIT"
 repository = "https://github.com/suzuke/agend-terminal"
@@ -68,9 +69,9 @@ serde_yaml_ng = "0.10"
 teloxide = { version = "0.15", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
 
 # Utilities
-anyhow = "1"
 async-trait = "0.1"
-fs2 = "0.4"
+anyhow = "1"
+fs4 = "0.12"
 dirs = "6"
 regex = "1"
 # Sprint 24 P0 PR2 — task_sweep forensic api_response_hash on PrSnapshot.
@@ -91,10 +92,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] 
 arboard = "3.6.1"
 unicode-width = "0.2"
 which = "6"
-sysinfo = "0.30"
+sysinfo = "0.32"
 
 # Crypto-grade random for API-connection cookie (P1-10)
-getrandom = "0.2"
+getrandom = "0.3"
 iana-time-zone = "0.1.65"
 # Menu-bar / system-tray (feature = "tray"). tray-icon loads PNG via
 # Icon::from_rgba natively — do NOT pull the `image` crate. `toml` is
@@ -119,7 +120,7 @@ libc = "0.2"
 windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_Console", "Win32_Foundation", "Win32_System_Registry"] }
 
 [target.'cfg(windows)'.build-dependencies]
-embed-resource = "2"
+embed-resource = "3"
 
 [dev-dependencies]
 # Used only for asserting that codex_trust_directory writes syntactically

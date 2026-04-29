@@ -53,12 +53,16 @@ pub fn spawn_monitor_tick(home: std::path::PathBuf, registry: crate::agent::Agen
 
 /// Collect metrics for all agents in the registry. Called from daemon tick.
 pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
-    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
     let mut sys = System::new_with_specifics(
         RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
     );
-    sys.refresh_processes_specifics(ProcessRefreshKind::everything());
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::everything(),
+    );
 
     let now = Instant::now();
     let handles: Vec<(String, Option<u32>)> = {

@@ -225,7 +225,7 @@ fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
 }
 
 fn acquire_daemon_lock(home: &Path) -> Result<DaemonLock> {
-    use fs2::FileExt;
+    use fs4::fs_std::FileExt;
     let path = home.join(".daemon.lock");
     let file = std::fs::File::create(&path).with_context(|| format!("open {}", path.display()))?;
     file.try_lock_exclusive().map_err(|e| {

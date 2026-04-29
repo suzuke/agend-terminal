@@ -27,9 +27,9 @@ fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(not(unix))]
 fn is_process_alive(pid: u32) -> bool {
-    use sysinfo::{Pid, System};
+    use sysinfo::{Pid, ProcessesToUpdate, System};
     let mut sys = System::new();
-    sys.refresh_processes();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
     sys.process(Pid::from_u32(pid)).is_some()
 }
 
