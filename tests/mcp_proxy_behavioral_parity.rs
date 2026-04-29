@@ -162,6 +162,7 @@ fn bridge_tools_call_returns_expected_results_for_five_tools() {
     }
 
     let mut child = Command::new(&bridge)
+        .env("AGEND_TEST_ISOLATION", "1")
         .env("AGEND_HOME", &run_dir)
         .env("AGEND_INSTANCE_NAME", "test-agent")
         .stdin(Stdio::piped())
@@ -252,6 +253,7 @@ fn bridge_returns_error_when_daemon_unreachable() {
     std::fs::create_dir_all(&fake_home).ok();
 
     let mut child = Command::new(&bridge)
+        .env("AGEND_TEST_ISOLATION", "1")
         .env("AGEND_HOME", &fake_home)
         .env("AGEND_INSTANCE_NAME", "test-agent")
         .stdin(Stdio::piped())
