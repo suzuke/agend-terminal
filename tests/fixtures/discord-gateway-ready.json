@@ -1,0 +1,33 @@
+{
+  "op": 0,
+  "d": {
+    "v": 10,
+    "user": {
+      "id": "123456789012345678",
+      "username": "agend-bot",
+      "discriminator": "0",
+      "avatar": null,
+      "bot": true,
+      "system": false,
+      "mfa_enabled": false,
+      "flags": 0,
+      "public_flags": 0,
+      "global_name": "agend-bot"
+    },
+    "guilds": [
+      {
+        "id": "987654321098765432",
+        "unavailable": true
+      }
+    ],
+    "session_id": "abc123session",
+    "resume_gateway_url": "wss://gateway.discord.gg",
+    "shard": [0, 1],
+    "application": {
+      "id": "123456789012345678",
+      "flags": 0
+    }
+  },
+  "s": 1,
+  "t": "READY"
+}
