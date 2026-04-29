@@ -536,7 +536,7 @@ fn render_pane(
         (s, s, 1u8)
     };
 
-    let title_segments = pane_title_segments(pane, state, title_style);
+    let title_segments = pane_title_segments(pane, title_style);
 
     // Inner (content) area = outer shrunk 1 cell on every side, matching the
     // former Block::ALL inner. Borders are drawn later in `render_border_grid`
@@ -603,17 +603,9 @@ fn render_pane(
     }
 }
 
-fn pane_title_segments(
-    pane: &crate::layout::Pane,
-    state: AgentState,
-    title_style: Style,
-) -> Vec<(String, Style)> {
+fn pane_title_segments(pane: &crate::layout::Pane, title_style: Style) -> Vec<(String, Style)> {
     let mut segments = Vec::new();
-    let base = if pane.backend.is_some() {
-        format!(" {} [{}]", pane.label(), state.display_name())
-    } else {
-        format!(" {}", pane.label())
-    };
+    let base = format!(" {}", pane.label());
     segments.push((base, title_style));
     if pane.pending_notification_count > 0 {
         segments.push((
@@ -2132,7 +2124,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
         };
-        let segments = pane_title_segments(&pane, AgentState::Idle, Style::default());
+        let segments = pane_title_segments(&pane, Style::default());
         let joined = segments
             .into_iter()
             .map(|(text, _)| text)
@@ -2158,7 +2150,7 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
         };
-        let segments = pane_title_segments(&pane, AgentState::Idle, Style::default());
+        let segments = pane_title_segments(&pane, Style::default());
         let joined: String = segments.iter().map(|(t, _)| t.as_str()).collect();
         assert!(
             !joined.contains("[idle]"),
