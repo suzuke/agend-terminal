@@ -1754,3 +1754,15 @@ fn create_instance_explicit_working_directory_used() {
         );
     }
 }
+
+// Sprint 31+ #84: behavioral assertion — setup_recorder sets AGEND_TEST_ISOLATION
+#[test]
+fn test_isolation_active_after_setup_recorder() {
+    let _g = fleet_test_guard();
+    let (_rec, _home) = setup_recorder("isolation-check");
+    assert_eq!(
+        std::env::var("AGEND_TEST_ISOLATION").as_deref(),
+        Ok("1"),
+        "setup_recorder must set AGEND_TEST_ISOLATION=1"
+    );
+}
