@@ -193,7 +193,7 @@ The orchestrator may then reassign the review instead of waiting.
 
 A reviewer may have at most one active review task unless an incoming task is explicitly marked `interrupt=true` with a reason.
 
-A review task becomes active when the reviewer reads or accepts the delegate_task, and remains active until `send(request_kind: report)` is sent.
+A review task becomes active when the reviewer reads or accepts the `send(request_kind: task)`, and remains active until `send(request_kind: report)` is sent.
 
 New review dispatches to an active reviewer are queued, not implicitly preemptive. The reviewer must finish and report the active task before starting another, unless:
 
