@@ -24,9 +24,7 @@ fn channel_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
         json!({"name": "react", "description": "React to a message with an emoji.",
             "inputSchema": {"type": "object", "properties": {"emoji": {"type": "string"}}, "required": ["emoji"]}}),
-        json!({"name": "edit_message", "description": "Edit a previously sent message.",
-            "inputSchema": {"type": "object", "properties": {"message_id": {"type": "string"}, "text": {"type": "string"}}, "required": ["message_id", "text"]}}),
-        json!({"name": "download_attachment", "description": "Download a file attachment. Returns local path.",
+        json!({"name": "download_attachment", "description": "Download a file attachment (telegram multimedia: images, audio, documents). Returns local path.",
             "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}}),
     ]
 }
@@ -185,12 +183,6 @@ fn task_tools() -> Vec<Value> {
             "pause": {"type": "boolean", "description": "Pause/resume the sweep tick"},
             "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"}
         }}}),
-        json!({"name": "task_legacy_backfill_run",
-            "description": "One-shot legacy-backfill sweep against `repo` for every open task. Computes confidence per (task, PR) candidate (Signal 1 exact-suffix branch + Signal 2 jaccard fuzzy + Signal 3 Closes marker) with 6 false-high attack defenses. Returns a structured report with per-task tier (auto-apply / propose / silent) + sub-scores.",
-            "inputSchema": {"type": "object", "properties": {
-                "repo": {"type": "string", "description": "GitHub `owner/repo` to scan"},
-                "dry_run": {"type": "boolean", "description": "Default true. False = emit Done events for auto-tier; true = TaskCloseProposed only."}
-            }, "required": ["repo"]}}),
     ]
 }
 

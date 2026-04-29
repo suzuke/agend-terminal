@@ -228,8 +228,12 @@ pub trait Channel: Send + Sync {
 
     /// Unified entry for **agent-callable** outbound operations.
     ///
-    /// Fan-in for the four MCP→Channel bridge surfaces (`reply`, `react`,
-    /// `edit_message`, `delegate_task` provenance side-channel).
+    /// Fan-in for the MCP→Channel bridge surfaces (`reply`, `react`,
+    /// `delegate_task` provenance side-channel). The `Edit` variant is
+    /// retained for telegram-internal edit operations (e.g. reaction
+    /// replacement) — Sprint 30 PR-3 removed the agent-callable
+    /// `edit_message` MCP tool, but the channel-internal Edit op still
+    /// drives existing telegram.rs code paths.
     ///
     /// Implementations must:
     /// 1. Check [`Self::outbound_authorized`] (PR #216 allowlist gate).
@@ -248,11 +252,13 @@ pub trait Channel: Send + Sync {
 
 /// Op-specific payload for [`Channel::send_from_agent`].
 ///
-/// One variant per agent-callable bridge in `mcp/handlers.rs`:
+/// Variants:
 ///
 /// - `Reply` — `reply` MCP tool (free-form text into bound topic)
 /// - `React` — `react` MCP tool (emoji on existing message)
-/// - `Edit` — `edit_message` MCP tool (replace text of bot-sent message)
+/// - `Edit` — channel-internal edit (replace text of bot-sent message);
+///   retained after Sprint 30 PR-3 removed the `edit_message` MCP tool
+///   for telegram-internal edit paths (reaction replacement, etc.)
 /// - `InjectProvenance` — `delegate_task` provenance side-channel
 ///   (renders "@from delegated to @target" tag in target's topic)
 #[derive(Debug, Clone)]

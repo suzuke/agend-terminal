@@ -79,8 +79,7 @@ def handle(req):
         tools = [
             {"name":"reply","description":"Reply to the user via Telegram.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}},
             {"name":"react","description":"React to a message with an emoji.","inputSchema":{"type":"object","properties":{"emoji":{"type":"string"}},"required":["emoji"]}},
-            {"name":"edit_message","description":"Edit a previously sent message.","inputSchema":{"type":"object","properties":{"message_id":{"type":"string"},"text":{"type":"string"}},"required":["message_id","text"]}},
-            {"name":"download_attachment","description":"Download a file attachment.","inputSchema":{"type":"object","properties":{"file_id":{"type":"string"}},"required":["file_id"]}},
+            {"name":"download_attachment","description":"Download a file attachment (telegram multimedia).","inputSchema":{"type":"object","properties":{"file_id":{"type":"string"}},"required":["file_id"]}},
             {"name":"send_to_instance","description":"Send a message to another agent instance.","inputSchema":{"type":"object","properties":{"instance_name":{"type":"string"},"message":{"type":"string"},"request_kind":{"type":"string","enum":["query","task","report","update"]},"requires_reply":{"type":"boolean"}},"required":["instance_name","message"]}},
             {"name":"delegate_task","description":"Delegate a task to another instance.","inputSchema":{"type":"object","properties":{"target_instance":{"type":"string"},"task":{"type":"string"},"success_criteria":{"type":"string"},"context":{"type":"string"}},"required":["target_instance","task"]}},
             {"name":"report_result","description":"Report results back.","inputSchema":{"type":"object","properties":{"target_instance":{"type":"string"},"summary":{"type":"string"},"correlation_id":{"type":"string"},"artifacts":{"type":"string"}},"required":["target_instance","summary"]}},

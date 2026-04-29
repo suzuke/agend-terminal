@@ -41,10 +41,6 @@ pub(super) fn handle_task_sweep_config(home: &Path, args: &Value) -> Value {
     crate::daemon::task_sweep::handle_task_sweep_config(home, args)
 }
 
-pub(super) fn handle_task_legacy_backfill_run(home: &Path, args: &Value) -> Value {
-    crate::daemon::legacy_backfill::handle_task_legacy_backfill_run(home, args)
-}
-
 pub(super) fn handle_create_team(home: &Path, args: &Value) -> Value {
     match crate::api::call(
         home,
