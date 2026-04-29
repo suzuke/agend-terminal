@@ -1112,9 +1112,10 @@ pub fn init_from_config(
             topic_map.insert("general".to_string(), 1);
         } else if inst.topic_id.is_none() {
             tracing::info!(instance = %name, "creating topic");
-            match telegram_runtime()
-                .block_on(async { bot.create_forum_topic(chat_id, name, 0x6FB9F0, "").await })
-            {
+            match telegram_runtime().block_on(async {
+                bot.create_forum_topic(chat_id, name, teloxide::types::Rgb::from_u32(0x6FB9F0), "")
+                    .await
+            }) {
                 Ok(topic) => {
                     let tid = topic.thread_id.0 .0;
                     tracing::info!(instance = %name, topic_id = tid, "created topic");
@@ -1206,9 +1207,10 @@ fn resolve_fleet_binding(
 
     // Slow path: create the forum topic once and pin it into the registry.
     tracing::info!(%name, "creating fleet_binding topic");
-    match telegram_runtime()
-        .block_on(async { bot.create_forum_topic(chat_id, &name, 0x6FB9F0, "").await })
-    {
+    match telegram_runtime().block_on(async {
+        bot.create_forum_topic(chat_id, &name, teloxide::types::Rgb::from_u32(0x6FB9F0), "")
+            .await
+    }) {
         Ok(topic) => {
             let tid = topic.thread_id.0 .0;
             tracing::info!(topic_id = tid, %name, "created fleet_binding topic");
@@ -1589,7 +1591,7 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
             .create_forum_topic(
                 teloxide::types::ChatId(ch.group_id),
                 instance_name,
-                0x6FB9F0,
+                teloxide::types::Rgb::from_u32(0x6FB9F0),
                 "",
             )
             .await?;
