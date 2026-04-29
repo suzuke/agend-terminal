@@ -38,7 +38,7 @@ PTY children are children of the daemon. Daemon dies → PTY dies → all agents
 | **`task` / `decision` / `team` / `schedule` / `ci` / `repo` / `health` / `deployment`** | Action-based CRUD per domain |
 | Direct daemon API | TUI sessions, supervisor (gone), bridges |
 
-26 MCP tools after Sprint 30 consolidation. `src/mcp/tools.rs` is the registry; an invariant test (`tests/mcp_tools_count.rs`) pins the count to catch silent drift.
+26 MCP tools after Sprint 30 consolidation. `src/mcp/tools.rs` is the registry; an inline invariant test `tool_definitions_count_invariant_post_sprint_30` (in the same file's `mod tests`) pins the count to catch silent drift.
 
 ## Where to start reading
 
