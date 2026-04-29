@@ -36,22 +36,6 @@ fn err_needs_identity(tool: &str) -> Value {
     })
 }
 
-/// Pure function: build tool_kill success response.
-#[cfg(unix)]
-pub(crate) fn build_tool_kill_result(target: &str, pgid: i32, reason: &str) -> Value {
-    let mut result = json!({"ok": true, "target": target, "pgid": pgid});
-    if !reason.is_empty() {
-        result["reason"] = json!(reason);
-    }
-    result
-}
-
-/// Pure function: build tool_kill audit log detail string.
-#[cfg(unix)]
-pub(crate) fn build_tool_kill_audit(reason: &str, pgid: i32) -> String {
-    format!("reason={reason}, pgid={pgid}")
-}
-
 /// Build the INJECT API params for an interrupt ESC byte injection.
 /// Extracted for testability — unit tests verify the exact params
 /// without needing a running daemon.
@@ -119,7 +103,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "set_display_name" => instance::handle_set_display_name(&home, args, instance_name),
         "set_description" => instance::handle_set_description(&home, args, instance_name),
         "interrupt" => instance::handle_interrupt(&home, args),
-        "tool_kill" => instance::handle_tool_kill(&home, args),
         "set_waiting_on" => instance::handle_set_waiting_on(&home, args, instance_name, &sender),
         "move_pane" => instance::handle_move_pane(&home, args),
         // Consolidated: health action=report/clear

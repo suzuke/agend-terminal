@@ -52,9 +52,6 @@ pub struct BehavioralConfig {
     /// Whether this backend supports cursor position query (DSR CPR).
     #[allow(dead_code)] // Phase 2 Sprint 28+
     pub supports_cursor_query: bool,
-    /// Whether fg pgid inference is meaningful for this backend.
-    #[allow(dead_code)] // Phase 2 Sprint 28+
-    pub supports_fg_pgid: bool,
 }
 
 impl Default for BehavioralConfig {
@@ -63,7 +60,6 @@ impl Default for BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
             supports_cursor_query: false,
-            supports_fg_pgid: false,
         }
     }
 }
@@ -75,31 +71,26 @@ pub fn config_for(backend: &Backend) -> BehavioralConfig {
             silence_thinking_ms: 2000,
             silence_idle_ms: 6000,
             supports_cursor_query: true,
-            supports_fg_pgid: cfg!(unix),
         },
         Backend::KiroCli => BehavioralConfig {
             silence_thinking_ms: 2500,
             silence_idle_ms: 7000,
             supports_cursor_query: true,
-            supports_fg_pgid: cfg!(unix),
         },
         Backend::Codex => BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
             supports_cursor_query: false, // bubbletea TUI may not respond to DSR
-            supports_fg_pgid: cfg!(unix),
         },
         Backend::Gemini => BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
             supports_cursor_query: false,
-            supports_fg_pgid: cfg!(unix),
         },
         Backend::OpenCode => BehavioralConfig {
             silence_thinking_ms: 3000,
             silence_idle_ms: 8000,
             supports_cursor_query: false,
-            supports_fg_pgid: cfg!(unix),
         },
         Backend::Shell | Backend::Raw(_) => BehavioralConfig::default(),
     }

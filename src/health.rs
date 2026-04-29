@@ -49,7 +49,7 @@ pub enum HealthState {
     /// Sprint 24 P1 (F-NEW-DAEMON-HEALTH-CLASSIFIER-1): agent is silent
     /// past the hang threshold but **no input is pending past last
     /// response** — typically `Ready` state waiting for next dispatch.
-    /// Cron escalation chains (`interrupt` / `tool_kill` / `replace`)
+    /// Cron escalation chains (`interrupt` / `replace`)
     /// MUST NOT trigger on this state; only `Hung` is escalation-worthy.
     /// Closes the operator 04:00 UTC false-alarm pattern where impl-1's
     /// 30-min idle-waiting was mis-classified as `Hung`.
@@ -207,7 +207,7 @@ impl HealthTracker {
     ///
     /// Returns `true` ONLY when transitioning **into** [`HealthState::Hung`]
     /// (the escalation-worthy state). [`HealthState::IdleLong`] transitions
-    /// return `false` so cron escalation consumers (interrupt / tool_kill
+    /// return `false` so cron escalation consumers (interrupt
     /// / replace) keep their existing semantics — they only act on `Hung`.
     pub fn check_hang(
         &mut self,

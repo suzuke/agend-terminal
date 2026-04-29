@@ -1494,48 +1494,6 @@ fn test_old_inbox_json_with_interrupt_meta_deserializes_into_force_meta() {
     assert!(!meta.forced_at.is_empty());
 }
 
-// --- Sprint 11: tool_kill pure function tests ---
-
-#[test]
-#[cfg(unix)]
-fn test_tool_kill_result_includes_pgid_and_target() {
-    let result = build_tool_kill_result("agent1", 12345, "");
-    assert_eq!(result["ok"], true);
-    assert_eq!(result["target"], "agent1");
-    assert_eq!(result["pgid"], 12345);
-    assert!(result["reason"].is_null(), "empty reason must not appear");
-}
-
-#[test]
-#[cfg(unix)]
-fn test_tool_kill_result_includes_reason_when_provided() {
-    let result = build_tool_kill_result("agent1", 12345, "stuck on cargo test");
-    assert_eq!(result["reason"], "stuck on cargo test");
-}
-
-#[test]
-#[cfg(unix)]
-fn test_tool_kill_audit_format() {
-    let audit = build_tool_kill_audit("priority task", 42);
-    assert!(audit.contains("reason=priority task"), "audit: {audit}");
-    assert!(audit.contains("pgid=42"), "audit: {audit}");
-}
-
-#[test]
-fn test_tool_kill_target_not_found_returns_error() {
-    let _g = fleet_test_guard();
-    let home = tmp_home("tool-kill-notfound");
-    std::env::set_var("AGEND_HOME", &home);
-    // No fleet.yaml → target doesn't exist
-    let result = handle_tool("tool_kill", &json!({"target": "ghost"}), "sender");
-    assert!(
-        result.get("error").is_some(),
-        "tool_kill to nonexistent target must error: {result}"
-    );
-    std::env::remove_var("AGEND_HOME");
-    std::fs::remove_dir_all(&home).ok();
-}
-
 // ─── Team auto-attach tests (Sprint 14 PR-AL) ────────────────────
 
 #[test]
