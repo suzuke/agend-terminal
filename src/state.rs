@@ -304,6 +304,12 @@ impl StatePatterns {
                 // [docs] HTTP error handling
                 // Sprint 31+ #4: word-boundary `429` per Claude pattern.
                 (AgentState::RateLimit, r"rate.?limit|\b429\b"),
+                // [measured] Provider-side validation errors (e.g. MiniMax
+                // M2.5 rejecting eager_input_streaming in tool spec).
+                (
+                    AgentState::ApiError,
+                    r"Error from provider:|request validation errors",
+                ),
                 // [docs] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [docs] Permission UI
