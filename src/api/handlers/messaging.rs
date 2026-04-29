@@ -45,6 +45,49 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             }
         }
     }
+
+    // Sprint 37 team isolation gate — 3 rules, zero escape hatch.
+    // Rule 1 (self-send) already rejected above.
+    // Rule 2: general bus
+    let is_general_bus = from == "general" || target == "general";
+    // Rule 3: same-team via Option<Team> equality
+    let from_team = crate::teams::find_team_for(ctx.home, from);
+    let target_team = crate::teams::find_team_for(ctx.home, target);
+    let same_team = match (&from_team, &target_team) {
+        (Some(a), Some(b)) => a.name == b.name,
+        (None, None) => true,
+        _ => false,
+    };
+    if !is_general_bus && !same_team {
+        crate::event_log::log(
+            ctx.home,
+            "send_cross_team_blocked",
+            from,
+            &format!(
+                "target={target}, sender_team={:?}, target_team={:?}",
+                from_team.as_ref().map(|t| &t.name),
+                target_team.as_ref().map(|t| &t.name),
+            ),
+        );
+        return json!({
+            "ok": false,
+            "error": format!(
+                "cross-team send blocked: '{from}' (team={:?}) → '{target}' (team={:?}). \
+                 Route via general, or use create_instance(team=...) to grow your team.",
+                from_team.as_ref().map(|t| &t.name),
+                target_team.as_ref().map(|t| &t.name),
+            )
+        });
+    }
+    if is_general_bus && !same_team {
+        crate::event_log::log(
+            ctx.home,
+            "send_cross_team_allowed_general",
+            from,
+            &format!("target={target}"),
+        );
+    }
+
     let msg = {
         let mut thread_id = params["thread_id"].as_str().map(String::from);
         let parent_id = params["parent_id"].as_str().map(String::from);
@@ -267,11 +310,7 @@ mod tests {
     // --- Sprint 37: team isolation gate tests ---
 
     /// Set up fleet.yaml with given instances and teams.json with given teams.
-    fn setup_team_env(
-        home: &std::path::Path,
-        fleet_instances: &[&str],
-        teams: &[(& str, &[&str])],
-    ) {
+    fn setup_team_env(home: &std::path::Path, fleet_instances: &[&str], teams: &[(&str, &[&str])]) {
         let fleet_yaml = fleet_instances
             .iter()
             .map(|n| format!("  {n}:\n    backend: claude"))
@@ -295,9 +334,8 @@ mod tests {
                 })
                 .collect();
             let store = json!({"schema_version": 1, "teams": team_objs});
-            std::fs::create_dir_all(home.join("store")).ok();
             std::fs::write(
-                home.join("store").join("teams.json"),
+                home.join("teams.json"),
                 serde_json::to_string_pretty(&store).expect("json"),
             )
             .ok();
@@ -317,7 +355,10 @@ mod tests {
         let home = tmp_home("same-team");
         setup_team_env(&home, &["alice", "bob"], &[("dev2", &["alice", "bob"])]);
         let ctx = test_ctx(&home);
-        let result = handle_send(&json!({"from": "alice", "target": "bob", "text": "hi"}), &ctx);
+        let result = handle_send(
+            &json!({"from": "alice", "target": "bob", "text": "hi"}),
+            &ctx,
+        );
         assert_eq!(result["ok"], true, "same-team send must succeed: {result}");
         assert!(!audit_log_contains(&home, "send_cross_team_blocked"));
         std::fs::remove_dir_all(&home).ok();
@@ -332,10 +373,19 @@ mod tests {
             &[("dev2", &["alice"]), ("dev", &["bob"])],
         );
         let ctx = test_ctx(&home);
-        let result = handle_send(&json!({"from": "alice", "target": "bob", "text": "hi"}), &ctx);
-        assert_eq!(result["ok"], false, "cross-team send must be blocked: {result}");
+        let result = handle_send(
+            &json!({"from": "alice", "target": "bob", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], false,
+            "cross-team send must be blocked: {result}"
+        );
         assert!(
-            result["error"].as_str().unwrap_or("").contains("cross-team"),
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cross-team"),
             "error must mention cross-team: {result}"
         );
         assert!(audit_log_contains(&home, "send_cross_team_blocked"));
@@ -345,11 +395,7 @@ mod tests {
     #[test]
     fn send_to_general_allowed_from_any_team() {
         let home = tmp_home("to-general");
-        setup_team_env(
-            &home,
-            &["alice", "general"],
-            &[("dev2", &["alice"])],
-        );
+        setup_team_env(&home, &["alice", "general"], &[("dev2", &["alice"])]);
         let ctx = test_ctx(&home);
         let result = handle_send(
             &json!({"from": "alice", "target": "general", "text": "hi"}),
@@ -362,17 +408,16 @@ mod tests {
     #[test]
     fn send_from_general_to_any_team_allowed() {
         let home = tmp_home("from-general");
-        setup_team_env(
-            &home,
-            &["general", "bob"],
-            &[("dev", &["bob"])],
-        );
+        setup_team_env(&home, &["general", "bob"], &[("dev", &["bob"])]);
         let ctx = test_ctx(&home);
         let result = handle_send(
             &json!({"from": "general", "target": "bob", "text": "hi"}),
             &ctx,
         );
-        assert_eq!(result["ok"], true, "send from general must succeed: {result}");
+        assert_eq!(
+            result["ok"], true,
+            "send from general must succeed: {result}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -381,7 +426,10 @@ mod tests {
         let home = tmp_home("self-block-team");
         setup_team_env(&home, &["alice"], &[("dev2", &["alice"])]);
         let ctx = test_ctx(&home);
-        let result = handle_send(&json!({"from": "alice", "target": "alice", "text": "hi"}), &ctx);
+        let result = handle_send(
+            &json!({"from": "alice", "target": "alice", "text": "hi"}),
+            &ctx,
+        );
         assert_eq!(result["ok"], false);
         assert!(
             result["error"].as_str().unwrap_or("").contains("self"),
@@ -395,8 +443,14 @@ mod tests {
         let home = tmp_home("no-team");
         setup_team_env(&home, &["alice", "bob"], &[]);
         let ctx = test_ctx(&home);
-        let result = handle_send(&json!({"from": "alice", "target": "bob", "text": "hi"}), &ctx);
-        assert_eq!(result["ok"], true, "both teamless must be allowed: {result}");
+        let result = handle_send(
+            &json!({"from": "alice", "target": "bob", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], true,
+            "both teamless must be allowed: {result}"
+        );
         assert!(!audit_log_contains(&home, "send_cross_team_blocked"));
         std::fs::remove_dir_all(&home).ok();
     }
@@ -406,8 +460,14 @@ mod tests {
         let home = tmp_home("team-to-none");
         setup_team_env(&home, &["alice", "bob"], &[("dev2", &["alice"])]);
         let ctx = test_ctx(&home);
-        let result = handle_send(&json!({"from": "alice", "target": "bob", "text": "hi"}), &ctx);
-        assert_eq!(result["ok"], false, "team→teamless must be blocked: {result}");
+        let result = handle_send(
+            &json!({"from": "alice", "target": "bob", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], false,
+            "team→teamless must be blocked: {result}"
+        );
         assert!(audit_log_contains(&home, "send_cross_team_blocked"));
         std::fs::remove_dir_all(&home).ok();
     }
@@ -417,8 +477,14 @@ mod tests {
         let home = tmp_home("none-to-team");
         setup_team_env(&home, &["alice", "bob"], &[("dev2", &["bob"])]);
         let ctx = test_ctx(&home);
-        let result = handle_send(&json!({"from": "alice", "target": "bob", "text": "hi"}), &ctx);
-        assert_eq!(result["ok"], false, "teamless→team must be blocked: {result}");
+        let result = handle_send(
+            &json!({"from": "alice", "target": "bob", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], false,
+            "teamless→team must be blocked: {result}"
+        );
         assert!(audit_log_contains(&home, "send_cross_team_blocked"));
         std::fs::remove_dir_all(&home).ok();
     }
