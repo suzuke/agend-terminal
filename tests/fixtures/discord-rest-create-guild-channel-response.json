@@ -1,0 +1,13 @@
+{
+  "id": "555555555555555555",
+  "type": 0,
+  "guild_id": "987654321098765432",
+  "name": "test-agent",
+  "position": 1,
+  "permission_overwrites": [],
+  "nsfw": false,
+  "topic": null,
+  "last_message_id": null,
+  "rate_limit_per_user": 0,
+  "parent_id": null
+}

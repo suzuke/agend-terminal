@@ -1,0 +1,13 @@
+{
+  "op": 0,
+  "s": 5,
+  "t": "CHANNEL_DELETE",
+  "d": {
+    "id": "290926798999357250",
+    "type": 0,
+    "guild_id": "987654321098765432",
+    "name": "deleted-channel",
+    "position": 0,
+    "permission_overwrites": []
+  }
+}
