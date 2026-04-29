@@ -136,7 +136,9 @@ impl StatePatterns {
                     r"API key|authentication failed|unauthorized",
                 ),
                 // [docs] SDK retry logic for 429/overloaded
-                (AgentState::RateLimit, r"overloaded|rate.?limit|429"),
+                // Sprint 31+ #4: word-boundary `429` to avoid false-positive
+                // on substrings like "build #4290" / "request id: 4291...".
+                (AgentState::RateLimit, r"overloaded|rate.?limit|\b429\b"),
                 // [docs] Auto-compaction on context limit
                 (
                     AgentState::ContextFull,
@@ -187,9 +189,10 @@ impl StatePatterns {
                     r"ServiceQuotaExceeded|InsufficientModelCapacity",
                 ),
                 // [docs] HTTP 429 handling
+                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
                 (
                     AgentState::RateLimit,
-                    r"Too Many Requests|ThrottlingError|429",
+                    r"Too Many Requests|ThrottlingError|\b429\b",
                 ),
                 // [docs] Context overflow triggers compaction
                 // `/compact` was previously included but matches the slash-
@@ -236,7 +239,8 @@ impl StatePatterns {
                 // [実測 v0.118.0] Quota exhausted message
                 (AgentState::UsageLimit, r"hit your usage limit|try again at"),
                 // [docs] HTTP 429 handling
-                (AgentState::RateLimit, r"rate.?limit|429"),
+                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
+                (AgentState::RateLimit, r"rate.?limit|\b429\b"),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [measured] Codex 0.120.0 renders approval dialogs with
@@ -291,7 +295,8 @@ impl StatePatterns {
             // OpenCode v1.4.0
             Backend::OpenCode => vec![
                 // [docs] HTTP error handling
-                (AgentState::RateLimit, r"rate.?limit|429"),
+                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
+                (AgentState::RateLimit, r"rate.?limit|\b429\b"),
                 // [docs] Context overflow
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [docs] Permission UI
@@ -338,7 +343,8 @@ impl StatePatterns {
                     r"Usage limit reached|Access resets at",
                 ),
                 // [docs] API resource exhaustion
-                (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|429"),
+                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
+                (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|\b429\b"),
                 // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
                 // [docs] Permission select options
@@ -426,7 +432,8 @@ pub fn classify_pty_output(
             {
                 return Some(BlockedReason::QuotaExceeded);
             }
-            if regex::Regex::new(r"(?i)overloaded|rate.?limit|429")
+            // Sprint 31+ #4: word-boundary `429` per state-pattern fix.
+            if regex::Regex::new(r"(?i)overloaded|rate.?limit|\b429\b")
                 .ok()?
                 .is_match(output)
             {
