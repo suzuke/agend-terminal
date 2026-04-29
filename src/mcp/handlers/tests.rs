@@ -1758,3 +1758,19 @@ fn send_kind_query_maps_message_field_to_question() {
         "send(kind=query, message=...) should route message → question; got error={err}"
     );
 }
+
+// --- Sprint 33 PR-3: pane_snapshot tests ---
+
+#[test]
+fn pane_snapshot_target_not_found_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("pane-snapshot-notfound");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("pane_snapshot", &json!({"target": "ghost"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "pane_snapshot to nonexistent target must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}

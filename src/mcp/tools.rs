@@ -111,6 +111,11 @@ fn instance_tools() -> Vec<Value> {
                 "target_tab": {"type": "string", "description": "Destination tab name. Created if not present."},
                 "split_dir": {"type": "string", "enum": ["horizontal", "vertical"], "description": "Split direction when the destination tab already exists. Default: horizontal. Ignored when a new tab is created."}
             }, "required": ["agent", "target_tab"]}}),
+        json!({"name": "pane_snapshot", "description": "Read visible text from a target instance's PTY scrollback. Returns plain text (ANSI stripped). Default 100 lines, max 10000.",
+            "inputSchema": {"type": "object", "properties": {
+                "target": {"type": "string", "description": "Target instance name"},
+                "lines": {"type": "integer", "description": "Number of lines to return (default 100, max 10000)"}
+            }, "required": ["target"]}}),
     ]
 }
 
@@ -367,14 +372,25 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            25,
-            "Sprint 33 tool count = 25. \
+            25 + 1,
+            "Sprint 33 tool count = 26 (pane_snapshot added). \
              Adding/removing a tool requires updating this assertion. \
              Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pane_snapshot_tool_registered() {
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(
+            names.contains(&"pane_snapshot"),
+            "pane_snapshot tool must be registered, got: {names:?}"
         );
     }
 }

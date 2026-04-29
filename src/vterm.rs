@@ -330,6 +330,54 @@ impl VTerm {
         text
     }
 
+    /// Read scrollback history + visible screen as plain text (ANSI stripped).
+    /// Returns the last `max_lines` lines. Walks from `topmost_line()` to
+    /// `bottommost_line()` via `safe_cell` — same pattern as `tail_lines`.
+    pub fn read_scrollback(&self, max_lines: usize) -> String {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let top = grid.topmost_line();
+        let bot = grid.bottommost_line();
+        let total = (bot.0 - top.0 + 1) as usize;
+
+        let start = if total > max_lines {
+            Line(bot.0 - max_lines as i32 + 1)
+        } else {
+            top
+        };
+
+        let mut lines: Vec<String> = Vec::with_capacity(max_lines.min(total));
+        let mut row = start;
+        while row <= bot {
+            let mut line = String::with_capacity(cols);
+            let mut col = 0;
+            while col < cols {
+                let cell = safe_cell(grid, row, col);
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    col += 1;
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                line.push(ch);
+                col += 1;
+            }
+            lines.push(line.trim_end().to_string());
+            row += 1;
+        }
+
+        // Trim blank lines at both ends
+        let first = lines
+            .iter()
+            .position(|l| !l.is_empty())
+            .unwrap_or(lines.len());
+        let last = lines
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .map(|i| i + 1)
+            .unwrap_or(first);
+        lines[first..last].join("\n")
+    }
+
     /// Return the last `n` visible rows of the screen as plain text,
     /// stripped of ANSI attributes and trailing spaces. Leading blank
     /// rows are omitted so short output doesn't look padded.
@@ -971,5 +1019,45 @@ mod tests {
         vt.process(b"After erase");
         let tail = vt.tail_lines(3);
         assert!(tail.contains("After erase"));
+    }
+
+    #[test]
+    fn read_scrollback_returns_visible_and_history() {
+        let mut vt = VTerm::new(80, 5);
+        // Write 10 lines into a 5-row terminal — first 5 scroll into history
+        for i in 1..=10 {
+            vt.process(format!("line{i}\r\n").as_bytes());
+        }
+        let text = vt.read_scrollback(100);
+        assert!(
+            text.contains("line1"),
+            "scrollback must include history line1, got: {text}"
+        );
+        assert!(
+            text.contains("line10"),
+            "scrollback must include visible line10, got: {text}"
+        );
+    }
+
+    #[test]
+    fn read_scrollback_limits_to_n_lines() {
+        let mut vt = VTerm::new(80, 5);
+        for i in 1..=20 {
+            vt.process(format!("line{i}\r\n").as_bytes());
+        }
+        let text = vt.read_scrollback(3);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines.len() <= 3,
+            "read_scrollback(3) must return at most 3 lines, got {}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn read_scrollback_empty_terminal() {
+        let vt = VTerm::new(80, 24);
+        let text = vt.read_scrollback(100);
+        assert!(text.is_empty(), "empty terminal must return empty string");
     }
 }

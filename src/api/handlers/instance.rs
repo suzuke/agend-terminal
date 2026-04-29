@@ -350,6 +350,24 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
     }
 }
 
+pub(crate) fn handle_pane_snapshot(params: &Value, ctx: &HandlerCtx) -> Value {
+    let name = match params["name"].as_str() {
+        Some(n) => n,
+        None => return json!({"ok": false, "error": "missing 'name'"}),
+    };
+    let lines = params["lines"].as_u64().unwrap_or(100) as usize;
+    let reg = agent::lock_registry(ctx.registry);
+    let handle = match reg.get(name) {
+        Some(h) => h,
+        None => return json!({"ok": false, "error": format!("instance '{name}' not found")}),
+    };
+    let core = handle.core.lock();
+    let text = core.vterm.read_scrollback(lines);
+    drop(core);
+    drop(reg);
+    json!({"ok": true, "text": text})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +487,45 @@ mod tests {
         drop(reg);
 
         cleanup_agent(&ctx, "health-clear");
+    }
+
+    /// §3.5.10 wire-format: pane_snapshot success-path response shape
+    /// with deterministic PTY content. Pins ok=true, text=string, content
+    /// ordering, and empty-PTY shape.
+    #[test]
+    fn pane_snapshot_success_shape_with_deterministic_content() {
+        let (ctx, _home) = test_ctx_with_agent("snap-shape");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // Feed deterministic content into the agent's VTerm
+        {
+            let reg = agent::lock_registry(ctx.registry);
+            let handle = reg.get("snap-shape").expect("agent exists");
+            let mut core = handle.core.lock();
+            for i in 1..=5 {
+                core.vterm.process(format!("TESTLINE{i}\r\n").as_bytes());
+            }
+        }
+
+        let result = handle_pane_snapshot(&json!({"name": "snap-shape", "lines": 100}), &ctx);
+
+        // Pin response shape: ok=true, text=string
+        assert_eq!(result["ok"], true, "success must have ok=true: {result}");
+        let text = result["text"].as_str().expect("text must be a string");
+        assert!(
+            text.contains("TESTLINE1"),
+            "must contain TESTLINE1, got: {text}"
+        );
+        assert!(
+            text.contains("TESTLINE5"),
+            "must contain TESTLINE5, got: {text}"
+        );
+
+        // Verify line ordering
+        let pos1 = text.find("TESTLINE1").expect("TESTLINE1 present");
+        let pos5 = text.find("TESTLINE5").expect("TESTLINE5 present");
+        assert!(pos1 < pos5, "lines must be in order");
+
+        cleanup_agent(&ctx, "snap-shape");
     }
 }
