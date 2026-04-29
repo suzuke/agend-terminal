@@ -60,9 +60,21 @@ fn save_topic_registry(home: &Path, registry: &HashMap<i32, String>) {
 }
 
 fn register_topic(home: &Path, topic_id: i32, instance_name: &str) {
+    // Write-side unification (Fix B): all three sources updated atomically.
+    // 1. topics.json (disk registry)
     let mut reg = load_topic_registry(home);
     reg.insert(topic_id, instance_name.to_string());
     save_topic_registry(home, &reg);
+    // 2. fleet.yaml topic_id field
+    let _ = crate::fleet::update_instance_field(
+        home,
+        instance_name,
+        "topic_id",
+        serde_yaml::Value::Number(serde_yaml::Number::from(topic_id)),
+    );
+    // 3. in-memory state is updated by the caller (Channel trait methods
+    //    that hold &self.state). Free-function callers without state access
+    //    rely on resolve_topic's topics.json fallback as defense-in-depth.
 }
 
 fn unregister_topic(home: &Path, topic_id: i32) {
@@ -429,6 +441,19 @@ fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) -> String {
                 }
             }
         }
+        // Fix B: check topics.json as third source (runtime-created topics
+        // may exist there but not in fleet.yaml or in-memory state).
+        let reg = load_topic_registry(&state.home);
+        if let Some(inst_name) = reg.get(&tid) {
+            state.topic_to_instance.insert(tid, inst_name.clone());
+            state.instance_to_topic.insert(inst_name.clone(), tid);
+            return inst_name.clone();
+        }
+        // Fix C: warn before fallback so operator sees misroute.
+        tracing::warn!(
+            thread_id = tid,
+            "resolve_topic: topic_id not found in memory, fleet.yaml, or topics.json — falling back to \"general\""
+        );
     }
     "general".to_string()
 }
@@ -1066,6 +1091,21 @@ pub fn init_from_config(
         .filter_map(|(name, inst)| inst.topic_id.map(|tid| (name.clone(), tid)))
         .collect();
 
+    // Fix B: merge topics.json entries not already in fleet.yaml.
+    // topics.json is the runtime registry (written by register_topic on
+    // create_instance); fleet.yaml is the declarative config. Fleet.yaml
+    // wins on conflict (same instance, different topic_id).
+    for (tid, inst_name) in &reg {
+        if *tid != 1 && inst_name != FLEET_BINDING_SENTINEL && !topic_map.contains_key(inst_name) {
+            tracing::info!(
+                instance = %inst_name,
+                topic_id = tid,
+                "merging topic from topics.json (not in fleet.yaml)"
+            );
+            topic_map.insert(inst_name.clone(), *tid);
+        }
+    }
+
     // Auto-create topics for instances without topic_id
     for (name, inst) in &config.instances {
         if name == "general" && inst.topic_id.is_none() {
@@ -1557,12 +1597,6 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     }) {
         Ok(tid) => {
             tracing::info!(instance = %instance_name, topic_id = tid, "created topic");
-            let _ = crate::fleet::update_instance_field(
-                home,
-                instance_name,
-                "topic_id",
-                serde_yaml::Value::Number(serde_yaml::Number::from(tid)),
-            );
             register_topic(home, tid, instance_name);
             Some(tid)
         }
@@ -3045,6 +3079,61 @@ instances:
         // Delete fleet.yaml — second call should use cached map
         std::fs::remove_file(home.join("fleet.yaml")).ok();
         assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Fix B: resolve_topic checks topics.json as third source when
+    /// topic_id is not in memory or fleet.yaml. Before this fix,
+    /// runtime-created instances (registered only in topics.json)
+    /// would misroute to "general".
+    #[test]
+    fn resolve_topic_falls_back_to_topics_json() {
+        let home = tmp_home("resolve_topics_json");
+        // No fleet.yaml — topic only exists in topics.json.
+        // Use save_topic_registry directly (not register_topic, which
+        // now writes fleet.yaml too — we want to test the read fallback).
+        let mut reg = HashMap::new();
+        reg.insert(2474, "test-gemini".to_string());
+        save_topic_registry(&home, &reg);
+        let mut state = TelegramState::new_for_contract_test(
+            -1,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        );
+        assert_eq!(
+            resolve_topic(&mut state, Some(2474)),
+            "test-gemini",
+            "topic in topics.json must resolve, not fall through to general"
+        );
+        assert_eq!(resolve_topic(&mut state, Some(2474)), "test-gemini");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Fix B write-side: register_topic writes fleet.yaml topic_id.
+    /// §3.5.11: on main HEAD (before fix), register_topic does NOT
+    /// write fleet.yaml — this test would fail.
+    #[test]
+    fn register_topic_writes_fleet_yaml() {
+        let home = tmp_home("register_writes_yaml");
+        // Create a minimal fleet.yaml with the instance but no topic_id.
+        let yaml = "defaults:\n  backend: claude\ninstances:\n  alice:\n    backend: claude\n";
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+
+        register_topic(&home, 42, "alice");
+
+        // Verify fleet.yaml now contains topic_id: 42 for alice.
+        let content =
+            std::fs::read_to_string(home.join("fleet.yaml")).expect("fleet.yaml must exist");
+        assert!(
+            content.contains("topic_id"),
+            "fleet.yaml must contain topic_id after register_topic: {content}"
+        );
+        // Also verify topics.json was written.
+        let reg = load_topic_registry(&home);
+        assert_eq!(reg.get(&42), Some(&"alice".to_string()));
 
         std::fs::remove_dir_all(&home).ok();
     }
