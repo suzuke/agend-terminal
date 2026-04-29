@@ -105,9 +105,18 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "report_result" => comms::handle_report_result(&home, args, &sender),
         "request_information" => comms::handle_request_information(&home, args, &sender),
         "broadcast" => comms::handle_broadcast(&home, args, &sender),
-        "inbox" => comms::handle_inbox(&home, instance_name),
-        "describe_message" => comms::handle_describe_message(&home, args, instance_name),
-        "describe_thread" => comms::handle_describe_thread(&home, args),
+        // Sprint 30 PR-4: inbox subsumes describe_message + describe_thread.
+        // Old names kept as aliases for 1-sprint migration window per
+        // operator m-203 #4 (consolidation alias retention pattern).
+        "inbox" | "describe_message" | "describe_thread" => {
+            if args.get("message_id").and_then(|v| v.as_str()).is_some() {
+                comms::handle_describe_message(&home, args, instance_name)
+            } else if args.get("thread_id").and_then(|v| v.as_str()).is_some() {
+                comms::handle_describe_thread(&home, args)
+            } else {
+                comms::handle_inbox(&home, instance_name)
+            }
+        }
 
         // --- Instance management ---
         "list_instances" => instance::handle_list_instances(&home, instance_name),
