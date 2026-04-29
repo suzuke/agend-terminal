@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// Install the process-wide signal handler. Called once per process.
 /// Subsequent calls return an error from `ctrlc::set_handler` (already set);
 /// we log and continue rather than fail hard.
-pub fn install(shutdown: Arc<AtomicBool>, shutdown_tx: crossbeam::channel::Sender<()>) {
+pub fn install(shutdown: Arc<AtomicBool>, shutdown_tx: crossbeam_channel::Sender<()>) {
     // Windows: re-enable CTRL+C delivery in case something (inherited parent
     // state, a dependency's init) has set the per-process "ignore CTRL+C"
     // flag. Without this, `SetConsoleCtrlHandler` routines are skipped

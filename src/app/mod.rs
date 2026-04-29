@@ -106,7 +106,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         .unwrap_or_else(|| home.join("fleet.yaml"));
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let (tui_event_tx, tui_event_rx) = crossbeam::channel::bounded::<TuiEvent>(256);
+    let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
 
     // Preflight via the shared bootstrap seam so `api.cookie` is issued before
     // `api::serve` starts — otherwise `inbox::notify_agent`'s `api::call(INJECT)`
@@ -192,7 +192,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // Counter for auto-dedup agent names
     let mut name_counter: HashMap<String, usize> = HashMap::new();
 
-    let (wakeup_tx, wakeup_rx) = crossbeam::channel::unbounded::<usize>();
+    let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let pane_rows = rows.saturating_sub(4);
@@ -278,7 +278,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let mut last_remote_sync = std::time::Instant::now();
 
     // Crossterm event reader thread
-    let (event_tx, event_rx) = crossbeam::channel::unbounded::<Event>();
+    let (event_tx, event_rx) = crossbeam_channel::unbounded::<Event>();
     std::thread::Builder::new()
         .name("crossterm_events".into())
         .spawn(move || loop {
@@ -294,7 +294,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // Only active in owned (non-attached) mode; when attached, the daemon
     // process handles schedules, CI watches, and health decay.
     let tick_rx = if !attached_mode {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = crossbeam_channel::bounded(1);
         std::thread::Builder::new()
             .name("app_tick".into())
             .spawn(move || loop {
@@ -310,7 +310,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     };
     // Never-ready channel used when attached_mode — select! needs a
     // concrete Receiver but this arm will never fire.
-    let never_rx = crossbeam::channel::never::<()>();
+    let never_rx = crossbeam_channel::never::<()>();
     let tick_rx_ref = tick_rx.as_ref().unwrap_or(&never_rx);
 
     loop {
@@ -411,7 +411,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             }
         })?;
 
-        crossbeam::select! {
+        crossbeam_channel::select! {
             recv(event_rx) -> ev => {
                 let ev = match ev {
                     Ok(e) => e,
@@ -694,7 +694,7 @@ fn pane_from_menu_item(
     home: &Path,
     cols: u16,
     rows: u16,
-    wakeup_tx: &crossbeam::channel::Sender<usize>,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
     name_counter: &mut HashMap<String, usize>,
 ) -> Result<Pane> {
     match item.kind {
@@ -921,7 +921,7 @@ mod tests {
         Pane {
             agent_name: name.to_string(),
             vterm: VTerm::new(10, 10),
-            rx: crossbeam::channel::bounded(1).1,
+            rx: crossbeam_channel::bounded(1).1,
             id: 1,
             backend: None,
             working_dir: None,

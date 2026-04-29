@@ -25,7 +25,7 @@ pub enum PaneSource {
 pub struct Pane {
     pub agent_name: String,
     pub vterm: VTerm,
-    pub rx: crossbeam::channel::Receiver<Vec<u8>>,
+    pub rx: crossbeam_channel::Receiver<Vec<u8>>,
     pub id: usize,
     pub backend: Option<Backend>,
     /// Working directory this pane was spawned in.
@@ -1464,7 +1464,7 @@ mod tests {
             first: Box::new(PaneNode::Leaf(Box::new(Pane {
                 agent_name: "a".to_string(),
                 vterm: VTerm::new(10, 10),
-                rx: crossbeam::channel::bounded(1).1,
+                rx: crossbeam_channel::bounded(1).1,
                 id: 1,
                 backend: None,
                 working_dir: None,
@@ -1480,7 +1480,7 @@ mod tests {
             second: Box::new(PaneNode::Leaf(Box::new(Pane {
                 agent_name: "b".to_string(),
                 vterm: VTerm::new(10, 10),
-                rx: crossbeam::channel::bounded(1).1,
+                rx: crossbeam_channel::bounded(1).1,
                 id: 2,
                 backend: None,
                 working_dir: None,
@@ -1527,7 +1527,7 @@ mod tests {
             PaneNode::Leaf(Box::new(Pane {
                 agent_name: name.to_string(),
                 vterm: VTerm::new(10, 10),
-                rx: crossbeam::channel::bounded(1).1,
+                rx: crossbeam_channel::bounded(1).1,
                 id,
                 backend: None,
                 working_dir: None,
@@ -1591,7 +1591,7 @@ mod tests {
             first: Box::new(PaneNode::Leaf(Box::new(Pane {
                 agent_name: "top".to_string(),
                 vterm: VTerm::new(10, 10),
-                rx: crossbeam::channel::bounded(1).1,
+                rx: crossbeam_channel::bounded(1).1,
                 id: 1,
                 backend: None,
                 working_dir: None,
@@ -1607,7 +1607,7 @@ mod tests {
             second: Box::new(PaneNode::Leaf(Box::new(Pane {
                 agent_name: "bot".to_string(),
                 vterm: VTerm::new(10, 10),
-                rx: crossbeam::channel::bounded(1).1,
+                rx: crossbeam_channel::bounded(1).1,
                 id: 2,
                 backend: None,
                 working_dir: None,
@@ -1642,7 +1642,7 @@ mod tests {
             first: Box::new(PaneNode::Leaf(Box::new(Pane {
                 agent_name: "a".to_string(),
                 vterm: VTerm::new(10, 10),
-                rx: crossbeam::channel::bounded(1).1,
+                rx: crossbeam_channel::bounded(1).1,
                 id: 1,
                 backend: None,
                 working_dir: None,
@@ -1658,7 +1658,7 @@ mod tests {
             second: Box::new(PaneNode::Leaf(Box::new(Pane {
                 agent_name: "b".to_string(),
                 vterm: VTerm::new(10, 10),
-                rx: crossbeam::channel::bounded(1).1,
+                rx: crossbeam_channel::bounded(1).1,
                 id: 2,
                 backend: None,
                 working_dir: None,
@@ -1715,7 +1715,7 @@ mod tests {
         let pane = Pane {
             agent_name: name.to_string(),
             vterm: VTerm::new(10, 10),
-            rx: crossbeam::channel::bounded(1).1,
+            rx: crossbeam_channel::bounded(1).1,
             id,
             backend: None,
             working_dir: None,
@@ -1778,7 +1778,7 @@ mod tests {
         Pane {
             agent_name: name.to_string(),
             vterm: VTerm::new(10, 10),
-            rx: crossbeam::channel::bounded(1).1,
+            rx: crossbeam_channel::bounded(1).1,
             id,
             backend: None,
             working_dir: None,

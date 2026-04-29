@@ -256,7 +256,7 @@ fn run_core(
     // more than a plausible burst — every fleet member crashing at once —
     // and senders use `try_send` so a full channel drops the event with a
     // warning rather than blocking the PTY close handler.
-    let (crash_tx, crash_rx) = crossbeam::channel::bounded::<String>(64);
+    let (crash_tx, crash_rx) = crossbeam_channel::bounded::<String>(64);
 
     // Store configs for respawn
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -299,7 +299,7 @@ fn run_core(
 
     // Shutdown wake channel — signal handler sends on this so the main loop's
     // select! wakes immediately instead of waiting up to 10s for the next tick.
-    let (shutdown_tx, shutdown_rx) = crossbeam::channel::bounded::<()>(1);
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     crate::bootstrap::signals::install(Arc::clone(&shutdown), shutdown_tx);
 
     crate::event_log::log(
@@ -339,7 +339,7 @@ fn run_core(
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
-        let (tx, rx) = crossbeam::channel::bounded(1);
+        let (tx, rx) = crossbeam_channel::bounded(1);
         // fire-and-forget: tick producer terminates when the bounded(1) tx
         // returns Err, which happens when the rx end (held by the main loop)
         // is dropped during daemon shutdown. Self-terminating; no JoinHandle
@@ -367,7 +367,7 @@ fn run_core(
 
         // Block until a crash event, periodic tick, or shutdown signal.
         let crashed_name: Option<String>;
-        crossbeam::select! {
+        crossbeam_channel::select! {
             recv(crash_rx) -> msg => {
                 crashed_name = msg.ok();
             }
@@ -940,7 +940,7 @@ fn spawn_and_register_agent(
     def: &crate::bootstrap::AgentDef,
     registry: &AgentRegistry,
     configs: &Arc<Mutex<HashMap<String, AgentConfig>>>,
-    crash_tx: &crossbeam::channel::Sender<String>,
+    crash_tx: &crossbeam_channel::Sender<String>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let (name, command, args, env, working_dir, submit_key) = def;

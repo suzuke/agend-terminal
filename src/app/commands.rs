@@ -18,7 +18,7 @@ pub(super) struct CommandCtx<'a> {
     pub layout: &'a mut Layout,
     pub registry: &'a AgentRegistry,
     pub home: &'a Path,
-    pub wakeup_tx: &'a crossbeam::channel::Sender<usize>,
+    pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
     pub telegram_state: &'a Option<Arc<dyn crate::channel::Channel>>,
 }

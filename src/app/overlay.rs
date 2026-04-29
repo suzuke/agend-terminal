@@ -157,7 +157,7 @@ pub(super) struct OverlayCtx<'a> {
     pub registry: &'a AgentRegistry,
     pub home: &'a Path,
     pub fleet_path: &'a Path,
-    pub wakeup_tx: &'a crossbeam::channel::Sender<usize>,
+    pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
     pub telegram_state: &'a Option<Arc<dyn crate::channel::Channel>>,
 }
@@ -848,7 +848,7 @@ mod tests {
         let home = std::env::temp_dir().join("overlay_test_help_show");
         std::fs::create_dir_all(&home).ok();
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, _rx) = crossbeam::channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
@@ -872,7 +872,7 @@ mod tests {
         let home = std::env::temp_dir().join("overlay_test_help_esc");
         std::fs::create_dir_all(&home).ok();
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, _rx) = crossbeam::channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
@@ -902,7 +902,7 @@ mod tests {
         let home = std::env::temp_dir().join("overlay_test_help_toggle");
         std::fs::create_dir_all(&home).ok();
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, _rx) = crossbeam::channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
@@ -950,7 +950,7 @@ mod tests {
         home: &'a std::path::Path,
         layout: &'a mut crate::layout::Layout,
         registry: &'a crate::agent::AgentRegistry,
-        tx: &'a crossbeam::channel::Sender<usize>,
+        tx: &'a crossbeam_channel::Sender<usize>,
         name_counter: &'a mut HashMap<String, usize>,
         tg: &'a Option<Arc<dyn crate::channel::Channel>>,
     ) -> OverlayCtx<'a> {
@@ -971,7 +971,7 @@ mod tests {
     fn task_board_l_updates_task_status_and_persists() {
         let home = tmp_home("l_persist");
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, _rx) = crossbeam::channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
@@ -1015,7 +1015,7 @@ mod tests {
         ] {
             let home = tmp_home(&format!("shift_d_{label}"));
             let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-            let (tx, _rx) = crossbeam::channel::unbounded();
+            let (tx, _rx) = crossbeam_channel::unbounded();
             let mut name_counter = HashMap::new();
             let tg: Option<Arc<dyn crate::channel::Channel>> = None;
             let mut layout = crate::layout::Layout::new();
@@ -1054,7 +1054,7 @@ mod tests {
     fn task_board_cursor_resolves_correct_task_index() {
         let home = tmp_home("cursor_resolve");
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, _rx) = crossbeam::channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
@@ -1117,7 +1117,7 @@ mod tests {
         let home = std::env::temp_dir().join("overlay_test_tab_toggle");
         std::fs::create_dir_all(&home).ok();
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, _rx) = crossbeam::channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
@@ -1163,7 +1163,7 @@ mod tests {
         let home = std::env::temp_dir().join("overlay_test_tab_ignore");
         std::fs::create_dir_all(&home).ok();
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, _rx) = crossbeam::channel::unbounded();
+        let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let tg: Option<Arc<dyn crate::channel::Channel>> = None;
         let mut layout = crate::layout::Layout::new();
