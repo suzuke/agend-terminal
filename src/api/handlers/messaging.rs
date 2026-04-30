@@ -194,7 +194,36 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         }
     }
 
-    json!({"ok": true, "delivery_mode": delivery_mode})
+    // B2 boundary: worktree-checkout side-effect pushed from MCP comms to
+    // API SEND. When delegate-task carries a branch param, checkout the
+    // branch in the target's working directory (Sprint 31 task #52).
+    let mut branch_checked_out: Option<&str> = None;
+    if let Some(branch) = params["branch"].as_str().filter(|b| !b.is_empty()) {
+        let fleet_path = ctx.home.join("fleet.yaml");
+        if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {
+            if let Some(resolved) = config.resolve_instance(target) {
+                if let Some(ref wd) = resolved.working_directory {
+                    if crate::worktree::is_git_repo(wd) {
+                        match crate::worktree::checkout_branch(wd, branch) {
+                            Ok(()) => branch_checked_out = Some(branch),
+                            Err(e) => {
+                                tracing::warn!(
+                                    target_name = target, branch, error = %e,
+                                    "task.branch checkout failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut resp = json!({"ok": true, "delivery_mode": delivery_mode});
+    if let Some(branch) = branch_checked_out {
+        resp["branch_checked_out"] = json!(branch);
+    }
+    resp
 }
 
 #[cfg(test)]
@@ -603,6 +632,114 @@ mod tests {
         assert_eq!(
             result["ok"], true,
             "send with provenance params must succeed: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Sprint 40 T-6: worktree-checkout boundary invariant ---
+
+    #[test]
+    fn send_with_branch_param_does_not_panic() {
+        // B2 boundary invariant (safety): branch param in SEND is accepted
+        // without panic even when target has no working directory or is not
+        // a git repo. Checkout is best-effort.
+        let home = tmp_home("branch-safe");
+        setup_team_env(&home, &["sender", "target"], &[]);
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "target",
+                "text": "task with branch",
+                "branch": "feat/test-branch"
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], true,
+            "send with branch param must succeed (checkout best-effort): {result}"
+        );
+        // branch_checked_out absent when target has no working dir
+        assert!(
+            result.get("branch_checked_out").is_none(),
+            "no checkout expected without working dir: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn send_with_branch_non_git_dir_logs_no_panic() {
+        // B2 boundary invariant (order-of-operations): branch checkout
+        // happens AFTER delivery, not before. Even if checkout would fail,
+        // the send itself succeeds.
+        let home = tmp_home("branch-nongit");
+        // Create fleet.yaml with working_directory pointing to a non-git dir
+        std::fs::write(
+            home.join("fleet.yaml"),
+            format!(
+                "instances:\n  sender:\n    backend: claude\n  target:\n    backend: claude\n    working_directory: {}\n",
+                home.join("workspace/target").display()
+            ),
+        )
+        .ok();
+        std::fs::create_dir_all(home.join("workspace/target")).ok();
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "target",
+                "text": "task",
+                "branch": "feat/x"
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], true,
+            "send must succeed even when checkout skipped (non-git): {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn send_with_branch_checkout_failure_logs_warn() {
+        // B2 boundary invariant (observability): when checkout fails,
+        // tracing::warn must fire. Parallel to DESIGN §4 Q4 pattern.
+        let home = tmp_home("branch-fail");
+        let wd = home.join("workspace/target");
+        std::fs::create_dir_all(&wd).ok();
+        // Init a git repo so is_git_repo returns true
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&wd)
+            .output();
+        std::fs::write(
+            home.join("fleet.yaml"),
+            format!(
+                "instances:\n  sender:\n    backend: claude\n  target:\n    backend: claude\n    working_directory: {}\n",
+                wd.display()
+            ),
+        )
+        .ok();
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "target",
+                "text": "task",
+                "branch": "invalid..branch"
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], true,
+            "send must succeed even when checkout fails: {result}"
+        );
+        // Observability pin: warn must fire on checkout failure
+        assert!(
+            logs_contain("task.branch checkout failed"),
+            "B2 observability invariant: warn must fire on checkout failure"
         );
         std::fs::remove_dir_all(&home).ok();
     }
