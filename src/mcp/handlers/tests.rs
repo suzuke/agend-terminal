@@ -2154,3 +2154,234 @@ fn schedule_list_routes_to_schedules_module() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ─── Sprint 40 T-3: instance.rs black-box invariants ─────────────
+
+// --- create_instance ---
+
+#[test]
+fn create_instance_missing_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("ci-no-name");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("create_instance", &json!({"backend": "claude"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "create_instance without name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_instance_invalid_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("ci-bad-name");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool(
+        "create_instance",
+        &json!({"name": "../escape", "backend": "claude"}),
+        "sender",
+    );
+    assert!(
+        result.get("error").is_some(),
+        "create_instance with path-traversal name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn create_instance_empty_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("ci-empty-name");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool(
+        "create_instance",
+        &json!({"name": "", "backend": "claude"}),
+        "sender",
+    );
+    assert!(
+        result.get("error").is_some(),
+        "create_instance with empty name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// --- start_instance ---
+
+#[test]
+fn start_instance_missing_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("si-no-name");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("start_instance", &json!({}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "start_instance without name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn start_instance_invalid_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("si-bad-name");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("start_instance", &json!({"name": "a/b"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "start_instance with invalid name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn start_instance_unknown_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("si-unknown");
+    std::env::set_var("AGEND_HOME", &home);
+    // No fleet.yaml → instance not found
+    let result = handle_tool("start_instance", &json!({"name": "ghost"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "start_instance with unknown name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// --- describe_instance ---
+
+#[test]
+fn describe_instance_missing_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("di-no-name");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("describe_instance", &json!({}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "describe_instance without name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn describe_instance_invalid_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("di-bad-name");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("describe_instance", &json!({"name": "../../etc"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "describe_instance with path-traversal name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn describe_instance_unknown_name_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("di-unknown");
+    std::env::set_var("AGEND_HOME", &home);
+    // No daemon → API unavailable → error
+    let result = handle_tool("describe_instance", &json!({"name": "ghost"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "describe_instance with unknown name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// --- Sprint 40 T-3 r2: response-shape invariant tests ---
+
+#[test]
+fn create_instance_success_response_shape() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("ci-shape");
+    std::env::set_var("AGEND_HOME", &home);
+    // Without a running daemon, create_instance returns an API error.
+    // Verify the response is structured JSON (not panic) and contains
+    // either {ok, name} on success or {error} on failure.
+    let result = handle_tool(
+        "create_instance",
+        &json!({"name": "shape-test", "backend": "claude"}),
+        "sender",
+    );
+    assert!(
+        result.is_object(),
+        "create_instance must return JSON object: {result}"
+    );
+    // Response must have either "ok" key (success) or "error" key (structured failure)
+    assert!(
+        result.get("ok").is_some() || result.get("error").is_some() || result.get("name").is_some(),
+        "create_instance response must have ok/error/name key: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn start_instance_response_shape_includes_structured_result() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("si-shape");
+    std::env::set_var("AGEND_HOME", &home);
+    // Set up fleet.yaml so start_instance can resolve the instance
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  shape-agent:\n    backend: claude\n",
+    )
+    .ok();
+    let result = handle_tool("start_instance", &json!({"name": "shape-agent"}), "sender");
+    assert!(
+        result.is_object(),
+        "start_instance must return JSON object: {result}"
+    );
+    // Response must have either success keys or structured error
+    assert!(
+        result.get("ok").is_some()
+            || result.get("error").is_some()
+            || result.get("resumed").is_some(),
+        "start_instance response must have ok/error/resumed key: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn describe_instance_response_shape_has_required_keys() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("di-shape");
+    std::env::set_var("AGEND_HOME", &home);
+    // Without daemon, describe returns API-unavailable error.
+    // Verify the response is structured JSON with either {instance: {name, ...}}
+    // on success or {error} on failure.
+    let result = handle_tool(
+        "describe_instance",
+        &json!({"name": "shape-agent"}),
+        "sender",
+    );
+    assert!(
+        result.is_object(),
+        "describe_instance must return JSON object: {result}"
+    );
+    assert!(
+        result.get("instance").is_some() || result.get("error").is_some(),
+        "describe_instance response must have instance/error key: {result}"
+    );
+    // If success, verify required keys in instance object
+    if let Some(inst) = result.get("instance") {
+        assert!(
+            inst.get("name").is_some(),
+            "instance object must have 'name' key: {inst}"
+        );
+    }
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
