@@ -251,8 +251,12 @@ impl GitLabCiProvider {
         if let Ok(token) = std::env::var("GITLAB_TOKEN") {
             return Some(token);
         }
-        // Fallback: glab CLI config file.
-        let config_path = dirs::config_dir()?.join("glab-cli").join("config.yml");
+        // Fallback: glab CLI config file at $HOME/.config/glab-cli/config.yml.
+        let home = std::env::var("HOME").ok()?;
+        let config_path = std::path::PathBuf::from(home)
+            .join(".config")
+            .join("glab-cli")
+            .join("config.yml");
         let content = std::fs::read_to_string(config_path).ok()?;
         // glab config stores token as `token: <value>` under hosts.
         for line in content.lines() {
@@ -1972,32 +1976,47 @@ mod tests {
     /// Captured request from mock server: (path, full_request).
     type MockCapture = std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>;
 
-    /// RAII guard that saves/restores GITLAB_TOKEN env var.
+    /// RAII guard that saves/restores GITLAB_TOKEN + HOME env vars.
     /// Also holds a static mutex to serialize env-var-touching tests.
     struct GitlabTokenGuard {
-        prev: Option<std::ffi::OsString>,
+        prev_token: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
     impl GitlabTokenGuard {
         fn clear() -> Self {
             let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("GITLAB_TOKEN");
+            let prev_token = std::env::var_os("GITLAB_TOKEN");
+            let prev_home = std::env::var_os("HOME");
             std::env::remove_var("GITLAB_TOKEN");
-            Self { prev, _lock: lock }
+            Self {
+                prev_token,
+                prev_home,
+                _lock: lock,
+            }
         }
         fn set(val: &str) -> Self {
             let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("GITLAB_TOKEN");
+            let prev_token = std::env::var_os("GITLAB_TOKEN");
+            let prev_home = std::env::var_os("HOME");
             std::env::set_var("GITLAB_TOKEN", val);
-            Self { prev, _lock: lock }
+            Self {
+                prev_token,
+                prev_home,
+                _lock: lock,
+            }
         }
     }
     impl Drop for GitlabTokenGuard {
         fn drop(&mut self) {
-            match &self.prev {
+            match &self.prev_token {
                 Some(v) => std::env::set_var("GITLAB_TOKEN", v),
                 None => std::env::remove_var("GITLAB_TOKEN"),
+            }
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => {} // don't remove HOME
             }
         }
     }
@@ -2175,5 +2194,46 @@ mod tests {
                 || request.contains("PRIVATE-TOKEN: test-token-123"),
             "must send PRIVATE-TOKEN header: {request}"
         );
+    }
+
+    /// B4 state 2: env absent + glab CLI config present → token from config.
+    #[test]
+    fn gitlab_auth_glab_config_fallback_sends_private_token_header() {
+        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+
+        // Guard serializes + saves/restores GITLAB_TOKEN + HOME.
+        let mut guard = GitlabTokenGuard::clear();
+        // Setup temp HOME with glab config.
+        let temp = std::env::temp_dir().join(format!("agend-glab-test-{}", std::process::id()));
+        let glab_dir = temp.join(".config").join("glab-cli");
+        std::fs::create_dir_all(&glab_dir).ok();
+        std::fs::write(
+            glab_dir.join("config.yml"),
+            "hosts:\n  gitlab.com:\n    token: glab_config_token_abc\n",
+        )
+        .expect("write glab config");
+        // Override HOME so resolve_token finds the temp config.
+        guard.prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &temp);
+
+        let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let _ = rt.block_on(provider.poll_runs("foo/bar", "main"));
+        handle.join().expect("mock");
+
+        let (_, request) = captured.lock().expect("lock").take().expect("captured");
+        assert!(
+            request.contains("private-token: glab_config_token_abc")
+                || request.contains("PRIVATE-TOKEN: glab_config_token_abc"),
+            "must send PRIVATE-TOKEN from glab config: {request}"
+        );
+
+        std::fs::remove_dir_all(&temp).ok();
+        // guard drop restores HOME + GITLAB_TOKEN
     }
 }
