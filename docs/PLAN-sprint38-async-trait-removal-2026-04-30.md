@@ -236,6 +236,22 @@ If operator picks C: this plan PR closes; IMPL wave is null (status quo).
 
 ---
 
+## 9.1 Operator decision (recorded 2026-04-30 per general m-20260430020753092663-103)
+
+**Decision**: **Option C (status quo)** — keep `async-trait` + `trait CiProvider` + `Box<dyn>`.
+
+**Reason**: Operator answered §13 #2 — closed-world commitment **NO**. Future GitLab/Bitbucket provider extension is concretely planned, not speculative. Per §7 conditional framing, "if no → C": Option A would itself be a bridge (since the trait would need re-introducing for new providers), making C the smaller-blast-radius choice that preserves PR-AD's deliberate runtime-extensibility intent.
+
+Operator explicitly accepted reviewer (codex) prior-art DISSENT and overrode their own "永久解" framing on this case — the chosen path is "preserve architecture intent + revisit when Rust native dyn-async stabilizes".
+
+**Trigger for revisit**: Rust `async_fn_in_dyn_trait` stabilization (tracking issue rust-lang/rust#133119, currently experimental).
+
+**No IMPL wave dispatched.** This plan PR itself is the deliverable — it records the trade-off analysis + decision + future trigger. async-trait audit item from Sprint 36 marked **deferred-permanent until Rust dyn-async stable**.
+
+**Process retrospective note**: this decision validates the PLAN-first 4-perspective process. operator initially preferred Option A, lead's PR-D close framing was over-conservative, dev recommended A, reviewer dissented to C — surfacing the dissent honestly let operator weigh trade-offs and reverse to C when Q3 (closed-world) couldn't be committed. Avoiding paper-over preserved decision quality.
+
+---
+
 ## 10. Cross-references
 
 - general m-20260430015658047285-86 (operator pushback + Sprint 38 scope)
