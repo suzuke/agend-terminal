@@ -393,3 +393,137 @@ fn restore_node_reconciled(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{Pane, PaneSource};
+    use crate::vterm::VTerm;
+
+    fn test_pane(id: usize, agent: &str, fleet_name: Option<&str>) -> Pane {
+        Pane {
+            agent_name: agent.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: fleet_name.map(String::from),
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    fn tmp_home(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agend-session-test-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn save_session_writes_valid_json() {
+        let home = tmp_home("save-json");
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new(
+            "tab1".to_string(),
+            test_pane(1, "dev", Some("dev-abc")),
+        ));
+        save_session(&home, &layout);
+
+        let path = home.join("session.json");
+        assert!(path.exists(), "session.json must be written");
+        let content = std::fs::read_to_string(&path).expect("read session.json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("session.json must be valid JSON");
+        assert!(parsed["tabs"].is_array());
+        assert_eq!(parsed["tabs"].as_array().expect("tabs").len(), 1);
+        assert_eq!(parsed["active_tab"], 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn save_node_preserves_fleet_instance_name() {
+        let pane = test_pane(1, "dev", Some("dev-x1y2"));
+        let node = PaneNode::Leaf(Box::new(pane));
+        let saved = save_node(&node);
+        match saved {
+            SessionNode::Leaf(sp) => {
+                assert_eq!(sp.fleet_instance_name, Some("dev-x1y2".to_string()));
+            }
+            _ => panic!("expected Leaf"),
+        }
+    }
+
+    #[test]
+    fn save_node_preserves_split_structure() {
+        let left = test_pane(1, "a", Some("a-1"));
+        let right = test_pane(2, "b", Some("b-1"));
+        let node = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.6,
+            first: Box::new(PaneNode::Leaf(Box::new(left))),
+            second: Box::new(PaneNode::Leaf(Box::new(right))),
+        };
+        let saved = save_node(&node);
+        match saved {
+            SessionNode::Split {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                assert_eq!(dir, SplitDir::Vertical);
+                assert!((ratio - 0.6).abs() < 0.01);
+                assert!(matches!(*first, SessionNode::Leaf(_)));
+                assert!(matches!(*second, SessionNode::Leaf(_)));
+            }
+            _ => panic!("expected Split"),
+        }
+    }
+
+    #[test]
+    fn save_restore_roundtrip_json_shape() {
+        // Save → read JSON → deserialise → verify structural equivalence
+        let home = tmp_home("roundtrip");
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new(
+            "main".to_string(),
+            test_pane(1, "dev", Some("dev-rt")),
+        ));
+        layout.active = 0;
+        save_session(&home, &layout);
+
+        let content =
+            std::fs::read_to_string(home.join("session.json")).expect("read session.json");
+        let session: Session = serde_json::from_str(&content).expect("deserialise session");
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.tabs[0].name, "main");
+        assert_eq!(session.active_tab, 0);
+        match &session.tabs[0].root {
+            SessionNode::Leaf(sp) => {
+                assert_eq!(sp.fleet_instance_name, Some("dev-rt".to_string()));
+            }
+            _ => panic!("expected Leaf root"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn save_session_empty_layout_writes_empty_tabs() {
+        let home = tmp_home("empty");
+        let layout = Layout::new();
+        save_session(&home, &layout);
+
+        let content =
+            std::fs::read_to_string(home.join("session.json")).expect("read session.json");
+        let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
+        assert_eq!(parsed["tabs"].as_array().expect("tabs").len(), 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
