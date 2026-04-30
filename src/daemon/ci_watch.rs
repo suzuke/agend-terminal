@@ -19,6 +19,7 @@ pub struct CiRun {
 }
 
 /// Result of polling CI runs for a branch.
+#[derive(Debug)]
 pub enum CiPollResult {
     /// Runs retrieved successfully (may be empty).
     Runs(Vec<CiRun>),
@@ -33,6 +34,7 @@ pub enum CiPollResult {
 }
 
 /// PR terminal-state check result.
+#[derive(Debug)]
 pub enum PrState {
     /// PR reached terminal state (closed or merged).
     Terminal { merged: bool },
@@ -211,6 +213,193 @@ impl CiProvider for GitHubCiProvider {
 
     fn token_warning(&self) -> Option<&'static str> {
         github_token_warning(std::env::var("GITHUB_TOKEN").ok().as_deref())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GitLab CI provider
+// ---------------------------------------------------------------------------
+
+/// GitLab Pipelines implementation of [`CiProvider`].
+pub struct GitLabCiProvider {
+    client: reqwest::Client,
+    /// Base URL for GitLab API (self-hosted support).
+    /// Defaults to `https://gitlab.com`.
+    base_url: String,
+}
+
+impl GitLabCiProvider {
+    pub fn new() -> anyhow::Result<Self> {
+        Self::with_base_url("https://gitlab.com".to_string())
+    }
+
+    pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
+            base_url,
+        })
+    }
+
+    /// Resolve GitLab auth token via fallback chain:
+    /// 1. GITLAB_TOKEN env var
+    /// 2. glab CLI config (~/.config/glab-cli/config.yml)
+    fn resolve_token() -> Option<String> {
+        if let Ok(token) = std::env::var("GITLAB_TOKEN") {
+            return Some(token);
+        }
+        // Fallback: glab CLI config file.
+        let config_path = dirs::config_dir()?.join("glab-cli").join("config.yml");
+        let content = std::fs::read_to_string(config_path).ok()?;
+        // glab config stores token as `token: <value>` under hosts.
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(token) = trimmed.strip_prefix("token:") {
+                let token = token.trim().to_string();
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
+        }
+        None
+    }
+
+    fn gl_get(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}/api/v4/{path}", self.base_url);
+        let mut req = self.client.get(&url).header("User-Agent", "agend-terminal");
+        if let Some(token) = Self::resolve_token() {
+            req = req.header("PRIVATE-TOKEN", token);
+        }
+        req
+    }
+
+    /// URL-encode a `owner/repo` path for GitLab project ID.
+    fn encode_project(repo: &str) -> String {
+        repo.replace('/', "%2F")
+    }
+}
+
+#[async_trait::async_trait]
+impl CiProvider for GitLabCiProvider {
+    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
+        let project = Self::encode_project(repo);
+        let resp = self
+            .gl_get(&format!(
+                "projects/{project}/pipelines?ref={branch}&per_page=5"
+            ))
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let rate_limit_reset = resp
+            .headers()
+            .get("ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let body: serde_json::Value = resp.json().await?;
+
+        if !(200..300).contains(&status) {
+            let message = body["message"]
+                .as_str()
+                .or_else(|| body["error"].as_str())
+                .unwrap_or("(no message)")
+                .to_string();
+            return Ok(CiPollResult::ApiError {
+                status,
+                message: format!("GitLab API {status}: {message}"),
+                rate_limit_reset,
+            });
+        }
+
+        let runs = body
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let gl_status = r["status"].as_str()?;
+                        let conclusion = match gl_status {
+                            "success" => Some("success".to_string()),
+                            "failed" => Some("failure".to_string()),
+                            "canceled" => Some("cancelled".to_string()),
+                            _ => None, // running/pending/etc → in-progress
+                        };
+                        Some(CiRun {
+                            id: r["id"].as_u64()?,
+                            conclusion,
+                            head_sha: r["sha"].as_str()?.to_string(),
+                            url: r["web_url"].as_str().unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(CiPollResult::Runs(runs))
+    }
+
+    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
+        let project = Self::encode_project(repo);
+        let resp: serde_json::Value = match self
+            .gl_get(&format!(
+                "projects/{project}/merge_requests?source_branch={branch}&state=all&per_page=1"
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return PrState::Unknown,
+            },
+            Err(_) => return PrState::Unknown,
+        };
+        match resp.as_array().and_then(|a| a.first()) {
+            Some(mr) => match mr["state"].as_str() {
+                Some("merged") => PrState::Terminal { merged: true },
+                Some("closed") => PrState::Terminal { merged: false },
+                Some("opened") => PrState::Open,
+                _ => PrState::Unknown,
+            },
+            None => PrState::Unknown,
+        }
+    }
+
+    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
+        let project = Self::encode_project(repo);
+        let jobs_resp: serde_json::Value = match self
+            .gl_get(&format!(
+                "projects/{project}/pipelines/{run_id}/jobs?per_page=20"
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return "unknown job".to_string(),
+            },
+            Err(_) => return "unknown job".to_string(),
+        };
+        jobs_resp
+            .as_array()
+            .and_then(|jobs| {
+                jobs.iter().find_map(|job| {
+                    (job["status"].as_str() == Some("failed")).then(|| {
+                        format!(
+                            "{} / {}",
+                            job["stage"].as_str().unwrap_or("?"),
+                            job["name"].as_str().unwrap_or("?")
+                        )
+                    })
+                })
+            })
+            .unwrap_or_else(|| "unknown job".to_string())
+    }
+
+    fn token_warning(&self) -> Option<&'static str> {
+        if Self::resolve_token().is_some() {
+            None
+        } else {
+            Some("GITLAB_TOKEN not set and glab CLI config not found — API calls may be rate-limited or fail for private repos")
+        }
     }
 }
 
@@ -1740,5 +1929,138 @@ mod tests {
         check_ci_watches(&dir, &registry);
         assert!(watch_path.exists(), "backoff watch must be preserved");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── GitLab CiProvider tests (Sprint 39 PR-1) ────────────────────
+
+    /// Helper: mock HTTP server for GitLab tests. Reuses Sprint 32
+    /// raw TCP listener pattern.
+    fn gitlab_mock_server(
+        response_body: &str,
+    ) -> (
+        u16,
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_clone = captured.clone();
+        let body = response_body.to_string();
+
+        // fire-and-forget: test mock server thread
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).expect("read");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let path = request
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_string();
+            *captured_clone.lock().expect("lock") = Some(path);
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).expect("write");
+        });
+
+        (port, handle, captured)
+    }
+
+    /// §3.5.10 production-path-coupled: GitLabCiProvider::poll_runs
+    /// against mock server with spec-quoted fixture.
+    #[test]
+    fn gitlab_poll_runs_parses_pipelines() {
+        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+
+        let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let result = rt.block_on(provider.poll_runs("foo/bar", "main"));
+
+        handle.join().expect("mock");
+        let path = captured.lock().expect("lock").take().expect("path");
+        assert!(
+            path.contains("/projects/foo%2Fbar/pipelines"),
+            "path must target pipelines: {path}"
+        );
+
+        let runs = match result.expect("poll_runs") {
+            super::CiPollResult::Runs(r) => r,
+            other => panic!("expected Runs, got: {other:?}"),
+        };
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, 47);
+        assert_eq!(runs[0].conclusion, Some("success".to_string()));
+        assert_eq!(runs[1].conclusion, Some("failure".to_string()));
+    }
+
+    /// §3.5.10: GitLabCiProvider::check_pr_terminal parses MR state.
+    #[test]
+    fn gitlab_check_pr_terminal_merged() {
+        let fixture = include_str!("../../tests/fixtures/gitlab-merge-requests-response.json");
+        let (port, handle, _) = gitlab_mock_server(fixture);
+
+        let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let state = rt.block_on(provider.check_pr_terminal("foo/bar", "feat/test"));
+
+        handle.join().expect("mock");
+        assert!(
+            matches!(state, super::PrState::Terminal { merged: true }),
+            "expected Terminal(merged), got: {state:?}"
+        );
+    }
+
+    /// §3.5.10: GitLabCiProvider::fetch_failure_summary finds failed job.
+    #[test]
+    fn gitlab_fetch_failure_summary_finds_failed_job() {
+        let fixture = include_str!("../../tests/fixtures/gitlab-jobs-response.json");
+        let (port, handle, _) = gitlab_mock_server(fixture);
+
+        let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 48));
+
+        handle.join().expect("mock");
+        assert_eq!(summary, "test / cargo-test");
+    }
+
+    /// Auth fallback: token_warning returns warning when no token found.
+    #[test]
+    fn gitlab_token_warning_when_no_token() {
+        // Ensure GITLAB_TOKEN is not set for this test.
+        std::env::remove_var("GITLAB_TOKEN");
+        let provider = super::GitLabCiProvider::new().expect("provider");
+        let warning = provider.token_warning();
+        assert!(warning.is_some(), "should warn when no token");
+        assert!(
+            warning.expect("w").contains("GITLAB_TOKEN"),
+            "warning must mention GITLAB_TOKEN"
+        );
     }
 }
