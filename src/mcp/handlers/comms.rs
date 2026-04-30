@@ -162,6 +162,17 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         Err(e) => return json!({"error": e}),
     };
     let target = resolved_target.as_str();
+    // M5: reject if team-orchestrator resolution collapsed target to sender.
+    // Only fires when resolution actually changed the target (raw_target !=
+    // resolved_target), so plain self-sends still hit the API-layer check
+    // with its own error message.
+    if *sender == target && raw_target != target {
+        return json!({"error": format!(
+            "task target '{}' resolved to sender '{}' (team orchestrator loop) \
+             — verify target_instance name does not collide with a team template name",
+            raw_target, sender.as_str()
+        )});
+    }
     let task = match args["task"].as_str() {
         Some(t) => t,
         None => return json!({"error": "missing 'task'"}),
