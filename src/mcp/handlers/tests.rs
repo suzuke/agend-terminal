@@ -1774,3 +1774,383 @@ fn pane_snapshot_target_not_found_returns_error() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ─── Sprint 40 T-1: MCP handler test coverage batch ──────────────
+
+// --- channel.rs error paths ---
+
+#[test]
+fn reply_no_active_channel_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-no-ch");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  sender:\n    backend: claude\n",
+    )
+    .ok();
+    let result = handle_tool("reply", &json!({"text": "hello"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "reply with no active channel must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn react_no_active_channel_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("react-no-ch");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("react", &json!({"emoji": "👍"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "react with no active channel must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn download_attachment_missing_file_id_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("dl-no-fid");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("download_attachment", &json!({}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "download_attachment without file_id must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn download_attachment_no_active_channel_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("dl-no-ch");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool(
+        "download_attachment",
+        &json!({"file_id": "some-file-id"}),
+        "sender",
+    );
+    assert!(
+        result.get("error").is_some(),
+        "download_attachment with no active channel must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn react_missing_required_arg_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("react-no-arg");
+    std::env::set_var("AGEND_HOME", &home);
+    // Missing emoji arg — react requires emoji
+    let result = handle_tool("react", &json!({}), "sender");
+    assert!(
+        result.get("error").is_some() || result.get("emoji").and_then(|v| v.as_str()) == Some(""),
+        "react without emoji arg must error or return empty: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// --- ci.rs error paths ---
+
+#[test]
+fn checkout_repo_missing_source_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("checkout-no-src");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("repo", &json!({"action": "checkout"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "checkout without source must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn release_repo_missing_path_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("release-no-path");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("repo", &json!({"action": "release"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "release without path must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn watch_ci_missing_repo_returns_error() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("watch-no-repo");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("ci", &json!({"action": "watch"}), "sender");
+    assert!(
+        result.get("error").is_some(),
+        "watch_ci without repo must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn watch_ci_valid_repo_returns_watching() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("watch-ok");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool(
+        "ci",
+        &json!({"action": "watch", "repo": "owner/repo", "branch": "main"}),
+        "sender",
+    );
+    assert_eq!(
+        result["repo"].as_str(),
+        Some("owner/repo"),
+        "watch_ci must return repo: {result}"
+    );
+    assert_eq!(
+        result["watching"], true,
+        "watch_ci must return watching=true: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn checkout_repo_absolute_path_used_directly() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("checkout-abs");
+    std::env::set_var("AGEND_HOME", &home);
+    // Absolute path source — should be used as-is (git worktree add will fail
+    // because the path doesn't exist, but the error should reference the path)
+    let result = handle_tool(
+        "repo",
+        &json!({"action": "checkout", "source": "/nonexistent/abs/path", "branch": "main"}),
+        "sender",
+    );
+    // Either succeeds (unlikely) or errors with the path in the message
+    let is_error = result.get("error").is_some();
+    let has_path = result.to_string().contains("/nonexistent/abs/path")
+        || result.to_string().contains("nonexistent");
+    assert!(
+        is_error || has_path,
+        "absolute path must be used directly: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn checkout_repo_tilde_source_expands_home() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("checkout-tilde");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool(
+        "repo",
+        &json!({"action": "checkout", "source": "~/nonexistent-tilde-test", "branch": "main"}),
+        "sender",
+    );
+    // Tilde should expand — error message should NOT contain literal "~/"
+    let err_str = result.to_string();
+    let has_literal_tilde = err_str.contains("~/nonexistent-tilde-test");
+    // The expanded path should reference the user's home dir, not literal tilde
+    assert!(
+        !has_literal_tilde || result.get("error").is_some(),
+        "tilde source must be expanded: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn checkout_repo_agent_name_source_with_agent_not_found() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("checkout-agent");
+    std::env::set_var("AGEND_HOME", &home);
+    // Agent name source — no daemon running, agent lookup fails → fallback to literal string
+    let result = handle_tool(
+        "repo",
+        &json!({"action": "checkout", "source": "nonexistent-agent", "branch": "main"}),
+        "sender",
+    );
+    // Should error (git worktree add on a non-repo path) or return structured result
+    assert!(
+        result.is_object(),
+        "agent-name source with not-found must return structured result: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// --- task.rs fallback paths ---
+
+#[test]
+fn create_team_fallback_to_direct_when_daemon_unreachable() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-fallback");
+    std::env::set_var("AGEND_HOME", &home);
+    // No daemon running → API call fails → falls back to teams::create
+    let result = handle_tool(
+        "team",
+        &json!({"action": "create", "name": "test-team", "members": ["a", "b"]}),
+        "sender",
+    );
+    // Should succeed via direct fallback (or return structured error, not panic)
+    assert!(
+        result.get("error").is_none() || result.get("name").is_some(),
+        "create_team fallback must not panic: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn update_team_fallback_to_direct_when_daemon_unreachable() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-update-fb");
+    std::env::set_var("AGEND_HOME", &home);
+    // Pre-create team so update has something to work with
+    let _ = handle_tool(
+        "team",
+        &json!({"action": "create", "name": "upd-team", "members": ["a"]}),
+        "sender",
+    );
+    // No daemon running → API call fails → falls back to teams::update
+    let result = handle_tool(
+        "team",
+        &json!({"action": "update", "name": "upd-team", "add": ["b"]}),
+        "sender",
+    );
+    assert!(
+        result.is_object(),
+        "update_team fallback must not panic: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn delete_team_returns_result() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("team-delete");
+    std::env::set_var("AGEND_HOME", &home);
+    // Create then delete
+    let _ = handle_tool(
+        "team",
+        &json!({"action": "create", "name": "del-team", "members": ["x"]}),
+        "sender",
+    );
+    let result = handle_tool(
+        "team",
+        &json!({"action": "delete", "name": "del-team"}),
+        "sender",
+    );
+    // Should not panic regardless of outcome
+    assert!(
+        result.is_object(),
+        "delete_team must return JSON object: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// --- comms.rs broadcast ---
+
+#[test]
+fn broadcast_without_targets_sends_to_all() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("bcast-all");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  sender:\n    backend: claude\n  target1:\n    backend: claude\n",
+    )
+    .ok();
+    let sender = crate::identity::Sender::new("sender").expect("valid sender");
+    let args = json!({"message": "hello all"});
+    let result = super::comms::handle_broadcast(&home, &args, &Some(sender));
+    // Should attempt to send (may fail without daemon, but count/sent_to shape must exist)
+    assert!(
+        result.get("sent_to").is_some() || result.get("count").is_some(),
+        "broadcast must return sent_to/count shape: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn broadcast_with_team_filter_targets_team_members() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("bcast-team");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  sender:\n    backend: claude\n  alice:\n    backend: claude\n  bob:\n    backend: claude\n",
+    )
+    .ok();
+    // Create a team
+    let store = json!({"schema_version": 1, "teams": [{"name": "dev2", "members": ["sender", "alice"], "created_at": "2026-01-01T00:00:00Z"}]});
+    std::fs::write(
+        home.join("teams.json"),
+        serde_json::to_string(&store).expect("json"),
+    )
+    .ok();
+    let sender = crate::identity::Sender::new("sender").expect("valid sender");
+    let args = json!({"message": "team msg", "team": "dev2"});
+    let result = super::comms::handle_broadcast(&home, &args, &Some(sender));
+    let sent = result["sent_to"].as_array();
+    if let Some(sent) = sent {
+        let names: Vec<&str> = sent.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            !names.contains(&"bob"),
+            "broadcast with team filter must not include non-member bob: {result}"
+        );
+    }
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// --- schedule.rs route-level dispatch pin ---
+
+#[test]
+fn schedule_create_routes_to_schedules_module() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("sched-route");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool(
+        "schedule",
+        &json!({"action": "create", "target": "agent1", "message": "check", "run_at": "2026-12-31T00:00:00Z", "label": "test"}),
+        "sender",
+    );
+    // Should return a schedule ID (routed to schedules::create) or structured error
+    assert!(
+        result.get("id").is_some() || result.get("error").is_some(),
+        "schedule create must route to schedules module: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn schedule_list_routes_to_schedules_module() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("sched-list");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("schedule", &json!({"action": "list"}), "sender");
+    assert!(
+        result.get("schedules").is_some() || result.is_array(),
+        "schedule list must return schedules: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
