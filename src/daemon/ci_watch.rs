@@ -2014,9 +2014,8 @@ mod tests {
                 Some(v) => std::env::set_var("GITLAB_TOKEN", v),
                 None => std::env::remove_var("GITLAB_TOKEN"),
             }
-            match &self.prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => {} // don't remove HOME
+            if let Some(v) = &self.prev_home {
+                std::env::set_var("HOME", v);
             }
         }
     }
