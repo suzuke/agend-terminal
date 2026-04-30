@@ -98,15 +98,7 @@ pub(super) fn handle_send_to_instance(
         }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
-            // Validate target exists in fleet.yaml before fallback delivery.
-            let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
-                .ok()
-                .map(|c| c.instances.contains_key(target))
-                .unwrap_or(false);
-            if !in_fleet {
-                return json!({"error": format!("target instance '{target}' not found (API unavailable: {e})")});
-            }
-            // Resolve thread inheritance for direct delivery
+            // Centralised fallback (Sprint 40 T-7 B4)
             let mut resolved_thread = thread_id.map(String::from);
             let resolved_parent = parent_id.map(String::from);
             if resolved_thread.is_none() {
@@ -136,14 +128,7 @@ pub(super) fn handle_send_to_instance(
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
             };
-            let _ = crate::inbox::enqueue(home, target, msg);
-            crate::inbox::notify_agent(
-                home,
-                target,
-                &crate::inbox::NotifySource::Agent(sender.as_str()),
-                text,
-            );
-            json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable, sent direct: {e}")})
+            crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
     };
     // Warn if kind=report without parent_id
@@ -281,14 +266,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
-            // Fallback: direct delivery with task_id
-            let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
-                .ok()
-                .map(|c| c.instances.contains_key(target))
-                .unwrap_or(false);
-            if !in_fleet {
-                return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {e})")});
-            }
+            // Centralised fallback (Sprint 40 T-7 B4)
             let inbox_msg = crate::inbox::InboxMessage {
                 schema_version: 0,
                 id: None,
@@ -311,14 +289,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
             };
-            let _ = crate::inbox::enqueue(home, target, inbox_msg);
-            crate::inbox::notify_agent(
-                home,
-                target,
-                &crate::inbox::NotifySource::Agent(sender.as_str()),
-                &msg,
-            );
-            json!({"target": target, "note": format!("API unavailable: {e}")})
+            crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
     };
     if is_ok_result(&result) {
@@ -408,6 +379,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
             Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
             Err(e) => {
+                // Centralised fallback (Sprint 40 T-7 B4)
                 let inbox_msg = crate::inbox::InboxMessage {
                     schema_version: 0,
                     id: None,
@@ -428,14 +400,14 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
                 };
-                let _ = crate::inbox::enqueue(home, target, inbox_msg);
-                crate::inbox::notify_agent(
+                crate::agent_ops::fallback_deliver(
                     home,
+                    sender.as_str(),
                     target,
-                    &crate::inbox::NotifySource::Agent(sender.as_str()),
                     &msg,
-                );
-                json!({"target": target, "note": format!("API unavailable: {e}")})
+                    inbox_msg,
+                    &e,
+                )
             }
         }
     };

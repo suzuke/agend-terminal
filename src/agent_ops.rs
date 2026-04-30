@@ -18,6 +18,29 @@ use std::path::Path;
 // Messaging
 // ---------------------------------------------------------------------------
 
+/// Centralised daemon-unavailable fallback: validate target in fleet.yaml,
+/// enqueue inbox message, notify agent. Returns fallback JSON response.
+/// Extracted from 3 duplicated sites in comms.rs (Sprint 40 T-7 B4).
+pub fn fallback_deliver(
+    home: &Path,
+    from: &str,
+    target: &str,
+    text: &str,
+    msg: crate::inbox::InboxMessage,
+    api_error: &anyhow::Error,
+) -> Value {
+    let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+        .ok()
+        .map(|c| c.instances.contains_key(target))
+        .unwrap_or(false);
+    if !in_fleet {
+        return json!({"error": format!("target instance '{target}' not found in fleet.yaml (API unavailable: {api_error})")});
+    }
+    let _ = crate::inbox::enqueue(home, target, msg);
+    crate::inbox::notify_agent(home, target, &crate::inbox::NotifySource::Agent(from), text);
+    json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {api_error}")})
+}
+
 /// Send a message to a target instance via API, falling back to direct
 /// inbox delivery when the daemon is unreachable.
 ///
@@ -39,8 +62,6 @@ pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str)
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
             // Validate target exists in fleet.yaml before writing to inbox.
-            // Without this, daemon-down + ghost target silently creates an
-            // unread inbox file — the exact silent-failure this PR eliminates.
             let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
                 .ok()
                 .map(|c| c.instances.contains_key(target))
