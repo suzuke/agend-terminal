@@ -220,6 +220,30 @@ Per §3.5.10 production-path-coupled fixture: every PR's CI matrix automatically
 
 ---
 
+## 11. Operator-proxy decisions (recorded 2026-04-30 per general m-20260430022206205445-129)
+
+operator stepped away "全權處理"; general (operator surrogate) decided all 6 §13 remaining items per lead synthesis recommendations + reviewer dissent integration. Audit log: general m-20260430022206205445-129 timestamps 2026-04-30 02:22; no deviation from lead recommendations; general takes responsibility for unanticipated cost; operator may retrospective on return.
+
+| §13 # | Decision | Rationale |
+|---|---|---|
+| 1 (Bitbucket variant) | **Cloud-first MVP** (adopts reviewer P4/P5 dissent) | Bitbucket Cloud REST 2.0 ≠ Server REST 1.0 = two independent APIs; bundling = "半吊子"; Server defer Sprint 41+ pending operator self-host need. PR-2 LOC ~350 → ~250. |
+| 2 (Auto-detect) | **Default + warning enhancement** (compromise — not full reviewer dissent) | Default still auto-detect from git remote; **but** non-standard host (not github.com/gitlab.com/bitbucket.org/bitbucket.com) → daemon log warn "自訂 host pattern detected, suggest setting fleet.yaml `ci_provider: <kind>` explicitly". Adversarial fixture must include self-hosted custom-domain remote + verify warning fires. Catches reviewer's misclassification concern + preserves operator user-onboarding default. |
+| 3 (CLI fallback timing) | **PR-1 ships gh + glab; PR-2 ships bb** (per-provider cohesion) | Not deferred to PR-3 (low cohesion); each provider independently testable with its own fallback chain. |
+| 4 (Verification Plan §6 signoff) | **Accept as-is** | operator absent for deep review; matrix design accepted; impl-time gaps surfaced by dev get back-filled into §6. |
+| 5 (Tier classification) | **Tier-1 all 3 PRs** | Reviewer P1 confirmed: pure impl of existing trait, no architecture change, no Discord-style novelty. Single-reviewer suffices. |
+| 6 (IMPL dispatch ownership) | **dev (kiro) all 3 PRs** | Continuity / context accumulation; dev2 reserved for Sprint 40 Group 1 MCP cleanup. |
+
+### §3.5.13 mandate carried forward
+Per PR #343 amendment + Sprint 35-37 lessons: orchestrator pre-dispatch verification of dev's push-notification scope claims is required during Sprint 39 IMPL wave. Each PR push will be verified against scope dispatch before review dispatched (preventing PR-B r1 claim-mislabel pattern).
+
+### Cross-team review authorization (if needed)
+If any PR-1/2/3 needs cross-vantage reviewer (reviewer2), dispatch must carry operator authorization line: "Operator-proxy authorized cross-team review per general m-20260430022206205445-129". Same precedent pattern as Sprint 35 PR #333 / Sprint 36 PR-A.
+
+### Updated PR-2 scope (per §13 #1)
+PR-2 scope reduced to Bitbucket Cloud only (~250 LOC, was ~350). Bitbucket Server impl deferred to Sprint 41+ as a separate PR when operator confirms self-hosted instance access. PR-2 explicit `ci_provider: bitbucket_cloud` enum value (not bare `bitbucket`) — `bitbucket_server` rejected with operator-actionable error message saying "Bitbucket Server not yet supported; track Sprint 41+ candidate".
+
+---
+
 ## 10. Cross-references
 
 - general m-20260430021257912735-108 (operator scope)
