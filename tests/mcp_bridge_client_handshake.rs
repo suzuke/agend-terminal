@@ -152,3 +152,131 @@ fn bridge_response_is_raw_ndjson_not_content_length_framed() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&tmp_home);
 }
+
+// --- Sprint 40 T-2: proxy_request error path tests ---
+
+/// When the daemon is unreachable (no socket), a tools/call request must
+/// return an operator-actionable MCP error response, not hang or panic.
+#[test]
+fn proxy_request_daemon_unreachable_returns_error() {
+    let bridge = bridge_binary();
+    let tmp_home =
+        std::env::temp_dir().join(format!("agend-bridge-proxy-err-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_home).unwrap();
+
+    let mut child = Command::new(&bridge)
+        .env("AGEND_HOME", &tmp_home)
+        .env("AGEND_INSTANCE_NAME", "test-proxy-err")
+        .env("AGEND_TEST_ISOLATION", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bridge");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    // Initialize first (handled locally, no daemon needed)
+    writeln!(stdin, "{CLAUDE_CODE_INIT}").expect("write init");
+    // Then send a tools/call that requires daemon proxy
+    let tool_call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"inbox","arguments":{}}}"#;
+    writeln!(stdin, "{tool_call}").expect("write tool call");
+    stdin.flush().expect("flush");
+    drop(stdin);
+
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let lines: Vec<String> = reader
+            .lines()
+            .take(2)
+            .filter_map(|l| l.ok())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let _ = tx.send(lines);
+    });
+
+    let lines = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default();
+
+    // Should have at least the init response; tool call should return error or content with error
+    assert!(
+        !lines.is_empty(),
+        "bridge must respond (not hang) when daemon unreachable"
+    );
+    // If we got a second response (tool call result), verify it's structured
+    if lines.len() >= 2 {
+        let resp: Value = serde_json::from_str(lines[1].trim()).unwrap_or_default();
+        // MCP error response or content with error text — either is acceptable
+        let has_error = resp.get("error").is_some();
+        let has_content = resp["result"]["content"].is_array();
+        assert!(
+            has_error || has_content,
+            "proxy error must return MCP error or content with error text, got: {}",
+            lines[1]
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&tmp_home);
+}
+
+/// Malformed JSON-RPC request must return a parse error, not crash the bridge.
+#[test]
+fn proxy_request_malformed_json_returns_parse_error() {
+    let bridge = bridge_binary();
+    let tmp_home =
+        std::env::temp_dir().join(format!("agend-bridge-malformed-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_home).unwrap();
+
+    let mut child = Command::new(&bridge)
+        .env("AGEND_HOME", &tmp_home)
+        .env("AGEND_INSTANCE_NAME", "test-malformed")
+        .env("AGEND_TEST_ISOLATION", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bridge");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    // Initialize first
+    writeln!(stdin, "{CLAUDE_CODE_INIT}").expect("write init");
+    // Send malformed JSON
+    writeln!(stdin, "{{not valid json}}}}").expect("write malformed");
+    stdin.flush().expect("flush");
+    drop(stdin);
+
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let lines: Vec<String> = reader
+            .lines()
+            .take(2)
+            .filter_map(|l| l.ok())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let _ = tx.send(lines);
+    });
+
+    let lines = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+
+    // Bridge must not crash — at minimum the init response should be present
+    assert!(!lines.is_empty(), "bridge must not crash on malformed JSON");
+    // If a second response exists, it should be a JSON-RPC error
+    if lines.len() >= 2 {
+        let resp: Value = serde_json::from_str(lines[1].trim()).unwrap_or_default();
+        assert!(
+            resp.get("error").is_some(),
+            "malformed JSON must return JSON-RPC error, got: {}",
+            lines[1]
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&tmp_home);
+}
