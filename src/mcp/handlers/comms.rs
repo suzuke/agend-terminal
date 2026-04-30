@@ -270,6 +270,10 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 "kind": "task",
                 "task_id": task_id_str,
                 "force_meta": force_meta_json,
+                "provenance": {
+                    "from": sender.as_str(),
+                    "task": task,
+                },
             }
         }),
     ) {
@@ -345,27 +349,6 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             summary: task.to_string(),
             task_id,
         }));
-        let provenance_result = match crate::channel::active_channel() {
-            Some(ch) => ch
-                .send_from_agent(
-                    target,
-                    crate::channel::AgentOutboundOp::InjectProvenance {
-                        from: sender.as_str().to_string(),
-                        task: task.to_string(),
-                    },
-                )
-                .map(|_| ())
-                .map_err(|e| anyhow::anyhow!("{e}")),
-            None => Err(anyhow::anyhow!("no active channel")),
-        };
-        if let Err(e) = provenance_result {
-            tracing::warn!(
-                %e,
-                target = %target,
-                from = %sender.as_str(),
-                "S2d provenance injection failed — routing may be broken"
-            );
-        }
     }
     // Add deprecation warning if caller used old field names
     let mut result = result;
