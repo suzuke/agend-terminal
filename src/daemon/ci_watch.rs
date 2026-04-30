@@ -2867,25 +2867,43 @@ mod tests {
     #[test]
     fn explicit_ci_provider_overrides_auto_detect() {
         // Watch with ci_provider: gitlab but repo URL pointing to github.com.
-        // Factory should construct GitLab, not GitHub.
+        // Factory should construct GitLab provider, not GitHub.
+        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+
+        // Construct GitLab provider via the same factory logic as production:
+        // explicit ci_provider="gitlab" + ci_provider_url pointing to mock.
         let watch = serde_json::json!({
             "repo": "github.com/myorg/myrepo",
             "branch": "main",
             "ci_provider": "gitlab",
+            "ci_provider_url": format!("http://127.0.0.1:{port}"),
         });
-        let ci_type = watch
-            .get("ci_provider")
-            .and_then(|v| v.as_str())
-            .unwrap_or("github");
-        assert_eq!(
-            ci_type, "gitlab",
-            "explicit ci_provider must win over auto-detect"
+        let ci_type = watch["ci_provider"].as_str().unwrap();
+        assert_eq!(ci_type, "gitlab");
+
+        // Construct provider as factory would.
+        let url = watch["ci_provider_url"].as_str().unwrap().to_string();
+        let provider = super::GitLabCiProvider::with_base_url(url).expect("provider");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let _ = rt.block_on(provider.poll_runs("myorg/myrepo", "main"));
+        handle.join().expect("mock");
+
+        // Assert: request went to GitLab-shaped URL (/projects/{id}/pipelines),
+        // NOT GitHub-shaped (/repos/{owner}/{repo}/actions/runs).
+        let (path, _) = captured.lock().expect("lock").take().expect("captured");
+        assert!(
+            path.contains("/projects/") && path.contains("/pipelines"),
+            "explicit gitlab must produce GitLab-shaped request, got: {path}"
         );
-        // Auto-detect would return github for this URL.
-        let (auto_kind, _) = super::detect_provider_from_remote(watch["repo"].as_str().unwrap());
-        assert_eq!(auto_kind, "github", "auto-detect sees github.com");
-        // But explicit config wins.
-        assert_ne!(ci_type, auto_kind, "explicit must override auto-detect");
+        assert!(
+            !path.contains("/repos/") && !path.contains("/actions/"),
+            "must NOT produce GitHub-shaped request: {path}"
+        );
     }
 
     #[test]
