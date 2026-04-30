@@ -328,3 +328,123 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{Layout, Pane, PaneSource, Tab};
+    use crate::vterm::VTerm;
+    use std::collections::HashMap;
+
+    fn test_pane(id: usize, name: &str) -> Pane {
+        Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    fn make_ctx<'a>(
+        layout: &'a mut Layout,
+        registry: &'a AgentRegistry,
+        home: &'a Path,
+        last_tab: &'a mut usize,
+        wakeup_tx: &'a crossbeam_channel::Sender<usize>,
+        name_counter: &'a mut HashMap<String, usize>,
+    ) -> DispatchCtx<'a> {
+        DispatchCtx {
+            layout,
+            registry,
+            home,
+            fleet_path: home,
+            last_tab,
+            wakeup_tx,
+            name_counter,
+        }
+    }
+
+    #[test]
+    fn next_tab_advances_active() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("a".to_string(), test_pane(1, "a")));
+        layout.add_tab(Tab::new("b".to_string(), test_pane(2, "b")));
+        layout.active = 0;
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+        let result = dispatch(Action::NextTab, &mut ctx);
+        assert!(result.needs_resize);
+        assert_eq!(ctx.layout.active, 1);
+    }
+
+    #[test]
+    fn prev_tab_decrements_active() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("a".to_string(), test_pane(1, "a")));
+        layout.add_tab(Tab::new("b".to_string(), test_pane(2, "b")));
+        layout.active = 1;
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+        let result = dispatch(Action::PrevTab, &mut ctx);
+        assert!(result.needs_resize);
+        assert_eq!(ctx.layout.active, 0);
+    }
+
+    #[test]
+    fn goto_tab_sets_active_and_last() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("a".to_string(), test_pane(1, "a")));
+        layout.add_tab(Tab::new("b".to_string(), test_pane(2, "b")));
+        layout.add_tab(Tab::new("c".to_string(), test_pane(3, "c")));
+        layout.active = 0;
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+        let result = dispatch(Action::GotoTab(2), &mut ctx);
+        assert!(result.needs_resize);
+        assert_eq!(ctx.layout.active, 2);
+        assert_eq!(*ctx.last_tab, 0);
+    }
+}

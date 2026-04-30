@@ -323,3 +323,76 @@ fn lookup_fleet_name(layout: &Layout, agent_name: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::{Layout, Pane, PaneSource, Tab};
+    use crate::vterm::VTerm;
+
+    fn test_pane(id: usize, agent: &str, fleet_name: Option<&str>) -> Pane {
+        Pane {
+            agent_name: agent.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: fleet_name.map(String::from),
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    #[test]
+    fn lookup_fleet_name_found() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new(
+            "t".to_string(),
+            test_pane(1, "dev", Some("dev-a1b2c3")),
+        ));
+        assert_eq!(
+            lookup_fleet_name(&layout, "dev"),
+            Some("dev-a1b2c3".to_string())
+        );
+    }
+
+    #[test]
+    fn lookup_fleet_name_not_found() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new(
+            "t".to_string(),
+            test_pane(1, "dev", Some("dev-x")),
+        ));
+        assert_eq!(lookup_fleet_name(&layout, "ghost"), None);
+    }
+
+    #[test]
+    fn lookup_fleet_name_no_fleet_name_returns_none() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t".to_string(), test_pane(1, "dev", None)));
+        assert_eq!(lookup_fleet_name(&layout, "dev"), None);
+    }
+
+    #[test]
+    fn command_parsing_splits_at_most_3_parts() {
+        // Pin the parsing shape: splitn(3, ' ') means at most 3 parts
+        let parts: Vec<&str> = "send target hello world".trim().splitn(3, ' ').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "send");
+        assert_eq!(parts[1], "target");
+        assert_eq!(parts[2], "hello world"); // remainder preserved
+    }
+
+    #[test]
+    fn command_parsing_empty_input() {
+        let parts: Vec<&str> = "".trim().splitn(3, ' ').collect();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], "");
+    }
+}
