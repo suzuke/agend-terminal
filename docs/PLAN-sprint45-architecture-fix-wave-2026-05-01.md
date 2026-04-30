@@ -37,11 +37,28 @@ Source on main; daemon-rebuild gap noted above.
 
 ### 1.2 ea377a audit intake
 
-50 issues delivered as inbox `m-20260430143550920865-672`. Severity breakdown:
-- 17 HIGH (concurrency / soundness / unbounded / data-loss / security)
-- 33 MEDIUM (consistency / cleanup / refactoring / clippy)
+Inbox source: `m-20260430143550920865-672` (not counting the 6 already-closed Sprint 44 prelude tasks C1-C3 + H1-H3).
 
-Fully grouped by ea377a into the 9 architecture groups defined in `docs/ARCHITECTURE-GROUPS.md`.
+Per-group enumeration (counts derived directly from the itemised list; **the source's summary line stated 17 HIGH + 33 MEDIUM = 50 total but the itemised list actually contains 21 HIGH + 37 MEDIUM = 58 — the summary line was an arithmetic mismatch and the itemised list is authoritative**):
+
+| Group | HIGH | MEDIUM | Total | §2 anchor |
+|-------|------|--------|-------|-----------|
+| G1 Agent State Classifier | 0 | 2 | 2 | §2 G1 |
+| G2 Agent Lifecycle & Process | 2 | 3 | 5 | §2 G2 |
+| G3 Daemon Core | 3 | 5 | 8 | §2 G3 |
+| G4 MCP Layer | 2 | 6 | 8 | §2 G4 |
+| G5 Fleet Config & Management | 0 | 4 | 4 | §2 G5 |
+| G6 Persistence & Audit | 4 | 4 | 8 | §2 G6 |
+| G7 TUI / App Layer | 5 | 5 | 10 | §2 G7 |
+| G8 Channel Layer | 3 | 4 | 7 | §2 G8 |
+| G9 CLI / Entry / Bootstrap | 2 | 4 | 6 | §2 G9 |
+| **Total** | **21** | **37** | **58** | — |
+
+Severity classes:
+- HIGH (21): concurrency / soundness / unbounded / data-loss / security
+- MEDIUM (37): consistency / cleanup / refactoring / clippy
+
+§2 below enumerates each issue per group as a one-line bullet — anyone reviewing this PLAN can grep the source inbox message + cross-check against the per-group count column above for completeness audit.
 
 ### 1.3 Coverage baseline
 
