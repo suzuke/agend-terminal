@@ -14,6 +14,7 @@ pub fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
 }
 
 /// Save a typed struct to a JSON file. Returns error on failure.
+#[allow(dead_code)] // Last caller (deployments::save) migrated to save_atomic; kept for future use
 pub fn save<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

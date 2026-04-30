@@ -937,19 +937,25 @@ pub fn broadcast_registry(
 ) -> Vec<String> {
     let msg = format!("[from:{from}] {text}");
     let msg_bytes = msg.as_bytes();
-    let reg = lock_registry(registry);
-    let targets: Vec<String> = reg
-        .iter()
-        .filter(|(name, handle)| {
-            (exclude != Some(name.as_str()))
-                && crate::backend::Backend::from_command(&handle.backend_command).is_some()
-        })
-        .map(|(name, handle)| {
+    // H1 fix: collect target names under lock, release, then re-acquire
+    // per-target for inject. Avoids holding registry lock during inject().
+    let target_names: Vec<String> = {
+        let reg = lock_registry(registry);
+        reg.iter()
+            .filter(|(name, handle)| {
+                (exclude != Some(name.as_str()))
+                    && crate::backend::Backend::from_command(&handle.backend_command).is_some()
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }; // lock dropped here
+    for name in &target_names {
+        let reg = lock_registry(registry);
+        if let Some(handle) = reg.get(name) {
             let _ = inject_to_agent(handle, msg_bytes);
-            name.clone()
-        })
-        .collect();
-    targets
+        }
+    }
+    target_names
 }
 
 /// Get atomic subscribe + screen dump (under core lock — no output gap).

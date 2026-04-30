@@ -47,7 +47,6 @@ fn rotate(base: &Path) {
 
 /// Append an event to the log file. Rotates when size exceeds MAX_LOG_SIZE.
 pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
-    let log_path = home.join("event-log.jsonl");
     let event = Event {
         timestamp: chrono::Utc::now().to_rfc3339(),
         kind,
@@ -55,35 +54,17 @@ pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
         detail: detail.to_string(),
     };
 
+    // Route through locked append path for atomicity (C3 fix).
+    let log_path = home.join("event-log.jsonl");
     if let Ok(meta) = std::fs::metadata(&log_path) {
         if meta.len() > MAX_LOG_SIZE {
             rotate(&log_path);
         }
     }
-
-    if let Ok(json) = serde_json::to_string(&event) {
-        use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            Ok(mut f) => {
-                if let Err(e) = writeln!(f, "{json}") {
-                    tracing::warn!(path = %log_path.display(), error = %e, "failed to write event log entry");
-                    return;
-                }
-                // Flush kernel buffers so audit records survive a host
-                // crash. Best-effort: we cannot fail a caller on fsync
-                // error, but we surface it in logs.
-                if let Err(e) = f.sync_all() {
-                    tracing::warn!(path = %log_path.display(), error = %e, "event log fsync failed");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(path = %log_path.display(), error = %e, "failed to open event log");
-            }
-        }
+    if let Err(e) = append_lines_under_lock(home, "event-log", |_| {
+        Ok(vec![serde_json::to_string(&event)?])
+    }) {
+        tracing::warn!(error = %e, "failed to write event log entry");
     }
 }
 

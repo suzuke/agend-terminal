@@ -42,10 +42,16 @@ fn load(home: &Path) -> DeploymentStore {
 fn save(home: &Path, store: &mut DeploymentStore) -> anyhow::Result<()> {
     use crate::store::SchemaVersioned;
     *store.version_mut() = DeploymentStore::CURRENT;
-    crate::store::save(&store_path(home), store)
+    crate::store::save_atomic(&store_path(home), store)
 }
 
 pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
+    // C1 fix: flock around load-modify-save to prevent lost-update race.
+    let lock_path = store_path(home).with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
+    };
     let template = match args["template"].as_str() {
         Some(t) => t,
         None => return serde_json::json!({"error": "missing 'template'"}),
@@ -301,6 +307,12 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
 }
 
 pub fn teardown(home: &Path, args: &Value) -> Value {
+    // C1 fix: flock around load-modify-save to prevent lost-update race.
+    let lock_path = store_path(home).with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => return serde_json::json!({"error": format!("deployment lock failed: {e}")}),
+    };
     let name = match args["name"].as_str() {
         Some(n) => n,
         None => return serde_json::json!({"error": "missing 'name'"}),
