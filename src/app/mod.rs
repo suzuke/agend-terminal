@@ -333,7 +333,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         if needs_resize {
             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
             let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
-            render::resize_panes(pane_area, &mut layout, &registry);
+            crate::layout::resize_panes(pane_area, &mut layout, &registry);
             needs_resize = false;
         }
         sync_notification_state(&home, &mut layout);
@@ -504,7 +504,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                     }
                     Event::Resize(cols, rows) => {
                         let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
-                        render::resize_panes(pane_area, &mut layout, &registry);
+                        crate::layout::resize_panes(pane_area, &mut layout, &registry);
                     }
                     _ => {}
                 }
