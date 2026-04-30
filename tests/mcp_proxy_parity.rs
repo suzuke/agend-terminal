@@ -10,13 +10,13 @@
 //! 2. The response wrapping is consistent (ok + result shape)
 //! 3. The 5 representative tools are routed correctly
 
-/// Verify the mcp_proxy handler source calls handle_tool directly.
+/// Verify the mcp_proxy handler source calls execute_tool via service boundary.
 #[test]
 fn proxy_handler_calls_handle_tool_directly() {
     let src = std::fs::read_to_string("src/api/handlers/mcp_proxy.rs").expect("read mcp_proxy.rs");
     assert!(
-        src.contains("crate::mcp::handlers::handle_tool("),
-        "mcp_proxy must call handle_tool"
+        src.contains("crate::mcp::execute_tool("),
+        "mcp_proxy must call execute_tool (service boundary)"
     );
 }
 
