@@ -11,6 +11,13 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Write};
 
+/// Service boundary: single public entry point for MCP tool execution.
+/// API layer calls this instead of reaching into `handlers::handle_tool`
+/// directly, keeping timeout policy in API and execution in MCP.
+pub fn execute_tool(tool_name: &str, args: &Value, instance_name: &str) -> Value {
+    handlers::handle_tool(tool_name, args, instance_name)
+}
+
 /// Tool authz: returns `(allow, deny)` sets parsed from
 /// `AGEND_MCP_TOOLS_ALLOW` / `AGEND_MCP_TOOLS_DENY` (comma-separated,
 /// whitespace-tolerant). An empty allow-set means "allow all" (legacy

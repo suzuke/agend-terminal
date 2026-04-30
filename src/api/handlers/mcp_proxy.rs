@@ -55,7 +55,7 @@ pub(crate) fn handle_mcp_tool(params: &Value, _ctx: &HandlerCtx) -> Value {
     let handle = std::thread::Builder::new()
         .name(format!("mcp_tool_{tool_owned}"))
         .spawn(move || {
-            let result = crate::mcp::handlers::handle_tool(&tool_owned, &args, &instance);
+            let result = crate::mcp::execute_tool(&tool_owned, &args, &instance);
             let _ = tx.send(result);
         });
 
