@@ -1,6 +1,6 @@
 //! Channel capabilities — feature matrix consulted by core and UX layers.
 //!
-//! Per `docs/PLAN-channel-abstraction.md` §3.4, this struct lets core code
+//! Per `docs/archived/PLAN-channel-abstraction.md` §3.4, this struct lets core code
 //! query "does this channel emit deletion events?" / "what markdown dialect?"
 //! via data rather than `if channel.kind() == "telegram"` branches.
 //!

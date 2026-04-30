@@ -282,7 +282,7 @@ fn read_message(reader: &mut impl BufRead) -> Result<Option<String>, Box<dyn std
         // Gemini, OpenCode) send NDJSON over stdio. Content-Length (LSP-style)
         // fallback removed — it was an attack surface (drip-feed DoS via
         // blocking read_exact, negative Content-Length crash, OOM via large
-        // Content-Length). See docs/MCP-FRAMING-PER-BACKEND.md.
+        // Content-Length). See docs/archived/MCP-FRAMING-PER-BACKEND.md.
         if trimmed.starts_with('{') {
             return Ok(Some(trimmed.to_string()));
         }

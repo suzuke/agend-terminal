@@ -124,7 +124,7 @@ Today the Telegram adapter sidesteps this by populating `inbox::InboxMessage::at
 
 #### L3 — Sentinel `"__fleet__"` for fleet-binding topic registry
 
-`telegram.rs` references a `FLEET_BINDING_SENTINEL` (`docs/DESIGN-stage-b-ux.md` §3/§5) for storing the fleet-binding topic id in the on-disk topic registry. Sentinel-string-as-key is a magic value. Future fleet-event subscriptions (multi-fleet?) would need a richer schema; for now it's an explicit tradeoff documented in design. Minor refactor candidate, not a bug.
+`telegram.rs` references a `FLEET_BINDING_SENTINEL` (`docs/archived/DESIGN-stage-b-ux.md` §3/§5) for storing the fleet-binding topic id in the on-disk topic registry. Sentinel-string-as-key is a magic value. Future fleet-event subscriptions (multi-fleet?) would need a richer schema; for now it's an explicit tradeoff documented in design. Minor refactor candidate, not a bug.
 
 #### L4 — `init_from_config` allowlist legacy-vs-empty messaging
 

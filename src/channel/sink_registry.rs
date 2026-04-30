@@ -13,7 +13,7 @@
 //! `src/channel/telegram.rs::RT`, `src/vterm.rs::CACHE`. We do NOT
 //! introduce a DI framework or service-locator abstraction — a small
 //! crate-wide resource handled by the same pattern as its neighbors
-//! beats a bespoke abstraction. Decision: `docs/DESIGN-stage-b-ux.md`
+//! beats a bespoke abstraction. Decision: `docs/archived/DESIGN-stage-b-ux.md`
 //! §9 Q3, by general.
 //!
 //! ## Scope of PR-A

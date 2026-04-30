@@ -100,7 +100,7 @@ struct JsonRpcRequest {
 /// All known MCP backends (Claude Code, Kiro CLI, Codex, Gemini, OpenCode)
 /// send NDJSON over stdio. Content-Length (LSP-style) fallback removed per
 /// Sprint 25 P3 framing audit — it was an attack surface (drip-feed DoS,
-/// negative Content-Length crash, OOM). See docs/MCP-FRAMING-PER-BACKEND.md.
+/// negative Content-Length crash, OOM). See docs/archived/MCP-FRAMING-PER-BACKEND.md.
 fn read_message(reader: &mut impl BufRead) -> anyhow::Result<Option<String>> {
     let mut line = String::new();
     loop {

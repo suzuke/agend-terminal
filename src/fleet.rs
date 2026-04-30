@@ -15,7 +15,7 @@ pub struct FleetConfig {
     /// Channel configuration (e.g., Telegram). Legacy singular form.
     ///
     /// Prefer [`FleetConfig::channels`] (plural) going forward — per
-    /// `docs/PLAN-channel-abstraction.md` §3.6. When both are omitted,
+    /// `docs/archived/PLAN-channel-abstraction.md` §3.6. When both are omitted,
     /// Telegram stays off. When only `channels:` is set, `normalize()`
     /// collapses the first entry into this field so existing call sites
     /// (which read `self.channel` directly) keep working unchanged.
@@ -66,7 +66,7 @@ pub enum ChannelConfig {
         ///
         /// PR-A lands the schema only; resolution into a concrete
         /// `BindingRef` and the rendering pipeline land with PR-B (see
-        /// `docs/DESIGN-stage-b-ux.md` §3 and §5).
+        /// `docs/archived/DESIGN-stage-b-ux.md` §3 and §5).
         #[serde(default)]
         fleet_binding: Option<FleetBindingConfig>,
     },

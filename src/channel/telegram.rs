@@ -136,7 +136,7 @@ pub struct TelegramState {
     /// routing read `agent_state` directly instead of via the `LIST` RPC.
     pub registry: Option<AgentRegistry>,
     /// Resolved `fleet_binding` target for cross-instance fleet activity
-    /// rendering (Stage B-UX, `docs/DESIGN-stage-b-ux.md` §3/§5). `None`
+    /// rendering (Stage B-UX, `docs/archived/DESIGN-stage-b-ux.md` §3/§5). `None`
     /// means no mirror is configured — [`TelegramChannel::apply_fleet_action`]
     /// returns early. Resolution happens in [`init_from_config`] from the
     /// config's `fleet_binding` block plus the on-disk topic registry
@@ -1141,7 +1141,7 @@ pub fn init_from_config(
         tracing::info!("updated fleet.yaml with topic_ids");
     }
 
-    // Resolve `fleet_binding` → topic_id. See docs/DESIGN-stage-b-ux.md §3/§5.
+    // Resolve `fleet_binding` → topic_id. See docs/archived/DESIGN-stage-b-ux.md §3/§5.
     // Persistence uses the `FLEET_BINDING_SENTINEL` row in `topics.json` so
     // the same topic is reused across daemon restarts without touching
     // fleet.yaml schema. Shorthand is warned + ignored (TG has no
@@ -1884,7 +1884,7 @@ impl TelegramChannel {
             // into the same dispatch path. The underlying platform does
             // push `edited_message` / `edited_channel_post` through
             // `getUpdates`, but the field's contract (per
-            // `docs/PLAN-channel-ux-layer.md`) is "adapter currently
+            // `docs/archived/PLAN-channel-ux-layer.md`) is "adapter currently
             // emits this signal", not "platform is capable". Flip to
             // true when the ingest path lands.
             receives_edit_events: false,
@@ -2348,7 +2348,7 @@ fn empty_msg_ref() -> crate::channel::MsgRef {
 impl crate::channel::ux_event::UxEventSink for TelegramChannel {
     fn emit(&self, event: &crate::channel::ux_event::UxEvent) {
         use crate::channel::ux_event::{select_action, UxAction, UxEvent};
-        // Dispatch split per docs/DESIGN-stage-b-ux.md §4.4: Fleet events
+        // Dispatch split per docs/archived/DESIGN-stage-b-ux.md §4.4: Fleet events
         // never flow through the Q1 `select_action` cap-degradation ladder —
         // their target is the configured `fleet_binding`, not the origin
         // user's thread, and rendering is a plain one-liner with no
@@ -2687,7 +2687,7 @@ user_allowlist:
     // These tests cover the wiring between `TelegramState.fleet_binding_topic_id`
     // (set at bootstrap by `init_from_config::resolve_fleet_binding`) and
     // `TelegramChannel::apply_fleet_action` (invoked via the UxEventSink
-    // dispatch split from docs/DESIGN-stage-b-ux.md §4.4).
+    // dispatch split from docs/archived/DESIGN-stage-b-ux.md §4.4).
 
     /// Value-source pin per Reviewer Contract v0.1 §4.
     ///
