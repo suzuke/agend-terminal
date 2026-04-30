@@ -56,7 +56,7 @@ impl AgendHarness {
 
         // BLOCKING 3.2: poll api.port AND try_wait for early exit
         let start = Instant::now();
-        let timeout = Duration::from_secs(15);
+        let timeout = platform_timeout(Duration::from_secs(15));
         let run_dir = home.join("run").join(pid.to_string());
 
         let mut child = child;
@@ -407,6 +407,8 @@ impl TuiClient {
     where
         F: Fn(&str) -> bool,
     {
+        // Windows CI runners are slower; apply timeout multiplier.
+        let effective_timeout = platform_timeout(timeout);
         self.vterm.process(data);
         let start = Instant::now();
         loop {
@@ -415,11 +417,21 @@ impl TuiClient {
             if predicate(&screen) {
                 return true;
             }
-            if start.elapsed() > timeout {
+            if start.elapsed() > effective_timeout {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// Platform-aware timeout: Windows CI runners are ~3-5x slower than
+/// macOS/Linux. Multiply timeouts to avoid flaky failures.
+fn platform_timeout(timeout: Duration) -> Duration {
+    if cfg!(windows) {
+        timeout * 3
+    } else {
+        timeout
     }
 }
 
