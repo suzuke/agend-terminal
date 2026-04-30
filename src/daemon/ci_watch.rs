@@ -1960,13 +1960,41 @@ mod tests {
     // ── GitLab CiProvider tests (Sprint 39 PR-1) ────────────────────
 
     /// Helper: mock HTTP server for GitLab tests. Captures path + headers.
-    fn gitlab_mock_server(
-        response_body: &str,
-    ) -> (
-        u16,
-        std::thread::JoinHandle<()>,
-        std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
-    ) {
+    /// Captured request from mock server: (path, full_request).
+    type MockCapture = std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>;
+
+    /// RAII guard that saves/restores GITLAB_TOKEN env var.
+    /// Also holds a static mutex to serialize env-var-touching tests.
+    struct GitlabTokenGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    impl GitlabTokenGuard {
+        fn clear() -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("GITLAB_TOKEN");
+            std::env::remove_var("GITLAB_TOKEN");
+            Self { prev, _lock: lock }
+        }
+        fn set(val: &str) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("GITLAB_TOKEN");
+            std::env::set_var("GITLAB_TOKEN", val);
+            Self { prev, _lock: lock }
+        }
+    }
+    impl Drop for GitlabTokenGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("GITLAB_TOKEN", v),
+                None => std::env::remove_var("GITLAB_TOKEN"),
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn gitlab_mock_server(response_body: &str) -> (u16, std::thread::JoinHandle<()>, MockCapture) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -2079,8 +2107,7 @@ mod tests {
     /// Auth fallback: token_warning returns warning when no token found.
     #[test]
     fn gitlab_token_warning_when_no_token() {
-        // Ensure GITLAB_TOKEN is not set for this test.
-        std::env::remove_var("GITLAB_TOKEN");
+        let _guard = GitlabTokenGuard::clear();
         let provider = super::GitLabCiProvider::new().expect("provider");
         let warning = provider.token_warning();
         assert!(warning.is_some(), "should warn when no token");
@@ -2112,7 +2139,7 @@ mod tests {
         let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
 
-        std::env::set_var("GITLAB_TOKEN", "test-token-123");
+        let _guard = GitlabTokenGuard::set("test-token-123");
         let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
             .expect("provider");
         let rt = tokio::runtime::Builder::new_current_thread()
