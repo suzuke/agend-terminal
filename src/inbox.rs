@@ -210,6 +210,10 @@ pub struct InboxMessage {
     /// Excerpt of the replied-to message (first 200 chars + author tag).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to_excerpt: Option<String>,
+    /// ID of a newer message that supersedes this one (e.g. ci-watch SHA update).
+    /// Messages with superseded_by set are excluded from drain by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).
@@ -298,6 +302,60 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
     })?
 }
 
+/// Mark prior unread ci-watch messages for the same repo+branch as superseded.
+/// Called before enqueuing a new ci-watch notification so stale events don't surface.
+pub fn mark_ci_watch_superseded(
+    home: &Path,
+    instance: &str,
+    repo_branch_key: &str,
+    new_msg_id: &str,
+) {
+    let path = inbox_path(home, instance);
+    if !path.exists() {
+        return;
+    }
+    let _ = with_inbox_lock(home, instance, |path| -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let mut changed = false;
+        let mut lines: Vec<String> = Vec::new();
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                lines.push(line.to_string());
+                continue;
+            }
+            if let Ok(mut msg) = serde_json::from_str::<InboxMessage>(line) {
+                if msg.read_at.is_none()
+                    && msg.superseded_by.is_none()
+                    && msg.kind.as_deref() == Some("ci-watch")
+                    && msg.from == "system:ci"
+                    && msg.text.contains(repo_branch_key)
+                {
+                    msg.superseded_by = Some(new_msg_id.to_string());
+                    changed = true;
+                }
+                lines.push(serde_json::to_string(&msg).unwrap_or_else(|_| line.to_string()));
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+        if changed {
+            let tmp = path.with_extension("jsonl.tmp");
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            use std::io::Write;
+            for l in &lines {
+                writeln!(f, "{l}")?;
+            }
+            f.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+        }
+        Ok(())
+    });
+}
+
 /// Drain unread messages: mark them with `read_at` and write back.
 /// Returns only the messages that were previously unread.
 ///
@@ -345,6 +403,12 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                 continue;
             }
             if msg.read_at.is_none() {
+                // M6: skip superseded messages — they are stale
+                if msg.superseded_by.is_some() {
+                    msg.read_at = Some(now.clone());
+                    all_messages.push(msg);
+                    continue;
+                }
                 msg.read_at = Some(now.clone());
                 unread.push(msg.clone());
             }
@@ -736,6 +800,7 @@ pub fn deliver(
         attachments: vec![],
         in_reply_to_msg_id: None,
         in_reply_to_excerpt: None,
+        superseded_by: None,
     };
     let _ = enqueue(home, agent_name, msg);
     notify_agent(home, agent_name, source, text);
@@ -904,6 +969,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         }
     }
 
@@ -1037,6 +1103,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1141,6 +1208,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1170,6 +1238,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1762,6 +1831,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("thread_id"));
@@ -1812,6 +1882,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("[AGEND-MSG]"));
@@ -1845,6 +1916,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("from=from:agent"));
@@ -1883,6 +1955,7 @@ mod tests {
             }],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1912,6 +1985,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1955,6 +2029,7 @@ mod tests {
             ],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -1984,6 +2059,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: Some("42".into()),
             in_reply_to_excerpt: Some("[bob] original".into()),
+            superseded_by: None,
         };
         let h = format_header(&msg);
         assert!(h.contains("reply_to_excerpt=[bob] original"), "{h}");
@@ -2080,6 +2156,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: Some("42".into()),
             in_reply_to_excerpt: Some("[b] line1\nline2".into()),
+            superseded_by: None,
         };
         let h = format_header(&msg);
         assert!(!h.contains('\n'), "must be single line: {h}");
@@ -2107,6 +2184,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2142,6 +2220,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2182,6 +2261,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2225,6 +2305,7 @@ mod tests {
             attachments: vec![],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2385,6 +2466,7 @@ mod tests {
             }],
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
+            superseded_by: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: InboxMessage = serde_json::from_str(&json).unwrap();
@@ -2404,5 +2486,104 @@ mod tests {
         );
         let back: InboxMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.in_reply_to_msg_id, Some("999".to_string()));
+    }
+
+    // --- M6: ci-watch supersede tests ---
+
+    #[test]
+    fn superseded_by_field_backward_compat() {
+        // Old JSONL without superseded_by should deserialize with None
+        let json = r#"{"from":"system:ci","text":"test","timestamp":"2026-01-01T00:00:00Z"}"#;
+        let msg: InboxMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.superseded_by.is_none());
+    }
+
+    #[test]
+    fn mark_ci_watch_superseded_tags_prior_messages() {
+        let home = tmp_home("supersede_tag");
+        let agent = "test-agent";
+        let msg1 = InboxMessage {
+            schema_version: 0,
+            id: Some("old-1".into()),
+            from: "system:ci".into(),
+            text: "[ci-pass] owner/repo@main: passed ✓".into(),
+            kind: Some("ci-watch".into()),
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            channel: None,
+            delivery_mode: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+        };
+        enqueue(&home, agent, msg1).unwrap();
+        mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-msg-id");
+        let msgs = drain(&home, agent);
+        assert!(
+            msgs.is_empty(),
+            "superseded message should be filtered: {msgs:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn drain_excludes_superseded_messages() {
+        let home = tmp_home("drain_superseded");
+        let agent = "test-agent";
+        let normal = InboxMessage {
+            schema_version: 0,
+            id: Some("normal-1".into()),
+            from: "from:lead".into(),
+            text: "hello".into(),
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            channel: None,
+            delivery_mode: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+        };
+        let superseded = InboxMessage {
+            schema_version: 0,
+            id: Some("old-ci".into()),
+            from: "system:ci".into(),
+            text: "[ci-pass] repo@main".into(),
+            kind: Some("ci-watch".into()),
+            timestamp: "2026-01-01T00:00:01Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            channel: None,
+            delivery_mode: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: Some("new-ci".into()),
+        };
+        enqueue(&home, agent, normal).unwrap();
+        enqueue(&home, agent, superseded).unwrap();
+        let msgs = drain(&home, agent);
+        assert_eq!(msgs.len(), 1, "only non-superseded: {msgs:?}");
+        assert_eq!(msgs[0].id.as_deref(), Some("normal-1"));
+        std::fs::remove_dir_all(&home).ok();
     }
 }

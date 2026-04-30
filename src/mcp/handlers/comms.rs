@@ -127,6 +127,7 @@ pub(super) fn handle_send_to_instance(
                 attachments: vec![],
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
+                superseded_by: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
@@ -299,6 +300,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 attachments: vec![],
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
+                superseded_by: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
@@ -371,6 +373,30 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
     let result = {
         let correlation_id = args["correlation_id"].as_str();
         let reviewed_head = args["reviewed_head"].as_str();
+
+        // M3: SHA-staleness gate — if reviewed_head is provided and summary
+        // contains a PR URL, verify the SHA matches current PR HEAD.
+        if let Some(rh) = reviewed_head {
+            if let Some(pr_num) = extract_pr_number(summary) {
+                match fetch_pr_head_sha(&pr_num) {
+                    Ok(current_sha) => {
+                        if !current_sha.starts_with(rh) && !rh.starts_with(&current_sha) {
+                            return json!({"error": format!(
+                                "verdict reviewed_head={rh} but PR is at {current_sha}; \
+                                 please git fetch -f && re-review against current head"
+                            )});
+                        }
+                    }
+                    Err(e) => {
+                        // Fail-closed: gh fetch failure → reject verdict
+                        return json!({"error": format!(
+                            "cannot verify reviewed_head: {e} — retry after ensuring gh CLI is authenticated"
+                        )});
+                    }
+                }
+            }
+        }
+
         match crate::api::call(
             home,
             &json!({
@@ -410,6 +436,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     attachments: vec![],
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
+                    superseded_by: None,
                 };
                 crate::agent_ops::fallback_deliver(
                     home,
@@ -598,6 +625,60 @@ pub(super) fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
 }
 
+/// Extract PR number from text containing a GitHub PR URL.
+/// Returns `Some("owner/repo#N")` style string for `gh pr view`.
+fn extract_pr_number(text: &str) -> Option<String> {
+    // Match https://github.com/<owner>/<repo>/pull/<N>
+    let marker = "/pull/";
+    let idx = text.find(marker)?;
+    let before = &text[..idx];
+    // Walk back to find github.com/<owner>/<repo>
+    let gh_idx = before.rfind("github.com/")?;
+    let repo_path = &before[gh_idx + "github.com/".len()..];
+    let after = &text[idx + marker.len()..];
+    let pr_num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if pr_num.is_empty() {
+        return None;
+    }
+    Some(format!("{repo_path}#{pr_num}"))
+}
+
+/// Fetch the current HEAD SHA of a PR via `gh pr view`.
+/// `pr_ref` is in format "owner/repo#N".
+fn fetch_pr_head_sha(pr_ref: &str) -> Result<String, String> {
+    let parts: Vec<&str> = pr_ref.splitn(2, '#').collect();
+    if parts.len() != 2 {
+        return Err(format!("invalid PR ref: {pr_ref}"));
+    }
+    let (repo, number) = (parts[0], parts[1]);
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            number,
+            "--repo",
+            repo,
+            "--json",
+            "headRefOid",
+            "-q",
+            ".headRefOid",
+        ])
+        .output()
+        .map_err(|e| format!("gh pr view failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh pr view exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err("gh pr view returned empty SHA".to_string());
+    }
+    Ok(sha)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +720,20 @@ mod tests {
         let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
         // send_to_instance without sender returns identity error
         assert!(result.get("error").is_some());
+    }
+
+    // --- M3: SHA-staleness gate tests ---
+
+    #[test]
+    fn extract_pr_number_from_url() {
+        let text = "Review of https://github.com/suzuke/agend-terminal/pull/384 complete";
+        let pr = extract_pr_number(text);
+        assert_eq!(pr, Some("suzuke/agend-terminal#384".to_string()));
+    }
+
+    #[test]
+    fn extract_pr_number_no_url() {
+        let text = "Just a plain report with no PR link";
+        assert_eq!(extract_pr_number(text), None);
     }
 }

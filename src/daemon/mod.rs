@@ -851,6 +851,7 @@ pub fn run_task_maintenance(home: &Path) {
                 attachments: vec![],
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
+                superseded_by: None,
             },
         );
     }
@@ -915,6 +916,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                     attachments: vec![],
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
+                    superseded_by: None,
                 },
             );
         }

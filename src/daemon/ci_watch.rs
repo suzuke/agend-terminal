@@ -1280,6 +1280,14 @@ async fn ci_check_repo(
                 let _ = agent::inject_to_agent(handle, headline.as_bytes());
             }
             drop(reg);
+            // M6: mark prior ci-watch messages for same repo+branch as superseded
+            let repo_branch_key = format!("{repo}@{branch}");
+            crate::inbox::mark_ci_watch_superseded(
+                home,
+                instance,
+                &repo_branch_key,
+                &format!("ci-{}-{}", run_id, sha),
+            );
             let _ = crate::inbox::enqueue(
                 home,
                 instance,
@@ -1302,6 +1310,7 @@ async fn ci_check_repo(
                     attachments: vec![],
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
+                    superseded_by: None,
                 },
             );
         }

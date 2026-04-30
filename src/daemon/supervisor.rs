@@ -144,6 +144,7 @@ pub(crate) fn maybe_notify_member_state_change(
         attachments: vec![],
         in_reply_to_msg_id: None,
         in_reply_to_excerpt: None,
+        superseded_by: None,
     };
     let _ = crate::inbox::enqueue(home, orch, msg);
     crate::inbox::notify_agent(
