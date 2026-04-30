@@ -589,13 +589,14 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             .collect();
                         to_add.sort();
                         for name in &to_add {
+                            let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
                             match pane_factory::create_remote_pane(
                                 name,
                                 &home,
                                 &fleet_path,
                                 &mut layout,
-                                pane_cols,
-                                pane_rows,
+                                dc.saturating_sub(2),
+                                dr.saturating_sub(4),
                                 &wakeup_tx,
                             ) {
                                 Ok(pane) => {
