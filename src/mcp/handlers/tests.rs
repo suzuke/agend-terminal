@@ -2385,3 +2385,58 @@ fn describe_instance_response_shape_has_required_keys() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+#[test]
+fn delegate_task_rejects_team_orchestrator_self_route() {
+    // M5: when target_instance name collides with a team template name whose
+    // orchestrator is the sender, handle_delegate_task must reject with an
+    // informative error — not fall through to the API-layer generic
+    // "cannot send to self".
+    let _g = fleet_test_guard();
+    let home = tmp_home("m5_self_route");
+    std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("AGEND_TEST_ISOLATION", "1");
+    // Fleet: instance "dev" exists, sender is "lead".
+    let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n  lead:\n    role: Test\n";
+    std::fs::write(home.join("fleet.yaml"), yaml).ok();
+    // Team fixture: team named "dev" with orchestrator "lead".
+    // This causes resolve_team_orchestrator("dev") → Some("lead").
+    let teams = serde_json::json!({
+        "schema_version": 1,
+        "teams": [{
+            "name": "dev",
+            "members": ["lead", "dev"],
+            "orchestrator": "lead",
+            "description": null,
+            "created_at": "2026-04-30T00:00:00Z"
+        }]
+    });
+    std::fs::write(
+        home.join("teams.json"),
+        serde_json::to_string_pretty(&teams).unwrap(),
+    )
+    .ok();
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "dev",
+            "request_kind": "task",
+            "message": "do something"
+        }),
+        "lead", // sender — same as team "dev" orchestrator
+    );
+
+    let err = result["error"].as_str().expect("should return error");
+    assert!(
+        err.contains("team orchestrator loop"),
+        "error must mention orchestrator loop, got: {err}"
+    );
+    assert!(
+        !err.contains("cannot send to self"),
+        "must NOT hit generic self-send error: {err}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
