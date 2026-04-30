@@ -24,6 +24,8 @@ pub enum Claim {
     OnlyFormatting,
     /// "deps unchanged" — Cargo.lock must have empty diff.
     DepsUnchanged,
+    /// Grammar v1.1: "fn name() exists" — verify function exists in repo via syn AST + rg fallback.
+    FunctionExists { fn_names: Vec<String> },
     /// Unrecognised phrase — pass through, no check.
     Unknown(String),
 }
@@ -81,6 +83,11 @@ fn parse_one(s: &str) -> Claim {
     if lower.contains("deps unchanged") {
         return Claim::DepsUnchanged;
     }
+    // Grammar v1.1: detect fn references — "fn name() exists" or "fn name(" patterns
+    let fn_names = extract_fn_names(s);
+    if !fn_names.is_empty() {
+        return Claim::FunctionExists { fn_names };
+    }
     Claim::Unknown(s.to_string())
 }
 
@@ -121,6 +128,29 @@ fn extract_task_id(s: &str) -> Option<String> {
     }
 }
 
+/// Extract function names from claim text. Matches `fn name(` patterns.
+fn extract_fn_names(s: &str) -> Vec<String> {
+    let re_pattern = "fn\\s+(\\w+)\\s*\\(";
+    let mut names = Vec::new();
+    // Simple regex-like scan without regex crate
+    let mut rest = s;
+    while let Some(idx) = rest.find("fn ") {
+        rest = &rest[idx + 3..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            let after_name = &rest[name.len()..].trim_start();
+            if after_name.starts_with('(') {
+                names.push(name);
+            }
+        }
+    }
+    let _ = re_pattern; // suppress unused warning — documents the pattern
+    names
+}
+
 // ---------------------------------------------------------------------------
 // Verifier — run mechanical checks against git diff
 // ---------------------------------------------------------------------------
@@ -149,6 +179,7 @@ pub fn verify(
             }
             Claim::OnlyFormatting => check_only_formatting(repo_dir, base, head),
             Claim::DepsUnchanged => check_deps_unchanged(repo_dir, base, head),
+            Claim::FunctionExists { fn_names } => check_fn_exists(repo_dir, fn_names),
             Claim::Unknown(text) => ClaimResult {
                 claim: text.clone(),
                 passed: true,
@@ -451,6 +482,112 @@ fn git_show_and_fmt(repo_dir: &Path, rev: &str, path: &str) -> Result<String, St
         .wait_with_output()
         .map_err(|e| format!("rustfmt wait failed: {e}"))?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn check_fn_exists(repo_dir: &Path, fn_names: &[String]) -> ClaimResult {
+    if fn_names.is_empty() {
+        return ClaimResult {
+            claim: "function exists".to_string(),
+            passed: false,
+            detail: "no function names in claim".to_string(),
+        };
+    }
+    // Build fn name set from repo via syn AST walk + rg fallback
+    let known_fns = collect_fn_names_from_repo(repo_dir);
+    let mut missing = Vec::new();
+    for name in fn_names {
+        if !known_fns.contains(name.as_str()) {
+            // Fallback: ripgrep for fn declaration
+            if !rg_fn_exists(repo_dir, name) {
+                missing.push(name.clone());
+            }
+        }
+    }
+    if missing.is_empty() {
+        ClaimResult {
+            claim: "function exists".to_string(),
+            passed: true,
+            detail: format!("{} function(s) verified", fn_names.len()),
+        }
+    } else {
+        ClaimResult {
+            claim: "function exists".to_string(),
+            passed: false,
+            detail: format!("function(s) not found in repo: {}", missing.join(", ")),
+        }
+    }
+}
+
+/// Walk all .rs files under repo_dir/src/ and extract fn names via syn AST.
+fn collect_fn_names_from_repo(repo_dir: &Path) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    let src_dir = repo_dir.join("src");
+    if !src_dir.exists() {
+        return names;
+    }
+    fn walk_dir(dir: &Path, names: &mut std::collections::HashSet<String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_dir(&path, names);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(file) = syn::parse_file(&content) {
+                        extract_fn_names_from_file(&file, names);
+                    }
+                }
+            }
+        }
+    }
+    walk_dir(&src_dir, &mut names);
+    names
+}
+
+/// Extract fn names from a parsed syn File.
+fn extract_fn_names_from_file(file: &syn::File, names: &mut std::collections::HashSet<String>) {
+    for item in &file.items {
+        extract_fn_names_from_item(item, names);
+    }
+}
+
+fn extract_fn_names_from_item(item: &syn::Item, names: &mut std::collections::HashSet<String>) {
+    match item {
+        syn::Item::Fn(f) => {
+            names.insert(f.sig.ident.to_string());
+        }
+        syn::Item::Impl(imp) => {
+            for item in &imp.items {
+                if let syn::ImplItem::Fn(f) = item {
+                    names.insert(f.sig.ident.to_string());
+                }
+            }
+        }
+        syn::Item::Mod(m) => {
+            if let Some((_, items)) = &m.content {
+                for item in items {
+                    extract_fn_names_from_item(item, names);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Fallback: use ripgrep to check if `fn name` exists in repo.
+fn rg_fn_exists(repo_dir: &Path, name: &str) -> bool {
+    let pattern = format!("\\bfn {name}\\b");
+    let output = std::process::Command::new("grep")
+        .args(["-r", "-l", &pattern, "src/"])
+        .current_dir(repo_dir)
+        .output();
+    match output {
+        Ok(o) => !o.stdout.is_empty(),
+        Err(_) => false,
+    }
 }
 
 fn check_deps_unchanged(repo_dir: &Path, base: &str, head: &str) -> ClaimResult {
@@ -941,6 +1078,102 @@ mod tests {
             "byte-equal with no paths should reject: {:?}",
             r.results
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- M4: FunctionExists tests ---
+
+    #[test]
+    fn parse_fn_exists_claim() {
+        let claims = parse_claims("references fn verify_push()");
+        assert_eq!(
+            claims,
+            vec![Claim::FunctionExists {
+                fn_names: vec!["verify_push".into()]
+            }]
+        );
+    }
+
+    #[test]
+    fn fn_exists_green_real_fn() {
+        let dir = setup_git_repo("fn_green");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn real_function() {}\n").unwrap();
+        let base = git_head(&dir);
+        let r = verify(
+            &dir,
+            &base,
+            &base,
+            &[Claim::FunctionExists {
+                fn_names: vec!["real_function".into()],
+            }],
+            None,
+        );
+        assert!(r.ok, "real fn should pass: {:?}", r.results);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fn_exists_red_fake_fn() {
+        let dir = setup_git_repo("fn_red");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn real_function() {}\n").unwrap();
+        let base = git_head(&dir);
+        let r = verify(
+            &dir,
+            &base,
+            &base,
+            &[Claim::FunctionExists {
+                fn_names: vec!["hallucinated_function".into()],
+            }],
+            None,
+        );
+        assert!(!r.ok, "fake fn should reject: {:?}", r.results);
+        assert!(r.results[0].detail.contains("hallucinated_function"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fn_exists_impl_method() {
+        let dir = setup_git_repo("fn_impl");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "struct Foo;\nimpl Foo { fn method_one(&self) {} }\n",
+        )
+        .unwrap();
+        let base = git_head(&dir);
+        let r = verify(
+            &dir,
+            &base,
+            &base,
+            &[Claim::FunctionExists {
+                fn_names: vec!["method_one".into()],
+            }],
+            None,
+        );
+        assert!(r.ok, "impl method should be found: {:?}", r.results);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fn_exists_multi_one_missing() {
+        let dir = setup_git_repo("fn_multi");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn exists_fn() {}\n").unwrap();
+        let base = git_head(&dir);
+        let r = verify(
+            &dir,
+            &base,
+            &base,
+            &[Claim::FunctionExists {
+                fn_names: vec!["exists_fn".into(), "missing_fn".into()],
+            }],
+            None,
+        );
+        assert!(!r.ok, "one missing fn should reject: {:?}", r.results);
+        assert!(r.results[0].detail.contains("missing_fn"));
+        assert!(!r.results[0].detail.contains("exists_fn"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
