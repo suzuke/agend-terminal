@@ -213,6 +213,38 @@ Standard fixture/test-first per phase scope.
 
 ---
 
+## 11. Status & operator decisions (recorded 2026-04-30 per general m-20260430060731311284-342)
+
+**Status**: PLAN approved 2026-04-30 by operator-proxy general; **IMPL DEFERRED pending Sprint 41 (Group 2 TUI/App PLAN+IMPL) + Sprint 43 (supervisor member-state-change notify) closure**. Re-trigger on Sprint 43 closeout.
+
+**Sprint order**: 41 → 43 → 42 (TUI conflict avoidance; operator decision via general m-?). Sprint 42 phases hold.
+
+### §13 final answers (all 9 RESOLVED per general m-20260430060731311284-342)
+
+| §13 # | Decision | Rationale |
+|---|---|---|
+| 1 (Phase 1 immediate dispatch) | **DEFERRED** until Sprint 43 close | Sprint order 41 → 43 → 42 |
+| 2 (Phase 2 wait Sprint 41) | YES, natural hold | claude-a1f200 §6.3 spec'd |
+| 3 (Phase 3-5 sequential) | YES | per claude-a1f200 |
+| 4 (vte gotchas +2: wide chars + safe_cell) | YES | reviewer-kiro P4 cross-confirmed dev S4 |
+| 5 (§6.1 5-CLIs gaps: bugreport error / completions zsh,fish / --help snapshot) | YES | dev S2 negative-case coverage |
+| 6 (Phase 2 Tier-2 dual reviewer) | YES | testing infra novelty per reviewer P1 |
+| 7 (PLAN-doc update path) | claude-a1f200 v3 amends own v2 (single source of truth) | this review-extend doc serves as input to v3 authoring (separate work) |
+| 8 (2 BLOCKING items 3.1 + 3.2 accepted) | YES | adversarial scenarios point to real CI degradation risk |
+| 9 (Sprint number 42) | confirmed | |
+
+### Re-trigger trigger
+On Sprint 43 closeout:
+- claude-a1f200 (or other authoring agent) authors PLAN doc v3 amending v2 with: §13 #5 (5-CLIs gaps closing), §13 #4 (vte gotchas +2), §13 #6 (Tier-2 Phase 2), §13 #8 (2 BLOCKING items folded into Phase 2 spec), §4.1 §5.2 layout-composition gap softening
+- Phase 1 immediate dispatch (no Sprint 41 file overlap; can run parallel)
+- Phase 2 holds for Sprint 41 closure
+- Phase 3-5 strict serial
+
+### CiHttpClient extraction follow-up
+Sprint 39 retrospective task `t-20260430024226176283-9` — bundle with Sprint 43 IMPL wave OR independent nit-PR, decide at Sprint 43 IMPL dispatch time.
+
+---
+
 ## 10. Cross-references
 
 - general m-20260430054947092086-323 (operator scope)
