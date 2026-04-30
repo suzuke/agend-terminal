@@ -1193,4 +1193,50 @@ mod tests {
         }
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // --- Sprint 41 T-4: handle_list_scroll logic coverage ---
+
+    #[test]
+    fn list_scroll_up_decrements() {
+        let mut scroll = 5;
+        let consumed = handle_list_scroll(KeyCode::Up, &mut scroll, 10);
+        assert!(consumed);
+        assert_eq!(scroll, 4);
+    }
+
+    #[test]
+    fn list_scroll_up_at_zero_stays_zero() {
+        let mut scroll = 0;
+        handle_list_scroll(KeyCode::Up, &mut scroll, 10);
+        assert_eq!(scroll, 0);
+    }
+
+    #[test]
+    fn list_scroll_down_increments() {
+        let mut scroll = 3;
+        let consumed = handle_list_scroll(KeyCode::Down, &mut scroll, 10);
+        assert!(consumed);
+        assert_eq!(scroll, 4);
+    }
+
+    #[test]
+    fn list_scroll_down_at_end_stays() {
+        let mut scroll = 9;
+        handle_list_scroll(KeyCode::Down, &mut scroll, 10);
+        assert_eq!(scroll, 9);
+    }
+
+    #[test]
+    fn list_scroll_esc_returns_false() {
+        let mut scroll = 5;
+        let consumed = handle_list_scroll(KeyCode::Esc, &mut scroll, 10);
+        assert!(!consumed, "Esc must return false (close overlay)");
+    }
+
+    #[test]
+    fn list_scroll_page_down_jumps_10() {
+        let mut scroll = 0;
+        handle_list_scroll(KeyCode::PageDown, &mut scroll, 50);
+        assert_eq!(scroll, 10);
+    }
 }
