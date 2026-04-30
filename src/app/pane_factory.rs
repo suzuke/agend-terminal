@@ -524,4 +524,26 @@ mod tests {
         assert_eq!(name, "codex-2");
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // --- Sprint 41 T-4: resolve_backend config resolution ---
+
+    #[test]
+    fn resolve_backend_known_preset_returns_command() {
+        let (cmd, submit) = resolve_backend("claude");
+        assert!(
+            !cmd.is_empty(),
+            "known backend must resolve to non-empty command"
+        );
+        assert_eq!(submit, "\r", "claude submit key must be \\r");
+    }
+
+    #[test]
+    fn resolve_backend_unknown_returns_passthrough() {
+        let (cmd, submit) = resolve_backend("my-custom-cli");
+        assert_eq!(cmd, "my-custom-cli", "unknown backend must pass through");
+        assert_eq!(
+            submit, "\r",
+            "unknown backend default submit key must be \\r"
+        );
+    }
 }
