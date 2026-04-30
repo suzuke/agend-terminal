@@ -270,6 +270,28 @@ impl TestVTerm {
         self.processor.advance(&mut self.term, data);
     }
 
+    #[allow(dead_code)]
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.cols = cols;
+        self.rows = rows;
+        struct Size {
+            cols: u16,
+            rows: u16,
+        }
+        impl Dimensions for Size {
+            fn total_lines(&self) -> usize {
+                self.rows as usize
+            }
+            fn screen_lines(&self) -> usize {
+                self.rows as usize
+            }
+            fn columns(&self) -> usize {
+                self.cols as usize
+            }
+        }
+        self.term.resize(Size { cols, rows });
+    }
+
     fn tail_lines(&self, n: usize) -> String {
         let grid = self.term.grid();
         let cols = self.cols as usize;
@@ -313,6 +335,7 @@ impl TestVTerm {
 
 /// TuiClient — connect to daemon API + in-process vterm for PTY output parsing.
 /// Mirrors production `src/vterm.rs` API via alacritty_terminal::Term.
+#[allow(dead_code)]
 pub struct TuiClient {
     port: u16,
     home: PathBuf,
@@ -329,6 +352,7 @@ impl TuiClient {
     }
 
     /// Call the daemon API with a method + params.
+    #[allow(dead_code)]
     pub fn call(
         &self,
         method: &str,
@@ -336,6 +360,12 @@ impl TuiClient {
     ) -> Result<serde_json::Value, String> {
         let req = serde_json::json!({"method": method, "params": params});
         authed_api_call(self.port, &self.home, &req)
+    }
+
+    /// Resize the vterm (simulates terminal resize).
+    #[allow(dead_code)]
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        self.vterm.resize(cols, rows);
     }
 
     /// Feed raw bytes into the vterm (simulates PTY output).
@@ -366,6 +396,7 @@ impl TuiClient {
     /// Feed bytes, then poll until predicate matches screen content or timeout.
     /// The predicate is checked against the vterm screen after the initial feed.
     /// Useful when the fed content triggers state changes that need time to settle.
+    #[allow(dead_code)]
     pub fn wait_for<F>(&mut self, data: &[u8], predicate: F, timeout: Duration) -> bool
     where
         F: Fn(&str) -> bool,
