@@ -88,6 +88,7 @@ pub(super) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         "branch": branch,
         "interval_secs": interval,
         "instance": instance_name,
+        "ci_provider_url": args["ci_provider_url"].as_str(),
         "last_run_id": null,
         "head_sha": null,
         "last_polled_at": null,

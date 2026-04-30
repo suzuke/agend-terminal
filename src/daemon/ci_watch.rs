@@ -380,20 +380,44 @@ impl CiProvider for GitLabCiProvider {
             },
             Err(_) => return "unknown job".to_string(),
         };
-        jobs_resp
-            .as_array()
-            .and_then(|jobs| {
-                jobs.iter().find_map(|job| {
-                    (job["status"].as_str() == Some("failed")).then(|| {
-                        format!(
-                            "{} / {}",
-                            job["stage"].as_str().unwrap_or("?"),
-                            job["name"].as_str().unwrap_or("?")
-                        )
-                    })
-                })
-            })
-            .unwrap_or_else(|| "unknown job".to_string())
+        let failed_job = jobs_resp.as_array().and_then(|jobs| {
+            jobs.iter()
+                .find(|job| job["status"].as_str() == Some("failed"))
+        });
+        let Some(job) = failed_job else {
+            return "unknown job".to_string();
+        };
+        let stage = job["stage"].as_str().unwrap_or("?");
+        let name = job["name"].as_str().unwrap_or("?");
+        let header = format!("{stage} / {name}");
+
+        // Chain: fetch job trace (log tail ~50 lines) for richer summary.
+        let job_id = match job["id"].as_u64() {
+            Some(id) => id,
+            None => return header,
+        };
+        let trace = match self
+            .gl_get(&format!("projects/{project}/jobs/{job_id}/trace"))
+            .send()
+            .await
+        {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => return header,
+        };
+        let tail: String = trace
+            .lines()
+            .rev()
+            .take(50)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if tail.is_empty() {
+            header
+        } else {
+            format!("{header}\n---\n{tail}")
+        }
     }
 
     fn token_warning(&self) -> Option<&'static str> {
@@ -1935,21 +1959,20 @@ mod tests {
 
     // ── GitLab CiProvider tests (Sprint 39 PR-1) ────────────────────
 
-    /// Helper: mock HTTP server for GitLab tests. Reuses Sprint 32
-    /// raw TCP listener pattern.
+    /// Helper: mock HTTP server for GitLab tests. Captures path + headers.
     fn gitlab_mock_server(
         response_body: &str,
     ) -> (
         u16,
         std::thread::JoinHandle<()>,
-        std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        std::sync::Arc<std::sync::Mutex<Option<(String, String)>>>,
     ) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<(String, String)>));
         let captured_clone = captured.clone();
         let body = response_body.to_string();
 
@@ -1965,7 +1988,8 @@ mod tests {
                 .and_then(|l| l.split_whitespace().nth(1))
                 .unwrap_or("")
                 .to_string();
-            *captured_clone.lock().expect("lock") = Some(path);
+            // Capture full request (path + headers) for assertion.
+            *captured_clone.lock().expect("lock") = Some((path, request));
 
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -1995,7 +2019,7 @@ mod tests {
         let result = rt.block_on(provider.poll_runs("foo/bar", "main"));
 
         handle.join().expect("mock");
-        let path = captured.lock().expect("lock").take().expect("path");
+        let (path, _request) = captured.lock().expect("lock").take().expect("captured");
         assert!(
             path.contains("/projects/foo%2Fbar/pipelines"),
             "path must target pipelines: {path}"
@@ -2080,5 +2104,30 @@ mod tests {
             super::GitLabCiProvider::with_base_url("https://git.corp.example.com".into())
                 .expect("with_base_url");
         assert_eq!(provider.base_url, "https://git.corp.example.com");
+    }
+
+    /// B4: Auth state 1 — GITLAB_TOKEN env present → PRIVATE-TOKEN header sent.
+    #[test]
+    fn gitlab_auth_env_token_sends_private_token_header() {
+        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+
+        std::env::set_var("GITLAB_TOKEN", "test-token-123");
+        let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let _ = rt.block_on(provider.poll_runs("foo/bar", "main"));
+        handle.join().expect("mock");
+        std::env::remove_var("GITLAB_TOKEN");
+
+        let (_, request) = captured.lock().expect("lock").take().expect("captured");
+        assert!(
+            request.contains("private-token: test-token-123")
+                || request.contains("PRIVATE-TOKEN: test-token-123"),
+            "must send PRIVATE-TOKEN header: {request}"
+        );
     }
 }
