@@ -128,10 +128,15 @@ fn extract_task_id(s: &str) -> Option<String> {
 /// Verify all claims against the diff between `base` and `head`.
 /// `repo_dir` is the git working directory.
 pub fn verify(repo_dir: &Path, base: &str, head: &str, claims: &[Claim]) -> VerifyResult {
+    // B1: check if NoOtherChanges is paired with ScopeFollowsDispatchSpec
+    let has_scope_spec = claims
+        .iter()
+        .any(|c| matches!(c, Claim::ScopeFollowsDispatchSpec { .. }));
+
     let mut results = Vec::new();
     for claim in claims {
         let r = match claim {
-            Claim::NoOtherChanges => check_no_other_changes(repo_dir, base, head),
+            Claim::NoOtherChanges => check_no_other_changes(repo_dir, base, head, has_scope_spec),
             Claim::ByteEqualVerified { paths } => check_byte_equal(repo_dir, base, head, paths),
             Claim::ScopeFollowsDispatchSpec { task_id } => {
                 check_scope_follows_spec(repo_dir, base, head, task_id)
@@ -195,10 +200,23 @@ fn git_diff_path_empty(
 
 // --- Individual claim checks ---
 
-fn check_no_other_changes(repo_dir: &Path, base: &str, head: &str) -> ClaimResult {
-    // Without a dispatch spec to compare against, we can only report the
-    // changed files. The caller (or a higher-level check) compares against
-    // the expected set. For now, just list the files.
+fn check_no_other_changes(
+    repo_dir: &Path,
+    base: &str,
+    head: &str,
+    has_scope_spec: bool,
+) -> ClaimResult {
+    // B1: standalone "no other changes" without a paired ScopeFollowsDispatchSpec
+    // is unverifiable — reject and guide toward explicit scope claim.
+    if !has_scope_spec {
+        return ClaimResult {
+            claim: "no other changes".to_string(),
+            passed: false,
+            detail: "standalone 'no other changes' is unverifiable — \
+                     pair with 'scope follows dispatch spec <task_id>' to specify scope"
+                .to_string(),
+        };
+    }
     match git_diff_files(repo_dir, base, head) {
         Ok(files) if files.is_empty() => ClaimResult {
             claim: "no other changes".to_string(),
@@ -275,9 +293,15 @@ fn check_scope_follows_spec(repo_dir: &Path, base: &str, head: &str, task_id: &s
     let allowed = home.and_then(|h| load_spec_files(&h, task_id));
     match allowed {
         Some(spec_files) => {
+            // B2a: path-equality or directory-prefix, not substring
             let out_of_scope: Vec<_> = diff_files
                 .iter()
-                .filter(|f| !spec_files.iter().any(|s| f.contains(s.as_str())))
+                .filter(|f| {
+                    !spec_files.iter().any(|s| {
+                        // Exact path match, or spec is a directory prefix
+                        *f == s || f.starts_with(&format!("{s}/"))
+                    })
+                })
                 .cloned()
                 .collect();
             if out_of_scope.is_empty() {
@@ -296,8 +320,10 @@ fn check_scope_follows_spec(repo_dir: &Path, base: &str, head: &str, task_id: &s
         }
         None => ClaimResult {
             claim: format!("scope follows dispatch spec {task_id}"),
-            passed: true,
-            detail: "no dispatch spec found — pass-through".to_string(),
+            passed: false,
+            detail: format!(
+                "claimed dispatch spec {task_id} but no entry found in dispatch_tracking.json"
+            ),
         },
     }
 }
@@ -335,46 +361,83 @@ fn check_only_formatting(repo_dir: &Path, base: &str, head: &str) -> ClaimResult
             }
         }
     };
-    let rs_files: Vec<_> = files.iter().filter(|f| f.ends_with(".rs")).collect();
-    if rs_files.is_empty() {
+    // B3: non-.rs file changes under "only formatting" → reject
+    let non_rs: Vec<_> = files.iter().filter(|f| !f.ends_with(".rs")).collect();
+    if !non_rs.is_empty() {
         return ClaimResult {
-            claim: "only formatting".to_string(),
-            passed: true,
-            detail: "no .rs files changed".to_string(),
-        };
-    }
-    // Run rustfmt --check on the changed .rs files at HEAD
-    let fmt_result = std::process::Command::new("rustfmt")
-        .arg("--edition")
-        .arg("2021")
-        .arg("--check")
-        .args(&rs_files)
-        .current_dir(repo_dir)
-        .output();
-    match fmt_result {
-        Ok(o) if o.status.success() => ClaimResult {
-            claim: "only formatting".to_string(),
-            passed: true,
-            detail: format!("{} .rs file(s) pass rustfmt", rs_files.len()),
-        },
-        Ok(o) => ClaimResult {
             claim: "only formatting".to_string(),
             passed: false,
             detail: format!(
-                "rustfmt reports diffs: {}",
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .take(5)
+                "non-.rs files changed: {}",
+                non_rs
+                    .iter()
+                    .map(|s| s.as_str())
                     .collect::<Vec<_>>()
-                    .join("; ")
+                    .join(", ")
             ),
-        },
-        Err(e) => ClaimResult {
+        };
+    }
+    if files.is_empty() {
+        return ClaimResult {
+            claim: "only formatting".to_string(),
+            passed: true,
+            detail: "no files changed".to_string(),
+        };
+    }
+    // B3: compare rustfmt(base-content) vs rustfmt(head-content) for each .rs file.
+    // If they match, the diff is formatting-only.
+    let mut failures = Vec::new();
+    for f in &files {
+        let base_fmt = git_show_and_fmt(repo_dir, base, f);
+        let head_fmt = git_show_and_fmt(repo_dir, head, f);
+        match (base_fmt, head_fmt) {
+            (Ok(b), Ok(h)) if b == h => {} // fmt-only ✓
+            (Ok(_), Ok(_)) => failures.push(f.clone()),
+            (Err(e), _) | (_, Err(e)) => failures.push(format!("{f}: {e}")),
+        }
+    }
+    if failures.is_empty() {
+        ClaimResult {
+            claim: "only formatting".to_string(),
+            passed: true,
+            detail: format!("{} .rs file(s) confirmed fmt-only", files.len()),
+        }
+    } else {
+        ClaimResult {
             claim: "only formatting".to_string(),
             passed: false,
-            detail: format!("rustfmt not available: {e}"),
-        },
+            detail: format!("non-formatting changes in: {}", failures.join(", ")),
+        }
     }
+}
+
+/// Get file content at a given revision and run rustfmt on it.
+fn git_show_and_fmt(repo_dir: &Path, rev: &str, path: &str) -> Result<String, String> {
+    let show = std::process::Command::new("git")
+        .args(["show", &format!("{rev}:{path}")])
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|e| format!("git show failed: {e}"))?;
+    if !show.status.success() {
+        // File may not exist at base (new file) — treat as empty
+        return Ok(String::new());
+    }
+    let mut fmt = std::process::Command::new("rustfmt")
+        .arg("--edition")
+        .arg("2021")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("rustfmt spawn failed: {e}"))?;
+    if let Some(mut stdin) = fmt.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(&show.stdout);
+    }
+    let output = fmt
+        .wait_with_output()
+        .map_err(|e| format!("rustfmt wait failed: {e}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn check_deps_unchanged(repo_dir: &Path, base: &str, head: &str) -> ClaimResult {
@@ -597,42 +660,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- no other changes: GREEN (reports files) ---
+    // --- no other changes: RED (standalone without ScopeFollowsDispatchSpec) ---
     #[test]
-    fn no_other_changes_green() {
-        let dir = setup_git_repo("noc_green");
+    fn no_other_changes_standalone_red() {
+        let dir = setup_git_repo("noc_standalone");
         let base = git_head(&dir);
         std::fs::write(dir.join("src.rs"), "fn main() { v2(); }\n").unwrap();
         git_commit(&dir, "update");
         let head = git_head(&dir);
         let r = verify(&dir, &base, &head, &[Claim::NoOtherChanges]);
-        // NoOtherChanges currently passes and reports files
-        assert!(r.ok);
-        assert!(r.results[0].detail.contains("src.rs"));
+        // B1: standalone NoOtherChanges → REJECT
+        assert!(
+            !r.ok,
+            "standalone no-other-changes should reject: {:?}",
+            r.results
+        );
+        assert!(r.results[0].detail.contains("scope follows dispatch spec"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- only formatting: GREEN (no .rs changes) ---
+    // --- only formatting: RED (non-.rs file changed) ---
     #[test]
-    fn only_formatting_green_no_rs() {
-        let dir = setup_git_repo("fmt_green");
+    fn only_formatting_red_non_rs() {
+        let dir = setup_git_repo("fmt_non_rs");
         let base = git_head(&dir);
         std::fs::write(dir.join("README.md"), "# hello\n").unwrap();
         git_commit(&dir, "add readme");
         let head = git_head(&dir);
         let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting]);
+        // B3: non-.rs files under "only formatting" → REJECT
         assert!(
-            r.ok,
-            "only formatting should pass with no .rs: {:?}",
+            !r.ok,
+            "only formatting with non-.rs should reject: {:?}",
             r.results
         );
+        assert!(r.results[0].detail.contains("non-.rs"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- scope follows dispatch spec: pass-through when no spec ---
+    // --- scope follows dispatch spec: RED when no spec found (fail-closed) ---
     #[test]
-    fn scope_follows_spec_passthrough() {
-        let dir = setup_git_repo("scope_pt");
+    fn scope_follows_spec_missing_red() {
+        let dir = setup_git_repo("scope_missing");
         let base = git_head(&dir);
         std::fs::write(dir.join("src.rs"), "fn v2() {}\n").unwrap();
         git_commit(&dir, "update");
@@ -645,8 +714,9 @@ mod tests {
                 task_id: "t-nonexistent".into(),
             }],
         );
-        // No dispatch spec → pass-through
-        assert!(r.ok, "scope spec should pass-through: {:?}", r.results);
+        // B2b: missing spec → fail-closed
+        assert!(!r.ok, "missing spec should reject: {:?}", r.results);
+        assert!(r.results[0].detail.contains("no entry found"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -664,6 +734,197 @@ mod tests {
         );
         assert!(r.ok);
         assert!(r.results[0].detail.contains("pass-through"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- B5: RED tests for reject paths ---
+
+    // B1: NoOtherChanges paired with ScopeFollowsDispatchSpec → passes (the NoOtherChanges part)
+    #[test]
+    fn no_other_changes_paired_with_scope_spec() {
+        let dir = setup_git_repo("noc_paired");
+        let base = git_head(&dir);
+        let head = base.clone(); // no changes
+        let r = verify(
+            &dir,
+            &base,
+            &head,
+            &[
+                Claim::NoOtherChanges,
+                Claim::ScopeFollowsDispatchSpec {
+                    task_id: "t-x".into(),
+                },
+            ],
+        );
+        // NoOtherChanges passes when paired (ScopeFollowsDispatchSpec may fail separately)
+        let noc_result = &r.results[0];
+        assert!(
+            noc_result.passed,
+            "paired NoOtherChanges should pass: {:?}",
+            noc_result
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // B2a: substring collision — spec allows "src/foo.rs" but "src/foo.rs.bak" modified → REJECT
+    #[test]
+    fn scope_spec_substring_collision_red() {
+        let dir = setup_git_repo("scope_substr");
+        let base = git_head(&dir);
+        // Create a file that is a substring-collision with "src.rs"
+        std::fs::write(dir.join("src.rs.bak"), "backup\n").unwrap();
+        git_commit(&dir, "add bak file");
+        let head = git_head(&dir);
+        // Set up dispatch tracking with allowed file "src.rs"
+        let home =
+            std::env::temp_dir().join(format!("agend-scope-substr-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let tracking = serde_json::json!({
+            "schema_version": 1,
+            "entries": [{"task_id": "t-substr", "allowed_files": ["src.rs"]}]
+        });
+        std::fs::write(
+            home.join("dispatch_tracking.json"),
+            serde_json::to_string(&tracking).unwrap(),
+        )
+        .unwrap();
+        std::env::set_var("AGEND_HOME", &home);
+        let r = verify(
+            &dir,
+            &base,
+            &head,
+            &[Claim::ScopeFollowsDispatchSpec {
+                task_id: "t-substr".into(),
+            }],
+        );
+        // B2a: "src.rs.bak" should NOT match spec "src.rs" — out of scope
+        assert!(!r.ok, "substring collision should reject: {:?}", r.results);
+        assert!(r.results[0].detail.contains("out-of-scope"));
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // B2: scope spec GREEN — in-scope file passes
+    #[test]
+    fn scope_spec_in_scope_green() {
+        let dir = setup_git_repo("scope_green");
+        let base = git_head(&dir);
+        std::fs::write(dir.join("src.rs"), "fn v2() {}\n").unwrap();
+        git_commit(&dir, "update src");
+        let head = git_head(&dir);
+        let home =
+            std::env::temp_dir().join(format!("agend-scope-green-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let tracking = serde_json::json!({
+            "schema_version": 1,
+            "entries": [{"task_id": "t-green", "allowed_files": ["src.rs"]}]
+        });
+        std::fs::write(
+            home.join("dispatch_tracking.json"),
+            serde_json::to_string(&tracking).unwrap(),
+        )
+        .unwrap();
+        std::env::set_var("AGEND_HOME", &home);
+        let r = verify(
+            &dir,
+            &base,
+            &head,
+            &[Claim::ScopeFollowsDispatchSpec {
+                task_id: "t-green".into(),
+            }],
+        );
+        assert!(r.ok, "in-scope file should pass: {:?}", r.results);
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // B2: scope spec RED — out-of-scope file
+    #[test]
+    fn scope_spec_out_of_scope_red() {
+        let dir = setup_git_repo("scope_oos");
+        let base = git_head(&dir);
+        std::fs::write(dir.join("other.rs"), "fn other() {}\n").unwrap();
+        git_commit(&dir, "add other");
+        let head = git_head(&dir);
+        let home =
+            std::env::temp_dir().join(format!("agend-scope-oos-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let tracking = serde_json::json!({
+            "schema_version": 1,
+            "entries": [{"task_id": "t-oos", "allowed_files": ["src.rs"]}]
+        });
+        std::fs::write(
+            home.join("dispatch_tracking.json"),
+            serde_json::to_string(&tracking).unwrap(),
+        )
+        .unwrap();
+        std::env::set_var("AGEND_HOME", &home);
+        let r = verify(
+            &dir,
+            &base,
+            &head,
+            &[Claim::ScopeFollowsDispatchSpec {
+                task_id: "t-oos".into(),
+            }],
+        );
+        assert!(!r.ok, "out-of-scope should reject: {:?}", r.results);
+        assert!(r.results[0].detail.contains("out-of-scope"));
+        std::env::remove_var("AGEND_HOME");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // B3: only formatting RED — logic change in .rs file
+    #[test]
+    fn only_formatting_logic_change_red() {
+        let dir = setup_git_repo("fmt_logic");
+        let base = git_head(&dir);
+        // Change logic, not just formatting
+        std::fs::write(dir.join("src.rs"), "fn main() { new_logic(); }\n").unwrap();
+        git_commit(&dir, "logic change");
+        let head = git_head(&dir);
+        let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting]);
+        assert!(
+            !r.ok,
+            "logic change should reject only-formatting: {:?}",
+            r.results
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // B3: only formatting GREEN — pure whitespace/fmt change
+    #[test]
+    fn only_formatting_pure_fmt_green() {
+        let dir = setup_git_repo("fmt_pure");
+        let base = git_head(&dir);
+        // Change only formatting (add trailing whitespace that rustfmt normalizes)
+        std::fs::write(dir.join("src.rs"), "fn  main(  )  {  }\n").unwrap();
+        git_commit(&dir, "fmt change");
+        let head = git_head(&dir);
+        let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting]);
+        assert!(r.ok, "pure fmt change should pass: {:?}", r.results);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // B4: byte-equal with empty paths → RED
+    #[test]
+    fn byte_equal_no_paths_red() {
+        let dir = setup_git_repo("byte_no_paths");
+        let base = git_head(&dir);
+        let head = base.clone();
+        let r = verify(
+            &dir,
+            &base,
+            &head,
+            &[Claim::ByteEqualVerified { paths: vec![] }],
+        );
+        assert!(
+            !r.ok,
+            "byte-equal with no paths should reject: {:?}",
+            r.results
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

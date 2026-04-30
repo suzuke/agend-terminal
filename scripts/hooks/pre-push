@@ -33,21 +33,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         base="$remote_sha"
     fi
 
-    # Extract claim text from the latest commit's message.
-    # Look for a "Claim:" trailer or lines containing claim keywords.
+    # Extract claim text from the latest commit's "Claim:" trailer only.
+    # Incidental prose containing claim keywords must NOT trigger verification.
     commit_msg=$(git log -1 --format=%B "$local_sha")
     claim_text=""
 
-    # Try trailer first: "Claim: <text>"
+    # Trailer-only: "Claim: <text>"
     trailer=$(echo "$commit_msg" | grep -i '^Claim:' | sed 's/^[Cc]laim:[[:space:]]*//' || true)
     if [ -n "$trailer" ]; then
         claim_text="$trailer"
-    else
-        # Fallback: scan for known claim phrases in the commit message
-        phrases=$(echo "$commit_msg" | grep -iE '(no other changes|byte-equal verified|scope follows dispatch spec|only formatting|deps unchanged)' || true)
-        if [ -n "$phrases" ]; then
-            claim_text="$phrases"
-        fi
     fi
 
     # If no claim text found, skip verification (no claims to check)
