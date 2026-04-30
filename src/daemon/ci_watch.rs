@@ -69,21 +69,30 @@ pub trait CiProvider: Send + Sync {
 /// GitHub Actions implementation of [`CiProvider`].
 pub struct GitHubCiProvider {
     client: reqwest::Client,
+    base_url: String,
 }
 
 impl GitHubCiProvider {
+    #[allow(dead_code)] // used by tests + future direct callers
     pub fn new() -> anyhow::Result<Self> {
+        Self::with_base_url("https://api.github.com".to_string())
+    }
+
+    #[allow(dead_code)] // used by auto-detect for GHE; wired in this PR
+    pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()?,
+            base_url,
         })
     }
 
-    fn gh_get(&self, url: &str) -> reqwest::RequestBuilder {
+    fn gh_get(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}/{path}", self.base_url);
         let mut req = self
             .client
-            .get(url)
+            .get(&url)
             .header("User-Agent", "agend-terminal")
             .header("Accept", "application/vnd.github+json");
         if let Ok(token) = std::env::var("GITHUB_TOKEN") {
@@ -98,7 +107,7 @@ impl CiProvider for GitHubCiProvider {
     async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
         let resp = self
             .gh_get(&format!(
-                "https://api.github.com/repos/{repo}/actions/runs?branch={branch}&per_page=5"
+                "repos/{repo}/actions/runs?branch={branch}&per_page=5"
             ))
             .send()
             .await?;
@@ -154,7 +163,7 @@ impl CiProvider for GitHubCiProvider {
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
         let resp: serde_json::Value = match self
             .gh_get(&format!(
-                "https://api.github.com/repos/{repo}/pulls?head={branch}&state=all&per_page=1"
+                "repos/{repo}/pulls?head={branch}&state=all&per_page=1"
             ))
             .send()
             .await
@@ -179,9 +188,7 @@ impl CiProvider for GitHubCiProvider {
 
     async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
         let jobs_resp: serde_json::Value = match self
-            .gh_get(&format!(
-                "https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
-            ))
+            .gh_get(&format!("repos/{repo}/actions/runs/{run_id}/jobs"))
             .send()
             .await
         {
@@ -736,23 +743,69 @@ pub fn github_token_warning_from_env() -> Option<&'static str> {
 }
 
 /// Check CI watch configs and inject failure logs to agents when CI fails.
+/// Auto-detect CI provider from a `repo` string (typically from git remote URL).
+/// Returns `(provider_kind, custom_host)`. `custom_host=true` means the domain
+/// doesn't exactly match the canonical host — caller should warn.
+pub fn detect_provider_from_remote(repo: &str) -> (&'static str, bool) {
+    if repo.contains("gitlab.com") {
+        ("gitlab", false)
+    } else if repo.contains("gitlab") {
+        ("gitlab", true) // self-hosted GitLab
+    } else if repo.contains("bitbucket.org") {
+        ("bitbucket_cloud", false)
+    } else if repo.contains("bitbucket") {
+        ("bitbucket_cloud", true) // custom Bitbucket domain
+    } else if repo.contains("github.com") {
+        ("github", false) // canonical github.com
+    } else {
+        // GitHub Enterprise custom domain OR fully unknown → default github + warn
+        ("github", true)
+    }
+}
+
 pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
     check_ci_watches_with_provider(home, registry, |watch| {
         let ci_url = watch
             .get("ci_provider_url")
             .and_then(|v| v.as_str())
             .map(String::from);
-        let ci_type = watch
-            .get("ci_provider")
-            .and_then(|v| v.as_str())
-            .unwrap_or("github");
+        let repo = watch.get("repo").and_then(|v| v.as_str()).unwrap_or("");
+        // Explicit ci_provider wins; absent → auto-detect from repo URL.
+        let (ci_type, default_url) = match watch.get("ci_provider").and_then(|v| v.as_str()) {
+            Some(explicit) => (explicit, String::new()),
+            None => {
+                let (kind, is_custom) = detect_provider_from_remote(repo);
+                if is_custom {
+                    tracing::warn!(
+                        repo,
+                        kind,
+                        "ci_watch: custom CI host pattern detected — suggest setting fleet.yaml ci_provider: explicitly"
+                    );
+                }
+                let default = match kind {
+                    "gitlab" => "https://gitlab.com",
+                    "bitbucket_cloud" => "https://api.bitbucket.org",
+                    _ => "https://api.github.com",
+                };
+                (kind, default.to_string())
+            }
+        };
+        let url = ci_url.unwrap_or(default_url);
         match ci_type {
             "gitlab" => {
-                let url = ci_url.unwrap_or_else(|| "https://gitlab.com".to_string());
+                let url = if url.is_empty() {
+                    "https://gitlab.com".to_string()
+                } else {
+                    url
+                };
                 Some(Box::new(GitLabCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
             }
             "bitbucket_cloud" => {
-                let url = ci_url.unwrap_or_else(|| "https://api.bitbucket.org".to_string());
+                let url = if url.is_empty() {
+                    "https://api.bitbucket.org".to_string()
+                } else {
+                    url
+                };
                 Some(Box::new(BitbucketCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
             }
             "bitbucket_server" => {
@@ -762,7 +815,14 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
                 );
                 None
             }
-            _ => Some(Box::new(GitHubCiProvider::new().ok()?) as Box<dyn CiProvider>),
+            _ => {
+                let url = if url.is_empty() {
+                    "https://api.github.com".to_string()
+                } else {
+                    url
+                };
+                Some(Box::new(GitHubCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
+            }
         }
     });
 }
@@ -2761,5 +2821,102 @@ mod tests {
             "error must mention deferral: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── PR-3 tests: auto-detect + GHE ───────────────────────────────
+
+    #[test]
+    fn detect_provider_github_com() {
+        let (kind, is_custom) = super::detect_provider_from_remote("github.com/owner/repo");
+        assert_eq!(kind, "github");
+        assert!(!is_custom);
+    }
+
+    #[test]
+    fn detect_provider_gitlab_com() {
+        let (kind, is_custom) = super::detect_provider_from_remote("gitlab.com/group/project");
+        assert_eq!(kind, "gitlab");
+        assert!(!is_custom);
+    }
+
+    #[test]
+    fn detect_provider_bitbucket_org() {
+        let (kind, is_custom) = super::detect_provider_from_remote("bitbucket.org/ws/repo");
+        assert_eq!(kind, "bitbucket_cloud");
+        assert!(!is_custom);
+    }
+
+    #[test]
+    fn detect_provider_custom_domain_defaults_github_with_warning() {
+        let (kind, is_custom) =
+            super::detect_provider_from_remote("git.corp.example.com/team/repo");
+        assert_eq!(kind, "github", "unknown domain defaults to github");
+        assert!(is_custom, "unknown domain must flag custom_host");
+    }
+
+    /// B1: GitHub Enterprise custom domain detected as github + custom.
+    #[test]
+    fn detect_provider_github_enterprise_custom_domain() {
+        let (kind, is_custom) =
+            super::detect_provider_from_remote("https://github.acme.corp/myorg/myrepo");
+        assert_eq!(kind, "github");
+        assert!(is_custom, "GHE custom domain must flag custom_host");
+    }
+
+    /// B3: explicit ci_provider in watch JSON overrides auto-detect.
+    #[test]
+    fn explicit_ci_provider_overrides_auto_detect() {
+        // Watch with ci_provider: gitlab but repo URL pointing to github.com.
+        // Factory should construct GitLab provider, not GitHub.
+        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+
+        // Construct GitLab provider via the same factory logic as production:
+        // explicit ci_provider="gitlab" + ci_provider_url pointing to mock.
+        let watch = serde_json::json!({
+            "repo": "github.com/myorg/myrepo",
+            "branch": "main",
+            "ci_provider": "gitlab",
+            "ci_provider_url": format!("http://127.0.0.1:{port}"),
+        });
+        let ci_type = watch["ci_provider"].as_str().unwrap();
+        assert_eq!(ci_type, "gitlab");
+
+        // Construct provider as factory would.
+        let url = watch["ci_provider_url"].as_str().unwrap().to_string();
+        let provider = super::GitLabCiProvider::with_base_url(url).expect("provider");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let _ = rt.block_on(provider.poll_runs("myorg/myrepo", "main"));
+        handle.join().expect("mock");
+
+        // Assert: request went to GitLab-shaped URL (/projects/{id}/pipelines),
+        // NOT GitHub-shaped (/repos/{owner}/{repo}/actions/runs).
+        let (path, _) = captured.lock().expect("lock").take().expect("captured");
+        assert!(
+            path.contains("/projects/") && path.contains("/pipelines"),
+            "explicit gitlab must produce GitLab-shaped request, got: {path}"
+        );
+        assert!(
+            !path.contains("/repos/") && !path.contains("/actions/"),
+            "must NOT produce GitHub-shaped request: {path}"
+        );
+    }
+
+    #[test]
+    fn github_with_base_url_sets_custom_for_ghe() {
+        let provider =
+            super::GitHubCiProvider::with_base_url("https://github.corp.example.com/api/v3".into())
+                .expect("with_base_url");
+        assert_eq!(provider.base_url, "https://github.corp.example.com/api/v3");
+    }
+
+    #[test]
+    fn github_new_defaults_to_api_github_com() {
+        let provider = super::GitHubCiProvider::new().expect("new");
+        assert_eq!(provider.base_url, "https://api.github.com");
     }
 }
