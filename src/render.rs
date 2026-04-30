@@ -232,7 +232,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
 /// Split an area into two child rects that overlap by 1 cell on the split axis
 /// so siblings share a border column/row. Mirrors `layout::split_child_areas`
 /// — keep the two in sync (both produce overlap-by-1 results).
-fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] {
+pub(crate) fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] {
     let total = match dir {
         SplitDir::Horizontal => area.height,
         SplitDir::Vertical => area.width,
@@ -259,69 +259,6 @@ fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] {
                 Rect::new(area.x, area.y, first_size, area.height),
                 Rect::new(second_x, area.y, second_w, area.height),
             ]
-        }
-    }
-}
-
-/// Resize pass — sync VTerm + PTY sizes to match render layout.
-/// Call this after terminal resize, split/close, zoom toggle, or tab switch.
-pub fn resize_panes(pane_area: Rect, layout: &mut Layout, registry: &AgentRegistry) {
-    let tab = match layout.tabs.get_mut(layout.active) {
-        Some(t) => t,
-        None => return,
-    };
-    let mut resizes: Vec<(usize, u16, u16)> = Vec::new();
-    if tab.zoomed {
-        let focus_id = tab.focus_id;
-        if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
-            let w = pane_area.width.saturating_sub(2);
-            let h = pane_area.height.saturating_sub(2);
-            if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
-                pane.vterm.resize(w, h);
-                resizes.push((pane.id, w, h));
-            }
-        }
-    } else {
-        let mut rects = std::mem::take(&mut tab.pane_rects);
-        rects.clear();
-        collect_resize_needs(pane_area, tab.root_mut(), &mut rects, &mut resizes);
-        tab.pane_rects = rects;
-    }
-    // Dispatch PTY / bridge resize via `Pane::resize_pty` — local panes hit
-    // the registry, remote panes push through their BridgeClient.
-    for (id, cols, rows) in &resizes {
-        if let Some(pane) = tab.root().find_pane(*id) {
-            pane.resize_pty(registry, *cols, *rows);
-        }
-    }
-}
-
-/// Collect (pane_id, width, height) for all panes that need resizing.
-fn collect_resize_needs(
-    area: Rect,
-    node: &mut PaneNode,
-    rects: &mut std::collections::HashMap<usize, (u16, u16, u16, u16)>,
-    resizes: &mut Vec<(usize, u16, u16)>,
-) {
-    match node {
-        PaneNode::Leaf(pane) => {
-            rects.insert(pane.id, (area.x, area.y, area.width, area.height));
-            let w = area.width.saturating_sub(2);
-            let h = area.height.saturating_sub(2);
-            if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
-                pane.vterm.resize(w, h);
-                resizes.push((pane.id, w, h));
-            }
-        }
-        PaneNode::Split {
-            dir,
-            ratio,
-            first,
-            second,
-        } => {
-            let [c0, c1] = split_chunks(area, dir, *ratio);
-            collect_resize_needs(c0, first, rects, resizes);
-            collect_resize_needs(c1, second, rects, resizes);
         }
     }
 }
@@ -1911,7 +1848,7 @@ pub fn render_scratch_shell(
     pane.drain_output();
 
     // Resize VTerm + PTY if the floating box shape changed. Panes in the
-    // layout go through `render::resize_panes` on Event::Resize; overlay
+    // layout go through `layout::resize_panes` on Event::Resize; overlay
     // panes aren't in the layout, so we reconcile here on each draw.
     if inner.width != pane.vterm.cols() || inner.height != pane.vterm.rows() {
         pane.vterm.resize(inner.width, inner.height);

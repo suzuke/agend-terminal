@@ -1359,6 +1359,70 @@ impl Layout {
     }
 }
 
+/// Resize all panes in the active tab to fit the given area.
+/// Dispatches PTY resize I/O for panes whose dimensions changed.
+pub fn resize_panes(
+    pane_area: ratatui::layout::Rect,
+    layout: &mut Layout,
+    registry: &crate::agent::AgentRegistry,
+) {
+    let tab = match layout.tabs.get_mut(layout.active) {
+        Some(t) => t,
+        None => return,
+    };
+    let mut resizes: Vec<(usize, u16, u16)> = Vec::new();
+    if tab.zoomed {
+        let focus_id = tab.focus_id;
+        if let Some(pane) = tab.root_mut().find_pane_mut(focus_id) {
+            let w = pane_area.width.saturating_sub(2);
+            let h = pane_area.height.saturating_sub(2);
+            if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
+                pane.vterm.resize(w, h);
+                resizes.push((pane.id, w, h));
+            }
+        }
+    } else {
+        let mut rects = std::mem::take(&mut tab.pane_rects);
+        rects.clear();
+        collect_resize_needs(pane_area, tab.root_mut(), &mut rects, &mut resizes);
+        tab.pane_rects = rects;
+    }
+    for (id, cols, rows) in &resizes {
+        if let Some(pane) = tab.root().find_pane(*id) {
+            pane.resize_pty(registry, *cols, *rows);
+        }
+    }
+}
+
+fn collect_resize_needs(
+    area: ratatui::layout::Rect,
+    node: &mut PaneNode,
+    rects: &mut std::collections::HashMap<usize, (u16, u16, u16, u16)>,
+    resizes: &mut Vec<(usize, u16, u16)>,
+) {
+    match node {
+        PaneNode::Leaf(pane) => {
+            rects.insert(pane.id, (area.x, area.y, area.width, area.height));
+            let w = area.width.saturating_sub(2);
+            let h = area.height.saturating_sub(2);
+            if w > 0 && h > 0 && (w != pane.vterm.cols() || h != pane.vterm.rows()) {
+                pane.vterm.resize(w, h);
+                resizes.push((pane.id, w, h));
+            }
+        }
+        PaneNode::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            let [c0, c1] = crate::render::split_chunks(area, dir, *ratio);
+            collect_resize_needs(c0, first, rects, resizes);
+            collect_resize_needs(c1, second, rects, resizes);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
