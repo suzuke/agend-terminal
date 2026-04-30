@@ -1,0 +1,11 @@
+{
+  "values": [
+    {
+      "id": 1,
+      "title": "Feature branch",
+      "state": "MERGED",
+      "source": {"branch": {"name": "feat/test"}},
+      "destination": {"branch": {"name": "main"}}
+    }
+  ]
+}

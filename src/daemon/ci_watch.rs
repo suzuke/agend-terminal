@@ -433,6 +433,195 @@ impl CiProvider for GitLabCiProvider {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bitbucket Cloud CI provider
+// ---------------------------------------------------------------------------
+
+/// Bitbucket Cloud Pipelines implementation of [`CiProvider`].
+/// Cloud-only MVP per Sprint 39 §11 #1; Bitbucket Server deferred to Sprint 41+.
+pub struct BitbucketCiProvider {
+    client: reqwest::Client,
+    base_url: String,
+}
+
+#[allow(dead_code)] // Constructors wired in Sprint 39 PR-3
+impl BitbucketCiProvider {
+    pub fn new() -> anyhow::Result<Self> {
+        Self::with_base_url("https://api.bitbucket.org".to_string())
+    }
+
+    pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
+            base_url,
+        })
+    }
+
+    /// Resolve Bitbucket auth via fallback chain:
+    /// 1. BITBUCKET_TOKEN env (format: "user:app_password")
+    /// 2. ~/.config/bb/config (Bitbucket CLI config)
+    fn resolve_token() -> Option<String> {
+        if let Ok(token) = std::env::var("BITBUCKET_TOKEN") {
+            return Some(token);
+        }
+        let home = std::env::var("HOME").ok()?;
+        let config_path = std::path::PathBuf::from(home)
+            .join(".config")
+            .join("bb")
+            .join("config");
+        let content = std::fs::read_to_string(config_path).ok()?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(token) = trimmed.strip_prefix("token:") {
+                let token = token.trim().to_string();
+                if !token.is_empty() {
+                    return Some(token);
+                }
+            }
+        }
+        None
+    }
+
+    fn bb_get(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}/2.0/{path}", self.base_url);
+        let mut req = self.client.get(&url).header("User-Agent", "agend-terminal");
+        if let Some(token) = Self::resolve_token() {
+            // token format: "user:app_password" → reqwest basic_auth
+            let parts: Vec<&str> = token.splitn(2, ':').collect();
+            if parts.len() == 2 {
+                req = req.basic_auth(parts[0], Some(parts[1]));
+            } else {
+                // Treat as bearer token if no colon separator.
+                req = req.bearer_auth(&token);
+            }
+        }
+        req
+    }
+}
+
+#[async_trait::async_trait]
+impl CiProvider for BitbucketCiProvider {
+    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
+        let resp = self
+            .bb_get(&format!(
+                "repositories/{repo}/pipelines/?target.branch={branch}&pagelen=5&sort=-created_on"
+            ))
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let body: serde_json::Value = resp.json().await?;
+
+        if !(200..300).contains(&status) {
+            let message = body["error"]["message"]
+                .as_str()
+                .unwrap_or("(no message)")
+                .to_string();
+            return Ok(CiPollResult::ApiError {
+                status,
+                message: format!("Bitbucket API {status}: {message}"),
+                rate_limit_reset: None,
+            });
+        }
+
+        let runs = body["values"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        let state = r["state"]["name"].as_str()?;
+                        let conclusion = match state {
+                            "COMPLETED" => {
+                                let result = r["state"]["result"]["name"].as_str()?;
+                                Some(match result {
+                                    "SUCCESSFUL" => "success".to_string(),
+                                    "FAILED" => "failure".to_string(),
+                                    "STOPPED" => "cancelled".to_string(),
+                                    other => other.to_lowercase(),
+                                })
+                            }
+                            _ => None, // RUNNING/PENDING → in-progress
+                        };
+                        Some(CiRun {
+                            id: r["build_number"].as_u64()?,
+                            conclusion,
+                            head_sha: r["target"]["commit"]["hash"].as_str()?.to_string(),
+                            url: r["links"]["html"]["href"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(CiPollResult::Runs(runs))
+    }
+
+    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
+        let resp: serde_json::Value = match self
+            .bb_get(&format!(
+                "repositories/{repo}/pullrequests?q=source.branch.name=\"{branch}\"&pagelen=1"
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return PrState::Unknown,
+            },
+            Err(_) => return PrState::Unknown,
+        };
+        match resp["values"].as_array().and_then(|a| a.first()) {
+            Some(pr) => match pr["state"].as_str() {
+                Some("MERGED") => PrState::Terminal { merged: true },
+                Some("DECLINED") | Some("SUPERSEDED") => PrState::Terminal { merged: false },
+                Some("OPEN") => PrState::Open,
+                _ => PrState::Unknown,
+            },
+            None => PrState::Unknown,
+        }
+    }
+
+    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
+        // Bitbucket uses pipeline UUID for steps, but we store build_number.
+        // Steps endpoint: GET /repositories/{repo}/pipelines/{pipeline_uuid}/steps/
+        // Since we have build_number, use it as pipeline selector.
+        let steps_resp: serde_json::Value = match self
+            .bb_get(&format!(
+                "repositories/{repo}/pipelines/{run_id}/steps/?pagelen=20"
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return "unknown step".to_string(),
+            },
+            Err(_) => return "unknown step".to_string(),
+        };
+        steps_resp["values"]
+            .as_array()
+            .and_then(|steps| {
+                steps.iter().find_map(|step| {
+                    let result = step["state"]["result"]["name"].as_str()?;
+                    (result == "FAILED").then(|| step["name"].as_str().unwrap_or("?").to_string())
+                })
+            })
+            .unwrap_or_else(|| "unknown step".to_string())
+    }
+
+    fn token_warning(&self) -> Option<&'static str> {
+        if Self::resolve_token().is_some() {
+            None
+        } else {
+            Some("BITBUCKET_TOKEN not set and bb CLI config not found — API calls may fail for private repos")
+        }
+    }
+}
+
 /// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
 pub const WATCH_TTL_HOURS: i64 = 72;
 
@@ -524,11 +713,20 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
             .get("ci_provider_url")
             .and_then(|v| v.as_str())
             .map(String::from);
-        match ci_url {
-            Some(url) => {
+        let ci_type = watch
+            .get("ci_provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("github");
+        match ci_type {
+            "gitlab" => {
+                let url = ci_url.unwrap_or_else(|| "https://gitlab.com".to_string());
                 Some(Box::new(GitLabCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
             }
-            None => Some(Box::new(GitHubCiProvider::new().ok()?) as Box<dyn CiProvider>),
+            "bitbucket_cloud" => {
+                let url = ci_url.unwrap_or_else(|| "https://api.bitbucket.org".to_string());
+                Some(Box::new(BitbucketCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
+            }
+            _ => Some(Box::new(GitHubCiProvider::new().ok()?) as Box<dyn CiProvider>),
         }
     });
 }
@@ -2234,5 +2432,168 @@ mod tests {
 
         std::fs::remove_dir_all(&temp).ok();
         // guard drop restores HOME + GITLAB_TOKEN
+    }
+
+    // ── Bitbucket Cloud CiProvider tests (Sprint 39 PR-2) ───────────
+
+    /// Env guard for BITBUCKET_TOKEN + HOME (mirrors GitlabTokenGuard).
+    struct BitbucketTokenGuard {
+        prev_token: Option<std::ffi::OsString>,
+        prev_home: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    static BB_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    impl BitbucketTokenGuard {
+        fn clear() -> Self {
+            let lock = BB_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_token = std::env::var_os("BITBUCKET_TOKEN");
+            let prev_home = std::env::var_os("HOME");
+            std::env::remove_var("BITBUCKET_TOKEN");
+            Self {
+                prev_token,
+                prev_home,
+                _lock: lock,
+            }
+        }
+        fn set(val: &str) -> Self {
+            let lock = BB_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_token = std::env::var_os("BITBUCKET_TOKEN");
+            let prev_home = std::env::var_os("HOME");
+            std::env::set_var("BITBUCKET_TOKEN", val);
+            Self {
+                prev_token,
+                prev_home,
+                _lock: lock,
+            }
+        }
+    }
+    impl Drop for BitbucketTokenGuard {
+        fn drop(&mut self) {
+            match &self.prev_token {
+                Some(v) => std::env::set_var("BITBUCKET_TOKEN", v),
+                None => std::env::remove_var("BITBUCKET_TOKEN"),
+            }
+            if let Some(v) = &self.prev_home {
+                std::env::set_var("HOME", v);
+            }
+        }
+    }
+
+    /// Reuse gitlab_mock_server for Bitbucket (same raw TCP pattern).
+    /// §3.5.10: poll_runs parses Bitbucket pipelines response.
+    #[test]
+    fn bitbucket_poll_runs_parses_pipelines() {
+        let fixture = include_str!("../../tests/fixtures/bitbucket-pipelines-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+        let provider =
+            super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+                .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let result = rt.block_on(provider.poll_runs("foo/bar", "main"));
+        handle.join().expect("mock");
+        let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+        assert!(
+            path.contains("/repositories/foo/bar/pipelines"),
+            "path: {path}"
+        );
+        assert!(path.contains("target.branch=main"), "query: {path}");
+        let runs = match result.expect("poll_runs") {
+            super::CiPollResult::Runs(r) => r,
+            other => panic!("expected Runs, got: {other:?}"),
+        };
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].conclusion, Some("success".to_string()));
+        assert_eq!(runs[1].conclusion, Some("failure".to_string()));
+    }
+
+    /// §3.5.10: check_pr_terminal parses Bitbucket PR state.
+    #[test]
+    fn bitbucket_check_pr_terminal_merged() {
+        let fixture = include_str!("../../tests/fixtures/bitbucket-pullrequests-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+        let provider =
+            super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+                .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let state = rt.block_on(provider.check_pr_terminal("foo/bar", "feat/test"));
+        handle.join().expect("mock");
+        let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+        assert!(path.contains("/pullrequests"), "path: {path}");
+        assert!(
+            matches!(state, super::PrState::Terminal { merged: true }),
+            "got: {state:?}"
+        );
+    }
+
+    /// §3.5.10: fetch_failure_summary finds failed step.
+    #[test]
+    fn bitbucket_fetch_failure_summary_finds_failed_step() {
+        let fixture = include_str!("../../tests/fixtures/bitbucket-steps-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+        let provider =
+            super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+                .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 48));
+        handle.join().expect("mock");
+        let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+        assert!(path.contains("/pipelines/48/steps"), "path: {path}");
+        assert_eq!(summary, "Test");
+    }
+
+    /// Auth state 1: BITBUCKET_TOKEN env → Basic auth header.
+    #[test]
+    fn bitbucket_auth_env_token_sends_basic_header() {
+        let fixture = include_str!("../../tests/fixtures/bitbucket-pipelines-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+        let _guard = BitbucketTokenGuard::set("user:app_pass");
+        let provider =
+            super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+                .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let _ = rt.block_on(provider.poll_runs("foo/bar", "main"));
+        handle.join().expect("mock");
+        let (_, request) = captured.lock().expect("lock").take().expect("captured");
+        assert!(
+            request.contains("authorization: Basic") || request.contains("Authorization: Basic"),
+            "must send Basic auth: {request}"
+        );
+    }
+
+    /// Auth state 3: no token → warning.
+    #[test]
+    fn bitbucket_token_warning_when_no_token() {
+        let _guard = BitbucketTokenGuard::clear();
+        let provider = super::BitbucketCiProvider::new().expect("provider");
+        let warning = provider.token_warning();
+        assert!(warning.is_some());
+        assert!(warning.expect("w").contains("BITBUCKET_TOKEN"));
+    }
+
+    /// Smoke: constructors.
+    #[test]
+    fn bitbucket_new_defaults_to_api_bitbucket_org() {
+        let provider = super::BitbucketCiProvider::new().expect("new");
+        assert_eq!(provider.base_url, "https://api.bitbucket.org");
+    }
+
+    #[test]
+    fn bitbucket_with_base_url_sets_custom() {
+        let provider =
+            super::BitbucketCiProvider::with_base_url("https://bb.corp.example.com".into())
+                .expect("with_base_url");
+        assert_eq!(provider.base_url, "https://bb.corp.example.com");
     }
 }

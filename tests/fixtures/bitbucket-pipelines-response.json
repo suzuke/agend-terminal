@@ -1,0 +1,18 @@
+{
+  "values": [
+    {
+      "uuid": "{abc-123}",
+      "build_number": 47,
+      "state": {"name": "COMPLETED", "result": {"name": "SUCCESSFUL"}},
+      "target": {"commit": {"hash": "a91957a858320c0e17f3a0eca7cfacbff50ea29a"}, "ref_name": "main"},
+      "links": {"html": {"href": "https://bitbucket.org/foo/bar/pipelines/results/47"}}
+    },
+    {
+      "uuid": "{def-456}",
+      "build_number": 48,
+      "state": {"name": "COMPLETED", "result": {"name": "FAILED"}},
+      "target": {"commit": {"hash": "eb94b618fb5865b26e80fdd8ae531b7a63ad851a"}, "ref_name": "main"},
+      "links": {"html": {"href": "https://bitbucket.org/foo/bar/pipelines/results/48"}}
+    }
+  ]
+}
