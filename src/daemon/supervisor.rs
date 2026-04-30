@@ -13,15 +13,42 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::channel::NotifySeverity;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How often the supervisor wakes to scan the registry.
 const TICK: Duration = Duration::from_secs(10);
 /// Vterm tail size pushed to Telegram when a stall is detected.
 const TAIL_LINES: usize = 40;
+/// Debounce cooldown for member-state-change notify (Sprint 43).
+const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Per-agent notify tracking: last notify time + consecutive error count.
+pub(crate) struct NotifyTrack {
+    last_at: Instant,
+    consecutive: u32,
+}
+
+/// Parse unlock time from usage_limit pane output (e.g., "resets at 15:14 UTC").
+fn parse_unlock_at(pane_text: &str) -> Option<String> {
+    // Common patterns: "resets at HH:MM", "try again after HH:MM", "limit resets HH:MM"
+    for line in pane_text.lines().rev() {
+        let lower = line.to_lowercase();
+        if lower.contains("reset") || lower.contains("try again") || lower.contains("limit") {
+            // Extract time-like pattern HH:MM
+            if let Some(idx) = lower.find(|c: char| c.is_ascii_digit()) {
+                let rest = &line[idx..];
+                if rest.len() >= 5 && rest.as_bytes()[2] == b':' {
+                    return Some(rest[..5].to_string());
+                }
+            }
+        }
+    }
+    None
+}
 
 /// Spawn the supervisor thread. Idempotent per process is the caller's
 /// responsibility — in practice each entry point calls it exactly once.
@@ -37,14 +64,108 @@ pub fn spawn(home: PathBuf, registry: AgentRegistry) {
 }
 
 fn run_loop(home: PathBuf, registry: AgentRegistry) {
+    let mut notify_tracks: HashMap<String, NotifyTrack> = HashMap::new();
     loop {
         thread::sleep(TICK);
-        tick(&home, &registry);
+        tick(&home, &registry, &mut notify_tracks);
     }
 }
 
+/// Decide and dispatch member-state-change notify. Returns true if notify sent.
+/// Production-path-coupled per §3.5.10 — tests call this same function.
+pub(crate) fn maybe_notify_member_state_change(
+    home: &std::path::Path,
+    name: &str,
+    prev_state: crate::state::AgentState,
+    new_state: crate::state::AgentState,
+    pane_tail: &str,
+    tracks: &mut HashMap<String, NotifyTrack>,
+) -> bool {
+    if prev_state == new_state || !new_state.is_notify_error_class() {
+        return false;
+    }
+    let now = Instant::now();
+    let should = tracks
+        .get(name)
+        .is_none_or(|t| now.duration_since(t.last_at) >= NOTIFY_COOLDOWN);
+    if !should {
+        return false;
+    }
+    let Some(team) = crate::teams::find_team_for(home, name) else {
+        return false;
+    };
+    let Some(ref orch) = team.orchestrator else {
+        tracing::warn!(agent = %name, team = %team.name, "member-state-change: team has no orchestrator — notify dropped");
+        return false;
+    };
+    if orch == name {
+        return false; // D3: skip self-notify
+    }
+    let unlock_at = if new_state == crate::state::AgentState::UsageLimit {
+        parse_unlock_at(pane_tail)
+    } else {
+        None
+    };
+    let track = tracks.entry(name.to_string()).or_insert(NotifyTrack {
+        last_at: now,
+        consecutive: 0,
+    });
+    track.consecutive += 1;
+    track.last_at = now;
+    let payload = serde_json::json!({
+        "type": "member_state_change",
+        "member": name,
+        "team": team.name,
+        "from_state": prev_state.display_name(),
+        "to_state": new_state.display_name(),
+        "detected_at": chrono::Utc::now().to_rfc3339(),
+        "context": {
+            "last_pane_excerpt": pane_tail,
+            "unlock_at": unlock_at,
+            "consecutive_count": track.consecutive,
+        }
+    });
+    let msg = crate::inbox::InboxMessage {
+        schema_version: 0,
+        id: None,
+        read_at: None,
+        thread_id: None,
+        parent_id: None,
+        task_id: None,
+        force_meta: None,
+        correlation_id: None,
+        reviewed_head: None,
+        from: "system:supervisor".to_string(),
+        text: payload.to_string(),
+        kind: Some("member_state_change".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        channel: None,
+        delivery_mode: None,
+        attachments: vec![],
+        in_reply_to_msg_id: None,
+        in_reply_to_excerpt: None,
+    };
+    let _ = crate::inbox::enqueue(home, orch, msg);
+    crate::inbox::notify_agent(
+        home,
+        orch,
+        &crate::inbox::NotifySource::System("supervisor"),
+        &format!(
+            "[member_state_change] {name}: {} → {}",
+            prev_state.display_name(),
+            new_state.display_name()
+        ),
+    );
+    tracing::info!(agent = %name, from = prev_state.display_name(), to = new_state.display_name(), orchestrator = %orch, "member-state-change notify sent");
+    true
+}
+
 /// One iteration of the supervisor loop. Public for tests.
-fn tick(home: &std::path::Path, registry: &AgentRegistry) {
+fn tick(
+    home: &std::path::Path,
+    registry: &AgentRegistry,
+    notify_tracks: &mut HashMap<String, NotifyTrack>,
+) {
     // Snapshot the agent names + handles so we can release the registry lock
     // before touching any per-agent core lock. Holding both at once risks
     // deadlocks against code paths that take core then registry.
@@ -90,7 +211,22 @@ fn tick(home: &std::path::Path, registry: &AgentRegistry) {
 
             // Expire stale latched states (ToolUse/Thinking) that feed()
             // can't reach when the agent goes quiet (no PTY output).
+            let prev_state = core.state.current;
             core.state.tick();
+
+            // Sprint 43: member-state-change notify to orchestrator.
+            let new_state = core.state.current;
+            if prev_state != new_state && new_state.is_notify_error_class() {
+                let pane_tail = core.vterm.tail_lines(10);
+                maybe_notify_member_state_change(
+                    home,
+                    &name,
+                    prev_state,
+                    new_state,
+                    &pane_tail,
+                    notify_tracks,
+                );
+            }
 
             // §4.4 stale decay: clear waiting_on when heartbeat is stale.
             clear_waiting_on_if_stale(home, &name, !core.state.is_heartbeat_fresh());
@@ -430,5 +566,152 @@ mod tests {
             "unrelated `role` must survive the batch write"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 43: member-state-change notify tests ──────────────────
+
+    /// is_notify_error_class matches exactly the GO-NARROW 6 states.
+    #[test]
+    fn is_notify_error_class_matches_go_narrow_6() {
+        use crate::state::AgentState;
+        assert!(AgentState::UsageLimit.is_notify_error_class());
+        assert!(AgentState::RateLimit.is_notify_error_class());
+        assert!(AgentState::Hang.is_notify_error_class());
+        assert!(AgentState::Crashed.is_notify_error_class());
+        assert!(AgentState::AuthError.is_notify_error_class());
+        assert!(AgentState::PermissionPrompt.is_notify_error_class());
+        assert!(!AgentState::ContextFull.is_notify_error_class());
+        assert!(!AgentState::AwaitingOperator.is_notify_error_class());
+        assert!(!AgentState::ApiError.is_notify_error_class());
+        assert!(!AgentState::Restarting.is_notify_error_class());
+        assert!(!AgentState::InteractivePrompt.is_notify_error_class());
+        assert!(!AgentState::Ready.is_notify_error_class());
+        assert!(!AgentState::Idle.is_notify_error_class());
+        assert!(!AgentState::ToolUse.is_notify_error_class());
+        assert!(!AgentState::Starting.is_notify_error_class());
+    }
+
+    /// NOTIFY_COOLDOWN constant is 60 seconds.
+    #[test]
+    fn notify_cooldown_is_60_seconds() {
+        assert_eq!(super::NOTIFY_COOLDOWN, std::time::Duration::from_secs(60));
+    }
+
+    /// D4: 2×2 invariant fixture — production-path-coupled.
+    /// 2 teams (team-a: orch-a + worker-a, team-b: orch-b + worker-b).
+    /// worker-a transitions Ready → UsageLimit.
+    /// Assert: orch-a inbox has 1 event; orch-b/worker-a/worker-b have 0.
+    #[test]
+    fn notify_single_receiver_2x2_invariant() {
+        let home = std::env::temp_dir().join(format!("agend-notify-2x2-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("inbox")).ok();
+
+        // Setup teams via teams API (correct store format).
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "team-a", "members": ["orch-a", "worker-a"], "orchestrator": "orch-a"}),
+        );
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "team-b", "members": ["orch-b", "worker-b"], "orchestrator": "orch-b"}),
+        );
+
+        // Call production function (§3.5.10 production-path-coupled).
+        let mut tracks = std::collections::HashMap::new();
+        let sent = super::maybe_notify_member_state_change(
+            &home,
+            "worker-a",
+            crate::state::AgentState::Ready,
+            crate::state::AgentState::UsageLimit,
+            "Usage limit reached. Resets at 15:14 UTC",
+            &mut tracks,
+        );
+        assert!(sent, "notify must be sent");
+
+        // Assert: orch-a has 1 event (JSONL file).
+        let orch_a_inbox = home.join("inbox").join("orch-a.jsonl");
+        let orch_a_count = std::fs::read_to_string(&orch_a_inbox)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count();
+        assert_eq!(orch_a_count, 1, "orch-a must have exactly 1 event");
+
+        // Assert: others have 0.
+        for other in &["orch-b", "worker-a", "worker-b", "general"] {
+            let inbox = home.join("inbox").join(format!("{other}.jsonl"));
+            let count = std::fs::read_to_string(&inbox)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count();
+            assert_eq!(count, 0, "{other} must have 0 events");
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// D3: skip self-notify — orchestrator hits UsageLimit → 0 events.
+    #[test]
+    fn notify_skip_self_when_member_is_orchestrator() {
+        let home = std::env::temp_dir().join(format!("agend-notify-self-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "team-a", "members": ["orch-a"], "orchestrator": "orch-a"}),
+        );
+
+        // Call production function — should return false (self-notify skip).
+        let mut tracks = std::collections::HashMap::new();
+        let sent = super::maybe_notify_member_state_change(
+            &home,
+            "orch-a",
+            crate::state::AgentState::Ready,
+            crate::state::AgentState::UsageLimit,
+            "",
+            &mut tracks,
+        );
+        assert!(!sent, "self-notify must be skipped");
+        let content =
+            std::fs::read_to_string(home.join("inbox").join("orch-a.jsonl")).unwrap_or_default();
+        assert_eq!(
+            content.lines().filter(|l| !l.is_empty()).count(),
+            0,
+            "orch-a=0"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// E: no orchestrator → notify returns false (warn logged).
+    #[test]
+    fn notify_warns_when_no_orchestrator() {
+        let home = std::env::temp_dir().join(format!("agend-notify-noorch-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "team-a", "members": ["worker-a"]}),
+        );
+        let mut tracks = std::collections::HashMap::new();
+        let sent = super::maybe_notify_member_state_change(
+            &home,
+            "worker-a",
+            crate::state::AgentState::Ready,
+            crate::state::AgentState::Hang,
+            "",
+            &mut tracks,
+        );
+        assert!(!sent, "no orchestrator → no notify");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// parse_unlock_at extracts time from pane output.
+    #[test]
+    fn parse_unlock_at_extracts_time() {
+        assert_eq!(
+            super::parse_unlock_at("Usage limit reached. Resets at 15:14 UTC"),
+            Some("15:14".to_string())
+        );
+        assert_eq!(super::parse_unlock_at("no time here"), None);
     }
 }
