@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Pre-push hook: verify push claims against actual diff.
+#
+# Reads push refs from stdin (standard git pre-push protocol), extracts
+# claim text from the latest commit's message trailer, and runs the
+# claim verifier via `cargo run --quiet --bin agend-terminal -- verify-push`.
+#
+# Emergency override: `git push --no-verify`
+#
+# The daemon-side API endpoint provides defense-in-depth — bypassing
+# this hook via --no-verify does not bypass the daemon gate.
+
+set -euo pipefail
+
+# Locate repo root (works in worktrees too)
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Read push refs from stdin: <local ref> <local sha> <remote ref> <remote sha>
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # Skip delete pushes
+    if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+        continue
+    fi
+
+    # Determine base: if remote_sha is zero (new branch), use merge-base with origin/main
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        base=$(git merge-base origin/main "$local_sha" 2>/dev/null || echo "")
+        if [ -z "$base" ]; then
+            echo "pre-push: cannot determine base for new branch, skipping verification." >&2
+            continue
+        fi
+    else
+        base="$remote_sha"
+    fi
+
+    # Extract claim text from the latest commit's "Claim:" trailer only.
+    # Incidental prose containing claim keywords must NOT trigger verification.
+    commit_msg=$(git log -1 --format=%B "$local_sha")
+    claim_text=""
+
+    # Trailer-only: "Claim: <text>"
+    trailer=$(echo "$commit_msg" | grep -i '^Claim:' | sed 's/^[Cc]laim:[[:space:]]*//' || true)
+    if [ -n "$trailer" ]; then
+        claim_text="$trailer"
+    fi
+
+    # If no claim text found, skip verification (no claims to check)
+    if [ -z "$claim_text" ]; then
+        continue
+    fi
+
+    echo "pre-push: verifying claims for ${local_sha:0:7}..." >&2
+
+    # Run the claim verifier
+    if ! echo "$claim_text" | cargo run --quiet --bin agend-terminal -- verify-push \
+        --base "$base" --head "$local_sha" --claim-from-stdin; then
+        echo "pre-push: claim verification FAILED — fix claims or amend diff." >&2
+        echo "pre-push: use 'git push --no-verify' for emergency override." >&2
+        exit 1
+    fi
+
+    echo "pre-push: claims verified ✓" >&2
+done
+
+exit 0

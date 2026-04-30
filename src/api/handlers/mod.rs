@@ -9,6 +9,7 @@ pub(crate) mod mcp_proxy;
 pub(crate) mod messaging;
 pub(crate) mod query;
 pub(crate) mod team;
+pub(crate) mod verify_push;
 
 use crate::agent::{AgentRegistry, ExternalRegistry};
 use crate::api::{ApiNotifier, ConfigRegistry};
