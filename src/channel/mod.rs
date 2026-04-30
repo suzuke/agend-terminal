@@ -2,7 +2,7 @@
 //!
 //! This module defines the trait + types that `src/telegram.rs` (and future
 //! Discord / Slack / Matrix adapters) implement. The design follows
-//! `docs/PLAN-channel-abstraction.md` §3.
+//! `docs/archived/PLAN-channel-abstraction.md` §3.
 //!
 //! **Status (T1 prep scaffold):** this module is intentionally unused by any
 //! call site. PR2 in the T1 series (the atomic type cut-over) is the one that
@@ -135,7 +135,7 @@ pub enum ChannelKind {
 /// Platform-neutral channel trait. Implementations live next to their
 /// platform glue (e.g., `src/telegram.rs` → future `src/channel/telegram.rs`).
 ///
-/// Signature mirrors `docs/PLAN-channel-abstraction.md` §3.1. Events are
+/// Signature mirrors `docs/archived/PLAN-channel-abstraction.md` §3.1. Events are
 /// delivered through a pull-style API (`poll_event`) rather than an async
 /// stream, to keep the trait agnostic to the caller's runtime choice
 /// (today's core loop is sync; teloxide runs on a private tokio runtime

@@ -205,7 +205,7 @@ instances:
     outbound_capabilities: []                # explicit "no agent outbound"
 ```
 
-See `docs/MIGRATION-OUTBOUND-CAPS.md` for the full transition guide (Sprint 22 P0 fail-closed → Sprint 23 P1 default-open reversal section) and the `ChannelOpKind` enum reference.
+See `docs/archived/MIGRATION-OUTBOUND-CAPS.md` for the full transition guide (Sprint 22 P0 fail-closed → Sprint 23 P1 default-open reversal section) and the `ChannelOpKind` enum reference.
 
 ## Other Commands
 

@@ -255,7 +255,7 @@ Sprint 39 retrospective task `t-20260430024226176283-9` — bundle with Sprint 4
 - dev S1-S5 perspective: m-20260430055459689131-334
 - reviewer-kiro P1-P5 perspective: m-20260430060010397970-337
 - claude-a1f200 PLAN-v2 source: `docs/PLAN-tui-test-harness-2026-04-30.md` on branch `plan/tui-test-harness` `0def4d0`
-- Sprint 32 multi-PR + production-path-coupled fixture precedent: `docs/PLAN-discord-channel-2026-04.md`
+- Sprint 32 multi-PR + production-path-coupled fixture precedent: `docs/archived/PLAN-discord-channel-2026-04.md`
 - Sprint 39 wave (PR #350/#358/#359 closure)
 - `docs/FLEET-DEV-PROTOCOL-v1.md` §0 / §3.5.10 / §3.5.11 / §3.5.13 / §10.1
 - `src/vterm.rs` (production VTerm reference for TuiClient mirroring)

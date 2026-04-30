@@ -10,7 +10,7 @@ Every PR, amendment, or sprint proposal must answer two questions in the descrip
 
 Violation = `KISS-VIOLATION — UNVERIFIED unless the PR provides a concrete failure mode that the change prevents`. The reviewer's verdict body must cite the protected failure mode.
 
-**Why this rule exists**: Sprint 29 over-engineering audit (`docs/audit-over-engineering-2026-04-28.md`) found 9 paranoid-defense items totaling ~5400 LOC accumulated across Sprint 21-28 — each individually justified at write-time, none defending against a real threat in the localhost-single-user model. The 4-perspective challenge round on item #1 (RBAC removal) found 0 of 9 attempted counter-examples held; PR #285 deleted 858 LOC. The pattern: code that nobody can articulate the threat for is dead weight, not defense.
+**Why this rule exists**: Sprint 29 over-engineering audit (`docs/archived/audit-over-engineering-2026-04-28.md`) found 9 paranoid-defense items totaling ~5400 LOC accumulated across Sprint 21-28 — each individually justified at write-time, none defending against a real threat in the localhost-single-user model. The 4-perspective challenge round on item #1 (RBAC removal) found 0 of 9 attempted counter-examples held; PR #285 deleted 858 LOC. The pattern: code that nobody can articulate the threat for is dead weight, not defense.
 
 **How to apply**: when writing a PR, lead the description with the concrete failure mode; when reviewing, refuse to accept "defense in depth" or "future-proofing" as standalone justification. Either there's a real failure mode being prevented, or the change is over-engineering.
 
@@ -956,7 +956,7 @@ The daemon supervisor (`src/daemon/supervisor.rs::tick()`) detects agent state t
 - **Debounce**: 60s cooldown per agent (`NOTIFY_COOLDOWN`); state-flap within window suppressed.
 - **Log warning**: when team has no orchestrator, `tracing::warn!` emitted (avoid silent drop).
 
-**Cross-references**: `src/daemon/supervisor.rs::maybe_notify_member_state_change` (PR #364); `docs/PLAN-sprint43-supervisor-notify-2026-04-30.md`; `docs/BACKLOG-supervisor-notify-policy-2026-04-30.md`; Sprint 35 anti-broadcast PR #333.
+**Cross-references**: `src/daemon/supervisor.rs::maybe_notify_member_state_change` (PR #364); `docs/archived/PLAN-sprint43-supervisor-notify-2026-04-30.md`; `docs/archived/BACKLOG-supervisor-notify-policy-2026-04-30.md`; Sprint 35 anti-broadcast PR #333.
 
 ## 8. Git workflow
 

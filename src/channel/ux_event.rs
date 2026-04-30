@@ -2,7 +2,7 @@
 //! adapters, translated into platform actions via capability-gated
 //! degradation.
 //!
-//! Per `docs/PLAN-channel-ux-layer.md` §4 + §6, `UxEvent` is what the daemon
+//! Per `docs/archived/PLAN-channel-ux-layer.md` §4 + §6, `UxEvent` is what the daemon
 //! observes about user ↔ agent interaction (message received, picked up,
 //! replied). It is NOT a Telegram / Discord / Slack API return — the trigger
 //! is a daemon-side state change. Adapters sit behind the [`UxEventSink`]
@@ -16,7 +16,7 @@
 //! Q2 fleet-visibility subset: [`UxEvent::Fleet`] wrapping a
 //! [`FleetEvent`] — routed by `sink_registry` to any registered sink,
 //! rendered per adapter (PR-B lands the Telegram renderer). Stage B-UX
-//! design: `docs/DESIGN-stage-b-ux.md` §4.
+//! design: `docs/archived/DESIGN-stage-b-ux.md` §4.
 //!
 //! `AgentThinking` / `AgentIdle` / `AgentRateLimited` / `AgentCrashed` /
 //! `AgentRestarted` (remaining Q1 events) are deferred — they do not
@@ -72,7 +72,7 @@ pub enum UxEvent {
     /// decisions, and broadcasts observed on the daemon's MCP surface.
     /// Rendered into a separate `fleet_binding` (see plan §6 S2c),
     /// NOT into the origin user's thread. See [`FleetEvent`] and
-    /// `docs/DESIGN-stage-b-ux.md` §4 for the producer hook table.
+    /// `docs/archived/DESIGN-stage-b-ux.md` §4 for the producer hook table.
     Fleet(FleetEvent),
 }
 
@@ -82,13 +82,13 @@ pub enum UxEvent {
 /// the target is always the configured `fleet_binding`, and rendering is
 /// pure format (see [`select_action`] Fleet arm for why).
 ///
-/// The enum shape is locked by `docs/PLAN-channel-ux-layer.md` §4 with
+/// The enum shape is locked by `docs/archived/PLAN-channel-ux-layer.md` §4 with
 /// one deviation: `task_id` is `Option<String>` rather than a newtype
 /// `TaskId`. Rationale: the `correlation_id` arg on `report_result` is
 /// an ad-hoc caller-chosen string (e.g. `"AGD-42"`); making it required
 /// with a typed wrapper overstates what the MCP surface actually
 /// guarantees. Renderers display the id when present and omit it
-/// otherwise. Decision: `docs/DESIGN-stage-b-ux.md` §9 Q1, by general.
+/// otherwise. Decision: `docs/archived/DESIGN-stage-b-ux.md` §9 Q1, by general.
 #[derive(Debug, Clone)]
 pub enum FleetEvent {
     /// `delegate_task` MCP call landed.
@@ -109,7 +109,7 @@ pub enum FleetEvent {
     /// `post_decision` MCP call succeeded. Anonymous posts (no
     /// `AGEND_INSTANCE_NAME` / explicit `instance_name`) are
     /// deliberately NOT emitted — fleet provenance requires an
-    /// identified author (see `docs/DESIGN-stage-b-ux.md` §4.3).
+    /// identified author (see `docs/archived/DESIGN-stage-b-ux.md` §4.3).
     PostDecision {
         by: String,
         title: String,
@@ -171,8 +171,8 @@ pub enum UxAction {
 }
 
 /// Render a [`FleetEvent`] into the one-liner log shape defined in
-/// `docs/DESIGN-stage-b-ux.md` §5.1 (which in turn mirrors the `S2c`
-/// exemplars in `docs/PLAN-channel-ux-layer.md` §6). Pure fn — no I/O,
+/// `docs/archived/DESIGN-stage-b-ux.md` §5.1 (which in turn mirrors the `S2c`
+/// exemplars in `docs/archived/PLAN-channel-ux-layer.md` §6). Pure fn — no I/O,
 /// no time, snapshot-testable.
 ///
 /// Format shape by variant:
@@ -416,7 +416,7 @@ pub fn select_action(event: &UxEvent, caps: &ChannelCapabilities) -> UxAction {
             // one-liner format (no react / edit option). Adapters that
             // want to consume Fleet events dispatch on the `UxEvent`
             // variant *before* calling this function (see
-            // `docs/DESIGN-stage-b-ux.md` §4.4 dispatch-split). Adapters
+            // `docs/archived/DESIGN-stage-b-ux.md` §4.4 dispatch-split). Adapters
             // that ignore Fleet events — or haven't wired a renderer
             // yet (e.g. PR-A Telegram, where the renderer lands in
             // PR-B) — correctly no-op via this arm.

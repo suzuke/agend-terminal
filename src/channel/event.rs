@@ -1,6 +1,6 @@
 //! Normalised inbound events and outbound payload shapes.
 //!
-//! Per `docs/PLAN-channel-abstraction.md` §3.3, all channels emit the same
+//! Per `docs/archived/PLAN-channel-abstraction.md` §3.3, all channels emit the same
 //! `ChannelEvent` enum regardless of platform. The unification is the whole
 //! point: Telegram's `forum_topic_closed`, Discord's `channelDelete`,
 //! and Slack's `channel_deleted` all map to

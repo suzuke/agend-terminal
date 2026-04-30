@@ -61,4 +61,4 @@ PTY children are children of the daemon. Daemon dies → PTY dies → all agents
 
 ## What's deliberately absent
 
-Removed Sprint 29 (~5 400 LOC net delete): self-healing supervisor, slow-loris timeout, RBAC outbound capability layer, hot-reload engine, working-directory symlink validation, constant-time cookie compare, frame-size env override. All confirmed unnecessary under the single-operator threat model. `docs/audit-over-engineering-2026-04-28.md` documents the reasoning.
+Removed Sprint 29 (~5 400 LOC net delete): self-healing supervisor, slow-loris timeout, RBAC outbound capability layer, hot-reload engine, working-directory symlink validation, constant-time cookie compare, frame-size env override. All confirmed unnecessary under the single-operator threat model. `docs/archived/audit-over-engineering-2026-04-28.md` documents the reasoning.
