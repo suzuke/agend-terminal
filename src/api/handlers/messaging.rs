@@ -157,6 +157,43 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         drop(reg);
         "inbox_only"
     };
+
+    // B1 boundary: provenance injection pushed from MCP comms to API SEND.
+    // When the caller passes provenance metadata (delegate-task path), inject
+    // it into the active channel so operators see task routing in Telegram/Discord.
+    if let Some(prov) = params.get("provenance").and_then(|v| v.as_object()) {
+        let prov_from = prov
+            .get("from")
+            .and_then(|v| v.as_str())
+            .unwrap_or(from)
+            .to_string();
+        let prov_task = prov
+            .get("task")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(ch) = crate::channel::active_channel() {
+            if let Err(e) = ch.send_from_agent(
+                target,
+                crate::channel::AgentOutboundOp::InjectProvenance {
+                    from: prov_from,
+                    task: prov_task,
+                },
+            ) {
+                tracing::warn!(
+                    %e, target, from,
+                    "provenance injection failed — routing may be broken"
+                );
+            }
+        } else {
+            tracing::warn!(
+                target,
+                from,
+                "provenance injection failed — no active channel"
+            );
+        }
+    }
+
     json!({"ok": true, "delivery_mode": delivery_mode})
 }
 
@@ -486,6 +523,87 @@ mod tests {
             "teamless→team must be blocked: {result}"
         );
         assert!(audit_log_contains(&home, "send_cross_team_blocked"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- Sprint 40 T-5: provenance injection invariant at API boundary ---
+
+    #[test]
+    fn provenance_injection_no_active_channel_does_not_panic() {
+        // DESIGN §4 Q4 invariant re-pinned at API SEND boundary (moved from
+        // MCP comms layer in T-5). When provenance params are present but no
+        // active channel exists, handle_send must not panic and must return
+        // a successful delivery result (provenance is best-effort).
+        let home = tmp_home("prov-no-ch");
+        setup_team_env(&home, &["sender", "target"], &[]);
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "target",
+                "text": "task text",
+                "kind": "task",
+                "provenance": {"from": "sender", "task": "do the thing"}
+            }),
+            &ctx,
+        );
+        // Send succeeds (inbox delivery); provenance silently skipped (no channel).
+        assert_eq!(
+            result["ok"], true,
+            "send with provenance must succeed even without active channel: {result}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// DESIGN §4 Q4 warn-observability invariant: provenance injection
+    /// failure MUST produce a tracing::warn record, not a silent drop.
+    /// Re-pinned at API SEND boundary after T-5 moved provenance from
+    /// MCP comms layer.
+    #[test]
+    #[tracing_test::traced_test]
+    fn provenance_injection_no_active_channel_logs_warn() {
+        let home = tmp_home("prov-warn");
+        setup_team_env(&home, &["sender", "target"], &[]);
+        let ctx = test_ctx(&home);
+        let _result = handle_send(
+            &json!({
+                "from": "sender",
+                "target": "target",
+                "text": "task text",
+                "provenance": {"from": "sender", "task": "do the thing"}
+            }),
+            &ctx,
+        );
+        // No active channel → provenance injection fails → warn emitted.
+        // The warn text at messaging.rs:185 is "provenance injection failed".
+        assert!(
+            logs_contain("provenance injection failed"),
+            "DESIGN §4 Q4: provenance failure warn must be emitted at API boundary"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn provenance_params_passed_through_send() {
+        // Verify that provenance field in SEND params is accepted and does
+        // not cause errors. The actual channel injection is best-effort;
+        // this test pins that the API layer processes the field without panic.
+        let home = tmp_home("prov-pass");
+        setup_team_env(&home, &["alice", "bob"], &[("dev2", &["alice", "bob"])]);
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "alice",
+                "target": "bob",
+                "text": "delegated task",
+                "provenance": {"from": "alice", "task": "build feature X"}
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], true,
+            "send with provenance params must succeed: {result}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
