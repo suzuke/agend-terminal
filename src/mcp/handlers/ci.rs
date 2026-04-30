@@ -53,22 +53,86 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
     }
 }
 
+/// Reject paths that would be dangerous to `remove_dir_all`.
+/// Validate and canonicalize a release path. Returns canonical absolute
+/// path on success, or error message on rejection.
+fn validate_release_path(path_str: &str) -> Result<std::path::PathBuf, String> {
+    let path_str = path_str.trim();
+    if path_str.is_empty() {
+        return Err("rejected: empty path".into());
+    }
+    let path = std::path::Path::new(path_str);
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("path does not exist or unreadable: {e}"))?;
+    if canonical.parent().is_none() {
+        return Err(format!("rejected: root: {}", canonical.display()));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if canonical == std::path::Path::new(&home) {
+            return Err(format!("rejected: HOME: {}", canonical.display()));
+        }
+    }
+    let system_prefixes: &[&str] = if cfg!(windows) {
+        &[
+            "C:\\Windows",
+            "C:\\Program Files",
+            "C:\\Program Files (x86)",
+            "C:\\ProgramData",
+        ]
+    } else {
+        &[
+            "/etc",
+            "/usr",
+            "/var",
+            "/bin",
+            "/sbin",
+            "/boot",
+            "/sys",
+            "/proc",
+            "/dev",
+            "/Library",
+            "/System",
+            "/Applications",
+            "/opt",
+            "/tmp",
+            "/private",
+        ]
+    };
+    for prefix in system_prefixes {
+        if canonical.starts_with(prefix) {
+            return Err(format!("rejected: system path: {}", canonical.display()));
+        }
+    }
+    if canonical.components().count() < 3 {
+        return Err(format!("rejected: too shallow: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
 pub(super) fn handle_release_repo(args: &Value) -> Value {
     let path = match args["path"].as_str() {
         Some(p) => p,
         None => return json!({"error": "missing 'path'"}),
     };
+
+    // H3 fix: validate + canonicalize path before any filesystem ops.
+    let canonical = match validate_release_path(path) {
+        Ok(p) => p,
+        Err(e) => return json!({"error": e}),
+    };
+    let path_str = canonical.to_string_lossy();
+
     match std::process::Command::new("git")
-        .args(["worktree", "remove", "--force", path])
+        .args(["worktree", "remove", "--force", &path_str])
         .output()
     {
         Ok(o) if o.status.success() => json!({"path": path}),
         Ok(o) => {
-            let _ = std::fs::remove_dir_all(path);
+            let _ = std::fs::remove_dir_all(&canonical);
             json!({"path": path, "note": String::from_utf8_lossy(&o.stderr).to_string()})
         }
         Err(_) => {
-            let _ = std::fs::remove_dir_all(path);
+            let _ = std::fs::remove_dir_all(&canonical);
             json!({"path": path})
         }
     }
@@ -126,4 +190,68 @@ pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
     let path = home.join("ci-watches").join(&filename);
     let _ = std::fs::remove_file(&path);
     json!({"repo": repo, "watching": false})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_repo_rejects_root_path() {
+        let result = handle_release_repo(&serde_json::json!({"path": "/"}));
+        assert!(result["error"].as_str().is_some(), "root must be rejected");
+    }
+
+    #[test]
+    fn release_repo_rejects_system_path() {
+        let result = super::validate_release_path("/etc");
+        assert!(result.is_err(), "/etc must be rejected: {:?}", result);
+    }
+
+    #[test]
+    fn release_repo_rejects_empty_path() {
+        let result = handle_release_repo(&serde_json::json!({"path": ""}));
+        assert!(result["error"].as_str().is_some(), "empty must be rejected");
+    }
+
+    #[test]
+    fn validate_release_path_rejects_relative_dotdot() {
+        let result = super::validate_release_path("../../etc");
+        // Either fails canonicalize (doesn't exist) or rejects as system path.
+        assert!(result.is_err(), "relative dotdot must be rejected");
+    }
+
+    #[test]
+    fn validate_release_path_rejects_relative_no_root() {
+        let result = super::validate_release_path("a/b/c");
+        // Relative path that doesn't exist → canonicalize fails.
+        assert!(result.is_err(), "relative path must be rejected");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_release_path_rejects_shallow() {
+        // /tmp canonicalizes to /private/tmp on macOS → system prefix match.
+        let result = super::validate_release_path("/tmp");
+        assert!(result.is_err(), "/tmp must be rejected: {:?}", result);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_release_path_accepts_deep_existing() {
+        // Create a temp dir deep enough to pass.
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let dir = std::path::PathBuf::from(home)
+            .join(format!(".agend-release-test-{}", std::process::id()));
+        let deep = dir.join("sub");
+        std::fs::create_dir_all(&deep).ok();
+        let result = super::validate_release_path(deep.to_str().expect("valid UTF-8"));
+        // Should pass (deep enough, not system dir).
+        assert!(
+            result.is_ok(),
+            "deep existing path should pass: {:?}",
+            result.err()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
