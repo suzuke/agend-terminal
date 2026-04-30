@@ -1,0 +1,6 @@
+{
+  "values": [
+    {"uuid": "{step-1}", "name": "Build", "state": {"name": "COMPLETED", "result": {"name": "SUCCESSFUL"}}},
+    {"uuid": "{step-2}", "name": "Test", "state": {"name": "COMPLETED", "result": {"name": "FAILED"}}}
+  ]
+}

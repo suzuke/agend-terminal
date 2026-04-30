@@ -74,13 +74,19 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
     }
 }
 
-pub(super) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
+pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
     let repo = match args["repo"].as_str() {
         Some(r) => r,
         None => return json!({"error": "missing 'repo'"}),
     };
     let branch = args["branch"].as_str().unwrap_or("main");
     let interval = args["interval_secs"].as_u64().unwrap_or(60);
+
+    // Reject unsupported providers early with operator-actionable error.
+    if args["ci_provider"].as_str() == Some("bitbucket_server") {
+        return json!({"error": "Bitbucket Server not yet supported — track Sprint 41+ candidate. Use bitbucket_cloud for Bitbucket Cloud repos."});
+    }
+
     let ci_dir = home.join("ci-watches");
     std::fs::create_dir_all(&ci_dir).ok();
     let watch = json!({
@@ -88,6 +94,7 @@ pub(super) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         "branch": branch,
         "interval_secs": interval,
         "instance": instance_name,
+        "ci_provider": args["ci_provider"].as_str(),
         "ci_provider_url": args["ci_provider_url"].as_str(),
         "last_run_id": null,
         "head_sha": null,

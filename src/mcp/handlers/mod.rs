@@ -1,7 +1,7 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
 mod channel;
-mod ci;
+pub(crate) mod ci;
 mod comms;
 mod instance;
 mod schedule;
