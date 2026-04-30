@@ -1,0 +1,18 @@
+[
+  {
+    "id": 101,
+    "status": "success",
+    "stage": "build",
+    "name": "compile",
+    "ref": "main",
+    "pipeline": {"id": 48}
+  },
+  {
+    "id": 102,
+    "status": "failed",
+    "stage": "test",
+    "name": "cargo-test",
+    "ref": "main",
+    "pipeline": {"id": 48}
+  }
+]
