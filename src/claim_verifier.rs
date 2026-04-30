@@ -24,7 +24,7 @@ pub enum Claim {
     OnlyFormatting,
     /// "deps unchanged" — Cargo.lock must have empty diff.
     DepsUnchanged,
-    /// Grammar v1.1: "fn name() exists" — verify function exists in repo via syn AST + rg fallback.
+    /// Grammar v1.1: claim text contains `fn name(` pattern — verify function exists in repo via syn AST + grep fallback.
     FunctionExists { fn_names: Vec<String> },
     /// Unrecognised phrase — pass through, no check.
     Unknown(String),
@@ -492,13 +492,13 @@ fn check_fn_exists(repo_dir: &Path, fn_names: &[String]) -> ClaimResult {
             detail: "no function names in claim".to_string(),
         };
     }
-    // Build fn name set from repo via syn AST walk + rg fallback
+    // Build fn name set from repo via syn AST walk + grep fallback
     let known_fns = collect_fn_names_from_repo(repo_dir);
     let mut missing = Vec::new();
     for name in fn_names {
         if !known_fns.contains(name.as_str()) {
-            // Fallback: ripgrep for fn declaration
-            if !rg_fn_exists(repo_dir, name) {
+            // Fallback: grep for fn declaration
+            if !grep_fn_exists(repo_dir, name) {
                 missing.push(name.clone());
             }
         }
@@ -577,8 +577,8 @@ fn extract_fn_names_from_item(item: &syn::Item, names: &mut std::collections::Ha
     }
 }
 
-/// Fallback: use ripgrep to check if `fn name` exists in repo.
-fn rg_fn_exists(repo_dir: &Path, name: &str) -> bool {
+/// Fallback: use grep to check if `fn name` exists in repo.
+fn grep_fn_exists(repo_dir: &Path, name: &str) -> bool {
     let pattern = format!("\\bfn {name}\\b");
     let output = std::process::Command::new("grep")
         .args(["-r", "-l", &pattern, "src/"])
