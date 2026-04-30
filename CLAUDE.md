@@ -16,6 +16,10 @@ A pre-commit hook at `.git/hooks/pre-commit` auto-formats staged `.rs` files
 and re-stages them. It does NOT run clippy — clippy is too slow for a
 pre-commit path. Run clippy yourself before `git push`.
 
+A pre-push hook verifies push claims (e.g. "no other changes", "deps
+unchanged") against the actual diff. Override with `git push --no-verify`
+in emergencies.
+
 ### If the hook isn't installed
 
 Hooks are per-clone. After a fresh `git clone`, install with:

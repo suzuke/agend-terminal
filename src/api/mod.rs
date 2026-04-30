@@ -142,6 +142,7 @@ pub mod method {
     pub const MCP_TOOL: &str = "mcp_tool";
     pub const MCP_TOOLS_LIST: &str = "mcp_tools_list";
     pub const PANE_SNAPSHOT: &str = "pane_snapshot";
+    pub const VERIFY_PUSH: &str = "verify_push";
 }
 
 /// Start API socket server (blocks calling thread).
@@ -314,6 +315,7 @@ fn handle_session(
             method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
             method::MOVE_PANE => handlers::instance::handle_move_pane(params, &ctx),
             method::PANE_SNAPSHOT => handlers::instance::handle_pane_snapshot(params, &ctx),
+            method::VERIFY_PUSH => handlers::verify_push::handle_verify_push(params),
             method::SET_BLOCKED_REASON => {
                 handlers::instance::handle_set_blocked_reason(params, &ctx)
             }

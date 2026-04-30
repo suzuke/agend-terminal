@@ -11,6 +11,7 @@ mod bootstrap;
 mod bridge_client;
 mod bugreport;
 mod channel;
+mod claim_verifier;
 mod cli;
 mod connect;
 mod daemon;
@@ -289,6 +290,24 @@ enum Commands {
     Completions {
         /// Shell type
         shell: clap_complete::Shell,
+    },
+    /// Verify push claims against actual diff (push-time semantic gate)
+    VerifyPush {
+        /// Base commit (e.g. origin/main)
+        #[arg(long)]
+        base: String,
+        /// Head commit (default: HEAD)
+        #[arg(long, default_value = "HEAD")]
+        head: String,
+        /// Read claim text from stdin
+        #[arg(long)]
+        claim_from_stdin: bool,
+        /// Claim text (alternative to stdin)
+        #[arg(long)]
+        claim: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -633,6 +652,37 @@ fn main() -> anyhow::Result<()> {
                 "agend-terminal",
                 &mut std::io::stdout(),
             );
+        }
+        Some(Commands::VerifyPush {
+            base,
+            head,
+            claim_from_stdin,
+            claim,
+            json,
+        }) => {
+            let claim_text = if claim_from_stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                buf
+            } else if let Some(c) = claim {
+                c
+            } else {
+                anyhow::bail!("provide --claim or --claim-from-stdin");
+            };
+            let repo_dir = std::env::current_dir()?;
+            let claims = claim_verifier::parse_claims(&claim_text);
+            let result = claim_verifier::verify(&repo_dir, &base, &head, &claims);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                for r in &result.results {
+                    let icon = if r.passed { "✓" } else { "✗" };
+                    println!("{icon} {}: {}", r.claim, r.detail);
+                }
+                if !result.ok {
+                    std::process::exit(1);
+                }
+            }
         }
     }
 
