@@ -23,13 +23,16 @@ impl AgendHarness {
     /// Spawn a real daemon with the given fleet.yaml content.
     /// Waits up to 15s for the API port file to appear.
     pub fn spawn(home: PathBuf, fleet_yaml: &str) -> Result<Self, String> {
+        Self::spawn_with(home, fleet_yaml, "daemon")
+    }
+    pub fn spawn_with(home: PathBuf, fleet_yaml: &str, subcommand: &str) -> Result<Self, String> {
         std::fs::create_dir_all(&home).map_err(|e| format!("create home: {e}"))?;
         std::fs::write(home.join("fleet.yaml"), fleet_yaml)
             .map_err(|e| format!("write fleet.yaml: {e}"))?;
 
         let binary = binary_path();
         let mut cmd = Command::new(&binary);
-        cmd.args(["daemon"])
+        cmd.args([&subcommand])
             .env("AGEND_HOME", &home)
             .env("AGEND_TEST_ISOLATION", "1")
             .stdout(Stdio::piped())
@@ -369,11 +372,13 @@ impl TuiClient {
     }
 
     /// Feed raw bytes into the vterm (simulates PTY output).
+    #[allow(dead_code)]
     pub fn feed(&mut self, data: &[u8]) {
         self.vterm.process(data);
     }
 
     /// Read the last N lines from the vterm as plain text (ANSI stripped).
+    #[allow(dead_code)]
     pub fn screen_text(&self, lines: usize) -> String {
         self.vterm.tail_lines(lines)
     }
@@ -387,6 +392,7 @@ impl TuiClient {
     /// Feed bytes into vterm and return screen text. Single-pass — does not
     /// poll or wait. Use for deterministic test content where all bytes are
     /// available upfront.
+    #[allow(dead_code)]
     pub fn feed_and_extract(&mut self, data: &[u8]) -> String {
         self.vterm.process(data);
         let rows = self.vterm.rows as usize;
