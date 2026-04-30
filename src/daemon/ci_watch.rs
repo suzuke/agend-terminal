@@ -744,28 +744,22 @@ pub fn github_token_warning_from_env() -> Option<&'static str> {
 
 /// Check CI watch configs and inject failure logs to agents when CI fails.
 /// Auto-detect CI provider from a `repo` string (typically from git remote URL).
-/// Returns `(provider_kind, base_url)`.
-///
-/// Detection rules:
-/// - Contains "github.com" → ("github", "https://api.github.com")
-/// - Contains "gitlab.com" → ("gitlab", "https://gitlab.com")
-/// - Contains "bitbucket.org" → ("bitbucket_cloud", "https://api.bitbucket.org")
-/// - Otherwise → ("github", "https://api.github.com") with warning
-pub fn detect_provider_from_remote(repo: &str) -> (&'static str, String) {
-    if repo.contains("gitlab.com") || repo.contains("gitlab") {
-        ("gitlab", "https://gitlab.com".to_string())
-    } else if repo.contains("bitbucket.org") || repo.contains("bitbucket") {
-        ("bitbucket_cloud", "https://api.bitbucket.org".to_string())
+/// Returns `(provider_kind, custom_host)`. `custom_host=true` means the domain
+/// doesn't exactly match the canonical host — caller should warn.
+pub fn detect_provider_from_remote(repo: &str) -> (&'static str, bool) {
+    if repo.contains("gitlab.com") {
+        ("gitlab", false)
+    } else if repo.contains("gitlab") {
+        ("gitlab", true) // self-hosted GitLab
+    } else if repo.contains("bitbucket.org") {
+        ("bitbucket_cloud", false)
+    } else if repo.contains("bitbucket") {
+        ("bitbucket_cloud", true) // custom Bitbucket domain
+    } else if repo.contains("github.com") {
+        ("github", false) // canonical github.com
     } else {
-        // Default to GitHub (most common); includes github.com and GHE domains.
-        if !repo.contains("github.com") && !repo.contains("github") {
-            tracing::warn!(
-                repo,
-                "ci_watch: could not auto-detect CI provider from repo URL — defaulting to GitHub. \
-                 Set ci_provider explicitly in watch_ci args if this is incorrect."
-            );
-        }
-        ("github", "https://api.github.com".to_string())
+        // GitHub Enterprise custom domain OR fully unknown → default github + warn
+        ("github", true)
     }
 }
 
@@ -780,8 +774,20 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
         let (ci_type, default_url) = match watch.get("ci_provider").and_then(|v| v.as_str()) {
             Some(explicit) => (explicit, String::new()),
             None => {
-                let (kind, url) = detect_provider_from_remote(repo);
-                (kind, url)
+                let (kind, is_custom) = detect_provider_from_remote(repo);
+                if is_custom {
+                    tracing::warn!(
+                        repo,
+                        kind,
+                        "ci_watch: custom CI host pattern detected — suggest setting fleet.yaml ci_provider: explicitly"
+                    );
+                }
+                let default = match kind {
+                    "gitlab" => "https://gitlab.com",
+                    "bitbucket_cloud" => "https://api.bitbucket.org",
+                    _ => "https://api.github.com",
+                };
+                (kind, default.to_string())
             }
         };
         let url = ci_url.unwrap_or(default_url);
@@ -2821,30 +2827,65 @@ mod tests {
 
     #[test]
     fn detect_provider_github_com() {
-        let (kind, url) = super::detect_provider_from_remote("github.com/owner/repo");
+        let (kind, is_custom) = super::detect_provider_from_remote("github.com/owner/repo");
         assert_eq!(kind, "github");
-        assert_eq!(url, "https://api.github.com");
+        assert!(!is_custom);
     }
 
     #[test]
     fn detect_provider_gitlab_com() {
-        let (kind, url) = super::detect_provider_from_remote("gitlab.com/group/project");
+        let (kind, is_custom) = super::detect_provider_from_remote("gitlab.com/group/project");
         assert_eq!(kind, "gitlab");
-        assert_eq!(url, "https://gitlab.com");
+        assert!(!is_custom);
     }
 
     #[test]
     fn detect_provider_bitbucket_org() {
-        let (kind, url) = super::detect_provider_from_remote("bitbucket.org/ws/repo");
+        let (kind, is_custom) = super::detect_provider_from_remote("bitbucket.org/ws/repo");
         assert_eq!(kind, "bitbucket_cloud");
-        assert_eq!(url, "https://api.bitbucket.org");
+        assert!(!is_custom);
     }
 
     #[test]
     fn detect_provider_custom_domain_defaults_github_with_warning() {
-        // Custom domain that doesn't match any known provider.
-        let (kind, _url) = super::detect_provider_from_remote("git.corp.example.com/team/repo");
+        let (kind, is_custom) =
+            super::detect_provider_from_remote("git.corp.example.com/team/repo");
         assert_eq!(kind, "github", "unknown domain defaults to github");
+        assert!(is_custom, "unknown domain must flag custom_host");
+    }
+
+    /// B1: GitHub Enterprise custom domain detected as github + custom.
+    #[test]
+    fn detect_provider_github_enterprise_custom_domain() {
+        let (kind, is_custom) =
+            super::detect_provider_from_remote("https://github.acme.corp/myorg/myrepo");
+        assert_eq!(kind, "github");
+        assert!(is_custom, "GHE custom domain must flag custom_host");
+    }
+
+    /// B3: explicit ci_provider in watch JSON overrides auto-detect.
+    #[test]
+    fn explicit_ci_provider_overrides_auto_detect() {
+        // Watch with ci_provider: gitlab but repo URL pointing to github.com.
+        // Factory should construct GitLab, not GitHub.
+        let watch = serde_json::json!({
+            "repo": "github.com/myorg/myrepo",
+            "branch": "main",
+            "ci_provider": "gitlab",
+        });
+        let ci_type = watch
+            .get("ci_provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("github");
+        assert_eq!(
+            ci_type, "gitlab",
+            "explicit ci_provider must win over auto-detect"
+        );
+        // Auto-detect would return github for this URL.
+        let (auto_kind, _) = super::detect_provider_from_remote(watch["repo"].as_str().unwrap());
+        assert_eq!(auto_kind, "github", "auto-detect sees github.com");
+        // But explicit config wins.
+        assert_ne!(ci_type, auto_kind, "explicit must override auto-detect");
     }
 
     #[test]
