@@ -2310,4 +2310,52 @@ mod tests {
         assert_eq!(transient_state_badge(AgentState::Hang), None);
         assert_eq!(transient_state_badge(AgentState::PermissionPrompt), None);
     }
+
+    // --- Sprint 41 T-3: render logic function coverage ---
+
+    #[test]
+    fn state_color_returns_distinct_colors_for_key_states() {
+        // Pin that key states have distinct colors (logic outcome, not pixel)
+        let idle = state_color(AgentState::Idle);
+        let thinking = state_color(AgentState::Thinking);
+        let tool_use = state_color(AgentState::ToolUse);
+        let ready = state_color(AgentState::Ready);
+        assert_ne!(idle, thinking, "idle vs thinking must differ");
+        assert_ne!(thinking, tool_use, "thinking vs tool_use must differ");
+        assert_ne!(idle, ready, "idle vs ready must differ");
+    }
+
+    #[test]
+    fn state_color_error_states_are_red() {
+        use ratatui::style::Color;
+        assert_eq!(state_color(AgentState::Crashed), Color::Red);
+        assert_eq!(state_color(AgentState::Restarting), Color::Red);
+    }
+
+    #[test]
+    fn highest_priority_state_returns_idle_for_empty_tab() {
+        let tab = crate::layout::Tab::new(
+            "empty".to_string(),
+            crate::layout::Pane {
+                agent_name: "test".to_string(),
+                vterm: VTerm::new(10, 10),
+                rx: crossbeam_channel::bounded(1).1,
+                id: 1,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
+                selection: None,
+                source: PaneSource::Local,
+            },
+        );
+        let registry: crate::agent::AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let result = highest_priority_state(&tab, &registry);
+        assert_eq!(result, AgentState::Idle);
+    }
 }

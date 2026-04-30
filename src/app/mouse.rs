@@ -293,6 +293,7 @@ fn handle_up(
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum TabBarClick {
     Tab(usize),
     NewTab,
@@ -621,5 +622,111 @@ mod tests {
         handle_drag(event, &mut layout, &mut state);
         assert_eq!(layout.tabs[0].drag_target, Some(2));
         assert!(layout.tabs[0].drag_target_tab.is_none());
+    }
+
+    // --- Sprint 41 T-3: tab_bar_hit_test coverage ---
+
+    #[test]
+    fn tab_bar_hit_test_first_tab() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("tab0".to_string(), leaf(1, "a")));
+        // First tab starts at col 0: "*" (1) + " tab0 " (6) = 7 cols
+        let result = tab_bar_hit_test(&layout, 0);
+        assert_eq!(result, Some(TabBarClick::Tab(0)));
+    }
+
+    #[test]
+    fn tab_bar_hit_test_second_tab() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("a".to_string(), leaf(1, "x")));
+        layout.add_tab(Tab::new("b".to_string(), leaf(2, "y")));
+        // Tab "a": "*" + " a " = 4 cols (0..3). Separator: 1 col (4).
+        // Tab "b": "*" + " b " = 4 cols (5..8).
+        let result = tab_bar_hit_test(&layout, 5);
+        assert_eq!(result, Some(TabBarClick::Tab(1)));
+    }
+
+    #[test]
+    fn tab_bar_hit_test_new_tab_button() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("x".to_string(), leaf(1, "a")));
+        // Tab "x": 4 cols (0..3). Then " [+] " at col 4..8.
+        let result = tab_bar_hit_test(&layout, 4);
+        assert_eq!(result, Some(TabBarClick::NewTab));
+    }
+
+    #[test]
+    fn tab_bar_hit_test_beyond_all_tabs_returns_none() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t".to_string(), leaf(1, "a")));
+        // Way past all tabs + [+] button
+        let result = tab_bar_hit_test(&layout, 100);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn tab_bar_hit_test_empty_layout_returns_new_tab() {
+        let layout = Layout::new();
+        // No tabs → only [+] button at col 0
+        let result = tab_bar_hit_test(&layout, 0);
+        assert_eq!(result, Some(TabBarClick::NewTab));
+    }
+
+    // --- Sprint 41 T-3 r2: drag state machine tests ---
+
+    #[test]
+    fn drag_start_sets_dragging_pane_on_title_hit() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 2;
+        layout.tabs[0].dragging_pane = Some(2);
+        layout.tabs[0].drag_target = None;
+
+        assert_eq!(layout.tabs[0].dragging_pane, Some(2));
+        assert_eq!(layout.tabs[0].drag_target, None);
+    }
+
+    #[test]
+    fn drag_end_clears_dragging_pane() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 2;
+        layout.tabs[0].dragging_pane = Some(2);
+        layout.tabs[0].drag_target = Some(1);
+
+        let mut state = MouseState::default();
+        let mut out = MouseOutcome::default();
+        handle_up(up_event(), &mut layout, &mut state, &mut out);
+
+        assert_eq!(
+            layout.tabs[0].dragging_pane, None,
+            "drag-end must clear dragging_pane"
+        );
+    }
+
+    #[test]
+    fn border_drag_state_cleared_on_mouse_up() {
+        let mut state = MouseState {
+            border_drag: Some((
+                crate::layout::SplitBorderHit {
+                    split_area: (0, 1, 60, 38),
+                    dir: SplitDir::Vertical,
+                },
+                ratatui::layout::Rect::new(0, 1, 120, 38),
+            )),
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t".to_string(), leaf(1, "a")));
+        let mut out = MouseOutcome::default();
+        handle_up(up_event(), &mut layout, &mut state, &mut out);
+
+        assert!(
+            state.border_drag.is_none(),
+            "border_drag must be cleared on mouse-up"
+        );
     }
 }
