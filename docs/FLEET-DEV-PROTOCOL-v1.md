@@ -914,6 +914,50 @@ The timeout policy above applies as baseline. The following backend-specific mod
 
 **Incident source**: PR-C dev wedge incident, 2026-04-29 — dev (kiro-cli) appeared wedged 3+ hours; compaction-recovered on its own.
 
+### Supervisor member-state-change notify (Sprint 43 amendment)
+
+The daemon supervisor (`src/daemon/supervisor.rs::tick()`) detects agent state transitions into error states and proactively notifies the team orchestrator via inbox. This replaces the reactive pattern where orchestrators only learned about issues through timeout or operator escalation.
+
+**Detection**: per-tick `prev_state` vs `new_state` diff via `maybe_notify_member_state_change()`. Triggers on transition INTO (not sustained in) an error state.
+
+**6 GO-NARROW states triggering notify** (operator §13 #1):
+
+| State | Orchestrator action |
+|---|---|
+| `UsageLimit` | Parse `unlock_at` from pane; wait for unlock or dispatch alternative backend |
+| `RateLimit` | Exponential backoff retry; true throttle resolves in 5-15 min |
+| `Hang` | `interrupt(target)` MCP tool; if persists after 5 min, escalate to general |
+| `Crashed` | Daemon auto-respawn handles; orchestrator monitors next tick |
+| `AuthError` | Escalate to general immediately (operator credential refresh required) |
+| `PermissionPrompt` | Reply via `send` / approve via MCP |
+
+**States explicitly NOT triggering notify** (deferred): `ContextFull` (self-healing via compaction), `AwaitingOperator` (operator-side), `ApiError`, `Restarting` (daemon-handled), `InteractivePrompt`.
+
+**Payload schema** (kind: `member_state_change`, from: `system:supervisor`):
+```json
+{
+  "type": "member_state_change",
+  "member": "<agent_name>",
+  "team": "<team_name>",
+  "from_state": "<state>",
+  "to_state": "<state>",
+  "detected_at": "<rfc3339>",
+  "context": {
+    "last_pane_excerpt": "<vterm tail 10 lines>",
+    "unlock_at": "<HH:MM or null>",
+    "consecutive_count": "<u32>"
+  }
+}
+```
+
+**Routing invariants**:
+- **Single-receiver**: orchestrator ONLY via `inbox::enqueue`. NOT general; NOT broadcast (Sprint 35 `fleet_broadcast` removal precedent — PR #333).
+- **Skip self-notify**: when `member == team.orchestrator`, no notify emitted.
+- **Debounce**: 60s cooldown per agent (`NOTIFY_COOLDOWN`); state-flap within window suppressed.
+- **Log warning**: when team has no orchestrator, `tracing::warn!` emitted (avoid silent drop).
+
+**Cross-references**: `src/daemon/supervisor.rs::maybe_notify_member_state_change` (PR #364); `docs/PLAN-sprint43-supervisor-notify-2026-04-30.md`; `docs/BACKLOG-supervisor-notify-policy-2026-04-30.md`; Sprint 35 anti-broadcast PR #333.
+
 ## 8. Git workflow
 
 ### Worktree rules (from CLAUDE.md, reinforced)
