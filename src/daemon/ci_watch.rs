@@ -602,15 +602,44 @@ impl CiProvider for BitbucketCiProvider {
             },
             Err(_) => return "unknown step".to_string(),
         };
-        steps_resp["values"]
-            .as_array()
-            .and_then(|steps| {
-                steps.iter().find_map(|step| {
-                    let result = step["state"]["result"]["name"].as_str()?;
-                    (result == "FAILED").then(|| step["name"].as_str().unwrap_or("?").to_string())
-                })
-            })
-            .unwrap_or_else(|| "unknown step".to_string())
+        let failed_step = steps_resp["values"].as_array().and_then(|steps| {
+            steps
+                .iter()
+                .find(|step| step["state"]["result"]["name"].as_str() == Some("FAILED"))
+        });
+        let Some(step) = failed_step else {
+            return "unknown step".to_string();
+        };
+        let name = step["name"].as_str().unwrap_or("?").to_string();
+        // Chain: fetch step log tail (~50 lines).
+        let step_uuid = match step["uuid"].as_str() {
+            Some(u) => u,
+            None => return name,
+        };
+        let log = match self
+            .bb_get(&format!(
+                "repositories/{repo}/pipelines/{run_id}/steps/{step_uuid}/log"
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => r.text().await.unwrap_or_default(),
+            Err(_) => return name,
+        };
+        let tail: String = log
+            .lines()
+            .rev()
+            .take(50)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if tail.is_empty() {
+            name
+        } else {
+            format!("{name}\n---\n{tail}")
+        }
     }
 
     fn token_warning(&self) -> Option<&'static str> {
@@ -725,6 +754,13 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
             "bitbucket_cloud" => {
                 let url = ci_url.unwrap_or_else(|| "https://api.bitbucket.org".to_string());
                 Some(Box::new(BitbucketCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
+            }
+            "bitbucket_server" => {
+                tracing::error!(
+                    "Bitbucket Server not yet supported — track Sprint 41+ candidate. \
+                     Use bitbucket_cloud for Bitbucket Cloud repos."
+                );
+                None
             }
             _ => Some(Box::new(GitHubCiProvider::new().ok()?) as Box<dyn CiProvider>),
         }
@@ -2580,6 +2616,38 @@ mod tests {
         let warning = provider.token_warning();
         assert!(warning.is_some());
         assert!(warning.expect("w").contains("BITBUCKET_TOKEN"));
+    }
+
+    /// Auth state 2: env absent + bb CLI config → Basic auth from config.
+    #[test]
+    fn bitbucket_auth_bb_config_fallback_sends_basic_header() {
+        let fixture = include_str!("../../tests/fixtures/bitbucket-pipelines-response.json");
+        let (port, handle, captured) = gitlab_mock_server(fixture);
+        let mut guard = BitbucketTokenGuard::clear();
+        // Setup temp HOME with bb config.
+        let temp = std::env::temp_dir().join(format!("agend-bb-test-{}", std::process::id()));
+        let bb_dir = temp.join(".config").join("bb");
+        std::fs::create_dir_all(&bb_dir).ok();
+        std::fs::write(bb_dir.join("config"), "token: bbuser:bb_app_pass\n").expect("write");
+        guard.prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &temp);
+
+        let provider =
+            super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+                .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let _ = rt.block_on(provider.poll_runs("foo/bar", "main"));
+        handle.join().expect("mock");
+
+        let (_, request) = captured.lock().expect("lock").take().expect("captured");
+        assert!(
+            request.contains("authorization: Basic") || request.contains("Authorization: Basic"),
+            "must send Basic auth from bb config: {request}"
+        );
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     /// Smoke: constructors.
