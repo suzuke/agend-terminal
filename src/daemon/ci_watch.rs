@@ -2521,6 +2521,7 @@ mod tests {
     fn bitbucket_poll_runs_parses_pipelines() {
         let fixture = include_str!("../../tests/fixtures/bitbucket-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
+        let _guard = BitbucketTokenGuard::set("user:pass");
         let provider =
             super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
                 .expect("provider");
@@ -2530,12 +2531,16 @@ mod tests {
             .expect("rt");
         let result = rt.block_on(provider.poll_runs("foo/bar", "main"));
         handle.join().expect("mock");
-        let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+        let (path, req) = captured.lock().expect("lock").take().expect("captured");
         assert!(
             path.contains("/repositories/foo/bar/pipelines"),
             "path: {path}"
         );
         assert!(path.contains("target.branch=main"), "query: {path}");
+        assert!(
+            req.to_lowercase().contains("authorization: basic"),
+            "must send Basic auth header: {req}"
+        );
         let runs = match result.expect("poll_runs") {
             super::CiPollResult::Runs(r) => r,
             other => panic!("expected Runs, got: {other:?}"),
@@ -2550,6 +2555,7 @@ mod tests {
     fn bitbucket_check_pr_terminal_merged() {
         let fixture = include_str!("../../tests/fixtures/bitbucket-pullrequests-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
+        let _guard = BitbucketTokenGuard::set("user:pass");
         let provider =
             super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
                 .expect("provider");
@@ -2559,8 +2565,13 @@ mod tests {
             .expect("rt");
         let state = rt.block_on(provider.check_pr_terminal("foo/bar", "feat/test"));
         handle.join().expect("mock");
-        let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+        let (path, req) = captured.lock().expect("lock").take().expect("captured");
         assert!(path.contains("/pullrequests"), "path: {path}");
+        assert!(path.contains("source.branch.name"), "query: {path}");
+        assert!(
+            req.to_lowercase().contains("authorization: basic"),
+            "auth: {req}"
+        );
         assert!(
             matches!(state, super::PrState::Terminal { merged: true }),
             "got: {state:?}"
@@ -2572,6 +2583,7 @@ mod tests {
     fn bitbucket_fetch_failure_summary_finds_failed_step() {
         let fixture = include_str!("../../tests/fixtures/bitbucket-steps-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
+        let _guard = BitbucketTokenGuard::set("user:pass");
         let provider =
             super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
                 .expect("provider");
@@ -2581,8 +2593,12 @@ mod tests {
             .expect("rt");
         let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 48));
         handle.join().expect("mock");
-        let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+        let (path, req) = captured.lock().expect("lock").take().expect("captured");
         assert!(path.contains("/pipelines/48/steps"), "path: {path}");
+        assert!(
+            req.to_lowercase().contains("authorization: basic"),
+            "auth: {req}"
+        );
         assert_eq!(summary, "Test");
     }
 
