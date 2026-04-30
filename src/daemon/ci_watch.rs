@@ -3,6 +3,93 @@ use std::path::Path;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// Shared HTTP client for CI providers (Sprint 39 follow-up extraction)
+// ---------------------------------------------------------------------------
+
+/// Auth scheme for CI provider HTTP requests.
+pub(crate) enum CiAuth {
+    /// `Authorization: Bearer <token>` (GitHub)
+    Bearer(String),
+    /// Custom header name + value (GitLab: `PRIVATE-TOKEN: <token>`)
+    Header(String, String),
+    /// HTTP Basic auth `user:password` (Bitbucket)
+    Basic(String, String),
+}
+
+/// Shared HTTP client wrapping reqwest + auth + base URL.
+/// Each CiProvider stores one and delegates request construction.
+pub(crate) struct CiHttpClient {
+    client: reqwest::Client,
+    base_url: String,
+    /// Path prefix inserted between base_url and the caller's path
+    /// (e.g., "/api/v4" for GitLab, "/2.0" for Bitbucket, "" for GitHub).
+    path_prefix: String,
+    /// Auth resolver called per-request (token may change at runtime).
+    auth_fn: Box<dyn Fn() -> Option<CiAuth> + Send + Sync>,
+    /// Per-provider Accept header (e.g., GitHub's `application/vnd.github+json`).
+    default_accept: Option<String>,
+}
+
+impl CiHttpClient {
+    pub(crate) fn new(
+        base_url: String,
+        path_prefix: &str,
+        auth_fn: impl Fn() -> Option<CiAuth> + Send + Sync + 'static,
+    ) -> anyhow::Result<Self> {
+        Self::with_accept(base_url, path_prefix, None, auth_fn)
+    }
+
+    pub(crate) fn with_accept(
+        base_url: String,
+        path_prefix: &str,
+        default_accept: Option<String>,
+        auth_fn: impl Fn() -> Option<CiAuth> + Send + Sync + 'static,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?,
+            base_url,
+            path_prefix: path_prefix.to_string(),
+            auth_fn: Box::new(auth_fn),
+            default_accept,
+        })
+    }
+
+    /// Build a GET request with auth + User-Agent applied.
+    pub(crate) fn get(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = if self.path_prefix.is_empty() {
+            format!("{}/{path}", self.base_url)
+        } else {
+            format!("{}/{}/{path}", self.base_url, self.path_prefix)
+        };
+        let mut req = self.client.get(&url).header("User-Agent", "agend-terminal");
+        if let Some(ref accept) = self.default_accept {
+            req = req.header("Accept", accept.as_str());
+        }
+        if let Some(auth) = (self.auth_fn)() {
+            req = match auth {
+                CiAuth::Bearer(token) => req.bearer_auth(token),
+                CiAuth::Header(name, value) => req.header(name, value),
+                CiAuth::Basic(user, pass) => req.basic_auth(user, Some(pass)),
+            };
+        }
+        req
+    }
+
+    /// Parse rate-limit reset timestamp from response headers.
+    /// Checks both GitHub (`x-ratelimit-reset`) and GitLab (`ratelimit-reset`) header names.
+    #[allow(dead_code)] // available for providers to use; wired per-provider as needed
+    pub(crate) fn parse_rate_limit_reset(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+        headers
+            .get("x-ratelimit-reset")
+            .or_else(|| headers.get("ratelimit-reset"))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CiProvider trait — abstracts CI-server-specific HTTP calls so ci_watch
 // state-machine logic can be tested with a mock and future providers
 // (GitLab, Buildkite, …) can be added without touching the orchestration.
@@ -68,8 +155,7 @@ pub trait CiProvider: Send + Sync {
 
 /// GitHub Actions implementation of [`CiProvider`].
 pub struct GitHubCiProvider {
-    client: reqwest::Client,
-    base_url: String,
+    http: CiHttpClient,
 }
 
 impl GitHubCiProvider {
@@ -81,24 +167,13 @@ impl GitHubCiProvider {
     #[allow(dead_code)] // used by auto-detect for GHE; wired in this PR
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()?,
-            base_url,
+            http: CiHttpClient::with_accept(
+                base_url,
+                "",
+                Some("application/vnd.github+json".to_string()),
+                || std::env::var("GITHUB_TOKEN").ok().map(CiAuth::Bearer),
+            )?,
         })
-    }
-
-    fn gh_get(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{path}", self.base_url);
-        let mut req = self
-            .client
-            .get(&url)
-            .header("User-Agent", "agend-terminal")
-            .header("Accept", "application/vnd.github+json");
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
-        req
     }
 }
 
@@ -106,7 +181,8 @@ impl GitHubCiProvider {
 impl CiProvider for GitHubCiProvider {
     async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
         let resp = self
-            .gh_get(&format!(
+            .http
+            .get(&format!(
                 "repos/{repo}/actions/runs?branch={branch}&per_page=5"
             ))
             .send()
@@ -162,7 +238,8 @@ impl CiProvider for GitHubCiProvider {
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
         let resp: serde_json::Value = match self
-            .gh_get(&format!(
+            .http
+            .get(&format!(
                 "repos/{repo}/pulls?head={branch}&state=all&per_page=1"
             ))
             .send()
@@ -188,7 +265,8 @@ impl CiProvider for GitHubCiProvider {
 
     async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
         let jobs_resp: serde_json::Value = match self
-            .gh_get(&format!("repos/{repo}/actions/runs/{run_id}/jobs"))
+            .http
+            .get(&format!("repos/{repo}/actions/runs/{run_id}/jobs"))
             .send()
             .await
         {
@@ -229,10 +307,7 @@ impl CiProvider for GitHubCiProvider {
 
 /// GitLab Pipelines implementation of [`CiProvider`].
 pub struct GitLabCiProvider {
-    client: reqwest::Client,
-    /// Base URL for GitLab API (self-hosted support).
-    /// Defaults to `https://gitlab.com`.
-    base_url: String,
+    http: CiHttpClient,
 }
 
 impl GitLabCiProvider {
@@ -241,13 +316,12 @@ impl GitLabCiProvider {
         Self::with_base_url("https://gitlab.com".to_string())
     }
 
-    #[allow(dead_code)] // wired in Sprint 39 PR-3
+    #[allow(dead_code)]
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()?,
-            base_url,
+            http: CiHttpClient::new(base_url, "api/v4", || {
+                Self::resolve_token().map(|t| CiAuth::Header("PRIVATE-TOKEN".into(), t))
+            })?,
         })
     }
 
@@ -278,15 +352,6 @@ impl GitLabCiProvider {
         None
     }
 
-    fn gl_get(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/api/v4/{path}", self.base_url);
-        let mut req = self.client.get(&url).header("User-Agent", "agend-terminal");
-        if let Some(token) = Self::resolve_token() {
-            req = req.header("PRIVATE-TOKEN", token);
-        }
-        req
-    }
-
     /// URL-encode a `owner/repo` path for GitLab project ID.
     fn encode_project(repo: &str) -> String {
         repo.replace('/', "%2F")
@@ -298,7 +363,8 @@ impl CiProvider for GitLabCiProvider {
     async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
         let project = Self::encode_project(repo);
         let resp = self
-            .gl_get(&format!(
+            .http
+            .get(&format!(
                 "projects/{project}/pipelines?ref={branch}&per_page=5"
             ))
             .send()
@@ -353,7 +419,8 @@ impl CiProvider for GitLabCiProvider {
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
         let project = Self::encode_project(repo);
         let resp: serde_json::Value = match self
-            .gl_get(&format!(
+            .http
+            .get(&format!(
                 "projects/{project}/merge_requests?source_branch={branch}&state=all&per_page=1"
             ))
             .send()
@@ -379,7 +446,8 @@ impl CiProvider for GitLabCiProvider {
     async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
         let project = Self::encode_project(repo);
         let jobs_resp: serde_json::Value = match self
-            .gl_get(&format!(
+            .http
+            .get(&format!(
                 "projects/{project}/pipelines/{run_id}/jobs?per_page=20"
             ))
             .send()
@@ -408,7 +476,8 @@ impl CiProvider for GitLabCiProvider {
             None => return header,
         };
         let trace = match self
-            .gl_get(&format!("projects/{project}/jobs/{job_id}/trace"))
+            .http
+            .get(&format!("projects/{project}/jobs/{job_id}/trace"))
             .send()
             .await
         {
@@ -447,8 +516,7 @@ impl CiProvider for GitLabCiProvider {
 /// Bitbucket Cloud Pipelines implementation of [`CiProvider`].
 /// Cloud-only MVP per Sprint 39 §11 #1; Bitbucket Server deferred to Sprint 41+.
 pub struct BitbucketCiProvider {
-    client: reqwest::Client,
-    base_url: String,
+    http: CiHttpClient,
 }
 
 #[allow(dead_code)] // Constructors wired in Sprint 39 PR-3
@@ -459,10 +527,16 @@ impl BitbucketCiProvider {
 
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()?,
-            base_url,
+            http: CiHttpClient::new(base_url, "2.0", || {
+                Self::resolve_token().map(|t| {
+                    let parts: Vec<&str> = t.splitn(2, ':').collect();
+                    if parts.len() == 2 {
+                        CiAuth::Basic(parts[0].to_string(), parts[1].to_string())
+                    } else {
+                        CiAuth::Bearer(t)
+                    }
+                })
+            })?,
         })
     }
 
@@ -490,29 +564,14 @@ impl BitbucketCiProvider {
         }
         None
     }
-
-    fn bb_get(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/2.0/{path}", self.base_url);
-        let mut req = self.client.get(&url).header("User-Agent", "agend-terminal");
-        if let Some(token) = Self::resolve_token() {
-            // token format: "user:app_password" → reqwest basic_auth
-            let parts: Vec<&str> = token.splitn(2, ':').collect();
-            if parts.len() == 2 {
-                req = req.basic_auth(parts[0], Some(parts[1]));
-            } else {
-                // Treat as bearer token if no colon separator.
-                req = req.bearer_auth(&token);
-            }
-        }
-        req
-    }
 }
 
 #[async_trait::async_trait]
 impl CiProvider for BitbucketCiProvider {
     async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
         let resp = self
-            .bb_get(&format!(
+            .http
+            .get(&format!(
                 "repositories/{repo}/pipelines/?target.branch={branch}&pagelen=5&sort=-created_on"
             ))
             .send()
@@ -569,7 +628,8 @@ impl CiProvider for BitbucketCiProvider {
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
         let resp: serde_json::Value = match self
-            .bb_get(&format!(
+            .http
+            .get(&format!(
                 "repositories/{repo}/pullrequests?q=source.branch.name=\"{branch}\"&pagelen=1"
             ))
             .send()
@@ -597,7 +657,8 @@ impl CiProvider for BitbucketCiProvider {
         // Steps endpoint: GET /repositories/{repo}/pipelines/{pipeline_uuid}/steps/
         // Since we have build_number, use it as pipeline selector.
         let steps_resp: serde_json::Value = match self
-            .bb_get(&format!(
+            .http
+            .get(&format!(
                 "repositories/{repo}/pipelines/{run_id}/steps/?pagelen=20"
             ))
             .send()
@@ -624,7 +685,8 @@ impl CiProvider for BitbucketCiProvider {
             None => return name,
         };
         let log = match self
-            .bb_get(&format!(
+            .http
+            .get(&format!(
                 "repositories/{repo}/pipelines/{run_id}/steps/{step_uuid}/log"
             ))
             .send()
@@ -2452,7 +2514,7 @@ mod tests {
     #[test]
     fn gitlab_new_defaults_to_gitlab_com() {
         let provider = super::GitLabCiProvider::new().expect("new");
-        assert_eq!(provider.base_url, "https://gitlab.com");
+        assert_eq!(provider.http.base_url, "https://gitlab.com");
     }
 
     /// Smoke: with_base_url() sets custom base URL (self-hosted).
@@ -2461,7 +2523,7 @@ mod tests {
         let provider =
             super::GitLabCiProvider::with_base_url("https://git.corp.example.com".into())
                 .expect("with_base_url");
-        assert_eq!(provider.base_url, "https://git.corp.example.com");
+        assert_eq!(provider.http.base_url, "https://git.corp.example.com");
     }
 
     /// B4: Auth state 1 — GITLAB_TOKEN env present → PRIVATE-TOKEN header sent.
@@ -2786,7 +2848,7 @@ mod tests {
     #[test]
     fn bitbucket_new_defaults_to_api_bitbucket_org() {
         let provider = super::BitbucketCiProvider::new().expect("new");
-        assert_eq!(provider.base_url, "https://api.bitbucket.org");
+        assert_eq!(provider.http.base_url, "https://api.bitbucket.org");
     }
 
     #[test]
@@ -2794,7 +2856,7 @@ mod tests {
         let provider =
             super::BitbucketCiProvider::with_base_url("https://bb.corp.example.com".into())
                 .expect("with_base_url");
-        assert_eq!(provider.base_url, "https://bb.corp.example.com");
+        assert_eq!(provider.http.base_url, "https://bb.corp.example.com");
     }
 
     /// B5: watch_ci rejects bitbucket_server with operator-actionable error.
@@ -2911,12 +2973,15 @@ mod tests {
         let provider =
             super::GitHubCiProvider::with_base_url("https://github.corp.example.com/api/v3".into())
                 .expect("with_base_url");
-        assert_eq!(provider.base_url, "https://github.corp.example.com/api/v3");
+        assert_eq!(
+            provider.http.base_url,
+            "https://github.corp.example.com/api/v3"
+        );
     }
 
     #[test]
     fn github_new_defaults_to_api_github_com() {
         let provider = super::GitHubCiProvider::new().expect("new");
-        assert_eq!(provider.base_url, "https://api.github.com");
+        assert_eq!(provider.http.base_url, "https://api.github.com");
     }
 }
