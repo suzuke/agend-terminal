@@ -469,6 +469,12 @@ fn check_deps_unchanged(repo_dir: &Path, base: &str, head: &str) -> ClaimResult 
 mod tests {
     use super::*;
 
+    /// Serialize tests that mutate process-global AGEND_HOME env var.
+    fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     // --- Parser tests ---
 
     #[test]
@@ -769,6 +775,7 @@ mod tests {
     // B2a: substring collision — spec allows "src/foo.rs" but "src/foo.rs.bak" modified → REJECT
     #[test]
     fn scope_spec_substring_collision_red() {
+        let _g = env_test_guard();
         let dir = setup_git_repo("scope_substr");
         let base = git_head(&dir);
         // Create a file that is a substring-collision with "src.rs"
@@ -808,6 +815,7 @@ mod tests {
     // B2: scope spec GREEN — in-scope file passes
     #[test]
     fn scope_spec_in_scope_green() {
+        let _g = env_test_guard();
         let dir = setup_git_repo("scope_green");
         let base = git_head(&dir);
         std::fs::write(dir.join("src.rs"), "fn v2() {}\n").unwrap();
@@ -843,6 +851,7 @@ mod tests {
     // B2: scope spec RED — out-of-scope file
     #[test]
     fn scope_spec_out_of_scope_red() {
+        let _g = env_test_guard();
         let dir = setup_git_repo("scope_oos");
         let base = git_head(&dir);
         std::fs::write(dir.join("other.rs"), "fn other() {}\n").unwrap();
