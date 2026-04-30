@@ -5,6 +5,7 @@ pub(crate) mod ci;
 mod comms;
 mod instance;
 mod schedule;
+pub(crate) mod sha_gate;
 mod task;
 
 use crate::agent_ops::save_metadata;

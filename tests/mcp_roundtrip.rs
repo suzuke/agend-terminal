@@ -851,7 +851,8 @@ fn test_correlation_id_persisted_as_typed_field() {
 }
 
 #[test]
-fn test_report_result_reviewed_head_persisted() {
+fn test_report_result_reviewed_head_no_pr_url_rejected() {
+    // M3 B2: reviewed_head provided but no PR URL in summary → reject
     let home = mcp_home();
     std::fs::write(
         home.join("fleet.yaml"),
@@ -866,18 +867,22 @@ fn test_report_result_reviewed_head_persisted() {
         ],
     );
     assert!(responses.len() >= 2);
+    let result = extract_tool_result(&responses[1]);
+    let err = result["error"]
+        .as_str()
+        .expect("should return error when reviewed_head but no PR URL");
+    assert!(
+        err.contains("no GitHub PR URL"),
+        "error must mention missing PR URL: {err}"
+    );
+    // Message must NOT be in inbox (rejected before delivery)
     let inbox_path = home.join("inbox").join("test-agent.jsonl");
     let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
-    let msg: serde_json::Value = content
+    let has_report = content
         .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .find(|v: &serde_json::Value| v["text"].as_str().unwrap_or("").contains("[report_result]"))
-        .expect("report_result must be in inbox");
-    assert_eq!(
-        msg["reviewed_head"].as_str(),
-        Some("abc123"),
-        "reviewed_head must be persisted: {msg}"
-    );
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .any(|v| v["text"].as_str().unwrap_or("").contains("[report_result]"));
+    assert!(!has_report, "rejected report must NOT be in inbox");
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -967,57 +972,43 @@ fn test_send_to_instance_correlation_id_persisted() {
 }
 
 #[test]
-fn test_reviewed_head_mismatch_annotates_stale() {
+fn test_reviewed_head_no_pr_url_rejected_not_in_inbox() {
+    // M3 B2: reviewed_head + no PR URL → reject, message never reaches inbox
     let home = mcp_home();
     std::fs::write(
         home.join("fleet.yaml"),
         "instances:\n  test-agent:\n    backend: claude\n",
     )
     .ok();
-    // Send report_result with reviewed_head
-    mcp_session_in_home(
+    let responses = mcp_session_in_home(
         &home,
         &[
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"request_kind":"report","target_instance":"test-agent","summary":"reviewed","message":"reviewed","reviewed_head":"old-sha-123","correlation_id":"t-1","parent_id":"m-1"}}}"#,
         ],
     );
-    // Drain to mark as read, then describe_message
-    let responses = mcp_session_in_home(
+    let result = extract_tool_result(&responses[1]);
+    assert!(
+        result["error"].as_str().is_some(),
+        "reviewed_head without PR URL must be rejected: {result}"
+    );
+    // Drain inbox — should be empty (rejected before delivery)
+    let drain_responses = mcp_session_in_home(
         &home,
         &[
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inbox","arguments":{}}}"#,
         ],
     );
-    // Get the message ID from inbox
-    let inbox_result = extract_tool_result(&responses[1]);
-    let messages = inbox_result["messages"].as_array().expect("messages");
-    let msg = messages
+    let inbox_result = extract_tool_result(&drain_responses[1]);
+    let empty = vec![];
+    let messages = inbox_result["messages"].as_array().unwrap_or(&empty);
+    let has_reviewed = messages
         .iter()
-        .find(|m| m["reviewed_head"].as_str() == Some("old-sha-123"))
-        .expect("msg with reviewed_head");
-    let msg_id = msg["id"].as_str().expect("msg id");
-    // Now describe_message should show stale_possible
-    let desc_req = format!(
-        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"inbox","arguments":{{"message_id":"{msg_id}"}}}}}}"#
-    );
-    let responses2 = mcp_session_in_home(
-        &home,
-        &[
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#,
-            &desc_req,
-        ],
-    );
-    let desc = extract_tool_result(&responses2[1]);
-    assert_eq!(
-        desc["reviewed_head"].as_str(),
-        Some("old-sha-123"),
-        "describe_message must show reviewed_head: {desc}"
-    );
-    assert_eq!(
-        desc["stale_possible"], true,
-        "reviewed_head present must annotate stale_possible: {desc}"
+        .any(|m| m["reviewed_head"].as_str() == Some("old-sha-123"));
+    assert!(
+        !has_reviewed,
+        "rejected report must not appear in inbox: {messages:?}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }

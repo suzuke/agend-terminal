@@ -127,6 +127,7 @@ pub(super) fn handle_send_to_instance(
                 attachments: vec![],
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
+                superseded_by: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
@@ -299,6 +300,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 attachments: vec![],
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
+                superseded_by: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
@@ -371,6 +373,16 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
     let result = {
         let correlation_id = args["correlation_id"].as_str();
         let reviewed_head = args["reviewed_head"].as_str();
+
+        // M3: SHA-staleness gate — if reviewed_head is provided, verify against PR HEAD.
+        if let Some(rh) = reviewed_head {
+            if let Err(e) =
+                super::sha_gate::check_sha_gate(rh, summary, super::sha_gate::fetch_pr_head_sha)
+            {
+                return json!({"error": e});
+            }
+        }
+
         match crate::api::call(
             home,
             &json!({
@@ -410,6 +422,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     attachments: vec![],
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
+                    superseded_by: None,
                 };
                 crate::agent_ops::fallback_deliver(
                     home,
@@ -599,6 +612,7 @@ pub(super) fn handle_describe_thread(home: &Path, args: &Value) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde_json::json;
