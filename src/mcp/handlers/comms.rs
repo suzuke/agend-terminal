@@ -274,6 +274,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                     "from": sender.as_str(),
                     "task": task,
                 },
+                "branch": args["branch"].as_str(),
             }
         }),
     ) {
@@ -358,30 +359,6 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 "warning".into(),
                 json!("interrupt/reason fields deprecated, use force/force_reason; will be removed Sprint 11"),
             );
-        }
-    }
-    // Sprint 31 task #52: checkout branch in target's worktree when task.branch set
-    if let Some(branch) = args["branch"].as_str() {
-        if !branch.is_empty() {
-            let fleet_path = home.join("fleet.yaml");
-            if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {
-                if let Some(resolved) = config.resolve_instance(target) {
-                    if let Some(ref wd) = resolved.working_directory {
-                        if crate::worktree::is_git_repo(wd) {
-                            match crate::worktree::checkout_branch(wd, branch) {
-                                Ok(()) => {
-                                    if let Some(obj) = result.as_object_mut() {
-                                        obj.insert("branch_checked_out".into(), json!(branch));
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(target_name = target, branch, error = %e, "task.branch checkout failed");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
     result
