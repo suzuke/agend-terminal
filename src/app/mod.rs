@@ -80,7 +80,28 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     )
     .ok();
 
+    // Panic hook: restore terminal on panic so the user doesn't get stuck
+    // in raw mode with mouse capture enabled. Chains the original hook so
+    // panic messages still print.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::event::PopKeyboardEnhancementFlags,
+        );
+        ratatui::restore();
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+        );
+        original_hook(info);
+    }));
+
     let result = run_app(&mut terminal, fleet_path.as_deref());
+
+    // Restore default panic hook before normal cleanup (avoid double-restore).
+    drop(std::panic::take_hook());
 
     // Pop before leaving alternate screen (symmetric with push).
     crossterm::execute!(
