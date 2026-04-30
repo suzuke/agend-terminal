@@ -18,7 +18,7 @@ pub(crate) fn handle_verify_push(params: &Value) -> Value {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     let claims = crate::claim_verifier::parse_claims(claim_text);
-    let result = crate::claim_verifier::verify(&repo_dir, base, head, &claims);
+    let result = crate::claim_verifier::verify(&repo_dir, base, head, &claims, None);
 
     json!({
         "ok": result.ok,

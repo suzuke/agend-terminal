@@ -671,7 +671,7 @@ fn main() -> anyhow::Result<()> {
             };
             let repo_dir = std::env::current_dir()?;
             let claims = claim_verifier::parse_claims(&claim_text);
-            let result = claim_verifier::verify(&repo_dir, &base, &head, &claims);
+            let result = claim_verifier::verify(&repo_dir, &base, &head, &claims, None);
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {

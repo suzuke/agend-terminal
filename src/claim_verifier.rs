@@ -127,7 +127,13 @@ fn extract_task_id(s: &str) -> Option<String> {
 
 /// Verify all claims against the diff between `base` and `head`.
 /// `repo_dir` is the git working directory.
-pub fn verify(repo_dir: &Path, base: &str, head: &str, claims: &[Claim]) -> VerifyResult {
+pub fn verify(
+    repo_dir: &Path,
+    base: &str,
+    head: &str,
+    claims: &[Claim],
+    home_override: Option<&Path>,
+) -> VerifyResult {
     // B1: check if NoOtherChanges is paired with ScopeFollowsDispatchSpec
     let has_scope_spec = claims
         .iter()
@@ -139,7 +145,7 @@ pub fn verify(repo_dir: &Path, base: &str, head: &str, claims: &[Claim]) -> Veri
             Claim::NoOtherChanges => check_no_other_changes(repo_dir, base, head, has_scope_spec),
             Claim::ByteEqualVerified { paths } => check_byte_equal(repo_dir, base, head, paths),
             Claim::ScopeFollowsDispatchSpec { task_id } => {
-                check_scope_follows_spec(repo_dir, base, head, task_id)
+                check_scope_follows_spec(repo_dir, base, head, task_id, home_override)
             }
             Claim::OnlyFormatting => check_only_formatting(repo_dir, base, head),
             Claim::DepsUnchanged => check_deps_unchanged(repo_dir, base, head),
@@ -267,7 +273,13 @@ fn check_byte_equal(repo_dir: &Path, base: &str, head: &str, paths: &[String]) -
     }
 }
 
-fn check_scope_follows_spec(repo_dir: &Path, base: &str, head: &str, task_id: &str) -> ClaimResult {
+fn check_scope_follows_spec(
+    repo_dir: &Path,
+    base: &str,
+    head: &str,
+    task_id: &str,
+    home_override: Option<&Path>,
+) -> ClaimResult {
     if task_id.is_empty() {
         return ClaimResult {
             claim: "scope follows dispatch spec".to_string(),
@@ -286,10 +298,11 @@ fn check_scope_follows_spec(repo_dir: &Path, base: &str, head: &str, task_id: &s
         }
     };
     // Load dispatch tracking to find allowed files for this task.
-    // If no AGEND_HOME or no dispatch entry, pass through (can't verify).
-    let home = std::env::var("AGEND_HOME")
-        .map(std::path::PathBuf::from)
-        .ok();
+    let home = home_override.map(std::path::PathBuf::from).or_else(|| {
+        std::env::var("AGEND_HOME")
+            .ok()
+            .map(std::path::PathBuf::from)
+    });
     let allowed = home.and_then(|h| load_spec_files(&h, task_id));
     match allowed {
         Some(spec_files) => {
@@ -469,12 +482,6 @@ fn check_deps_unchanged(repo_dir: &Path, base: &str, head: &str) -> ClaimResult 
 mod tests {
     use super::*;
 
-    /// Serialize tests that mutate process-global AGEND_HOME env var.
-    fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        GUARD.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     // --- Parser tests ---
 
     #[test]
@@ -608,7 +615,7 @@ mod tests {
         std::fs::write(dir.join("src.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
         git_commit(&dir, "add print");
         let head = git_head(&dir);
-        let r = verify(&dir, &base, &head, &[Claim::DepsUnchanged]);
+        let r = verify(&dir, &base, &head, &[Claim::DepsUnchanged], None);
         assert!(r.ok, "deps unchanged should pass: {:?}", r.results);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -621,7 +628,7 @@ mod tests {
         std::fs::write(dir.join("Cargo.lock"), "# lock v2 — changed\n").unwrap();
         git_commit(&dir, "change lock");
         let head = git_head(&dir);
-        let r = verify(&dir, &base, &head, &[Claim::DepsUnchanged]);
+        let r = verify(&dir, &base, &head, &[Claim::DepsUnchanged], None);
         assert!(!r.ok, "deps unchanged should fail: {:?}", r.results);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -641,6 +648,7 @@ mod tests {
             &[Claim::ByteEqualVerified {
                 paths: vec!["src.rs".into()],
             }],
+            None,
         );
         assert!(r.ok, "byte-equal should pass: {:?}", r.results);
         std::fs::remove_dir_all(&dir).ok();
@@ -661,6 +669,7 @@ mod tests {
             &[Claim::ByteEqualVerified {
                 paths: vec!["src.rs".into()],
             }],
+            None,
         );
         assert!(!r.ok, "byte-equal should fail: {:?}", r.results);
         std::fs::remove_dir_all(&dir).ok();
@@ -674,7 +683,7 @@ mod tests {
         std::fs::write(dir.join("src.rs"), "fn main() { v2(); }\n").unwrap();
         git_commit(&dir, "update");
         let head = git_head(&dir);
-        let r = verify(&dir, &base, &head, &[Claim::NoOtherChanges]);
+        let r = verify(&dir, &base, &head, &[Claim::NoOtherChanges], None);
         // B1: standalone NoOtherChanges → REJECT
         assert!(
             !r.ok,
@@ -693,7 +702,7 @@ mod tests {
         std::fs::write(dir.join("README.md"), "# hello\n").unwrap();
         git_commit(&dir, "add readme");
         let head = git_head(&dir);
-        let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting]);
+        let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting], None);
         // B3: non-.rs files under "only formatting" → REJECT
         assert!(
             !r.ok,
@@ -719,6 +728,7 @@ mod tests {
             &[Claim::ScopeFollowsDispatchSpec {
                 task_id: "t-nonexistent".into(),
             }],
+            None,
         );
         // B2b: missing spec → fail-closed
         assert!(!r.ok, "missing spec should reject: {:?}", r.results);
@@ -737,6 +747,7 @@ mod tests {
             &base,
             &head,
             &[Claim::Unknown("all tests passing".into())],
+            None,
         );
         assert!(r.ok);
         assert!(r.results[0].detail.contains("pass-through"));
@@ -761,6 +772,7 @@ mod tests {
                     task_id: "t-x".into(),
                 },
             ],
+            None,
         );
         // NoOtherChanges passes when paired (ScopeFollowsDispatchSpec may fail separately)
         let noc_result = &r.results[0];
@@ -775,7 +787,6 @@ mod tests {
     // B2a: substring collision — spec allows "src/foo.rs" but "src/foo.rs.bak" modified → REJECT
     #[test]
     fn scope_spec_substring_collision_red() {
-        let _g = env_test_guard();
         let dir = setup_git_repo("scope_substr");
         let base = git_head(&dir);
         // Create a file that is a substring-collision with "src.rs"
@@ -795,7 +806,6 @@ mod tests {
             serde_json::to_string(&tracking).unwrap(),
         )
         .unwrap();
-        std::env::set_var("AGEND_HOME", &home);
         let r = verify(
             &dir,
             &base,
@@ -803,11 +813,11 @@ mod tests {
             &[Claim::ScopeFollowsDispatchSpec {
                 task_id: "t-substr".into(),
             }],
+            Some(&home),
         );
         // B2a: "src.rs.bak" should NOT match spec "src.rs" — out of scope
         assert!(!r.ok, "substring collision should reject: {:?}", r.results);
         assert!(r.results[0].detail.contains("out-of-scope"));
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&home).ok();
     }
@@ -815,7 +825,6 @@ mod tests {
     // B2: scope spec GREEN — in-scope file passes
     #[test]
     fn scope_spec_in_scope_green() {
-        let _g = env_test_guard();
         let dir = setup_git_repo("scope_green");
         let base = git_head(&dir);
         std::fs::write(dir.join("src.rs"), "fn v2() {}\n").unwrap();
@@ -833,7 +842,6 @@ mod tests {
             serde_json::to_string(&tracking).unwrap(),
         )
         .unwrap();
-        std::env::set_var("AGEND_HOME", &home);
         let r = verify(
             &dir,
             &base,
@@ -841,9 +849,9 @@ mod tests {
             &[Claim::ScopeFollowsDispatchSpec {
                 task_id: "t-green".into(),
             }],
+            Some(&home),
         );
         assert!(r.ok, "in-scope file should pass: {:?}", r.results);
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&home).ok();
     }
@@ -851,7 +859,6 @@ mod tests {
     // B2: scope spec RED — out-of-scope file
     #[test]
     fn scope_spec_out_of_scope_red() {
-        let _g = env_test_guard();
         let dir = setup_git_repo("scope_oos");
         let base = git_head(&dir);
         std::fs::write(dir.join("other.rs"), "fn other() {}\n").unwrap();
@@ -869,7 +876,6 @@ mod tests {
             serde_json::to_string(&tracking).unwrap(),
         )
         .unwrap();
-        std::env::set_var("AGEND_HOME", &home);
         let r = verify(
             &dir,
             &base,
@@ -877,10 +883,10 @@ mod tests {
             &[Claim::ScopeFollowsDispatchSpec {
                 task_id: "t-oos".into(),
             }],
+            Some(&home),
         );
         assert!(!r.ok, "out-of-scope should reject: {:?}", r.results);
         assert!(r.results[0].detail.contains("out-of-scope"));
-        std::env::remove_var("AGEND_HOME");
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&home).ok();
     }
@@ -894,7 +900,7 @@ mod tests {
         std::fs::write(dir.join("src.rs"), "fn main() { new_logic(); }\n").unwrap();
         git_commit(&dir, "logic change");
         let head = git_head(&dir);
-        let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting]);
+        let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting], None);
         assert!(
             !r.ok,
             "logic change should reject only-formatting: {:?}",
@@ -912,7 +918,7 @@ mod tests {
         std::fs::write(dir.join("src.rs"), "fn  main(  )  {  }\n").unwrap();
         git_commit(&dir, "fmt change");
         let head = git_head(&dir);
-        let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting]);
+        let r = verify(&dir, &base, &head, &[Claim::OnlyFormatting], None);
         assert!(r.ok, "pure fmt change should pass: {:?}", r.results);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -928,6 +934,7 @@ mod tests {
             &base,
             &head,
             &[Claim::ByteEqualVerified { paths: vec![] }],
+            None,
         );
         assert!(
             !r.ok,
