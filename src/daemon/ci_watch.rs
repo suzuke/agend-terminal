@@ -2581,8 +2581,39 @@ mod tests {
     /// §3.5.10: fetch_failure_summary finds failed step.
     #[test]
     fn bitbucket_fetch_failure_summary_finds_failed_step() {
-        let fixture = include_str!("../../tests/fixtures/bitbucket-steps-response.json");
-        let (port, handle, captured) = gitlab_mock_server(fixture);
+        // 2-request chain mock: 1st returns steps, 2nd returns log.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let captured_reqs =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let cap = captured_reqs.clone();
+        let steps_body =
+            include_str!("../../tests/fixtures/bitbucket-steps-response.json").to_string();
+        // fire-and-forget: test mock server thread
+        let handle = std::thread::spawn(move || {
+            for i in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).expect("read");
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                cap.lock().expect("lock").push((path, request));
+                let body = if i == 0 {
+                    &steps_body
+                } else {
+                    "error line 1\nerror line 2\n"
+                };
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                stream.write_all(resp.as_bytes()).expect("write");
+            }
+        });
         let _guard = BitbucketTokenGuard::set("user:pass");
         let provider =
             super::BitbucketCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
@@ -2593,13 +2624,38 @@ mod tests {
             .expect("rt");
         let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 48));
         handle.join().expect("mock");
-        let (path, req) = captured.lock().expect("lock").take().expect("captured");
-        assert!(path.contains("/pipelines/48/steps"), "path: {path}");
-        assert!(
-            req.to_lowercase().contains("authorization: basic"),
-            "auth: {req}"
+        let reqs = captured_reqs.lock().expect("lock");
+        assert_eq!(
+            reqs.len(),
+            2,
+            "expected 2 requests for failure-summary chain"
         );
-        assert_eq!(summary, "Test");
+        assert!(
+            reqs[0].0.contains("/pipelines/48/steps"),
+            "req1 path: {}",
+            reqs[0].0
+        );
+        assert!(
+            reqs[0].1.to_lowercase().contains("authorization: basic"),
+            "req1 auth"
+        );
+        assert!(
+            reqs[1].0.contains("/log"),
+            "req2 path must contain /log: {}",
+            reqs[1].0
+        );
+        assert!(
+            reqs[1].1.to_lowercase().contains("authorization: basic"),
+            "req2 auth"
+        );
+        assert!(
+            summary.starts_with("Test"),
+            "summary must start with step name: {summary}"
+        );
+        assert!(
+            summary.contains("error line"),
+            "summary must contain log tail: {summary}"
+        );
     }
 
     /// Auth state 1: BITBUCKET_TOKEN env → Basic auth header.
@@ -2679,5 +2735,31 @@ mod tests {
             super::BitbucketCiProvider::with_base_url("https://bb.corp.example.com".into())
                 .expect("with_base_url");
         assert_eq!(provider.base_url, "https://bb.corp.example.com");
+    }
+
+    /// B5: watch_ci rejects bitbucket_server with operator-actionable error.
+    #[test]
+    fn watch_ci_rejects_bitbucket_server_with_actionable_error() {
+        let dir = std::env::temp_dir().join(format!("agend-bb-reject-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let result = crate::mcp::handlers::ci::handle_watch_ci(
+            &dir,
+            &serde_json::json!({
+                "repo": "myws/myrepo",
+                "branch": "main",
+                "ci_provider": "bitbucket_server",
+            }),
+            "test-inst",
+        );
+        assert!(
+            result["error"].as_str().is_some(),
+            "must return error for bitbucket_server: {result}"
+        );
+        let err = result["error"].as_str().expect("error");
+        assert!(
+            err.contains("not yet supported") || err.contains("Sprint 41"),
+            "error must mention deferral: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

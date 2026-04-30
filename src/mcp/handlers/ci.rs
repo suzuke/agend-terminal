@@ -74,7 +74,7 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
     }
 }
 
-pub(super) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
+pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
     let repo = match args["repo"].as_str() {
         Some(r) => r,
         None => return json!({"error": "missing 'repo'"}),
