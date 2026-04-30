@@ -229,10 +229,12 @@ pub struct GitLabCiProvider {
 }
 
 impl GitLabCiProvider {
+    #[allow(dead_code)] // wired in Sprint 39 PR-3 (fleet.yaml ci_provider config)
     pub fn new() -> anyhow::Result<Self> {
         Self::with_base_url("https://gitlab.com".to_string())
     }
 
+    #[allow(dead_code)] // wired in Sprint 39 PR-3
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
@@ -2062,5 +2064,21 @@ mod tests {
             warning.expect("w").contains("GITLAB_TOKEN"),
             "warning must mention GITLAB_TOKEN"
         );
+    }
+
+    /// Smoke: GitLabCiProvider::new() defaults to gitlab.com base URL.
+    #[test]
+    fn gitlab_new_defaults_to_gitlab_com() {
+        let provider = super::GitLabCiProvider::new().expect("new");
+        assert_eq!(provider.base_url, "https://gitlab.com");
+    }
+
+    /// Smoke: with_base_url() sets custom base URL (self-hosted).
+    #[test]
+    fn gitlab_with_base_url_sets_custom() {
+        let provider =
+            super::GitLabCiProvider::with_base_url("https://git.corp.example.com".into())
+                .expect("with_base_url");
+        assert_eq!(provider.base_url, "https://git.corp.example.com");
     }
 }
