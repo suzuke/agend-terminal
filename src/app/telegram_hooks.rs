@@ -4,29 +4,26 @@
 //! Telegram API calls run on background threads to avoid blocking the TUI event loop.
 
 use crate::agent::{self, AgentRegistry};
-use crate::channel::{BindingOpts, Channel};
+use crate::channel::{BindingOpts, Channel, TelegramStatus};
 use crate::layout::Pane;
-use crate::render;
 
 use std::path::Path;
 use std::sync::Arc;
 
 /// Derive Telegram status from an already-loaded FleetConfig (no disk I/O).
-pub(super) fn telegram_status_from_config(
-    config: &crate::fleet::FleetConfig,
-) -> render::TelegramStatus {
+pub(super) fn telegram_status_from_config(config: &crate::fleet::FleetConfig) -> TelegramStatus {
     match config.channel {
         Some(crate::fleet::ChannelConfig::Telegram {
             ref bot_token_env, ..
         }) => {
             if std::env::var(bot_token_env).is_ok() {
-                render::TelegramStatus::Connected
+                TelegramStatus::Connected
             } else {
-                render::TelegramStatus::NoToken
+                TelegramStatus::NoToken
             }
         }
-        None => render::TelegramStatus::NotConfigured,
-        Some(crate::fleet::ChannelConfig::Discord { .. }) => render::TelegramStatus::NotConfigured,
+        None => TelegramStatus::NotConfigured,
+        Some(crate::fleet::ChannelConfig::Discord { .. }) => TelegramStatus::NotConfigured,
     }
 }
 

@@ -11,16 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Telegram connection status for status bar display.
-#[derive(Clone, Copy)]
-pub enum TelegramStatus {
-    /// No Telegram channel config in fleet.yaml.
-    NotConfigured,
-    /// Configured but token env var is missing.
-    NoToken,
-    /// Configured and token present (polling should be active).
-    Connected,
-}
+use crate::channel::TelegramStatus;
 
 /// Clamp a desired overlay dimension by the available space minus padding,
 /// using saturating arithmetic so a tiny terminal renders a clipped overlay
