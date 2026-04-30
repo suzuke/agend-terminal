@@ -54,6 +54,20 @@ pub enum AgentState {
 }
 
 impl AgentState {
+    /// GO-NARROW 6 states that trigger orchestrator notify on transition.
+    /// Per Sprint 43 §13 #1 operator decision.
+    pub fn is_notify_error_class(self) -> bool {
+        matches!(
+            self,
+            Self::UsageLimit
+                | Self::RateLimit
+                | Self::Hang
+                | Self::Crashed
+                | Self::AuthError
+                | Self::PermissionPrompt
+        )
+    }
+
     /// Priority: higher = more urgent. Error states > prompts > active > passive.
     pub fn priority(self) -> u8 {
         match self {
