@@ -515,8 +515,17 @@ pub fn github_token_warning_from_env() -> Option<&'static str> {
 
 /// Check CI watch configs and inject failure logs to agents when CI fails.
 pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
-    check_ci_watches_with_provider(home, registry, || {
-        Some(Box::new(GitHubCiProvider::new().ok()?) as Box<dyn CiProvider>)
+    check_ci_watches_with_provider(home, registry, |watch| {
+        let ci_url = watch
+            .get("ci_provider_url")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        match ci_url {
+            Some(url) => {
+                Some(Box::new(GitLabCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
+            }
+            None => Some(Box::new(GitHubCiProvider::new().ok()?) as Box<dyn CiProvider>),
+        }
     });
 }
 
@@ -524,7 +533,7 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
 fn check_ci_watches_with_provider(
     home: &Path,
     registry: &AgentRegistry,
-    make_provider: impl Fn() -> Option<Box<dyn CiProvider>> + Send + Sync + 'static,
+    make_provider: impl Fn(&serde_json::Value) -> Option<Box<dyn CiProvider>> + Send + Sync + 'static,
 ) {
     let entries = match std::fs::read_dir(home.join("ci-watches")) {
         Ok(e) => e,
@@ -606,7 +615,7 @@ fn check_ci_watches_with_provider(
         let home = home.to_path_buf();
         let watch_path = path.clone();
         let registry = Arc::clone(registry);
-        let provider = match make_provider() {
+        let provider = match make_provider(&watch) {
             Some(p) => p,
             None => {
                 tracing::warn!(repo = %repo, "ci_check: failed to build CI provider");
@@ -2067,7 +2076,7 @@ mod tests {
     #[test]
     fn gitlab_check_pr_terminal_merged() {
         let fixture = include_str!("../../tests/fixtures/gitlab-merge-requests-response.json");
-        let (port, handle, _) = gitlab_mock_server(fixture);
+        let (port, handle, captured) = gitlab_mock_server(fixture);
 
         let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
             .expect("provider");
@@ -2079,6 +2088,9 @@ mod tests {
         let state = rt.block_on(provider.check_pr_terminal("foo/bar", "feat/test"));
 
         handle.join().expect("mock");
+        let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+        assert!(path.contains("/merge_requests"), "path: {path}");
+        assert!(path.contains("source_branch=feat"), "query: {path}");
         assert!(
             matches!(state, super::PrState::Terminal { merged: true }),
             "expected Terminal(merged), got: {state:?}"
@@ -2089,7 +2101,7 @@ mod tests {
     #[test]
     fn gitlab_fetch_failure_summary_finds_failed_job() {
         let fixture = include_str!("../../tests/fixtures/gitlab-jobs-response.json");
-        let (port, handle, _) = gitlab_mock_server(fixture);
+        let (port, handle, captured) = gitlab_mock_server(fixture);
 
         let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
             .expect("provider");
@@ -2101,7 +2113,14 @@ mod tests {
         let summary = rt.block_on(provider.fetch_failure_summary("foo/bar", 48));
 
         handle.join().expect("mock");
-        assert_eq!(summary, "test / cargo-test");
+        let (path, _req) = captured.lock().expect("lock").take().expect("captured");
+        assert!(path.contains("/pipelines/48/jobs"), "path: {path}");
+        // Summary starts with stage/name (trace fetch hits second accept
+        // which isn't available — falls back to header-only).
+        assert!(
+            summary.starts_with("test / cargo-test"),
+            "summary: {summary}"
+        );
     }
 
     /// Auth fallback: token_warning returns warning when no token found.
