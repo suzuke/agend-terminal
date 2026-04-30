@@ -374,26 +374,10 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         let correlation_id = args["correlation_id"].as_str();
         let reviewed_head = args["reviewed_head"].as_str();
 
-        // M3: SHA-staleness gate — if reviewed_head is provided and summary
-        // contains a PR URL, verify the SHA matches current PR HEAD.
+        // M3: SHA-staleness gate — if reviewed_head is provided, verify against PR HEAD.
         if let Some(rh) = reviewed_head {
-            if let Some(pr_num) = extract_pr_number(summary) {
-                match fetch_pr_head_sha(&pr_num) {
-                    Ok(current_sha) => {
-                        if !current_sha.starts_with(rh) && !rh.starts_with(&current_sha) {
-                            return json!({"error": format!(
-                                "verdict reviewed_head={rh} but PR is at {current_sha}; \
-                                 please git fetch -f && re-review against current head"
-                            )});
-                        }
-                    }
-                    Err(e) => {
-                        // Fail-closed: gh fetch failure → reject verdict
-                        return json!({"error": format!(
-                            "cannot verify reviewed_head: {e} — retry after ensuring gh CLI is authenticated"
-                        )});
-                    }
-                }
+            if let Err(e) = check_sha_gate(rh, summary, fetch_pr_head_sha) {
+                return json!({"error": e});
             }
         }
 
@@ -625,6 +609,39 @@ pub(super) fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
 }
 
+/// M3: SHA-staleness gate — extracted for testability.
+/// Returns Ok(()) if the verdict may proceed, Err(message) to reject.
+fn check_sha_gate(
+    reviewed_head: &str,
+    summary: &str,
+    fetch: impl Fn(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    let pr_ref = match extract_pr_number(summary) {
+        Some(pr) => pr,
+        None => {
+            // B2: reviewed_head provided but no PR URL → incomplete attestation
+            return Err("reviewed_head provided but no GitHub PR URL in summary; \
+                 include PR URL (https://github.com/owner/repo/pull/N) \
+                 so daemon can verify SHA against current PR head"
+                .to_string());
+        }
+    };
+    let current_sha = fetch(&pr_ref)?;
+    // N1: strict 40-char compare when full SHA provided; prefix match for short SHAs
+    let matches = if reviewed_head.len() >= 40 && current_sha.len() >= 40 {
+        reviewed_head == current_sha
+    } else {
+        current_sha.starts_with(reviewed_head) || reviewed_head.starts_with(&current_sha)
+    };
+    if !matches {
+        return Err(format!(
+            "verdict reviewed_head={reviewed_head} but PR is at {current_sha}; \
+             please git fetch -f && re-review against current head"
+        ));
+    }
+    Ok(())
+}
+
 /// Extract PR number from text containing a GitHub PR URL.
 /// Returns `Some("owner/repo#N")` style string for `gh pr view`.
 fn extract_pr_number(text: &str) -> Option<String> {
@@ -680,6 +697,7 @@ fn fetch_pr_head_sha(pr_ref: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -735,5 +753,53 @@ mod tests {
     fn extract_pr_number_no_url() {
         let text = "Just a plain report with no PR link";
         assert_eq!(extract_pr_number(text), None);
+    }
+
+    // --- M3: SHA gate behavior tests ---
+
+    #[test]
+    fn sha_gate_green_matching_sha() {
+        let sha = "abc123def456789012345678901234567890abcd";
+        let summary = "Review of https://github.com/owner/repo/pull/42 done";
+        let result = check_sha_gate(sha, summary, |_| Ok(sha.to_string()));
+        assert!(result.is_ok(), "matching SHA should pass: {result:?}");
+    }
+
+    #[test]
+    fn sha_gate_green_prefix_match() {
+        let summary = "Review of https://github.com/owner/repo/pull/42 done";
+        let result = check_sha_gate("abc123", summary, |_| Ok("abc123def456".to_string()));
+        assert!(result.is_ok(), "prefix match should pass: {result:?}");
+    }
+
+    #[test]
+    fn sha_gate_red_mismatch() {
+        let summary = "Review of https://github.com/owner/repo/pull/42 done";
+        let result = check_sha_gate("old_sha_111", summary, |_| Ok("new_sha_222".to_string()));
+        assert!(result.is_err(), "mismatch should reject");
+        let err = result.unwrap_err();
+        assert!(err.contains("verdict reviewed_head=old_sha_111 but PR is at new_sha_222"));
+    }
+
+    #[test]
+    fn sha_gate_red_fetch_failure() {
+        let summary = "Review of https://github.com/owner/repo/pull/42 done";
+        let result = check_sha_gate("abc123", summary, |_| {
+            Err("gh: not authenticated".to_string())
+        });
+        assert!(result.is_err(), "fetch failure should reject (fail-closed)");
+        assert!(result.unwrap_err().contains("not authenticated"));
+    }
+
+    #[test]
+    fn sha_gate_red_no_pr_url_with_reviewed_head() {
+        // B2: reviewed_head provided but no PR URL → reject
+        let summary = "Just a plain report with no PR link";
+        let result = check_sha_gate("abc123", summary, |_| unreachable!());
+        assert!(
+            result.is_err(),
+            "no PR URL with reviewed_head should reject"
+        );
+        assert!(result.unwrap_err().contains("no GitHub PR URL"));
     }
 }
