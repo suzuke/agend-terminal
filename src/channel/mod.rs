@@ -57,6 +57,17 @@ use std::sync::{Arc, OnceLock};
 // Supporting types for trait methods added in PR-AE3
 // ---------------------------------------------------------------------------
 
+/// Telegram connection status for status bar display.
+#[derive(Clone, Copy)]
+pub enum TelegramStatus {
+    /// No Telegram channel config in fleet.yaml.
+    NotConfigured,
+    /// Configured but token env var is missing.
+    NoToken,
+    /// Configured and token present (polling should be active).
+    Connected,
+}
+
 /// Error type for channel operations that may not be supported.
 #[derive(Debug)]
 pub enum ChannelError {

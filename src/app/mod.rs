@@ -18,6 +18,7 @@ pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
 
 use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
+use crate::channel::TelegramStatus;
 use crate::keybinds::KeyHandler;
 use crate::layout::{Layout, Pane};
 use crate::notification_queue;
@@ -126,7 +127,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
                 let telegram = prepared.telegram.clone();
                 let status = if telegram.is_some() {
-                    render::TelegramStatus::Connected
+                    TelegramStatus::Connected
                 } else {
                     telegram_hooks::telegram_status_from_config(&prepared.config)
                 };
@@ -147,7 +148,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 (
                     api_server::noop_guard(),
                     None,
-                    render::TelegramStatus::NotConfigured,
+                    TelegramStatus::NotConfigured,
                 )
             }
             Err(e) => {
@@ -155,7 +156,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 (
                     api_server::noop_guard(),
                     None,
-                    render::TelegramStatus::NotConfigured,
+                    TelegramStatus::NotConfigured,
                 )
             }
         };
