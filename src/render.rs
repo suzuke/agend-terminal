@@ -246,7 +246,8 @@ pub(crate) fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] 
     match dir {
         SplitDir::Horizontal => {
             let second_y = area.y + first_size.saturating_sub(overlap);
-            let second_h = area.height + overlap - first_size;
+            // H4: saturating_sub prevents underflow on tiny terminals
+            let second_h = (area.height + overlap).saturating_sub(first_size).max(1);
             [
                 Rect::new(area.x, area.y, area.width, first_size),
                 Rect::new(area.x, second_y, area.width, second_h),
@@ -254,7 +255,8 @@ pub(crate) fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] 
         }
         SplitDir::Vertical => {
             let second_x = area.x + first_size.saturating_sub(overlap);
-            let second_w = area.width + overlap - first_size;
+            // H4: saturating_sub prevents underflow on tiny terminals
+            let second_w = (area.width + overlap).saturating_sub(first_size).max(1);
             [
                 Rect::new(area.x, area.y, first_size, area.height),
                 Rect::new(second_x, area.y, second_w, area.height),
@@ -2357,5 +2359,26 @@ mod tests {
             std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let result = highest_priority_state(&tab, &registry);
         assert_eq!(result, AgentState::Idle);
+    }
+
+    // H4: split_chunks must not underflow on tiny terminals
+    #[test]
+    fn split_chunks_tiny_terminal_no_underflow() {
+        use ratatui::layout::Rect;
+        // 1x1 terminal — extreme case
+        let area = Rect::new(0, 0, 1, 1);
+        let [_a, b] = split_chunks(area, &crate::layout::SplitDir::Horizontal, 0.9);
+        // Should not panic; second chunk should have min height 1
+        assert!(
+            b.height >= 1,
+            "second chunk height must be ≥1, got {}",
+            b.height
+        );
+        let [_c, d] = split_chunks(area, &crate::layout::SplitDir::Vertical, 0.9);
+        assert!(
+            d.width >= 1,
+            "second chunk width must be ≥1, got {}",
+            d.width
+        );
     }
 }
