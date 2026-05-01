@@ -14,10 +14,16 @@
 
 | # | File:Line | Env Var | Purpose | Replacement Strategy |
 |---|---|---|---|---|
-| R1 | `src/inbox.rs:522` | `AGEND_POINTER_ONLY_INJECT` | Feature flag: pointer-only inbox injection | Replace with `DaemonConfig.pointer_only_inject: bool` |
-| R2 | `src/main.rs:80+` | `AGEND_HOME` | Home directory override | Keep — process-wide, read once at startup |
-| R3 | `src/identity.rs:25` | `AGEND_INSTANCE_NAME` | Agent identity for MCP bridge | Keep — set by parent process for child, read once |
-| R4 | `src/mcp/mod.rs:267` | `AGEND_HOME` (comment) | Comment noting env var race risk | No action — comment only |
+| R1 | `src/inbox.rs:522` | `AGEND_POINTER_ONLY_INJECT` | Feature flag: pointer-only inbox injection | Replace with `DaemonConfig.pointer_only_inject` |
+| R2 | `src/main.rs:82` | `AGEND_HOME` | Home directory override | Keep — process-wide, read once at startup |
+| R3 | `src/identity.rs:22` | `AGEND_INSTANCE_NAME` | Agent identity for MCP bridge | Keep — set by parent process for child, read once |
+| R4 | `src/mcp/mod.rs:247` | `AGEND_DAEMON_PID` | Check if running inside daemon process | Replace with `DaemonConfig.daemon_pid` (P2 writer's reader) |
+| R5 | `src/mcp/mod.rs:268` | `AGEND_TEST_ISOLATION` | Skip daemon API calls in tests | Keep — test-only guard, not prod config |
+| R6 | `src/daemon/mod.rs:931` | `AGEND_SPAWN_STAGGER_MS` | Stagger agent spawn timing | Keep — low-frequency startup config, env var acceptable |
+| R7 | `src/daemon/watchdog.rs:9` | `AGEND_WATCHDOG_DRY_RUN` | Watchdog dry-run mode | Keep — debug/test flag, not prod config |
+| R8 | `src/worktree_cleanup.rs:13` | `AGEND_WORKTREE_AUTO_CLEANUP` | Auto-cleanup worktrees flag | Keep — opt-in feature flag, env var acceptable |
+| R9 | `src/agent.rs:603` | `AGEND_DEBUG_PTY_READ` | Debug PTY read logging | Keep — debug flag |
+| R10 | `src/mcp/mod.rs:36,40` | `AGEND_MCP_TOOLS_ALLOW/DENY` | MCP tool allow/deny lists | Keep — startup config, env var acceptable |
 
 ## Test-only `set_var` callsites (excluded from prod scope)
 
@@ -34,7 +40,8 @@
 ## PR-3 plan
 
 PR-3 will:
-1. Swap P2 (`AGEND_DAEMON_PID`) to use `DaemonConfig`
-2. Swap R1 (`AGEND_POINTER_ONLY_INJECT`) to use `DaemonConfig`
-3. Keep P1 (`.env` loader) and R2/R3 (startup-only reads) as-is
-4. Migrate test fixtures to explicit-param where feasible
+1. Swap P2 (`AGEND_DAEMON_PID` writer in `daemon/mod.rs`) to use `DaemonConfig.daemon_pid`
+2. Swap R1 (`AGEND_POINTER_ONLY_INJECT` reader in `inbox.rs`) to use `DaemonConfig.pointer_only_inject`
+3. Swap R4 (`AGEND_DAEMON_PID` reader in `mcp/mod.rs`) to use `DaemonConfig.daemon_pid`
+4. Keep P1 (`.env` loader) and R2/R3/R5-R10 (startup-only reads, debug flags) as-is
+5. Migrate test fixtures to explicit-param where feasible
