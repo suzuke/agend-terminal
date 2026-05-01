@@ -26,28 +26,9 @@ pub fn save(home: &Path, agents: &[AgentSnapshot]) {
         agents: agents.to_vec(),
     };
     let path = home.join("snapshot.json");
-    if let Err(e) = save_atomic(&path, &snapshot) {
+    if let Err(e) = crate::store::save_atomic(&path, &snapshot) {
         tracing::warn!(path = %path.display(), error = %e, "failed to persist snapshot");
     }
-}
-
-// Write-to-temp + fsync + rename. Guarantees snapshot.json is never
-// observed as a half-written file even if the process crashes mid-write.
-fn save_atomic(final_path: &Path, snapshot: &FleetSnapshot) -> std::io::Result<()> {
-    use std::io::Write;
-    let body = serde_json::to_string_pretty(snapshot)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let tmp_path = final_path.with_extension("json.tmp");
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, final_path)
 }
 
 pub fn load(home: &Path) -> Option<FleetSnapshot> {

@@ -315,8 +315,12 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         Ok(t) => t,
         Err(e) => return serde_json::json!({"error": e}),
     };
-    let now = chrono::Utc::now().to_rfc3339();
-    let id = format!("s-{}", &now[..19].replace([':', '-', 'T'], ""));
+    let now = chrono::Utc::now();
+    let now_str = now.to_rfc3339();
+    // H3: microsecond precision + counter to prevent same-second collision
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let id = format!("s-{}-{}", now.format("%Y%m%d%H%M%S%6f"), seq);
     let schedule = Schedule {
         id: id.clone(),
         trigger,
@@ -326,8 +330,8 @@ pub fn create(home: &Path, instance_name: &str, args: &Value) -> Value {
         timezone,
         enabled: true,
         created_by: instance_name.to_string(),
-        created_at: now.clone(),
-        updated_at: now,
+        created_at: now_str.clone(),
+        updated_at: now_str,
         run_history: Vec::new(),
     };
     match crate::store::mutate_versioned(&store_path(home), |store: &mut ScheduleStore| {
@@ -921,6 +925,20 @@ mod tests {
             .expect("arr");
         assert_eq!(history[0]["status"], "replayed");
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn schedule_ids_unique_when_created_rapidly() {
+        // H3: two schedules created in rapid succession must have distinct IDs
+        let home = tmp_home("id_unique");
+        let args1 = serde_json::json!({"message": "a", "cron": "0 * * * *"});
+        let args2 = serde_json::json!({"message": "b", "cron": "0 * * * *"});
+        let r1 = create(&home, "test", &args1);
+        let r2 = create(&home, "test", &args2);
+        let id1 = r1["id"].as_str().expect("id1");
+        let id2 = r2["id"].as_str().expect("id2");
+        assert_ne!(id1, id2, "rapid-fire schedule IDs must be unique");
         std::fs::remove_dir_all(&home).ok();
     }
 }

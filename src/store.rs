@@ -7,10 +7,30 @@ use std::path::{Path, PathBuf};
 
 /// Load a JSON file into a typed struct, returning default if missing or invalid.
 pub fn load<T: DeserializeOwned + Default>(path: &Path) -> T {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or_default()
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return T::default(),
+    };
+    if content.trim().is_empty() {
+        return T::default();
+    }
+    match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "store load: corrupt JSON, returning default — backing up corrupt file"
+            );
+            // M1: backup corrupt file so operator can inspect/recover
+            let backup = path.with_extension(format!(
+                "corrupt.{}",
+                chrono::Utc::now().format("%Y%m%d%H%M%S")
+            ));
+            let _ = std::fs::copy(path, &backup);
+            T::default()
+        }
+    }
 }
 
 /// Save a typed struct to a JSON file. Returns error on failure.
@@ -400,6 +420,31 @@ mod tests {
         drop(guard);
         let after = fs::read_to_string(&lock_path).expect("read");
         assert_eq!(after, "sentinel", "lock acquisition must not truncate");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_corrupt_creates_backup() {
+        let dir = tmp_dir("corrupt_backup");
+        let path = dir.join("data.json");
+        fs::write(&path, "not valid json {{{").expect("write");
+        let loaded: TestData = load(&path);
+        assert_eq!(loaded, TestData::default(), "corrupt should return default");
+        // M1: backup file should exist
+        let backups: Vec<_> = fs::read_dir(&dir)
+            .expect("read dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("data.corrupt."))
+            .collect();
+        assert!(
+            !backups.is_empty(),
+            "corrupt file should be backed up: {:?}",
+            fs::read_dir(&dir)
+                .expect("read dir")
+                .flatten()
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }
