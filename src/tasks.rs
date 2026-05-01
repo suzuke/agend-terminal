@@ -642,10 +642,16 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             let event = crate::task_events::TaskEvent::Done {
                 task_id: crate::task_events::TaskId(id.clone()),
                 by: crate::task_events::InstanceName(by),
-                source: crate::task_events::DoneSource::OperatorManual {
-                    authored_at: chrono::Utc::now().to_rfc3339(),
-                    result: result_text,
-                },
+                // B2: honor caller-provided done_source for audit trail
+                source: args
+                    .get("done_source")
+                    .and_then(|v| {
+                        serde_json::from_value::<crate::task_events::DoneSource>(v.clone()).ok()
+                    })
+                    .unwrap_or_else(|| crate::task_events::DoneSource::OperatorManual {
+                        authored_at: chrono::Utc::now().to_rfc3339(),
+                        result: result_text,
+                    }),
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => serde_json::json!({"id": id, "status": "done"}),
@@ -2211,5 +2217,65 @@ mod tests {
     fn non_system_identity_rejected() {
         assert!(!is_system_identity("random_agent"));
         assert!(!is_system_identity("system")); // bare "system" not in list
+    }
+
+    #[test]
+    fn done_action_honors_done_source_override() {
+        let home = tmp_home("done_source");
+        // Create a task, claim it, then done with custom done_source
+        let created = handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "create", "title": "test task"}),
+        );
+        let id = created["id"].as_str().expect("task id");
+        handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let done = handle(
+            &home,
+            "dev",
+            &serde_json::json!({
+                "action": "done",
+                "id": id,
+                "done_source": {
+                    "via": "AutoCloseOnPrMerge",
+                    "branch": "feat/test",
+                    "merged_at": "2026-05-01T00:00:00Z"
+                }
+            }),
+        );
+        assert_eq!(done["status"], "done", "done should succeed: {done}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn system_identity_can_mutate_others_task() {
+        let home = tmp_home("sys_acl");
+        // Create task owned by "dev"
+        let created = handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "create", "title": "dev task"}),
+        );
+        let id = created["id"].as_str().expect("task id");
+        handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        // system:auto_close should be able to close dev's task
+        let done = handle(
+            &home,
+            "system:auto_close",
+            &serde_json::json!({"action": "done", "id": id}),
+        );
+        assert_eq!(
+            done["status"], "done",
+            "system identity should bypass ACL: {done}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
