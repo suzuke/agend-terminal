@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Post-merge hook: background cargo build --release when src/ changes.
+#
+# Triggered after every `git merge` (including `git pull`). Checks if any
+# file under src/ was modified; if so, kicks off a background rebuild and
+# sends a desktop notification on completion.
+#
+# Does NOT auto-restart the daemon — operator decides restart timing.
+# Emergency disable: git config core.hooksPath /dev/null
+
+set -euo pipefail
+
+# Check if any src/ files changed in this merge
+changed_src=$(git diff-tree --no-commit-id --name-only -r ORIG_HEAD HEAD -- src/ 2>/dev/null || true)
+
+if [ -z "$changed_src" ]; then
+    exit 0
+fi
+
+echo "post-merge: src/ changes detected, starting background rebuild..." >&2
+
+# Background build + notification (detached, won't block hook return)
+(
+    if cargo build --release 2>/dev/null; then
+        # Desktop notification on success
+        if [ "$(uname)" = "Darwin" ]; then
+            osascript -e 'display notification "agend-terminal rebuilt successfully" with title "post-merge rebuild"' 2>/dev/null || true
+        elif command -v notify-send >/dev/null 2>&1; then
+            notify-send "post-merge rebuild" "agend-terminal rebuilt successfully" 2>/dev/null || true
+        fi
+        echo "post-merge: rebuild complete ✓" >&2
+    else
+        if [ "$(uname)" = "Darwin" ]; then
+            osascript -e 'display notification "agend-terminal rebuild FAILED" with title "post-merge rebuild"' 2>/dev/null || true
+        elif command -v notify-send >/dev/null 2>&1; then
+            notify-send "post-merge rebuild" "agend-terminal rebuild FAILED" 2>/dev/null || true
+        fi
+        echo "post-merge: rebuild FAILED" >&2
+    fi
+) >/dev/null 2>&1 &
+
+exit 0

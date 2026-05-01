@@ -20,6 +20,11 @@ A pre-push hook verifies push claims (e.g. "no other changes", "deps
 unchanged") against the actual diff. Override with `git push --no-verify`
 in emergencies.
 
+A post-merge hook triggers a background `cargo build --release` when `src/`
+files change. Desktop notification on completion. Does not auto-restart the
+daemon — operator decides restart timing. Disable with
+`git config core.hooksPath /dev/null`.
+
 ### If the hook isn't installed
 
 Hooks are per-clone. After a fresh `git clone`, install with:
