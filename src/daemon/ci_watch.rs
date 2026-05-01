@@ -3,6 +3,23 @@ use std::path::Path;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// H2: Shared tokio runtime for CI watch — avoids spawning a new thread +
+// runtime per poll cycle. Bounded to 2 worker threads.
+// ---------------------------------------------------------------------------
+
+fn shared_ci_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("ci-watch")
+            .enable_all()
+            .build()
+            .expect("ci-watch runtime")
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Shared HTTP client for CI providers (Sprint 39 follow-up extraction)
 // ---------------------------------------------------------------------------
 
@@ -982,43 +999,28 @@ fn check_ci_watches_with_provider(
                 continue;
             }
         };
-        // fire-and-forget: ci_check is one-shot per poll cycle. Builds a
-        // single-thread tokio runtime, blocks on one provider call, exits.
-        // No JoinHandle / shutdown signal needed because the tick loop will
-        // re-spawn next cycle if anything is still being watched.
-        std::thread::Builder::new()
-            .name("ci_check".into())
-            .spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    tracing::warn!(repo = %repo, "ci_check: failed to build tokio runtime");
-                    return;
-                };
-                if let Err(e) = rt.block_on(ci_check_repo(
-                    &home,
-                    &watch_path,
-                    &repo,
-                    &branch,
-                    &instance,
-                    last_run_id,
-                    head_sha.as_deref(),
-                    last_notified_sha.as_deref(),
-                    &registry,
-                    provider.as_ref(),
-                )) {
-                    tracing::warn!(repo = %repo, error = %e, "CI check failed");
-                }
-            })
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "ci_check: failed to spawn background thread");
-                // fire-and-forget: dummy no-op JoinHandle returned only to
-                // satisfy the unwrap_or_else return type. The closure body
-                // does nothing — the real work was the failed spawn above.
-                // No shutdown semantics needed.
-                std::thread::spawn(|| {})
-            });
+        // H2: use shared runtime instead of per-poll thread + runtime.
+        // fire-and-forget: ci_check is one-shot per poll cycle. The shared
+        // runtime bounds concurrency to 2 worker threads. No JoinHandle
+        // needed — the tick loop re-spawns next cycle if still watching.
+        shared_ci_runtime().spawn(async move {
+            if let Err(e) = ci_check_repo(
+                &home,
+                &watch_path,
+                &repo,
+                &branch,
+                &instance,
+                last_run_id,
+                head_sha.as_deref(),
+                last_notified_sha.as_deref(),
+                &registry,
+                provider.as_ref(),
+            )
+            .await
+            {
+                tracing::warn!(repo = %repo, error = %e, "CI check failed");
+            }
+        });
     }
 }
 

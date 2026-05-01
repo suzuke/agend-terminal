@@ -174,7 +174,7 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
         };
 
         // Validation must-have #1: HTML-comment injection sanitize.
-        let sanitized_body = strip_html_comments(&pr.body);
+        let sanitized_body = crate::daemon::utils::strip_html_comments(&pr.body);
         // Validation must-have #2: strict ASCII regex rejects non-ASCII
         // homoglyphs in the task ID portion.
         let markers = extract_closes_markers(&sanitized_body);
@@ -271,34 +271,6 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
 /// hide inside a comment.
 ///
 /// The implementation walks bytes (ASCII-safe — we strip whole comments,
-/// not their bytes) and rebuilds a String char-by-char where the byte is
-/// guaranteed to be a single-byte char by the surrounding ASCII bracket
-/// match. Unterminated comments (`<!--` without `-->`) drop the rest of
-/// the body — a future fuzzy attacker writing partial comments still
-/// can't sneak a directive past us.
-fn strip_html_comments(body: &str) -> String {
-    let bytes = body.as_bytes();
-    let mut out = String::with_capacity(body.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" {
-            match body[i + 4..].find("-->") {
-                Some(end) => {
-                    i += 4 + end + 3;
-                    continue;
-                }
-                None => break, // unterminated — drop tail
-            }
-        }
-        // Push the next UTF-8 character to preserve unicode in the
-        // non-comment body. char_indices iterator-style walk:
-        let ch_len = body[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-        out.push_str(&body[i..i + ch_len]);
-        i += ch_len;
-    }
-    out
-}
-
 /// Extract every `Closes t-<digits>-<digits>` marker. Strict ASCII regex
 /// rejects non-ASCII codepoints inside the task ID; combined with the
 /// HTML-comment sanitiser this defends against zero-width-char +
@@ -365,7 +337,7 @@ fn list_recently_merged_prs(repo: &str) -> anyhow::Result<Vec<PrMeta>> {
             // the exact JSON object the sweep observed (squash deletions
             // + future PR body edits won't change this).
             let pr_json_bytes = serde_json::to_vec(&pr)?;
-            let api_response_hash = sha256_hex(&pr_json_bytes);
+            let api_response_hash = crate::daemon::utils::sha256_hex(&pr_json_bytes);
             if let Some(meta) = parse_pr_meta(&pr, api_response_hash) {
                 out.push(meta);
             }
@@ -409,13 +381,6 @@ fn parse_pr_meta(v: &serde_json::Value, api_response_hash: String) -> Option<PrM
         author_login,
         api_response_hash,
     })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 // ── Operator-facing MCP tool surface ────────────────────────────────
@@ -478,7 +443,7 @@ mod tests {
     #[test]
     fn html_comment_injection_stripped() {
         let body = "Closes t-12345-1\n<!-- Closes t-99999-2 -->";
-        let sanitised = strip_html_comments(body);
+        let sanitised = crate::daemon::utils::strip_html_comments(body);
         let markers = extract_closes_markers(&sanitised);
         assert_eq!(markers, vec!["t-12345-1".to_string()]);
     }
@@ -489,7 +454,7 @@ mod tests {
     #[test]
     fn html_comment_unterminated_drops_tail() {
         let body = "Closes t-1-1\n<!-- partial Closes t-2-2";
-        let sanitised = strip_html_comments(body);
+        let sanitised = crate::daemon::utils::strip_html_comments(body);
         let markers = extract_closes_markers(&sanitised);
         assert_eq!(markers, vec!["t-1-1".to_string()]);
     }
@@ -606,12 +571,12 @@ mod tests {
     /// later auditor can correlate against an archived API response.
     #[test]
     fn sha256_hex_is_deterministic_64_hex() {
-        let h1 = sha256_hex(b"hello");
-        let h2 = sha256_hex(b"hello");
+        let h1 = crate::daemon::utils::sha256_hex(b"hello");
+        let h2 = crate::daemon::utils::sha256_hex(b"hello");
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
-        let h3 = sha256_hex(b"world");
+        let h3 = crate::daemon::utils::sha256_hex(b"world");
         assert_ne!(h1, h3);
     }
 

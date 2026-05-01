@@ -26,6 +26,10 @@ Level 0 (root):
                               (`crate::agent::AgentRegistry`)
   external_registry         — global HashMap<String, ExternalAgentHandle>
                               (`crate::agent::ExternalRegistry`)
+                              NOTE (G3 M5): `register_external` acquires
+                              external_registry THEN agent_registry (read).
+                              Never acquire agent_registry first then
+                              external_registry — deadlock risk.
   configs                   — daemon-only HashMap<String, AgentConfig>
                               (`src/daemon/mod.rs::AgentConfig`)
 
