@@ -88,6 +88,8 @@ pub fn serve_agent_tui(name: &str, run_dir: &Path, registry: &AgentRegistry) {
         // the broadcast subscriber rx drops (agent removed via
         // delete_transaction) or when frame write fails (client disconnect).
         // No graceful join needed — each client connection is independent.
+        // M4 analysis: no leak — write_frame failure on disconnect breaks
+        // the loop immediately; rx.recv() Err on agent deletion also exits.
         if let Err(e) = std::thread::Builder::new()
             .name(format!("{n}_tui_out"))
             .spawn(move || {

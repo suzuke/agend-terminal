@@ -984,9 +984,12 @@ fn check_ci_watches_with_provider(
         // throttle.
         let mut watch_with_stamp = watch.clone();
         watch_with_stamp["last_polled_at"] = serde_json::json!(now_ms);
-        let _ = std::fs::write(
+        // M1: atomic write
+        let _ = crate::store::atomic_write(
             &path,
-            serde_json::to_string_pretty(&watch_with_stamp).unwrap_or_default(),
+            serde_json::to_string_pretty(&watch_with_stamp)
+                .unwrap_or_default()
+                .as_bytes(),
         );
 
         let home = home.to_path_buf();
@@ -1198,9 +1201,12 @@ async fn ci_check_repo(
                 if let Ok(content) = std::fs::read_to_string(watch_path) {
                     if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
                         watch["rate_limit_until"] = serde_json::json!(reset_epoch);
-                        let _ = std::fs::write(
+                        // M1: atomic write
+                        let _ = crate::store::atomic_write(
                             watch_path,
-                            serde_json::to_string_pretty(&watch).unwrap_or_default(),
+                            serde_json::to_string_pretty(&watch)
+                                .unwrap_or_default()
+                                .as_bytes(),
                         );
                     }
                 }
@@ -1350,9 +1356,12 @@ fn update_watch_state_with_notify(
                 watch["last_notified_head_sha"] = serde_json::json!(sha);
             }
             watch["last_terminal_seen_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
-            let _ = std::fs::write(
+            // M1: atomic write to prevent partial-file on crash
+            let _ = crate::store::atomic_write(
                 watch_path,
-                serde_json::to_string_pretty(&watch).unwrap_or_default(),
+                serde_json::to_string_pretty(&watch)
+                    .unwrap_or_default()
+                    .as_bytes(),
             );
         }
     }
