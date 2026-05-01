@@ -326,32 +326,11 @@ fn numeric_mismatch(
 fn body_has_closes_marker(body: &str, task_id: &str) -> bool {
     use regex::Regex;
     // Strip HTML comments (defense — same vector as task_sweep #1).
-    let sanitised = strip_html_comments(body);
+    let sanitised = crate::daemon::utils::strip_html_comments(body);
     let pat = format!(r"(?m)Closes\s+{}\b", regex::escape(task_id));
     Regex::new(&pat)
         .map(|re| re.is_match(&sanitised))
         .unwrap_or(false)
-}
-
-fn strip_html_comments(body: &str) -> String {
-    let bytes = body.as_bytes();
-    let mut out = String::with_capacity(body.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"<!--" {
-            match body[i + 4..].find("-->") {
-                Some(end) => {
-                    i += 4 + end + 3;
-                    continue;
-                }
-                None => break,
-            }
-        }
-        let ch_len = body[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-        out.push_str(&body[i..i + ch_len]);
-        i += ch_len;
-    }
-    out
 }
 
 // ── Event emission ──────────────────────────────────────────────────
@@ -495,7 +474,7 @@ fn list_all_closed_prs(repo: &str) -> anyhow::Result<Vec<PrMeta>> {
         let mut out = Vec::with_capacity(arr.len());
         for pr in arr {
             let pr_bytes = serde_json::to_vec(&pr)?;
-            let api_response_hash = sha256_hex(&pr_bytes);
+            let api_response_hash = crate::daemon::utils::sha256_hex(&pr_bytes);
             if let Some(meta) = parse_pr_meta(&pr, api_response_hash) {
                 out.push(meta);
             }
@@ -543,13 +522,6 @@ fn parse_pr_meta(v: &serde_json::Value, api_response_hash: String) -> Option<PrM
         head_branch,
         api_response_hash,
     })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 // ── MCP tool surface ─────────────────────────────────────────────────

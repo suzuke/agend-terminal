@@ -11,6 +11,7 @@ pub(crate) mod supervisor;
 pub(crate) mod task_sweep;
 pub(crate) mod ticker;
 mod tui_bridge;
+pub(crate) mod utils;
 pub(crate) mod watchdog;
 
 use crate::agent::{self, AgentRegistry};
