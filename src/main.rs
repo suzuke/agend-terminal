@@ -15,6 +15,8 @@ mod claim_verifier;
 mod cli;
 mod connect;
 mod daemon;
+#[allow(dead_code)] // PR-2 prep: infra ready, callers swap in PR-3
+mod daemon_config;
 mod decisions;
 mod deployments;
 mod dispatch_tracking;
