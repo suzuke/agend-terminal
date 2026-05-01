@@ -243,12 +243,8 @@ pub(crate) fn is_running_inside_daemon_process() -> bool {
     *IS_DAEMON.get_or_init(|| {
         // Primary signal: ACTIVE_CHANNEL is only registered in daemon process
         crate::channel::active_channel().is_some()
-        // Fallback: check if we're the daemon by PID match
-        || std::env::var("AGEND_DAEMON_PID")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .map(|pid| pid == std::process::id())
-            .unwrap_or(false)
+        // G3 H1: read DaemonConfig instead of env var (thread-safe)
+        || crate::daemon_config::get().daemon_pid == std::process::id()
     })
 }
 

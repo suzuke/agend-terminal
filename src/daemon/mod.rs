@@ -221,7 +221,8 @@ fn run_core(
     // Sprint 25 P0 Option F: mark this process as the daemon so
     // `mcp::is_running_inside_daemon_process()` can short-circuit
     // tool calls without TCP round-trip.
-    std::env::set_var("AGEND_DAEMON_PID", std::process::id().to_string());
+    // G3 H1: replaced set_var with DaemonConfig init (thread-safe).
+    crate::daemon_config::init(crate::daemon_config::DaemonConfig::default());
 
     // Sprint 24 P0 PR2 — bridge-phase legacy migration. Walks tasks.json
     // and emits canonical Created (+ status transition) events into
