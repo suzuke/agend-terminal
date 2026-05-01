@@ -159,6 +159,8 @@ pub enum DoneSource {
         reasoning: String,
         snapshot: Option<PrSnapshot>,
     },
+    /// Auto-closed when the associated branch was merged.
+    AutoCloseOnPrMerge { branch: String, merged_at: String },
 }
 
 /// How a `Linked` event was discovered: explicit operator/agent action

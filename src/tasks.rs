@@ -455,7 +455,24 @@ fn read_task_record(home: &Path, id: &str) -> Option<crate::task_events::TaskRec
 /// canonical authority is the event log itself, and conflicting emissions
 /// resolve at replay time with the later seq winning. Auditors / tests
 /// using this for diagnostic checks are fine.
+/// System identities allowed to bypass normal ACL checks.
+/// These are internal daemon modules that emit events on behalf of the system.
+const SYSTEM_IDENTITIES: &[&str] = &[
+    "system:auto_close",
+    "system:overdue_sweep",
+    "system:task_sweep",
+];
+
+/// Check if a caller is a recognized system identity.
+pub fn is_system_identity(caller: &str) -> bool {
+    SYSTEM_IDENTITIES.contains(&caller)
+}
+
 fn can_mutate_record(home: &Path, caller: &str, record: &crate::task_events::TaskRecord) -> bool {
+    // B1: system identities pass ACL via explicit allow-list
+    if is_system_identity(caller) {
+        return true;
+    }
     match record.owner.as_ref() {
         None => true,
         Some(owner) => {
@@ -699,20 +716,34 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                                     .unwrap_or(caller.as_str()),
                             ),
                         }),
-                        (_, "done") => Some(crate::task_events::TaskEvent::Done {
-                            task_id: crate::task_events::TaskId(id.clone()),
-                            by: crate::task_events::InstanceName::from(
-                                record
-                                    .owner
-                                    .as_ref()
-                                    .map(|o| o.0.as_str())
-                                    .unwrap_or(caller.as_str()),
-                            ),
-                            source: crate::task_events::DoneSource::OperatorManual {
-                                authored_at: chrono::Utc::now().to_rfc3339(),
-                                result: record.result.clone(),
-                            },
-                        }),
+                        (_, "done") => {
+                            // B2: allow caller-provided done_source for audit trail
+                            let source = args
+                                .get("done_source")
+                                .and_then(|v| {
+                                    serde_json::from_value::<crate::task_events::DoneSource>(
+                                        v.clone(),
+                                    )
+                                    .ok()
+                                })
+                                .unwrap_or_else(|| {
+                                    crate::task_events::DoneSource::OperatorManual {
+                                        authored_at: chrono::Utc::now().to_rfc3339(),
+                                        result: record.result.clone(),
+                                    }
+                                });
+                            Some(crate::task_events::TaskEvent::Done {
+                                task_id: crate::task_events::TaskId(id.clone()),
+                                by: crate::task_events::InstanceName::from(
+                                    record
+                                        .owner
+                                        .as_ref()
+                                        .map(|o| o.0.as_str())
+                                        .unwrap_or(caller.as_str()),
+                                ),
+                                source,
+                            })
+                        }
                         (_, "cancelled") => Some(crate::task_events::TaskEvent::Cancelled {
                             task_id: crate::task_events::TaskId(id.clone()),
                             by: crate::task_events::InstanceName::from(caller.as_str()),
@@ -2166,5 +2197,19 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].branch.is_none());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // --- M4 r1-fix: ACL allow-list + state guard tests ---
+
+    #[test]
+    fn system_identity_in_allow_list() {
+        assert!(is_system_identity("system:auto_close"));
+        assert!(is_system_identity("system:overdue_sweep"));
+    }
+
+    #[test]
+    fn non_system_identity_rejected() {
+        assert!(!is_system_identity("random_agent"));
+        assert!(!is_system_identity("system")); // bare "system" not in list
     }
 }

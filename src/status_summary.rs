@@ -156,20 +156,26 @@ pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
 
     let task = candidates[0];
     let result = format!("auto-closed: branch '{}' merged", branch);
-    // M4: emit Done event directly via task_events::append, bypassing
-    // handle() which requires ACL check against "system" sender.
-    let emitter = crate::task_events::InstanceName::from("system:auto_close");
-    let event = crate::task_events::TaskEvent::Done {
-        task_id: crate::task_events::TaskId(task.id.clone()),
-        by: emitter.clone(),
-        source: crate::task_events::DoneSource::OperatorManual {
-            authored_at: chrono::Utc::now().to_rfc3339(),
-            result: Some(result),
-        },
-    };
-    match crate::task_events::append(home, &emitter, event) {
-        Ok(_) => tracing::info!(task_id = %task.id, branch, "auto-closed task on PR merge"),
-        Err(e) => tracing::warn!(error = %e, task_id = %task.id, "auto-close event append failed"),
+    // M4: use system:auto_close identity (in ACL allow-list) through
+    // tasks::handle() to get state-machine validation + proper ACL.
+    let resp = crate::tasks::handle(
+        home,
+        "system:auto_close",
+        &serde_json::json!({
+            "action": "done",
+            "id": task.id,
+            "result": result,
+            "done_source": {
+                "via": "AutoCloseOnPrMerge",
+                "branch": branch,
+                "merged_at": chrono::Utc::now().to_rfc3339(),
+            },
+        }),
+    );
+    if resp.get("error").is_some() {
+        tracing::warn!(task_id = %task.id, resp = %resp, "auto-close via handle() failed");
+    } else {
+        tracing::info!(task_id = %task.id, branch, "auto-closed task on PR merge");
     }
 }
 
