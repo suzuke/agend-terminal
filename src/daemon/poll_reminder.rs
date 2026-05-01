@@ -22,6 +22,14 @@ fn should_notify_and_record(name: &str, count: usize) -> bool {
     true
 }
 
+/// H3: Remove agent from dedup state when deleted (prevents unbounded growth).
+pub fn remove_agent(name: &str) {
+    let mut guard = LAST_NOTIFIED.lock();
+    if let Some(map) = guard.as_mut() {
+        map.remove(name);
+    }
+}
+
 /// Pure collector: returns (agent_name, reminder_string) for each agent
 /// that should be nudged. No side effects — does not inject into PTY.
 pub fn collect_poll_reminders(home: &Path, registry: &AgentRegistry) -> Vec<(String, String)> {

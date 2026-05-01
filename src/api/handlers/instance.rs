@@ -98,6 +98,8 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
     // had reaped the PID, exposing PID re-use + concurrent-spawn collision
     // races.
     crate::daemon::lifecycle::delete_transaction(ctx.home, name, ctx.registry, Some(ctx.configs));
+    // H3: clean up poll_reminder dedup state for deleted agent
+    crate::daemon::poll_reminder::remove_agent(name);
     if let Some(n) = ctx.notifier {
         tracing::info!(agent = name, "DELETE emitting InstanceDeleted");
         n.notify(ApiEvent::InstanceDeleted {

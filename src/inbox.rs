@@ -519,10 +519,8 @@ pub const HEADER_SIZE_THRESHOLD: usize = 300;
 /// When enabled, PTY injection uses header-only format for all messages,
 /// forcing agents to call `inbox` to read content (solves dispatch non-FIFO).
 pub fn pointer_only_inject() -> bool {
-    std::env::var("AGEND_POINTER_ONLY_INJECT")
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    // G3 H1: read DaemonConfig instead of env var (thread-safe)
+    crate::daemon_config::get().pointer_only_inject
 }
 
 /// ANSI-colored header prefix for visual distinction in terminal.
