@@ -865,6 +865,8 @@ pub fn run_task_maintenance(home: &Path) {
             &format!("task_id={tid} dispatched_at={}", orphan.delegated_at),
         );
     }
+    // M3: 30-day TTL cleanup for terminal dispatch entries
+    crate::dispatch_tracking::gc_old_entries(home);
 }
 
 fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {

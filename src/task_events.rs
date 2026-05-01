@@ -159,6 +159,8 @@ pub enum DoneSource {
         reasoning: String,
         snapshot: Option<PrSnapshot>,
     },
+    /// Auto-closed when the associated branch was merged.
+    AutoCloseOnPrMerge { branch: String, merged_at: String },
 }
 
 /// How a `Linked` event was discovered: explicit operator/agent action
@@ -662,13 +664,31 @@ pub fn append_batch(
         }
         Ok(lines)
     })?;
+    // H1: update cached high-water mark after successful append
+    if let Some(&last_seq) = seqs.last() {
+        let log_path = home.join(format!("{LOG_NAME}.jsonl"));
+        let key = (log_path, instance);
+        SEQ_CACHE.lock().insert(key, last_seq);
+    }
     Ok(seqs)
 }
 
 /// Tail-scan the hot log for the highest seq# this instance has emitted.
 /// Best-effort: malformed lines are skipped because [`replay`] is the
 /// strict reader; here we just need the high-water mark.
+/// H1: Cached high-water map — avoids full-file scan on every append.
+/// Populated on first access per log_path, updated in-memory on append.
+static SEQ_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, InstanceName), u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
 fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Result<u64> {
+    let key = (log_path.to_path_buf(), instance.clone());
+    let mut cache = SEQ_CACHE.lock();
+    if let Some(&cached) = cache.get(&key) {
+        return Ok(cached);
+    }
+    // First access: scan file once
     let content = match std::fs::read_to_string(log_path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -685,6 +705,7 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
             }
         }
     }
+    cache.insert(key, max);
     Ok(max)
 }
 
@@ -697,7 +718,10 @@ fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Res
 /// variant aborts (per dev-reviewer-2 must-have: replay must NOT silently
 /// skip unknown envelopes).
 pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
-    let mut envelopes: Vec<TaskEventEnvelope> = Vec::new();
+    // H2: stream-fold per file instead of collecting all envelopes into memory.
+    // Archives are chronologically ordered by filename; within each file,
+    // events are in append order. We sort per-file then fold immediately.
+    let mut state = TaskBoardState::default();
 
     let archive_dir = archive_dir(home);
     if archive_dir.is_dir() {
@@ -708,26 +732,30 @@ pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
             .collect();
         archives.sort();
         for path in archives {
+            let mut envelopes = Vec::new();
             read_envelopes_strict(&path, &mut envelopes)?;
+            sort_envelopes(&mut envelopes);
+            for env in &envelopes {
+                state.apply(env);
+            }
         }
     }
 
     let log_path = log_path(home);
     if log_path.exists() {
+        let mut envelopes = Vec::new();
         read_envelopes_strict(&log_path, &mut envelopes)?;
+        sort_envelopes(&mut envelopes);
+        for env in &envelopes {
+            state.apply(env);
+        }
     }
 
-    // Cross-process-deterministic ordering: same input → same fold output.
-    // F2 (PR1 r2 dev-reviewer-2): RFC3339 strings are lexically-sortable
-    // ONLY when they share UTC offset format. Today every emitter goes
-    // through `chrono::Utc::now().to_rfc3339()` (Z suffix), so lexical
-    // would be safe — but a future emitter passing a non-UTC offset
-    // (e.g. `+09:00`) would silently drift state across replay readers,
-    // a worst-class bug. Parse to absolute nanoseconds-since-epoch so
-    // ordering is chronological regardless of source offset. Unparseable
-    // timestamps fold to 0 (placed first); they would also fail the
-    // strict reader, so reaching this branch implies a programmer-
-    // injected sentinel rather than on-disk data.
+    Ok(state)
+}
+
+/// Sort envelopes by timestamp (absolute nanos) → instance → seq.
+fn sort_envelopes(envelopes: &mut [TaskEventEnvelope]) {
     envelopes.sort_by(|a, b| {
         let a_ts = chrono::DateTime::parse_from_rfc3339(&a.timestamp)
             .map(|d| d.timestamp_nanos_opt().unwrap_or(0))
@@ -739,12 +767,6 @@ pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
             .then_with(|| a.instance.0.cmp(&b.instance.0))
             .then_with(|| a.seq.cmp(&b.seq))
     });
-
-    let mut state = TaskBoardState::default();
-    for env in &envelopes {
-        state.apply(env);
-    }
-    Ok(state)
 }
 
 fn read_envelopes_strict(path: &Path, out: &mut Vec<TaskEventEnvelope>) -> anyhow::Result<()> {

@@ -121,6 +121,26 @@ pub fn sweep_orphans(home: &Path) -> Vec<DispatchEntry> {
     orphans
 }
 
+/// M3: Remove terminal entries (completed/orphaned) older than 30 days.
+/// Prevents unbounded growth of dispatch_tracking.json.
+pub fn gc_old_entries(home: &Path) {
+    const RETENTION_DAYS: i64 = 30;
+    let now = chrono::Utc::now();
+    let _ = crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+        store.entries.retain(|entry| {
+            if entry.status != "completed" && entry.status != "orphaned" {
+                return true; // keep active entries
+            }
+            let delegated = match chrono::DateTime::parse_from_rfc3339(&entry.delegated_at) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(_) => return false, // unparseable → drop
+            };
+            now.signed_duration_since(delegated).num_days() < RETENTION_DAYS
+        });
+        Ok(())
+    });
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -251,6 +271,40 @@ mod tests {
         assert_eq!(orphans.len(), 1, "25h old dispatch must be orphaned");
         assert_eq!(orphans[0].task_id.as_deref(), Some("t-orphan"));
         assert_eq!(orphans[0].status, "orphaned");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_gc_removes_old_terminal_entries() {
+        let home = tmp_home("gc_old");
+        // Add a completed entry from 31 days ago
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-old".into()),
+                from: "lead".into(),
+                to: "dev".into(),
+                delegated_at: (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339(),
+                status: "completed".into(),
+            },
+        );
+        // Add a recent completed entry (should survive)
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-recent".into()),
+                from: "lead".into(),
+                to: "dev".into(),
+                delegated_at: chrono::Utc::now().to_rfc3339(),
+                status: "completed".into(),
+            },
+        );
+        gc_old_entries(&home);
+        let store: serde_json::Value =
+            crate::store::load(&crate::store::store_path(&home, "dispatch_tracking.json"));
+        let entries = store["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1, "old entry should be removed: {entries:?}");
+        assert_eq!(entries[0]["task_id"], "t-recent");
         std::fs::remove_dir_all(&home).ok();
     }
 }

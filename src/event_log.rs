@@ -54,14 +54,13 @@ pub fn log(home: &Path, kind: &'static str, instance: &str, detail: &str) {
         detail: detail.to_string(),
     };
 
-    // Route through locked append path for atomicity (C3 fix).
-    let log_path = home.join("event-log.jsonl");
-    if let Ok(meta) = std::fs::metadata(&log_path) {
-        if meta.len() > MAX_LOG_SIZE {
-            rotate(&log_path);
+    // H4: size-check + rotation under lock to prevent TOCTOU race
+    if let Err(e) = append_lines_under_lock(home, "event-log", |path| {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_LOG_SIZE {
+                rotate(path);
+            }
         }
-    }
-    if let Err(e) = append_lines_under_lock(home, "event-log", |_| {
         Ok(vec![serde_json::to_string(&event)?])
     }) {
         tracing::warn!(error = %e, "failed to write event log entry");

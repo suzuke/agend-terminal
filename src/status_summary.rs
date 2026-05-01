@@ -156,17 +156,27 @@ pub fn auto_close_merged_tasks(home: &Path, branch: &str) {
 
     let task = candidates[0];
     let result = format!("auto-closed: branch '{}' merged", branch);
-    let _ = crate::tasks::handle(
+    // M4: use system:auto_close identity (in ACL allow-list) through
+    // tasks::handle() to get state-machine validation + proper ACL.
+    let resp = crate::tasks::handle(
         home,
-        "system",
+        "system:auto_close",
         &serde_json::json!({
-            "action": "update",
+            "action": "done",
             "id": task.id,
-            "status": "done",
             "result": result,
+            "done_source": {
+                "via": "AutoCloseOnPrMerge",
+                "branch": branch,
+                "merged_at": chrono::Utc::now().to_rfc3339(),
+            },
         }),
     );
-    tracing::info!(task_id = %task.id, branch, "auto-closed task on PR merge");
+    if resp.get("error").is_some() {
+        tracing::warn!(task_id = %task.id, resp = %resp, "auto-close via handle() failed");
+    } else {
+        tracing::info!(task_id = %task.id, branch, "auto-closed task on PR merge");
+    }
 }
 
 /// Check if `haystack` contains `needle` as a whole token (word-boundary match).
