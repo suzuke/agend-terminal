@@ -156,11 +156,22 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     if let Err(e) = crate::agent::validate_name(raw_target) {
         return json!({"error": e});
     }
-    // Resolve team name → orchestrator (align with task create behaviour).
-    let resolved_target = match crate::teams::resolve_team_orchestrator(home, raw_target) {
-        Ok(Some(orch)) => orch,
-        Ok(None) => raw_target.to_string(), // not a team, use as-is
-        Err(e) => return json!({"error": e}),
+    // Sprint 46 P1: instance-first lookup — if raw_target is a known instance
+    // in fleet.yaml, skip team resolution (fixes M5 name-shadowing root cause).
+    let is_known_instance = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+        .ok()
+        .map(|c| c.instances.contains_key(raw_target))
+        .unwrap_or(false);
+
+    let resolved_target = if is_known_instance {
+        raw_target.to_string() // instance wins over team template
+    } else {
+        // Fallback: resolve team name → orchestrator
+        match crate::teams::resolve_team_orchestrator(home, raw_target) {
+            Ok(Some(orch)) => orch,
+            Ok(None) => raw_target.to_string(),
+            Err(e) => return json!({"error": e}),
+        }
     };
     let target = resolved_target.as_str();
     // M5: reject if team-orchestrator resolution collapsed target to sender.

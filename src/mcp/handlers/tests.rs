@@ -2393,20 +2393,18 @@ fn describe_instance_response_shape_has_required_keys() {
 }
 
 #[test]
-fn delegate_task_rejects_team_orchestrator_self_route() {
-    // M5: when target_instance name collides with a team template name whose
-    // orchestrator is the sender, handle_delegate_task must reject with an
-    // informative error — not fall through to the API-layer generic
-    // "cannot send to self".
+fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
+    // Sprint 46 P1 M5 root fix: when target_instance name collides with a
+    // team template name, instance-first lookup wins → dispatches to instance
+    // directly, no team resolution. This is the M5 regression test.
     let _g = fleet_test_guard();
-    let home = tmp_home("m5_self_route");
+    let home = tmp_home("m5_instance_first");
     std::env::set_var("AGEND_HOME", &home);
     std::env::set_var("AGEND_TEST_ISOLATION", "1");
     // Fleet: instance "dev" exists, sender is "lead".
     let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n  lead:\n    role: Test\n";
     std::fs::write(home.join("fleet.yaml"), yaml).ok();
     // Team fixture: team named "dev" with orchestrator "lead".
-    // This causes resolve_team_orchestrator("dev") → Some("lead").
     let teams = serde_json::json!({
         "schema_version": 1,
         "teams": [{
@@ -2430,17 +2428,14 @@ fn delegate_task_rejects_team_orchestrator_self_route() {
             "request_kind": "task",
             "message": "do something"
         }),
-        "lead", // sender — same as team "dev" orchestrator
+        "lead",
     );
 
-    let err = result["error"].as_str().expect("should return error");
+    // M5 root fix: instance "dev" found in fleet.yaml → dispatches directly,
+    // no team resolution → no "orchestrator loop" error.
     assert!(
-        err.contains("team orchestrator loop"),
-        "error must mention orchestrator loop, got: {err}"
-    );
-    assert!(
-        !err.contains("cannot send to self"),
-        "must NOT hit generic self-send error: {err}"
+        result.get("error").is_none() || result["target"].as_str() == Some("dev"),
+        "instance-first lookup should succeed or target dev, got: {result}"
     );
 
     std::env::remove_var("AGEND_HOME");
