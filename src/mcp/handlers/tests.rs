@@ -895,6 +895,7 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
             superseded_by: None,
+            from_id: None,
         },
     );
 
@@ -956,6 +957,7 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
             superseded_by: None,
+            from_id: None,
         },
     );
 
@@ -1129,6 +1131,7 @@ fn test_describe_message_shows_delivery_mode() {
         in_reply_to_msg_id: None,
         in_reply_to_excerpt: None,
         superseded_by: None,
+        from_id: None,
     };
     let inbox_dir = home.join("inbox");
     std::fs::create_dir_all(&inbox_dir).ok();

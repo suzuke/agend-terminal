@@ -128,6 +128,7 @@ pub(super) fn handle_send_to_instance(
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
                 superseded_by: None,
+                from_id: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
@@ -312,6 +313,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
                 superseded_by: None,
+                from_id: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
@@ -434,6 +436,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
                     superseded_by: None,
+                    from_id: None,
                 };
                 crate::agent_ops::fallback_deliver(
                     home,

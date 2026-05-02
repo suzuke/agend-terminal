@@ -582,6 +582,12 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Shared mutex for tests that mutate process-global env vars.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static G: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        G.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn write_fleet(dir: &Path, yaml: &str) -> PathBuf {
         fs::create_dir_all(dir).ok();
         let path = dir.join("fleet.yaml");
@@ -1542,6 +1548,9 @@ defaults:
 
     #[test]
     fn backfill_ids_opt_out_no_writeback() {
+        // Local env guard for test isolation
+
+        let _g = env_guard();
         let dir = std::env::temp_dir().join(format!(
             "agend-fleet-backfill-optout-{}",
             std::process::id()
@@ -1553,11 +1562,31 @@ defaults:
         std::env::set_var("AGEND_FLEET_NO_AUTO_MIGRATE", "1");
         let _ = FleetConfig::load(&path);
         std::env::remove_var("AGEND_FLEET_NO_AUTO_MIGRATE");
-        // fleet.yaml should NOT have id field (opt-out)
         let content = std::fs::read_to_string(&path).expect("read");
         assert!(
             !content.contains("id:"),
             "opt-out should prevent id writeback: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backfill_ids_writes_when_opt_out_unset() {
+        // Same guard as backfill_ids_opt_out_no_writeback
+
+        let _g = env_guard();
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-backfill-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let yaml = "instances:\n  test-agent:\n    backend: claude\n";
+        let path = dir.join("fleet.yaml");
+        std::fs::write(&path, yaml).expect("write");
+        std::env::remove_var("AGEND_FLEET_NO_AUTO_MIGRATE");
+        let _ = FleetConfig::load(&path);
+        let content = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            content.contains("id:"),
+            "writeback should add id field: {content}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

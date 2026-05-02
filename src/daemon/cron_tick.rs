@@ -135,6 +135,7 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     in_reply_to_msg_id: None,
                     in_reply_to_excerpt: None,
                     superseded_by: None,
+                    from_id: None,
                 },
             );
             "ok_inbox"

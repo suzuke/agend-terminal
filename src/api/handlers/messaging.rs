@@ -117,6 +117,9 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             // Sprint 46 P1: store bare name in from (machine-readable for reply).
             // ID stored separately in from_id for audit trail per operator §13.5.
             from: format!("from:{from}"),
+            from_id: crate::fleet::FleetConfig::load(&ctx.home.join("fleet.yaml"))
+                .ok()
+                .and_then(|c| c.instances.get(from).and_then(|i| i.id.clone())),
             text: text.to_string(),
             kind: params
                 .get("kind")
