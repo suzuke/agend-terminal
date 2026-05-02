@@ -138,12 +138,16 @@ pub(super) fn create_pane(
     let tx = wakeup_tx.clone();
     let pane_rx = {
         let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        // fire-and-forget: forwarder exits when fwd_tx.send() fails (pane
+        // dropped → fwd_rx dropped → send returns Err) or rx.recv() fails
+        // (agent removed → broadcast sender dropped). H1: lifecycle is
+        // correct — pane drop triggers forwarder exit via channel close.
         std::thread::Builder::new()
             .name(format!("{name}_fwd"))
             .spawn(move || {
                 while let Ok(data) = rx.recv() {
                     if fwd_tx.send(data).is_err() {
-                        break;
+                        break; // H1: pane closed, fwd_rx dropped
                     }
                     let _ = tx.send(pane_id);
                 }
@@ -199,12 +203,13 @@ pub(super) fn attach_pane(
     let pane_rx = {
         let n = name.to_string();
         let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        // fire-and-forget: same lifecycle as create_pane forwarder (H1).
         std::thread::Builder::new()
             .name(format!("{n}_fwd"))
             .spawn(move || {
                 while let Ok(data) = rx.recv() {
                     if fwd_tx.send(data).is_err() {
-                        break;
+                        break; // H1: pane closed, fwd_rx dropped
                     }
                     let _ = tx.send(pane_id);
                 }

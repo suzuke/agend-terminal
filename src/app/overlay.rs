@@ -452,7 +452,7 @@ pub(super) fn handle_key(
                     let sel = *selected;
                     let dir = *split_dir;
                     let tabs_count = ctx.layout.tabs.len();
-                    *overlay = Overlay::None;
+                    // H5: overlay clear moved to after move logic (was before — fragile)
                     if sel == tabs_count {
                         // New tab: name after the pane's agent for a sensible default.
                         let name = ctx

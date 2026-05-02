@@ -301,6 +301,9 @@ enum TabBarClick {
 
 /// Hit-test the tab bar at the given column.
 /// SYNC: layout math must match render_tab_bar() in render.rs.
+/// M4: This is O(n_tabs) string-width scan, not a full layout re-render.
+/// Caching tab positions would save ~5 iterations but adds invalidation
+/// complexity. Kept as-is — n_tabs is typically 1-5.
 fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
     use unicode_width::UnicodeWidthStr;
     let mut x: u16 = 0;
