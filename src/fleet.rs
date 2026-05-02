@@ -146,6 +146,9 @@ pub struct InstanceConfig {
     /// Role description. TS version uses "description", accepted as alias.
     #[serde(alias = "description")]
     pub role: Option<String>,
+    /// Unique instance ID (UUIDv4). Auto-assigned on first load if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Backend preset name — overrides defaults.backend.
     pub backend: Option<Backend>,
     pub command: Option<String>,
@@ -196,6 +199,8 @@ impl FleetConfig {
         let mut config: FleetConfig = serde_yaml_ng::from_str(&content)
             .with_context(|| format!("Failed to parse fleet config: {}", path.display()))?;
         config.normalize();
+        // Sprint 46 P1: backfill instance IDs + reserved-name warnings
+        config.backfill_ids(path);
         Ok(config)
     }
 
@@ -375,6 +380,40 @@ impl FleetConfig {
     }
 
     /// Get all instance names.
+    /// Sprint 46 P1: assign UUIDv4 IDs to instances that lack them.
+    /// Writes back to fleet.yaml unless AGEND_FLEET_NO_AUTO_MIGRATE=1.
+    fn backfill_ids(&mut self, fleet_path: &std::path::Path) {
+        let mut changed = false;
+        let template_names: std::collections::HashSet<String> = self
+            .templates
+            .as_ref()
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+
+        for (name, inst) in &mut self.instances {
+            // Reserved-name warning: instance name collides with template name
+            if template_names.contains(name) {
+                tracing::warn!(
+                    name,
+                    "instance name collides with template name — may cause routing ambiguity"
+                );
+            }
+            // Backfill ID if absent
+            if inst.id.is_none() {
+                let id = crate::types::InstanceId::new();
+                inst.id = Some(id.full());
+                tracing::info!(name, id = %id.short(), "[fleet-migration] assigned instance ID");
+                changed = true;
+            }
+        }
+
+        if changed && std::env::var("AGEND_FLEET_NO_AUTO_MIGRATE").as_deref() != Ok("1") {
+            if let Ok(content) = serde_yaml_ng::to_string(&*self) {
+                let _ = crate::store::atomic_write(fleet_path, content.as_bytes());
+            }
+        }
+    }
+
     pub fn instance_names(&self) -> Vec<String> {
         self.instances.keys().cloned().collect()
     }
