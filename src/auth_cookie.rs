@@ -84,7 +84,15 @@ pub fn read_cookie(run_dir: &Path) -> Result<Cookie> {
 /// short-circuit 32-byte comparison (~ns), so timing-attack hardening is
 /// not applicable in this threat model. Plain `==` is sufficient.
 pub fn verify(expected: &Cookie, actual: &[u8]) -> bool {
-    actual == &expected[..]
+    // H2: constant-time comparison to prevent timing side-channel
+    if actual.len() != expected.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in actual.iter().zip(expected.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
 }
 
 pub fn to_hex(cookie: &Cookie) -> String {

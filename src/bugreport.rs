@@ -198,7 +198,19 @@ fn redact_secrets(content: &str) -> String {
         "group_id",
     ];
     let mut result = String::new();
+    let mut redacting_block = false;
+    let mut block_indent = 0usize;
     for line in content.lines() {
+        // M3: multi-line YAML — if we're in a redacted block, check indentation
+        if redacting_block {
+            let indent = line.len() - line.trim_start().len();
+            if indent > block_indent || line.trim().is_empty() {
+                result.push_str(&" ".repeat(indent));
+                result.push_str("***REDACTED***\n");
+                continue;
+            }
+            redacting_block = false;
+        }
         let (redactable, key_part) = if let Some((k, _)) = line.split_once(':') {
             let k_lower = k.to_ascii_lowercase();
             let hit = TRIGGERS.iter().any(|t| k_lower.contains(t));
@@ -209,6 +221,9 @@ fn redact_secrets(content: &str) -> String {
         if redactable {
             if let Some(k) = key_part {
                 result.push_str(&format!("{k}: ***REDACTED***\n"));
+                // Track block indent for multi-line values
+                block_indent = k.len() - k.trim_start().len();
+                redacting_block = true;
             } else {
                 result.push_str(line);
                 result.push('\n');
