@@ -34,6 +34,18 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
             })
             .unwrap_or_else(|| source.to_string())
     };
+    // H2: validate source_path — reject path traversal and system paths
+    let source_canonical = match std::path::Path::new(&source_path).canonicalize() {
+        Ok(p) => p,
+        Err(e) => return json!({"error": format!("invalid source path: {e}")}),
+    };
+    if source_canonical.starts_with("/etc")
+        || source_canonical.starts_with("/usr")
+        || source_canonical.starts_with("/sys")
+        || source_canonical.starts_with("/proc")
+    {
+        return json!({"error": "source path rejected: system directory"});
+    }
     match std::process::Command::new("git")
         .args([
             "worktree",
