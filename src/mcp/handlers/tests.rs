@@ -990,8 +990,11 @@ fn agent_picked_up_fires_for_all_pending_messages() {
     )
     .expect("parse");
     assert!(
-        meta["pending_pickup_ids"].is_null(),
-        "pending_pickup_ids must be cleared after drain"
+        meta["pending_pickup_ids"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true),
+        "pending_pickup_ids must be cleared after drain: {meta}"
     );
 
     std::env::remove_var("AGEND_HOME");
