@@ -60,16 +60,18 @@ pub fn terminate(pid: u32) {
 pub fn kill_process_tree(pid: u32) {
     #[cfg(unix)]
     {
-        let pgid = -(pid as i32);
+        // M2: query actual PGID instead of assuming PID==PGID
+        let pgid = unsafe { libc::getpgid(pid as i32) };
+        let kill_pgid = if pgid > 0 { -pgid } else { -(pid as i32) };
         // SIGTERM the entire process group
         unsafe {
-            libc::kill(pgid, libc::SIGTERM);
+            libc::kill(kill_pgid, libc::SIGTERM);
         }
         // Grace period, then unconditional SIGKILL (handles grandchildren
         // that ignore SIGTERM even if leader already exited).
         std::thread::sleep(std::time::Duration::from_millis(500));
         unsafe {
-            libc::kill(pgid, libc::SIGKILL);
+            libc::kill(kill_pgid, libc::SIGKILL);
         }
         // ESRCH (no such process) is fine — group already dead.
     }

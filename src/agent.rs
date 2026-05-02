@@ -516,7 +516,7 @@ fn spawn_instructions_bootstrap(
     // poll loop (returns early on shutdown). JoinHandle dropped because the
     // thread is short-lived and one missed bootstrap on shutdown is cosmetic.
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
-        let _census = crate::thread_census::register("pty_reader");
+        let _census = crate::thread_census::register("instr_boot"); // M3: was "pty_reader"
         let deadline = std::time::Instant::now() + timeout;
         let poll_interval = std::time::Duration::from_millis(200);
 
@@ -816,13 +816,25 @@ pub fn try_dismiss_dialog(
             // Delayed write: TUI escape-sequence parsers need time to distinguish
             // \x1b (ESC key) from \x1b[ (CSI start).  Writing immediately causes
             // Ink-based TUIs (kiro-cli) to interpret \x1b as "ESC to cancel".
+            // H2: bounded dismiss — skip if one already in-flight for this agent.
+            // Prevents thread accumulation from rapid dialog re-detection.
+            static DISMISS_IN_FLIGHT: std::sync::LazyLock<
+                parking_lot::Mutex<std::collections::HashSet<String>>,
+            > = std::sync::LazyLock::new(|| {
+                parking_lot::Mutex::new(std::collections::HashSet::new())
+            });
+            {
+                let mut inflight = DISMISS_IN_FLIGHT.lock();
+                if inflight.contains(name) {
+                    return true; // dismiss already pending
+                }
+                inflight.insert(name.to_string());
+            }
             let writer = Arc::clone(pty_writer);
             let keys = key_seq.clone();
             let agent = name.to_string();
             // fire-and-forget: dialog-dismiss keystroke writer is short-lived
-            // (sleep 300ms then write), no shutdown signal needed because the
-            // PTY closes on shutdown which surfaces as a write error inside
-            // the loop. Missing one auto-dismiss on shutdown is acceptable.
+            // (sleep 300ms then write). H2: removes from in-flight set on exit.
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 // Send keys in chunks split on \r/\n boundaries with delay between,
@@ -850,6 +862,8 @@ pub fn try_dismiss_dialog(
                     let _ = w.flush();
                 }
                 tracing::debug!(agent = %agent, "dismiss keystrokes sent");
+                // H2: remove from in-flight set
+                DISMISS_IN_FLIGHT.lock().remove(&agent);
             });
             return true;
         }
@@ -887,28 +901,36 @@ pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::R
 pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result<()> {
     let prefix = agent.inject_prefix.as_bytes();
     let submit = agent.submit_key.as_bytes();
-    let mut w = agent.pty_writer.lock();
 
-    // Write prefix + text
     if agent.typed_inject {
-        for byte in prefix.iter().chain(text.iter()) {
-            w.write_all(&[*byte])?;
-            w.flush()?;
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        // H1: collect all bytes first, then write in short lock bursts.
+        // Previous pattern held pty_writer lock for 2ms × N bytes (~20s for 10KB).
+        let all_bytes: Vec<u8> = prefix.iter().chain(text.iter()).copied().collect();
+        for chunk in all_bytes.chunks(64) {
+            let mut w = agent.pty_writer.lock();
+            for &byte in chunk {
+                w.write_all(&[byte])?;
+                w.flush()?;
+            }
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
         }
     } else {
+        let mut w = agent.pty_writer.lock();
         if !prefix.is_empty() {
             w.write_all(prefix)?;
             w.flush()?;
         }
         w.write_all(text)?;
         w.flush()?;
+        drop(w);
     }
 
     // Delay before submit
     std::thread::sleep(std::time::Duration::from_millis(20));
 
     // Write submit key
+    let mut w = agent.pty_writer.lock();
     w.write_all(submit)?;
     w.flush()?;
     Ok(())
