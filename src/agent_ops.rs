@@ -114,10 +114,8 @@ pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) 
         .unwrap_or(json!({}));
     meta[key] = value;
     let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
-    let tmp_path = meta_path.with_extension("json.tmp");
-    if std::fs::write(&tmp_path, &content).is_ok() {
-        let _ = std::fs::rename(&tmp_path, &meta_path);
-    }
+    // M1: atomic write with fsync
+    let _ = crate::store::atomic_write(&meta_path, content.as_bytes());
 }
 
 /// Persist multiple metadata key/value pairs in a single atomic write.
@@ -134,10 +132,8 @@ pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, V
         meta[*key] = value.clone();
     }
     let content = serde_json::to_string_pretty(&meta).unwrap_or_default();
-    let tmp_path = meta_path.with_extension("json.tmp");
-    if std::fs::write(&tmp_path, &content).is_ok() {
-        let _ = std::fs::rename(&tmp_path, &meta_path);
-    }
+    // M1: atomic write with fsync
+    let _ = crate::store::atomic_write(&meta_path, content.as_bytes());
 }
 
 // ---------------------------------------------------------------------------
