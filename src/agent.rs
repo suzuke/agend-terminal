@@ -151,12 +151,21 @@ fn strip_ansi(s: &str) -> String {
                     }
                 }
                 Some(']') => {
+                    // G1: OSC sequence — terminated by BEL (\x07) or ST (\x1b\\)
                     chars.next();
                     while let Some(&ch) = chars.peek() {
-                        chars.next();
-                        if ch == '\x07' || ch == '\\' {
+                        if ch == '\x07' {
+                            chars.next();
                             break;
                         }
+                        if ch == '\x1b' {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        chars.next();
                     }
                 }
                 Some('(' | ')') => {
