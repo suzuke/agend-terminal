@@ -328,6 +328,15 @@ impl FleetConfig {
         let submit_key = preset.submit_key.to_string();
 
         let working_directory = Some(if let Some(d) = inst.working_directory.as_ref() {
+            // M2: reject path traversal
+            if d.contains("..") {
+                tracing::warn!(
+                    name,
+                    dir = d,
+                    "working_directory contains '..' (path traversal rejected)"
+                );
+                return None;
+            }
             // Expand ~ to home directory
             if let Some(rest) = d.strip_prefix("~/") {
                 if let Some(home) = dirs_home() {
