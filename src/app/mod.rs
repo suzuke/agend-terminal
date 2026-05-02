@@ -358,7 +358,26 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
             needs_resize = false;
         }
         sync_notification_state(&home, &mut layout);
-        flush_idle_notifications(&home, &mut layout);
+        // H3: throttle flush to ≥1s intervals (was every 50ms tick → disk I/O storm)
+        {
+            static LAST_FLUSH: std::sync::Mutex<Option<std::time::Instant>> =
+                std::sync::Mutex::new(None);
+            let now = std::time::Instant::now();
+            let should_flush = LAST_FLUSH
+                .lock()
+                .map(|guard| {
+                    guard
+                        .map(|t| now.duration_since(t).as_secs() >= 1)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            if should_flush {
+                flush_idle_notifications(&home, &mut layout);
+                if let Ok(mut guard) = LAST_FLUSH.lock() {
+                    *guard = Some(now);
+                }
+            }
+        }
 
         let repeat_mode = key_handler.in_repeat();
 

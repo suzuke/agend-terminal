@@ -131,9 +131,22 @@ pub fn key_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
     }
     match code {
         KeyCode::Char(c) if ctrl => {
-            vec![(c.to_ascii_lowercase() as u8)
-                .wrapping_sub(b'a')
-                .wrapping_add(1)]
+            // M2: correct Ctrl mapping for both letters and special chars
+            let byte = c.to_ascii_lowercase() as u8;
+            if byte.is_ascii_lowercase() {
+                vec![byte - b'a' + 1] // Ctrl+A=1 .. Ctrl+Z=26
+            } else {
+                // Ctrl+[ = ESC (0x1b), Ctrl+\ = 0x1c, Ctrl+] = 0x1d, etc.
+                match c {
+                    '[' | '{' => vec![0x1b],
+                    '\\' | '|' => vec![0x1c],
+                    ']' | '}' => vec![0x1d],
+                    '^' | '~' => vec![0x1e],
+                    '_' | '?' => vec![0x1f],
+                    '@' | ' ' => vec![0x00],
+                    _ => vec![], // unknown Ctrl combo — swallow
+                }
+            }
         }
         KeyCode::Char(c) if alt => {
             let mut v = vec![0x1b];
@@ -209,5 +222,18 @@ mod tests {
     fn plain_char_forwards_normally() {
         let bytes = key_to_bytes(KeyCode::Char('c'), KeyModifiers::NONE);
         assert_eq!(bytes, vec![b'c']);
+    }
+
+    // M2: Ctrl+non-letter key mapping tests
+    #[test]
+    fn ctrl_bracket_is_escape() {
+        let bytes = key_to_bytes(KeyCode::Char('['), KeyModifiers::CONTROL);
+        assert_eq!(bytes, vec![0x1b], "Ctrl+[ should be ESC");
+    }
+
+    #[test]
+    fn ctrl_backslash_is_0x1c() {
+        let bytes = key_to_bytes(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(bytes, vec![0x1c], "Ctrl+\\ should be 0x1c");
     }
 }
