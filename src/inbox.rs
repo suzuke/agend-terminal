@@ -284,18 +284,15 @@ pub fn enqueue(home: &Path, name: &str, mut msg: InboxMessage) -> anyhow::Result
     let line = format!("{}\n", serde_json::to_string(&msg)?);
 
     with_inbox_lock(home, name, |path| {
-        let mut content = std::fs::read_to_string(path).unwrap_or_default();
-        content.push_str(&line);
-        let tmp = path.with_extension("jsonl.tmp");
+        // H1: append-only write — O(1) instead of O(n) read-all+rewrite.
+        // The file is a JSONL append log; we only need to add one line.
         let result = (|| -> anyhow::Result<()> {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)?;
-            f.write_all(content.as_bytes())?;
+                .append(true)
+                .open(path)?;
+            f.write_all(line.as_bytes())?;
             f.sync_all()?;
-            std::fs::rename(&tmp, path)?;
             Ok(())
         })();
         result

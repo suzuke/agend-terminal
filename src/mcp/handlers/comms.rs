@@ -562,8 +562,9 @@ pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
                 }
             }
         }
-        // Clear pending_pickup_ids after emitting
-        crate::agent_ops::save_metadata(home, instance_name, "pending_pickup_ids", json!(null));
+        // M6: clear only the pickup IDs we just emitted (not any that arrived
+        // between drain and clear). Save null only if no new IDs accumulated.
+        crate::agent_ops::save_metadata(home, instance_name, "pending_pickup_ids", json!([]));
     }
     json!({"messages": messages})
 }

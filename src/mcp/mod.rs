@@ -44,10 +44,26 @@ fn read_acl_from_env() -> (HashSet<String>, HashSet<String>) {
     (allow, deny)
 }
 
-fn tool_acl() -> &'static (HashSet<String>, HashSet<String>) {
-    use std::sync::OnceLock;
-    static ACL: OnceLock<(HashSet<String>, HashSet<String>)> = OnceLock::new();
-    ACL.get_or_init(read_acl_from_env)
+/// M3: RwLock ACL cache — allows invalidation via invalidate_acl_cache().
+static ACL_CACHE: parking_lot::RwLock<Option<(HashSet<String>, HashSet<String>)>> =
+    parking_lot::RwLock::new(None);
+
+fn tool_acl() -> (HashSet<String>, HashSet<String>) {
+    {
+        let guard = ACL_CACHE.read();
+        if let Some(ref cached) = *guard {
+            return cached.clone();
+        }
+    }
+    let fresh = read_acl_from_env();
+    *ACL_CACHE.write() = Some(fresh.clone());
+    fresh
+}
+
+/// Invalidate the cached ACL so the next `tool_acl()` call re-reads env vars.
+#[allow(dead_code)] // M3: available for runtime config reload, not yet wired
+pub(crate) fn invalidate_acl_cache() {
+    *ACL_CACHE.write() = None;
 }
 
 /// Check if a tool is allowed given explicit allow/deny sets.
@@ -64,7 +80,7 @@ fn check_allowed(tool: &str, allow: &HashSet<String>, deny: &HashSet<String>) ->
 /// Returns true if `tool` is callable under the configured ACL.
 pub(crate) fn tool_is_allowed(tool: &str) -> bool {
     let (allow, deny) = tool_acl();
-    check_allowed(tool, allow, deny)
+    check_allowed(tool, &allow, &deny)
 }
 
 /// Filter a `tool_definitions()` value in place to drop tools blocked by the
@@ -79,7 +95,7 @@ pub(crate) fn filter_tools(defs: Value) -> Value {
         .into_iter()
         .filter(|t| {
             let n = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            check_allowed(n, allow, deny)
+            check_allowed(n, &allow, &deny)
         })
         .collect();
     json!({ "tools": filtered })
