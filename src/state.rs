@@ -451,61 +451,58 @@ pub fn classify_pty_output(
     use crate::backend::Backend;
     use crate::health::BlockedReason;
 
+    // G1: cached regexes via LazyLock — compiled once, not per-call
+    macro_rules! cached_re {
+        ($name:ident, $pat:expr) => {
+            static $name: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                regex::Regex::new($pat).expect(concat!("regex: ", $pat))
+            });
+        };
+    }
+    cached_re!(RE_CLAUDE_QUOTA, r"(?i)credit_balance_too_low");
+    cached_re!(RE_CLAUDE_RATE, r"(?i)overloaded|rate.?limit|\b429\b");
+    cached_re!(
+        RE_KIRO_QUOTA,
+        r"ServiceQuotaExceeded|InsufficientModelCapacity"
+    );
+    cached_re!(RE_KIRO_RATE, r"Too Many Requests|ThrottlingError|\b429\b");
+    cached_re!(RE_CODEX_QUOTA, r"hit your usage limit|try again at");
+    cached_re!(RE_CODEX_RATE, r"(?i)rate.?limit|\b429\b");
+    cached_re!(RE_GEMINI_RATE, r"RESOURCE_EXHAUSTED|\b429\b");
+
     match backend {
         Backend::ClaudeCode => {
-            if regex::Regex::new(r"(?i)credit_balance_too_low")
-                .ok()?
-                .is_match(output)
-            {
+            if RE_CLAUDE_QUOTA.is_match(output) {
                 return Some(BlockedReason::QuotaExceeded);
             }
-            // Sprint 31+ #4: word-boundary `429` per state-pattern fix.
-            if regex::Regex::new(r"(?i)overloaded|rate.?limit|\b429\b")
-                .ok()?
-                .is_match(output)
-            {
+            if RE_CLAUDE_RATE.is_match(output) {
                 return Some(BlockedReason::RateLimit {
                     retry_after_secs: None,
                 });
             }
         }
         Backend::KiroCli => {
-            if regex::Regex::new(r"ServiceQuotaExceeded|InsufficientModelCapacity")
-                .ok()?
-                .is_match(output)
-            {
+            if RE_KIRO_QUOTA.is_match(output) {
                 return Some(BlockedReason::QuotaExceeded);
             }
-            if regex::Regex::new(r"Too Many Requests|ThrottlingError|\b429\b")
-                .ok()?
-                .is_match(output)
-            {
+            if RE_KIRO_RATE.is_match(output) {
                 return Some(BlockedReason::RateLimit {
                     retry_after_secs: None,
                 });
             }
         }
         Backend::Codex => {
-            if regex::Regex::new(r"hit your usage limit|try again at")
-                .ok()?
-                .is_match(output)
-            {
+            if RE_CODEX_QUOTA.is_match(output) {
                 return Some(BlockedReason::QuotaExceeded);
             }
-            if regex::Regex::new(r"(?i)rate.?limit|\b429\b")
-                .ok()?
-                .is_match(output)
-            {
+            if RE_CODEX_RATE.is_match(output) {
                 return Some(BlockedReason::RateLimit {
                     retry_after_secs: None,
                 });
             }
         }
         Backend::Gemini => {
-            if regex::Regex::new(r"RESOURCE_EXHAUSTED|\b429\b")
-                .ok()?
-                .is_match(output)
-            {
+            if RE_GEMINI_RATE.is_match(output) {
                 return Some(BlockedReason::QuotaExceeded);
             }
         }
