@@ -13,7 +13,15 @@ impl Sender {
     /// Construct a `Sender`. Returns `None` if the input is empty.
     pub fn new(s: impl Into<String>) -> Option<Self> {
         let s = s.into();
-        (!s.is_empty()).then_some(Self(s))
+        // M2: validate name format — only alphanumeric, dash, underscore, colon
+        if s.is_empty()
+            || !s
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+        {
+            return None;
+        }
+        Some(Self(s))
     }
 
     /// Read the sender identity from `AGEND_INSTANCE_NAME`. Returns `None`

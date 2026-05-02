@@ -81,6 +81,9 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
                 if let Some(task_text) = task {
                     let home = home.to_path_buf();
                     let names = spawned.clone();
+                    // fire-and-forget: team task injection waits 3s for agents to
+                    // initialize, then injects task text. No JoinHandle needed —
+                    // losing the injection on shutdown is acceptable (M5 §10.5).
                     std::thread::Builder::new()
                         .name("team_task_inject".into())
                         .spawn(move || {
@@ -377,10 +380,12 @@ pub(super) fn handle_pane_snapshot(home: &Path, args: &Value) -> Value {
     if let Err(e) = crate::agent::validate_name(target) {
         return json!({"error": e});
     }
-    let lines = args["lines"].as_u64().unwrap_or(100) as usize;
-    if lines > 10000 {
+    let lines_u64 = args["lines"].as_u64().unwrap_or(100);
+    // M1: explicit bounds check before u64→usize cast (32-bit safety)
+    if lines_u64 > 10000 {
         return json!({"error": "lines must be <= 10000 (scrolling_history limit)"});
     }
+    let lines = lines_u64 as usize;
     match crate::api::call(
         home,
         &json!({"method": crate::api::method::PANE_SNAPSHOT, "params": {"name": target, "lines": lines}}),
@@ -502,8 +507,9 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
         return json!({"error": e});
     }
     let name_owned = {
-        use std::sync::atomic::{AtomicU16, Ordering};
-        static DEDUP_SEQ: AtomicU16 = AtomicU16::new(0);
+        // M4: AtomicU64 prevents 65536 wrap-around collision
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DEDUP_SEQ: AtomicU64 = AtomicU64::new(0);
 
         let existing: std::collections::HashSet<String> =
             crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
@@ -605,6 +611,7 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
             if let Some(task_text) = task {
                 let h = home.to_path_buf();
                 let n = name.to_string();
+                // fire-and-forget: single-agent task injection (M5 §10.5).
                 std::thread::Builder::new()
                     .name("task_inject".into())
                     .spawn(move || {
