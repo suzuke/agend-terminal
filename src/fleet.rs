@@ -1539,4 +1539,26 @@ defaults:
             "string values preserved: {output}"
         );
     }
+
+    #[test]
+    fn backfill_ids_opt_out_no_writeback() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-backfill-optout-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let yaml = "instances:\n  test-agent:\n    backend: claude\n";
+        let path = dir.join("fleet.yaml");
+        std::fs::write(&path, yaml).expect("write");
+        std::env::set_var("AGEND_FLEET_NO_AUTO_MIGRATE", "1");
+        let _ = FleetConfig::load(&path);
+        std::env::remove_var("AGEND_FLEET_NO_AUTO_MIGRATE");
+        // fleet.yaml should NOT have id field (opt-out)
+        let content = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !content.contains("id:"),
+            "opt-out should prevent id writeback: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

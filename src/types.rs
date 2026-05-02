@@ -17,7 +17,7 @@ impl InstanceId {
         self.0.as_simple().to_string()[..8].to_string()
     }
 
-    /// Parse from a UUID string or 8-char short alias.
+    /// Parse from a full UUID string. Short aliases are display-only (no parse-back).
     pub fn parse(s: &str) -> Option<Self> {
         uuid::Uuid::parse_str(s).ok().map(Self)
     }

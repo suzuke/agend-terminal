@@ -114,16 +114,9 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
                 .and_then(|v| serde_json::from_value::<crate::inbox::ForceMeta>(v.clone()).ok()),
             correlation_id: params["correlation_id"].as_str().map(String::from),
             reviewed_head: params["reviewed_head"].as_str().map(String::from),
-            // Sprint 46 P1: include instance ID in from field per operator §13.5
-            from: {
-                let id_suffix = crate::fleet::FleetConfig::load(&ctx.home.join("fleet.yaml"))
-                    .ok()
-                    .and_then(|c| c.instances.get(from).and_then(|i| i.id.clone()))
-                    .and_then(|id| crate::types::InstanceId::parse(&id))
-                    .map(|id| format!(" ({})", id.short()))
-                    .unwrap_or_default();
-                format!("from:{from}{id_suffix}")
-            },
+            // Sprint 46 P1: store bare name in from (machine-readable for reply).
+            // ID stored separately in from_id for audit trail per operator §13.5.
+            from: format!("from:{from}"),
             text: text.to_string(),
             kind: params
                 .get("kind")
