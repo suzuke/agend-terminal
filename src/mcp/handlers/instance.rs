@@ -276,6 +276,7 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
             superseded_by: None,
+            from_id: None,
         },
     );
     tracing::info!(%name, %reason, "replace_instance");

@@ -51,6 +51,7 @@ mod thread_census;
 #[cfg(feature = "tray")]
 mod tray;
 mod tui;
+pub mod types;
 mod verify;
 mod vterm;
 mod worktree;

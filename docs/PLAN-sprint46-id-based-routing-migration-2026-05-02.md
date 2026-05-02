@@ -111,48 +111,74 @@ Daemon startup:
 - Debug logs: full `name (id)`
 - Error messages on Ambiguous: `name "dev" matches 2 instances: a3k9p2xf, b8c2d1ef — pass id explicitly`
 
-## §4 Phase split (per reviewer COST-BENEFIT m-240)
+## §4 Phase split (per reviewer COST-BENEFIT m-240, **revised 2026-05-02 per operator m-298**)
 
-### Phase 1 — Routing core + reserved-name warn (Tier-2)
+> **Re-scope note (2026-05-02 16:00 UTC)**: P1 IMPL (PR #407 r1-fix) shipped ID infrastructure
+> + an instance-first name-lookup quick-fix for M5 (NOT ID-based dispatch). This is honest re-scope:
+> P1 retitled to "ID infra + M5 instance-first quick-fix"; P2 retitled to "ID-based routing migration
+> (true)" and gains a binding commitment to remove the name-string fallback.
+> Operator ruling m-20260502154707580980-298.
 
-**Scope** ~75 LOC:
-- `src/types.rs` InstanceId type + 2 tests (~25 LOC)
-- `src/agent.rs` registry: `HashMap<InstanceId, Handle>` + `name_to_id_index: HashMap<String, Vec<InstanceId>>` (~15 LOC)
-- `src/mcp/handlers/comms.rs` handle_send_to_instance + handle_delegate_task: resolve name→id, route by id (~20 LOC)
-- `src/api/handlers/messaging.rs` self-route check by id (~5 LOC)
-- `src/fleet.rs` reserved-name lint (warn if `instances.X` collides with `templates.X`) (~10 LOC)
-- Backfill on load + writeback (~15 LOC)
+### Phase 1 — ID infra + M5 instance-first quick-fix (Tier-2) — SHIPPED in PR #407
+
+**Scope** ~140 LOC actual (vs ~75 LOC PLAN estimate):
+- `src/types.rs` InstanceId UUIDv4 type + 2 tests (~59 LOC)
+- `src/fleet.rs` backfill_ids on load + reserved-name warn + writeback (~39 LOC)
+- `src/api/handlers/messaging.rs` inbox `from` field includes `(id8)` per §3.5 / operator §13.5 (~11 LOC)
+- `src/mcp/handlers/comms.rs` **instance-first lookup** (NOT ID routing): if `fleet.instances.contains_key(raw_target)` skip team resolution (~22 LOC)
+- `src/main.rs` wire backfill on daemon start (~1 LOC)
+- Cargo.toml uuid v4+serde feature
 
 **Tests**:
-- ID generation determinism + collision-resistance (1)
+- ID generation + UUIDv4 format ✓
+- Default impl ✓
+- M5 regression: `delegate_task_instance_first_bypasses_team_orchestrator_collision` ✓
+- (deferred to P2: name→id resolution, Ambiguous error, registry dual-index round-trip)
+
+**Files touched**: 6 (types.rs new, fleet.rs, messaging.rs, comms.rs, main.rs, Cargo.toml/lock).
+
+**NOT done in P1** (deferred to P2 with binding commitment):
+- ❌ `src/agent.rs` registry `HashMap<InstanceId, Handle>` dual-index
+- ❌ `src/mcp/handlers/comms.rs` resolve name→id and route by id (currently routes by name)
+- ❌ `resolve_instance(home, name_or_id) -> Result<(InstanceId, String), ResolveError>` helper
+- ❌ Ambiguous-name error path
+
+**Done definition (revised)**: Sprint 44 M5 unblocked via instance-first lookup. Workaround `feedback_kind_task_self_route_workaround.md` retired. ID infra in place but not yet routing-bearing.
+
+### Phase 2 — ID-based routing migration (true) + file path migration (Tier-2) — **binding**
+
+> Re-scope per operator m-298: P2 absorbs the routing migration de-scoped from P1.
+> **Binding constraint**: P2 MUST eliminate the name-string fallback in dispatch path.
+> No more `if instances.contains_key(name) { route_by_name }` shortcut — all routing must
+> resolve through `InstanceId`. Bandaid pattern is non-negotiable to remove.
+
+**Scope** ~75-90 LOC (revised up from ~40):
+
+Routing migration (de-scoped from P1):
+- `src/agent.rs` registry: `HashMap<InstanceId, Handle>` + `name_to_id_index: HashMap<String, Vec<InstanceId>>` (~15 LOC)
+- `src/mcp/handlers/comms.rs` `handle_send_to_instance` + `handle_delegate_task`: replace instance-first name lookup with `resolve_instance(home, raw_target) -> Result<(InstanceId, String), ResolveError>`; route by id (~25 LOC, REPLACES P1 r1-fix bandaid)
+- `src/api/handlers/messaging.rs` self-route check by id (~5 LOC)
+- `resolve_instance` helper (~15 LOC)
+
+File path migration (original P2):
+- `src/inbox.rs::inbox_path` accepts `&InstanceId`, writes to `inbox/{id}.jsonl` (~15 LOC)
+- Migration: name-based file exists → create id-based file/symlink (~15 LOC, with Windows file-copy fallback per operator §13.7)
+- `metadata/{id}.json` + `ipc/{id}.port` similar (~10 LOC)
+- Cleanup sweep: deferred to Sprint 47
+
+**Tests**:
 - name resolves to single id (1)
 - collision returns Ambiguous (1)
-- M5 regression: `kind=task target=dev sender=lead` works after fix (1)
-- reserved-name warn fires (1)
-- writeback round-trip (existing fleet.yaml without `id` → has `id` after daemon load) (1)
+- M5 regression survives — routing now via id, name-string fallback REMOVED (1)
+- new instance writes to `{id}.jsonl` directly (1)
+- legacy instance: name-based file → id-based file via migration (1)
+- writes after migration go to id-based path (1)
 
-**Files touched**: 6 (types.rs new, agent.rs, comms.rs, messaging.rs, fleet.rs, tests).
-
-**Tier**: Tier-2 dual review — codex PRIMARY + lead cross-vantage. Routing core is high-blast-radius.
-
-**Done definition**: Sprint 44 M5 unblocked. Workaround `feedback_kind_task_self_route_workaround.md` retired.
-
-### Phase 2 — File path migration (Tier-2)
-
-**Scope** ~40 LOC:
-- `src/inbox.rs::inbox_path` accepts `&InstanceId`, writes to `inbox/{id}.jsonl` (~15 LOC)
-- Migration: on first load, `inbox/{name}.jsonl` exists → create `inbox/{id}.jsonl` symlink → existing readers follow symlink (~15 LOC)
-- `metadata/{id}.json` + `ipc/{id}.port` similar (~10 LOC)
-- Cleanup sweep: after sprint+1 grace period, drop name-based files (deferred to Sprint 47)
-
-**Tests**:
-- new instance writes to `{id}.jsonl` directly
-- legacy instance: name-based file exists → symlink created → reads work
-- writes after migration go to id-based path
-
-**Tier**: Tier-2 dual review — file path migration has highest revert cost.
+**Tier**: Tier-2 dual review — routing core + file path migration both high blast radius.
 
 **Dependency**: requires P1 merged.
+
+**Done definition**: Bandaid pattern in comms.rs removed. All routing resolves through InstanceId.
 
 ### Phase 3 — Audit trail (Tier-1)
 

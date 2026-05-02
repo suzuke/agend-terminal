@@ -1071,6 +1071,7 @@ mod tests {
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
             superseded_by: None,
+            from_id: None,
         };
         let header = crate::inbox::format_header(&sample_msg);
 
