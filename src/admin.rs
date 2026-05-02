@@ -113,7 +113,7 @@ pub fn execute_cleanup(repo: &Path, checks: &[BranchCheck], dry_run: bool) -> (u
                     log_lines.push(msg);
                 } else {
                     let result = std::process::Command::new("git")
-                        .args(["branch", "-D", &check.branch])
+                        .args(["branch", "-d", &check.branch])
                         .current_dir(repo)
                         .output();
                     match result {

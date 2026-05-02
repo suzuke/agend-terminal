@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Returns true when the `AGEND_WORKTREE_AUTO_CLEANUP` feature flag is set to "1".
+/// M4 note: tests use set_var to toggle this flag. Production reads once at
+/// call time — acceptable since worktree cleanup is not a hot path.
+/// Full explicit-param migration deferred (test-only concern, low priority).
 pub fn auto_cleanup_enabled() -> bool {
     std::env::var("AGEND_WORKTREE_AUTO_CLEANUP")
         .ok()

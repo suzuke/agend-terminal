@@ -120,8 +120,19 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
         return Ok((String::new(), None));
     }
 
-    if !token.contains(':') {
-        println!("  ⚠ Token format looks wrong. Continuing anyway.\n");
+    // M1: validate telegram bot token format: <digits>:<alphanumeric+_->
+    let valid_format = token.split_once(':').is_some_and(|(num, rest)| {
+        num.len() >= 8
+            && num.chars().all(|c| c.is_ascii_digit())
+            && rest.len() >= 30
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    });
+    if !valid_format {
+        println!(
+            "  ⚠ Token format looks wrong (expected <digits>:<35+ chars>). Continuing anyway.\n"
+        );
     }
 
     print!("  Verifying bot... ");

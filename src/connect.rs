@@ -137,53 +137,47 @@ pub fn run(
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
 
-    // Install signal handler to kill child and deregister on SIGINT/SIGTERM
+    // H1: async-signal-safe handler — set atomic flag only.
+    // Main loop checks flag and performs cleanup outside signal context.
     let child_id = child.id();
     let deregister_name = name.to_string();
     let deregister_home = home.to_path_buf();
-    let cleanup = move || {
-        crate::process::terminate(child_id);
-        let _ = crate::api::call(
-            &deregister_home,
-            &serde_json::json!({
-                "method": crate::api::method::DEREGISTER_EXTERNAL,
-                "params": { "name": deregister_name }
-            }),
-        );
-    };
-    let cleanup_for_handler = std::sync::Arc::new(parking_lot::Mutex::new(Some(cleanup)));
-    let handler_ref = cleanup_for_handler.clone();
+    static SIGNAL_RECEIVED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     ctrlc::set_handler(move || {
-        {
-            let mut guard = handler_ref.lock();
-            if let Some(f) = guard.take() {
-                f();
-            }
-        }
-        std::process::exit(130);
+        SIGNAL_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
     })
     .ok();
 
-    // 11. Wait for child to exit
-    let status = child.wait()?;
-
-    // 12. Deregister from daemon (normal exit path — handler not triggered)
-    // Consume the handler so it won't run again
-    {
-        let mut guard = cleanup_for_handler.lock();
-        guard.take();
+    // 11. Wait for child to exit, checking signal flag
+    loop {
+        if SIGNAL_RECEIVED.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::process::terminate(child_id);
+            let _ = crate::api::call(
+                &deregister_home,
+                &serde_json::json!({
+                    "method": crate::api::method::DEREGISTER_EXTERNAL,
+                    "params": { "name": deregister_name }
+                }),
+            );
+            std::process::exit(130);
+        }
+        match child.try_wait()? {
+            Some(status) => {
+                let _ = crate::api::call(
+                    home,
+                    &serde_json::json!({
+                        "method": crate::api::method::DEREGISTER_EXTERNAL,
+                        "params": { "name": name }
+                    }),
+                );
+                tracing::info!(%name, "agent disconnected");
+                if !status.success() {
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                return Ok(());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
     }
-    let _ = crate::api::call(
-        home,
-        &serde_json::json!({
-            "method": crate::api::method::DEREGISTER_EXTERNAL,
-            "params": { "name": name }
-        }),
-    );
-    tracing::info!(%name, "agent disconnected");
-
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    Ok(())
 }
