@@ -2605,4 +2605,33 @@ mod tests {
         assert_eq!(msgs[0].id.as_deref(), Some("normal-1"));
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn from_id_round_trip() {
+        let msg = InboxMessage {
+            schema_version: 0,
+            id: Some("m-1".into()),
+            from: "from:dev".into(),
+            from_id: Some("a3k9p2xf".into()),
+            text: "hello".into(),
+            kind: None,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            channel: None,
+            delivery_mode: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.from_id, Some("a3k9p2xf".to_string()));
+    }
 }
