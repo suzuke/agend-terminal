@@ -177,7 +177,7 @@ fn discord_caps() -> ChannelCapabilities {
             per_minute: 50,
         },
         // UX
-        react: true,
+        react: false, // M3: not implemented yet (returns NotSupported)
         edit: true,
         typing_indicator: true,
         receives_edit_events: true,
