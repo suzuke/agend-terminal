@@ -55,7 +55,8 @@ fn load_topic_registry(home: &Path) -> HashMap<i32, String> {
 fn save_topic_registry(home: &Path, registry: &HashMap<i32, String>) {
     let map: HashMap<String, &String> = registry.iter().map(|(k, v)| (k.to_string(), v)).collect();
     if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::write(topic_registry_path(home), json);
+        // H2: atomic write to prevent partial-file on crash
+        let _ = crate::store::atomic_write(&topic_registry_path(home), json.as_bytes());
     }
 }
 
@@ -98,6 +99,11 @@ fn telegram_runtime() -> &'static tokio::runtime::Runtime {
 /// (e.g. Telegram polling → emit path), spawns a fire-and-forget task on the
 /// current runtime to avoid `block_on`-inside-runtime panic. Returns `Ok(())`
 /// for the spawned path since the result is not awaited.
+///
+/// H3: the spawn path returns Ok(()) immediately — errors are logged but not
+/// propagated. This is intentional: the caller is in a sync context and cannot
+/// await the spawned task. Callers must not assume Ok(()) means the operation
+/// succeeded — it means the task was submitted. Check tracing logs for failures.
 fn spawn_or_block_on<F>(fut: F) -> anyhow::Result<()>
 where
     F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
@@ -711,7 +717,12 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         });
         match meta.get_mut("pending_pickup_ids") {
             Some(arr) if arr.is_array() => {
-                arr.as_array_mut().expect("checked").push(entry);
+                let vec = arr.as_array_mut().expect("checked");
+                vec.push(entry);
+                // M2: cap to prevent unbounded growth (keep newest 100)
+                if vec.len() > 100 {
+                    *vec = vec.split_off(vec.len() - 100);
+                }
             }
             _ => {
                 meta["pending_pickup_ids"] = serde_json::json!([entry]);
@@ -1714,77 +1725,58 @@ fn notify_telegram_inner(
     let text = text.to_string();
     let home_owned = home.to_path_buf();
     let instance_owned = instance_name.to_string();
-    // fire-and-forget: per-call tg_notify spawns its own ephemeral runtime to
-    // ship one notify message, then exits. No JoinHandle / shutdown signal
-    // needed — losing one notification on shutdown is acceptable and the
-    // sender continues with subsequent calls.
-    std::thread::Builder::new()
-        .name("tg_notify".into())
-        .spawn(move || {
-            let _census = crate::thread_census::register("tg_notify");
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            if let Err(e) = rt.block_on(async {
-                use teloxide::payloads::SendMessageSetters;
-                use teloxide::prelude::Requester;
-                let bot = teloxide::Bot::new(&token);
-                let chat_id = teloxide::types::ChatId(group_id);
-                match topic_id {
-                    Some(tid) if tid != 1 => {
+    // H1: use shared telegram_runtime() instead of per-notification thread+runtime.
+    // fire-and-forget: losing one notification on shutdown is acceptable.
+    telegram_runtime().spawn(async move {
+        use teloxide::payloads::SendMessageSetters;
+        use teloxide::prelude::Requester;
+        let bot = teloxide::Bot::new(&token);
+        let chat_id = teloxide::types::ChatId(group_id);
+        let result = match topic_id {
+            Some(tid) if tid != 1 => {
+                let mut req = bot
+                    .send_message(chat_id, &text)
+                    .message_thread_id(teloxide::types::ThreadId(teloxide::types::MessageId(tid)));
+                if disable_notification {
+                    req = req.disable_notification(true);
+                }
+                req.await.map(|_| ())
+            }
+            _ => {
+                let mut req = bot.send_message(chat_id, &text);
+                if disable_notification {
+                    req = req.disable_notification(true);
+                }
+                req.await.map(|_| ())
+            }
+        };
+        if let Err(e) = result {
+            let e: anyhow::Error = e.into();
+            if let Some(stale_tid) = topic_id {
+                if is_topic_deleted_error(&e) {
+                    if let Some(new_tid) =
+                        invalidate_and_recreate_topic(&home_owned, &instance_owned, stale_tid)
+                    {
+                        tracing::info!(
+                            instance = %instance_owned,
+                            old_topic = stale_tid,
+                            new_topic = new_tid,
+                            "notify: retrying with recreated topic"
+                        );
                         let mut req = bot.send_message(chat_id, &text).message_thread_id(
-                            teloxide::types::ThreadId(teloxide::types::MessageId(tid)),
+                            teloxide::types::ThreadId(teloxide::types::MessageId(new_tid)),
                         );
                         if disable_notification {
                             req = req.disable_notification(true);
                         }
-                        req.await?;
-                    }
-                    _ => {
-                        let mut req = bot.send_message(chat_id, &text);
-                        if disable_notification {
-                            req = req.disable_notification(true);
-                        }
-                        req.await?;
+                        let _ = req.await;
+                        return;
                     }
                 }
-                Ok::<(), anyhow::Error>(())
-            }) {
-                if let Some(stale_tid) = topic_id {
-                    if is_topic_deleted_error(&e) {
-                        if let Some(new_tid) =
-                            invalidate_and_recreate_topic(&home_owned, &instance_owned, stale_tid)
-                        {
-                            tracing::info!(
-                                instance = %instance_owned,
-                                old_topic = stale_tid,
-                                new_topic = new_tid,
-                                "notify: retrying with recreated topic"
-                            );
-                            let _ = rt.block_on(async {
-                                use teloxide::payloads::SendMessageSetters;
-                                use teloxide::prelude::Requester;
-                                let bot = teloxide::Bot::new(&token);
-                                let chat_id = teloxide::types::ChatId(group_id);
-                                let mut req = bot.send_message(chat_id, &text).message_thread_id(
-                                    teloxide::types::ThreadId(teloxide::types::MessageId(new_tid)),
-                                );
-                                if disable_notification {
-                                    req = req.disable_notification(true);
-                                }
-                                req.await
-                            });
-                            return;
-                        }
-                    }
-                }
-                tracing::warn!(error = %e, "telegram notify failed");
             }
-        })
-        .ok();
+            tracing::warn!(error = %e, "telegram notify failed");
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
