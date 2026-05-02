@@ -49,14 +49,14 @@ static ACL_CACHE: parking_lot::RwLock<Option<(HashSet<String>, HashSet<String>)>
     parking_lot::RwLock::new(None);
 
 fn tool_acl() -> (HashSet<String>, HashSet<String>) {
-    {
-        let guard = ACL_CACHE.read();
-        if let Some(ref cached) = *guard {
-            return cached.clone();
-        }
+    // M3 r1-fix: compute under write lock to prevent invalidate-during-compute race.
+    // ACL is not a hot path — write lock simplicity > read-mostly concurrency.
+    let mut guard = ACL_CACHE.write();
+    if let Some(ref cached) = *guard {
+        return cached.clone();
     }
     let fresh = read_acl_from_env();
-    *ACL_CACHE.write() = Some(fresh.clone());
+    *guard = Some(fresh.clone());
     fresh
 }
 
