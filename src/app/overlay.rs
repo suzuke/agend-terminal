@@ -38,6 +38,8 @@ pub enum TaskBoardMode {
         /// (display_label, assignee_value)
         choices: Vec<(String, String)>,
         selected: usize,
+        /// M3: captured task ID to avoid col/row index drift
+        task_id: String,
     },
     Help,
 }
@@ -590,6 +592,7 @@ pub(super) fn handle_key(
                 TaskBoardMode::Assign {
                     ref choices,
                     ref mut selected,
+                    ref task_id,
                 } => match key.code {
                     KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
                         *selected -= 1;
@@ -598,20 +601,18 @@ pub(super) fn handle_key(
                         *selected += 1;
                     }
                     KeyCode::Enter if !choices.is_empty() => {
-                        let columns = crate::render::task_board_columns(items);
-                        if let Some(task) = columns[*col].get(*row) {
-                            let assignee = &choices[*selected].1;
-                            crate::tasks::handle(
-                                ctx.home,
-                                "user",
-                                &serde_json::json!({
-                                    "action": "update",
-                                    "id": task.id,
-                                    "assignee": assignee,
-                                }),
-                            );
-                            *items = crate::tasks::list_all(ctx.home);
-                        }
+                        // M3: use captured task_id instead of col/row indices
+                        let assignee = &choices[*selected].1;
+                        crate::tasks::handle(
+                            ctx.home,
+                            "user",
+                            &serde_json::json!({
+                                "action": "update",
+                                "id": task_id,
+                                "assignee": assignee,
+                            }),
+                        );
+                        *items = crate::tasks::list_all(ctx.home);
                         *mode = TaskBoardMode::Board;
                     }
                     KeyCode::Esc => {
@@ -697,6 +698,11 @@ pub(super) fn handle_key(
                         }
                         // a — assign
                         KeyCode::Char('a') if !columns[*col].is_empty() => {
+                            // M3: capture task_id now to avoid col/row drift
+                            let target_task_id = columns[*col]
+                                .get(*row)
+                                .map(|t| t.id.clone())
+                                .unwrap_or_default();
                             let mut choices: Vec<(String, String)> = Vec::new();
                             let mut seen = std::collections::HashSet::new();
                             // Teams
@@ -729,6 +735,7 @@ pub(super) fn handle_key(
                             *mode = TaskBoardMode::Assign {
                                 choices,
                                 selected: 0,
+                                task_id: target_task_id,
                             };
                         }
                         // Shift+← / Shift+→ — move task status

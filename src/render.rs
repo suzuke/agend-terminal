@@ -1483,7 +1483,7 @@ pub fn render_tasks(
                 inner_popup,
             );
         }
-        TaskBoardMode::Assign { choices, selected } => {
+        TaskBoardMode::Assign { choices, selected, .. } => {
             let h = (choices.len() as u16 + 2).min(inner.height.saturating_sub(2));
             let w = 40u16.min(inner.width.saturating_sub(4));
             let popup = Rect::new(

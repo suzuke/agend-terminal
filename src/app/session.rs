@@ -69,6 +69,13 @@ pub(super) fn sync_fleet_yaml(home: &Path, layout: &Layout) {
         }
     }
 
+    // H2: guard — if no panes have fleet_instance_name, the layout wasn't
+    // populated from fleet.yaml (crash recovery / fresh start). Skip sync
+    // to avoid deleting all fleet entries.
+    if active_fleet_names.is_empty() {
+        return;
+    }
+
     // Batch-remove fleet entries not in any pane (single atomic write)
     if let Some(ref f) = fleet {
         let to_remove: Vec<String> = f

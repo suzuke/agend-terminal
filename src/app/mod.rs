@@ -121,6 +121,15 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     result
 }
 
+/// Main event loop for the TUI app.
+///
+/// M5 note: this function is 550+ lines with 15+ locals. Extraction to
+/// `app/event_loop.rs` deferred — the function is a single coherent event
+/// loop with no natural split point that wouldn't increase coupling.
+/// Locals are all loop-scoped state (layout, registry, overlay, etc.)
+/// that the event loop needs in every iteration. Splitting would require
+/// passing all state as a context struct, adding complexity without
+/// reducing cognitive load. Revisit if the function grows further.
 fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Result<()> {
     let home = crate::home_dir();
     let fleet_path = fleet_override
