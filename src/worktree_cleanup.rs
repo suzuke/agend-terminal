@@ -10,15 +10,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Returns true when the `AGEND_WORKTREE_AUTO_CLEANUP` feature flag is set to "1".
-/// M4 note: tests use set_var to toggle this flag. Production reads once at
-/// call time — acceptable since worktree cleanup is not a hot path.
-/// Full explicit-param migration deferred (test-only concern, low priority).
+/// Returns true unless `AGEND_WORKTREE_AUTO_CLEANUP` is explicitly set to "0".
+/// Cleanup is on by default — set `AGEND_WORKTREE_AUTO_CLEANUP=0` to disable.
 pub fn auto_cleanup_enabled() -> bool {
     std::env::var("AGEND_WORKTREE_AUTO_CLEANUP")
         .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false)
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Entry for a git worktree.
@@ -319,7 +317,15 @@ mod tests {
     fn test_flag_disabled_default() {
         let _lock = ENV_LOCK.lock();
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        assert!(auto_cleanup_enabled());
+    }
+
+    #[test]
+    fn test_flag_disabled_explicit() {
+        let _lock = ENV_LOCK.lock();
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "0");
         assert!(!auto_cleanup_enabled());
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
     }
 
     #[test]
@@ -333,10 +339,11 @@ mod tests {
     #[test]
     fn test_sweep_noop_when_flag_disabled() {
         let _lock = ENV_LOCK.lock();
-        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "0");
         let configs = HashMap::new();
         let removed = sweep_from_registry(&configs, &[]);
         assert!(removed.is_empty());
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
     }
 
     #[test]
