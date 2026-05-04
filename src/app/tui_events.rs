@@ -694,4 +694,46 @@ mod tests {
             resolve_split_anchor(LayoutHint::Tab, Some("peer"), Some("peer"), &layout).is_none()
         );
     }
+
+    /// Multi-pane tab: removing one agent pane preserves the tab and other panes.
+    /// Models the clean-exit shell-fallback scenario: agent exits, shell takes
+    /// its slot (same name), other panes in the tab remain untouched.
+    #[test]
+    fn clean_exit_multi_pane_preserves_tab_with_remaining_panes() {
+        use crate::layout::SplitDir;
+        let mut layout = Layout::new();
+        let mut tab = Tab::new("team".into(), leaf(1, "agent-a"));
+        tab.split_focused(SplitDir::Horizontal, leaf(2, "agent-b"));
+        layout.add_tab(tab);
+        assert_eq!(layout.tabs[0].root().pane_count(), 2);
+
+        // Simulate: agent-a exits cleanly → shell replaces it in registry
+        // (same name). The pane stays because the agent name still exists.
+        // Only if shell spawn FAILS does remove_agent_pane fire.
+        // Here we verify multi-pane removal keeps the tab alive.
+        remove_agent_pane("agent-a", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1, "tab must survive (multi-pane)");
+        assert_eq!(
+            layout.tabs[0].root().pane_count(),
+            1,
+            "only agent-b pane remains"
+        );
+    }
+
+    /// Single-pane tab: InstanceDeleted (from shell spawn failure) closes the tab.
+    #[test]
+    fn clean_exit_single_pane_with_shell_failure_closes_tab() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("solo".into(), leaf(1, "agent-solo")));
+        layout.add_tab(Tab::new("other".into(), leaf(2, "agent-other")));
+        assert_eq!(layout.tabs.len(), 2);
+
+        // Shell spawn failed → InstanceDeleted fires → handle_instance_deleted
+        // calls remove_agent_pane → single-pane tab closes.
+        handle_instance_deleted("agent-solo", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1, "single-pane tab must close");
+        assert_eq!(layout.tabs[0].name, "other");
+    }
 }

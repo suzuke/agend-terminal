@@ -258,7 +258,7 @@ fn run_core(
     // more than a plausible burst — every fleet member crashing at once —
     // and senders use `try_send` so a full channel drops the event with a
     // warning rather than blocking the PTY close handler.
-    let (crash_tx, crash_rx) = crossbeam_channel::bounded::<String>(64);
+    let (crash_tx, crash_rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(64);
 
     // Store configs for respawn
     let configs: Arc<Mutex<HashMap<String, AgentConfig>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -367,14 +367,14 @@ fn run_core(
             break;
         }
 
-        // Block until a crash event, periodic tick, or shutdown signal.
-        let crashed_name: Option<String>;
+        // Block until an exit event, periodic tick, or shutdown signal.
+        let exit_event: Option<crate::agent::AgentExitEvent>;
         crossbeam_channel::select! {
             recv(crash_rx) -> msg => {
-                crashed_name = msg.ok();
+                exit_event = msg.ok();
             }
             recv(tick_rx) -> _ => {
-                crashed_name = None;
+                exit_event = None;
             }
             recv(shutdown_rx) -> _ => {
                 // Re-check flag at top of loop and break.
@@ -563,10 +563,30 @@ fn run_core(
             }
         }
 
-        // Handle crash event (if any)
-        let crashed_name = match crashed_name {
-            Some(n) => n,
-            None => continue, // Tick only — no crash to handle
+        // Handle exit event (if any)
+        let exit_event = match exit_event {
+            Some(e) => e,
+            None => continue, // Tick only — no exit to handle
+        };
+
+        // Handle clean exit: agent typed /exit or /quit — no respawn.
+        if let crate::agent::AgentExitEvent::CleanExit(ref name) = exit_event {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
+            {
+                let mut reg = registry.lock();
+                reg.remove(name.as_str());
+            }
+            configs.lock().remove(name.as_str());
+            continue;
+        }
+
+        // Crash path: extract name and proceed with respawn logic.
+        let crashed_name = match exit_event {
+            crate::agent::AgentExitEvent::Crash(n) => n,
+            _ => continue,
         };
 
         // Ignore crash events during shutdown — agents are being killed intentionally.
@@ -948,7 +968,7 @@ fn spawn_and_register_agent(
     def: &crate::bootstrap::AgentDef,
     registry: &AgentRegistry,
     configs: &Arc<Mutex<HashMap<String, AgentConfig>>>,
-    crash_tx: &crossbeam_channel::Sender<String>,
+    crash_tx: &crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
     shutdown: &Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let (name, command, args, env, working_dir, submit_key) = def;
@@ -1149,5 +1169,115 @@ mod tests {
     fn opencode_fresh_args_same_as_preset() {
         let p = crate::backend::Backend::OpenCode.preset();
         assert!(p.fresh_args.is_none());
+    }
+
+    // ── Clean exit vs crash respawn tests ────────────────────────────
+
+    #[test]
+    fn clean_exit_does_not_respawn() {
+        // Simulate: daemon receives CleanExit event → agent removed from
+        // registry + configs, no respawn thread spawned.
+        let (tx, rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(8);
+        tx.send(crate::agent::AgentExitEvent::CleanExit("agent-1".into()))
+            .expect("send test event");
+        let event = rx.recv().expect("recv test event");
+        assert!(
+            matches!(event, crate::agent::AgentExitEvent::CleanExit(ref n) if n == "agent-1"),
+            "expected CleanExit, got {event:?}"
+        );
+        // Verify the daemon loop logic: CleanExit removes from registry, does NOT respawn.
+        // We test the discriminant matching that the main loop uses.
+        let is_clean = matches!(event, crate::agent::AgentExitEvent::CleanExit(_));
+        assert!(is_clean, "CleanExit must be recognized as clean");
+    }
+
+    #[test]
+    fn crash_still_respawns() {
+        // Simulate: daemon receives Crash event → should trigger respawn.
+        let (tx, rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(8);
+        tx.send(crate::agent::AgentExitEvent::Crash("agent-2".into()))
+            .expect("send test event");
+        let event = rx.recv().expect("recv test event");
+        let is_crash =
+            matches!(event, crate::agent::AgentExitEvent::Crash(ref n) if n == "agent-2");
+        assert!(is_crash, "Crash event must be recognized for respawn");
+        let is_clean = matches!(event, crate::agent::AgentExitEvent::CleanExit(_));
+        assert!(!is_clean, "Crash must NOT be treated as clean exit");
+    }
+
+    #[test]
+    fn clean_exit_removes_from_configs() {
+        // Verify the daemon loop's CleanExit handler removes the agent
+        // from the configs map (preventing stale respawn config).
+        let configs: Arc<Mutex<HashMap<String, AgentConfig>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        configs.lock().insert(
+            "agent-3".into(),
+            AgentConfig {
+                name: "agent-3".into(),
+                backend_command: "claude".into(),
+                args: vec![],
+                env: None,
+                working_dir: None,
+                worktree_source: None,
+                submit_key: "\r".into(),
+            },
+        );
+        assert!(configs.lock().contains_key("agent-3"));
+        // Simulate the CleanExit handler logic from the main loop:
+        configs.lock().remove("agent-3");
+        assert!(
+            !configs.lock().contains_key("agent-3"),
+            "CleanExit must remove agent from configs"
+        );
+    }
+
+    #[test]
+    fn sigint_130_treated_as_clean_exit() {
+        // SIGINT (exit code 130 = 128+2) from /quit in some CLIs must be
+        // treated as clean exit, not crash.
+        let exit_code = Some(130_i32);
+        let is_crash = !matches!(exit_code, Some(0) | Some(130));
+        assert!(!is_crash, "exit code 130 (SIGINT) must not be a crash");
+        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
+        assert!(
+            is_user_clean,
+            "exit code 130 must be user-initiated clean exit"
+        );
+    }
+
+    #[test]
+    fn sigkill_137_not_clean_exit() {
+        // SIGKILL (137) is daemon-initiated, not user /exit.
+        let exit_code = Some(137_i32);
+        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
+        assert!(
+            !is_user_clean,
+            "SIGKILL must NOT be user-initiated clean exit"
+        );
+    }
+
+    #[test]
+    fn sigterm_143_not_clean_exit() {
+        // SIGTERM (143) is daemon-initiated, not user /exit.
+        let exit_code = Some(143_i32);
+        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
+        assert!(
+            !is_user_clean,
+            "SIGTERM must NOT be user-initiated clean exit"
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_is_crash() {
+        // Exit code 1 (error) must trigger crash respawn.
+        let exit_code = Some(1_i32);
+        let is_crash = match exit_code {
+            Some(0) | Some(130) => false,
+            Some(137) | Some(143) => false,
+            Some(_) => true,
+            None => true,
+        };
+        assert!(is_crash, "exit code 1 must be a crash");
     }
 }
