@@ -842,6 +842,23 @@ pub fn deliver(
         from_id: None,
     };
     let _ = enqueue(home, agent_name, msg);
+    // Sprint 49: track input channel for channel discipline correction.
+    let channel_tag = match source {
+        NotifySource::Channel(_, _) => Some("telegram"),
+        NotifySource::Agent(_) => Some("agent_peer"),
+        NotifySource::System(_) => None,
+    };
+    if let Some(tag) = channel_tag {
+        crate::agent_ops::save_metadata_batch(
+            home,
+            agent_name,
+            &[
+                ("last_input_channel", serde_json::json!(tag)),
+                ("reply_tool_called_since_input", serde_json::json!(false)),
+                ("inject_count_since_input", serde_json::json!(0)),
+            ],
+        );
+    }
     notify_agent(home, agent_name, source, text);
 }
 
