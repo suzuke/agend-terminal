@@ -253,3 +253,40 @@ pub enum Direction {
     Left,
     Right,
 }
+
+/// Split an area into two sub-rects along the given direction, with 1-cell
+/// overlap at the border (so the border character is shared between both
+/// children). Mirror of `render::render_pane_tree`'s split logic
+/// — keep the two in sync (both produce overlap-by-1 results).
+pub(crate) fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] {
+    let total = match dir {
+        SplitDir::Horizontal => area.height,
+        SplitDir::Vertical => area.width,
+    };
+    let first_size = ratio_to_size(ratio, total);
+    let overlap: u16 = if first_size >= 1 && total > first_size {
+        1
+    } else {
+        0
+    };
+    match dir {
+        SplitDir::Horizontal => {
+            let second_y = area.y + first_size.saturating_sub(overlap);
+            // H4: saturating_sub prevents underflow on tiny terminals
+            let second_h = (area.height + overlap).saturating_sub(first_size).max(1);
+            [
+                Rect::new(area.x, area.y, area.width, first_size),
+                Rect::new(area.x, second_y, area.width, second_h),
+            ]
+        }
+        SplitDir::Vertical => {
+            let second_x = area.x + first_size.saturating_sub(overlap);
+            // H4: saturating_sub prevents underflow on tiny terminals
+            let second_w = (area.width + overlap).saturating_sub(first_size).max(1);
+            [
+                Rect::new(area.x, area.y, first_size, area.height),
+                Rect::new(second_x, area.y, second_w, area.height),
+            ]
+        }
+    }
+}

@@ -13,6 +13,7 @@ pub use split::{
     adjust_split_ratio, find_split_border, ratio_to_size, resize_focused, split_child_areas,
     Direction, SplitBorderHit, VSPLIT_BORDER_HIT_TOLERANCE,
 };
+pub(crate) use split::split_chunks;
 pub use tab::{DragTabTarget, Tab};
 pub use tree::{swap_panes, PaneNode, SplitDir};
 
@@ -250,7 +251,7 @@ fn collect_resize_needs(
             first,
             second,
         } => {
-            let [c0, c1] = crate::render::split_chunks(area, dir, *ratio);
+            let [c0, c1] = split::split_chunks(area, dir, *ratio);
             collect_resize_needs(c0, first, rects, resizes);
             collect_resize_needs(c1, second, rects, resizes);
         }
