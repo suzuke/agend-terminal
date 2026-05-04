@@ -836,7 +836,7 @@ fn handle_pty_close(
     }
 
     let is_crash = match exit_code {
-        Some(0) => false, // Graceful exit
+        Some(0) | Some(130) => false, // Graceful exit: 0 = normal, 130 = SIGINT (user Ctrl+C / /quit)
         Some(137) | Some(143) => {
             // SIGKILL (137) / SIGTERM (143) — killed by daemon or user
             tracing::info!(
@@ -856,6 +856,10 @@ fn handle_pty_close(
         }
     };
 
+    // Distinguish user-initiated clean exit from daemon-initiated kill.
+    // SIGKILL/SIGTERM are daemon kills — not user /exit or /quit.
+    let is_user_clean_exit = matches!(exit_code, Some(0) | Some(130));
+
     // Sprint 21 F-NEW1: sweep the child process tree before respawn fires so
     // any leaked grandchildren (kiro-cli's bun + acp etc.) don't survive across
     // the respawn boundary and collide with the new process tree's port/file
@@ -865,18 +869,107 @@ fn handle_pty_close(
     // orphaned to PID 1) and the 2s timeout (leader still alive).
     sweep_child_tree(name, registry);
 
-    if !is_crash {
-        // Clean exit (code 0): user typed /exit, /quit, or similar.
-        // Do NOT respawn — remove from registry and clean up.
-        tracing::info!(agent = name, "clean exit (code 0), no respawn");
+    if is_user_clean_exit {
+        // User-initiated clean exit (code 0 or 130): /exit, /quit, Ctrl+C.
+        // Do NOT respawn the agent — spawn a shell replacement instead
+        // (tmux-style: pane stays alive with a shell prompt).
+        tracing::info!(
+            agent = name,
+            ?exit_code,
+            "clean exit, spawning shell fallback"
+        );
         if let Some(ref home) = home {
-            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
             crate::event_log::log(home, "clean_exit", name, "agent exited cleanly");
         }
-        if let Some(ref tx) = crash_tx {
-            if let Err(e) = tx.try_send(AgentExitEvent::CleanExit(name.to_string())) {
-                tracing::warn!(agent = %name, error = %e, "exit channel full — clean exit event dropped");
+
+        // Grab terminal size from the existing VTerm before removing.
+        let (cols, rows) = {
+            let reg = registry.lock();
+            reg.get(name)
+                .map(|h| {
+                    let c = h.core.lock();
+                    (c.vterm.cols(), c.vterm.rows())
+                })
+                .unwrap_or_else(|| crossterm::terminal::size().unwrap_or((120, 40)))
+        };
+
+        // Read working_dir from metadata (agent handle doesn't store it).
+        let work_dir: Option<std::path::PathBuf> = home.as_ref().and_then(|h| {
+            let meta_path = h.join("metadata").join(format!("{name}.json"));
+            std::fs::read_to_string(meta_path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                .and_then(|v| {
+                    v["working_directory"]
+                        .as_str()
+                        .map(std::path::PathBuf::from)
+                })
+        });
+
+        // Remove old agent from registry so spawn_agent can reuse the name.
+        {
+            let mut reg = registry.lock();
+            reg.remove(name);
+        }
+        if let Some(ref home) = home {
+            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
+        }
+
+        // Spawn $SHELL as replacement. Best-effort: if it fails, notify
+        // daemon for cleanup instead.
+        let shell = crate::default_shell();
+        let spawn_result = spawn_agent(
+            &SpawnConfig {
+                name,
+                backend_command: shell,
+                args: &[],
+                spawn_mode: crate::backend::SpawnMode::Fresh,
+                cols,
+                rows,
+                env: None,
+                working_dir: work_dir.as_deref(),
+                submit_key: "\r",
+                home: home.as_deref(),
+                crash_tx: crash_tx.clone(),
+                shutdown: shutdown.clone(),
+            },
+            registry,
+        );
+        match spawn_result {
+            Ok(()) => {
+                tracing::info!(agent = name, shell, "shell fallback spawned");
+                // Start TUI socket for the shell agent so the pane can connect.
+                if let Some(ref home) = home {
+                    let rdir = crate::daemon::run_dir(home);
+                    let reg = Arc::clone(registry);
+                    let n = name.to_string();
+                    // fire-and-forget: shell TUI server exits when agent removed.
+                    let _ = std::thread::Builder::new()
+                        .name(format!("{n}_tui"))
+                        .spawn(move || crate::daemon::serve_agent_tui(&n, &rdir, &reg));
+                }
             }
+            Err(e) => {
+                tracing::warn!(agent = name, error = %e, "shell fallback failed");
+                // Fall through: notify daemon for cleanup.
+                if let Some(ref tx) = crash_tx {
+                    let _ = tx.try_send(AgentExitEvent::CleanExit(name.to_string()));
+                }
+            }
+        }
+        return;
+    }
+
+    if !is_crash {
+        // SIGKILL/SIGTERM — daemon-initiated kill, not user action.
+        // Already handled by shutdown check above; if we reach here it's
+        // an explicit `kill` command. Remove from registry, no respawn.
+        {
+            let mut reg = registry.lock();
+            reg.remove(name);
+        }
+        if let Some(ref home) = home {
+            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
         }
         return;
     }

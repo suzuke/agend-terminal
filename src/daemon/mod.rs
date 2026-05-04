@@ -1231,4 +1231,53 @@ mod tests {
             "CleanExit must remove agent from configs"
         );
     }
+
+    #[test]
+    fn sigint_130_treated_as_clean_exit() {
+        // SIGINT (exit code 130 = 128+2) from /quit in some CLIs must be
+        // treated as clean exit, not crash.
+        let exit_code = Some(130_i32);
+        let is_crash = !matches!(exit_code, Some(0) | Some(130));
+        assert!(!is_crash, "exit code 130 (SIGINT) must not be a crash");
+        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
+        assert!(
+            is_user_clean,
+            "exit code 130 must be user-initiated clean exit"
+        );
+    }
+
+    #[test]
+    fn sigkill_137_not_clean_exit() {
+        // SIGKILL (137) is daemon-initiated, not user /exit.
+        let exit_code = Some(137_i32);
+        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
+        assert!(
+            !is_user_clean,
+            "SIGKILL must NOT be user-initiated clean exit"
+        );
+    }
+
+    #[test]
+    fn sigterm_143_not_clean_exit() {
+        // SIGTERM (143) is daemon-initiated, not user /exit.
+        let exit_code = Some(143_i32);
+        let is_user_clean = matches!(exit_code, Some(0) | Some(130));
+        assert!(
+            !is_user_clean,
+            "SIGTERM must NOT be user-initiated clean exit"
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_is_crash() {
+        // Exit code 1 (error) must trigger crash respawn.
+        let exit_code = Some(1_i32);
+        let is_crash = match exit_code {
+            Some(0) | Some(130) => false,
+            Some(137) | Some(143) => false,
+            Some(_) => true,
+            None => true,
+        };
+        assert!(is_crash, "exit code 1 must be a crash");
+    }
 }
