@@ -162,12 +162,6 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     // directly. Otherwise fall through to team-orchestrator resolution.
     let resolved_target = match crate::agent::resolve_instance(home, raw_target) {
         Ok((_id, name)) => name,
-        Err(crate::agent::ResolveError::Ambiguous(n, ids)) => {
-            return json!({"error": format!(
-                "name \"{n}\" matches {} instances: {} — pass id explicitly",
-                ids.len(), ids.join(", ")
-            )});
-        }
         Err(crate::agent::ResolveError::NotFound(_)) => {
             // Not a known instance — try team-orchestrator resolution
             match crate::teams::resolve_team_orchestrator(home, raw_target) {
@@ -547,7 +541,7 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
 pub(super) fn handle_inbox(home: &Path, instance_name: &str) -> Value {
     let messages = crate::inbox::drain(home, instance_name);
     if !messages.is_empty() {
-        let meta_path = home.join("metadata").join(format!("{instance_name}.json"));
+        let meta_path = crate::agent_ops::metadata_path_resolved(home, instance_name);
         if let Some(meta) = std::fs::read_to_string(&meta_path)
             .ok()
             .and_then(|c| serde_json::from_str::<Value>(&c).ok())

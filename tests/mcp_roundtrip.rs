@@ -23,6 +23,24 @@ fn binary() -> PathBuf {
     path
 }
 
+/// Read all `.jsonl` content from the inbox directory (id-based or name-based).
+/// Sprint 46 P2: inbox files may be named by UUID instead of instance name.
+fn read_inbox_content(home: &std::path::Path) -> String {
+    let inbox_dir = home.join("inbox");
+    let mut content = String::new();
+    if let Ok(entries) = std::fs::read_dir(&inbox_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                if let Ok(c) = std::fs::read_to_string(&path) {
+                    content.push_str(&c);
+                }
+            }
+        }
+    }
+    content
+}
+
 fn mcp_home() -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -648,8 +666,7 @@ fn test_send_to_instance_passes_thread_id() {
     );
     assert!(responses.len() >= 2);
     // Verify the message was enqueued to other-agent's inbox with thread_id
-    let inbox_path = home.join("inbox").join("other-agent.jsonl");
-    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    let content = read_inbox_content(&home);
     assert!(
         content.contains("t-root-42"),
         "thread_id must be in inbox JSONL: {content}"
@@ -742,7 +759,7 @@ fn test_parent_id_auto_inherits_thread() {
     );
     assert!(responses.len() >= 2);
     // Read other-agent's inbox directly to verify thread_id was inherited
-    let content = std::fs::read_to_string(inbox_dir.join("other-agent.jsonl")).unwrap_or_default();
+    let content = read_inbox_content(&home);
     let lines: Vec<&str> = content.lines().collect();
     // Find the reply (has parent_id=m-parent, not the parent itself)
     let reply_line = lines
@@ -774,8 +791,7 @@ fn test_delegate_task_persists_task_id() {
     );
     assert!(responses.len() >= 2);
     // Deserialize inbox JSONL and verify typed task_id field
-    let inbox_path = home.join("inbox").join("test-agent.jsonl");
-    let content = std::fs::read_to_string(&inbox_path).expect("inbox file must exist");
+    let content = read_inbox_content(&home);
     let msg: serde_json::Value = content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -805,8 +821,7 @@ fn test_delegate_task_no_task_id_remains_none() {
         ],
     );
     assert!(responses.len() >= 2);
-    let inbox_path = home.join("inbox").join("test-agent.jsonl");
-    let content = std::fs::read_to_string(&inbox_path).expect("inbox file must exist");
+    let content = read_inbox_content(&home);
     let msg: serde_json::Value = content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -835,8 +850,7 @@ fn test_correlation_id_persisted_as_typed_field() {
         ],
     );
     assert!(responses.len() >= 2);
-    let inbox_path = home.join("inbox").join("test-agent.jsonl");
-    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    let content = read_inbox_content(&home);
     let msg: serde_json::Value = content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -876,8 +890,7 @@ fn test_report_result_reviewed_head_no_pr_url_rejected() {
         "error must mention missing PR URL: {err}"
     );
     // Message must NOT be in inbox (rejected before delivery)
-    let inbox_path = home.join("inbox").join("test-agent.jsonl");
-    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    let content = read_inbox_content(&home);
     let has_report = content
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -956,8 +969,7 @@ fn test_send_to_instance_correlation_id_persisted() {
         ],
     );
     assert!(responses.len() >= 2);
-    let inbox_path = home.join("inbox").join("other.jsonl");
-    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    let content = read_inbox_content(&home);
     let msg: serde_json::Value = content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -1029,8 +1041,7 @@ fn test_report_result_persists_parent_and_thread() {
         ],
     );
     assert!(responses.len() >= 2);
-    let inbox_path = home.join("inbox").join("test-agent.jsonl");
-    let content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+    let content = read_inbox_content(&home);
     let msg: serde_json::Value = content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())

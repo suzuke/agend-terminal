@@ -687,7 +687,8 @@ fn set_waiting_on_persists_and_clears() {
     // Value-source pin: return value `since` must match metadata file.
     let returned_since = result["since"].as_str().expect("since in return");
     let meta: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
+        &std::fs::read_to_string(crate::agent_ops::metadata_path_resolved(&home, "sender"))
+            .expect("read meta"),
     )
     .expect("parse meta");
     assert_eq!(meta["waiting_on"], "review from at-dev-4");
@@ -701,7 +702,8 @@ fn set_waiting_on_persists_and_clears() {
     let result = handle_tool("set_waiting_on", &json!({"condition": ""}), "sender");
     assert_eq!(result["cleared"], true);
     let meta: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read meta"),
+        &std::fs::read_to_string(crate::agent_ops::metadata_path_resolved(&home, "sender"))
+            .expect("read meta"),
     )
     .expect("parse meta");
     assert!(
@@ -730,7 +732,7 @@ fn implicit_heartbeat_recorded_on_tool_call() {
     // setup_recorder's set_var and handle_tool's home_dir() read.
     // Using home_dir() here matches wherever handle_tool actually wrote.
     let actual_home = crate::home_dir();
-    let meta_path = actual_home.join("metadata/sender.json");
+    let meta_path = crate::agent_ops::metadata_path_resolved(&actual_home, "sender");
     let meta: Value =
         serde_json::from_str(&std::fs::read_to_string(&meta_path).expect("read meta"))
             .expect("parse meta — atomic write must produce valid JSON");
@@ -844,7 +846,8 @@ fn metadata_persisted_on_pending_pickup() {
     );
 
     let meta: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read"),
+        &std::fs::read_to_string(crate::agent_ops::metadata_path_resolved(&home, "sender"))
+            .expect("read"),
     )
     .expect("parse");
     let arr = meta["pending_pickup_ids"]
@@ -988,7 +991,8 @@ fn agent_picked_up_fires_for_all_pending_messages() {
 
     // Verify pending_pickup_ids cleared after drain
     let meta: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.join("metadata/sender.json")).expect("read"),
+        &std::fs::read_to_string(crate::agent_ops::metadata_path_resolved(&home, "sender"))
+            .expect("read"),
     )
     .expect("parse");
     assert!(

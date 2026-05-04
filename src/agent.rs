@@ -127,19 +127,12 @@ pub fn validate_name(name: &str) -> Result<&str, String> {
 #[derive(Debug)]
 pub enum ResolveError {
     NotFound(String),
-    Ambiguous(String, Vec<String>),
 }
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound(t) => write!(f, "instance '{t}' not found"),
-            Self::Ambiguous(name, ids) => write!(
-                f,
-                "name \"{name}\" matches {} instances: {} — pass id explicitly",
-                ids.len(),
-                ids.join(", ")
-            ),
         }
     }
 }
@@ -148,8 +141,11 @@ impl std::fmt::Display for ResolveError {
 ///
 /// Resolution order per PLAN §3.3:
 /// 1. Exact full-UUID match
-/// 2. Exact 8-char short-id prefix match (must be unique)
-/// 3. Exact instance name match — collision → `ResolveError::Ambiguous`
+/// 2. Exact 8-char short-id prefix match
+/// 3. Exact instance name match
+///
+/// fleet.yaml `instances` is a `HashMap<String, _>` so name uniqueness is
+/// structurally guaranteed — no Ambiguous error path needed.
 pub fn resolve_instance(
     home: &std::path::Path,
     name_or_id: &str,
@@ -170,47 +166,29 @@ pub fn resolve_instance(
 
     // 2. Short-id prefix match (8 hex chars)
     if name_or_id.len() == 8 && name_or_id.chars().all(|c| c.is_ascii_hexdigit()) {
-        let mut matches = Vec::new();
         for (name, inst) in &fleet.instances {
             if let Some(ref id_str) = inst.id {
                 if let Some(id) = crate::types::InstanceId::parse(id_str) {
                     if id.short() == name_or_id {
-                        matches.push((id, name.clone()));
+                        return Ok((id, name.clone()));
                     }
                 }
             }
         }
-        if matches.len() == 1 {
-            // SAFETY: len == 1 guarantees next() returns Some
-            return Ok(matches.into_iter().next().expect("len == 1"));
-        }
-        if matches.len() > 1 {
-            let ids: Vec<String> = matches.iter().map(|(id, _)| id.short()).collect();
-            return Err(ResolveError::Ambiguous(name_or_id.to_string(), ids));
-        }
         // Fall through to name match
     }
 
-    // 3. Exact name match
-    let mut matches = Vec::new();
-    for (name, inst) in &fleet.instances {
-        if name == name_or_id {
-            let id = inst
-                .id
-                .as_deref()
-                .and_then(crate::types::InstanceId::parse)
-                .unwrap_or_default();
-            matches.push((id, name.clone()));
-        }
+    // 3. Exact name match — HashMap guarantees at most one entry per name.
+    if let Some(inst) = fleet.instances.get(name_or_id) {
+        let id = inst
+            .id
+            .as_deref()
+            .and_then(crate::types::InstanceId::parse)
+            .unwrap_or_default();
+        return Ok((id, name_or_id.to_string()));
     }
-    match matches.len() {
-        0 => Err(ResolveError::NotFound(name_or_id.to_string())),
-        1 => Ok(matches.into_iter().next().expect("len == 1")),
-        _ => {
-            let ids: Vec<String> = matches.iter().map(|(id, _)| id.short()).collect();
-            Err(ResolveError::Ambiguous(name_or_id.to_string(), ids))
-        }
-    }
+
+    Err(ResolveError::NotFound(name_or_id.to_string()))
 }
 
 /// Lock the agent registry, recovering from poison.
@@ -1416,11 +1394,10 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn name_collision_returns_ambiguous() {
-        // HashMap<String, _> can't have duplicate keys, so a single fleet.yaml
-        // can't produce a true name collision. Ambiguous only fires for short-id
-        // collisions. Test that a non-existent name returns NotFound.
-        let home = resolve_test_home("collision");
+    fn nonexistent_name_returns_not_found() {
+        // fleet.yaml HashMap guarantees name uniqueness — no Ambiguous path.
+        // Verify that a non-existent name returns NotFound.
+        let home = resolve_test_home("notfound");
         let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n";
         std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
         let result = resolve_instance(&home, "nonexistent");
