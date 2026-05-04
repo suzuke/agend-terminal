@@ -159,7 +159,7 @@ mod tests {
 
     use crate::channel::telegram::state::TelegramState;
     use crate::channel::telegram::topic_registry::{
-        load_topic_registry, register_topic, save_topic_registry,
+        load_topic_registry, register_topic, save_topic_registry, FLEET_BINDING_SENTINEL,
     };
 
     fn tmp_home(name: &str) -> PathBuf {
@@ -340,6 +340,70 @@ instances:
         assert!(
             fleet_yaml.contains("important"),
             "instance role must survive; yaml:\n{fleet_yaml}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fleet_binding_self_heals_when_topic_deleted() {
+        let home = tmp_home("fleet-self-heal");
+        let mut reg = HashMap::new();
+        reg.insert(42, FLEET_BINDING_SENTINEL.to_string());
+        reg.insert(100, "at-dev-1".to_string());
+        save_topic_registry(&home, &reg);
+        let state = Arc::new(Mutex::new(TelegramState::new(
+            "tok",
+            -12345,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        )));
+        {
+            let mut s = lock_state(&state);
+            s.fleet_binding_topic_id = Some(42);
+        }
+        let err = anyhow::anyhow!("Bad Request: message thread not found");
+        let handled = handle_fleet_send_failure(&err, &home, &state, 42);
+        assert!(handled);
+        assert_eq!(lock_state(&state).fleet_binding_topic_id, None);
+        let reg_after = load_topic_registry(&home);
+        assert!(!reg_after.values().any(|v| v == FLEET_BINDING_SENTINEL));
+        assert_eq!(reg_after.get(&100), Some(&"at-dev-1".to_string()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn fleet_binding_self_heal_ignores_unrelated_errors() {
+        let home = tmp_home("fleet-self-heal-neg");
+        let mut reg = HashMap::new();
+        reg.insert(42, FLEET_BINDING_SENTINEL.to_string());
+        save_topic_registry(&home, &reg);
+        let state = Arc::new(Mutex::new(TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        )));
+        {
+            let mut s = lock_state(&state);
+            s.fleet_binding_topic_id = Some(42);
+        }
+        for msg in [
+            "network timeout",
+            "Too Many Requests: retry after 5",
+            "Forbidden: bot was blocked by the user",
+        ] {
+            let err = anyhow::anyhow!(msg.to_string());
+            assert!(!handle_fleet_send_failure(&err, &home, &state, 42));
+        }
+        assert_eq!(lock_state(&state).fleet_binding_topic_id, Some(42));
+        let reg_after = load_topic_registry(&home);
+        assert_eq!(
+            reg_after.get(&42),
+            Some(&FLEET_BINDING_SENTINEL.to_string())
         );
         std::fs::remove_dir_all(&home).ok();
     }
