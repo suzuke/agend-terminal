@@ -2,7 +2,7 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::app::MenuItem;
-use crate::layout::{DragTabTarget, Layout, PaneNode, SplitDir};
+use crate::layout::{DragTabTarget, Layout, PaneNode};
 use crate::state::AgentState;
 use ratatui::layout::{Alignment, Constraint, Direction, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -229,41 +229,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
     frame.render_widget(tabs, area);
 }
 
-/// Split an area into two child rects that overlap by 1 cell on the split axis
-/// so siblings share a border column/row. Mirrors `layout::split_child_areas`
-/// — keep the two in sync (both produce overlap-by-1 results).
-pub(crate) fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] {
-    let total = match dir {
-        SplitDir::Horizontal => area.height,
-        SplitDir::Vertical => area.width,
-    };
-    let first_size = crate::layout::ratio_to_size(ratio, total);
-    let overlap: u16 = if first_size >= 1 && total > first_size {
-        1
-    } else {
-        0
-    };
-    match dir {
-        SplitDir::Horizontal => {
-            let second_y = area.y + first_size.saturating_sub(overlap);
-            // H4: saturating_sub prevents underflow on tiny terminals
-            let second_h = (area.height + overlap).saturating_sub(first_size).max(1);
-            [
-                Rect::new(area.x, area.y, area.width, first_size),
-                Rect::new(area.x, second_y, area.width, second_h),
-            ]
-        }
-        SplitDir::Vertical => {
-            let second_x = area.x + first_size.saturating_sub(overlap);
-            // H4: saturating_sub prevents underflow on tiny terminals
-            let second_w = (area.width + overlap).saturating_sub(first_size).max(1);
-            [
-                Rect::new(area.x, area.y, first_size, area.height),
-                Rect::new(second_x, area.y, second_w, area.height),
-            ]
-        }
-    }
-}
+// split_chunks moved to layout/split.rs (Sprint 48 PR 1 — cross-dep resolution).
 
 fn render_pane_tree(
     frame: &mut Frame,
@@ -360,7 +326,7 @@ fn render_node(
             first,
             second,
         } => {
-            let [c0, c1] = split_chunks(area, dir, *ratio);
+            let [c0, c1] = crate::layout::split_chunks(area, dir, *ratio);
             render_node(
                 frame,
                 c0,
@@ -2369,14 +2335,14 @@ mod tests {
         use ratatui::layout::Rect;
         // 1x1 terminal — extreme case
         let area = Rect::new(0, 0, 1, 1);
-        let [_a, b] = split_chunks(area, &crate::layout::SplitDir::Horizontal, 0.9);
+        let [_a, b] = crate::layout::split_chunks(area, &crate::layout::SplitDir::Horizontal, 0.9);
         // Should not panic; second chunk should have min height 1
         assert!(
             b.height >= 1,
             "second chunk height must be ≥1, got {}",
             b.height
         );
-        let [_c, d] = split_chunks(area, &crate::layout::SplitDir::Vertical, 0.9);
+        let [_c, d] = crate::layout::split_chunks(area, &crate::layout::SplitDir::Vertical, 0.9);
         assert!(
             d.width >= 1,
             "second chunk width must be ≥1, got {}",
