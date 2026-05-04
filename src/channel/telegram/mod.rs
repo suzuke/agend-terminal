@@ -17,6 +17,7 @@ pub(crate) mod bot_api;
 pub(crate) mod creds;
 pub(crate) mod notify;
 pub(crate) mod reply;
+pub(crate) mod ux_sink;
 
 pub(crate) use adapter::*;
 pub(crate) use bootstrap::*;
