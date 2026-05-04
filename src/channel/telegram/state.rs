@@ -169,3 +169,152 @@ impl TelegramState {
         send_with_topic(bot, self.group_id, Some(*topic_id), text, None).await
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    #[test]
+    fn telegram_state_new_builds_reverse_map() {
+        let mut topic_map = HashMap::new();
+        topic_map.insert("agent1".to_string(), 100);
+        topic_map.insert("agent2".to_string(), 200);
+        let state = TelegramState::new(
+            "fake-token",
+            -12345,
+            topic_map,
+            PathBuf::from("/tmp/test"),
+            HashMap::new(),
+            None,
+        );
+        assert_eq!(
+            state.topic_to_instance.get(&100),
+            Some(&"agent1".to_string())
+        );
+        assert_eq!(
+            state.topic_to_instance.get(&200),
+            Some(&"agent2".to_string())
+        );
+        assert_eq!(state.instance_to_topic.get("agent1"), Some(&100));
+        assert_eq!(state.instance_to_topic.get("agent2"), Some(&200));
+    }
+
+    #[test]
+    fn telegram_state_empty_topic_map() {
+        let state = TelegramState::new(
+            "fake-token",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        assert!(state.topic_to_instance.is_empty());
+        assert!(state.instance_to_topic.is_empty());
+    }
+
+    #[test]
+    fn telegram_state_submit_keys_preserved() {
+        let mut keys = HashMap::new();
+        keys.insert("agent1".to_string(), "\n".to_string());
+        let state =
+            TelegramState::new("tok", -1, HashMap::new(), PathBuf::from("/tmp"), keys, None);
+        assert_eq!(state.submit_keys.get("agent1"), Some(&"\n".to_string()));
+    }
+
+    #[test]
+    fn is_user_allowed_none_rejects_all_after_phase2_fail_closed_swap() {
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            None,
+        );
+        assert!(
+            !state.is_user_allowed(1),
+            "fail-closed: None must reject any user"
+        );
+        assert!(
+            !state.is_user_allowed(i64::MAX),
+            "fail-closed: None must reject even valid Telegram user_ids"
+        );
+    }
+
+    #[test]
+    fn is_user_allowed_empty_rejects_all() {
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            Some(vec![]),
+        );
+        assert!(!state.is_user_allowed(1));
+        assert!(!state.is_user_allowed(0));
+    }
+
+    #[test]
+    fn is_user_allowed_restricts_to_list() {
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            Some(vec![42, 100]),
+        );
+        assert!(state.is_user_allowed(42));
+        assert!(state.is_user_allowed(100));
+        assert!(!state.is_user_allowed(41));
+        assert!(!state.is_user_allowed(0));
+    }
+
+    #[test]
+    fn is_user_allowed_realistic_user_id_after_phase2() {
+        const REAL_USER_ID: i64 = 1_047_180_393;
+        let state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            Some(vec![REAL_USER_ID]),
+        );
+        assert!(state.is_user_allowed(REAL_USER_ID));
+        assert!(!state.is_user_allowed(REAL_USER_ID + 1));
+        assert!(!state.is_user_allowed(REAL_USER_ID - 1));
+    }
+
+    #[test]
+    fn user_allowlist_yaml_round_trip_i64_realistic_values() {
+        let yaml = r#"
+group_id: -1003725098111
+user_allowlist:
+  - 1047180393
+"#;
+        #[derive(serde::Deserialize, Debug)]
+        struct PartialChannel {
+            group_id: i64,
+            user_allowlist: Vec<i64>,
+        }
+        let parsed: PartialChannel = serde_yaml_ng::from_str(yaml).expect("yaml must deserialize");
+        assert_eq!(parsed.group_id, -1_003_725_098_111_i64);
+        assert_eq!(parsed.user_allowlist, vec![1_047_180_393_i64]);
+
+        let serialized = serde_yaml_ng::to_string(&serde_json::json!({
+            "group_id": parsed.group_id,
+            "user_allowlist": parsed.user_allowlist,
+        }))
+        .expect("yaml must serialize");
+        let reparsed: PartialChannel =
+            serde_yaml_ng::from_str(&serialized).expect("yaml round-trip must deserialize");
+        assert_eq!(reparsed.group_id, parsed.group_id);
+        assert_eq!(reparsed.user_allowlist, parsed.user_allowlist);
+    }
+}

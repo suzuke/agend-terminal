@@ -472,3 +472,28 @@ pub(super) fn agent_wants_raw_keystrokes(
     let guard = core.lock();
     guard.state.current.wants_raw_keystrokes()
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    #[test]
+    fn handle_message_body_has_no_block_on() {
+        let src = include_str!("inbound.rs");
+        let start = src
+            .find("async fn handle_message(")
+            .expect("handle_message must exist");
+        let rest = &src[start + 30..];
+        let end = rest
+            .find("\nfn ")
+            .or_else(|| rest.find("\nasync fn "))
+            .or_else(|| rest.find("\npub fn "))
+            .or_else(|| rest.find("\npub(crate) fn "))
+            .or_else(|| rest.find("\npub(super) fn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("block_on"),
+            "handle_message must not call block_on (nested runtime panic). Found block_on in body."
+        );
+    }
+}
