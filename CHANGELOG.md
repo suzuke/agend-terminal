@@ -5,6 +5,38 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Added
+
+- **ID-based routing migration (Sprint 46)** — `InstanceId` (UUIDv4) assigned to every fleet instance. Routing resolves through `resolve_instance(name_or_id)` with 3-step resolution (full UUID → short-id → name). Replaces the Sprint 44 M5 name-lookup bandaid. Self-route check compares IDs. Audit trail fields (`emitter_id`, `from_id`, `to_id`) added to task events and dispatch tracking. (#407, #409, #412)
+- **CI hardening (Sprint 47)** — Job-level `timeout-minutes: 60` safety net. Per-step timeouts (fmt 5m, clippy 10m, build 20m, tests 20-30m, smoke 10m). Concurrency group with `cancel-in-progress` for PRs — superseded CI runs auto-cancel. (#411)
+- **File path migration infrastructure (Sprint 46 P2)** — `inbox_path_resolved` and `metadata_path_resolved` helpers with symlink migration from name-based to id-based paths. (#409)
+
+### Changed
+
+- **Large file split refactor (Sprint 48)** — Three oversized files (~8700 LOC total) split into 25 sub-modules, all ≤700 LOC:
+  - `layout.rs` (2170 LOC) → 6 sub-modules: `pane`, `tree`, `preset`, `split`, `tab`, `mod` (#414)
+  - `channel/telegram.rs` (4201 LOC) → 13 sub-modules: `state`, `topic_registry`, `send`, `inbound`, `error`, `creds`, `reply`, `bot_api`, `notify`, `adapter`, `ux_sink`, `bootstrap`, `mod` (#416, #419)
+  - `render.rs` (2352 LOC) → 7 sub-modules: `core_render`, `border`, `overlay`, `panels`, `panels_fleet`, `scratch`, `mod` (#421)
+  - Circular dependency resolved: `split_chunks` moved from render to layout/split (#414)
+- **CI workflow cleanup** — Merged redundant clippy/test steps, bumped checkout to v5. (#422)
+
+### Fixed
+
+- **Codex InteractivePrompt false-positive** — Removed codex `Update available!|Press enter to continue` regex that misfired on normal idle prompts, causing spurious operator notifications. (#408)
+- **topic_id not persisted on create_instance** — `create_instance` created a Telegram topic but never wrote `topic_id` to `fleet.yaml`. On daemon restart, the topic was orphaned. Now persisted via `update_instance_field`. `describe_instance` also surfaces `topic_id`. (#417, closes #415)
+- **Windows CI mock server hang** — Added `Connection: close` header to test mock servers for reliable Windows CI execution. (#420)
+
+### Reverted
+
+- **Sprint 49 channel discipline correction** — Inject-only nudge mechanism (PR #424) reverted due to daemon deadlock and design issues. Follow-up redesign tracked in issue #426. (#425)
+
+### Internal
+
+- Sprint 44 push-time semantic gate: claim verifier + pre-push hook (M1+M2), reviewer SHA gate + ci-watch supersede (M3+M6), hallucinated-fn extension (M4). (#384, #385, #386)
+- Sprint 44.5: post-merge rebuild hook + CI slowness investigation. (#388, #389)
+- Sprint 45: 15 PRs across 9 architecture groups — persistence/audit, set_var removal, shared runtime, lifecycle, channel, MCP, fleet config, state classifier, CLI/bootstrap. (#390–#404)
+- Sprint 48 investigation: bitbucket tests hang under tray feature on Windows — root cause is `tao` Win32 message pump interference, not test logic. (#418)
+
 ## [0.4.1] — 2026-04-24
 
 ### Fixed
