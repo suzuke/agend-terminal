@@ -1,8 +1,10 @@
 # Sprint 49 PLAN — Channel Discipline Correction (NARROW)
 
+> **REVERTED 2026-05-04**: Original IMPL PR #424 reverted via PR #425 due to daemon deadlock + design issues. Follow-up redesign tracked in issue #426.
+
 **Date**: 2026-05-04
 **Author**: lead
-**Status**: PLAN (awaiting §8 GO + scope ruling)
+**Status**: REVERTED
 **Source-of-truth**: `origin/main` HEAD `834f30d`
 **Synthesis inputs (preserved)**:
 - dev STRUCTURAL — m-20260504113841219730-5
