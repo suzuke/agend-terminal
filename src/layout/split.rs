@@ -289,3 +289,161 @@ pub(crate) fn split_chunks(area: Rect, dir: &SplitDir, ratio: f32) -> [Rect; 2] 
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::layout::pane::{Pane, PaneSource};
+    use crate::layout::tree::{PaneNode, SplitDir, MIN_PANE_CELLS};
+    use crate::vterm::VTerm;
+
+    fn mk_pane(id: usize, name: &str) -> Pane {
+        Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+    fn mk_leaf(id: usize, name: &str) -> PaneNode {
+        PaneNode::Leaf(Box::new(mk_pane(id, name)))
+    }
+
+    #[test]
+    fn ratio_to_size_no_zero_when_room() {
+        for total in [6u16, 10, 40, 100, 500] {
+            for ri in 0..=100 {
+                let r = ri as f32 / 100.0;
+                let first = ratio_to_size(r, total);
+                let second = total - first;
+                assert!(
+                    first >= MIN_PANE_CELLS && second >= MIN_PANE_CELLS,
+                    "total={total} ratio={r} -> first={first} second={second}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn ratio_to_size_degenerate_does_not_panic() {
+        assert_eq!(ratio_to_size(0.5, 0), 0);
+        assert_eq!(ratio_to_size(0.5, 1), 0);
+    }
+    #[test]
+    fn ratio_to_size_sum_matches_total() {
+        for total in [2u16, 3, 10, 100, 1000] {
+            for ri in [0, 25, 50, 75, 100] {
+                let r = ri as f32 / 100.0;
+                let first = ratio_to_size(r, total);
+                assert!(first <= total);
+            }
+        }
+    }
+    #[test]
+    fn split_child_areas_vertical_siblings_share_one_cell() {
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Vertical, 0.5);
+        assert_eq!(second.0, first.0 + first.2 - 1);
+        assert_eq!(first.2 + second.2 - 1, area.2);
+    }
+    #[test]
+    fn split_child_areas_horizontal_siblings_share_one_cell() {
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Horizontal, 0.5);
+        assert_eq!(second.1, first.1 + first.3 - 1);
+        assert_eq!(first.3 + second.3 - 1, area.3);
+    }
+    #[test]
+    fn find_split_border_matches_shared_column() {
+        let root = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(mk_leaf(1, "a")),
+            second: Box::new(mk_leaf(2, "b")),
+        };
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (first, second) = split_child_areas(area, SplitDir::Vertical, 0.5);
+        let shared_col = first.0 + first.2 - 1;
+        assert_eq!(shared_col, second.0);
+        assert!(find_split_border(&root, area, shared_col, 5).is_some());
+        assert!(find_split_border(&root, area, shared_col + 1, 5).is_some());
+        assert!(find_split_border(&root, area, shared_col - 1, 5).is_some());
+        assert!(find_split_border(&root, area, shared_col + 2, 5).is_none());
+        assert!(find_split_border(&root, area, shared_col.saturating_sub(2), 5).is_none());
+    }
+    #[test]
+    fn nested_vsplit_inner_border_wins_over_outer_tolerance() {
+        let inner = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(mk_leaf(1, "a")),
+            second: Box::new(mk_leaf(2, "b")),
+        };
+        let outer = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(inner),
+            second: Box::new(mk_leaf(3, "c")),
+        };
+        let outer_area = (0u16, 0u16, 40u16, 10u16);
+        let (inner_area, outer_second_area) =
+            split_child_areas(outer_area, SplitDir::Vertical, 0.5);
+        let outer_border = outer_second_area.0;
+        let (inner_first, _) = split_child_areas(inner_area, SplitDir::Vertical, 0.5);
+        let inner_border = inner_first.0 + inner_first.2 - 1;
+        assert_ne!(inner_border, outer_border);
+        let hit = find_split_border(&outer, outer_area, inner_border, 5).unwrap();
+        assert_eq!(hit.split_area, inner_area);
+        let hit = find_split_border(&outer, outer_area, outer_border, 5).unwrap();
+        assert_eq!(hit.split_area, outer_area);
+    }
+    #[test]
+    fn hsplit_border_hit_is_not_widened() {
+        let root = PaneNode::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            first: Box::new(mk_leaf(1, "top")),
+            second: Box::new(mk_leaf(2, "bot")),
+        };
+        let area = (0u16, 0u16, 20u16, 10u16);
+        let (_, second) = split_child_areas(area, SplitDir::Horizontal, 0.5);
+        let border_row = second.1;
+        assert!(find_split_border(&root, area, 5, border_row).is_some());
+        assert!(find_split_border(&root, area, 5, border_row + 1).is_none());
+        assert!(find_split_border(&root, area, 5, border_row.saturating_sub(1)).is_none());
+    }
+    #[test]
+    fn adjust_split_ratio_border_lands_where_user_clicked() {
+        let mut root = PaneNode::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            first: Box::new(mk_leaf(1, "a")),
+            second: Box::new(mk_leaf(2, "b")),
+        };
+        let area = (0u16, 0u16, 100u16, 20u16);
+        assert!(adjust_split_ratio(
+            &mut root,
+            area,
+            area,
+            60,
+            SplitDir::Vertical
+        ));
+        if let PaneNode::Split { ratio, .. } = &root {
+            let (first, _) = split_child_areas(area, SplitDir::Vertical, *ratio);
+            let new_border = first.0 + first.2 - 1;
+            assert!((new_border as i32 - 60).abs() <= 1);
+        } else {
+            panic!("root should be Split");
+        }
+    }
+}

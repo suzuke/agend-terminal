@@ -312,3 +312,79 @@ fn find_two_panes<'a>(
         },
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::layout::pane::PaneSource;
+    use crate::vterm::VTerm;
+
+    fn leaf(id: usize, name: &str) -> Pane {
+        Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+    fn leaf_agent(id: usize, name: &str) -> Pane {
+        let mut p = leaf(id, name);
+        p.backend = Some(Backend::ClaudeCode);
+        p
+    }
+
+    #[test]
+    fn ratio_bounds_symmetric_when_room() {
+        let (lo, hi) = ratio_bounds(100);
+        assert!((lo + hi - 1.0).abs() < f32::EPSILON);
+    }
+    #[test]
+    fn ratio_bounds_degenerate_when_tiny() {
+        assert_eq!(ratio_bounds(5), (0.5, 0.5));
+        assert_eq!(ratio_bounds(0), (0.5, 0.5));
+    }
+    #[test]
+    fn ratio_bounds_min_cells_enforced() {
+        let (lo, _) = ratio_bounds(30);
+        let first = (lo * 30.0).round() as u16;
+        assert_eq!(first, MIN_PANE_CELLS);
+    }
+    #[test]
+    fn pane_count_and_agent_count_across_split() {
+        use crate::layout::tab::Tab;
+        let mut tab = Tab::new("mixed".to_string(), leaf_agent(1, "alice"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "shell")));
+        assert_eq!(tab.root().pane_count(), 2);
+        assert_eq!(tab.root().agent_count(), 1);
+    }
+    #[test]
+    fn swap_panes_across_nested_split() {
+        use crate::layout::tab::Tab;
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        tab.focus_id = 1;
+        assert!(tab.split_focused(SplitDir::Horizontal, leaf(3, "c")));
+        tab.focus_id = 2;
+        assert!(tab.split_focused(SplitDir::Horizontal, leaf(4, "d")));
+        let pre = tab.root().pane_ids();
+        let first_id = pre[0];
+        let last_id = *pre.last().unwrap();
+        assert!(swap_panes(tab.root_mut(), first_id, last_id));
+        let post = tab.root().pane_ids();
+        assert_eq!(post.len(), pre.len());
+        assert_eq!(post[0], last_id);
+        assert_eq!(*post.last().unwrap(), first_id);
+    }
+}

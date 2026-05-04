@@ -11,9 +11,6 @@ pub use pane::{Pane, PaneSource, Selection};
 pub use preset::LayoutPreset;
 pub(crate) use split::split_chunks;
 pub use split::{adjust_split_ratio, find_split_border, resize_focused, Direction, SplitBorderHit};
-// Re-export for tests.
-#[cfg(test)]
-pub(crate) use split::{ratio_to_size, split_child_areas};
 pub use tab::{DragTabTarget, Tab};
 pub use tree::{swap_panes, PaneNode, SplitDir};
 
@@ -255,4 +252,127 @@ fn collect_resize_needs(
 }
 
 #[cfg(test)]
-mod tests;
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::layout::pane::PaneSource;
+    use crate::vterm::VTerm;
+
+    fn leaf(id: usize, name: &str) -> Pane {
+        Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    #[test]
+    fn layout_next_tab_wraps_at_boundary() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t1".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("t2".to_string(), leaf(2, "b")));
+        layout.add_tab(Tab::new("t3".to_string(), leaf(3, "c")));
+        assert_eq!(layout.active, 2);
+        layout.next_tab();
+        assert_eq!(layout.active, 0);
+    }
+    #[test]
+    fn move_pane_across_tabs_same_tab_rejected() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t0".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        assert!(layout
+            .move_pane_across_tabs(
+                0,
+                1,
+                MovePlacement::SplitFocused {
+                    to_tab: 0,
+                    dir: SplitDir::Vertical
+                }
+            )
+            .is_none());
+        assert_eq!(layout.tabs[0].root().pane_count(), 2);
+    }
+    #[test]
+    fn move_pane_across_tabs_split_focused_preserves_both_tabs() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        layout.add_tab(Tab::new("dst".to_string(), leaf(3, "c")));
+        let dest = layout
+            .move_pane_across_tabs(
+                0,
+                2,
+                MovePlacement::SplitFocused {
+                    to_tab: 1,
+                    dir: SplitDir::Horizontal,
+                },
+            )
+            .unwrap();
+        assert_eq!(dest, 1);
+        assert_eq!(layout.tabs.len(), 2);
+        assert_eq!(layout.tabs[0].root().pane_count(), 1);
+        assert_eq!(layout.tabs[1].root().pane_count(), 2);
+        assert!(layout.tabs[1].root().has_agent("b"));
+        assert_eq!(layout.tabs[1].focus_id, 2);
+    }
+    #[test]
+    fn move_pane_across_tabs_single_pane_source_removes_tab() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("solo".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("dst".to_string(), leaf(2, "b")));
+        let dest = layout
+            .move_pane_across_tabs(
+                0,
+                1,
+                MovePlacement::SplitFocused {
+                    to_tab: 1,
+                    dir: SplitDir::Horizontal,
+                },
+            )
+            .unwrap();
+        assert_eq!(dest, 0);
+        assert_eq!(layout.tabs.len(), 1);
+        assert!(layout.tabs[0].root().has_agent("a"));
+    }
+    #[test]
+    fn move_pane_across_tabs_new_tab_placement() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("src".to_string(), leaf(1, "a")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "b"));
+        let dest = layout
+            .move_pane_across_tabs(
+                0,
+                2,
+                MovePlacement::NewTab {
+                    name: "popped".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(dest, 1);
+        assert_eq!(layout.tabs.len(), 2);
+        assert!(layout.tabs[1].root().has_agent("b"));
+        assert_eq!(layout.active, 1);
+    }
+    #[test]
+    fn find_agent_pane_returns_location() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("t0".to_string(), leaf(1, "a")));
+        layout.add_tab(Tab::new("t1".to_string(), leaf(2, "b")));
+        layout.tabs[1].split_focused(SplitDir::Vertical, leaf(3, "c"));
+        assert_eq!(layout.find_agent_pane("a"), Some((0, 1)));
+        assert_eq!(layout.find_agent_pane("c"), Some((1, 3)));
+        assert_eq!(layout.find_agent_pane("ghost"), None);
+    }
+}

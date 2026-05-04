@@ -133,3 +133,45 @@ impl Pane {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vterm::VTerm;
+
+    fn leaf(id: usize, name: &str) -> Pane {
+        Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+
+    #[test]
+    fn pane_composing_after_input() {
+        let mut pane = leaf(1, "agent");
+        pane.mark_input_activity();
+        assert!(pane.is_composing());
+    }
+    #[test]
+    fn pane_not_composing_after_idle() {
+        let mut pane = leaf(1, "agent");
+        pane.last_input_at = Some(
+            std::time::Instant::now()
+                - crate::notification_queue::COMPOSE_IDLE_TIMEOUT
+                - std::time::Duration::from_millis(1),
+        );
+        assert!(!pane.is_composing());
+    }
+}

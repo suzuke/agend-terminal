@@ -334,3 +334,159 @@ impl Tab {
         removed
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::layout::pane::PaneSource;
+    use crate::layout::tree::SplitDir;
+    use crate::vterm::VTerm;
+    use unicode_width::UnicodeWidthStr;
+
+    fn leaf(id: usize, name: &str) -> Pane {
+        Pane {
+            agent_name: name.to_string(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+        }
+    }
+    fn tab_with_pane(name: &str, id: usize, rect: (u16, u16, u16, u16)) -> Tab {
+        let mut tab = Tab::new("test".into(), leaf(id, name));
+        tab.pane_rects.insert(id, rect);
+        tab
+    }
+
+    #[test]
+    fn unicode_width_for_title_matches_terminal_cells() {
+        assert_eq!(UnicodeWidthStr::width("alice") as u16, 5);
+        assert_eq!(UnicodeWidthStr::width("代理") as u16, 4);
+        assert_eq!(UnicodeWidthStr::width("a代") as u16, 3);
+    }
+    #[test]
+    fn title_bar_at_hits_within_name_text() {
+        let tab = tab_with_pane("alice", 1, (0, 0, 40, 10));
+        assert_eq!(tab.title_bar_at(1, 0), Some(1));
+        assert_eq!(tab.title_bar_at(6, 0), Some(1));
+        assert_eq!(tab.title_bar_at(7, 0), Some(1));
+    }
+    #[test]
+    fn title_bar_at_misses_outside_name_text() {
+        let tab = tab_with_pane("alice", 1, (0, 0, 40, 10));
+        assert_eq!(tab.title_bar_at(0, 0), None);
+        assert_eq!(tab.title_bar_at(8, 0), None);
+        assert_eq!(tab.title_bar_at(30, 0), None);
+    }
+    #[test]
+    fn title_bar_at_name_fills_pane_width() {
+        let tab = tab_with_pane("longname", 1, (0, 0, 11, 10));
+        for col in 1..11 {
+            assert_eq!(tab.title_bar_at(col, 0), Some(1), "col {col}");
+        }
+    }
+    #[test]
+    fn split_at_pane_targets_non_focused_pane() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert_eq!(tab.focus_id, 1);
+        assert!(tab.split_at_pane(2, SplitDir::Horizontal, leaf(3, "c")));
+        assert_eq!(tab.root().pane_count(), 3);
+        assert!(tab.root().has_agent("c"));
+    }
+    #[test]
+    fn split_at_pane_returns_false_when_target_missing() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(!tab.split_at_pane(999, SplitDir::Vertical, leaf(2, "b")));
+        assert_eq!(tab.root().pane_count(), 1);
+    }
+    #[test]
+    fn close_focused_updates_focus_to_sibling() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert_eq!(tab.focus_id, 1);
+        let removed = tab.close_focused();
+        assert_eq!(removed.as_deref(), Some("a"));
+        assert_eq!(tab.focus_id, 2);
+    }
+    #[test]
+    fn close_pane_by_id_returns_none_when_last() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "only"));
+        assert!(tab.close_pane_by_id(1).is_none());
+        assert_eq!(tab.root().pane_count(), 1);
+    }
+    #[test]
+    fn cycle_focus_wraps_around_three_panes() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(3, "c")));
+        let start = tab.focus_id;
+        tab.cycle_focus();
+        tab.cycle_focus();
+        tab.cycle_focus();
+        assert_eq!(tab.focus_id, start);
+    }
+    #[test]
+    fn apply_layout_even_horizontal_preserves_pane_count() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert!(tab.split_focused(SplitDir::Horizontal, leaf(3, "c")));
+        tab.pane_rects.insert(1, (0, 0, 10, 10));
+        tab.apply_layout(LayoutPreset::EvenHorizontal);
+        assert_eq!(tab.root().pane_count(), 3);
+        assert_eq!(tab.last_layout, Some(LayoutPreset::EvenHorizontal));
+        assert!(tab.pane_rects.is_empty());
+    }
+    #[test]
+    fn next_layout_cycles_from_none_to_even_horizontal() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert!(tab.last_layout.is_none());
+        tab.next_layout();
+        assert_eq!(tab.last_layout, Some(LayoutPreset::EvenHorizontal));
+    }
+    #[test]
+    fn detach_pane_refuses_sole_pane() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.detach_pane(1).is_none());
+        assert_eq!(tab.root().pane_count(), 1);
+    }
+    #[test]
+    fn detach_pane_missing_id_returns_none() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        assert!(tab.detach_pane(999).is_none());
+        assert_eq!(tab.root().pane_count(), 2);
+    }
+    #[test]
+    fn detach_pane_returns_pane_and_moves_focus() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        tab.focus_id = 1;
+        let d = tab.detach_pane(1).unwrap();
+        assert_eq!(d.agent_name, "a");
+        assert_eq!(tab.focus_id, 2);
+    }
+    #[test]
+    fn detach_pane_clears_transient_state() {
+        let mut tab = Tab::new("t".to_string(), leaf(1, "a"));
+        assert!(tab.split_focused(SplitDir::Vertical, leaf(2, "b")));
+        tab.dragging_pane = Some(1);
+        tab.drag_target = Some(1);
+        tab.selecting_pane = Some(1);
+        let _ = tab.detach_pane(1).unwrap();
+        assert!(tab.dragging_pane.is_none());
+        assert!(tab.drag_target.is_none());
+        assert!(tab.selecting_pane.is_none());
+    }
+}
