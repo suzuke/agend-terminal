@@ -1,6 +1,6 @@
 [package]
 name = "agend-terminal"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Agent Process Manager — orchestrate AI coding agents with PTY isolation, fleet management, and 35 MCP tools"
