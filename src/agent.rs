@@ -951,7 +951,15 @@ fn handle_pty_close(
             }
             Err(e) => {
                 tracing::warn!(agent = name, error = %e, "shell fallback failed");
-                // Fall through: notify daemon for cleanup.
+                // Trigger InstanceDeleted so TUI cleans up the dead pane.
+                // api::call goes through the API server which emits the event.
+                if let Some(ref home) = home {
+                    let _ = crate::api::call(
+                        home,
+                        &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
+                    );
+                }
+                // Also notify daemon for cleanup if channel available.
                 if let Some(ref tx) = crash_tx {
                     let _ = tx.try_send(AgentExitEvent::CleanExit(name.to_string()));
                 }
