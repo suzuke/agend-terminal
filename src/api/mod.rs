@@ -1024,7 +1024,7 @@ mod tests {
         );
         assert_eq!(resp["ok"], true);
         // Verify message was enqueued to receiver's inbox
-        let inbox_file = home.join("inbox").join("receiver.jsonl");
+        let inbox_file = crate::inbox::inbox_path_resolved(&home, "receiver");
         assert!(
             inbox_file.exists(),
             "expected inbox file at {}",

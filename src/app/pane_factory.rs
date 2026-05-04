@@ -425,7 +425,7 @@ fn unique_fleet_name_with(home: &Path, base: &str, mut ids: impl Iterator<Item =
         if home.join("workspace").join(name).exists() {
             return true;
         }
-        if crate::inbox::inbox_path(home, name).exists() {
+        if crate::inbox::inbox_path_resolved(home, name).exists() {
             return true;
         }
         false

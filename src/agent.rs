@@ -27,6 +27,7 @@ pub struct AgentCore {
 /// Handle to interact with an agent.
 #[allow(dead_code)]
 pub struct AgentHandle {
+    pub id: crate::types::InstanceId,
     pub name: String,
     pub backend_command: String,
     pub pty_writer: PtyWriter,
@@ -120,6 +121,74 @@ pub fn validate_name(name: &str) -> Result<&str, String> {
         ));
     }
     Ok(name)
+}
+
+/// Error from [`resolve_instance`].
+#[derive(Debug)]
+pub enum ResolveError {
+    NotFound(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(t) => write!(f, "instance '{t}' not found"),
+        }
+    }
+}
+
+/// Resolve a name-or-id string to `(InstanceId, display_name)` via fleet.yaml.
+///
+/// Resolution order per PLAN §3.3:
+/// 1. Exact full-UUID match
+/// 2. Exact 8-char short-id prefix match
+/// 3. Exact instance name match
+///
+/// fleet.yaml `instances` is a `HashMap<String, _>` so name uniqueness is
+/// structurally guaranteed — no Ambiguous error path needed.
+pub fn resolve_instance(
+    home: &std::path::Path,
+    name_or_id: &str,
+) -> Result<(crate::types::InstanceId, String), ResolveError> {
+    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+        .ok()
+        .unwrap_or_default();
+
+    // 1. Full UUID match
+    if let Some(id) = crate::types::InstanceId::parse(name_or_id) {
+        for (name, inst) in &fleet.instances {
+            if inst.id.as_deref().and_then(crate::types::InstanceId::parse) == Some(id.clone()) {
+                return Ok((id, name.clone()));
+            }
+        }
+        return Err(ResolveError::NotFound(name_or_id.to_string()));
+    }
+
+    // 2. Short-id prefix match (8 hex chars)
+    if name_or_id.len() == 8 && name_or_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        for (name, inst) in &fleet.instances {
+            if let Some(ref id_str) = inst.id {
+                if let Some(id) = crate::types::InstanceId::parse(id_str) {
+                    if id.short() == name_or_id {
+                        return Ok((id, name.clone()));
+                    }
+                }
+            }
+        }
+        // Fall through to name match
+    }
+
+    // 3. Exact name match — HashMap guarantees at most one entry per name.
+    if let Some(inst) = fleet.instances.get(name_or_id) {
+        let id = inst
+            .id
+            .as_deref()
+            .and_then(crate::types::InstanceId::parse)
+            .unwrap_or_default();
+        return Ok((id, name_or_id.to_string()));
+    }
+
+    Err(ResolveError::NotFound(name_or_id.to_string()))
 }
 
 /// Lock the agent registry, recovering from poison.
@@ -394,10 +463,22 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
 
     // Register in registry
     {
+        // Sprint 46 P2: resolve instance ID from fleet.yaml (backfilled by P1).
+        let instance_id = config
+            .home
+            .and_then(|h| crate::fleet::FleetConfig::load(&h.join("fleet.yaml")).ok())
+            .and_then(|c| {
+                c.instances
+                    .get(*name)
+                    .and_then(|i| i.id.as_deref())
+                    .and_then(crate::types::InstanceId::parse)
+            })
+            .unwrap_or_default();
         let mut reg = registry.lock();
         reg.insert(
             name.to_string(),
             AgentHandle {
+                id: instance_id,
                 name: name.to_string(),
                 backend_command: backend_command.to_string(),
                 pty_writer: Arc::clone(&pty_writer),
@@ -1167,6 +1248,7 @@ mod tests {
             health: HealthTracker::new(),
         }));
         let handle = AgentHandle {
+            id: crate::types::InstanceId::default(),
             name: "sweep-test".to_string(),
             backend_command: "sh".to_string(),
             pty_writer,
@@ -1277,5 +1359,52 @@ mod tests {
         for (i, &v) in received.iter().enumerate() {
             assert_eq!(v, i, "message {i} out of order");
         }
+    }
+
+    // ── Sprint 46 P2: resolve_instance tests ────────────────────────────
+
+    fn resolve_test_home(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CTR: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-resolve-{}-{}-{}",
+            std::process::id(),
+            name,
+            CTR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn name_resolves_to_single_id() {
+        let home = resolve_test_home("single");
+        let id = crate::types::InstanceId::new();
+        let yaml = format!(
+            "defaults:\n  backend: claude\ninstances:\n  dev:\n    id: \"{}\"\n    role: Test\n",
+            id.full()
+        );
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let (resolved_id, resolved_name) = resolve_instance(&home, "dev").unwrap();
+        assert_eq!(resolved_id, id);
+        assert_eq!(resolved_name, "dev");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn nonexistent_name_returns_not_found() {
+        // fleet.yaml HashMap guarantees name uniqueness — no Ambiguous path.
+        // Verify that a non-existent name returns NotFound.
+        let home = resolve_test_home("notfound");
+        let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n";
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let result = resolve_instance(&home, "nonexistent");
+        assert!(
+            matches!(result, Err(ResolveError::NotFound(_))),
+            "expected NotFound, got: {result:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

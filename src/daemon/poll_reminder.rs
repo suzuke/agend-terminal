@@ -151,6 +151,7 @@ mod tests {
             health: crate::health::HealthTracker::new(),
         };
         let handle = AgentHandle {
+            id: crate::types::InstanceId::default(),
             name: name.to_string(),
             backend_command: "test".to_string(),
             pty_writer: Arc::new(Mutex::new(writer)),

@@ -250,11 +250,51 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
     home.join("inbox").join(format!("{name}.jsonl"))
 }
 
+/// Sprint 46 P2: resolve inbox path by InstanceId when available.
+/// Migrates legacy name-based files to id-based on first access.
+pub(crate) fn inbox_path_resolved(home: &Path, name: &str) -> PathBuf {
+    // Only use id-based path when the instance has a real ID in fleet.yaml
+    // (backfilled by P1). Instances without an ID use name-based paths.
+    let id = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+        .ok()
+        .and_then(|c| {
+            c.instances
+                .get(name)
+                .and_then(|i| i.id.as_deref())
+                .and_then(crate::types::InstanceId::parse)
+        });
+    let Some(id) = id else {
+        return inbox_path(home, name);
+    };
+    let id_path = home.join("inbox").join(format!("{}.jsonl", id.full()));
+    if id_path.exists() {
+        return id_path;
+    }
+    let name_path = inbox_path(home, name);
+    if name_path.exists() {
+        // Migrate: create symlink from id-based to name-based (or copy on Windows)
+        if let Some(parent) = id_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&name_path, &id_path);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::fs::copy(&name_path, &id_path);
+        }
+        return id_path;
+    }
+    // New instance — use id-based path directly
+    id_path
+}
+
 /// Acquire a per-agent flock and run `f` with the inbox path.
 /// All read-modify-write operations on an agent's inbox (enqueue, drain,
 /// sweep_expired) must go through this helper to prevent concurrent races.
 fn with_inbox_lock<T>(home: &Path, name: &str, f: impl FnOnce(&Path) -> T) -> anyhow::Result<T> {
-    let path = inbox_path(home, name);
+    let path = inbox_path_resolved(home, name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -310,7 +350,7 @@ pub fn mark_ci_watch_superseded(
     repo_branch_key: &str,
     new_msg_id: &str,
 ) {
-    let path = inbox_path(home, instance);
+    let path = inbox_path_resolved(home, instance);
     if !path.exists() {
         return;
     }
@@ -363,7 +403,7 @@ pub fn mark_ci_watch_superseded(
 /// set; [`sweep_expired`] removes them later based on TTL rules.
 /// Uses atomic tmp+fsync+rename for crash safety.
 pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
-    let path = inbox_path(home, name);
+    let path = inbox_path_resolved(home, name);
 
     if !path.exists() && !path.with_extension("draining").exists() {
         return Vec::new();
@@ -488,7 +528,7 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
 
 /// Count unread messages (read_at == None) for an agent.
 pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
-    let path = inbox_path(home, name);
+    let path = inbox_path_resolved(home, name);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return (0, None),
@@ -681,7 +721,7 @@ pub fn sweep_expired(home: &Path) {
 /// Look up a message by ID in a specific agent's inbox file.
 /// If `instance` is provided, only that agent's inbox is searched.
 pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageStatus {
-    let path = inbox_path(home, instance);
+    let path = inbox_path_resolved(home, instance);
     if !path.exists() {
         return MessageStatus::NotFound;
     }
