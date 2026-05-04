@@ -477,7 +477,33 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
 
         unread
     }) {
-        Ok(msgs) => msgs,
+        Ok(msgs) => {
+            // Sprint 49: track input channel on dequeue for channel discipline.
+            if !msgs.is_empty() {
+                let channel_tag = msgs.iter().find_map(|m| {
+                    if m.from.contains("via telegram") || m.from.contains("via discord") {
+                        Some("telegram")
+                    } else if m.from.starts_with("from:") {
+                        Some("agent_peer")
+                    } else {
+                        None
+                    }
+                });
+                if let Some(tag) = channel_tag {
+                    crate::agent_ops::save_metadata_batch(
+                        home,
+                        name,
+                        &[
+                            ("last_input_channel", serde_json::json!(tag)),
+                            ("reply_tool_called_since_input", serde_json::json!(false)),
+                            ("inject_count_since_input", serde_json::json!(0)),
+                            ("last_inject_at_ms", serde_json::json!(0)),
+                        ],
+                    );
+                }
+            }
+            msgs
+        }
         Err(e) => {
             tracing::warn!(error = %e, "inbox drain lock failed");
             Vec::new()
@@ -842,23 +868,6 @@ pub fn deliver(
         from_id: None,
     };
     let _ = enqueue(home, agent_name, msg);
-    // Sprint 49: track input channel for channel discipline correction.
-    let channel_tag = match source {
-        NotifySource::Channel(_, _) => Some("telegram"),
-        NotifySource::Agent(_) => Some("agent_peer"),
-        NotifySource::System(_) => None,
-    };
-    if let Some(tag) = channel_tag {
-        crate::agent_ops::save_metadata_batch(
-            home,
-            agent_name,
-            &[
-                ("last_input_channel", serde_json::json!(tag)),
-                ("reply_tool_called_since_input", serde_json::json!(false)),
-                ("inject_count_since_input", serde_json::json!(0)),
-            ],
-        );
-    }
     notify_agent(home, agent_name, source, text);
 }
 

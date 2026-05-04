@@ -402,6 +402,19 @@ fn check_channel_discipline(home: &std::path::Path, name: &str) {
          operator/peer sees it."
     );
     crate::inbox::compose_aware_send(home, name, &msg);
+    // Sprint 49 §13.4: log first inject per cycle to decision board.
+    if count == 0 {
+        crate::decisions::post(
+            home,
+            "system:channel-discipline",
+            &serde_json::json!({
+                "title": format!("channel discipline inject — {name}"),
+                "content": format!("last input from {channel}, agent emitted direct text"),
+                "scope": "project",
+                "tags": ["channel-discipline"]
+            }),
+        );
+    }
     crate::agent_ops::save_metadata_batch(
         home,
         name,
