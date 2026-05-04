@@ -207,6 +207,16 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
             let mut result = json!({"name": name});
             if let Some(tid) = topic_id {
                 result["topic_id"] = json!(tid);
+                // Persist topic_id to fleet.yaml so daemon can route messages
+                // to this instance's topic on restart (#415).
+                if let Ok(tid_num) = tid.parse::<i32>() {
+                    let _ = crate::fleet::update_instance_field(
+                        ctx.home,
+                        name,
+                        "topic_id",
+                        serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(tid_num)),
+                    );
+                }
             }
             json!({"ok": true, "result": result})
         }
@@ -627,5 +637,32 @@ mod tests {
         }
 
         cleanup_agent(&ctx, "team-meta");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn topic_id_persists_to_fleet_yaml_via_update_instance_field() {
+        // Regression test for #415: topic_id must round-trip through fleet.yaml.
+        let home = std::env::temp_dir().join(format!("agend-topic-persist-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  agent1:\n    backend: claude\n",
+        )
+        .unwrap();
+        crate::fleet::update_instance_field(
+            &home,
+            "agent1",
+            "topic_id",
+            serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(42)),
+        )
+        .unwrap();
+        let cfg = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        assert_eq!(
+            cfg.instances.get("agent1").and_then(|i| i.topic_id),
+            Some(42),
+            "topic_id must be persisted to fleet.yaml"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
