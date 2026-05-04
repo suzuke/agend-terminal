@@ -205,7 +205,7 @@ fn dispatch_scoped_sweep_sites_have_rationale() {
         ("daemon/mod.rs", "std::thread::Builder::new()"),
         ("daemon/ci_watch.rs", "std::thread::Builder::new()"),
         ("daemon/tui_bridge.rs", "std::thread::Builder::new()"),
-        ("channel/telegram.rs", "std::thread::Builder::new()"),
+        ("channel/telegram/inbound.rs", "std::thread::Builder::new()"),
         ("app/telegram_hooks.rs", "std::thread::spawn"),
     ];
     for (rel_suffix, _expected_substr) in swept_sites {
