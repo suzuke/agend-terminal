@@ -528,7 +528,7 @@ fn read_drain_file(tmp: &Path) -> Vec<InboxMessage> {
 
 /// Count unread messages (read_at == None) for an agent.
 pub fn unread_count(home: &Path, name: &str) -> (usize, Option<chrono::DateTime<chrono::Utc>>) {
-    let path = inbox_path(home, name);
+    let path = inbox_path_resolved(home, name);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return (0, None),
@@ -721,7 +721,7 @@ pub fn sweep_expired(home: &Path) {
 /// Look up a message by ID in a specific agent's inbox file.
 /// If `instance` is provided, only that agent's inbox is searched.
 pub fn describe_message(home: &Path, msg_id: &str, instance: &str) -> MessageStatus {
-    let path = inbox_path(home, instance);
+    let path = inbox_path_resolved(home, instance);
     if !path.exists() {
         return MessageStatus::NotFound;
     }
