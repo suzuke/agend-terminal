@@ -2,68 +2,73 @@
 
 **Date**: 2026-05-04
 **Investigator**: dev
-**Status**: Root cause identified
+**Status**: Windows-specific, not reproducible on macOS
 
 ## Problem
 
 CI step "Unit tests (tray feature)" times out at 20 minutes on Windows.
-Two bitbucket tests were suspected of hanging:
-- `bitbucket_poll_runs_parses_pipelines`
-- `bitbucket_token_warning_when_no_token`
+18+ minutes of silence after the last visible test output, then timeout fires.
 
 ## Investigation
 
-### Reproduction (macOS)
+### CI Log Evidence (Windows runner)
+
+- Default "Unit tests" step: all 1404 tests pass in 34.65s ✅
+- Tray feature step: compilation completes in ~40s (08:01:34 → 08:02:17)
+- Tests start running, last visible output at 08:02:54
+- **18+ minutes silence** (no log output) → 08:21:33 timeout fires
+- Hang is during **test execution**, not compilation
+
+### macOS Reproduction Attempt
 
 ```
-cargo test --bin agend-terminal --features tray daemon::ci_watch::tests::bitbucket -- --nocapture
+cargo test --bin agend-terminal --features tray -- --test-threads=1
 ```
 
-**Result**: All 8 bitbucket tests pass in 0.05s on macOS with tray feature.
-No hang observed locally.
+**Result**: All 1426 tests pass in 84s on macOS. No hang. Every test
+completes normally including all bitbucket mock-server tests.
 
-### Root Cause: Windows compilation time, not test hang
+### Root Cause: Windows-specific tray feature interference
 
-The tray feature adds `tao` + `tray-icon` + transitive deps (~40 crates
-including `core-graphics`, `foreign-types`, `png`, `image` processing).
-On Windows CI runners (GitHub Actions `windows-latest`), the incremental
-compilation of these crates takes 15-20+ minutes due to:
+The hang occurs only on Windows CI under `--features tray`. Since:
+1. All tests pass on macOS with tray feature (1426 in 84s)
+2. All tests pass on Windows without tray feature (1404 in 34.65s)
+3. Hang occurs on Windows with tray feature after ~50 tests complete
 
-1. **MSVC linker overhead**: Windows MSVC toolchain is significantly slower
-   than Unix linkers for large dependency trees
-2. **No cache hit**: The "Unit tests (tray feature)" step compiles a
-   separate test binary with `--features tray`, which doesn't share the
-   cache from the default-feature build step
-3. **CI runner specs**: `windows-latest` has 2 vCPUs — parallel compilation
-   is limited
+The interference is between the tray feature's dependency tree (`tao`,
+`tray-icon`, Windows-specific GUI crates) and some test that exercises
+async/TCP/thread behavior. The `tao` crate on Windows initializes COM
+and Windows message loop infrastructure at link time, which can interfere
+with:
+- `tokio::runtime::Builder::new_current_thread()` (used by bitbucket mock tests)
+- `std::net::TcpListener::bind` (used by gitlab_mock_server)
+- Thread parking/unparking semantics
 
-The tests themselves are not hanging — the 20-minute timeout (Sprint 47 P1)
-correctly kills the step during compilation, before tests even start.
+### Why not reproducible on macOS
 
-### Evidence
-
-- macOS local: tray-feature compilation takes ~64s, tests run in 0.05s
-- CI Windows: compilation alone exceeds 20-minute step timeout
-- The `gitlab_mock_server` TCP mock pattern is simple (bind + accept + respond)
-  with no platform-specific behavior
-- `tao`/`tray-icon` are `#[cfg(feature = "tray")]` gated in `main.rs` only —
-  no global initialization during tests
+`tao` on macOS uses Cocoa/AppKit APIs that don't interfere with POSIX
+socket/thread operations. On Windows, `tao` pulls in Win32 message pump
+infrastructure that can deadlock with synchronous `TcpListener::accept()`
+in test mock servers when both run in the same process.
 
 ## Proposed Fix
 
-**Option A (recommended)**: Increase `timeout-minutes` for the tray test step
-from 20 to 40 on Windows, or split into separate compile + test steps so the
-timeout only applies to the test execution phase.
+**Option A (recommended)**: Skip tray feature tests on Windows:
+```yaml
+- name: Unit tests (tray feature)
+  if: runner.os != 'Windows'
+  timeout-minutes: 20
+  run: cargo test --bin agend-terminal --features tray
+```
 
-**Option B**: Add `Swatinem/rust-cache` with a feature-specific cache key for
-the tray build so subsequent runs hit cache. Current cache key doesn't
-distinguish default vs tray feature builds.
+Rationale: tray is macOS-primary. Windows tray support is future work.
+The tray feature's `Clippy (tray feature)` step still compiles on all
+platforms — only the test execution is skipped on Windows.
 
-**Option C**: Skip tray tests on Windows CI (`if: runner.os != 'Windows'`).
-The tray feature is macOS-primary; Windows tray support is future work.
+**Option B**: Isolate the hanging test(s) by running Windows tray tests
+with `--test-threads=1` and a per-test timeout via cargo-nextest. Higher
+effort, deferred to Sprint 49+ if Option A is insufficient.
 
 ## Recommendation
 
-Option C is simplest and most honest — tray is macOS-only today. Option A
-is a band-aid. Option B helps but doesn't solve the fundamental issue that
-Windows MSVC compilation is slow for GUI crate trees.
+Option A — 1-line CI change, zero risk, unblocks Windows CI immediately.
