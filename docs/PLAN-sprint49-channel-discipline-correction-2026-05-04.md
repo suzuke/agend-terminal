@@ -1,229 +1,177 @@
-# Sprint 49 PLAN — Channel Discipline Correction
+# Sprint 49 PLAN — Channel Discipline Correction (NARROW)
 
 **Date**: 2026-05-04
 **Author**: lead
 **Status**: PLAN (awaiting §8 GO + scope ruling)
-**Source-of-truth**: `origin/main` HEAD `834f30d` (Sprint 48 PR 4 just merged)
-**Synthesis inputs**:
+**Source-of-truth**: `origin/main` HEAD `834f30d`
+**Synthesis inputs (preserved)**:
 - dev STRUCTURAL — m-20260504113841219730-5
 - reviewer PRIOR-ART — m-20260504113717979051-4
 - reviewer COST-BENEFIT — m-20260504113936047827-7
 - lead MINIMAL-DELTA — this document §5
 
+**Re-scope note (2026-05-04 ~11:50 UTC, operator m-15)**: Original PLAN proposed reroute + inject + sticky + keyword escalation + feature flag + P1+P2 split (~165 LOC across 2 PRs). Operator narrowed to **inject-only nudge** (no PTY text extraction, no reroute, no sticky, no keyword, no feature flag, single PR). Reasoning: daemon only nudges; agent re-emits via proper tool; avoids PTY parsing accuracy bar entirely.
+
 ---
 
 ## §0 Context
 
-Fleet-wide recurring problem: agent receives input via Telegram → emits direct text to its TUI pane (without using `reply` MCP tool) → operator on Telegram never sees the response. Channel discipline slip occurs daily; protocol rules + memory accumulation are treating symptoms not root cause.
+Fleet-wide recurring problem: agent receives input via Telegram → emits direct text to its TUI pane (without using `reply` MCP tool) → operator on Telegram never sees the response. Channel discipline slip occurs daily.
 
-Operator dispatch m-20260504113415876345-0 set Sprint 49 = daemon-level enforcement: detect channel mismatch + reroute response + inject correction prompt to agent.
+**Narrow design**: daemon detects mismatch (last input was Telegram + agent's response went to direct text instead of `reply` tool) → injects a system message to the agent: "You responded to the wrong channel. Please use the `reply` tool to send your response." Agent re-emits via the right tool. Operator/peer receive naturally.
 
 ## §1 Goal
 
-Daemon-side enforcement of channel discipline: when an agent receives input on channel X but emits its response on channel Y, daemon catches the mismatch and:
-1. **Re-routes** the response to the correct channel (operator sees reply)
-2. **Injects correction** to the agent (next time use the right tool)
-3. **Cooldowns** to prevent context bloat from correction-loop
+Daemon-side enforcement via **inject-only nudge**:
+1. Track `last_input_channel` per instance
+2. On agent emit completion (Idle→Ready transition), check if response went via `reply` tool when input was inbound (Telegram or peer)
+3. If mismatch → inject correction prompt to agent's pane
+4. Cooldown to prevent inject-loop
 
-**Non-goals**:
-- Strict-block mode (deferred — risk too high for day 1)
-- Confidence-score PTY pattern gate (deferred — over-engineering for current fleet scale per reviewer COST-BENEFIT m-7 §4)
-- Agent-initiated broadcast / non-reply traffic (out-of-scope per reviewer §8)
+**Non-goals (cut from original PLAN)**:
+- ❌ Reroute / PTY text extraction (no daemon-side parsing)
+- ❌ Per-backend regex / confidence-score gate
+- ❌ Active-channel sticky 60s race guard
+- ❌ ERROR/FAILED keyword escalation
+- ❌ Feature flag (direct enable for fleet)
+- ❌ P1+P2 split (single PR)
 
 ## §2 Verified state (origin/main 834f30d)
 
-Existing infrastructure relevant to design:
-- `src/inbox.rs` — inbox dispatch + `save_metadata` for `last_message_id`
-- `src/state.rs` — agent state machine with Thinking / ToolUse / Idle / Ready transitions (existing per-backend regex patterns sufficient per dev STRUCTURAL m-5 §2)
+Existing infrastructure:
+- `src/inbox.rs` — inbox dispatch with `save_metadata` for `last_message_id`
+- `src/state.rs` — agent state machine; Idle→Ready transition exists (no new regex needed)
 - `src/heartbeat_pair.rs` — per-instance heartbeat metadata
-- `src/daemon/supervisor.rs::tick()` — periodic per-instance check loop
-- `src/mcp/handlers/channel.rs::handle_reply()` — MCP `reply` tool callsite
-- `src/channel/{telegram,...}` — channel adapters with `send_from_agent` API
-- `src/agent.rs` — agent registry + Pane.last_input_at field
+- `src/daemon/supervisor.rs::tick()` — periodic per-instance check
+- `src/mcp/handlers/channel.rs::handle_reply()` — MCP reply tool callsite
 
 ## §3 Design
 
-### §3.1 State model (per-instance)
+### §3.1 State (per-instance metadata)
 
 ```rust
-// Added to metadata/{instance}.json (or heartbeat_pair in-memory)
-last_input_channel: Option<String>,     // "telegram" | "tui" | "agent_peer"
-last_input_channel_at: Option<i64>,     // ms timestamp
-last_reply_tool_at_ms: Option<i64>,     // last MCP reply call
-reply_tool_called_since_input: bool,    // reset on new inbox dequeue
-channel_discipline_reroute_count: u32,  // P2 cooldown counter
-channel_discipline_window_start_ms: i64,// P2 10min window anchor
-channel_discipline_silent_until_ms: i64,// P2 30min silent backoff
+last_input_channel: Option<String>,        // "telegram" | "tui" | "agent_peer"
+last_input_at_ms: Option<i64>,             // for cooldown/window checks
+reply_tool_called_since_input: bool,       // reset on new inbox dequeue
+last_inject_at_ms: Option<i64>,            // cooldown anchor
+inject_count_since_input: u32,             // cooldown counter (per input cycle)
 ```
 
-### §3.2 Hook sites (per dev STRUCTURAL m-5 §1)
+### §3.2 Hook sites + LOC
 
-| Site | LOC | Risk | Phase |
+| Site | LOC | Risk | Notes |
 |------|-----|------|-------|
-| `inbound.rs:283` write `last_input_channel` on dequeue | 15 | Low | P1 |
-| `state.rs:transition()` arm `response_complete_pending` on Thinking/ToolUse → Idle/Ready | 25 | Med | P1 |
-| `mcp/handlers/channel.rs::handle_reply()` write `last_reply_tool_at_ms` + flag | 10 | Low | P1 |
-| `daemon/supervisor.rs::tick()` mismatch detection + reroute path | 60 | High | P1 |
-| Cooldown logic + escalation | 15 | Low | P2 |
-| Active-channel sticky 60s + 3s race guard | 10 | Low | P1 |
-| Reroute failure retry queue | 20 | Med | P2 |
-| Feature flag (`AGEND_CHANNEL_DISCIPLINE` env + fleet.yaml) | 10 | Low | P1 |
+| `inbox.rs` write `last_input_channel` on dequeue | 10 | Low | Telegram/peer paths only; TUI direct skip |
+| `state.rs::transition()` arm `response_complete_pending` on Idle→Ready | 15 | Low | Use existing transition, add 1 flag |
+| `mcp/handlers/channel.rs::handle_reply()` write `reply_tool_called_since_input = true` | 5 | Low | Existing handler, 1 line write |
+| `daemon/supervisor.rs::tick()` mismatch detect + inject + cooldown | 20 | Med | Core logic |
 
-### §3.3 Detection logic (P1 supervisor tick)
+**Total ~50 LOC** across 4 files. Single Tier-2 PR.
+
+### §3.3 Detection logic (supervisor tick)
 
 ```
 On supervisor tick per instance:
-1. If !channel_discipline_enabled → skip (feature flag off)
-2. If !response_complete_pending → skip (still working)
-3. If reply_tool_called_since_input → clear flag, skip (well-behaved)
-4. If !last_input_channel || last_input_channel == "tui" → skip (no inbound provenance per reviewer §8)
-5. Capture vterm tail since last_input_at as response_text
-6. If response_text contains "ERROR" / "FAILED" / "REJECTED" keywords → escalate priority (per reviewer §5)
-7. Reroute via ch.send_from_agent(name, Reply { text: response_text })
-8. Inject correction prompt to agent: "Direct text emit detected — please use reply tool for Telegram responses"
-9. Increment channel_discipline_reroute_count (P2 only acts on this)
-10. Clear response_complete_pending
+1. If !response_complete_pending → skip
+2. If reply_tool_called_since_input → clear flag, skip (well-behaved)
+3. If last_input_channel == "tui" || None → skip (no inbound provenance)
+4. If inject_count_since_input >= cooldown_N → skip (already nudged enough)
+5. If now_ms - last_inject_at_ms < cooldown_window_ms → skip (too recent)
+6. Inject correction prompt to agent's pane via existing pane.send_text()
+7. Increment inject_count_since_input
+8. Update last_inject_at_ms
+9. Clear response_complete_pending (next response cycle re-arms)
 ```
 
-### §3.4 Active-channel selection (edge case #7)
+### §3.4 Inject message wording (default; §13 question)
 
 ```
-fn active_channel(instance) -> &str:
-  let tg_ts = metadata.last_input_channel_at;  // telegram inbound
-  let tui_ts = pane.last_input_at;             // TUI direct input
-  if (tg_ts - tui_ts).abs() < 3_000ms:         // race guard
-    return last sticky channel (60s window)
-  if tg_ts > tui_ts:
-    return "telegram"
-  else:
-    return "tui"
+[CHANNEL DISCIPLINE] You received input from {channel} but your last response went to direct text. Please re-send using the `reply` MCP tool so the operator/peer sees it.
 ```
 
-### §3.5 Multi-target emit handling (edge case #3, reviewer §5)
+(Wording adjustable per operator §13.2.)
 
-- First MCP `reply` tool call after input → primary response
-- Subsequent direct text → supplementary (no reroute)
-- **EXCEPTION**: direct text containing `ERROR` / `FAILED` / `REJECTED` keywords → escalate reroute even after reply (high-signal info would be missed)
+### §3.5 Cooldown
 
-### §3.6 P2 — Cooldown + retry (per reviewer §2)
+- Default `N=2` injects per input cycle
+- Counter resets on next inbox dequeue (new input cycle)
+- Cooldown window between injects: 30s minimum
+- After N hits: silent (no further injects until next input cycle)
 
-```
-Cooldown logic:
-- N=2 reroute events within 10min window → escalate (inject prompt + notify operator)
-- After 2 escalations → silent reroute-only for 30min + jittered re-arm (avoid retry storm)
-- Window reset on successful reply tool call
+## §4 Phasing (single PR)
 
-Retry queue (reroute failure):
-- ch.send_from_agent fails → write to inbox/{instance}.jsonl with delivery_mode: "reroute_pending"
-- Next tick retries
-- After 3 failures → drop + log
-```
+**Single PR — Tier-2 dual review** (codex PRIMARY + lead cross-vantage). High blast radius on supervisor tick + state transitions.
 
-## §4 Phase split
-
-### Phase 1 — Core detection + reroute + feature flag (Tier-2 dual)
-
-**Scope** ~120 LOC across 6 files:
-- `src/inbound.rs` last_input_channel tracking (~15)
-- `src/state.rs` response_complete_pending flag (~25)
-- `src/mcp/handlers/channel.rs` reply tool timestamp (~10)
-- `src/daemon/supervisor.rs` mismatch detection + reroute (~60)
-- `src/heartbeat_pair.rs` new metadata fields (~10)
-- Active-channel sticky helper (~10)
-- ERROR/FAILED/REJECTED keyword guard (in supervisor reroute path)
-- Feature flag (env + fleet.yaml field) (~10)
-
-**Tier**: Tier-2 dual review — codex PRIMARY + lead cross-vantage. High blast radius on message routing.
+**Scope** ~50 LOC across 4 files (above).
 
 **Tests**:
-- last_input_channel persists across daemon restart
-- response_complete_pending arms on Thinking → Idle (debounced)
-- reroute fires when mismatch detected
-- reply tool flag prevents reroute (well-behaved case)
-- TUI input → no reroute (no inbound provenance)
-- Active-channel sticky preserves recent within 3s race
-- ERROR keyword escalation triggers reroute
-- Feature flag off → no detection at all
+- `last_input_channel` persists across daemon restart (round-trip serde test)
+- Agent receives Telegram + replies via `reply` tool → no inject (well-behaved)
+- Agent receives Telegram + emits direct text → inject fires once
+- After inject, agent uses `reply` tool → flag clears, no re-inject on next response
+- TUI direct input → no inject (skip rule #3)
+- Cooldown: 3 consecutive direct-text emits → 2 injects + 1 silent
 
-**Done definition**: Pilot enabled on lead + dev instances. Observe 24-72h reroute count + zero false-positives on agent-initiated traffic.
-
-### Phase 2 — Cooldown + retry queue (Tier-1 single)
-
-**Scope** ~45 LOC:
-- Cooldown state machine (N=2/10min/30min silent/jitter) (~15)
-- Retry queue for failed reroute (~20)
-- Operator notification on cooldown escalation (~10)
-
-**Tier**: Tier-1 single — codex review only. Lower blast radius.
-
-**Dependency**: requires P1 merged + 24-72h observation.
-
-**Done definition**: Reroute storm prevention verified. Operator-visible notification fires only on N+1 escalation.
-
-### Phase 3 — DEFERRED to Sprint 50+ (per reviewer §4)
-
-- Confidence-score PTY pattern gate (over-engineering for current scale)
-- Strict-block mode (risk-bounded, only after long observation)
-- Per-conversation routing state (rather than per-instance) — if multi-conversation traffic emerges
+**Done definition**: Pilot on lead + dev pair-test (lead → dev via Telegram-bound channel). Verify:
+- 0 false-positives on TUI direct input
+- 1 inject per direct-text emit (within cooldown)
+- Cooldown caps at N=2 per input cycle
 
 ## §5 MINIMAL-DELTA verification (lead vantage)
 
-**Smallest viable enforcement**: feature flag + state.rs flag + supervisor reroute = ~80 LOC. Could ship today.
+**Smallest viable enforcement**: skip cooldown entirely (~40 LOC). Rejected — unbounded inject loop on stuck agent context bloats fast.
 
-**Rejected as too small**: skipping the active-channel sticky (~10 LOC) creates false-positive reroutes when operator switches between Telegram + TUI. The 3s race + 60s sticky is necessary correctness.
+**Smaller alternative considered + rejected**: skip the `reply_tool_called_since_input` flag (just check direct text always). Rejected — well-behaved agents that already use `reply` tool would still get false-positive nudges.
 
-**Rejected as too large**: PRIOR-ART m-4 §7(E) confidence-score gate + control-mode block boundaries — ~50+ extra LOC. Not necessary at fleet scale per reviewer COST-BENEFIT m-7 §4.
+**Larger alternative considered + rejected**: original PLAN (reroute + PTY extract + sticky + keyword + flag + 2 PRs). Rejected per operator m-15 — complexity exceeds 80/20 floor.
 
-**Smaller alternative considered + rejected**: rely entirely on `reply_tool_called_since_input` boolean (no PTY detection at all). Rejected because some agent backends emit final response without any tool call — no flag would ever flip and reroute never fires.
-
-**Larger alternative considered + rejected**: bundle P1 + P2 into single PR. Rejected per reviewer COST-BENEFIT m-7 §3 — P1 first, observe, P2 second to bound rollback radius.
+**Hook minimum**: 4 sites (inbox dequeue + state transition + reply handler + supervisor tick). All exist; this PR adds metadata field reads/writes + 1 inject path. No new modules.
 
 ## §6 Backward compat
 
-- Feature flag off by default → zero behavior change for existing fleet
-- Per-instance opt-in via `fleet.yaml` `channel_discipline: true` field
-- Day 1 rollout: enable on `lead` + `dev` only (highest signal sources)
-- Week 2 rollout: fleet-wide after P1 stable
-- Existing agent code path unchanged when flag off
+- Direct enable for fleet (no feature flag per operator §scope cuts)
+- Day 1: all instances check channel discipline once shipped
+- Risk acceptable per operator m-15: inject-only is safe (no text extraction, no reroute)
+- Existing agent code path unchanged — only adds nudge on miss
 
 ## §7 Risks
 
-**HIGH**:
-- False-positive reroute when operator narrates intent in pane via TUI then expects agent to reply on TUI but agent caught mid-response → daemon reroutes to Telegram (last_input_channel still telegram). **Mitigation**: 3s race + 60s sticky on active-channel selection.
-- Inject loop: agent receives correction prompt + treats as task → emits another response → caught again → loops. **Mitigation**: P2 cooldown N=2 / silent reroute after.
-
 **MED**:
-- vterm tail capture window: where to begin reading from? `last_input_at` is one anchor but agent may have responded BEFORE input was logged. **Mitigation**: capture from `last_input_at` minus small margin (300ms); test against false-positive sequence.
-- Telegram down → reroute fails → retry queue grows. **Mitigation**: P2 retry queue with 3-fail drop.
+- False-positive inject when agent receives Telegram input but the response is genuinely meant for pane (e.g., agent says "thinking..." in pane while preparing tool call). **Mitigation**: only inject on `Idle→Ready` transition (response complete), not during Thinking/ToolUse. Cooldown N=2 caps loop.
+- Agent doesn't honor inject prompt (keeps emitting direct text). **Mitigation**: cooldown stops after N=2; operator notification (§13.4) surfaces persistent miss.
 
 **LOW**:
-- ERROR keyword false-positive (legitimate error message in narration). **Mitigation**: keyword-based escalation only changes priority, doesn't change reroute behavior.
+- `last_input_channel` race: input arrives during emit. **Mitigation**: input cycle tracked per inbox dequeue + reply tool flag; new input resets flag.
+- `inject_count` not persisted across daemon restart. **Mitigation**: acceptable — restart resets cooldown is benign behavior.
 
 ## §8 §13 candidate questions for operator
 
-1. **Cooldown N**: N=2 (reviewer COST-BENEFIT) vs N=3 (dev STRUCTURAL) — pick?
-2. **Day 1 rollout phase**: skip phase1 (reroute-only) and go directly to phase2 (reroute+inject) per reviewer COST-BENEFIT m-7 §1+§7? Or observe 1-2d in reroute-only first?
-3. **ERROR/FAILED/REJECTED keyword escalation rule**: include in P1 (~5 LOC) or defer?
-4. **Active-channel sticky window**: 60s (per lead MINIMAL-DELTA) vs longer/shorter?
-5. **Feature flag default**: off (lead recommend) vs on for lead+dev only?
-6. **P1+P2 same Sprint vs split**: reviewer COST-BENEFIT m-7 §9 推 same Sprint sequential. Confirm or split?
-7. **Operator notification on cooldown escalation (P2)**: telegram message? Inbox entry? Daemon log only?
-8. **Closure metric**: reviewer COST-BENEFIT m-7 §10 recommends "misroute-visible incidents=0 for 7 days continuous + reroute events/day reduction ≥80%". Agree or different threshold?
-9. **PR ordering**: P1 → observe 24-72h → P2 — confirm sequential, no parallel?
-10. **Sprint 50+ deferred items**: confirm confidence-score gate + strict-block + per-conversation routing all permanently deferred (not just Sprint 50)?
+1. **Cooldown N**: default `N=2` per input cycle — accept, or different (1 / 3 / configurable)?
+2. **Inject message wording**: default `[CHANNEL DISCIPLINE] You received input from {channel} but your last response went to direct text. Please re-send using the `reply` MCP tool so the operator/peer sees it.` — accept or revise (specifically: tool name, channel name interpolation, brevity)?
+3. **Detection hook**: use existing `state.rs::transition()` Idle→Ready edge (lead recommend, no new code) vs new dedicated hook?
+4. **First-inject operator notification**: when daemon first nudges an instance (per input cycle), should daemon send a `notify_telegram` to operator so operator knows enforcement fired? Default = no (silent first inject), but adjustable.
 
 ## §9 Estimates
 
-- P1 IMPL: ~3-5h code + 2-3 review cycles ~6-9h elapsed total
-- P1 observation: 24-72h pilot on lead + dev
-- P2 IMPL: ~1.5-2h code + 1 review cycle ~3-4h elapsed
-- Total Sprint 49: 2-4 wall-clock days (most time in observation window)
+- IMPL: ~3-4h code + 1-2 review cycles ~5-7h elapsed total
+- Pilot observation: ~1 day on lead + dev pair
+- Total Sprint 49: ~1-2 wall-clock days
 
 ## §10 Reuse from prior synthesis
 
-- Sprint 47 P1 timeout/concurrency hardening — refactor PRs benefit + supervisor tick already has known cadence
-- Sprint 48 channel/telegram/* refactor — reroute path lands on cleanly split adapter modules
-- Existing state.rs Idle/Ready transitions = response-complete signal (no new PTY regex per dev STRUCTURAL m-5 §2)
+- dev STRUCTURAL m-5 §1 hook sites: 4 of 4 still apply (with smaller LOC)
+- dev STRUCTURAL m-5 §2 PTY analysis: only the "Idle→Ready already detects response complete" finding applies; per-backend regex unused per re-scope
+- reviewer PRIOR-ART m-4 §3 IRC + §6 cooldown idioms: confirms inject + cooldown is canonical
+- reviewer COST-BENEFIT m-7 §2 cooldown N=2: applied as default
+
+## §11 Sprint 50+ deferred items
+
+- Reroute (PTY text extraction) — original Phase 1 deliverable, deferred
+- Active-channel sticky 60s race guard — deferred until day-1 race observed
+- ERROR/FAILED keyword escalation — deferred
+- Feature flag + per-instance opt-in — deferred (direct enable instead)
+- Confidence-score PTY pattern gate — deferred (Sprint 50 candidate per reviewer §4)
+- Strict-block mode — deferred (risk-bounded, only after long observation)
 
 ---
 
