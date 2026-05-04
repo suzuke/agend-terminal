@@ -233,12 +233,6 @@ fn tick(
             // §4.4 stale decay: clear waiting_on when heartbeat is stale.
             clear_waiting_on_if_stale(home, &name, !core.state.is_heartbeat_fresh());
 
-            // Sprint 49: channel discipline — inject nudge when agent
-            // completes a response without using the reply tool.
-            if core.state.take_response_complete() {
-                check_channel_discipline(home, &name);
-            }
-
             let agent_state = core.state.current;
             let silent = core.state.last_output.elapsed();
             if core.health.check_awaiting_operator(agent_state, silent) {
@@ -357,73 +351,6 @@ fn format_stall_notice(name: &str, tail: &str, silent_secs: Option<u64>) -> Stri
 /// conversation again.
 fn format_recovery_notice(name: &str) -> String {
     format!("✅ {name} 已就緒，可以繼續對話")
-}
-
-/// Sprint 49: channel discipline — inject nudge when agent completes a
-/// response without using the `reply` tool after receiving inbound input.
-fn check_channel_discipline(home: &std::path::Path, name: &str) {
-    use serde_json::json;
-
-    let meta_path = crate::agent_ops::metadata_path_resolved(home, name);
-    let meta: serde_json::Value = std::fs::read_to_string(&meta_path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or(json!({}));
-
-    // Skip if agent already used reply tool this input cycle.
-    if meta["reply_tool_called_since_input"].as_bool() == Some(true) {
-        return;
-    }
-    // Skip if no inbound channel tracked (TUI direct or no input yet).
-    let channel = match meta["last_input_channel"].as_str() {
-        Some(ch @ ("telegram" | "agent_peer")) => ch,
-        _ => return,
-    };
-    // Cooldown: max 2 injects per input cycle.
-    let count = meta["inject_count_since_input"].as_u64().unwrap_or(0);
-    if count >= 2 {
-        return;
-    }
-    // Cooldown: 30s minimum between injects.
-    let last_inject = meta["last_inject_at_ms"].as_i64().unwrap_or(0);
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    if now_ms - last_inject < 30_000 {
-        return;
-    }
-
-    let tool_name = if channel == "telegram" {
-        "reply"
-    } else {
-        "send"
-    };
-    let msg = format!(
-        "[CHANNEL DISCIPLINE] You received input from {channel} but your last response \
-         went to direct text. Please re-send using the `{tool_name}` MCP tool so the \
-         operator/peer sees it."
-    );
-    crate::inbox::compose_aware_send(home, name, &msg);
-    // Sprint 49 §13.4: log first inject per cycle to decision board.
-    if count == 0 {
-        crate::decisions::post(
-            home,
-            "system:channel-discipline",
-            &serde_json::json!({
-                "title": format!("channel discipline inject — {name}"),
-                "content": format!("last input from {channel}, agent emitted direct text"),
-                "scope": "project",
-                "tags": ["channel-discipline"]
-            }),
-        );
-    }
-    crate::agent_ops::save_metadata_batch(
-        home,
-        name,
-        &[
-            ("inject_count_since_input", json!(count + 1)),
-            ("last_inject_at_ms", json!(now_ms)),
-        ],
-    );
-    tracing::info!(agent = %name, %channel, inject_count = count + 1, "channel discipline inject fired");
 }
 
 /// Read `last_heartbeat` from the agent's metadata file and return the age
@@ -788,111 +715,5 @@ mod tests {
             Some("15:14".to_string())
         );
         assert_eq!(super::parse_unlock_at("no time here"), None);
-    }
-
-    // ── Sprint 49: channel discipline tests ─────────────────────────
-
-    fn cd_home(tag: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static CTR: AtomicU32 = AtomicU32::new(0);
-        let d = std::env::temp_dir().join(format!(
-            "agend-cd-{}-{}-{}",
-            std::process::id(),
-            tag,
-            CTR.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&d).ok();
-        d
-    }
-
-    #[test]
-    fn channel_discipline_no_inject_when_reply_tool_used() {
-        let home = cd_home("reply-ok");
-        crate::agent_ops::save_metadata_batch(
-            &home,
-            "a",
-            &[
-                ("last_input_channel", serde_json::json!("telegram")),
-                ("reply_tool_called_since_input", serde_json::json!(true)),
-                ("inject_count_since_input", serde_json::json!(0)),
-            ],
-        );
-        super::check_channel_discipline(&home, "a");
-        // No inject should have fired — compose_aware_send not called.
-        // Verify inject_count unchanged.
-        let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(crate::agent_ops::metadata_path_resolved(&home, "a"))
-                .unwrap_or_default(),
-        )
-        .unwrap_or_default();
-        assert_eq!(meta["inject_count_since_input"], 0);
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn channel_discipline_inject_fires_on_direct_text() {
-        let home = cd_home("direct-text");
-        crate::agent_ops::save_metadata_batch(
-            &home,
-            "a",
-            &[
-                ("last_input_channel", serde_json::json!("telegram")),
-                ("reply_tool_called_since_input", serde_json::json!(false)),
-                ("inject_count_since_input", serde_json::json!(0)),
-            ],
-        );
-        super::check_channel_discipline(&home, "a");
-        let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(crate::agent_ops::metadata_path_resolved(&home, "a"))
-                .unwrap_or_default(),
-        )
-        .unwrap_or_default();
-        assert_eq!(meta["inject_count_since_input"], 1);
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn channel_discipline_tui_input_skipped() {
-        let home = cd_home("tui-skip");
-        crate::agent_ops::save_metadata_batch(
-            &home,
-            "a",
-            &[
-                ("last_input_channel", serde_json::json!("tui")),
-                ("reply_tool_called_since_input", serde_json::json!(false)),
-                ("inject_count_since_input", serde_json::json!(0)),
-            ],
-        );
-        super::check_channel_discipline(&home, "a");
-        let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(crate::agent_ops::metadata_path_resolved(&home, "a"))
-                .unwrap_or_default(),
-        )
-        .unwrap_or_default();
-        assert_eq!(meta["inject_count_since_input"], 0);
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn channel_discipline_cooldown_caps_at_2() {
-        let home = cd_home("cooldown");
-        crate::agent_ops::save_metadata_batch(
-            &home,
-            "a",
-            &[
-                ("last_input_channel", serde_json::json!("telegram")),
-                ("reply_tool_called_since_input", serde_json::json!(false)),
-                ("inject_count_since_input", serde_json::json!(2)),
-            ],
-        );
-        super::check_channel_discipline(&home, "a");
-        let meta: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(crate::agent_ops::metadata_path_resolved(&home, "a"))
-                .unwrap_or_default(),
-        )
-        .unwrap_or_default();
-        // Should still be 2 — cooldown prevents further injects.
-        assert_eq!(meta["inject_count_since_input"], 2);
-        std::fs::remove_dir_all(&home).ok();
     }
 }
