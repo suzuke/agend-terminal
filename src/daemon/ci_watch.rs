@@ -2424,7 +2424,7 @@ mod tests {
             *captured_clone.lock().expect("lock") = Some((path, request));
 
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -2753,7 +2753,7 @@ mod tests {
                 } else {
                     "error line 1\nerror line 2\n"
                 };
-                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
                 stream.write_all(resp.as_bytes()).expect("write");
             }
         });
