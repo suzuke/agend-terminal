@@ -559,9 +559,6 @@ pub struct StateTracker {
     instance_name: String,
     /// Backend name for telemetry logging.
     backend_name: String,
-    /// Sprint 49: armed when agent transitions from Thinking/ToolUse to
-    /// Idle/Ready — signals response completion for channel discipline check.
-    response_complete_pending: bool,
 }
 
 fn hash_screen(text: &str) -> u64 {
@@ -620,7 +617,6 @@ impl StateTracker {
             behavioral_config: backend.map(crate::behavioral::config_for),
             instance_name: String::new(),
             backend_name: backend.map(|b| b.name().to_string()).unwrap_or_default(),
-            response_complete_pending: false,
         }
     }
 
@@ -897,20 +893,6 @@ impl StateTracker {
         {
             self.interactive_recovery_pending_notice = true;
         }
-
-        // Sprint 49: arm channel discipline check when agent finishes
-        // generating (Thinking/ToolUse → Idle/Ready).
-        if matches!(prev, AgentState::Thinking | AgentState::ToolUse)
-            && matches!(self.current, AgentState::Idle | AgentState::Ready)
-            && prev != self.current
-        {
-            self.response_complete_pending = true;
-        }
-    }
-
-    /// Sprint 49: returns true once per response completion, then clears.
-    pub fn take_response_complete(&mut self) -> bool {
-        std::mem::replace(&mut self.response_complete_pending, false)
     }
 }
 

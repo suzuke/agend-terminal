@@ -16,16 +16,7 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         instance_name,
         crate::channel::AgentOutboundOp::Reply { text },
     ) {
-        Ok(msg) => {
-            // Sprint 49: mark that agent used reply tool (channel discipline).
-            crate::agent_ops::save_metadata(
-                home,
-                instance_name,
-                "reply_tool_called_since_input",
-                json!(true),
-            );
-            json!({ "message_id": msg.id })
-        }
+        Ok(msg) => json!({ "message_id": msg.id }),
         Err(e) => json!({"error": format!("{e}")}),
     }
 }
