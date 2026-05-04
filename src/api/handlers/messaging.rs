@@ -25,24 +25,26 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Err(e) = agent::validate_name(target) {
         return json!({"ok": false, "error": e});
     }
-    if from == target {
+    // Sprint 46 P2: self-route check by ID — prevents bypass via rename.
+    // Resolve both sender and target; if both resolve to the same InstanceId, reject.
+    let from_resolved = crate::agent::resolve_instance(ctx.home, from).ok();
+    let target_resolved = crate::agent::resolve_instance(ctx.home, target).ok();
+    if let (Some((from_id, _)), Some((target_id, _))) = (&from_resolved, &target_resolved) {
+        if from_id == target_id {
+            return json!({"ok": false, "error": "cannot send to self"});
+        }
+    } else if from == target {
+        // Fallback: name comparison for instances not in fleet.yaml
         return json!({"ok": false, "error": "cannot send to self"});
     }
 
-    // Validate target exists: check runtime registry OR fleet.yaml definitions.
-    // Messages to non-existent targets would silently land in an unread inbox file.
+    // Validate target exists: check runtime registry OR fleet.yaml via resolve_instance.
     {
         let reg = agent::lock_registry(ctx.registry);
         let in_registry = reg.contains_key(target);
         drop(reg);
-        if !in_registry {
-            let in_fleet = crate::fleet::FleetConfig::load(&ctx.home.join("fleet.yaml"))
-                .ok()
-                .map(|c| c.instances.contains_key(target))
-                .unwrap_or(false);
-            if !in_fleet {
-                return json!({"ok": false, "error": format!("target instance '{target}' not found (not in registry or fleet.yaml)")});
-            }
+        if !in_registry && target_resolved.is_none() {
+            return json!({"ok": false, "error": format!("target instance '{target}' not found (not in registry or fleet.yaml)")});
         }
     }
 
@@ -114,12 +116,9 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
                 .and_then(|v| serde_json::from_value::<crate::inbox::ForceMeta>(v.clone()).ok()),
             correlation_id: params["correlation_id"].as_str().map(String::from),
             reviewed_head: params["reviewed_head"].as_str().map(String::from),
-            // Sprint 46 P1: store bare name in from (machine-readable for reply).
-            // ID stored separately in from_id for audit trail per operator §13.5.
+            // Sprint 46 P2: use already-resolved sender ID from resolve_instance.
             from: format!("from:{from}"),
-            from_id: crate::fleet::FleetConfig::load(&ctx.home.join("fleet.yaml"))
-                .ok()
-                .and_then(|c| c.instances.get(from).and_then(|i| i.id.clone())),
+            from_id: from_resolved.as_ref().map(|(id, _)| id.full()),
             text: text.to_string(),
             kind: params
                 .get("kind")

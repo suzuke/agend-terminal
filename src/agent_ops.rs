@@ -12,7 +12,7 @@
 
 use crate::identity::Sender;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Messaging
@@ -87,9 +87,47 @@ pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str)
 // Metadata
 // ---------------------------------------------------------------------------
 
+/// Name-based metadata path (legacy).
+pub fn metadata_path(home: &Path, name: &str) -> PathBuf {
+    home.join("metadata").join(format!("{name}.json"))
+}
+
+/// Sprint 46 P2: resolve metadata path by InstanceId when available.
+/// Migrates legacy name-based files to id-based on first access.
+/// Infrastructure for Sprint 47 file path migration — callers adopt incrementally.
+#[allow(dead_code)]
+pub fn metadata_path_resolved(home: &Path, name: &str) -> PathBuf {
+    let id = crate::agent::resolve_instance(home, name)
+        .ok()
+        .map(|(id, _)| id);
+    let Some(id) = id else {
+        return metadata_path(home, name);
+    };
+    let id_path = home.join("metadata").join(format!("{}.json", id.full()));
+    if id_path.exists() {
+        return id_path;
+    }
+    let name_path = metadata_path(home, name);
+    if name_path.exists() {
+        if let Some(parent) = id_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&name_path, &id_path);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::fs::copy(&name_path, &id_path);
+        }
+        return id_path;
+    }
+    id_path
+}
+
 /// Load metadata for an instance and merge it into the given JSON value.
 pub fn merge_metadata(home: &Path, name: &str, info: &mut Value) {
-    let meta_path = home.join("metadata").join(format!("{name}.json"));
+    let meta_path = metadata_path(home, name);
     if let Ok(meta) = std::fs::read_to_string(&meta_path)
         .and_then(|c| serde_json::from_str::<Value>(&c).map_err(std::io::Error::other))
     {
@@ -108,7 +146,7 @@ pub fn merge_metadata(home: &Path, name: &str, info: &mut Value) {
 pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) {
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
-    let meta_path = meta_dir.join(format!("{instance_name}.json"));
+    let meta_path = metadata_path(home, instance_name);
     let mut meta: Value = std::fs::read_to_string(&meta_path)
         .map(|c| serde_json::from_str(&c).unwrap_or(json!({})))
         .unwrap_or(json!({}));
@@ -124,7 +162,7 @@ pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) 
 pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, Value)]) {
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
-    let meta_path = meta_dir.join(format!("{instance_name}.json"));
+    let meta_path = metadata_path(home, instance_name);
     let mut meta: Value = std::fs::read_to_string(&meta_path)
         .map(|c| serde_json::from_str(&c).unwrap_or(json!({})))
         .unwrap_or(json!({}));

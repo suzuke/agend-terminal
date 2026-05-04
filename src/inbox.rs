@@ -250,6 +250,41 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
     home.join("inbox").join(format!("{name}.jsonl"))
 }
 
+/// Sprint 46 P2: resolve inbox path by InstanceId when available.
+/// Migrates legacy name-based files to id-based on first access.
+/// Infrastructure for Sprint 47 file path migration — callers adopt incrementally.
+#[allow(dead_code)]
+pub(crate) fn inbox_path_resolved(home: &Path, name: &str) -> PathBuf {
+    let id = crate::agent::resolve_instance(home, name)
+        .ok()
+        .map(|(id, _)| id);
+    let Some(id) = id else {
+        return inbox_path(home, name);
+    };
+    let id_path = home.join("inbox").join(format!("{}.jsonl", id.full()));
+    if id_path.exists() {
+        return id_path;
+    }
+    let name_path = inbox_path(home, name);
+    if name_path.exists() {
+        // Migrate: create symlink from id-based to name-based (or copy on Windows)
+        if let Some(parent) = id_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&name_path, &id_path);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::fs::copy(&name_path, &id_path);
+        }
+        return id_path;
+    }
+    // New instance — use id-based path directly
+    id_path
+}
+
 /// Acquire a per-agent flock and run `f` with the inbox path.
 /// All read-modify-write operations on an agent's inbox (enqueue, drain,
 /// sweep_expired) must go through this helper to prevent concurrent races.

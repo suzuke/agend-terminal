@@ -311,6 +311,7 @@ mod tests {
             health: crate::health::HealthTracker::new(),
         }));
         crate::agent::AgentHandle {
+            id: crate::types::InstanceId::default(),
             name: name.to_string(),
             backend_command: "true".to_string(),
             pty_writer,

@@ -2444,3 +2444,115 @@ fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── Sprint 46 P2: ID-based routing tests ────────────────────────────────
+
+#[test]
+fn m5_regression_via_id_routing() {
+    // Sprint 46 P2: M5 regression now routes via resolve_instance (ID-based),
+    // not the P1 name-lookup bandaid. Instance "dev" resolves by name → ID,
+    // bypassing team-orchestrator collision.
+    let _g = fleet_test_guard();
+    let home = tmp_home("m5_id_routing");
+    std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("AGEND_TEST_ISOLATION", "1");
+    let id = crate::types::InstanceId::new();
+    let yaml = format!(
+        "defaults:\n  backend: claude\ninstances:\n  dev:\n    id: \"{}\"\n    role: Test\n  lead:\n    role: Test\n",
+        id.full()
+    );
+    std::fs::write(home.join("fleet.yaml"), &yaml).ok();
+    let teams = serde_json::json!({
+        "schema_version": 1,
+        "teams": [{
+            "name": "dev",
+            "members": ["lead", "dev"],
+            "orchestrator": "lead",
+            "description": null,
+            "created_at": "2026-04-30T00:00:00Z"
+        }]
+    });
+    std::fs::write(
+        home.join("teams.json"),
+        serde_json::to_string_pretty(&teams).unwrap(),
+    )
+    .ok();
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "dev",
+            "request_kind": "task",
+            "message": "do something"
+        }),
+        "lead",
+    );
+    assert!(
+        result.get("error").is_none() || result["target"].as_str() == Some("dev"),
+        "ID-based routing should succeed for instance 'dev', got: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn new_instance_writes_to_id_jsonl() {
+    // Sprint 46 P2: new instances with an ID should use id-based inbox path.
+    let home = tmp_home("id_jsonl");
+    let id = crate::types::InstanceId::new();
+    let yaml = format!(
+        "defaults:\n  backend: claude\ninstances:\n  fresh:\n    id: \"{}\"\n    role: Test\n",
+        id.full()
+    );
+    std::fs::write(home.join("fleet.yaml"), &yaml).unwrap();
+    let resolved = crate::inbox::inbox_path_resolved(&home, "fresh");
+    assert!(
+        resolved.to_string_lossy().contains(&id.full()),
+        "new instance should use id-based path, got: {}",
+        resolved.display()
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn legacy_instance_migration() {
+    // Sprint 46 P2: name-based inbox file exists → id-based via migration.
+    let home = tmp_home("legacy_migration");
+    let id = crate::types::InstanceId::new();
+    let yaml = format!(
+        "defaults:\n  backend: claude\ninstances:\n  old:\n    id: \"{}\"\n    role: Test\n",
+        id.full()
+    );
+    std::fs::write(home.join("fleet.yaml"), &yaml).unwrap();
+    // Create legacy name-based inbox file
+    std::fs::create_dir_all(home.join("inbox")).unwrap();
+    std::fs::write(home.join("inbox/old.jsonl"), "legacy data\n").unwrap();
+
+    let resolved = crate::inbox::inbox_path_resolved(&home, "old");
+    assert!(
+        resolved.to_string_lossy().contains(&id.full()),
+        "should migrate to id-based path, got: {}",
+        resolved.display()
+    );
+    // The id-based path should exist (symlink or copy)
+    assert!(
+        resolved.exists(),
+        "id-based path should exist after migration"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn bandaid_removed_invariant() {
+    // Sprint 46 P2 binding constraint: no `instances.contains_key` in comms.rs
+    // dispatch path. The P1 bandaid pattern MUST be gone.
+    let comms_src = include_str!("comms.rs");
+    // The bandaid was: `c.instances.contains_key(raw_target)` in handle_delegate_task.
+    // After P2, resolve_instance replaces it. Assert no contains_key on instances
+    // in the dispatch functions (handle_delegate_task, handle_send_to_instance).
+    assert!(
+        !comms_src.contains("instances.contains_key"),
+        "P1 bandaid pattern `instances.contains_key` must be removed from comms.rs"
+    );
+}

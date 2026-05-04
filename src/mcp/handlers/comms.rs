@@ -157,21 +157,24 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     if let Err(e) = crate::agent::validate_name(raw_target) {
         return json!({"error": e});
     }
-    // Sprint 46 P1: instance-first lookup — if raw_target is a known instance
-    // in fleet.yaml, skip team resolution (fixes M5 name-shadowing root cause).
-    let is_known_instance = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
-        .ok()
-        .map(|c| c.instances.contains_key(raw_target))
-        .unwrap_or(false);
-
-    let resolved_target = if is_known_instance {
-        raw_target.to_string() // instance wins over team template
-    } else {
-        // Fallback: resolve team name → orchestrator
-        match crate::teams::resolve_team_orchestrator(home, raw_target) {
-            Ok(Some(orch)) => orch,
-            Ok(None) => raw_target.to_string(),
-            Err(e) => return json!({"error": e}),
+    // Sprint 46 P2: resolve target via InstanceId — replaces P1 name-lookup bandaid.
+    // If raw_target resolves to a known instance (by id, short-id, or name), route
+    // directly. Otherwise fall through to team-orchestrator resolution.
+    let resolved_target = match crate::agent::resolve_instance(home, raw_target) {
+        Ok((_id, name)) => name,
+        Err(crate::agent::ResolveError::Ambiguous(n, ids)) => {
+            return json!({"error": format!(
+                "name \"{n}\" matches {} instances: {} — pass id explicitly",
+                ids.len(), ids.join(", ")
+            )});
+        }
+        Err(crate::agent::ResolveError::NotFound(_)) => {
+            // Not a known instance — try team-orchestrator resolution
+            match crate::teams::resolve_team_orchestrator(home, raw_target) {
+                Ok(Some(orch)) => orch,
+                Ok(None) => raw_target.to_string(),
+                Err(e) => return json!({"error": e}),
+            }
         }
     };
     let target = resolved_target.as_str();
