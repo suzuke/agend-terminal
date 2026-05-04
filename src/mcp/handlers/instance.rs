@@ -214,6 +214,15 @@ pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
                 Some(agent) => {
                     let mut info = agent.clone();
                     merge_metadata(home, name, &mut info);
+                    // Surface topic_id from fleet.yaml for debugging (#415).
+                    if info.get("topic_id").is_none() {
+                        if let Some(tid) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                            .ok()
+                            .and_then(|c| c.instances.get(name)?.topic_id)
+                        {
+                            info["topic_id"] = json!(tid);
+                        }
+                    }
                     json!({"instance": info})
                 }
                 None => json!({"error": format!("Instance '{name}' not found")}),
