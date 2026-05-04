@@ -102,8 +102,8 @@ impl AgentState {
 
     /// States where operator reply text should bypass the inbox and reach the
     /// PTY as raw keystrokes — i.e. the agent is showing an interactive modal
-    /// (startup stall or pattern-matched InteractivePrompt like codex's
-    /// update menu), not a free-form conversation prompt.
+    /// (startup stall or pattern-matched InteractivePrompt), not a
+    /// free-form conversation prompt.
     pub fn wants_raw_keystrokes(self) -> bool {
         matches!(self, Self::AwaitingOperator | Self::InteractivePrompt)
     }
@@ -278,15 +278,6 @@ impl StatePatterns {
                 (
                     AgentState::PermissionPrompt,
                     r"Would you like to run the following command\?|Yes, proceed|No, and tell Codex|Press enter to confirm or esc to cancel|Request approval|approve|deny",
-                ),
-                // [measured] Codex launches into an update-available modal
-                // when a newer version is published; the banner blocks the
-                // REPL until the operator presses Enter to dismiss or select.
-                // Previously this left the agent visibly at Ready (the banner
-                // text still matched "OpenAI Codex") while silently stalled.
-                (
-                    AgentState::InteractivePrompt,
-                    r"Update available!|Press enter to continue",
                 ),
                 // [measured] Codex 0.120.0 renders tool-call blocks as a
                 // two-line region — a `•` title line (`• Explored`,
@@ -964,6 +955,21 @@ mod tests {
             t.get_state(),
             AgentState::RateLimit,
             "canonical `429` standalone token must still trigger RateLimit"
+        );
+    }
+
+    // Sprint 46: codex InteractivePrompt regex (`Update available!|Press
+    // enter to continue`) false-positived on normal idle prompts because
+    // the `›` idle pattern and the InteractivePrompt pattern both matched
+    // transient output. Removed the codex InteractivePrompt entry entirely.
+    #[test]
+    fn codex_idle_prompt_does_not_trigger_interactive_prompt() {
+        let mut t = tracker_at(&Backend::Codex, AgentState::Idle, 0);
+        t.feed("› ");
+        assert_ne!(
+            t.get_state(),
+            AgentState::InteractivePrompt,
+            "codex idle prompt `›` must not trigger InteractivePrompt"
         );
     }
 
@@ -1693,131 +1699,68 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_codex_update_menu_is_interactive_prompt() {
-        // Regression for BUG 2: codex launches with an "Update available!"
-        // modal overlaid on the usual ready banner. Without a dedicated
-        // pattern, the Ready pattern still matched the banner and the
-        // operator saw a "ready" pane that silently ignored input —
-        // really it was waiting on the modal.
-        let mut vt = VTerm::new(80, 24);
-        let mut st = StateTracker::new(Some(&Backend::Codex));
-        // Banner + modal rendered together on startup.
-        drive(
-            &mut vt,
-            &mut st,
-            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
-        );
-        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
-    }
-
-    #[test]
     fn interactive_prompt_notice_armed_on_entry_and_dedupes() {
-        // Fresh tracker (state = Starting) must not claim a pending notice —
-        // we only arm after a real transition INTO InteractivePrompt.
-        let mut vt = VTerm::new(80, 24);
-        let mut st = StateTracker::new(Some(&Backend::Codex));
-        assert!(!st.take_interactive_prompt_notice());
+        // Use tracker_at to place the tracker directly into InteractivePrompt
+        // (no backend pattern triggers it after Sprint 46 removal).
+        let mut t = tracker_at(&Backend::Codex, AgentState::Starting, 0);
+        assert!(!t.take_interactive_prompt_notice());
 
-        // Codex update menu → InteractivePrompt. First take fires, second
-        // is debounced so supervisor ticks don't spam Telegram.
-        drive(
-            &mut vt,
-            &mut st,
-            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
-        );
-        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
-        assert!(st.take_interactive_prompt_notice(), "first entry must arm");
+        // Simulate entering InteractivePrompt via direct transition.
+        t.transition(AgentState::InteractivePrompt);
+        assert_eq!(t.get_state(), AgentState::InteractivePrompt);
+        assert!(t.take_interactive_prompt_notice(), "first entry must arm");
         assert!(
-            !st.take_interactive_prompt_notice(),
+            !t.take_interactive_prompt_notice(),
             "subsequent ticks within the same InteractivePrompt must not re-arm"
         );
     }
 
     #[test]
     fn interactive_prompt_notice_rearms_on_reentry() {
-        // Dismiss → Ready → re-enter InteractivePrompt should re-arm the
-        // notice so the operator is told again on the second modal.
-        let mut vt = VTerm::new(80, 24);
-        let mut st = StateTracker::new(Some(&Backend::Codex));
-        drive(
-            &mut vt,
-            &mut st,
-            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
-        );
-        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
-        assert!(st.take_interactive_prompt_notice());
+        // Enter InteractivePrompt, leave to Ready, re-enter — notice must re-arm.
+        let mut t = tracker_at(&Backend::Codex, AgentState::Starting, 0);
+        t.transition(AgentState::InteractivePrompt);
+        assert_eq!(t.get_state(), AgentState::InteractivePrompt);
+        assert!(t.take_interactive_prompt_notice());
 
         // Simulate passive-hold window so InteractivePrompt can drop back.
-        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
-        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
-        assert_eq!(st.get_state(), AgentState::Ready);
-        assert!(
-            !st.take_interactive_prompt_notice(),
-            "no notice while Ready"
-        );
+        t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        t.transition(AgentState::Ready);
+        assert_eq!(t.get_state(), AgentState::Ready);
+        assert!(!t.take_interactive_prompt_notice(), "no notice while Ready");
 
-        // Second modal appears.
-        drive(
-            &mut vt,
-            &mut st,
-            b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
-        );
-        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+        // Re-enter InteractivePrompt.
+        t.transition(AgentState::InteractivePrompt);
+        assert_eq!(t.get_state(), AgentState::InteractivePrompt);
         assert!(
-            st.take_interactive_prompt_notice(),
+            t.take_interactive_prompt_notice(),
             "re-entry after a leave must re-arm the notice"
         );
     }
 
     #[test]
-    fn pipeline_codex_update_menu_dismiss_returns_to_ready() {
-        // After the operator presses Enter, the modal text leaves the
-        // screen. Screen re-renders with just the ready banner → detect
-        // returns Ready, and after hysteresis the state drops from
-        // InteractivePrompt (prio 7) back to Ready (prio 3).
-        let mut vt = VTerm::new(80, 24);
-        let mut st = StateTracker::new(Some(&Backend::Codex));
-        drive(
-            &mut vt,
-            &mut st,
-            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
-        );
-        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
-        // Simulate passive-hold window elapsing so the downgrade can fire.
-        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
-        // Clear screen, banner alone re-renders.
-        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
-        assert_eq!(st.get_state(), AgentState::Ready);
-    }
-
-    #[test]
     fn recovery_notice_armed_when_leaving_interactive_prompt() {
-        // Fresh tracker has nothing armed.
-        let mut vt = VTerm::new(80, 24);
-        let mut st = StateTracker::new(Some(&Backend::Codex));
-        assert!(!st.take_recovery_notice());
+        // Use tracker_at to place the tracker directly into InteractivePrompt.
+        let mut t = tracker_at(&Backend::Codex, AgentState::Starting, 0);
+        assert!(!t.take_recovery_notice());
 
         // Enter InteractivePrompt.
-        drive(
-            &mut vt,
-            &mut st,
-            b"OpenAI Codex v0.120.0\r\nUpdate available! Press enter to continue\r\n",
-        );
-        assert_eq!(st.get_state(), AgentState::InteractivePrompt);
+        t.transition(AgentState::InteractivePrompt);
+        assert_eq!(t.get_state(), AgentState::InteractivePrompt);
         // Still nothing to report — we only arm when we LEAVE the blocked
         // state, not when we enter it.
-        assert!(!st.take_recovery_notice());
+        assert!(!t.take_recovery_notice());
 
         // Dismiss → Ready.
-        st.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
-        drive(&mut vt, &mut st, b"\x1b[2J\x1b[HOpenAI Codex v0.120.0\r\n");
-        assert_eq!(st.get_state(), AgentState::Ready);
+        t.since = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        t.transition(AgentState::Ready);
+        assert_eq!(t.get_state(), AgentState::Ready);
 
         // First take fires; subsequent ticks within the same Ready don't
         // re-spam.
-        assert!(st.take_recovery_notice(), "recovery must arm on exit");
+        assert!(t.take_recovery_notice(), "recovery must arm on exit");
         assert!(
-            !st.take_recovery_notice(),
+            !t.take_recovery_notice(),
             "supervisor ticks after the first must not re-arm"
         );
     }
