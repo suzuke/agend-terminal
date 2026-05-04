@@ -46,42 +46,24 @@ jobs:
         timeout-minutes: 5
         run: cargo fmt --check
 
-      - name: Clippy
-        timeout-minutes: 10
-        run: cargo clippy -- -D warnings
-
-      # Tray feature gate (docs/archived/PLAN-tray-resident.md). Release binaries
-      # still ship default-only until PLAN task #4 pulls in tray-icon/tao;
-      # this step just guarantees the feature code compiles on all three
-      # platforms so per-OS regressions surface before the event loop lands.
-      - name: Clippy (tray feature)
-        timeout-minutes: 10
+      # Single clippy pass with --all-targets --features tray is a superset
+      # of the default-feature check — catches both default and tray code
+      # paths in one compilation, saving a full rebuild.
+      - name: Clippy (all targets + tray)
+        timeout-minutes: 15
         run: cargo clippy --all-targets --features tray -- -D warnings
 
       - name: Build
         timeout-minutes: 20
         run: cargo build --release
 
-      - name: Unit tests
-        timeout-minutes: 20
-        run: cargo test --bin agend-terminal
-
-      - name: Unit tests (tray feature)
-        timeout-minutes: 20
-        run: cargo test --bin agend-terminal --features tray
-
-      # Sprint 23 P1 — anti-bypass invariant tests live in tests/*.rs but
-      # the previous `cargo test --test integration` only ran one file
-      # (integration.rs). Anti-bypass invariants (task_events /
-      # legacy_outbound / spawn_rationale / heartbeat_pair) and
-      # characterization tests (mcp_characterization / mcp_roundtrip /
-      # no_dual_track_drift / self_healing_supervisor) silently passed CI
-      # if their assertions broke. `--tests` covers every `tests/*.rs`
-      # file plus already-covered unit tests; the unit-test repeat is
-      # cheap (cached) and keeps the invariant net fail-loud.
-      - name: Integration tests + anti-bypass invariants
+      # `--tests` covers unit tests (--bin) + every tests/*.rs integration
+      # file. `--features tray` ensures tray-gated code is tested too.
+      # Previously this was 3 separate steps (unit, unit+tray, integration)
+      # which triggered 2 extra recompilations from feature-flag switching.
+      - name: Tests (unit + integration + tray)
         timeout-minutes: 30
-        run: cargo test --tests
+        run: cargo test --tests --features tray
 
       - name: CLI smoke (Phase C.5)
         timeout-minutes: 10
