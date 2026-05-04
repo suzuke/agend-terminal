@@ -8,11 +8,17 @@ pub const DISPATCH_WARN_MINUTES: i64 = 15;
 /// Ask threshold: daemon sends query to assignee after this.
 pub const DISPATCH_ASK_MINUTES: i64 = 30;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DispatchEntry {
     pub task_id: Option<String>,
     pub from: String,
     pub to: String,
+    /// Sprint 46 P3: sender's InstanceId for audit trail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_id: Option<String>,
+    /// Sprint 46 P3: target's InstanceId for audit trail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_id: Option<String>,
     pub delegated_at: String,
     pub status: String, // "pending" | "completed" | "warned" | "asked"
 }
@@ -166,6 +172,8 @@ mod tests {
                 task_id: Some("t-test".into()),
                 from: "lead".into(),
                 to: "impl".into(),
+                from_id: None,
+                to_id: None,
                 delegated_at: past,
                 status: "pending".into(),
             },
@@ -190,6 +198,8 @@ mod tests {
                 task_id: Some("t-test".into()),
                 from: "lead".into(),
                 to: "reviewer".into(),
+                from_id: None,
+                to_id: None,
                 delegated_at: past,
                 status: "pending".into(),
             },
@@ -214,6 +224,8 @@ mod tests {
                 task_id: Some("t-123".into()),
                 from: "lead".into(),
                 to: "impl".into(),
+                from_id: None,
+                to_id: None,
                 delegated_at: (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339(),
                 status: "pending".into(),
             },
@@ -237,6 +249,8 @@ mod tests {
                 task_id: Some("t-stuck".into()),
                 from: "lead".into(),
                 to: "reviewer".into(),
+                from_id: None,
+                to_id: None,
                 delegated_at: past,
                 status: "pending".into(),
             },
@@ -263,6 +277,8 @@ mod tests {
                 task_id: Some("t-orphan".into()),
                 from: "lead".into(),
                 to: "worker".into(),
+                from_id: None,
+                to_id: None,
                 delegated_at: old_ts,
                 status: "pending".into(),
             },
@@ -284,6 +300,8 @@ mod tests {
                 task_id: Some("t-old".into()),
                 from: "lead".into(),
                 to: "dev".into(),
+                from_id: None,
+                to_id: None,
                 delegated_at: (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339(),
                 status: "completed".into(),
             },
@@ -295,6 +313,8 @@ mod tests {
                 task_id: Some("t-recent".into()),
                 from: "lead".into(),
                 to: "dev".into(),
+                from_id: None,
+                to_id: None,
                 delegated_at: chrono::Utc::now().to_rfc3339(),
                 status: "completed".into(),
             },

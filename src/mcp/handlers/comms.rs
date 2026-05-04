@@ -324,6 +324,12 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 task_id: task_id.clone(),
                 from: sender.as_str().to_string(),
                 to: target.to_string(),
+                from_id: crate::agent::resolve_instance(home, sender.as_str())
+                    .ok()
+                    .map(|(id, _)| id.full()),
+                to_id: crate::agent::resolve_instance(home, target)
+                    .ok()
+                    .map(|(id, _)| id.full()),
                 delegated_at: chrono::Utc::now().to_rfc3339(),
                 status: "pending".to_string(),
             },

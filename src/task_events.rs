@@ -361,6 +361,9 @@ pub struct TaskEventEnvelope {
     pub timestamp: String,
     /// Which agent emitted this event.
     pub instance: InstanceName,
+    /// Sprint 46 P3: emitter's InstanceId for audit trail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emitter_id: Option<String>,
     pub event: TaskEvent,
 }
 
@@ -647,6 +650,11 @@ pub fn append_batch(
     let mut seqs: Vec<u64> = Vec::with_capacity(count);
     let now = chrono::Utc::now().to_rfc3339();
 
+    // Sprint 46 P3: resolve emitter's InstanceId for audit trail.
+    let emitter_id = crate::agent::resolve_instance(home, instance.as_str())
+        .ok()
+        .map(|(id, _)| id.full());
+
     crate::event_log::append_lines_under_lock(home, LOG_NAME, |log_path| {
         let start_seq = max_seq_for_instance(log_path, &instance)? + 1;
         let mut lines = Vec::with_capacity(count);
@@ -658,6 +666,7 @@ pub fn append_batch(
                 seq,
                 timestamp: now.clone(),
                 instance: instance.clone(),
+                emitter_id: emitter_id.clone(),
                 event,
             };
             lines.push(serde_json::to_string(&envelope)?);
@@ -1001,6 +1010,7 @@ mod tests {
                 seq: i as u64,
                 timestamp: format!("2026-04-27T{:02}:00:00Z", i % 24),
                 instance: inst.clone(),
+                emitter_id: None,
                 event: TaskEvent::Unblocked {
                     task_id: format!("t-{i}").as_str().into(),
                 },
@@ -1228,6 +1238,7 @@ mod tests {
             seq: 1,
             timestamp: "2026-04-27T01:00:00+09:00".into(),
             instance: InstanceName::from("u"),
+            emitter_id: None,
             event: sample_event("t-TZ"),
         };
         let env_b = TaskEventEnvelope {
@@ -1235,6 +1246,7 @@ mod tests {
             seq: 2,
             timestamp: "2026-04-27T00:00:00Z".into(),
             instance: InstanceName::from("u"),
+            emitter_id: None,
             event: TaskEvent::Done {
                 task_id: "t-TZ".into(),
                 by: "u".into(),
@@ -1275,6 +1287,7 @@ mod tests {
                 seq: 2,
                 timestamp: "2026-04-27T00:00:02Z".into(),
                 instance: InstanceName::from("u"),
+                emitter_id: None,
                 event: TaskEvent::Claimed {
                     task_id: "t-O".into(),
                     by: "u".into(),
@@ -1285,6 +1298,7 @@ mod tests {
                 seq: 1,
                 timestamp: "2026-04-27T00:00:01Z".into(),
                 instance: InstanceName::from("u"),
+                emitter_id: None,
                 event: sample_event("t-O"),
             },
         ];
@@ -1652,6 +1666,7 @@ mod tests {
                 seq: 1,
                 timestamp: "2026-04-27T00:00:01Z".into(),
                 instance: inst.clone(),
+                emitter_id: None,
                 event: TaskEvent::Created {
                     task_id: TaskId::from("t-S1"),
                     title: "s1".into(),
@@ -1672,6 +1687,7 @@ mod tests {
                 seq: 1,
                 timestamp: "2026-04-27T00:00:03Z".into(),
                 instance: sweep.clone(),
+                emitter_id: None,
                 event: TaskEvent::Linked {
                     task_id: TaskId::from("t-S1"),
                     pr_id: PrId(42),
@@ -1691,6 +1707,7 @@ mod tests {
                 seq: 2,
                 timestamp: "2026-04-27T00:00:02Z".into(),
                 instance: inst.clone(),
+                emitter_id: None,
                 event: TaskEvent::Claimed {
                     task_id: TaskId::from("t-S1"),
                     by: inst.clone(),
@@ -1701,6 +1718,7 @@ mod tests {
                 seq: 2,
                 timestamp: "2026-04-27T00:00:04Z".into(),
                 instance: sweep.clone(),
+                emitter_id: None,
                 event: TaskEvent::Done {
                     task_id: TaskId::from("t-S1"),
                     by: inst.clone(),
@@ -1740,5 +1758,45 @@ mod tests {
         );
         fs::remove_dir_all(&home_a).ok();
         fs::remove_dir_all(&home_b).ok();
+    }
+
+    // ── Sprint 46 P3: audit trail round-trip tests ──────────────────
+
+    #[test]
+    fn emitter_id_round_trips_through_serde() {
+        let env = TaskEventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            seq: 1,
+            timestamp: "2026-05-04T00:00:00Z".into(),
+            instance: InstanceName::from("dev"),
+            emitter_id: Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".into()),
+            event: sample_event("t-rt"),
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(json.contains("a1b2c3d4"));
+        let deser: TaskEventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            deser.emitter_id.as_deref(),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+        );
+    }
+
+    #[test]
+    fn emitter_id_none_omitted_from_json() {
+        let env = TaskEventEnvelope {
+            schema_version: SCHEMA_VERSION,
+            seq: 1,
+            timestamp: "2026-05-04T00:00:00Z".into(),
+            instance: InstanceName::from("dev"),
+            emitter_id: None,
+            event: sample_event("t-rt2"),
+        };
+        let json = serde_json::to_string(&env).expect("serialize");
+        assert!(
+            !json.contains("emitter_id"),
+            "None emitter_id must be omitted"
+        );
+        let deser: TaskEventEnvelope = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deser.emitter_id, None);
     }
 }
