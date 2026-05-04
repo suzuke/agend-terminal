@@ -2,7 +2,7 @@
 
 use crate::agent::{self, AgentRegistry};
 use crate::app::MenuItem;
-use crate::layout::{DragTabTarget, Layout, PaneNode, SplitDir};
+use crate::layout::{DragTabTarget, Layout, PaneNode};
 use crate::state::AgentState;
 use ratatui::layout::{Alignment, Constraint, Direction, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -229,7 +229,6 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, layout: &Layout, registry: &Age
     frame.render_widget(tabs, area);
 }
 
-/// Split an area into two child rects that overlap by 1 cell on the split axis
 // split_chunks moved to layout/split.rs (Sprint 48 PR 1 — cross-dep resolution).
 
 fn render_pane_tree(
@@ -2343,7 +2342,7 @@ mod tests {
             "second chunk height must be ≥1, got {}",
             b.height
         );
-        let [_c, d] = split_chunks(area, &crate::layout::SplitDir::Vertical, 0.9);
+        let [_c, d] = crate::layout::split_chunks(area, &crate::layout::SplitDir::Vertical, 0.9);
         assert!(
             d.width >= 1,
             "second chunk width must be ≥1, got {}",

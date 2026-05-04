@@ -9,11 +9,11 @@ pub mod tree;
 // Re-export all public types so callers keep using `crate::layout::X`.
 pub use pane::{Pane, PaneSource, Selection};
 pub use preset::LayoutPreset;
-pub use split::{
-    adjust_split_ratio, find_split_border, ratio_to_size, resize_focused, split_child_areas,
-    Direction, SplitBorderHit, VSPLIT_BORDER_HIT_TOLERANCE,
-};
 pub(crate) use split::split_chunks;
+pub use split::{adjust_split_ratio, find_split_border, resize_focused, Direction, SplitBorderHit};
+// Re-export for tests.
+#[cfg(test)]
+pub(crate) use split::{ratio_to_size, split_child_areas};
 pub use tab::{DragTabTarget, Tab};
 pub use tree::{swap_panes, PaneNode, SplitDir};
 
@@ -196,11 +196,7 @@ impl Layout {
 }
 
 /// Resize all panes in the active tab to fit the given area.
-pub fn resize_panes(
-    pane_area: Rect,
-    layout: &mut Layout,
-    registry: &crate::agent::AgentRegistry,
-) {
+pub fn resize_panes(pane_area: Rect, layout: &mut Layout, registry: &crate::agent::AgentRegistry) {
     let tab = match layout.tabs.get_mut(layout.active) {
         Some(t) => t,
         None => return,
@@ -257,3 +253,6 @@ fn collect_resize_needs(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

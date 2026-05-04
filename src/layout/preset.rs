@@ -2,7 +2,6 @@
 
 use super::pane::Pane;
 use super::tree::{PaneNode, SplitDir, DEFAULT_RATIO};
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayoutPreset {
     /// All panes side by side (vertical splits).

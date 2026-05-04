@@ -1,7 +1,6 @@
 //! Split math — ratio calculation, hit-testing, resize, spatial navigation.
 
-use super::pane::Pane;
-use super::tree::{PaneNode, SplitDir, MIN_PANE_CELLS, ratio_bounds};
+use super::tree::{ratio_bounds, PaneNode, SplitDir};
 use ratatui::layout::Rect;
 
 pub fn ratio_to_size(ratio: f32, total: u16) -> u16 {

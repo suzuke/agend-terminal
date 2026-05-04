@@ -1,7 +1,6 @@
 //! Pane tree — PaneNode, SplitDir, tree transforms, swap.
 
 use super::pane::Pane;
-
 /// Split direction.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum SplitDir {
@@ -256,8 +255,6 @@ pub(super) fn remove_from_tree(node: PaneNode, target_id: usize) -> (PaneNode, O
 }
 
 // --- Layout presets ---
-
-/// Predefined pane arrangement patterns (tmux-compatible).
 
 pub fn swap_panes(root: &mut PaneNode, id_a: usize, id_b: usize) -> bool {
     if id_a == id_b {

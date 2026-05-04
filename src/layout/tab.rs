@@ -1,10 +1,9 @@
 //! Tab — container for a pane tree with focus tracking.
 
-use super::pane::{Pane, PaneSource};
+use super::pane::Pane;
 use super::preset::{build_preset, flatten_tree_into, LayoutPreset};
 use super::split::{center, overlaps_x, overlaps_y, Direction};
-use super::tree::{split_in_tree, remove_from_tree, PaneNode, SplitDir, DEFAULT_RATIO};
-use ratatui::layout::Rect;
+use super::tree::{remove_from_tree, split_in_tree, PaneNode, SplitDir};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DragTabTarget {
