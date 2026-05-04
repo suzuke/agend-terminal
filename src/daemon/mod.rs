@@ -1179,8 +1179,8 @@ mod tests {
         // registry + configs, no respawn thread spawned.
         let (tx, rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(8);
         tx.send(crate::agent::AgentExitEvent::CleanExit("agent-1".into()))
-            .unwrap();
-        let event = rx.recv().unwrap();
+            .expect("send test event");
+        let event = rx.recv().expect("recv test event");
         assert!(
             matches!(event, crate::agent::AgentExitEvent::CleanExit(ref n) if n == "agent-1"),
             "expected CleanExit, got {event:?}"
@@ -1196,8 +1196,8 @@ mod tests {
         // Simulate: daemon receives Crash event → should trigger respawn.
         let (tx, rx) = crossbeam_channel::bounded::<crate::agent::AgentExitEvent>(8);
         tx.send(crate::agent::AgentExitEvent::Crash("agent-2".into()))
-            .unwrap();
-        let event = rx.recv().unwrap();
+            .expect("send test event");
+        let event = rx.recv().expect("recv test event");
         let is_crash =
             matches!(event, crate::agent::AgentExitEvent::Crash(ref n) if n == "agent-2");
         assert!(is_crash, "Crash event must be recognized for respawn");
