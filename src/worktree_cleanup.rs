@@ -1,22 +1,22 @@
 //! Worktree auto-cleanup v2 — runtime registry based.
 //!
 //! Gated by `AGEND_WORKTREE_AUTO_CLEANUP=1` (opt-in).
-//! Sweeps worktrees whose branches are merged into main, using the daemon's
+//! Sweeps worktrees whose branches are merged into main OR whose remote
+//! tracking ref has been deleted (squash-merged PRs), using the daemon's
 //! live AgentConfig registry to find repos and detect in-use worktrees.
+//! Also prunes orphaned local branches with no worktree.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Returns true when the `AGEND_WORKTREE_AUTO_CLEANUP` feature flag is set to "1".
-/// M4 note: tests use set_var to toggle this flag. Production reads once at
-/// call time — acceptable since worktree cleanup is not a hot path.
-/// Full explicit-param migration deferred (test-only concern, low priority).
+/// Returns true unless `AGEND_WORKTREE_AUTO_CLEANUP` is explicitly set to "0".
+/// Cleanup is on by default — set `AGEND_WORKTREE_AUTO_CLEANUP=0` to disable.
 pub fn auto_cleanup_enabled() -> bool {
     std::env::var("AGEND_WORKTREE_AUTO_CLEANUP")
         .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false)
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Entry for a git worktree.
@@ -66,6 +66,35 @@ fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Check if a branch's remote tracking ref has been deleted (i.e. the PR was
+/// squash-merged or the remote branch was deleted). This catches the common
+/// case where `is_branch_merged` returns false because GitHub squash-merge
+/// rewrites the commit hash.
+fn is_remote_gone(repo_root: &Path, branch: &str) -> bool {
+    // Read upstream tracking ref: "refs/remotes/origin/<branch>" or empty
+    let output = Command::new("git")
+        .args(["config", &format!("branch.{branch}.remote")])
+        .current_dir(repo_root)
+        .output();
+    let has_remote = output
+        .as_ref()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false);
+    if !has_remote {
+        // No remote configured — not a remote-tracking branch, don't treat as "gone"
+        return false;
+    }
+    // Check if the remote ref still exists
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let exists = Command::new("git")
+        .args(["rev-parse", "--verify", &remote_ref])
+        .current_dir(repo_root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(true); // assume exists on error (safe default)
+    !exists
 }
 
 /// Check if a worktree has uncommitted changes.
@@ -146,6 +175,7 @@ pub fn sweep_from_registry(
     let mut removed = Vec::new();
 
     for repo in &repos {
+        // Phase 1: clean worktrees (existing logic + remote-gone)
         let entries = list_worktrees(repo);
         for entry in &entries {
             let wt_path = Path::new(&entry.path);
@@ -160,16 +190,90 @@ pub fn sweep_from_registry(
                 continue;
             }
 
-            if !is_branch_merged(repo, &entry.branch) {
+            let merged = is_branch_merged(repo, &entry.branch);
+            let gone = is_remote_gone(repo, &entry.branch);
+            if !merged && !gone {
                 continue;
             }
 
+            tracing::info!(
+                branch = %entry.branch,
+                path = %entry.path,
+                reason = if merged { "merged" } else { "remote-gone" },
+                "removing stale worktree"
+            );
             if remove_worktree(repo, &entry.path, &entry.branch) {
                 removed.push((entry.branch.clone(), entry.path.clone()));
             }
         }
+
+        // Phase 2: prune orphaned branches (no worktree, remote gone or merged)
+        prune_stale_worktrees(repo);
+        let pruned = prune_orphaned_branches(repo);
+        for branch in pruned {
+            removed.push((branch, String::new()));
+        }
     }
     removed
+}
+
+/// Run `git worktree prune` then delete local branches whose remote tracking
+/// ref is gone or that are merged into main. Skips branches checked out in
+/// any worktree.
+fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
+    // Collect branches currently checked out in worktrees — cannot delete these
+    let wt_branches: HashSet<String> = list_worktrees(repo_root)
+        .into_iter()
+        .map(|e| e.branch)
+        .collect();
+
+    let output = Command::new("git")
+        .args(["branch", "--format=%(refname:short)"])
+        .current_dir(repo_root)
+        .output();
+    let branches: Vec<String> = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|b| *b != "main" && *b != "master")
+            .map(String::from)
+            .collect(),
+        _ => return Vec::new(),
+    };
+
+    let mut pruned = Vec::new();
+    for branch in &branches {
+        if wt_branches.contains(branch) {
+            continue;
+        }
+        let merged = is_branch_merged(repo_root, branch);
+        let gone = is_remote_gone(repo_root, branch);
+        if !merged && !gone {
+            continue;
+        }
+        let ok = Command::new("git")
+            .args(["branch", "-D", branch])
+            .current_dir(repo_root)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            tracing::info!(
+                branch,
+                reason = if merged { "merged" } else { "remote-gone" },
+                "pruned orphaned branch"
+            );
+            pruned.push(branch.clone());
+        }
+    }
+    pruned
+}
+
+/// Run `git worktree prune` to clean stale worktree bookkeeping entries.
+fn prune_stale_worktrees(repo_root: &Path) {
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_root)
+        .output();
 }
 
 #[cfg(test)]
@@ -213,7 +317,15 @@ mod tests {
     fn test_flag_disabled_default() {
         let _lock = ENV_LOCK.lock();
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        assert!(auto_cleanup_enabled());
+    }
+
+    #[test]
+    fn test_flag_disabled_explicit() {
+        let _lock = ENV_LOCK.lock();
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "0");
         assert!(!auto_cleanup_enabled());
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
     }
 
     #[test]
@@ -227,10 +339,11 @@ mod tests {
     #[test]
     fn test_sweep_noop_when_flag_disabled() {
         let _lock = ENV_LOCK.lock();
-        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "0");
         let configs = HashMap::new();
         let removed = sweep_from_registry(&configs, &[]);
         assert!(removed.is_empty());
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
     }
 
     #[test]
@@ -343,5 +456,88 @@ mod tests {
         assert!(wt.exists(), "worktree dir must still exist");
         std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn test_v2_remote_gone_worktree_removed() {
+        // Simulate squash-merge: branch is NOT merged (different hash) but
+        // remote tracking ref is gone after `git fetch --prune`.
+        let _lock = ENV_LOCK.lock();
+
+        // Create "remote" bare repo
+        let remote_dir = std::env::temp_dir().join(format!(
+            "agend-wt-v2-remote-gone-{}-{}",
+            std::process::id(),
+            std::sync::atomic::AtomicU32::new(0).fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&remote_dir).ok();
+        git_in(&remote_dir, &["init", "--bare", "-b", "main"]);
+
+        // Clone it
+        let repo = std::env::temp_dir().join(format!(
+            "agend-wt-v2-remote-gone-clone-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&repo);
+        Command::new("git")
+            .args([
+                "clone",
+                remote_dir.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ])
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("clone");
+        std::fs::write(repo.join("README.md"), "init").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "init"]);
+        git_in(&repo, &["push", "-u", "origin", "main"]);
+
+        // Create a feature branch, push it, then delete remote ref
+        git_in(&repo, &["checkout", "-b", "feat/squashed"]);
+        std::fs::write(repo.join("feat.txt"), "feature").ok();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "feature work"]);
+        git_in(&repo, &["push", "-u", "origin", "feat/squashed"]);
+        git_in(&repo, &["checkout", "main"]);
+
+        // Create worktree on that branch
+        let wt = repo.join("wt-squashed");
+        git_in(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "feat/squashed"],
+        );
+
+        // Simulate: remote branch deleted (squash-merged on GitHub)
+        git_in(&remote_dir, &["branch", "-D", "feat/squashed"]);
+        git_in(&repo, &["fetch", "--prune"]);
+
+        // Branch is NOT merged (different commit hash) but remote is gone
+        assert!(
+            !is_branch_merged(&repo, "feat/squashed"),
+            "branch should NOT be detected as merged"
+        );
+        assert!(
+            is_remote_gone(&repo, "feat/squashed"),
+            "branch remote should be detected as gone"
+        );
+
+        std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+        let mut configs = HashMap::new();
+        configs.insert(
+            "other".to_string(),
+            (Some(repo.join("other")), Some(repo.clone())),
+        );
+        let removed = sweep_from_registry(&configs, &[]);
+        assert!(
+            removed.iter().any(|(b, _)| b == "feat/squashed"),
+            "remote-gone worktree must be removed: {removed:?}"
+        );
+        std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+        std::fs::remove_dir_all(&repo).ok();
+        std::fs::remove_dir_all(&remote_dir).ok();
     }
 }
