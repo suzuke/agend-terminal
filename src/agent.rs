@@ -252,9 +252,17 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Spawn an agent with PTY and register in registry.
-/// Channel for crash events from reaper to daemon.
-pub type CrashChannel = crossbeam_channel::Sender<String>;
+/// Exit event sent from the PTY reaper to the daemon main loop.
+#[derive(Debug, Clone)]
+pub enum AgentExitEvent {
+    /// Agent crashed or exited unexpectedly — daemon should respawn.
+    Crash(String),
+    /// Agent exited cleanly (exit code 0, e.g. `/exit` or `/quit`) — no respawn.
+    CleanExit(String),
+}
+
+/// Channel for exit events from reaper to daemon.
+pub type CrashChannel = crossbeam_channel::Sender<AgentExitEvent>;
 
 /// Configuration for spawning an agent.
 ///
@@ -857,18 +865,24 @@ fn handle_pty_close(
     // orphaned to PID 1) and the 2s timeout (leader still alive).
     sweep_child_tree(name, registry);
 
-    // In daemon mode, ALL unexpected exits trigger respawn — even exit 0.
-    // An agent exiting on its own (not via `kill` or shutdown) is unexpected.
-    // Only daemon shutdown and explicit `kill` skip respawn (handled above).
-    if is_crash {
-        tracing::info!(agent = name, "setting restarting state");
-    } else {
-        tracing::warn!(
-            agent = name,
-            "unexpected exit (code 0), treating as crash for respawn"
-        );
+    if !is_crash {
+        // Clean exit (code 0): user typed /exit, /quit, or similar.
+        // Do NOT respawn — remove from registry and clean up.
+        tracing::info!(agent = name, "clean exit (code 0), no respawn");
+        if let Some(ref home) = home {
+            crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
+            crate::event_log::log(home, "clean_exit", name, "agent exited cleanly");
+        }
+        if let Some(ref tx) = crash_tx {
+            if let Err(e) = tx.try_send(AgentExitEvent::CleanExit(name.to_string())) {
+                tracing::warn!(agent = %name, error = %e, "exit channel full — clean exit event dropped");
+            }
+        }
+        return;
     }
-    // Set Restarting state (don't remove from registry)
+
+    // Crash: set Restarting state and notify daemon for respawn.
+    tracing::info!(agent = name, "setting restarting state");
     {
         let reg = registry.lock();
         if let Some(handle) = reg.get(name) {
@@ -877,11 +891,7 @@ fn handle_pty_close(
         }
     }
     if let Some(ref tx) = crash_tx {
-        // Non-blocking send: the channel is bounded (see daemon::run), so a
-        // stalled reaper must not wedge this PTY close handler. Dropping a
-        // crash event means one agent skips auto-respawn — the next health
-        // probe will still catch a persistent failure.
-        if let Err(e) = tx.try_send(name.to_string()) {
+        if let Err(e) = tx.try_send(AgentExitEvent::Crash(name.to_string())) {
             tracing::warn!(agent = %name, error = %e, "crash channel full — respawn event dropped");
         }
     }

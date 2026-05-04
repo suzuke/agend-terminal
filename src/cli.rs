@@ -349,7 +349,7 @@ pub fn run_demo() -> anyhow::Result<()> {
     println!("  AgEnD Terminal — Live Multi-Agent Demo (Live Preview)\n");
     println!("  Spawning alice and bob...");
 
-    let (crash_tx, _rx) = crossbeam_channel::unbounded::<String>();
+    let (crash_tx, _rx) = crossbeam_channel::unbounded::<crate::agent::AgentExitEvent>();
     let args: Vec<String> = vec![];
     let shell = crate::default_shell();
     for name in &["alice", "bob"] {
