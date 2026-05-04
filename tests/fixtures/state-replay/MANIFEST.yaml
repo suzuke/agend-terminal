@@ -32,11 +32,11 @@ fixtures:
     cli_version: "0.120.0"
     recorded_on: "2026-04-20"
     scenario: "startup hits structural Press-Enter prompt, user was at usage limit"
-    # InteractivePrompt here fires via is_generic_startup_prompt or codex
-    # `Press enter to continue` pattern before the Ready banner appears.
-    # UsageLimit at the end because this recording happened to catch the
-    # quota-exceeded banner — a bonus regression test for that path.
-    expected_transitions: [starting, interactive_prompt, usage_limit]
+    # Sprint 46: codex InteractivePrompt regex removed (false-positive on
+    # idle `›` prompt). Without the pattern, the `›` prompt fires Idle,
+    # then Thinking from the working spinner, then UsageLimit from the
+    # quota-exceeded banner.
+    expected_transitions: [starting, idle, thinking, usage_limit]
     expected_final_state: usage_limit
     expected_final_detect: usage_limit
 
@@ -45,17 +45,12 @@ fixtures:
     cli_version: "0.120.0"
     recorded_on: "2026-04-20"
     scenario: "startup with Update available! menu, dismissed, then short prompt + response"
-    # Transitions: Starting → InteractivePrompt when Update menu renders.
-    # No further transitions observed in replay because hysteresis
-    # (InteractivePrompt is active-state, 2s min_hold) does not elapse
-    # during byte-level replay — each chunk is processed in microseconds.
-    # In production the hold always elapses between PTY reads, so
-    # dismissal drops back to Ready/Idle (unit test
-    # `pipeline_codex_update_menu_dismiss_returns_to_ready` covers that).
-    # Final detect() returns Idle because the menu text has scrolled off
-    # and the `› ` prompt glyph is visible on the final grid.
-    expected_transitions: [starting, interactive_prompt]
-    expected_final_state: interactive_prompt
+    # Sprint 46: codex InteractivePrompt regex removed (false-positive on
+    # idle `›` prompt). Without the pattern, the `›` prompt fires Idle,
+    # then the working spinner fires Thinking. Final detect() returns
+    # Idle because the `› ` prompt glyph is visible on the final grid.
+    expected_transitions: [starting, idle, thinking]
+    expected_final_state: thinking
     expected_final_detect: idle
 
   - file: gemini-thinking.raw
@@ -122,22 +117,16 @@ fixtures:
     cli_version: "0.120.0"
     recorded_on: "2026-04-20"
     scenario: "prompt 'write hello to /Users/suzuke/codex-perm-test.txt' (path outside default workspace-write sandbox) -> codex requests approval to run an escalated command -> user cancels -> /exit"
-    # Codex 0.120.0 dialog wording — `Would you like to run the
-    # following command?` header plus `1. Yes, proceed` / `3. No, and
-    # tell Codex` options plus `Press enter to confirm or esc to
-    # cancel` footer — is now matched by the expanded PermissionPrompt
-    # pattern, firing at byte ~68K when the approval dialog renders.
-    # InteractivePrompt still fires first at ~byte 1024 via the Update
-    # banner (`Press enter to continue`). Upward transition to
-    # PermissionPrompt (prio 8 > InteractivePrompt prio 7) is
-    # instantaneous, so it surfaces in the replay transition log.
-    # After the user cancels, the dialog disappears and the post-
-    # cancel frame shows `• Ran printf ...` / `└ (no output)`, which
-    # the Codex ToolUse pattern matches — hence detect()=tool_use on
+    # Sprint 46: codex InteractivePrompt regex removed (false-positive on
+    # idle `›` prompt). Without the pattern, the `›` prompt fires Idle,
+    # then Thinking from the working spinner, then PermissionPrompt from
+    # the approval dialog. After the user cancels, the dialog disappears
+    # and the post-cancel frame shows `• Ran printf ...` / `└ (no output)`,
+    # which the Codex ToolUse pattern matches — hence detect()=tool_use on
     # the final screen. The tracker retains PermissionPrompt via
     # hysteresis (byte-level replay cannot cross the 2s/5s min_hold
     # needed to downgrade from prio 8 to prio 5).
-    expected_transitions: [starting, interactive_prompt, permission]
+    expected_transitions: [starting, idle, thinking, permission]
     expected_final_state: permission
     expected_final_detect: tool_use
 
@@ -173,19 +162,15 @@ fixtures:
     cli_version: "0.120.0"
     recorded_on: "2026-04-20"
     scenario: "prompt 'read the README.md file' -> codex reads + summarizes -> /exit (recording tail shows the `/exit` slash-command autocomplete menu)"
-    # Codex 0.120.0 tool-block format (`• Explored` title + `└ Read
-    # README.md` continuation) is now covered by an expanded Codex
-    # ToolUse pattern, verified by codex_tooluse_title_line_match /
-    # codex_tooluse_continuation_line_match unit tests. Replay
-    # baseline unchanged: InteractivePrompt fires at byte ~1024 from
-    # the `Update available!` banner (prio 7, outranks ToolUse prio
-    # 5); hysteresis blocks the downgrade under byte-level replay
-    # where elapsed time does not cross the 5s passive min_hold.
-    # Final detect() returns None because the tool-block lines scroll
-    # off the visible tail by the final frame (only the `Token usage:`
-    # / `resume ...` summary lines remain).
-    expected_transitions: [starting, interactive_prompt]
-    expected_final_state: interactive_prompt
+    # Sprint 46: codex InteractivePrompt regex removed (false-positive on
+    # idle `›` prompt). Without the pattern, the `›` prompt fires Idle,
+    # then Thinking from the working spinner. Hysteresis blocks the
+    # downgrade under byte-level replay. Final detect() returns None
+    # because the tool-block lines scroll off the visible tail by the
+    # final frame (only the `Token usage:` / `resume ...` summary lines
+    # remain).
+    expected_transitions: [starting, idle, thinking]
+    expected_final_state: thinking
     expected_final_detect: null
 
   - file: gemini-tooluse.raw
