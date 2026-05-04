@@ -9,10 +9,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Sprint 47 P1: cancel superseded PR runs; main pushes run to completion.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   check:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -37,9 +43,11 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
 
       - name: Format check
+        timeout-minutes: 5
         run: cargo fmt --check
 
       - name: Clippy
+        timeout-minutes: 10
         run: cargo clippy -- -D warnings
 
       # Tray feature gate (docs/archived/PLAN-tray-resident.md). Release binaries
@@ -47,15 +55,19 @@ jobs:
       # this step just guarantees the feature code compiles on all three
       # platforms so per-OS regressions surface before the event loop lands.
       - name: Clippy (tray feature)
+        timeout-minutes: 10
         run: cargo clippy --all-targets --features tray -- -D warnings
 
       - name: Build
+        timeout-minutes: 20
         run: cargo build --release
 
       - name: Unit tests
+        timeout-minutes: 20
         run: cargo test --bin agend-terminal
 
       - name: Unit tests (tray feature)
+        timeout-minutes: 20
         run: cargo test --bin agend-terminal --features tray
 
       # Sprint 23 P1 — anti-bypass invariant tests live in tests/*.rs but
@@ -68,9 +80,11 @@ jobs:
       # file plus already-covered unit tests; the unit-test repeat is
       # cheap (cached) and keeps the invariant net fail-loud.
       - name: Integration tests + anti-bypass invariants
+        timeout-minutes: 30
         run: cargo test --tests
 
       - name: CLI smoke (Phase C.5)
+        timeout-minutes: 10
         shell: bash
         env:
           AGEND_HOME: ${{ runner.temp }}/agend-smoke
@@ -132,6 +146,7 @@ jobs:
           cat daemon.log || true
 
       - name: Upload binary (Unix)
+        timeout-minutes: 5
         if: runner.os != 'Windows'
         uses: actions/upload-artifact@v5
         with:
@@ -140,6 +155,7 @@ jobs:
           retention-days: 14
 
       - name: Upload binary (Windows)
+        timeout-minutes: 5
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v5
         with:
