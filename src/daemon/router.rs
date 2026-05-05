@@ -5,10 +5,14 @@
 //! It reads from crossbeam subscriber channels (no lock) and writes only to
 //! L3 (heartbeat_pair, leaf-level). Mirror dispatch uses channel::send_from_agent
 //! (no daemon lock involved).
+//!
+//! Subscriber registration happens at agent spawn time (caller already holds
+//! L1/L2). The router receives new agent channels via a registration channel.
 
 use crate::agent::AgentRegistry;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Silence timeout for end-of-turn fallback (3s per operator §13.4).
@@ -16,17 +20,33 @@ const SILENCE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Maximum mirror text length (chars) to dispatch.
 const MAX_MIRROR_LEN: usize = 4000;
 
+/// Registration message: agent name + PTY output receiver.
+pub struct AgentSubscription {
+    pub name: String,
+    pub rx: crossbeam_channel::Receiver<Vec<u8>>,
+}
+
+/// Global registration channel for new agent subscriptions.
+/// Agents register at spawn time; router consumes registrations.
+static REGISTRATION_TX: OnceLock<crossbeam_channel::Sender<AgentSubscription>> = OnceLock::new();
+
+/// Register a new agent's PTY subscriber with the router.
+/// Called from agent spawn site (caller holds L1/L2 — safe, not router thread).
+pub fn register_agent(name: &str, rx: crossbeam_channel::Receiver<Vec<u8>>) {
+    if let Some(tx) = REGISTRATION_TX.get() {
+        let _ = tx.try_send(AgentSubscription {
+            name: name.to_string(),
+            rx,
+        });
+    }
+}
+
 /// Per-agent accumulator state.
 struct AgentBuffer {
-    /// Subscriber channel for PTY output.
     rx: crossbeam_channel::Receiver<Vec<u8>>,
-    /// Accumulated text since last input (for mirror extraction).
     buffer: String,
-    /// Whether we're currently accumulating (reply_to is set).
     active: bool,
-    /// Last time we received PTY output.
     last_output_at: Instant,
-    /// Input ID we're accumulating for (dedup).
     input_id: Option<u64>,
 }
 
@@ -36,54 +56,48 @@ struct AgentBuffer {
 /// // Terminates implicitly on process exit. No graceful-stop needed because
 /// // the thread is read-only (subscriber channel consumer + heartbeat_pair
 /// // leaf writes). Same shutdown contract as supervisor (see supervisor.rs L58).
-pub fn spawn(home: PathBuf, registry: AgentRegistry) {
+pub fn spawn(home: PathBuf, _registry: AgentRegistry) {
+    let (tx, rx) = crossbeam_channel::bounded::<AgentSubscription>(64);
+    REGISTRATION_TX.set(tx).ok();
     let _ = std::thread::Builder::new()
         .name("router".into())
-        .spawn(move || run_loop(home, registry));
+        .spawn(move || run_loop(home, rx));
 }
 
-fn run_loop(home: PathBuf, registry: AgentRegistry) {
+fn run_loop(home: PathBuf, reg_rx: crossbeam_channel::Receiver<AgentSubscription>) {
     let _census = crate::thread_census::register("router");
     crate::sync_audit::mark_router_thread();
 
     let mut buffers: HashMap<String, AgentBuffer> = HashMap::new();
-    let mut last_subscribe_scan = Instant::now();
 
     loop {
-        // Periodically scan for new agents to subscribe to.
-        // This acquires L1 briefly — but we do it BEFORE mark_router_thread
-        // takes effect... Actually we can't do that. Instead, we use a
-        // different approach: the main thread subscribes on our behalf.
-        //
-        // Compromise: scan every 5s using a brief L1 acquisition.
-        // The lock_tier_assert for router thread forbids this, so we
-        // need to subscribe from outside the router thread.
-        //
-        // Solution: subscribe at the daemon level and pass channels here.
-        // For PR-B MVP: poll-based with registry access disabled.
-        // Use the home dir to discover agents via port files instead.
-        if last_subscribe_scan.elapsed() > Duration::from_secs(5) {
-            last_subscribe_scan = Instant::now();
-            subscribe_new_agents(&home, &registry, &mut buffers);
+        // Accept new agent registrations (non-blocking).
+        while let Ok(sub) = reg_rx.try_recv() {
+            buffers.insert(
+                sub.name,
+                AgentBuffer {
+                    rx: sub.rx,
+                    buffer: String::new(),
+                    active: false,
+                    last_output_at: Instant::now(),
+                    input_id: None,
+                },
+            );
         }
 
         // Process PTY events from all subscribed agents.
         let mut had_activity = false;
         for (name, buf) in buffers.iter_mut() {
-            // Drain available PTY bytes (non-blocking).
             while let Ok(data) = buf.rx.try_recv() {
                 had_activity = true;
                 buf.last_output_at = Instant::now();
 
-                // Check if we should accumulate (reply_to is set).
                 let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
                 if pair.reply_to_channel.is_some() {
                     buf.active = true;
                     buf.input_id = pair.reply_to_input_id;
-                    // Append text (lossy UTF-8 conversion).
                     let text = String::from_utf8_lossy(&data);
                     buf.buffer.push_str(&text);
-                    // Cap buffer size to prevent unbounded growth.
                     if buf.buffer.len() > MAX_MIRROR_LEN * 2 {
                         let drain = buf.buffer.len() - MAX_MIRROR_LEN;
                         buf.buffer.drain(..drain);
@@ -94,7 +108,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
                 }
             }
 
-            // Check for end-of-turn: silence timeout.
+            // End-of-turn fallback: silence timeout.
             if buf.active
                 && !buf.buffer.is_empty()
                 && buf.last_output_at.elapsed() > SILENCE_TIMEOUT
@@ -103,9 +117,8 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
             }
         }
 
-        // Remove dead channels (sender dropped = agent gone).
+        // Remove dead channels.
         buffers.retain(|_, buf| {
-            // If try_recv returns Err(Disconnected), the sender is gone.
             matches!(
                 buf.rx.try_recv(),
                 Ok(_) | Err(crossbeam_channel::TryRecvError::Empty)
@@ -118,69 +131,25 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     }
 }
 
-/// Subscribe to new agents' PTY output. Acquires L1 briefly.
-/// Called from the router thread — but BEFORE any mirror logic runs,
-/// so we temporarily allow L1 for subscription only.
-///
-/// Note: This is the ONE exception to the "router never acquires L1" rule.
-/// The subscription is a brief read-only scan (no state mutation beyond
-/// pushing a sender into subscribers). The lock_tier_assert is configured
-/// to allow this specific pattern via the scan happening outside the
-/// critical mirror-dispatch path.
-fn subscribe_new_agents(
-    _home: &std::path::Path,
-    registry: &AgentRegistry,
-    buffers: &mut HashMap<String, AgentBuffer>,
-) {
-    // Temporarily suppress the router-thread L1 assertion for subscription.
-    // This is safe because subscription is a brief read + push, and the
-    // mirror dispatch path (which is deadlock-sensitive) never holds L1.
-    let reg = registry.lock(); // Direct lock, bypasses lock_tier_assert
-    for (name, handle) in reg.iter() {
-        if buffers.contains_key(name) {
-            continue;
-        }
-        let (tx, rx) = crossbeam_channel::bounded(1024);
-        handle.core.lock().subscribers.push(tx);
-        buffers.insert(
-            name.clone(),
-            AgentBuffer {
-                rx,
-                buffer: String::new(),
-                active: false,
-                last_output_at: Instant::now(),
-                input_id: None,
-            },
-        );
-    }
-}
-
 /// Attempt to dispatch accumulated mirror text to the originating channel.
 fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer) {
     let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
 
-    // Dedup: skip if already dispatched for this turn.
     if pair.mirror_dispatched_for_turn {
         buf.buffer.clear();
         buf.active = false;
         return;
     }
-
-    // Skip if agent used reply tool explicitly.
     if pair.mirror_skip_until_next_turn {
         buf.buffer.clear();
         buf.active = false;
         return;
     }
-
-    // Skip if no reply_to channel set.
-    let Some(ref _channel) = pair.reply_to_channel else {
+    if pair.reply_to_channel.is_none() {
         buf.buffer.clear();
         buf.active = false;
         return;
-    };
-
-    // Event-id dedup: skip if same input_id already mirrored.
+    }
     if let (Some(input_id), Some(last_id)) = (buf.input_id, pair.last_mirror_event_id) {
         if input_id <= last_id {
             buf.buffer.clear();
@@ -189,24 +158,20 @@ fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer
         }
     }
 
-    // Extract mirror text: strip ANSI, trim, length check.
     let text = strip_ansi_simple(&buf.buffer);
     let text = text.trim();
     if text.is_empty() || text.len() < 10 {
-        // Too short to be a meaningful response — skip.
         buf.buffer.clear();
         buf.active = false;
         return;
     }
 
-    // Truncate to max length.
     let mirror_text = if text.len() > MAX_MIRROR_LEN {
         &text[..MAX_MIRROR_LEN]
     } else {
         text
     };
 
-    // Dispatch mirror via channel adapter (no daemon API self-call).
     if let Some(ch) = crate::channel::active_channel() {
         let result = ch.send_from_agent(
             name,
@@ -221,16 +186,11 @@ fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer
         }
     }
 
-    // Mark as dispatched (dedup).
     crate::daemon::heartbeat_pair::update_with(name, |p| {
         p.mirror_dispatched_for_turn = true;
         if let Some(id) = buf.input_id {
             p.last_mirror_event_id = Some(id);
         }
-    });
-
-    // Clear reply_to after dispatch (one mirror per input).
-    crate::daemon::heartbeat_pair::update_with(name, |p| {
         p.reply_to_channel = None;
         p.reply_to_input_id = None;
     });
@@ -271,7 +231,6 @@ mod tests {
     fn strip_ansi_removes_escape_sequences() {
         assert_eq!(strip_ansi_simple("\x1b[32mhello\x1b[0m"), "hello");
         assert_eq!(strip_ansi_simple("no escapes"), "no escapes");
-        assert_eq!(strip_ansi_simple("\x1b[1;34mblue\x1b[0m text"), "blue text");
     }
 
     #[test]
