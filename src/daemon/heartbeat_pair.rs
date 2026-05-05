@@ -71,6 +71,20 @@ pub struct HeartbeatPair {
     /// auto-retry on ServerRateLimit (re-inject after backoff).
     /// Cleared on successful response (Ready/Idle transition).
     pub last_input_text: Option<String>,
+    // ── Sprint 52 router-layer state ─────────────────────────────────
+    /// Channel to mirror output to (e.g. "telegram"). Set on inbox dequeue.
+    /// Cleared on TUI keyboard input or Ready/Idle transition.
+    pub reply_to_channel: Option<String>,
+    /// Monotonic input ID for dedup. Incremented on each inbox dequeue.
+    pub reply_to_input_id: Option<u64>,
+    /// When reply_to was set (epoch ms).
+    pub reply_to_set_at_ms: i64,
+    /// Last mirror event ID dispatched (dedup guard).
+    pub last_mirror_event_id: Option<u64>,
+    /// Set true after mirror dispatched for current turn. Cleared on Ready/Idle.
+    pub mirror_dispatched_for_turn: bool,
+    /// Set by handle_reply — skip mirror for current turn (agent replied explicitly).
+    pub mirror_skip_until_next_turn: bool,
 }
 
 /// Per-instance lock registry. Keys are agent names (per
@@ -212,5 +226,88 @@ mod tests {
         reader
             .join()
             .expect("reader thread joined — no torn read panic");
+    }
+
+    // ── Sprint 52 Invariant 3 — reply_to lifecycle ───────────────────
+
+    #[test]
+    fn reply_to_set_on_inbox_dequeue() {
+        let name = "test-reply-to-set";
+        update_with(name, |p| {
+            p.reply_to_channel = Some("telegram".to_string());
+            p.reply_to_input_id = Some(1);
+            p.reply_to_set_at_ms = 1000;
+        });
+        let snap = snapshot_for(name);
+        assert_eq!(snap.reply_to_channel.as_deref(), Some("telegram"));
+        assert_eq!(snap.reply_to_input_id, Some(1));
+        assert_eq!(snap.reply_to_set_at_ms, 1000);
+    }
+
+    #[test]
+    fn reply_to_cleared_on_tui_input() {
+        let name = "test-reply-to-clear-tui";
+        update_with(name, |p| {
+            p.reply_to_channel = Some("telegram".to_string());
+            p.reply_to_input_id = Some(5);
+        });
+        // Simulate TUI keyboard clear:
+        update_with(name, |p| {
+            p.reply_to_channel = None;
+            p.reply_to_input_id = None;
+        });
+        let snap = snapshot_for(name);
+        assert_eq!(snap.reply_to_channel, None);
+        assert_eq!(snap.reply_to_input_id, None);
+    }
+
+    #[test]
+    fn reply_to_cleared_on_ready_transition() {
+        let name = "test-reply-to-clear-ready";
+        update_with(name, |p| {
+            p.reply_to_channel = Some("discord".to_string());
+            p.reply_to_input_id = Some(3);
+            p.mirror_dispatched_for_turn = true;
+            p.mirror_skip_until_next_turn = true;
+        });
+        // Simulate Ready transition clear:
+        update_with(name, |p| {
+            p.reply_to_channel = None;
+            p.reply_to_input_id = None;
+            p.mirror_dispatched_for_turn = false;
+            p.mirror_skip_until_next_turn = false;
+        });
+        let snap = snapshot_for(name);
+        assert_eq!(snap.reply_to_channel, None);
+        assert!(!snap.mirror_dispatched_for_turn);
+        assert!(!snap.mirror_skip_until_next_turn);
+    }
+
+    #[test]
+    fn reply_to_input_id_monotonic() {
+        let name = "test-reply-to-monotonic";
+        for i in 1..=5 {
+            update_with(name, |p| {
+                p.reply_to_input_id = Some(p.reply_to_input_id.unwrap_or(0) + 1);
+            });
+            let snap = snapshot_for(name);
+            assert_eq!(snap.reply_to_input_id, Some(i));
+        }
+    }
+
+    #[test]
+    fn reply_to_ephemeral_across_restart() {
+        let name = "test-reply-to-ephemeral";
+        update_with(name, |p| {
+            p.reply_to_channel = Some("telegram".to_string());
+            p.reply_to_input_id = Some(99);
+        });
+        // Simulate restart: clear the global registry (new HeartbeatPair is Default).
+        let fresh = HeartbeatPair::default();
+        assert_eq!(
+            fresh.reply_to_channel, None,
+            "default must be None (ephemeral)"
+        );
+        assert_eq!(fresh.reply_to_input_id, None);
     }
 }

@@ -882,6 +882,19 @@ pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, te
     crate::daemon::heartbeat_pair::update_with(agent_name, |p| {
         p.last_input_at_ms = crate::daemon::heartbeat_pair::now_ms();
         p.last_input_text = Some(text.to_string());
+        // Sprint 52: set reply_to for router-layer mirror dispatch.
+        // Only channel-sourced messages set reply_to (agent/system messages don't).
+        if let NotifySource::Channel(_, kind) = source {
+            let channel_name = match kind {
+                crate::channel::ChannelKind::Telegram => "telegram",
+                crate::channel::ChannelKind::Discord => "discord",
+            };
+            p.reply_to_channel = Some(channel_name.to_string());
+            p.reply_to_input_id = Some(p.reply_to_input_id.unwrap_or(0) + 1);
+            p.reply_to_set_at_ms = crate::daemon::heartbeat_pair::now_ms() as i64;
+            p.mirror_dispatched_for_turn = false;
+            p.mirror_skip_until_next_turn = false;
+        }
     });
     let notification = format_notification_for_inject(pointer_only_inject(), source, text);
     compose_aware_inject(home, agent_name, &notification);

@@ -104,10 +104,12 @@ impl Pane {
                     let _ = agent::write_to_agent(handle, bytes);
                 }
                 drop(reg);
-                // Record for ServerRateLimit auto-retry.
+                // Record for ServerRateLimit auto-retry + clear reply_to (Sprint 52).
                 if let Ok(text) = std::str::from_utf8(bytes) {
                     crate::daemon::heartbeat_pair::update_with(&self.agent_name, |p| {
                         p.last_input_text = Some(text.to_string());
+                        p.reply_to_channel = None;
+                        p.reply_to_input_id = None;
                     });
                 }
             }

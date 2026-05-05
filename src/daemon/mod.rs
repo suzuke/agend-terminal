@@ -7,6 +7,7 @@ pub(crate) mod heartbeat_pair;
 pub(crate) mod legacy_backfill;
 pub(crate) mod lifecycle;
 pub(crate) mod poll_reminder;
+pub(crate) mod router;
 pub(crate) mod supervisor;
 pub(crate) mod task_sweep;
 pub(crate) mod ticker;
@@ -326,6 +327,7 @@ fn run_core(
     // Unix-only (the supervisor itself is Unix-only).
     #[cfg(unix)]
     supervisor::spawn(home.to_path_buf(), Arc::clone(&registry));
+    router::spawn(home.to_path_buf(), Arc::clone(&registry));
     crate::instance_monitor::spawn_monitor_tick(home.to_path_buf(), Arc::clone(&registry));
 
     // Recover any half-written inbox files from a previous crash.

@@ -16,7 +16,13 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         instance_name,
         crate::channel::AgentOutboundOp::Reply { text },
     ) {
-        Ok(msg) => json!({ "message_id": msg.id }),
+        Ok(msg) => {
+            // Sprint 52: agent replied explicitly — skip mirror for this turn.
+            crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
+                p.mirror_skip_until_next_turn = true;
+            });
+            json!({ "message_id": msg.id })
+        }
         Err(e) => json!({"error": format!("{e}")}),
     }
 }
