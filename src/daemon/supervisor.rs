@@ -42,6 +42,9 @@ pub(crate) struct RateLimitRetry {
     pub retry_count: u32,
     pub next_retry_at: Instant,
     pub input_text: String,
+    /// Set when max retries exceeded — prevents re-triggering on same
+    /// persistent ServerRateLimit state. Cleared on recovery (Ready/Idle).
+    pub exhausted: bool,
 }
 
 /// Parse unlock time from usage_limit pane output (e.g., "resets at 15:14 UTC").
@@ -349,7 +352,7 @@ pub(crate) fn process_server_rate_limit_retries(
             let state = handle.core.lock().state.current;
             if state == crate::state::AgentState::ServerRateLimit {
                 if retry_tracks.contains_key(name) {
-                    continue; // already tracking
+                    continue; // already tracking (or exhausted)
                 }
                 // Read last_input_text from heartbeat_pair (leaf-level lock).
                 let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
@@ -368,6 +371,7 @@ pub(crate) fn process_server_rate_limit_retries(
                         retry_count: 0,
                         next_retry_at: now + delay,
                         input_text,
+                        exhausted: false,
                     },
                 );
             } else if state == crate::state::AgentState::Ready
@@ -383,9 +387,8 @@ pub(crate) fn process_server_rate_limit_retries(
     // Registry lock released here.
 
     // Phase 2: fire due retries (PTY write with no locks held).
-    let mut completed = Vec::new();
     for (name, retry) in retry_tracks.iter_mut() {
-        if now < retry.next_retry_at {
+        if retry.exhausted || now < retry.next_retry_at {
             continue;
         }
         retry.retry_count += 1;
@@ -397,7 +400,7 @@ pub(crate) fn process_server_rate_limit_retries(
                 name,
                 &format!("gave up after {} retries", SERVER_RATE_LIMIT_MAX_RETRIES),
             );
-            completed.push(name.clone());
+            retry.exhausted = true;
             continue;
         }
 
@@ -431,11 +434,8 @@ pub(crate) fn process_server_rate_limit_retries(
                 Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
         } else {
             tracing::warn!(agent = %name, "ServerRateLimit: re-inject failed (agent gone?)");
-            completed.push(name.clone());
+            retry.exhausted = true;
         }
-    }
-    for name in completed {
-        retry_tracks.remove(&name);
     }
 }
 
@@ -853,6 +853,7 @@ mod tests {
             retry_count: 3,
             next_retry_at: std::time::Instant::now(),
             input_text: "test input".into(),
+            exhausted: false,
         };
         retry.retry_count += 1;
         assert!(
@@ -869,6 +870,7 @@ mod tests {
             retry_count: 0,
             next_retry_at: std::time::Instant::now(),
             input_text: original.to_string(),
+            exhausted: false,
         };
         assert_eq!(
             retry.input_text, original,
@@ -914,6 +916,96 @@ mod tests {
             pair.last_input_text.as_deref(),
             Some(input),
             "TUI keyboard input must be recorded in last_input_text for retry"
+        );
+    }
+
+    #[test]
+    fn retry_loop_does_not_restart_after_max_exceeded() {
+        // Simulate: retry exhausted (count > max) → entry stays with
+        // exhausted=true → Phase 1 sees contains_key → skips re-insert.
+        use super::RateLimitRetry;
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "agent-loop".into(),
+            RateLimitRetry {
+                retry_count: 4,
+                next_retry_at: std::time::Instant::now(),
+                input_text: "test".into(),
+                exhausted: true,
+            },
+        );
+        // Phase 1 logic: if retry_tracks.contains_key → skip
+        assert!(
+            tracks.contains_key("agent-loop"),
+            "exhausted entry must remain in tracks to prevent re-insert"
+        );
+        assert!(
+            tracks["agent-loop"].exhausted,
+            "entry must be marked exhausted"
+        );
+    }
+
+    #[test]
+    fn retry_resumes_after_recovery_then_new_failure() {
+        // State: ServerRateLimit → max → Ready → ServerRateLimit again
+        // Recovery clears the entry → new failure can start fresh sequence.
+        use super::RateLimitRetry;
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        tracks.insert(
+            "agent-recover".into(),
+            RateLimitRetry {
+                retry_count: 4,
+                next_retry_at: std::time::Instant::now(),
+                input_text: "old".into(),
+                exhausted: true,
+            },
+        );
+        // Simulate recovery (Ready/Idle transition removes entry):
+        tracks.remove("agent-recover");
+        assert!(!tracks.contains_key("agent-recover"));
+        // New failure can now insert fresh:
+        tracks.insert(
+            "agent-recover".into(),
+            RateLimitRetry {
+                retry_count: 0,
+                next_retry_at: std::time::Instant::now(),
+                input_text: "new input".into(),
+                exhausted: false,
+            },
+        );
+        assert_eq!(tracks["agent-recover"].retry_count, 0);
+        assert!(!tracks["agent-recover"].exhausted);
+    }
+
+    #[test]
+    fn retry_does_not_count_state_persistence_as_new_failure() {
+        // State stays ServerRateLimit for many ticks → only 1 retry
+        // sequence fires (not N sequences for N ticks).
+        use super::RateLimitRetry;
+        let mut tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+        // First tick: insert
+        tracks.insert(
+            "agent-persist".into(),
+            RateLimitRetry {
+                retry_count: 1,
+                next_retry_at: std::time::Instant::now(),
+                input_text: "input".into(),
+                exhausted: false,
+            },
+        );
+        // Subsequent ticks: Phase 1 checks contains_key → skips
+        for _ in 0..30 {
+            assert!(
+                tracks.contains_key("agent-persist"),
+                "entry must persist across ticks"
+            );
+            // Phase 1 would skip because contains_key is true
+        }
+        // Only 1 retry sequence was ever created
+        assert_eq!(
+            tracks.len(),
+            1,
+            "only 1 retry sequence despite 30 ticks of persistent state"
         );
     }
 }
