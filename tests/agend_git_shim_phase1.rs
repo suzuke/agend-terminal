@@ -41,7 +41,10 @@ fn hook_script_valid_shell_syntax() {
     assert!(hook.starts_with("#!/bin/sh"), "must have shebang");
     assert!(hook.contains("exit 0"), "must always exit 0");
     assert!(hook.contains("Agend-Agent:"), "must inject agent trailer");
-    assert!(hook.contains("AGEND_INSTANCE_NAME"), "must read instance name");
+    assert!(
+        hook.contains("AGEND_INSTANCE_NAME"),
+        "must read instance name"
+    );
 }
 
 /// Hook idempotent: existing trailer → skip.
@@ -58,7 +61,10 @@ fn hook_idempotent_skip_logic() {
 #[test]
 fn hook_skips_merge_squash_template() {
     let hook = include_str!("../assets/hooks/prepare-commit-msg");
-    assert!(hook.contains("merge|squash|template"), "must skip these sources");
+    assert!(
+        hook.contains("merge|squash|template"),
+        "must skip these sources"
+    );
 }
 
 /// AGEND_REAL_GIT injection: verify `which` crate resolves git.
