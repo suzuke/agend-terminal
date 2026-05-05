@@ -426,6 +426,8 @@ assets/hooks/
 
 > **Amendment 2026-05-05**：phase 重組以收斂最小可交付 (per team review synthesis lead m-, dev m-67, reviewer m-66)。
 > 原 Phase 3 將 worktree GC 跟 lifecycle 綁在一起放大 R3；GC 切出獨立 phase 才能 dry-run 觀察後再實刪。Phase 1 加 minimal binding.json writer 以支撐 trailer metadata。
+>
+> **Amendment 2026-05-06 (general m-16)**: Windows native 從 out-of-scope 撤回、納入 Phase 3 + Phase 1/2 retro patch。Cross-platform 從 Phase 3 起。R8 撤回、新增 R15 (Windows hook engine PowerShell vs bash)。Phase 1+2 已 ship 的 unix-only assumptions（cfg(unix) gating、`exec()` unix-only、bash hook only）需 retro patch 在 Phase 3 PR 同 ship。
 
 ### Phase 1 — Hook trailer + minimal binding writer + telemetry (1.5–2 天)
 
@@ -481,26 +483,37 @@ assets/hooks/
 
 ---
 
-### Phase 3 — Worktree lifecycle (lease/release，3 天)
+### Phase 3 — Worktree lifecycle (lease/release，cross-platform，3.5–5 天)
 
-**目標**：自動建/接管 worktree，**不含 GC**。
+**目標**：自動建/接管 worktree，**不含 GC**；同 PR ship Phase 1+2 retro patch 把 unix-only assumption 改 cross-platform。
 
 **Deliverables**:
 
+#### Phase 3 main scope
 - `src/worktree_pool.rs` lease / release 實作（GC 移到 Phase 4）
 - task dispatch 加 `lease/release` 鉤子
 - task done 觸發 release（標候選即可，不刪）
 - 啟動時 reconcile 孤兒 worktree（只 log，不刪）
 - `.env*` 複製、port offset hash（從 worktree path）
 - `worktree.list` MCP tool
+- E4.5 enforcement runtime check（reject lease for `main` branch）
+
+#### Phase 1+2 retro patch (cross-platform)
+- `src/bin/agend-git.rs` 移除 cfg(unix) gating；`std::os::unix::process::CommandExt::exec` → cross-platform：unix 仍 exec()、Windows 走 `Command::status()` + `process::exit(code)` 等價 status forwarding
+- `assets/hooks/prepare-commit-msg.ps1` (PowerShell) — Windows native git hook
+- `install_hooks` 平台偵測：unix → bash hook、Windows native git → PowerShell hook
+- `symlink_shim` Windows fallback：`fs::copy` 而非 symlink (避 admin 需求)、create `.bat` shim or `.exe` copy
+- Path normalization：`std::path::Path` cross-platform OK
 
 **Exit criteria**:
 
 - lead 派 impl task → daemon 自動建 worktree + install hook + bind
 - task done → worktree 標候選（保留磁碟）
 - 至少跑一次「同一 agent 接續做兩個不同 branch task」整個流程不 respawn
+- **Cross-platform CI green：mac / ubuntu / windows 三平台**
+- Windows 平台 shim binary 可執行、PowerShell hook 注入 trailer 正確
 
-**風險**：中低（最危險的 GC 推到 Phase 4）
+**風險**：中（Phase 1+2 retro 加 Windows、爆雷面變大；GC 仍 defer Phase 4）
 
 ---
 
@@ -620,13 +633,14 @@ Phase 2 結束後跑一次 fleet 級驗證：
 | R5 | 弱 backend 不理解 ERROR 訊息持續 retry | 中 | daemon 偵測連續 deny 通知 lead |
 | R6 | shim 性能不夠 | 低 | Rust release + 不每次重讀 binding（mtime cache） |
 | R7 | 跨 backend 行為不一 | 中 | Phase 2 結束跑 cross-backend smoke test |
-| R8 | Windows 不支援 | 低 | Phase 5 後評估，現階段 macOS/Linux only |
+| ~~R8~~ | ~~Windows 不支援~~ | — | **撤回 2026-05-06**：Windows 已納入 scope（Phase 3 + Phase 1/2 retro patch per general m-16）。見 R15。 |
 | R9 | 既有 worktree 跟新命名衝突 | 中 | reconcile 邏輯保留人類命名；只接管自動建立的 |
 | R10 | binding.json 路徑被 agent 推測並偽造 | 低 | 只有 daemon 有寫權限，shim 唯讀 |
 | **R11** | **Hook drift 跨 worktree 版本不一致** | 中 | `core.hooksPath` 統一目錄（daemon 一次更新全 worktree pick up）；不用 per-worktree copy mode |
 | **R12** | **Shim recursion**（shim 在 PATH 第一順位 → fork plain `git` 無限遞迴） | 高 | daemon spawn 時注入 `AGEND_REAL_GIT=$(which git)` env（pattern matches existing AGEND_HOME / AGEND_INSTANCE_NAME injection at agent.rs:344）；shim 讀 env first；fallback `which`-strip excluding `$AGEND_HOME/bin/` if env missing |
-| **R13** | **Multi-platform PATH priority**（macOS / Linux / WSL git resolution 順序差） | 中 | shim 不依賴 PATH 解析自身路徑（用 `AGEND_REAL_GIT` env or absolute path）；cross-backend smoke test 涵蓋三平台 |
+| **R13** | **Multi-platform PATH priority**（macOS / Linux / WSL / Windows git resolution 順序差） | 中 | shim 不依賴 PATH 解析自身路徑（用 `AGEND_REAL_GIT` env or absolute path）；cross-backend smoke test 涵蓋四平台 |
 | **R14** | **既有 human-managed worktree 命名衝突誤判** | 中 | daemon reconcile 用 daemon-tagged metadata（如 `binding.json` 紀錄 + worktree name pattern `<agent>-<branch-sanitized>`）區分；只接管 daemon-tagged，human-managed 保持中立 |
+| **R15** | **Windows hook engine 差異**（PowerShell vs bash） | 中 | daemon `install_hooks` 平台偵測：unix → bash hook、Windows native git → PowerShell hook（`.ps1`）；git Bash on Windows 也可走 bash hook、靠 git 原生 hook resolution。Cross-platform symlink → file copy fallback (Windows symlink 需 admin、避用)。 |
 
 ---
 
@@ -662,15 +676,17 @@ Phase 2 結束後跑一次 fleet 級驗證：
 ## 8. 預估工時
 
 > **Amendment 2026-05-05**：Phase 重組後重估；Phase 1 加 minimal binding writer + telemetry；原 Phase 2 binding+shim 跟原 Phase 4 deny 合併；Phase 3 拆出 lease/release，GC 獨立成 Phase 4 dry-run cutover。
+>
+> **Amendment 2026-05-06 (general m-16)**：Phase 3 加 Windows + Phase 1/2 retro patch、+1.5-2 天。
 
 | Phase | 樂觀 | 悲觀 |
 |---|---|---|
-| Phase 1 trailer + minimal binding writer + telemetry | 1.5 天 | 2 天 |
-| Phase 2 binding lifecycle + shim binary + deny + bypass 三層 + AGEND_REAL_GIT | 4 天 | 6 天 |
-| Phase 3 worktree lease/release（無 GC） | 2 天 | 3 天 |
+| Phase 1 trailer + minimal binding writer + telemetry | 1.5 天 | 2 天 (✓ shipped) |
+| Phase 2 binding lifecycle + shim binary + deny + bypass 三層 + AGEND_REAL_GIT | 4 天 | 6 天 (✓ shipped) |
+| **Phase 3 worktree lease/release + Phase 1/2 retro patch (Windows)** | **3.5 天** | **5 天** |
 | Phase 4 worktree GC dry-run + cutover | 1.5 天 | 2 天 |
 | Phase 5 hotspot（選做） | 2 天 | 3 天 |
-| **合計** | **11 天** | **16 天** |
+| **合計** | **12.5 天** | **18 天** |
 
 不含跨 backend smoke test（每 phase 結束加 0.5 天）。Phase 4 dry-run 觀察期另計（建議 N 天觀察後 cutover）。
 
@@ -678,9 +694,11 @@ Phase 2 結束後跑一次 fleet 級驗證：
 
 ## 9. Out-of-scope（明確排除）
 
+> **Amendment 2026-05-06 (general m-16)**: Windows native support 已從 out-of-scope 撤回、納入 Phase 3 + Phase 1/2 retro patch。R8 撤回、新增 R15 (Windows hook engine)。
+
 - mrq-style 連續快照（補 commit-之間的縫，獨立 product）
 - bash 整體劫持（safeexec 範疇）
-- Windows native 支援（macOS/Linux 為主，WSL 等於 Linux）
+- ~~Windows native 支援~~（**撤回**：已納入 scope per general m-16，cross-platform 從 Phase 3 開始）
 - 完整 D 群（Agentic Drift）解決方案 — 本計畫只解到 hotspot warning，不做 spec-driven 任務拆分
 - 替換 git（GitButler 路線）
 
