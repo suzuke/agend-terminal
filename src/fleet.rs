@@ -178,12 +178,6 @@ pub struct InstanceConfig {
     /// Content is appended to the generated agent instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// Legacy field — retained only to gracefully absorb old fleet.yaml
-    /// files that still declare `outbound_capabilities`. Not used at
-    /// runtime; skipped on serialization.
-    #[allow(dead_code)]
-    #[serde(default, skip_serializing)]
-    pub outbound_capabilities: Option<serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
