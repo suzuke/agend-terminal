@@ -1152,12 +1152,16 @@ fn ci_notification_message(
     branch: &str,
     conclusion: Option<&str>,
     _failure_detail: Option<&str>,
+    head_sha: Option<&str>,
 ) -> Option<String> {
     let conclusion = conclusion?;
+    let sha_short = head_sha
+        .map(|s| format!(" ({})", &s[..s.len().min(7)]))
+        .unwrap_or_default();
     let msg = match conclusion {
-        "failure" => format!("[ci-fail] {repo}@{branch}: failure\r"),
-        "success" => format!("[ci-pass] {repo}@{branch}: passed ✓\r"),
-        other => format!("[ci-ended] {repo}@{branch}: {other}\r"),
+        "failure" => format!("[ci-fail] {repo}@{branch}{sha_short}: failure\r"),
+        "success" => format!("[ci-pass] {repo}@{branch}{sha_short}: passed ✓\r"),
+        other => format!("[ci-ended] {repo}@{branch}{sha_short}: {other}\r"),
     };
     Some(msg)
 }
@@ -1270,7 +1274,7 @@ async fn ci_check_repo(
         let run = &runs[*idx];
         let conclusion = run.conclusion.as_deref();
 
-        if let Some(headline) = ci_notification_message(repo, branch, conclusion, None) {
+        if let Some(headline) = ci_notification_message(repo, branch, conclusion, None, Some(sha)) {
             let failure_detail = if conclusion == Some("failure") {
                 Some(provider.fetch_failure_summary(repo, *run_id).await)
             } else {
@@ -1433,7 +1437,7 @@ mod tests {
 
     #[test]
     fn ci_watch_success_notifies() {
-        let msg = ci_notification_message("owner/repo", "main", Some("success"), None);
+        let msg = ci_notification_message("owner/repo", "main", Some("success"), None, None);
         assert_eq!(
             msg.as_deref(),
             Some("[ci-pass] owner/repo@main: passed ✓\r")
@@ -1443,20 +1447,25 @@ mod tests {
     #[test]
     fn ci_watch_failure_headline_excludes_detail() {
         // Job detail moved to inbox body — headline just says "failure"
-        let msg =
-            ci_notification_message("owner/repo", "main", Some("failure"), Some("Build / Test"));
+        let msg = ci_notification_message(
+            "owner/repo",
+            "main",
+            Some("failure"),
+            Some("Build / Test"),
+            None,
+        );
         assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure\r"));
     }
 
     #[test]
     fn ci_watch_failure_without_detail_same_headline() {
-        let msg = ci_notification_message("owner/repo", "main", Some("failure"), None);
+        let msg = ci_notification_message("owner/repo", "main", Some("failure"), None, None);
         assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure\r"));
     }
 
     #[test]
     fn ci_watch_in_progress_skipped() {
-        let msg = ci_notification_message("owner/repo", "main", None, None);
+        let msg = ci_notification_message("owner/repo", "main", None, None, None);
         assert!(
             msg.is_none(),
             "in-progress (null conclusion) must be skipped"
@@ -1465,7 +1474,7 @@ mod tests {
 
     #[test]
     fn ci_watch_cancelled_notifies() {
-        let msg = ci_notification_message("owner/repo", "feat", Some("cancelled"), None);
+        let msg = ci_notification_message("owner/repo", "feat", Some("cancelled"), None, None);
         assert_eq!(
             msg.as_deref(),
             Some("[ci-ended] owner/repo@feat: cancelled\r")
@@ -1474,7 +1483,7 @@ mod tests {
 
     #[test]
     fn ci_watch_timed_out_notifies() {
-        let msg = ci_notification_message("owner/repo", "main", Some("timed_out"), None);
+        let msg = ci_notification_message("owner/repo", "main", Some("timed_out"), None, None);
         assert_eq!(
             msg.as_deref(),
             Some("[ci-ended] owner/repo@main: timed_out\r")
@@ -1865,6 +1874,7 @@ mod tests {
             "main",
             Some("failure"),
             Some("Check / Clippy (tray)"),
+            None,
         );
         let headline = msg.unwrap();
         assert!(
@@ -1883,7 +1893,7 @@ mod tests {
 
     #[test]
     fn test_headline_success_clean() {
-        let msg = ci_notification_message("o/r", "feat", Some("success"), None);
+        let msg = ci_notification_message("o/r", "feat", Some("success"), None, None);
         let headline = msg.unwrap();
         assert!(headline.contains("passed"), "success headline: {headline}");
         assert!(
