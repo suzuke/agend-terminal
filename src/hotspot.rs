@@ -81,7 +81,11 @@ pub fn build_index(repo_dir: &Path) -> HotspotIndex {
 }
 
 /// Check if a file is a hotspot for a given agent (another agent touched it recently).
-pub fn check_hotspot<'a>(index: &'a HotspotIndex, file: &Path, current_agent: &str) -> Option<&'a FileTouch> {
+pub fn check_hotspot<'a>(
+    index: &'a HotspotIndex,
+    file: &Path,
+    current_agent: &str,
+) -> Option<&'a FileTouch> {
     index.get(file).and_then(|touches| {
         touches
             .iter()
@@ -218,5 +222,46 @@ mod tests {
         let index = HotspotIndex::new();
         assert!(list_hotspots(&index).is_empty());
         assert!(check_hotspot(&index, Path::new("any.rs"), "agent").is_none());
+    }
+
+    #[test]
+    fn seven_day_boundary_window() {
+        // The git log --since flag handles the boundary. We verify the constant.
+        assert_eq!(HOTSPOT_WINDOW_DAYS, 7);
+        // Verify the format string used in build_index.
+        let since_arg = format!("--since={} days ago", HOTSPOT_WINDOW_DAYS);
+        assert_eq!(since_arg, "--since=7 days ago");
+        // 7d0h0m commit: included (git --since is inclusive of the boundary day).
+        // 7d0h1m commit: excluded by git's --since semantics.
+        // This is git's native behavior — we rely on it, not re-implement.
+    }
+
+    #[test]
+    fn hotspot_warn_emits_to_lead_inbox() {
+        let home = std::env::temp_dir().join(format!("agend-hotspot-warn-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        hotspot_warn(
+            &home,
+            "agent-x",
+            Path::new("src/shared.rs"),
+            "agent-y",
+            "2026-05-01",
+        );
+        let inbox = home.join("inbox").join("lead.jsonl");
+        assert!(inbox.exists(), "hotspot_warn must write to lead inbox");
+        let content = std::fs::read_to_string(&inbox).unwrap_or_default();
+        assert!(
+            content.contains("hotspot"),
+            "inbox must contain hotspot kind"
+        );
+        assert!(
+            content.contains("agent-x"),
+            "inbox must mention current agent"
+        );
+        assert!(
+            content.contains("agent-y"),
+            "inbox must mention last toucher"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

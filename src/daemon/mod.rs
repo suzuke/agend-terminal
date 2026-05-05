@@ -561,6 +561,8 @@ fn run_core(
                 } else {
                     crate::worktree_pool::gc_dry_run(home);
                 }
+                // Phase 5: hotspot scan — check recent commits for multi-agent file conflicts.
+                hotspot_scan(home, &configs);
             }
         }
 
@@ -823,6 +825,31 @@ fn run_core(
 
 /// Replay missed one-shot schedules on daemon startup.
 /// Calls `schedules::replay_missed_oneshots` and fires each returned
+/// Phase 5: scan worktrees for hotspot conflicts (multi-agent file touches).
+/// Called hourly from the periodic sweep. Builds index from each agent's
+/// worktree and warns lead on conflicts.
+fn hotspot_scan(home: &Path, configs: &crate::api::ConfigRegistry) {
+    let cfgs = configs.lock();
+    for (name, cfg) in cfgs.iter() {
+        let Some(ref wd) = cfg.working_dir else {
+            continue;
+        };
+        if !wd.join(".git").exists() && !wd.join("..").join(".git").exists() {
+            continue;
+        }
+        let index = crate::hotspot::build_index(wd);
+        let hotspots = crate::hotspot::list_hotspots(&index);
+        for (file, agents) in &hotspots {
+            // Warn if this agent is involved in a hotspot.
+            if agents.iter().any(|a| a == name) {
+                if let Some(other) = agents.iter().find(|a| *a != name) {
+                    crate::hotspot::hotspot_warn(home, name, file, other, "last 7d");
+                }
+            }
+        }
+    }
+}
+
 /// schedule through the same path as `cron_tick::check_schedules`.
 /// Sweep overdue claimed tasks and stuck dispatches, log events.
 pub fn run_task_maintenance(home: &Path) {
