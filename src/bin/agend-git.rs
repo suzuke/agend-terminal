@@ -8,26 +8,14 @@
 //!
 //! Bypass: AGEND_GIT_BYPASS=1 | AGEND_GIT_BYPASS_AGENT=<name> | AGEND_GIT_BYPASS_UNTIL=<epoch>
 //!
-//! Platform: Unix only (macOS/Linux). Windows compiles a no-op stub.
+//! Cross-platform: Unix uses exec() for process replacement; Windows uses
+//! status() + exit(code) for equivalent behavior.
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("agend-git: unix-only platform (macOS/Linux)");
-    std::process::exit(1);
-}
-
-#[cfg(unix)]
 use std::env;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(unix)]
 use std::path::PathBuf;
-#[cfg(unix)]
 use std::process::Command;
-#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(unix)]
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -60,7 +48,6 @@ fn main() {
 
 // ── Bypass ──────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 fn should_bypass() -> bool {
     if env::var("AGEND_GIT_BYPASS").is_ok() {
         return true;
@@ -88,7 +75,6 @@ fn should_bypass() -> bool {
 
 // ── Binding ─────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 #[derive(Default)]
 struct Binding {
     task_id: Option<String>,
@@ -96,7 +82,6 @@ struct Binding {
     worktree: Option<String>,
 }
 
-#[cfg(unix)]
 fn read_binding(home: &str, agent: &str) -> Binding {
     let path = PathBuf::from(home)
         .join("runtime")
@@ -117,21 +102,18 @@ fn read_binding(home: &str, agent: &str) -> Binding {
     }
 }
 
-#[cfg(unix)]
 fn is_bound(binding: &Binding) -> bool {
     binding.task_id.is_some()
 }
 
 // ── Classification ──────────────────────────────────────────────────────
 
-#[cfg(unix)]
 enum Action {
     Passthrough,
     ChdirPass(String),
     Deny(String),
 }
 
-#[cfg(unix)]
 fn classify(subcmd: &str, args: &[String], binding: &Binding) -> Action {
     let bound = is_bound(binding);
 
@@ -199,7 +181,6 @@ fn classify(subcmd: &str, args: &[String], binding: &Binding) -> Action {
 
 // ── Exec ────────────────────────────────────────────────────────────────
 
-#[cfg(unix)]
 fn exec_real_git(args: &[String], chdir: Option<&str>) -> ! {
     let git = resolve_real_git();
     let mut cmd = Command::new(&git);
@@ -207,12 +188,27 @@ fn exec_real_git(args: &[String], chdir: Option<&str>) -> ! {
         cmd.arg("-C").arg(dir);
     }
     cmd.args(args);
-    let err = cmd.exec(); // replaces process on Unix
-    eprintln!("agend-git: exec failed: {err}");
-    std::process::exit(127);
+
+    // Unix: exec() replaces process. Windows: status() + exit(code).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        eprintln!("agend-git: exec failed: {err}");
+        std::process::exit(127);
+    }
+    #[cfg(not(unix))]
+    {
+        match cmd.status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!("agend-git: exec failed: {e}");
+                std::process::exit(127);
+            }
+        }
+    }
 }
 
-#[cfg(unix)]
 fn resolve_real_git() -> String {
     // Priority 1: AGEND_REAL_GIT env (injected by daemon at spawn).
     if let Ok(path) = env::var("AGEND_REAL_GIT") {
@@ -224,12 +220,13 @@ fn resolve_real_git() -> String {
     let agend_bin = env::var("AGEND_HOME")
         .map(|h| format!("{h}/bin"))
         .unwrap_or_default();
+    let path_sep = if cfg!(windows) { ';' } else { ':' };
     let search: String = env::var("PATH")
         .unwrap_or_default()
-        .split(':')
+        .split(path_sep)
         .filter(|p| !p.is_empty() && *p != agend_bin)
         .collect::<Vec<_>>()
-        .join(":");
+        .join(&path_sep.to_string());
     which::which_in("git", Some(&search), ".")
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "/usr/bin/git".to_string())
@@ -237,14 +234,12 @@ fn resolve_real_git() -> String {
 
 // ── Error + Telemetry ───────────────────────────────────────────────────
 
-#[cfg(unix)]
 fn emit_deny_error(subcmd: &str, reason: &str, agent: &str) {
     eprintln!("agend-git: ERROR git {subcmd} denied");
     eprintln!("           agent={agent}, reason: {reason}");
     eprintln!("           HINT: use the task board to get a worktree assignment, or set AGEND_GIT_BYPASS=1 for emergency override");
 }
 
-#[cfg(unix)]
 fn write_git_event(home: &str, agent: &str, subcmd: &str, reason: &str) {
     let events_path = PathBuf::from(home).join("fleet_events.jsonl");
     let event = serde_json::json!({

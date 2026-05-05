@@ -56,19 +56,25 @@ pub fn read(home: &Path, agent: &str) -> Option<serde_json::Value> {
 
 /// Install the prepare-commit-msg hook into a worktree via core.hooksPath.
 /// Points to `$AGEND_HOME/hooks/` unified directory.
+/// Installs bash hook on Unix, PowerShell hook on Windows.
 pub fn install_hooks(home: &Path, worktree: &Path) {
     let hooks_dir = home.join("hooks");
     std::fs::create_dir_all(&hooks_dir).ok();
 
-    // Extract embedded hook script.
-    let hook_content = include_str!("../assets/hooks/prepare-commit-msg");
-    let hook_path = hooks_dir.join("prepare-commit-msg");
-    let _ = std::fs::write(&hook_path, hook_content);
+    // Extract embedded hook scripts (both platforms for portability).
+    let bash_hook = include_str!("../assets/hooks/prepare-commit-msg");
+    let bash_path = hooks_dir.join("prepare-commit-msg");
+    let _ = std::fs::write(&bash_path, bash_hook);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&bash_path, std::fs::Permissions::from_mode(0o755));
     }
+
+    // Windows: also install PowerShell version.
+    let ps_hook = include_str!("../assets/hooks/prepare-commit-msg.ps1");
+    let ps_path = hooks_dir.join("prepare-commit-msg.ps1");
+    let _ = std::fs::write(&ps_path, ps_hook);
 
     // Set core.hooksPath on the worktree.
     let _ = std::process::Command::new("git")
@@ -105,11 +111,17 @@ pub fn reconcile_hooks(home: &Path) {
 pub fn symlink_shim(home: &Path) {
     let bin_dir = home.join("bin");
     std::fs::create_dir_all(&bin_dir).ok();
-    let link_path = bin_dir.join("git");
+    let link_name = if cfg!(windows) { "git.exe" } else { "git" };
+    let link_path = bin_dir.join(link_name);
 
     // Find the agend-git binary alongside the main binary.
+    let shim_name = if cfg!(windows) {
+        "agend-git.exe"
+    } else {
+        "agend-git"
+    };
     let shim_src = std::env::current_exe().ok().and_then(|exe| {
-        let candidate = exe.with_file_name("agend-git");
+        let candidate = exe.with_file_name(shim_name);
         candidate.exists().then_some(candidate)
     });
 
