@@ -25,7 +25,6 @@ pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
 }
 
 /// Clear a binding for an agent (task completed/released).
-#[allow(dead_code)] // Used by tests + Phase 2 lifecycle manager
 pub fn unbind(home: &Path, agent: &str) {
     let path = home.join("runtime").join(agent).join("binding.json");
     let _ = std::fs::remove_file(path);
@@ -78,6 +77,67 @@ pub fn reconcile_hooks(home: &Path) {
                     for wt in wts.flatten() {
                         if wt.path().is_dir() {
                             install_hooks(home, &wt.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Symlink the agend-git binary into $AGEND_HOME/bin/git.
+/// Called at daemon startup so the shim shadows /usr/bin/git via PATH.
+pub fn symlink_shim(home: &Path) {
+    let bin_dir = home.join("bin");
+    std::fs::create_dir_all(&bin_dir).ok();
+    let link_path = bin_dir.join("git");
+
+    // Find the agend-git binary alongside the main binary.
+    let shim_src = std::env::current_exe().ok().and_then(|exe| {
+        let candidate = exe.with_file_name("agend-git");
+        candidate.exists().then_some(candidate)
+    });
+
+    if let Some(src) = shim_src {
+        // Remove stale symlink/file first.
+        let _ = std::fs::remove_file(&link_path);
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&src, &link_path);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::copy(&src, &link_path);
+        }
+    }
+}
+
+/// Clear orphan bindings (agents no longer in registry).
+/// Called at daemon startup.
+pub fn reconcile_orphans(home: &Path) {
+    let runtime_dir = home.join("runtime");
+    if !runtime_dir.exists() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(&runtime_dir) {
+        for entry in entries.flatten() {
+            let binding_path = entry.path().join("binding.json");
+            if binding_path.exists() {
+                // Check if binding is stale (issued_at > 24h ago).
+                if let Ok(content) = std::fs::read_to_string(&binding_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(issued) = v["issued_at"].as_str() {
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(issued) {
+                                let age = chrono::Utc::now()
+                                    .signed_duration_since(dt.with_timezone(&chrono::Utc));
+                                if age > chrono::Duration::hours(24) {
+                                    let _ = std::fs::remove_file(&binding_path);
+                                    tracing::info!(
+                                        path = %binding_path.display(),
+                                        "removed orphan binding (>24h old)"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

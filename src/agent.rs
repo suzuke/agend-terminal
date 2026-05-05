@@ -365,10 +365,17 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         }
     }
 
-    // Add agend-terminal binary to PATH (use platform PATH separator)
+    // Add agend-terminal binary + $AGEND_HOME/bin (shim) to PATH.
+    // Shim dir goes first so agend-git shadows /usr/bin/git.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin_dir) = exe.parent() {
-            let mut paths: Vec<PathBuf> = vec![bin_dir.to_path_buf()];
+            let mut paths: Vec<PathBuf> = Vec::new();
+            // Phase 2: prepend $AGEND_HOME/bin/ for git shim shadowing.
+            if let Some(h) = home {
+                let shim_dir = h.join("bin");
+                paths.push(shim_dir);
+            }
+            paths.push(bin_dir.to_path_buf());
             if let Some(existing) = std::env::var_os("PATH") {
                 paths.extend(std::env::split_paths(&existing));
             }

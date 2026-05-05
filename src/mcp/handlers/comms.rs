@@ -470,6 +470,8 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         // Mark dispatch as completed so timeout sweep doesn't false-warn.
         let cid = args["correlation_id"].as_str();
         crate::dispatch_tracking::mark_completed(home, cid, sender.as_str());
+        // Phase 2 git-shim: clear binding on task completion.
+        crate::binding::unbind(home, sender.as_str());
         let task_id = args["correlation_id"]
             .as_str()
             .filter(|s| !s.is_empty())
