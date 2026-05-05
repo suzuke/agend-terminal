@@ -122,6 +122,132 @@ pub fn reconcile_orphan_leases(home: &Path) {
     }
 }
 
+// ── Phase 4: GC scan + dry-run + cutover ────────────────────────────────
+
+/// Grace period before a released worktree becomes a GC candidate.
+const GC_GRACE_HOURS: i64 = 24;
+
+/// A worktree identified as a GC candidate.
+#[derive(Debug, Clone)]
+pub struct GcCandidate {
+    pub path: PathBuf,
+    pub agent: String,
+    pub reason: String,
+}
+
+/// Scan for GC candidates: daemon-tagged, past grace TTL, not pinned, no active binding.
+pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
+    let mut candidates = Vec::new();
+    let workspace = home.join("workspace");
+    if !workspace.exists() {
+        return candidates;
+    }
+
+    // Scan all .worktrees subdirectories.
+    if let Ok(entries) = std::fs::read_dir(&workspace) {
+        for entry in entries.flatten() {
+            let wt_base = entry.path().join(".worktrees");
+            if !wt_base.is_dir() {
+                continue;
+            }
+            if let Ok(wts) = std::fs::read_dir(&wt_base) {
+                for wt in wts.flatten() {
+                    let wt_path = wt.path();
+                    if !wt_path.is_dir() {
+                        continue;
+                    }
+                    if let Some(candidate) = evaluate_candidate(home, &wt_path) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+    }
+    candidates
+}
+
+fn evaluate_candidate(home: &Path, wt_path: &Path) -> Option<GcCandidate> {
+    // Must be daemon-managed (R14).
+    if !is_daemon_managed(wt_path) {
+        return None;
+    }
+    // Must not be pinned.
+    if is_pinned(wt_path) {
+        return None;
+    }
+    // Must not have active binding.
+    let agent_name = wt_path.file_name()?.to_string_lossy().to_string();
+    if crate::binding::read(home, &agent_name).is_some() {
+        return None;
+    }
+    // Must be past grace TTL (check .agend-managed marker timestamp).
+    let marker = wt_path.join(MANAGED_MARKER);
+    let content = std::fs::read_to_string(&marker).unwrap_or_default();
+    if let Some(leased_line) = content.lines().find(|l| l.starts_with("leased_at=")) {
+        let ts = leased_line.strip_prefix("leased_at=").unwrap_or("");
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+            let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
+            if age < chrono::Duration::hours(GC_GRACE_HOURS) {
+                return None; // Still within grace period.
+            }
+        }
+    }
+
+    Some(GcCandidate {
+        path: wt_path.to_path_buf(),
+        agent: agent_name,
+        reason: format!("daemon-tagged, released >{}h, not pinned", GC_GRACE_HOURS),
+    })
+}
+
+/// Dry-run: log candidates without deleting. Returns candidate list.
+pub fn gc_dry_run(home: &Path) -> Vec<GcCandidate> {
+    let candidates = gc_candidates(home);
+    for c in &candidates {
+        tracing::info!(
+            agent = %c.agent,
+            path = %c.path.display(),
+            reason = %c.reason,
+            "gc_dry_run candidate"
+        );
+    }
+    if !candidates.is_empty() {
+        crate::event_log::log(
+            home,
+            "gc_dry_run",
+            "",
+            &format!("{} candidates identified", candidates.len()),
+        );
+    }
+    candidates
+}
+
+/// Cutover: actually delete GC candidates. Requires AGEND_WORKTREE_GC=1 env.
+/// Returns number of worktrees removed.
+pub fn gc_cutover(home: &Path) -> usize {
+    if std::env::var("AGEND_WORKTREE_GC").as_deref() != Ok("1") {
+        tracing::debug!("gc_cutover skipped — AGEND_WORKTREE_GC not set");
+        return 0;
+    }
+    let candidates = gc_candidates(home);
+    let mut removed = 0;
+    for c in &candidates {
+        if std::fs::remove_dir_all(&c.path).is_ok() {
+            removed += 1;
+            tracing::info!(agent = %c.agent, path = %c.path.display(), "gc_cutover: removed");
+        }
+    }
+    if removed > 0 {
+        crate::event_log::log(
+            home,
+            "gc_cutover",
+            "",
+            &format!("{removed} worktrees removed"),
+        );
+    }
+    removed
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -237,5 +363,120 @@ mod tests {
         unpin(&dir); // idempotent
         assert!(!is_pinned(&dir));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Phase 4 GC tests ────────────────────────────────────────────
+
+    fn make_gc_candidate(home: &Path, agent: &str) -> PathBuf {
+        let wt = home
+            .join("workspace")
+            .join("repo")
+            .join(".worktrees")
+            .join(agent);
+        std::fs::create_dir_all(&wt).ok();
+        // Daemon-managed marker with old timestamp (past grace).
+        let old_ts = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
+        std::fs::write(
+            wt.join(MANAGED_MARKER),
+            format!("agent={agent}\nleased_at={old_ts}\n"),
+        )
+        .ok();
+        wt
+    }
+
+    #[test]
+    fn gc_candidates_includes_only_daemon_tagged() {
+        let home = tmp_home("gc-tagged");
+        let wt = home
+            .join("workspace")
+            .join("repo")
+            .join(".worktrees")
+            .join("human");
+        std::fs::create_dir_all(&wt).ok();
+        // No .agend-managed marker → not a candidate.
+        let candidates = gc_candidates(&home);
+        assert!(
+            candidates.is_empty(),
+            "human worktree must not be candidate"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_candidates_excludes_pinned() {
+        let home = tmp_home("gc-pinned");
+        let wt = make_gc_candidate(&home, "pinned-agent");
+        pin(&wt);
+        let candidates = gc_candidates(&home);
+        assert!(candidates.is_empty(), "pinned must not be candidate");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_candidates_respects_grace_ttl() {
+        let home = tmp_home("gc-grace");
+        let wt = home
+            .join("workspace")
+            .join("repo")
+            .join(".worktrees")
+            .join("fresh");
+        std::fs::create_dir_all(&wt).ok();
+        // Recent timestamp (within grace).
+        let recent = chrono::Utc::now().to_rfc3339();
+        std::fs::write(
+            wt.join(MANAGED_MARKER),
+            format!("agent=fresh\nleased_at={recent}\n"),
+        )
+        .ok();
+        let candidates = gc_candidates(&home);
+        assert!(
+            candidates.is_empty(),
+            "fresh worktree within grace must not be candidate"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_candidates_excludes_active_binding() {
+        let home = tmp_home("gc-active");
+        make_gc_candidate(&home, "active-agent");
+        // Create active binding.
+        crate::binding::bind(&home, "active-agent", "T-1", "feat");
+        let candidates = gc_candidates(&home);
+        assert!(candidates.is_empty(), "active binding must exclude from GC");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dry_run_no_actual_delete() {
+        let home = tmp_home("gc-dry");
+        let wt = make_gc_candidate(&home, "dry-agent");
+        gc_dry_run(&home);
+        assert!(wt.exists(), "dry-run must NOT delete");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cutover_requires_env_flag() {
+        let home = tmp_home("gc-cutover-no-flag");
+        let wt = make_gc_candidate(&home, "no-flag-agent");
+        // Explicitly unset to avoid race with cutover_deletes_with_flag test.
+        unsafe { std::env::remove_var("AGEND_WORKTREE_GC") };
+        let removed = gc_cutover(&home);
+        assert_eq!(removed, 0, "cutover must skip without flag");
+        assert!(wt.exists(), "worktree must survive without flag");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cutover_deletes_with_flag() {
+        let home = tmp_home("gc-cutover-flag");
+        let wt = make_gc_candidate(&home, "flag-agent");
+        unsafe { std::env::set_var("AGEND_WORKTREE_GC", "1") };
+        let removed = gc_cutover(&home);
+        unsafe { std::env::remove_var("AGEND_WORKTREE_GC") };
+        assert_eq!(removed, 1);
+        assert!(!wt.exists(), "worktree must be deleted with flag");
+        std::fs::remove_dir_all(&home).ok();
     }
 }
