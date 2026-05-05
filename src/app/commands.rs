@@ -242,13 +242,19 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                             ctx.name_counter,
                         )
                     };
-                    if let Ok(mut new_pane) = pane_result {
+                    if let Ok(new_pane) = pane_result {
                         // Swap only vterm + rx into the existing pane slot
                         if let Some((ti, pid)) = pane_loc {
                             if let Some(pane) = ctx.layout.tabs[ti].root_mut().find_pane_mut(pid) {
-                                std::mem::swap(&mut pane.vterm, &mut new_pane.vterm);
-                                std::mem::swap(&mut pane.rx, &mut new_pane.rx);
-                                pane.agent_name = new_pane.agent_name;
+                                let old_id = pane.id;
+                                let old_selection = pane.selection.clone();
+                                let old_last_input = pane.last_input_at;
+
+                                *pane = new_pane;
+
+                                pane.id = old_id;
+                                pane.selection = old_selection;
+                                pane.last_input_at = old_last_input;
                                 pane.display_name = display_name;
                                 pane.scroll_offset = 0;
                                 pane.has_notification = false;
