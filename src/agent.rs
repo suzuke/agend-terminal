@@ -588,6 +588,17 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         }
     }
 
+    // Sprint 52: register PTY subscriber with the router for mirror dispatch.
+    // Done here (spawn site) so the router thread never needs L1/L2.
+    {
+        let reg = lock_registry(registry);
+        if let Some(handle) = reg.get(name.to_string().as_str()) {
+            let (tx, rx) = crossbeam_channel::bounded(1024);
+            handle.core.lock().subscribers.push(tx);
+            crate::daemon::router::register_agent(name, rx);
+        }
+    }
+
     // Disarm the rollback guard — all ordered mutations succeeded.
     rollback.commit();
 

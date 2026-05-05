@@ -312,4 +312,81 @@ mod tests {
         );
         assert_eq!(fresh.reply_to_input_id, None);
     }
+
+    // ── Sprint 52 Invariant 4 — Mirror dedup correctness ─────────────
+
+    #[test]
+    fn mirror_dedup_blocks_double_emit() {
+        let name = "test-dedup-double";
+        update_with(name, |p| {
+            p.reply_to_channel = Some("telegram".to_string());
+            p.reply_to_input_id = Some(1);
+            p.mirror_dispatched_for_turn = true;
+            p.last_mirror_event_id = Some(1);
+        });
+        let pair = snapshot_for(name);
+        assert!(
+            pair.mirror_dispatched_for_turn,
+            "flag must block second emit"
+        );
+    }
+
+    #[test]
+    fn mirror_dedup_clears_on_next_turn() {
+        let name = "test-dedup-clear-turn";
+        update_with(name, |p| {
+            p.mirror_dispatched_for_turn = true;
+            p.mirror_skip_until_next_turn = true;
+            p.last_mirror_event_id = Some(5);
+        });
+        // Simulate Ready transition:
+        update_with(name, |p| {
+            p.mirror_dispatched_for_turn = false;
+            p.mirror_skip_until_next_turn = false;
+        });
+        let pair = snapshot_for(name);
+        assert!(!pair.mirror_dispatched_for_turn);
+        assert!(!pair.mirror_skip_until_next_turn);
+        assert_eq!(pair.last_mirror_event_id, Some(5)); // persists across turns
+    }
+
+    #[test]
+    fn mirror_skip_set_on_reply_tool_call() {
+        let name = "test-skip-reply-tool";
+        update_with(name, |p| {
+            p.mirror_skip_until_next_turn = true;
+        });
+        let pair = snapshot_for(name);
+        assert!(pair.mirror_skip_until_next_turn);
+    }
+
+    #[test]
+    fn mirror_event_id_dedup_blocks_same_id() {
+        let name = "test-event-id-same";
+        update_with(name, |p| {
+            p.last_mirror_event_id = Some(10);
+            p.reply_to_input_id = Some(10);
+        });
+        let pair = snapshot_for(name);
+        let blocked = pair
+            .reply_to_input_id
+            .zip(pair.last_mirror_event_id)
+            .is_some_and(|(input, last)| input <= last);
+        assert!(blocked, "same input_id must be blocked");
+    }
+
+    #[test]
+    fn mirror_event_id_allows_newer() {
+        let name = "test-event-id-newer";
+        update_with(name, |p| {
+            p.last_mirror_event_id = Some(10);
+            p.reply_to_input_id = Some(11);
+        });
+        let pair = snapshot_for(name);
+        let blocked = pair
+            .reply_to_input_id
+            .zip(pair.last_mirror_event_id)
+            .is_some_and(|(input, last)| input <= last);
+        assert!(!blocked, "newer input_id must be allowed");
+    }
 }
