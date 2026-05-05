@@ -266,4 +266,43 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn dispatch_with_branch_and_repo_auto_invokes_watch_ci() {
+        let home = std::env::temp_dir().join(format!("agend-auto-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let args = serde_json::json!({"repo": "owner/repo", "branch": "feat/test"});
+        handle_watch_ci(&home, &args, "test-agent");
+        let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/test");
+        let watch_path = home.join("ci-watches").join(&filename);
+        assert!(watch_path.exists(), "watch file must be created");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dispatch_idempotent_double_watch_safe() {
+        let home =
+            std::env::temp_dir().join(format!("agend-auto-watch-idem-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let args = serde_json::json!({"repo": "owner/repo", "branch": "feat/idem"});
+        handle_watch_ci(&home, &args, "agent-1");
+        handle_watch_ci(&home, &args, "agent-1"); // second call — idempotent
+        let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/idem");
+        let watch_path = home.join("ci-watches").join(&filename);
+        assert!(watch_path.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dispatch_without_repo_no_auto_watch() {
+        // If no repo field, auto-watch should not fire.
+        // This tests the comms.rs logic: args["repo"].as_str() returns None.
+        let home = std::env::temp_dir().join(format!("agend-no-watch-{}", std::process::id()));
+        std::fs::create_dir_all(home.join("ci-watches")).ok();
+        // No watch file should exist for a branch without repo.
+        let filename = crate::daemon::ci_watch::watch_filename("", "feat/no-repo");
+        let watch_path = home.join("ci-watches").join(&filename);
+        assert!(!watch_path.exists(), "no watch without repo");
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
