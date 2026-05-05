@@ -241,9 +241,10 @@ fn configure_gemini(working_dir: &Path, instance_name: Option<&str>) -> Result<(
     if let Some(name) = instance_name {
         env["AGEND_INSTANCE_NAME"] = json!(name);
     }
+    let (cmd, args) = bridge_binary_path();
     config["mcpServers"]["agend-terminal"] = json!({
-        "command": binary_path(),
-        "args": ["mcp"],
+        "command": cmd,
+        "args": args,
         "env": env,
         "trust": true
     });
@@ -289,9 +290,13 @@ fn configure_opencode(working_dir: &Path, instance_name: Option<&str>) -> Result
     if let Some(name) = instance_name {
         oc_env["AGEND_INSTANCE_NAME"] = json!(name);
     }
+    let (oc_cmd, oc_args) = bridge_binary_path();
+    let oc_command: Vec<String> = std::iter::once(oc_cmd)
+        .chain(oc_args.iter().map(|s| s.to_string()))
+        .collect();
     config["mcp"]["agend-terminal"] = json!({
         "type": "local",
-        "command": [binary_path(), "mcp"],
+        "command": oc_command,
         "enabled": true,
         "environment": oc_env
     });
@@ -341,7 +346,8 @@ fn configure_codex_with_home(
     home: &str,
     instance_name: Option<&str>,
 ) -> Result<()> {
-    let bin = binary_path();
+    let (bridge_cmd, bridge_args) = bridge_binary_path();
+    let bin = bridge_cmd;
 
     let codex_dir = working_dir.join(".codex");
     std::fs::create_dir_all(&codex_dir)?;
@@ -377,10 +383,22 @@ fn configure_codex_with_home(
     let instance_line = instance_name
         .map(|n| format!("AGEND_INSTANCE_NAME = {}\n", toml_string_value(n)))
         .unwrap_or_default();
+    let args_toml = if bridge_args.is_empty() {
+        "[]".to_string()
+    } else {
+        format!(
+            "[{}]",
+            bridge_args
+                .iter()
+                .map(|a| format!("\"{a}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let body = format!(
         r#"{stripped}{separator}{CODEX_MCP_HEADER}
 command = {bin_lit}
-args = ["mcp"]
+args = {args_toml}
 
 {CODEX_MCP_ENV_HEADER}
 AGEND_HOME = {home_lit}
