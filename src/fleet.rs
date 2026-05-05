@@ -174,6 +174,10 @@ pub struct InstanceConfig {
     pub model: Option<String>,
     /// Display name for UI/Telegram.
     pub display_name: Option<String>,
+    /// Path to extra instructions file (relative to fleet.yaml dir).
+    /// Content is appended to the generated agent instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Legacy field — retained only to gracefully absorb old fleet.yaml
     /// files that still declare `outbound_capabilities`. Not used at
     /// runtime; skipped on serialization.

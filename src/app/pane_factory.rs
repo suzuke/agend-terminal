@@ -285,6 +285,7 @@ pub(super) fn create_pane_from_resolved(
         role: resolved.role.as_deref(),
         fleet_peers: &peers,
         team: team_ctx.as_ref(),
+        extra_instructions: None, // App mode doesn't resolve fleet.yaml instructions
     };
 
     let mut pane = create_pane(

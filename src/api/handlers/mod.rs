@@ -64,11 +64,21 @@ pub(crate) fn prepare_instructions(
             let role = explicit_role
                 .map(str::to_string)
                 .or_else(|| fleet.instances.get(name).and_then(|c| c.role.clone()));
+            // Resolve extra instructions file relative to fleet.yaml dir.
+            let extra_instr = fleet
+                .instances
+                .get(name)
+                .and_then(|c| c.instructions.as_deref())
+                .and_then(|p| {
+                    let resolved = fleet_path.parent().unwrap_or(home).join(p);
+                    std::fs::read_to_string(resolved).ok()
+                });
             let ctx = crate::instructions::AgentContext {
                 name,
                 role: role.as_deref(),
                 fleet_peers: &peers,
                 team: team_ctx.as_ref(),
+                extra_instructions: extra_instr.as_deref(),
             };
             crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
         }
@@ -78,6 +88,7 @@ pub(crate) fn prepare_instructions(
                 role: explicit_role,
                 fleet_peers: &[],
                 team: team_ctx.as_ref(),
+                extra_instructions: None,
             };
             crate::instructions::generate_with_context(work_dir, command, Some(&ctx));
         }
