@@ -141,44 +141,12 @@ fn configure_claude(working_dir: &Path, instance_name: Option<&str>) -> Result<(
 fn configure_kiro(working_dir: &Path, instance_name: Option<&str>) -> Result<()> {
     let path = working_dir.join(".kiro").join("settings").join("mcp.json");
 
-    // Generate wrapper script (Kiro ignores "env" in mcp.json). Atomic so
-    // a racing read never sees a partially-written script.
-    let wrapper_dir = working_dir.join(".kiro").join("settings");
-    std::fs::create_dir_all(&wrapper_dir)?;
-    let wrapper_ext = if cfg!(windows) { "cmd" } else { "sh" };
-    let wrapper_path = wrapper_dir.join(format!("agend-mcp-wrapper.{wrapper_ext}"));
-    let instance_env_win = instance_name
-        .map(|n| format!("set \"AGEND_INSTANCE_NAME={n}\"\r\n"))
-        .unwrap_or_default();
-    let instance_env_unix = instance_name
-        .map(|n| format!("export AGEND_INSTANCE_NAME={}\n", shell_escape(n)))
-        .unwrap_or_default();
-    let (bridge_cmd, bridge_args) = bridge_binary_path();
-    let bridge_args_str = bridge_args.join(" ");
-    let wrapper = if cfg!(windows) {
-        format!(
-            "@echo off\r\nset \"AGEND_HOME={home}\"\r\n{instance_env_win}\"{bin}\" {args}\r\n",
-            home = home_path(),
-            bin = bridge_cmd,
-            args = bridge_args_str,
-        )
-    } else {
-        format!(
-            "#!/bin/bash\nexport AGEND_HOME={home}\n{instance_env_unix}exec {bin} {args}\n",
-            home = shell_escape(&home_path()),
-            bin = shell_escape(&bridge_cmd),
-            args = bridge_args_str,
-        )
-    };
-    crate::store::atomic_write(&wrapper_path, wrapper.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))?;
+    let (cmd, args) = bridge_binary_path();
+    let mut env = json!({ "AGEND_HOME": home_path() });
+    if let Some(name) = instance_name {
+        env["AGEND_INSTANCE_NAME"] = json!(name);
     }
 
-    // Hold the mcp.json flock across the cleanup+rewrite so legacy-key
-    // removal and mcpServers upsert can't race a sibling caller.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -201,10 +169,9 @@ fn configure_kiro(working_dir: &Path, instance_name: Option<&str>) -> Result<()>
         config["mcpServers"] = json!({});
     }
     config["mcpServers"]["agend-terminal"] = json!({
-        "command": wrapper_path.display().to_string(),
-        "args": [],
-        // Auto-approve every tool from this server. `--trust-all-tools` only
-        // covers Kiro's built-in tools; per-MCP-server trust is set here.
+        "command": cmd,
+        "args": args,
+        "env": env,
         "autoApprove": ["*"]
     });
     let body = serde_json::to_string_pretty(&config)?;
@@ -485,6 +452,7 @@ pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>)
 }
 
 /// Escape a string for use in a bash script.
+#[allow(dead_code)] // Used by tests; was used by wrapper.sh (removed in Sprint 52)
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -692,50 +660,58 @@ mod tests {
 
     #[test]
     fn kiro_creates_wrapper_script() {
-        let dir = tmp_dir("kiro_wrapper");
-        configure_kiro(&dir, None).expect("configure");
-        let ext = if cfg!(windows) { "cmd" } else { "sh" };
-        let wrapper = dir.join(format!(".kiro/settings/agend-mcp-wrapper.{ext}"));
+        let dir = tmp_dir("kiro_env");
+        configure_kiro(&dir, Some("dev")).expect("configure");
+        let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
+        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        let entry = &config["mcpServers"]["agend-terminal"];
+        // Must have env field with AGEND_HOME and AGEND_INSTANCE_NAME
+        let env = entry.get("env").expect("env field must exist");
         assert!(
-            wrapper.exists(),
-            "wrapper script must exist at {}",
-            wrapper.display()
+            env["AGEND_HOME"].as_str().is_some(),
+            "env must contain AGEND_HOME"
         );
-        let content = std::fs::read_to_string(&wrapper).expect("read");
-        assert!(content.contains("AGEND_HOME"));
-        if cfg!(windows) {
-            assert!(content.starts_with("@echo off"));
-        } else {
-            assert!(content.starts_with("#!/bin/bash"));
-            assert!(content.contains("exec"));
-        }
+        assert_eq!(
+            env["AGEND_INSTANCE_NAME"].as_str(),
+            Some("dev"),
+            "env must contain AGEND_INSTANCE_NAME"
+        );
+        // Command must NOT be a wrapper script
+        let cmd = entry["command"].as_str().expect("command str");
+        assert!(
+            !cmd.contains("wrapper"),
+            "must not use wrapper script, got: {cmd}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn kiro_mcp_json_points_to_wrapper() {
-        let dir = tmp_dir("kiro_json");
+    fn kiro_mcp_json_uses_bridge_command() {
+        let dir = tmp_dir("kiro_bridge");
         configure_kiro(&dir, None).expect("configure");
         let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
         let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
         let cmd = config["mcpServers"]["agend-terminal"]["command"]
             .as_str()
             .expect("command str");
-        let ext = if cfg!(windows) { "cmd" } else { "sh" };
-        let needle = format!("agend-mcp-wrapper.{ext}");
-        assert!(cmd.contains(&needle), "expected {needle} in {cmd}");
+        // In test env, bridge binary doesn't exist → falls back to agend-terminal
+        assert!(
+            cmd.contains("agend-terminal") || cmd.contains("agend-mcp-bridge"),
+            "command must be bridge or fallback, got: {cmd}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn kiro_no_env_in_mcp_json() {
-        let dir = tmp_dir("kiro_noenv");
+    fn kiro_no_wrapper_script_created() {
+        let dir = tmp_dir("kiro_nowrapper");
         configure_kiro(&dir, None).expect("configure");
-        let content = std::fs::read_to_string(dir.join(".kiro/settings/mcp.json")).expect("read");
-        let config: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        let ext = if cfg!(windows) { "cmd" } else { "sh" };
+        let wrapper = dir.join(format!(".kiro/settings/agend-mcp-wrapper.{ext}"));
         assert!(
-            config["mcpServers"]["agend-terminal"].get("env").is_none(),
-            "kiro mcp.json should NOT have env (use wrapper instead)"
+            !wrapper.exists(),
+            "wrapper script must NOT be created: {}",
+            wrapper.display()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
