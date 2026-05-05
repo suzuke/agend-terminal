@@ -11,6 +11,8 @@ pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
     let dir = home.join("runtime").join(agent);
     std::fs::create_dir_all(&dir).ok();
     let path = dir.join("binding.json");
+    let lock_path = dir.join(".binding.json.lock");
+    let _lock = crate::store::acquire_file_lock(&lock_path);
     let binding = json!({
         "version": 1,
         "agent": agent,
