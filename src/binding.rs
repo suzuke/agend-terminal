@@ -8,18 +8,33 @@ use std::path::Path;
 
 /// Write a binding for an agent (task assigned).
 pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
+    bind_full(home, agent, task_id, branch, std::path::Path::new(""));
+}
+
+/// Write a full binding including worktree path (Phase 3).
+pub fn bind_full(
+    home: &Path,
+    agent: &str,
+    task_id: &str,
+    branch: &str,
+    worktree: &std::path::Path,
+) {
     let dir = home.join("runtime").join(agent);
     std::fs::create_dir_all(&dir).ok();
     let path = dir.join("binding.json");
     let lock_path = dir.join(".binding.json.lock");
     let _lock = crate::store::acquire_file_lock(&lock_path);
-    let binding = json!({
+    let wt_str = worktree.display().to_string();
+    let mut binding = json!({
         "version": 1,
         "agent": agent,
         "task_id": task_id,
         "branch": branch,
         "issued_at": chrono::Utc::now().to_rfc3339(),
     });
+    if !wt_str.is_empty() {
+        binding["worktree"] = json!(wt_str);
+    }
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     let _ = crate::store::atomic_write(&path, body.as_bytes());
 }

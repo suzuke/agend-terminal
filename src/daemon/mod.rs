@@ -183,6 +183,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     crate::binding::reconcile_hooks(home);
     crate::binding::symlink_shim(home);
     crate::binding::reconcile_orphans(home);
+    crate::worktree_pool::reconcile_orphan_leases(home);
 
     // Check for previous snapshot if fleet.yaml doesn't exist
     if !home.join("fleet.yaml").exists() {

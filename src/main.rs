@@ -59,6 +59,8 @@ mod verify;
 mod vterm;
 mod worktree;
 mod worktree_cleanup;
+#[allow(dead_code)]
+mod worktree_pool;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
