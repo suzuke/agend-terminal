@@ -44,6 +44,8 @@ mod state;
 mod status_summary;
 mod store;
 mod sync;
+#[allow(dead_code)]
+mod sync_audit;
 mod task_events;
 mod tasks;
 mod teams;

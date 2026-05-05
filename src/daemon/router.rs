@@ -26,9 +26,8 @@ pub fn spawn(home: PathBuf, registry: AgentRegistry) {
 
 fn run_loop(_home: PathBuf, _registry: AgentRegistry) {
     let _census = crate::thread_census::register("router");
+    crate::sync_audit::mark_router_thread();
     // PR-A: skeleton loop. PR-B adds subscriber registration + mirror dispatch.
-    // For now, just sleep to avoid busy-spin. The thread exists so invariant
-    // tests can verify its spawn site and lock ordering properties.
     loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
     }
