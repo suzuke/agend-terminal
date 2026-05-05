@@ -103,6 +103,13 @@ impl Pane {
                 if let Some(handle) = reg.get(&self.agent_name) {
                     let _ = agent::write_to_agent(handle, bytes);
                 }
+                drop(reg);
+                // Record for ServerRateLimit auto-retry.
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    crate::daemon::heartbeat_pair::update_with(&self.agent_name, |p| {
+                        p.last_input_text = Some(text.to_string());
+                    });
+                }
             }
             PaneSource::Remote(client) => {
                 let mut c = client.lock();

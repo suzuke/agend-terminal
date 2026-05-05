@@ -899,4 +899,21 @@ mod tests {
             "retry must NOT use api::call (Sprint 49 deadlock)"
         );
     }
+
+    #[test]
+    fn re_inject_works_after_tui_keyboard_input() {
+        // Verify that TUI keyboard input (pane.rs write_to_agent path)
+        // records last_input_text so ServerRateLimit retry can re-inject.
+        let agent_name = "test-tui-input";
+        let input = "Please analyze this code";
+        crate::daemon::heartbeat_pair::update_with(agent_name, |p| {
+            p.last_input_text = Some(input.to_string());
+        });
+        let pair = crate::daemon::heartbeat_pair::snapshot_for(agent_name);
+        assert_eq!(
+            pair.last_input_text.as_deref(),
+            Some(input),
+            "TUI keyboard input must be recorded in last_input_text for retry"
+        );
+    }
 }
