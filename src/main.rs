@@ -453,8 +453,28 @@ fn main() -> anyhow::Result<()> {
                     || err.contains("connectionreset")
                     || err.contains("connection reset")
                 {
-                    eprintln!("Agent '{name}' not found.");
-                    list_running_agents(&home);
+                    // Distinguish not-found from not-attachable by checking registry.
+                    let agent_exists =
+                        api::call(&home, &serde_json::json!({"method": api::method::LIST}))
+                            .ok()
+                            .and_then(|r| r["result"]["agents"].as_array().cloned())
+                            .is_some_and(|agents| {
+                                agents.iter().any(|a| a["name"].as_str() == Some(&name))
+                            });
+
+                    if agent_exists {
+                        eprintln!("Agent '{name}' exists but is not attachable.");
+                        eprintln!("Possible reasons:");
+                        eprintln!("  - Already attached (only one attach session per agent)");
+                        eprintln!(
+                            "  - tui_bridge port not listening (daemon partially restarted?)"
+                        );
+                        eprintln!("  - Stale port file");
+                        eprintln!("Run 'agend-terminal list' to confirm agent state.");
+                    } else {
+                        eprintln!("Agent '{name}' not found.");
+                        list_running_agents(&home);
+                    }
                 } else {
                     return Err(e);
                 }

@@ -116,3 +116,26 @@ fn completions_emits_for_zsh_fish_bash() {
         "zsh and bash completions must differ"
     );
 }
+
+/// `agend attach <nonexistent>` without daemon shows daemon hint, not "not found".
+#[test]
+fn attach_without_daemon_shows_daemon_hint() {
+    let output = cmd()
+        .env(
+            "AGEND_HOME",
+            std::env::temp_dir().join("agend-attach-test-nodaemon"),
+        )
+        .arg("attach")
+        .arg("ghost-agent")
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("not running") || stderr.contains("Start it with"),
+        "attach without daemon must hint about daemon, got stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("not found"),
+        "must not say 'not found' when daemon isn't running"
+    );
+}
