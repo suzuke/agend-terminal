@@ -195,6 +195,7 @@ pub fn resolve_instance(
 pub fn lock_registry(
     reg: &AgentRegistry,
 ) -> parking_lot::MutexGuard<'_, std::collections::HashMap<String, AgentHandle>> {
+    crate::sync_audit::assert_lock_tier(1, "registry");
     reg.lock()
 }
 

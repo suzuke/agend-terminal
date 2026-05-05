@@ -106,6 +106,7 @@ pub fn pair_for(name: &str) -> Arc<Mutex<HeartbeatPair>> {
 /// Helper: load the pair as a snapshot. Acquires lock briefly, copies the
 /// `Copy` struct, releases. Use when the caller only needs a read view.
 pub fn snapshot_for(name: &str) -> HeartbeatPair {
+    crate::sync_audit::assert_lock_tier(3, "heartbeat_pair");
     let pair = pair_for(name);
     let g = pair.lock();
     g.clone()
@@ -119,6 +120,7 @@ pub fn update_with<F>(name: &str, f: F)
 where
     F: FnOnce(&mut HeartbeatPair),
 {
+    crate::sync_audit::assert_lock_tier(3, "heartbeat_pair");
     let pair = pair_for(name);
     let mut g = pair.lock();
     f(&mut g);
