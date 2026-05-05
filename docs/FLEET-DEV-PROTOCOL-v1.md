@@ -1056,12 +1056,16 @@ Three rules to eliminate idle time. Operator-authorized 2026-04-26.
 
 **Worktree naming convention:**
 ```
-git worktree add ../agend-terminal.worktrees/<branch-name> <branch-name>
+git worktree add -b <new-branch> ../agend-terminal.worktrees/<branch-name> origin/main
 ```
 Or for reviewers:
 ```
-git worktree add /tmp/agend-prNNN-review <branch-name>
+git worktree add /tmp/agend-prNNN-review origin/<branch-name>
 ```
+
+The `-b <new-branch>` form (or `origin/<existing-branch>` for review) is
+mandatory: never write `git worktree add <path> main`, as that locks the
+main checkout into the worktree and breaks operator/CI builds (see E4.5).
 
 **Exceptions:**
 - **dev-lead**: merge operations + read-only queries may use the main repo (atomic merge is safe).
@@ -1075,6 +1079,7 @@ git worktree add /tmp/agend-prNNN-review <branch-name>
 | E4.2 | **Cleanup after merge.** `git worktree remove <path>` + `git branch -d <branch>` after PR merge. Stale worktrees waste disk and confuse `git worktree list`. |
 | E4.3 | **Consistent with CLAUDE.md.** This rule formalizes the existing CLAUDE.md global rule "never commit directly to main; always use worktree + branch" into the fleet protocol. |
 | E4.4 | **Pipeline + worktree.** Rule 1 pipeline dispatch naturally requires worktrees — you cannot have two branches checked out in one working tree. Worktree mandatory is the mechanical prerequisite for pipeline to work safely. |
+| E4.5 | **Never check out main into a worktree.** `git worktree add <path> main` makes the canonical repo `detached HEAD` (or errors on `git switch main`), breaking operator `cargo build --release`. Always use `-b <new-branch>` to create a fresh branch, or check out an existing non-main branch via `origin/<name>`. The MCP `repo` tool's `branch` argument is honoured verbatim — pass a non-main name. Recovery if you slip: `cd <worktree> && git switch -c <dedicated-branch>` releases the main reference. (Origin: 2026-05-05 incident — lead daemon worktree took main, blocked operator binary build.) |
 
 ### 10.5 Spawn site rationale (v1.2 amendment)
 

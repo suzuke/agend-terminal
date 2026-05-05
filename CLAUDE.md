@@ -33,6 +33,30 @@ Hooks are per-clone. After a fresh `git clone`, install with:
 scripts/install-hooks.sh
 ```
 
+## Worktree branch policy
+
+When creating a worktree, **always use `-b <dedicated-branch>`** to create a
+fresh branch. **Never** check out `main` (or any other long-lived shared
+branch) directly into a worktree:
+
+```bash
+# Good — dedicated branch
+git worktree add ../path -b feat/short-name origin/main
+
+# Bad — locks main checkout, blocks operator/CI build
+git worktree add ../path main
+```
+
+A worktree that holds `main` makes the canonical repo go `detached HEAD` (or
+errors on `git switch main`) and breaks `cargo build --release` for operator
+and tooling. The fix is `cd <worktree> && git switch -c <dedicated-branch>`,
+but it is far cheaper to never take main in the first place.
+
+This applies to fleet agents (lead/dev/reviewer) and to the MCP `repo` tool —
+when calling `mcp__agend-terminal__repo action=checkout`, pass a non-main
+`branch` argument (the daemon honours it verbatim and will not derive a fresh
+branch for you).
+
 ## Release
 
 Tags matching `v*` trigger `.github/workflows/release.yml`, which builds 5
