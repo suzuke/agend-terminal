@@ -25,6 +25,8 @@ mod event_log;
 mod fleet;
 mod framing;
 mod health;
+#[allow(dead_code)]
+mod hotspot;
 mod identity;
 mod inbox;
 mod instance_monitor;
