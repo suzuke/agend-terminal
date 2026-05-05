@@ -378,6 +378,14 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         }
     }
 
+    // Phase 1 git-shim: inject AGEND_REAL_GIT so the shim can exec the
+    // real git binary without recursion (R12 mitigation).
+    if std::env::var("AGEND_REAL_GIT").is_err() {
+        if let Ok(git_path) = which::which("git") {
+            cmd.env("AGEND_REAL_GIT", git_path);
+        }
+    }
+
     if let Some(dir) = working_dir {
         // Defense-in-depth: the API spawn handler already calls
         // validate_working_directory at admission, but a symlink could have

@@ -180,6 +180,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
 
     // Extract embedded fleet protocol to AGEND_HOME/protocol/.default/
     crate::protocol::extract_default(home);
+    crate::binding::reconcile_hooks(home);
 
     // Check for previous snapshot if fleet.yaml doesn't exist
     if !home.join("fleet.yaml").exists() {

@@ -343,6 +343,10 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 task_id = ?task_id_str,
                 "delegate_task branch hint — implementer should work on this branch"
             );
+            // Phase 1 git-shim: write binding for trailer hook.
+            if let Some(tid) = task_id_str {
+                crate::binding::bind(home, target, tid, branch);
+            }
         }
         ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
             from: sender.as_str().to_string(),

@@ -1,0 +1,50 @@
+#!/bin/sh
+# agend-terminal prepare-commit-msg hook — injects fleet trailers.
+# Reads binding.json for the current agent and appends metadata trailers.
+# Always exits 0 (hook failure must not block commits).
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="$2"
+
+# Skip merge/squash/template commits.
+case "$COMMIT_SOURCE" in
+    merge|squash|template) exit 0 ;;
+esac
+
+# Determine agent name from env.
+AGENT="${AGEND_INSTANCE_NAME:-}"
+if [ -z "$AGENT" ]; then
+    exit 0
+fi
+
+# Determine AGEND_HOME.
+HOME_DIR="${AGEND_HOME:-}"
+if [ -z "$HOME_DIR" ]; then
+    exit 0
+fi
+
+BINDING="$HOME_DIR/runtime/$AGENT/binding.json"
+if [ ! -f "$BINDING" ]; then
+    exit 0
+fi
+
+# Idempotent: skip if trailer already present.
+if grep -q "^Agend-Agent:" "$COMMIT_MSG_FILE" 2>/dev/null; then
+    exit 0
+fi
+
+# Parse binding.json (minimal jq-free parsing via grep/sed).
+TASK=$(grep -o '"task_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"task_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
+BRANCH=$(grep -o '"branch"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
+ISSUED=$(grep -o '"issued_at"[[:space:]]*:[[:space:]]*"[^"]*"' "$BINDING" | sed 's/.*"issued_at"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' 2>/dev/null)
+
+# Only inject if we have at least agent name.
+{
+    echo ""
+    echo "Agend-Agent: $AGENT"
+    [ -n "$TASK" ] && echo "Agend-Task: $TASK"
+    [ -n "$BRANCH" ] && echo "Agend-Branch: $BRANCH"
+    [ -n "$ISSUED" ] && echo "Agend-Issued-At: $ISSUED"
+} >> "$COMMIT_MSG_FILE"
+
+exit 0
