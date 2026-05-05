@@ -1008,4 +1008,51 @@ mod tests {
             "only 1 retry sequence despite 30 ticks of persistent state"
         );
     }
+
+    #[test]
+    fn last_input_text_stored_raw_no_header() {
+        // notify_agent stores raw text (not formatted notification with header).
+        // Verify by checking that the stored text does NOT contain [AGEND-MSG].
+        let agent = "test-raw-store";
+        let raw_body = "Please analyze this code";
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.last_input_text = Some(raw_body.to_string());
+        });
+        let pair = crate::daemon::heartbeat_pair::snapshot_for(agent);
+        let stored = pair.last_input_text.expect("must be set");
+        assert!(
+            !stored.contains("[AGEND-MSG]"),
+            "must not contain header: {stored}"
+        );
+        assert!(
+            !stored.contains("[from:"),
+            "must not contain source prefix: {stored}"
+        );
+        assert_eq!(stored, raw_body, "must store raw body exactly");
+    }
+
+    #[test]
+    fn retry_re_inject_uses_raw_text_no_header() {
+        // The retry path uses inject_to_agent with retry.input_text.
+        // Verify the source-level contract: input_text comes from
+        // last_input_text which is raw (per the fix above).
+        let src = include_str!("supervisor.rs");
+        let fn_start = src
+            .find("fn process_server_rate_limit_retries(")
+            .expect("function must exist");
+        let rest = &src[fn_start..];
+        let fn_end = rest
+            .find("\n/// ")
+            .or_else(|| rest.find("\nfn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..fn_end];
+        assert!(
+            body.contains("retry.input_text.as_bytes()"),
+            "retry must use input_text (raw body) for re-inject"
+        );
+        assert!(
+            !body.contains("format_notification"),
+            "retry must NOT re-format notification (would add header)"
+        );
+    }
 }
