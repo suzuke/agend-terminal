@@ -424,38 +424,47 @@ assets/hooks/
 
 ## 4. Phase 排序與 Deliverable
 
-### Phase 1 — Hook trailer (1.5 天)
+> **Amendment 2026-05-05**：phase 重組以收斂最小可交付 (per team review synthesis lead m-, dev m-67, reviewer m-66)。
+> 原 Phase 3 將 worktree GC 跟 lifecycle 綁在一起放大 R3；GC 切出獨立 phase 才能 dry-run 觀察後再實刪。Phase 1 加 minimal binding.json writer 以支撐 trailer metadata。
 
-**目標**：先把 commit 脈絡這個零風險獨立功能做掉，順便驗證 daemon → env → hook 鏈路。
+### Phase 1 — Hook trailer + minimal binding writer + telemetry (1.5–2 天)
+
+**目標**：先把 commit 脈絡這個零風險獨立功能做掉，順便驗證 daemon → env → hook 鏈路、並建立 deny telemetry baseline。
 
 **Deliverables**:
 
 - `assets/hooks/prepare-commit-msg` 模板（PoC 已有，改 production-ready）
 - `WorktreePool` 雛形：只實作 `install_hook(worktree)`
+- **Minimal `BindingManager` writer**：只寫 `task_id` + `branch` + `agent_name` + `issued_at` 到 `runtime/<agent>/binding.json`（任務 dispatch 時觸發）。lifecycle / unbind / reconcile 等延後。Hook 從這個檔讀 trailer metadata。
 - daemon 啟動時對既有 `worktrees/*` 補裝 hook（向下相容）
+- `fleet_events.jsonl` 加 `git_event` kind（先不寫 deny，預留 telemetry channel）
 - 文件：trailer 格式規範
 
 **Exit criteria**:
 
 - 手動建 worktree + 派任意 dummy task，commit 看到 trailer
 - 三個 backend（claude / codex / kiro / gemini 任選兩）都驗證一次
+- binding.json 在 task dispatch 後寫入，內容可被 hook 讀
 
-**風險**：極低（不動 git 行為）
+**風險**：極低（不動 git 行為，只多寫 metadata）
 
 ---
 
-### Phase 2 — Binding state + shim binary (4 天)
+### Phase 2 — Binding lifecycle + shim binary + deny (合併原 Phase 2/3 binding-shim+原 Phase 4 deny；4–6 天)
 
-**目標**：核心 component 上線。
+**目標**：核心 component + 防禦面一起上線；GC 留給後面 phase。
 
 **Deliverables**:
 
-- `crates/agend-git/` 完整 binary
-- `src/binding.rs`：BindingManager 完整 + flock
+- `crates/agend-git/` 完整 binary（passthrough / chdir+pass / deny 三 mode）
+- `BindingManager` 補完 unbind / reconcile / flock + atomic rename
 - `agent.rs`: PATH 注入加 `$AGEND_HOME/bin/`
-- daemon 啟動時 reconcile binding 孤兒
-- shim 行為矩陣的 `passthrough` + `chdir+pass` 兩個 mode（先不做 deny）
-- `AGEND_GIT_BYPASS=1` 逃生口
+- daemon 注入 `AGEND_REAL_GIT=$(which git)` env (R12 mitigation, 見 §6/§7)
+- shim 完整行為矩陣（含 deny）
+- ERROR 訊息統一格式
+- deny 事件寫 `fleet_events.jsonl`（Phase 1 已開 channel）
+- daemon 偵測連續 N 次同 deny → inbox 通知 lead
+- bypass：`AGEND_GIT_BYPASS=1` 全程逃生 + `AGEND_GIT_BYPASS_AGENT=<name>` per-agent + `AGEND_GIT_BYPASS_UNTIL=<epoch>` 絕對 epoch (R1 mitigation 見 §6/§7)
 
 **Exit criteria**:
 
@@ -463,54 +472,59 @@ assets/hooks/
 - unbound 模式：行為跟原本 git 一樣
 - 動態切換 binding 立即生效
 - shim overhead < 10ms（Rust release build）
-- bypass 環境變數驗證
+- 故意製造 cross-branch checkout 攻擊，全部被擋
+- ERROR 訊息對 LLM 可解析
+- 連續 deny 觸發 lead 通知
+- bypass 三層機制驗證（global / agent / epoch）
 
-**風險**：中（首次動 PATH，要保 bypass 可逃）
+**風險**：中（首次動 PATH，但 bypass 三層 + AGEND_REAL_GIT 注入解 recursion）
 
 ---
 
-### Phase 3 — Worktree lifecycle (3 天)
+### Phase 3 — Worktree lifecycle (lease/release，3 天)
 
-**目標**：把 §10.4 從人類紀律自動化。
+**目標**：自動建/接管 worktree，**不含 GC**。
 
 **Deliverables**:
 
-- `src/worktree_pool.rs` 完整實作
+- `src/worktree_pool.rs` lease / release 實作（GC 移到 Phase 4）
 - task dispatch 加 `lease/release` 鉤子
-- task done 觸發 release
-- 啟動時 reconcile 孤兒 worktree
+- task done 觸發 release（標候選即可，不刪）
+- 啟動時 reconcile 孤兒 worktree（只 log，不刪）
 - `.env*` 複製、port offset hash（從 worktree path）
 - `worktree.list` MCP tool
 
 **Exit criteria**:
 
 - lead 派 impl task → daemon 自動建 worktree + install hook + bind
-- task done → worktree 標候選 → 24h 後 GC（可調）
+- task done → worktree 標候選（保留磁碟）
 - 至少跑一次「同一 agent 接續做兩個不同 branch task」整個流程不 respawn
 
-**風險**：中（worktree GC 要小心不刪人類正在用的）
+**風險**：中低（最危險的 GC 推到 Phase 4）
 
 ---
 
-### Phase 4 — Deny list 完整化 (2 天)
+### Phase 4 — Worktree GC dry-run + cutover (2 天)
 
-**目標**：補 shim 防禦面，把 §10.4 的「checkout race」根除。
+**目標**：把 Phase 3 標候選的 worktree 真的回收，但用 dry-run 雙階段。
 
 **Deliverables**:
 
-- shim 完整 deny 行為矩陣（cross-branch checkout、worktree add、unbound mutate）
-- ERROR 訊息統一格式
-- deny 事件寫 `fleet_events.jsonl`
-- daemon 偵測連續 N 次同 deny → inbox 通知 lead
-- 操作員 CLI: `agend git override` 暫時放行（debug 用）
+- GC 第一輪 **dry-run**：daemon 找出可刪 worktree（候選 + 過 grace TTL + 不在 binding + 不被 pin），只寫 log + 通知 lead，**不實刪**
+- 操作員可用 `agend worktree gc-dry-run` MCP tool 觀察會刪什麼
+- 觀察 N 天後 enable 第二輪 **actual GC**（feature flag `AGEND_WORKTREE_GC=1`）
+- pin 機制：操作員可標 worktree 不被 GC（即使到 TTL）
+- only-daemon-tagged invariant：人類手建 worktree 不被回收
 
 **Exit criteria**:
 
-- 故意製造 cross-branch checkout 攻擊，全部被擋
-- ERROR 訊息對 LLM 可解析
-- 連續 deny 觸發 lead 通知
+- dry-run mode 列出候選清單正確
+- pin 過的不出現在候選
+- 人類命名的不出現在候選
+- 第二輪實刪只動 daemon-tagged + 過 TTL + 未 pin 的
+- 整個 enable / disable 透過 env flag
 
-**風險**：中低（核心邏輯已驗證，補周邊）
+**風險**：中（R3 風險面，dry-run 雙階段是緩解）
 
 ---
 
@@ -595,11 +609,13 @@ Phase 2 結束後跑一次 fleet 級驗證：
 
 ## 6. 風險登記
 
+> **Amendment 2026-05-05**：補 R11–R14 + R1/R3 緩解強化（per team review synthesis）。
+
 | ID | 風險 | 嚴重度 | 緩解 |
 |---|---|---|---|
-| R1 | shim panic 卡死整個 fleet 的 git | 高 | 強制 `AGEND_GIT_BYPASS=1` 逃生 + Phase 2 上線前 fuzz test |
+| R1 | shim panic 卡死整個 fleet 的 git | 高 | (a) `AGEND_GIT_BYPASS=1` 全程逃生（人工硬逃） (b) `AGEND_GIT_BYPASS_AGENT=<name>` per-agent scope (c) `AGEND_GIT_BYPASS_UNTIL=<epoch>` 絕對 epoch、daemon 設時算 now+ttl、shim 比 now（消 time-of-use drift） (d) **shim health-check + auto-bypass fallback**：shim 自偵 panic 過 N 次 / binding.json 反復解析失敗 → 自動 bypass，不靠人工 set env (e) Phase 2 上線前 fuzz test |
 | R2 | binding.json 並發寫 race | 中 | flock + atomic rename + daemon 是唯一 writer |
-| R3 | Worktree GC 刪到人類正在用的 | 高 | GC 只回收 daemon 紀錄為 idle 的；保留 N 天；操作員可 pin |
+| R3 | Worktree GC 刪到人類正在用的 | 高 | (a) **only-daemon-tagged 才回收**：人類手建 worktree 永不被 GC (b) **grace TTL** 緩衝 (c) 操作員可 **pin** 標記不被 GC (d) **dry-run 雙階段**（Phase 4）：第一輪只 log + 通知 lead，operator review 後第二輪才實刪；feature flag `AGEND_WORKTREE_GC=1` |
 | R4 | hook fail 阻擋 commit | 中 | hook 永遠 `exit 0`，trailer 失敗只 log |
 | R5 | 弱 backend 不理解 ERROR 訊息持續 retry | 中 | daemon 偵測連續 deny 通知 lead |
 | R6 | shim 性能不夠 | 低 | Rust release + 不每次重讀 binding（mtime cache） |
@@ -607,37 +623,56 @@ Phase 2 結束後跑一次 fleet 級驗證：
 | R8 | Windows 不支援 | 低 | Phase 5 後評估，現階段 macOS/Linux only |
 | R9 | 既有 worktree 跟新命名衝突 | 中 | reconcile 邏輯保留人類命名；只接管自動建立的 |
 | R10 | binding.json 路徑被 agent 推測並偽造 | 低 | 只有 daemon 有寫權限，shim 唯讀 |
+| **R11** | **Hook drift 跨 worktree 版本不一致** | 中 | `core.hooksPath` 統一目錄（daemon 一次更新全 worktree pick up）；不用 per-worktree copy mode |
+| **R12** | **Shim recursion**（shim 在 PATH 第一順位 → fork plain `git` 無限遞迴） | 高 | daemon spawn 時注入 `AGEND_REAL_GIT=$(which git)` env（pattern matches existing AGEND_HOME / AGEND_INSTANCE_NAME injection at agent.rs:344）；shim 讀 env first；fallback `which`-strip excluding `$AGEND_HOME/bin/` if env missing |
+| **R13** | **Multi-platform PATH priority**（macOS / Linux / WSL git resolution 順序差） | 中 | shim 不依賴 PATH 解析自身路徑（用 `AGEND_REAL_GIT` env or absolute path）；cross-backend smoke test 涵蓋三平台 |
+| **R14** | **既有 human-managed worktree 命名衝突誤判** | 中 | daemon reconcile 用 daemon-tagged metadata（如 `binding.json` 紀錄 + worktree name pattern `<agent>-<branch-sanitized>`）區分；只接管 daemon-tagged，human-managed 保持中立 |
 
 ---
 
 ## 7. 開工 Checklist
 
+> **Amendment 2026-05-05**：補 alignment items 1–3（per operator counter-proposal m-73 + dev m-77 + reviewer m-78 confirmed align）。
+
 實作開始前要確認：
 
-- [ ] 確認 `target/release/` vs `$AGEND_HOME/bin/` 哪個放 shim（傾向後者，避免污染 build dir）
-- [ ] 確認 `crates/agend-git` 在 workspace 還是獨立 crate
-- [ ] §10.4 既有 worktree 命名 `<agent>-<repo-path>` vs 新提議 `<agent>-<branch>` 是否衝突 → 決定要不要改命名
-- [ ] task board 結構是否有「task kind」欄位區分 impl/review/plan？沒有要加
-- [ ] 既有 `worktrees/` 下的人類手建 worktree 怎麼處理（Phase 3 reconcile 規則）
-- [ ] hook 安裝策略：每 worktree 一份 vs `core.hooksPath` 指向統一目錄（傾向後者，方便升級）
-- [ ] shim ERROR 走 stderr 還是 stdout（傾向 stderr，跟 git 原生一致）
-- [ ] AGEND_HOME 注入是否在所有 backend 都 OK（已確認 claude，其他要驗）
-- [ ] 是否要支援 `agend git override` 操作員 CLI（用於緊急 debug）
+### Resolved (本 amendment 拍定)
+
+- [x] **shim binary 放 `$AGEND_HOME/bin/`**（避免污染 build dir）；workspace 內 `crates/agend-git` 用 `[[bin]]`、daemon 啟動 symlink `$AGEND_HOME/bin/git → target/release/agend-git`
+- [x] **`crates/agend-git` 在 workspace** 共享 cargo lockfile（matches existing `agend-mcp-bridge` pattern）
+- [x] **hook 安裝策略：`core.hooksPath` 統一目錄**（unified update path、不用 per-worktree copy）
+- [x] **shim ERROR 走 stderr**（與 git 原生一致）
+- [x] **R12 shim recursion fix**：daemon 注入 `AGEND_REAL_GIT=$(which git)` env at spawn time（pattern matches existing AGEND_HOME / AGEND_INSTANCE_NAME injection at agent.rs:344）；shim 讀 env first，fallback `which`-strip excluding `$AGEND_HOME/bin/`
+- [x] **Bypass mechanism 三層**：
+  - `AGEND_GIT_BYPASS=1`：全 process 硬逃生（人工 emergency override）
+  - `AGEND_GIT_BYPASS_AGENT=<name>`：per-agent scope
+  - `AGEND_GIT_BYPASS_UNTIL=<epoch>`：絕對 epoch（daemon 設時算 now+ttl，shim 比 now）— 消 time-of-use drift
+- [x] **Phase 1 binding.json minimal writer**：option (a)—Phase 1 ship minimal writer（task_id + branch + agent_name + issued_at），lifecycle manager 移到 Phase 2。Cross-backend principle 維持（option b 需 backend-fragmented per-task env mechanism、會破）。
+
+### Open（仍要決定）
+
+- [ ] §10.4 既有 worktree 命名 `<agent>-<repo-path>` vs 新提議 `<agent>-<branch>` 是否衝突 → 決定要不要改命名（搬到 Phase 3 worktree lifecycle 才需要 finalize）
+- [ ] task board 結構是否有「task kind」欄位區分 impl/review/plan？沒有要加（dev m-67 確認 current TaskEntry 沒這欄位、Phase 1 不需、defer 到 Phase 2 整合 dispatch 時加）
+- [ ] 既有 `worktrees/` 下的人類手建 worktree 怎麼處理（Phase 3 reconcile 規則）— R14 緩解：daemon-tagged-only invariant
+- [ ] AGEND_HOME 注入是否在所有 backend 都 OK（已確認 claude，其他要驗）— Phase 1 cross-backend smoke test 一併驗
+- [ ] 是否要支援 `agend git override` 操作員 CLI（用於緊急 debug）— Phase 4 + dry-run GC 已部份覆蓋此用途，視 Phase 4 觀察期 feedback 決定
 
 ---
 
 ## 8. 預估工時
 
+> **Amendment 2026-05-05**：Phase 重組後重估；Phase 1 加 minimal binding writer + telemetry；原 Phase 2 binding+shim 跟原 Phase 4 deny 合併；Phase 3 拆出 lease/release，GC 獨立成 Phase 4 dry-run cutover。
+
 | Phase | 樂觀 | 悲觀 |
 |---|---|---|
-| Phase 1 trailer | 1 天 | 2 天 |
-| Phase 2 binding + shim | 3 天 | 6 天 |
-| Phase 3 worktree pool | 2 天 | 4 天 |
-| Phase 4 deny list | 1 天 | 3 天 |
-| Phase 5 hotspot | 2 天 | 3 天 |
-| **合計** | **9 天** | **18 天** |
+| Phase 1 trailer + minimal binding writer + telemetry | 1.5 天 | 2 天 |
+| Phase 2 binding lifecycle + shim binary + deny + bypass 三層 + AGEND_REAL_GIT | 4 天 | 6 天 |
+| Phase 3 worktree lease/release（無 GC） | 2 天 | 3 天 |
+| Phase 4 worktree GC dry-run + cutover | 1.5 天 | 2 天 |
+| Phase 5 hotspot（選做） | 2 天 | 3 天 |
+| **合計** | **11 天** | **16 天** |
 
-不含跨 backend smoke test（每 phase 結束加 0.5 天）。
+不含跨 backend smoke test（每 phase 結束加 0.5 天）。Phase 4 dry-run 觀察期另計（建議 N 天觀察後 cutover）。
 
 ---
 
