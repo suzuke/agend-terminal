@@ -347,6 +347,18 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
             if let Some(tid) = task_id_str {
                 crate::binding::bind(home, target, tid, branch);
             }
+            // Auto watch_ci for the branch (idempotent — skips if already watching).
+            // Only fires if dispatch includes explicit repo field.
+            if let Some(repo) = args["repo"].as_str() {
+                let watch_file = home
+                    .join("ci-watches")
+                    .join(crate::daemon::ci_watch::watch_filename(repo, branch));
+                if !watch_file.exists() {
+                    let watch_args = serde_json::json!({"repo": repo, "branch": branch});
+                    crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
+                    tracing::info!(%target, %repo, %branch, "auto watch_ci on dispatch");
+                }
+            }
         }
         ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
             from: sender.as_str().to_string(),
