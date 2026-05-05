@@ -176,8 +176,22 @@ pub(super) fn try_telegram_reply_no_cleanup_from(
 /// Format the S2d provenance tag body per DESIGN-stage-b-ux.md §6.
 ///
 /// Shape: `⬅️ from {from} — DELEGATE\n   (brief: "{brief}")`.
+/// Truncates to stay within Telegram's 4096 char limit (~3500 + overhead).
+const PROVENANCE_MAX_BRIEF: usize = 3400;
+
 pub(crate) fn format_provenance(from: &str, brief: &str) -> String {
-    format!("⬅️ from {from} — DELEGATE\n   (brief: \"{brief}\")")
+    let truncated = if brief.len() > PROVENANCE_MAX_BRIEF {
+        let cut: String = brief.chars().take(PROVENANCE_MAX_BRIEF).collect();
+        tracing::info!(
+            from,
+            original_len = brief.len(),
+            "provenance brief truncated to {PROVENANCE_MAX_BRIEF} chars"
+        );
+        format!("{cut} ...[truncated]")
+    } else {
+        brief.to_string()
+    };
+    format!("⬅️ from {from} — DELEGATE\n   (brief: \"{truncated}\")")
 }
 
 /// S2d provenance injection (Stage B-UX PR-C, DESIGN §6).
@@ -429,5 +443,43 @@ instances:
 
         std::env::remove_var("SPRINT23_P1_FAKE_TOKEN2");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Provenance truncation tests ──────────────────────────────────
+
+    #[test]
+    fn provenance_truncate_long_message_to_3500() {
+        let long_brief = "x".repeat(5000);
+        let result = format_provenance("lead", &long_brief);
+        assert!(
+            result.len() < 4096,
+            "formatted provenance must fit telegram limit, got {}",
+            result.len()
+        );
+        assert!(
+            result.contains("...[truncated]"),
+            "truncated message must have truncation marker"
+        );
+    }
+
+    #[test]
+    fn provenance_short_message_no_truncate() {
+        let short = "Fix the bug in auth module";
+        let result = format_provenance("lead", short);
+        assert!(
+            !result.contains("...[truncated]"),
+            "short message must not be truncated"
+        );
+        assert!(result.contains(short), "full brief must be present");
+    }
+
+    #[test]
+    fn provenance_exactly_at_limit_no_truncate() {
+        let exact = "y".repeat(super::PROVENANCE_MAX_BRIEF);
+        let result = format_provenance("lead", &exact);
+        assert!(
+            !result.contains("...[truncated]"),
+            "exactly-at-limit must not truncate"
+        );
     }
 }
