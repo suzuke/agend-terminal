@@ -49,7 +49,7 @@ use std::sync::{Arc, OnceLock};
 /// classifier only knew silence — adding the input-vs-heartbeat delta
 /// fixes the discrimination without breaking existing `Hung`-state
 /// consumers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeartbeatPair {
     /// Last heartbeat timestamp, epoch ms. `0` = never recorded (agent
     /// just spawned, or pre-Sprint 23 backfill not applied). Updated by
@@ -67,6 +67,10 @@ pub struct HeartbeatPair {
     /// and `Hung` (input pending past response → real hung). Updated by
     /// `inbox::notify_agent` central inject site.
     pub last_input_at_ms: u64,
+    /// Sprint 52: last input text injected to agent PTY. Used for
+    /// auto-retry on ServerRateLimit (re-inject after backoff).
+    /// Cleared on successful response (Ready/Idle transition).
+    pub last_input_text: Option<String>,
 }
 
 /// Per-instance lock registry. Keys are agent names (per
@@ -90,7 +94,7 @@ pub fn pair_for(name: &str) -> Arc<Mutex<HeartbeatPair>> {
 pub fn snapshot_for(name: &str) -> HeartbeatPair {
     let pair = pair_for(name);
     let g = pair.lock();
-    *g
+    g.clone()
 }
 
 /// Update the pair atomically. Acquires lock, applies `f`, releases.

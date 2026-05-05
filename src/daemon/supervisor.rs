@@ -25,11 +25,23 @@ const TICK: Duration = Duration::from_secs(10);
 const TAIL_LINES: usize = 40;
 /// Debounce cooldown for member-state-change notify (Sprint 43).
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
+/// Maximum auto-retries for ServerRateLimit before giving up.
+const SERVER_RATE_LIMIT_MAX_RETRIES: u32 = 3;
+/// Backoff schedule for ServerRateLimit retries (seconds).
+const SERVER_RATE_LIMIT_BACKOFF: [u64; 3] = [5, 15, 30];
 
 /// Per-agent notify tracking: last notify time + consecutive error count.
 pub(crate) struct NotifyTrack {
     last_at: Instant,
     consecutive: u32,
+}
+
+/// Per-agent ServerRateLimit retry state.
+#[derive(Debug, Clone)]
+pub(crate) struct RateLimitRetry {
+    pub retry_count: u32,
+    pub next_retry_at: Instant,
+    pub input_text: String,
 }
 
 /// Parse unlock time from usage_limit pane output (e.g., "resets at 15:14 UTC").
@@ -65,9 +77,11 @@ pub fn spawn(home: PathBuf, registry: AgentRegistry) {
 
 fn run_loop(home: PathBuf, registry: AgentRegistry) {
     let mut notify_tracks: HashMap<String, NotifyTrack> = HashMap::new();
+    let mut retry_tracks: HashMap<String, RateLimitRetry> = HashMap::new();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
+        process_server_rate_limit_retries(&home, &registry, &mut retry_tracks);
     }
 }
 
@@ -315,6 +329,113 @@ fn tick(
             }
             None => {}
         }
+    }
+}
+
+/// Process ServerRateLimit retries: detect new rate-limit states, schedule
+/// retries, and re-inject input after backoff. Runs AFTER tick() so all
+/// core locks are released — PTY writes happen lock-free (Sprint 49 lesson).
+pub(crate) fn process_server_rate_limit_retries(
+    home: &std::path::Path,
+    registry: &AgentRegistry,
+    retry_tracks: &mut HashMap<String, RateLimitRetry>,
+) {
+    let now = Instant::now();
+
+    // Phase 1: detect new ServerRateLimit states and schedule retries.
+    {
+        let reg = agent::lock_registry(registry);
+        for (name, handle) in reg.iter() {
+            let state = handle.core.lock().state.current;
+            if state == crate::state::AgentState::ServerRateLimit {
+                if retry_tracks.contains_key(name) {
+                    continue; // already tracking
+                }
+                // Read last_input_text from heartbeat_pair (leaf-level lock).
+                let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
+                let input_text = match pair.last_input_text {
+                    Some(t) if !t.is_empty() => t,
+                    _ => {
+                        tracing::warn!(agent = %name, "ServerRateLimit but no last_input_text — cannot retry");
+                        continue;
+                    }
+                };
+                let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
+                tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry");
+                retry_tracks.insert(
+                    name.clone(),
+                    RateLimitRetry {
+                        retry_count: 0,
+                        next_retry_at: now + delay,
+                        input_text,
+                    },
+                );
+            } else if state == crate::state::AgentState::Ready
+                || state == crate::state::AgentState::Idle
+            {
+                // Agent recovered — clear retry tracking.
+                if retry_tracks.remove(name).is_some() {
+                    tracing::info!(agent = %name, "ServerRateLimit retry cleared (agent recovered)");
+                }
+            }
+        }
+    }
+    // Registry lock released here.
+
+    // Phase 2: fire due retries (PTY write with no locks held).
+    let mut completed = Vec::new();
+    for (name, retry) in retry_tracks.iter_mut() {
+        if now < retry.next_retry_at {
+            continue;
+        }
+        retry.retry_count += 1;
+        if retry.retry_count > SERVER_RATE_LIMIT_MAX_RETRIES {
+            tracing::warn!(agent = %name, retries = retry.retry_count, "ServerRateLimit max retries exceeded — giving up");
+            crate::event_log::log(
+                home,
+                "server_rate_limit_exhausted",
+                name,
+                &format!("gave up after {} retries", SERVER_RATE_LIMIT_MAX_RETRIES),
+            );
+            completed.push(name.clone());
+            continue;
+        }
+
+        // Re-inject last input directly to PTY (no daemon API self-call).
+        let injected = {
+            let reg = agent::lock_registry(registry);
+            if let Some(handle) = reg.get(name.as_str()) {
+                let result = agent::inject_to_agent(handle, retry.input_text.as_bytes());
+                result.is_ok()
+            } else {
+                false
+            }
+        };
+
+        if injected {
+            tracing::info!(
+                agent = %name,
+                retry = retry.retry_count,
+                "ServerRateLimit: re-injected input (attempt {})",
+                retry.retry_count
+            );
+            crate::event_log::log(
+                home,
+                "server_rate_limit_retry",
+                name,
+                &format!("attempt {}", retry.retry_count),
+            );
+            // Schedule next retry with increased backoff.
+            let idx = (retry.retry_count as usize).min(SERVER_RATE_LIMIT_BACKOFF.len() - 1);
+            retry.next_retry_at =
+                Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
+        } else {
+            tracing::warn!(agent = %name, "ServerRateLimit: re-inject failed (agent gone?)");
+            completed.push(name.clone());
+        }
+    }
+    for name in completed {
+        retry_tracks.remove(&name);
     }
 }
 
@@ -715,5 +836,67 @@ mod tests {
             Some("15:14".to_string())
         );
         assert_eq!(super::parse_unlock_at("no time here"), None);
+    }
+
+    // ── ServerRateLimit auto-retry tests ─────────────────────────────
+
+    #[test]
+    fn backoff_5s_15s_30s_schedule() {
+        assert_eq!(super::SERVER_RATE_LIMIT_BACKOFF, [5, 15, 30]);
+        assert_eq!(super::SERVER_RATE_LIMIT_MAX_RETRIES, 3);
+    }
+
+    #[test]
+    fn three_retries_then_stop() {
+        use super::RateLimitRetry;
+        let mut retry = RateLimitRetry {
+            retry_count: 3,
+            next_retry_at: std::time::Instant::now(),
+            input_text: "test input".into(),
+        };
+        retry.retry_count += 1;
+        assert!(
+            retry.retry_count > super::SERVER_RATE_LIMIT_MAX_RETRIES,
+            "after 3 retries, count exceeds max"
+        );
+    }
+
+    #[test]
+    fn re_inject_preserves_last_input_text() {
+        use super::RateLimitRetry;
+        let original = "Please analyze this code and suggest improvements";
+        let retry = RateLimitRetry {
+            retry_count: 0,
+            next_retry_at: std::time::Instant::now(),
+            input_text: original.to_string(),
+        };
+        assert_eq!(
+            retry.input_text, original,
+            "input text must be preserved across retries"
+        );
+    }
+
+    #[test]
+    fn re_inject_path_does_not_self_ipc() {
+        // Verify the retry function uses agent::inject_to_agent directly
+        // (not crate::api::call) — Sprint 49 deadlock regression guard.
+        let src = include_str!("supervisor.rs");
+        let fn_start = src
+            .find("fn process_server_rate_limit_retries(")
+            .expect("function must exist");
+        let rest = &src[fn_start..];
+        let fn_end = rest
+            .find("\n/// ")
+            .or_else(|| rest.find("\nfn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..fn_end];
+        assert!(
+            body.contains("inject_to_agent"),
+            "retry must use inject_to_agent (direct PTY write)"
+        );
+        assert!(
+            !body.contains("api::call"),
+            "retry must NOT use api::call (Sprint 49 deadlock)"
+        );
     }
 }

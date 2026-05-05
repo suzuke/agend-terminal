@@ -46,6 +46,9 @@ pub enum AgentState {
     PermissionPrompt,
     ContextFull,
     RateLimit,
+    /// Anthropic server-side temporary throttle — distinct from user usage
+    /// limit. Auto-retry with exponential backoff is safe.
+    ServerRateLimit,
     UsageLimit,
     AuthError,
     ApiError,
@@ -82,6 +85,7 @@ impl AgentState {
             Self::PermissionPrompt => 8,
             Self::ContextFull => 9,
             Self::RateLimit => 10,
+            Self::ServerRateLimit => 10,
             Self::UsageLimit => 11,
             Self::AuthError => 12,
             Self::ApiError => 13,
@@ -121,6 +125,7 @@ impl AgentState {
             Self::PermissionPrompt => "permission",
             Self::ContextFull => "context_full",
             Self::RateLimit => "rate_limit",
+            Self::ServerRateLimit => "server_rate_limit",
             Self::UsageLimit => "usage_limit",
             Self::AuthError => "auth_error",
             Self::ApiError => "api_error",
@@ -152,6 +157,11 @@ impl StatePatterns {
                 // [docs] SDK retry logic for 429/overloaded
                 // Sprint 31+ #4: word-boundary `429` to avoid false-positive
                 // on substrings like "build #4290" / "request id: 4291...".
+                // Server-side throttle (distinct from user usage limit) — auto-retry safe.
+                (
+                    AgentState::ServerRateLimit,
+                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage",
+                ),
                 (AgentState::RateLimit, r"overloaded|rate.?limit|\b429\b"),
                 // [docs] Auto-compaction on context limit
                 (
@@ -2623,6 +2633,50 @@ mod tests {
             patterns.detect("Ask anything  tab agents"),
             Some(AgentState::ApiError),
             "normal opencode pane must not trigger ApiError"
+        );
+    }
+
+    // ── ServerRateLimit detection tests ──────────────────────────────
+
+    #[test]
+    fn server_rate_limit_pattern_detected() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let screen = "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited";
+        assert_eq!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "must detect Anthropic server-side rate limit"
+        );
+    }
+
+    #[test]
+    fn server_rate_limit_distinct_from_usage_limit() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        // ServerRateLimit
+        let server_msg = "Server is temporarily limiting requests";
+        assert_eq!(
+            patterns.detect(server_msg),
+            Some(AgentState::ServerRateLimit)
+        );
+        // UsageLimit (different pattern)
+        let usage_msg = "Usage limit reached. Resets at 15:14 UTC";
+        let detected = patterns.detect(usage_msg);
+        assert_ne!(
+            detected,
+            Some(AgentState::ServerRateLimit),
+            "usage limit must NOT be ServerRateLimit"
+        );
+    }
+
+    #[test]
+    fn generic_rate_limit_still_detected() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        // Generic "overloaded" should still be RateLimit (not ServerRateLimit)
+        let screen = "The API is overloaded, please try again";
+        assert_eq!(
+            patterns.detect(screen),
+            Some(AgentState::RateLimit),
+            "generic overloaded must be RateLimit, not ServerRateLimit"
         );
     }
 }

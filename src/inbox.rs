@@ -881,6 +881,7 @@ pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, te
     // mutex acquire but don't observe behavioural change.
     crate::daemon::heartbeat_pair::update_with(agent_name, |p| {
         p.last_input_at_ms = crate::daemon::heartbeat_pair::now_ms();
+        p.last_input_text = Some(text.to_string());
     });
     let notification = format_notification_for_inject(pointer_only_inject(), source, text);
     compose_aware_inject(home, agent_name, &notification);

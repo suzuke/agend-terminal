@@ -37,7 +37,9 @@ pub fn state_color(state: AgentState) -> Color {
         AgentState::ToolUse => Color::Blue,
         AgentState::InteractivePrompt => Color::Indexed(214),
         AgentState::PermissionPrompt => Color::Magenta,
-        AgentState::ContextFull | AgentState::RateLimit => Color::Indexed(208),
+        AgentState::ContextFull | AgentState::RateLimit | AgentState::ServerRateLimit => {
+            Color::Indexed(208)
+        }
         AgentState::UsageLimit | AgentState::AuthError | AgentState::ApiError => Color::Red,
         AgentState::Hang | AgentState::Crashed | AgentState::Restarting => Color::Red,
     }
