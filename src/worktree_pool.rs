@@ -58,10 +58,19 @@ pub fn lease(
 }
 
 /// Release a lease — marks worktree as GC candidate (does NOT delete, Phase 4).
+/// Writes `released_at` timestamp for grace period calculation.
 pub fn release(home: &Path, lease: &WorktreeLease) {
     // Clear binding (task done).
     crate::binding::unbind(home, &lease.agent);
-    // Log release event.
+    // Write released_at into the managed marker for GC grace calculation.
+    let marker = lease.path.join(MANAGED_MARKER);
+    if let Ok(mut content) = std::fs::read_to_string(&marker) {
+        content.push_str(&format!(
+            "released_at={}\n",
+            chrono::Utc::now().to_rfc3339()
+        ));
+        let _ = std::fs::write(&marker, content);
+    }
     crate::event_log::log(
         home,
         "worktree_lease_released",
@@ -180,17 +189,20 @@ fn evaluate_candidate(home: &Path, wt_path: &Path) -> Option<GcCandidate> {
     if crate::binding::read(home, &agent_name).is_some() {
         return None;
     }
-    // Must be past grace TTL (check .agend-managed marker timestamp).
+    // Must be past grace TTL (check released_at in .agend-managed marker).
+    // If no released_at, worktree is still active (not yet released) → not a candidate.
     let marker = wt_path.join(MANAGED_MARKER);
     let content = std::fs::read_to_string(&marker).unwrap_or_default();
-    if let Some(leased_line) = content.lines().find(|l| l.starts_with("leased_at=")) {
-        let ts = leased_line.strip_prefix("leased_at=").unwrap_or("");
+    if let Some(released_line) = content.lines().find(|l| l.starts_with("released_at=")) {
+        let ts = released_line.strip_prefix("released_at=").unwrap_or("");
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
             let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
             if age < chrono::Duration::hours(GC_GRACE_HOURS) {
-                return None; // Still within grace period.
+                return None; // Still within grace period after release.
             }
         }
+    } else {
+        return None; // No released_at → still active, not a GC candidate.
     }
 
     Some(GcCandidate {
@@ -378,7 +390,7 @@ mod tests {
         let old_ts = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
         std::fs::write(
             wt.join(MANAGED_MARKER),
-            format!("agent={agent}\nleased_at={old_ts}\n"),
+            format!("agent={agent}\nleased_at={old_ts}\nreleased_at={old_ts}\n"),
         )
         .ok();
         wt
@@ -425,7 +437,7 @@ mod tests {
         let recent = chrono::Utc::now().to_rfc3339();
         std::fs::write(
             wt.join(MANAGED_MARKER),
-            format!("agent=fresh\nleased_at={recent}\n"),
+            format!("agent=fresh\nleased_at={recent}\nreleased_at={recent}\n"),
         )
         .ok();
         let candidates = gc_candidates(&home);

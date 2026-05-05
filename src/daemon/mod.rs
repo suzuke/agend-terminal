@@ -554,6 +554,13 @@ fn run_core(
                         tracing::info!(branch, path, "worktree auto-removed (branch merged)");
                     }
                 }
+                // Phase 4 git-shim: worktree GC (hourly with sweep).
+                // Default: dry-run only. Cutover when AGEND_WORKTREE_GC=1.
+                if std::env::var("AGEND_WORKTREE_GC").as_deref() == Ok("1") {
+                    crate::worktree_pool::gc_cutover(home);
+                } else {
+                    crate::worktree_pool::gc_dry_run(home);
+                }
             }
         }
 

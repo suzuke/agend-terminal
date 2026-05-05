@@ -25,7 +25,7 @@ fn stress_concurrent_gc_scan_no_race() {
                 let old = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
                 std::fs::write(
                     wt.join(".agend-managed"),
-                    format!("agent={agent}\nleased_at={old}\n"),
+                    format!("agent={agent}\nleased_at={old}\nreleased_at={old}\n"),
                 )
                 .ok();
                 // Concurrent scan shouldn't panic.
