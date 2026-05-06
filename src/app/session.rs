@@ -150,6 +150,12 @@ pub(super) fn restore_with_reconciliation(
     if let Some(ref f) = fleet {
         crate::teams::reconcile_teams(home, f);
     }
+    // Issue #474: defensive reconcile — prune deployment-store entries whose
+    // member instances are no longer in fleet.yaml. Catches the case where
+    // a previous session closed the last instance via TUI without going
+    // through `deployment teardown`. Cheap (single store load + fleet
+    // membership scan), runs once per daemon boot.
+    let _ = crate::deployments::reconcile_orphans(home);
     let fleet_names: HashSet<String> = fleet
         .as_ref()
         .map(|f| f.instance_names().into_iter().collect())

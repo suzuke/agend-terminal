@@ -362,6 +362,114 @@ pub fn list(home: &Path) -> Value {
     serde_json::json!({"deployments": store.deployments})
 }
 
+/// Issue #474: prune deployment entries whose instances no longer exist in
+/// fleet.yaml. Shared core for the close-path hook (`reconcile_after_close`)
+/// and the daemon-startup sweep (`reconcile_orphans`).
+///
+/// For each deployment:
+/// - if NONE of its `instances` are present in fleet.yaml → prune the
+///   deployment entry from the store, delete the associated team, log.
+/// - otherwise → leave the deployment intact (multi-instance deployment
+///   with at least one member still alive).
+///
+/// Returns the names of deployments that were pruned (empty when nothing
+/// changed). The caller decides whether to log/event-report.
+pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
+    // Same lock as deploy/teardown — load-modify-save must be serialized.
+    let lock_path = store_path(home).with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "deployments reconcile: lock acquire failed — skipping");
+            return Vec::new();
+        }
+    };
+
+    let mut store = load(home);
+    if store.deployments.is_empty() {
+        return Vec::new();
+    }
+
+    // Snapshot current fleet.yaml instance set. If fleet.yaml fails to load,
+    // bail out with an empty result so a transient parse error doesn't wipe
+    // the deployment store.
+    let fleet_path = home.join("fleet.yaml");
+    let live_instances: std::collections::HashSet<String> = match crate::fleet::FleetConfig::load(
+        &fleet_path,
+    ) {
+        Ok(cfg) => cfg.instance_names().into_iter().collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "deployments reconcile: fleet.yaml load failed — skipping");
+            return Vec::new();
+        }
+    };
+
+    let mut pruned_names = Vec::new();
+    let mut pruned_teams = Vec::new();
+    store.deployments.retain(|d| {
+        let any_live = d.instances.iter().any(|i| live_instances.contains(i));
+        if any_live {
+            true
+        } else {
+            pruned_names.push(d.name.clone());
+            if let Some(t) = d.team.clone() {
+                pruned_teams.push(t);
+            }
+            false
+        }
+    });
+
+    if pruned_names.is_empty() {
+        return pruned_names;
+    }
+
+    // Persist pruned store first so a crash between save and team-delete
+    // doesn't leave the deployment-store in a more-stale state than the
+    // teams-store; teams without their parent deployment is the safer
+    // failure mode.
+    if let Err(e) = save(home, &mut store) {
+        tracing::warn!(
+            error = %e,
+            pruned = ?pruned_names,
+            "deployments reconcile: save failed — entries may resurface on next load"
+        );
+        return Vec::new();
+    }
+
+    for team in &pruned_teams {
+        let _ = crate::teams::delete(home, &serde_json::json!({"name": team}));
+    }
+
+    tracing::info!(
+        pruned = ?pruned_names,
+        teams = ?pruned_teams,
+        "deployments reconcile: pruned orphan entries"
+    );
+    pruned_names
+}
+
+/// Option 1 (auto-cleanup) hook. Called from the TUI close path AFTER
+/// `fleet::remove_instance(s)_from_yaml`, with the names that were just
+/// removed. Triggers `reconcile_orphan_deployments`, which detects the
+/// "last instance of this deployment was just closed" case generically.
+///
+/// `removed_names` is currently unused — the reconcile pass scans every
+/// deployment against the post-close fleet.yaml, so it doesn't need to
+/// know which specific names were removed. Kept in the signature so a
+/// future optimization can target only deployments touching those names
+/// without changing the call site.
+pub fn reconcile_after_close(home: &Path, removed_names: &[String]) -> Vec<String> {
+    let _ = removed_names;
+    reconcile_orphan_deployments(home)
+}
+
+/// Option 3 (defensive) hook. Called once at daemon startup, before
+/// `auto_start_fleet`, so a stale deployment-store entry left by a
+/// previous unclean shutdown doesn't carry over.
+pub fn reconcile_orphans(home: &Path) -> Vec<String> {
+    reconcile_orphan_deployments(home)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -843,6 +951,181 @@ instances: {}
             !config.instances.contains_key("dev-impl"),
             "teardown must remove fleet entry to prevent respawn"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Issue #474: TUI close path bypassed teardown ──────────────────
+    //
+    // The TUI close overlay (`Ctrl-B x` / tab close) calls
+    // `fleet::remove_instance(s)_from_yaml` + `kill_agent` but doesn't
+    // touch `deployments.json`. Result: stale entries in `deployment list`
+    // after every TUI-triggered close. The fix wires
+    // `deployments::reconcile_after_close` into the same overlay code path
+    // (Option 1, auto-cleanup) and adds `reconcile_orphans` to the daemon
+    // boot path (Option 3, defensive sweep).
+    //
+    // These tests target the production reconcile function that the
+    // overlay calls — they exercise the same code path the TUI close
+    // overlay does, just without the ratatui input boilerplate.
+
+    /// Build a fleet.yaml + deploy a 1-instance template, returning the
+    /// home dir. Used by tests that need a baseline post-deploy state.
+    fn deploy_single_instance_for_test(tag: &str, deploy_name: &str) -> std::path::PathBuf {
+        let home = tmp_home(tag);
+        let yaml = r#"
+templates:
+  tpl:
+    instances:
+      worker:
+        backend: claude
+instances: {}
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({
+                "template": "tpl",
+                "name": deploy_name,
+                "directory": home.display().to_string(),
+            }),
+        );
+        home
+    }
+
+    #[test]
+    fn close_last_instance_prunes_deployment_entry() {
+        // Production smoke for the Issue #474 fix: deploy → simulate the
+        // TUI close path (remove from fleet.yaml + reconcile_after_close)
+        // → deployment store entry gone.
+        let home = deploy_single_instance_for_test("close_last", "tpl");
+        let store = load(&home);
+        assert!(
+            store.deployments.iter().any(|d| d.name == "tpl"),
+            "pre: deployment must exist"
+        );
+
+        // TUI close path mirror: fleet.yaml first, then reconcile.
+        let names: Vec<String> = vec!["tpl-worker".to_string()];
+        let _ = crate::fleet::remove_instances_from_yaml(&home, &names);
+        let pruned = reconcile_after_close(&home, &names);
+
+        assert!(
+            pruned.iter().any(|n| n == "tpl"),
+            "reconcile must prune the empty deployment, got {pruned:?}"
+        );
+        let store = load(&home);
+        assert!(
+            store.deployments.iter().all(|d| d.name != "tpl"),
+            "deployment store must NOT contain 'tpl' post-close"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn close_non_last_instance_keeps_deployment_intact() {
+        // Multi-instance deployment: closing one of three keeps the
+        // deployment entry intact — only when ALL members are gone does
+        // the entry get pruned.
+        let home = tmp_home("close_non_last");
+        let yaml = r#"
+templates:
+  tpl:
+    instances:
+      a:
+        backend: claude
+      b:
+        backend: claude
+      c:
+        backend: claude
+instances: {}
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({
+                "template": "tpl",
+                "name": "tpl",
+                "directory": home.display().to_string(),
+            }),
+        );
+
+        // Close the first instance only.
+        let names: Vec<String> = vec!["tpl-a".to_string()];
+        let _ = crate::fleet::remove_instances_from_yaml(&home, &names);
+        let pruned = reconcile_after_close(&home, &names);
+        assert!(
+            pruned.is_empty(),
+            "reconcile must NOT prune when 2/3 members remain, got {pruned:?}"
+        );
+
+        let store = load(&home);
+        let entry = store
+            .deployments
+            .iter()
+            .find(|d| d.name == "tpl")
+            .expect("deployment must remain in store");
+        // The deployment record's `instances` list is the deploy-time
+        // snapshot; we don't shrink it as members leave. The only
+        // invariant the lint protects is "entry survives if any member
+        // still in fleet.yaml".
+        assert_eq!(
+            entry.instances.len(),
+            3,
+            "instances list unchanged: {entry:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reconcile_orphans_prunes_stale_entry_at_boot() {
+        // Defensive sweep (Option 3): a stale deployment-store entry left
+        // by an unclean shutdown — fleet.yaml has zero matching members
+        // — gets pruned on next `reconcile_orphans` call.
+        let home = tmp_home("reconcile_orphans");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
+        )
+        .unwrap();
+
+        // Hand-craft a deployment-store entry with no live members.
+        let mut store = load(&home);
+        store.deployments.push(Deployment {
+            name: "ghost".into(),
+            template: "tpl".into(),
+            instances: vec!["ghost-instance-that-never-was".into()],
+            team: None,
+            directory: home.display().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+        save(&home, &mut store).expect("save store");
+
+        let pruned = reconcile_orphans(&home);
+        assert!(
+            pruned.iter().any(|n| n == "ghost"),
+            "boot reconcile must prune stale entry, got {pruned:?}"
+        );
+        let store = load(&home);
+        assert!(
+            store.deployments.iter().all(|d| d.name != "ghost"),
+            "stale entry must be gone from store"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reconcile_after_close_is_idempotent() {
+        // Repeated reconciles on the same already-clean state must no-op
+        // (no spurious team-delete calls, no panics).
+        let home = deploy_single_instance_for_test("reconcile_idem", "tpl");
+        let names: Vec<String> = vec!["tpl-worker".to_string()];
+        let _ = crate::fleet::remove_instances_from_yaml(&home, &names);
+        let r1 = reconcile_after_close(&home, &names);
+        assert_eq!(r1, vec!["tpl".to_string()], "first reconcile prunes");
+        let r2 = reconcile_after_close(&home, &names);
+        assert!(r2.is_empty(), "second reconcile no-ops, got {r2:?}");
         std::fs::remove_dir_all(&home).ok();
     }
 }

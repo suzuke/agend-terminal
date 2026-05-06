@@ -368,6 +368,12 @@ pub(super) fn handle_key(
                     if !closed.is_empty() {
                         let names: Vec<String> = closed.iter().map(|(n, _)| n.clone()).collect();
                         let _ = crate::fleet::remove_instances_from_yaml(ctx.home, &names);
+                        // Issue #474: TUI close (Ctrl-B x / tab close) bypassed
+                        // deployment teardown, leaving stale entries in
+                        // `deployment list`. Reconcile after fleet.yaml is
+                        // updated: any deployment whose members are all now
+                        // gone gets pruned (entry + team).
+                        let _ = crate::deployments::reconcile_after_close(ctx.home, &names);
                     }
                     if let Some(tab) = ctx.layout.close_tab(idx) {
                         for name in tab.root().agent_names() {
@@ -395,6 +401,14 @@ pub(super) fn handle_key(
                             fleet_name,
                         );
                         let _ = crate::fleet::remove_instance_from_yaml(ctx.home, fleet_name);
+                        // Issue #474: same reconcile hook for single-pane
+                        // close. The reconcile is generic, so even if this
+                        // single instance was the last live member of a
+                        // multi-instance deployment, the entry gets pruned.
+                        let _ = crate::deployments::reconcile_after_close(
+                            ctx.home,
+                            std::slice::from_ref(fleet_name),
+                        );
                     }
                     if let Some(name) = tab.close_focused() {
                         super::kill_agent(ctx.home, ctx.registry, &name);
