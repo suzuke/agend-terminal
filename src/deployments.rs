@@ -331,19 +331,18 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
         None => return serde_json::json!({"error": format!("deployment '{name}' not found")}),
     };
 
-    // Delete all instances (full cleanup: workspace, configs, registry, port files).
-    // Uses DELETE instead of KILL to ensure complete teardown (fixes #456).
+    // Delete all instances (full cleanup via DELETE instead of KILL — #456).
     for inst in &deployment.instances {
         let _ = crate::api::call(
             home,
             &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": inst}}),
         );
-        // Also clean workspace directory if it exists.
-        let workspace_dir = home.join("workspace").join(inst);
-        if workspace_dir.exists() {
-            crate::agent_ops::cleanup_working_dir(home, inst, &workspace_dir);
-        }
     }
+
+    // Smoke 2 fix: filesystem cleanup of every spawned subdir, including
+    // custom-`directory` deployments that the prior inline
+    // `home/workspace/<inst>` loop missed.
+    cleanup_deployment_dirs(home, &deployment);
 
     // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
     // pane_factory could render identity; teardown must remove them or
@@ -367,6 +366,59 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
 pub fn list(home: &Path) -> Value {
     let store = load(home);
     serde_json::json!({"deployments": store.deployments})
+}
+
+/// Smoke 2 fix (post-#475): close-path + teardown both leave deployment
+/// member subdirs on disk when the deployment used a custom `directory:`
+/// arg outside `$AGEND_HOME/workspace/`. `cleanup_working_dir`'s
+/// user-provided-dir branch only removes specific agend files (by design,
+/// to protect user data), so a deployment with `directory: /tmp/foo` and
+/// member `foo-lead` leaves `/tmp/foo/foo-lead/` behind even after the
+/// agend files are stripped.
+///
+/// This helper is the single source of truth for "remove every subdir a
+/// deployment spawned" — used by both `reconcile_orphan_deployments`
+/// (close-path + boot-sweep) and `teardown` (operator action).
+///
+/// Removes:
+/// - `<deployment.directory>/<inst_name>` — the actual spawned subdir per
+///   `deploy()`'s `inst_dir = dir.join(&inst_name)`. Whole-tree removal
+///   because the subdir is daemon-managed.
+/// - `<home>/workspace/<inst_name>` — default-path fallback via
+///   `cleanup_working_dir`, so the AGEND_HOME/workspace branch handles
+///   default-directory deployments correctly.
+///
+/// All filesystem ops are best-effort (`let _ = ...` / matched and logged);
+/// a single per-instance failure doesn't abort the rest of the sweep.
+fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
+    let custom_root = std::path::Path::new(&deployment.directory);
+    for inst in &deployment.instances {
+        // Custom-directory branch: deploy()'s `inst_dir = dir.join(&inst_name)`.
+        let custom_subdir = custom_root.join(inst);
+        if custom_subdir.exists() {
+            match std::fs::remove_dir_all(&custom_subdir) {
+                Ok(()) => tracing::info!(
+                    inst = %inst,
+                    path = %custom_subdir.display(),
+                    "deployment cleanup: removed custom subdir"
+                ),
+                Err(e) => tracing::warn!(
+                    inst = %inst,
+                    path = %custom_subdir.display(),
+                    error = %e,
+                    "deployment cleanup: remove_dir_all failed"
+                ),
+            }
+        }
+        // Default-path branch: covers deployments whose `directory` defaulted
+        // to `home/workspace/<deploy_name>` (subdir lands at
+        // `home/workspace/<deploy_name>/<inst>`) AND covers historical
+        // teardown semantics that cleaned `home/workspace/<inst>` directly.
+        let default_subdir = home.join("workspace").join(inst);
+        if default_subdir.exists() {
+            crate::agent_ops::cleanup_working_dir(home, inst, &default_subdir);
+        }
+    }
 }
 
 /// Issue #474: prune deployment entries whose instances no longer exist in
@@ -411,8 +463,13 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
         }
     };
 
+    // Collect the pruned `Deployment` records (not just names) so we can
+    // hand each one to `cleanup_deployment_dirs` after the store is saved.
+    // Smoke 2 fix: without this we lose the `directory` + `instances` info
+    // needed to remove custom-directory subdirs.
     let mut pruned_names = Vec::new();
     let mut pruned_teams = Vec::new();
+    let mut pruned_deployments: Vec<Deployment> = Vec::new();
     store.deployments.retain(|d| {
         let any_live = d.instances.iter().any(|i| live_instances.contains(i));
         if any_live {
@@ -422,6 +479,7 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
             if let Some(t) = d.team.clone() {
                 pruned_teams.push(t);
             }
+            pruned_deployments.push(d.clone());
             false
         }
     });
@@ -445,6 +503,14 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
 
     for team in &pruned_teams {
         let _ = crate::teams::delete(home, &serde_json::json!({"name": team}));
+    }
+
+    // Smoke 2 fix: clean each pruned deployment's spawned subdirs. Runs
+    // AFTER the store save + team delete so a deployment store entry
+    // doesn't survive its filesystem cleanup (the safer failure mode is
+    // "files gone, store entry stays" not "store says clean, files leak").
+    for dep in &pruned_deployments {
+        cleanup_deployment_dirs(home, dep);
     }
 
     tracing::info!(
@@ -1161,5 +1227,229 @@ instances: {}
         let r2 = reconcile_after_close(&home, &names);
         assert!(r2.is_empty(), "second reconcile no-ops, got {r2:?}");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Smoke 2 (post-#475) — workspace dir cleanup tests ─────────────
+    //
+    // Issue: TUI close path + `deployment teardown` both invoked
+    // `cleanup_working_dir` for `home/workspace/<inst>` only. Deployments
+    // with `directory: /tmp/foo` left `/tmp/foo/<inst>/` on disk because
+    // `cleanup_working_dir`'s user-provided-dir branch only strips agend
+    // files (by design — protects user data).
+    //
+    // Fix: `cleanup_deployment_dirs` (this module) now removes both the
+    // custom-directory subdir (whole-tree) AND the default workspace
+    // path. Wired into both `reconcile_orphan_deployments` (close path /
+    // boot sweep) and `teardown` (operator action).
+    //
+    // Regression-proof: comment out the `for dep in &pruned_deployments`
+    // loop in `reconcile_orphan_deployments` and
+    // `reconcile_prunes_custom_directory_subdirs` FAILS — restore → PASS.
+
+    /// Helper: build a deployment-shaped fixture with a custom directory
+    /// outside `home/workspace/`. Mirrors deploy()'s `inst_dir = dir.join(name)`
+    /// shape so the test exercises the same on-disk layout production
+    /// produces.
+    fn deploy_with_custom_directory(
+        tag: &str,
+        deploy_name: &str,
+        members: &[&str],
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let home = tmp_home(tag);
+        // Custom directory parent — outside home/workspace/ so the
+        // user-provided-dir branch of cleanup_working_dir would normally
+        // skip whole-tree removal.
+        let custom_root = std::env::temp_dir().join(format!(
+            "agend-smoke2-{}-{}-custom",
+            std::process::id(),
+            tag
+        ));
+        std::fs::create_dir_all(&custom_root).ok();
+        // Hand-craft the deployment store entry + matching subdirs +
+        // fleet.yaml entries. Simpler than running deploy() because the
+        // deploy fn would also try to spawn instances via the API.
+        let mut store = load(&home);
+        let inst_names: Vec<String> = members
+            .iter()
+            .map(|m| format!("{deploy_name}-{m}"))
+            .collect();
+        for inst in &inst_names {
+            let inst_dir = custom_root.join(inst);
+            std::fs::create_dir_all(&inst_dir).unwrap();
+            // Drop a sentinel file so we can tell the dir was actually
+            // removed (vs e.g. moved or never created).
+            std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
+        }
+        store.deployments.push(Deployment {
+            name: deploy_name.to_string(),
+            template: "tpl".to_string(),
+            instances: inst_names.clone(),
+            team: None,
+            directory: custom_root.display().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+        save(&home, &mut store).unwrap();
+        // Empty fleet.yaml — simulates the "all instances closed" state
+        // that triggers the prune branch in reconcile.
+        std::fs::write(home.join("fleet.yaml"), "instances: {}\n").unwrap();
+        (home, custom_root)
+    }
+
+    #[test]
+    fn reconcile_prunes_custom_directory_subdirs() {
+        // Production smoke matching general's m-13 Smoke 2 reproduction.
+        // Custom directory + multi-member deployment + all instances
+        // already removed from fleet.yaml → reconcile must prune the
+        // entry AND remove every spawned subdir.
+        let (home, custom_root) = deploy_with_custom_directory(
+            "smoke2_custom",
+            "smoke2-team",
+            &["lead", "impl-1", "impl-2", "reviewer"],
+        );
+
+        // Pre-condition: subdirs exist with the sentinel file.
+        for member in ["lead", "impl-1", "impl-2", "reviewer"] {
+            let inst = format!("smoke2-team-{member}");
+            let inst_dir = custom_root.join(&inst);
+            assert!(
+                inst_dir.exists(),
+                "test setup: {inst_dir:?} must exist pre-reconcile"
+            );
+            assert!(
+                inst_dir.join("sentinel.txt").exists(),
+                "test setup: sentinel must exist in {inst_dir:?}"
+            );
+        }
+
+        let pruned = reconcile_orphans(&home);
+        assert!(
+            pruned.contains(&"smoke2-team".to_string()),
+            "reconcile must prune the deployment, got {pruned:?}"
+        );
+
+        // Post-condition: every per-member subdir gone.
+        for member in ["lead", "impl-1", "impl-2", "reviewer"] {
+            let inst = format!("smoke2-team-{member}");
+            let inst_dir = custom_root.join(&inst);
+            assert!(
+                !inst_dir.exists(),
+                "Smoke 2 fix: custom-directory subdir {inst_dir:?} must be gone post-reconcile"
+            );
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&custom_root).ok();
+    }
+
+    #[test]
+    fn close_last_instance_cleans_default_workspace_dir() {
+        // Default-directory deployment: `home/workspace/<deploy>/<inst>/`.
+        // After close + reconcile, the per-instance default workspace dir
+        // should be removed via cleanup_working_dir's AGEND_HOME branch.
+        let home = deploy_single_instance_for_test("close_default_wd", "tpl");
+        // Hand-create the workspace subdir (production's spawn path
+        // would have created it; deploy_single_instance_for_test stops
+        // short of spawning).
+        let wd = home.join("workspace").join("tpl-worker");
+        std::fs::create_dir_all(&wd).unwrap();
+        std::fs::write(wd.join("agent_data.txt"), "data").unwrap();
+        assert!(wd.exists(), "test setup: workspace dir must exist");
+
+        let names: Vec<String> = vec!["tpl-worker".to_string()];
+        let _ = crate::fleet::remove_instances_from_yaml(&home, &names);
+        let _ = reconcile_after_close(&home, &names);
+
+        assert!(
+            !wd.exists(),
+            "default workspace dir must be cleaned post-reconcile: {wd:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn teardown_cleans_custom_directory_subdirs() {
+        // Operator-driven `deployment teardown` action must also clean
+        // custom-directory subdirs (not just the home/workspace fallback
+        // the prior inline loop covered).
+        let (home, custom_root) =
+            deploy_with_custom_directory("smoke2_teardown", "td-team", &["a", "b"]);
+
+        // teardown looks up by deployment name from the store.
+        let _ = teardown(&home, &serde_json::json!({"name": "td-team"}));
+
+        for member in ["a", "b"] {
+            let inst = format!("td-team-{member}");
+            let inst_dir = custom_root.join(&inst);
+            assert!(
+                !inst_dir.exists(),
+                "teardown must remove custom subdir {inst_dir:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&custom_root).ok();
+    }
+
+    #[test]
+    fn cleanup_deployment_dirs_handles_missing_subdirs_gracefully() {
+        // Pre-removed subdirs (e.g., manual cleanup, or a previous reconcile
+        // already ran) must not panic the helper. Tests the
+        // `if custom_subdir.exists()` guard.
+        let home = tmp_home("smoke2_missing");
+        let custom_root = std::env::temp_dir().join(format!(
+            "agend-smoke2-{}-missing-custom",
+            std::process::id()
+        ));
+        // No subdir created — just point a Deployment at the (non-existent)
+        // path.
+        let dep = Deployment {
+            name: "ghost".to_string(),
+            template: "tpl".to_string(),
+            instances: vec!["ghost-a".to_string()],
+            team: None,
+            directory: custom_root.display().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        // Must not panic.
+        cleanup_deployment_dirs(&home, &dep);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reconcile_keeps_subdirs_when_deployment_still_alive() {
+        // Negative control: if any member still in fleet.yaml, the
+        // deployment is NOT pruned and the subdirs are NOT touched.
+        // Guards against an over-eager cleanup that runs on any
+        // reconcile invocation regardless of prune outcome.
+        let (home, custom_root) =
+            deploy_with_custom_directory("smoke2_alive", "alive-team", &["a", "b"]);
+        // Re-add one member back into fleet.yaml so reconcile sees it
+        // as live and refuses to prune.
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  alive-team-a:\n    backend: claude\n",
+        )
+        .unwrap();
+
+        let pruned = reconcile_orphans(&home);
+        assert!(
+            pruned.is_empty(),
+            "deployment with one live member must NOT be pruned: {pruned:?}"
+        );
+
+        // Both subdirs must still be on disk.
+        for member in ["a", "b"] {
+            let inst = format!("alive-team-{member}");
+            let inst_dir = custom_root.join(&inst);
+            assert!(
+                inst_dir.exists(),
+                "subdir must NOT be cleaned when deployment alive: {inst_dir:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&custom_root).ok();
     }
 }

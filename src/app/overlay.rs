@@ -384,6 +384,17 @@ pub(super) fn handle_key(
                         if let Some(wd) = wd {
                             crate::agent_ops::cleanup_working_dir(ctx.home, name, wd);
                         }
+                        // Smoke 2 fix (post-#475): defensive cleanup at the
+                        // default `home/workspace/<name>` path. Covers panes
+                        // whose `working_dir` is None (so the branch above
+                        // skipped) and deployments with default directory.
+                        // Custom-directory deployments are reaped by the
+                        // `reconcile_after_close` → `cleanup_deployment_dirs`
+                        // path above.
+                        let default_wd = ctx.home.join("workspace").join(name);
+                        if default_wd.exists() {
+                            crate::agent_ops::cleanup_working_dir(ctx.home, name, &default_wd);
+                        }
                     }
                     outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
@@ -414,8 +425,17 @@ pub(super) fn handle_key(
                         super::kill_agent(ctx.home, ctx.registry, &name);
                         outcome.needs_resize = true;
                     }
-                    if let Some((name, Some(wd))) = closed {
-                        crate::agent_ops::cleanup_working_dir(ctx.home, &name, &wd);
+                    if let Some((name, wd)) = closed {
+                        if let Some(ref wd) = wd {
+                            crate::agent_ops::cleanup_working_dir(ctx.home, &name, wd);
+                        }
+                        // Smoke 2 fix (post-#475): same defensive cleanup as
+                        // the Tab branch above. Covers default-path single-
+                        // instance closes and panes with `working_dir = None`.
+                        let default_wd = ctx.home.join("workspace").join(&name);
+                        if default_wd.exists() {
+                            crate::agent_ops::cleanup_working_dir(ctx.home, &name, &default_wd);
+                        }
                     }
                 }
             }
