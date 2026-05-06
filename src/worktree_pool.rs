@@ -47,8 +47,11 @@ pub fn lease(
         ),
     );
 
-    // Write full binding with worktree path.
-    crate::binding::bind_full(home, agent, "", branch, &info.path);
+    // Write full binding with worktree + source-repo paths.
+    // source_repo persistence (P0-X r1): release_full reads this back to run
+    // `git worktree remove --force` from the owning repo's cwd, which
+    // prevents stale registry entries that would block re-lease.
+    crate::binding::bind_full(home, agent, "", branch, &info.path, source_repo);
 
     Ok(WorktreeLease {
         agent: agent.to_string(),
@@ -131,12 +134,41 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
     let wt_path_str = binding["worktree"].as_str().unwrap_or("");
     if !wt_path_str.is_empty() {
         let wt_path = Path::new(wt_path_str);
+
+        // Source-repo: read from binding (P0-X r1 schema field), else derive
+        // from the daemon's worktree convention `<source>/.worktrees/<agent>`.
+        // Without a correct cwd, `git worktree remove` may fail and the
+        // fallback `remove_dir_all` would leak a stale registry entry.
+        let source_repo: PathBuf = binding["source_repo"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                // Derive: parent of `.worktrees/<agent>` is the source repo.
+                wt_path
+                    .parent()
+                    .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(".worktrees"))
+                    .and_then(|p| p.parent())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(PathBuf::new);
+
         if !wt_path.exists() {
             tracing::info!(
                 agent,
                 path = %wt_path.display(),
-                "release: worktree path already absent — clearing binding only"
+                "release: worktree path already absent — pruning registry + clearing binding"
             );
+            // Prune registry in case the source repo still lists this path.
+            // Safe even when source_repo is empty — git just errors out and
+            // we ignore the result.
+            if !source_repo.as_os_str().is_empty() {
+                let _ = std::process::Command::new("git")
+                    .current_dir(&source_repo)
+                    .args(["worktree", "prune"])
+                    .env("AGEND_GIT_BYPASS", "1")
+                    .output();
+            }
         } else if !is_daemon_managed(wt_path) {
             // R14 safety: never touch operator-created worktrees.
             tracing::warn!(
@@ -150,18 +182,22 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
             ));
             return out;
         } else {
-            // git worktree remove --force, then fall through to binding clear.
-            // AGEND_GIT_BYPASS=1 because the shim denies `git worktree`.
-            let cmd = std::process::Command::new("git")
-                .args([
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &wt_path.display().to_string(),
-                ])
-                .env("AGEND_GIT_BYPASS", "1")
-                .output();
-            match cmd {
+            // git worktree remove --force, run from the OWNING repo's cwd
+            // so the registry entry is cleaned up alongside the directory.
+            // AGEND_GIT_BYPASS=1 bypasses the shim's worktree-deny matrix.
+            let mut cmd = std::process::Command::new("git");
+            cmd.args([
+                "worktree",
+                "remove",
+                "--force",
+                &wt_path.display().to_string(),
+            ])
+            .env("AGEND_GIT_BYPASS", "1");
+            if !source_repo.as_os_str().is_empty() {
+                cmd.current_dir(&source_repo);
+            }
+            let result = cmd.output();
+            match result {
                 Ok(o) if o.status.success() => {
                     out.worktree_removed = true;
                 }
@@ -173,9 +209,23 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
                         path = %wt_path.display(),
                         "git worktree remove failed — falling back to remove_dir_all"
                     );
-                    // Fallback: best-effort manual remove. If it succeeds, count as removed.
+                    // Fallback: best-effort manual remove + registry prune.
                     let _ = std::fs::remove_dir_all(wt_path);
                     if !wt_path.exists() {
+                        // Prune the registry so `git worktree list` doesn't
+                        // keep advertising the (now-deleted) path. Without
+                        // this the next lease re-attempt sees the entry,
+                        // detects it as "checked out", and rejects.
+                        if !source_repo.as_os_str().is_empty() {
+                            let prune = std::process::Command::new("git")
+                                .current_dir(&source_repo)
+                                .args(["worktree", "prune"])
+                                .env("AGEND_GIT_BYPASS", "1")
+                                .output();
+                            if let Err(e) = prune {
+                                tracing::warn!(agent, error = %e, "git worktree prune failed");
+                            }
+                        }
                         out.worktree_removed = true;
                     } else {
                         out.error = Some(format!("git worktree remove failed: {stderr}"));
@@ -633,6 +683,92 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&unmanaged_wt).ok();
+    }
+
+    /// Helper: assert `git worktree list --porcelain` from `repo` does NOT
+    /// emit any `prunable` line (registry leak indicator).
+    fn assert_no_prunable_registry(repo: &Path, scenario: &str) {
+        let output = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git worktree list");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            !stdout.contains("prunable"),
+            "[{scenario}] git worktree registry must be clean — found `prunable` entry. Output:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn p0x_release_full_clears_git_worktree_registry() {
+        // r1 reviewer (PR #470): the prior IMPL didn't pass `.current_dir(source_repo)`
+        // and the `remove_dir_all` fallback didn't `git worktree prune`, so
+        // `git worktree list --porcelain` kept emitting `prunable` entries
+        // that would block re-lease (registry vs filesystem skew).
+        //
+        // Scenario A: happy path — `release_full` invokes `git worktree
+        // remove --force` from the owning repo's cwd. Registry must be clean.
+        let home = tmp_home("p0x-registry-happy");
+        let repo = tmp_repo("p0x-registry-happy-repo");
+        let _l = lease(&home, &repo, "agent-r", "feat/registry").expect("lease");
+
+        let outcome = release_full(&home, "agent-r");
+        assert!(outcome.released);
+        assert!(outcome.worktree_removed);
+        assert_no_prunable_registry(&repo, "happy-path");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn p0x_release_full_prunes_registry_after_external_dir_removal() {
+        // Reviewer's exact failure mode: the worktree dir gets removed
+        // externally (daemon crash mid-op, manual `rm`), so when `release_full`
+        // runs the dir is already gone but the git registry still lists the
+        // path as `prunable`. Without the explicit `git worktree prune` call
+        // in the missing-path branch, the next lease re-attempt fails because
+        // the registry sees the path as still claimed.
+        //
+        // This is the load-bearing regression-proof for the r1 fix:
+        // commenting out the `git worktree prune` block in `release_full`'s
+        // missing-path branch makes this test FAIL on the post-release
+        // assertion. Restore → PASS.
+        let home = tmp_home("p0x-registry-prune");
+        let repo = tmp_repo("p0x-registry-prune-repo");
+        let l = lease(&home, &repo, "agent-rm", "feat/prune").expect("lease");
+
+        // Simulate the leak: yank the worktree dir behind git's back.
+        std::fs::remove_dir_all(&l.path).ok();
+        assert!(!l.path.exists(), "test setup: dir must be gone");
+
+        // Pre-condition sanity: registry MUST list the now-missing entry as
+        // `prunable` before release_full runs. If git's behavior changes and
+        // this assertion no longer holds, the test setup is no longer
+        // exercising the bug — flag it via panic in the assertion.
+        let pre_output = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git worktree list pre");
+        let pre_stdout = String::from_utf8_lossy(&pre_output.stdout).to_string();
+        assert!(
+            pre_stdout.contains("prunable"),
+            "test setup invariant: dir-removed worktree must show as prunable pre-release. Output:\n{pre_stdout}"
+        );
+
+        let outcome = release_full(&home, "agent-rm");
+        assert!(outcome.released);
+        assert!(outcome.binding_removed);
+
+        // Post-condition: prune must have run, registry is clean.
+        assert_no_prunable_registry(&repo, "post-external-rm");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

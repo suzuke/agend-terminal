@@ -9,16 +9,31 @@ use std::path::Path;
 /// Write a binding for an agent (task assigned).
 #[allow(dead_code)] // Used by tests + auto-watch dispatch path
 pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
-    bind_full(home, agent, task_id, branch, std::path::Path::new(""));
+    bind_full(
+        home,
+        agent,
+        task_id,
+        branch,
+        std::path::Path::new(""),
+        std::path::Path::new(""),
+    );
 }
 
-/// Write a full binding including worktree path (Phase 3).
+/// Write a full binding including worktree + source-repo paths.
+///
+/// `source_repo` is the parent repo that owns the worktree, persisted as a
+/// schema field so `worktree_pool::release_full` (Sprint 53 P0-X r1) can run
+/// `git worktree remove --force` from the owning repo's cwd. Without this,
+/// the git registry leaves a stale prunable entry after a manual `remove_dir_all`
+/// fallback. Pass an empty path when unknown — `release_full` falls back to
+/// deriving the source from the worktree path's `.worktrees/<agent>` ancestor.
 pub fn bind_full(
     home: &Path,
     agent: &str,
     task_id: &str,
     branch: &str,
     worktree: &std::path::Path,
+    source_repo: &std::path::Path,
 ) {
     let dir = home.join("runtime").join(agent);
     std::fs::create_dir_all(&dir).ok();
@@ -26,6 +41,7 @@ pub fn bind_full(
     let lock_path = dir.join(".binding.json.lock");
     let _lock = crate::store::acquire_file_lock(&lock_path);
     let wt_str = worktree.display().to_string();
+    let src_str = source_repo.display().to_string();
     let mut binding = json!({
         "version": 1,
         "agent": agent,
@@ -35,6 +51,9 @@ pub fn bind_full(
     });
     if !wt_str.is_empty() {
         binding["worktree"] = json!(wt_str);
+    }
+    if !src_str.is_empty() {
+        binding["source_repo"] = json!(src_str);
     }
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     let _ = crate::store::atomic_write(&path, body.as_bytes());

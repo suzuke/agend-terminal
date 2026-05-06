@@ -43,8 +43,10 @@ pub(crate) fn dispatch_auto_bind_lease(
     // Lease errors REJECT the dispatch (Q2 + §3.3).
     let lease = crate::worktree_pool::lease(home, &source_repo, target, branch)?;
 
-    // Bind with worktree path. Bind file write error stays graceful (Q1).
-    crate::binding::bind_full(home, target, task_id, branch, &lease.path);
+    // Bind with worktree + source-repo paths. Bind file write error stays graceful (Q1).
+    // source_repo persistence (P0-X r1): release_full uses it to run
+    // `git worktree remove` from the owning repo's cwd.
+    crate::binding::bind_full(home, target, task_id, branch, &lease.path, &source_repo);
     tracing::info!(
         %target, %branch, path = %lease.path.display(),
         "dispatch auto-bind + lease OK"
