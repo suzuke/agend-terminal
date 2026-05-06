@@ -205,6 +205,56 @@ Impl/reviewer must use worktrees. `git worktree add -b <branch> <path> origin/ma
 ### 12.5 Spawn Site Rationale
 Every spawn must have `// fire-and-forget: <reason>` OR store JoinHandle. Test-only exempt.
 
+## §13. `AGEND_GIT_BYPASS=1` Usage
+
+**TL;DR:** emergency override only. Default is bare `git`. Bypass when shim explicitly denies AND the operation is on the required-bypass list below.
+
+### 13.1 When you should NOT use bypass
+
+Inside your bound worktree, all routine git ops pass through the shim cleanly. Run them bare:
+
+```bash
+git status / diff / log / show
+git add / commit / fetch
+git push origin <your-branch>     # any branch except main
+git checkout <existing-branch>    # within current repo
+git reset --hard <ref>            # within your worktree
+```
+
+Don't preemptively prefix `AGEND_GIT_BYPASS=1`. Try bare git, read the deny message if it fires, then decide.
+
+### 13.2 When bypass is required
+
+Operations on the lifecycle/safety surface the daemon manages directly:
+
+- `git worktree add` / `remove` / `move` — worktree pool is daemon-owned (Phase 3 lease, P0-X release)
+- `git checkout main` from an agent worktree — cross-branch deny, main is daemon-protected
+- `git push origin main` — main protected; CI gates required
+- Operator manual cleanup of orphan worktree or orphan binding (no MCP tool yet for some edge cases)
+- Daemon's own internal git command — bypass is set by the daemon to prevent self-recursion through its own shim
+
+If your op isn't on this list and you reach for bypass, you're probably solving the wrong problem.
+
+### 13.3 Why bypass is costly
+
+Skipping the shim skips the safety net:
+
+- **Phase 1 trailer skipped** — commit lacks `Agend-Agent: <name>` provenance, breaks audit trail
+- **Deny matrix skipped** — risky ops (force-push to protected refs, etc.) run unguarded
+- **Git registry can drift** — `git worktree add` outside the daemon's pool leaves untracked entries; subsequent leases may collide
+- **Phase 5 hotspot warning skipped** — concurrent edits to flagged files don't surface on the dispatch path
+
+These are not catastrophic individually. They erode the invariants the shim was built to maintain.
+
+### 13.4 Default workflow
+
+1. Run bare `git <command>`.
+2. If the shim denies, read the deny message — it names the specific reason and suggests a remediation.
+3. If the remediation is "use bypass," set `AGEND_GIT_BYPASS=1 AGEND_GIT_BYPASS_AGENT=<your-name>` for that one command.
+4. If the remediation is something else (e.g., "use the task board to get a worktree assignment"), follow it.
+
+`AGEND_GIT_BYPASS_UNTIL=<epoch>` exists for time-windowed bypass during multi-step operator interventions; per-command env is preferred for normal use.
+
 ---
 
 ## Appendix: Section Number Map (old → new)
