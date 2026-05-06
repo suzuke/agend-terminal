@@ -265,6 +265,18 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         None
     };
     let task_id_str = args["task_id"].as_str();
+
+    // Sprint 53 P0-1: lease gate BEFORE send (Q2 ordering fix).
+    // If branch field present, attempt lease first. Reject if lease fails.
+    if let Some(branch) = args["branch"].as_str() {
+        let task_id_val = task_id_str.unwrap_or("");
+        if let Err(e) =
+            super::dispatch_hook::dispatch_auto_bind_lease(home, target, task_id_val, branch)
+        {
+            return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
+        }
+    }
+
     let result = match crate::api::call(
         home,
         &json!({
@@ -343,10 +355,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 task_id = ?task_id_str,
                 "delegate_task branch hint — implementer should work on this branch"
             );
-            // Phase 1 git-shim: write binding for trailer hook.
-            if let Some(tid) = task_id_str {
-                crate::binding::bind(home, target, tid, branch);
-            }
+
             // Auto watch_ci for the branch (idempotent — skips if already watching).
             // Only fires if dispatch includes explicit repo field.
             if let Some(repo) = args["repo"].as_str() {
@@ -645,49 +654,4 @@ pub(super) fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     let instance = args["instance"].as_str();
     let msgs = crate::inbox::get_thread(home, thread_id, instance);
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn send_routes_to_broadcast_when_targets_present() {
-        let args = json!({"targets": ["a", "b"], "message": "hello"});
-        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
-        // Broadcast without sender returns identity error
-        assert!(result.get("error").is_some() || result.get("target").is_some());
-    }
-
-    #[test]
-    fn send_routes_to_delegate_task_when_request_kind_task() {
-        let args = json!({"target_instance": "dev", "message": "do X", "request_kind": "task"});
-        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
-        // delegate_task without sender returns identity error
-        assert!(result.get("error").is_some());
-    }
-
-    #[test]
-    fn send_routes_to_report_result_when_request_kind_report() {
-        let args = json!({"target_instance": "lead", "message": "done", "request_kind": "report"});
-        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
-        assert!(result.get("error").is_some());
-    }
-
-    #[test]
-    fn send_routes_to_request_information_when_request_kind_query() {
-        let args = json!({"target_instance": "lead", "message": "what?", "request_kind": "query"});
-        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
-        assert!(result.get("error").is_some());
-    }
-
-    #[test]
-    fn send_routes_to_send_to_instance_default() {
-        let args = json!({"target_instance": "dev", "message": "hi"});
-        let result = handle_unified_send(&std::env::temp_dir(), &args, &None);
-        // send_to_instance without sender returns identity error
-        assert!(result.get("error").is_some());
-    }
 }

@@ -7,6 +7,7 @@ use serde_json::json;
 use std::path::Path;
 
 /// Write a binding for an agent (task assigned).
+#[allow(dead_code)] // Used by tests + auto-watch dispatch path
 pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
     bind_full(home, agent, task_id, branch, std::path::Path::new(""));
 }

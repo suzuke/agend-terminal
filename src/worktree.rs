@@ -37,6 +37,7 @@ pub fn source_repo_of(working_dir: &Path) -> Option<PathBuf> {
 /// Check if a git repo has at least one commit (valid HEAD).
 fn has_commits(repo_dir: &Path) -> bool {
     std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_dir)
         .output()
@@ -65,6 +66,7 @@ pub fn create(
     if !has_commits(repo_dir) {
         tracing::info!(repo = %repo_dir.display(), "empty repo, creating initial commit for worktree support");
         let ok = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args([
                 "-c",
                 "user.name=agend-terminal",
@@ -115,6 +117,7 @@ pub fn create(
 
     // Try creating worktree: first with -b (new branch), fallback without -b (existing branch)
     let output = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args([
             "worktree",
             "add",
@@ -146,6 +149,7 @@ pub fn create(
                 && (stderr.contains("already exists") || stderr.contains("is already checked out"))
             {
                 let output2 = std::process::Command::new("git")
+                    .env("AGEND_GIT_BYPASS", "1")
                     .args(["worktree", "add", &wt_dir.display().to_string(), &branch])
                     .current_dir(repo_dir)
                     .output();
@@ -193,6 +197,7 @@ pub fn prune(repo_dir: &Path) {
         return;
     }
     let output = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["worktree", "prune"])
         .current_dir(repo_dir)
         .output();
@@ -216,6 +221,7 @@ pub fn prune(repo_dir: &Path) {
 /// Returns true if `git status --porcelain` produces non-empty output.
 pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
     let output = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["status", "--porcelain"])
         .current_dir(worktree_dir)
         .output();
@@ -235,6 +241,7 @@ pub fn remove_worktree(repo_dir: &Path, worktree_name: &str) -> Result<(), Strin
     }
     // git worktree remove --force <path>
     let output = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["worktree", "remove", "--force"])
         .arg(&wt_dir)
         .current_dir(repo_dir)
@@ -247,6 +254,7 @@ pub fn remove_worktree(repo_dir: &Path, worktree_name: &str) -> Result<(), Strin
     // Delete tracking branch agend/<name>
     let branch = format!("agend/{worktree_name}");
     let _ = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["branch", "-D", &branch])
         .current_dir(repo_dir)
         .output();
@@ -260,6 +268,7 @@ pub fn remove_worktree(repo_dir: &Path, worktree_name: &str) -> Result<(), Strin
 pub fn checkout_branch(worktree_dir: &Path, branch: &str) -> Result<(), String> {
     // Try switching to existing branch first
     let switch = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["switch", branch])
         .current_dir(worktree_dir)
         .output()
@@ -270,6 +279,7 @@ pub fn checkout_branch(worktree_dir: &Path, branch: &str) -> Result<(), String> 
     }
     // Branch doesn't exist — create from current HEAD
     let create = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["switch", "-c", branch])
         .current_dir(worktree_dir)
         .output()
@@ -344,11 +354,13 @@ mod tests {
         std::fs::create_dir_all(&dir).ok();
         // git init
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["init"])
             .current_dir(&dir)
             .output()
             .ok();
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args([
                 "-c",
                 "user.name=test",
@@ -440,6 +452,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["init"])
             .current_dir(&dir)
             .output()
@@ -464,11 +477,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agend-wt-checkout-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["init"])
             .current_dir(&dir)
             .output()
             .unwrap();
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["commit", "--allow-empty", "-m", "init"])
             .current_dir(&dir)
             .output()
@@ -479,6 +494,7 @@ mod tests {
 
         // Verify we're on the new branch
         let output = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["branch", "--show-current"])
             .current_dir(&dir)
             .output()

@@ -3,6 +3,7 @@
 mod channel;
 pub(crate) mod ci;
 mod comms;
+pub(crate) mod dispatch_hook;
 mod instance;
 mod schedule;
 pub(crate) mod sha_gate;
