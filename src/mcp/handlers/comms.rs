@@ -488,8 +488,17 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         // Mark dispatch as completed so timeout sweep doesn't false-warn.
         let cid = args["correlation_id"].as_str();
         crate::dispatch_tracking::mark_completed(home, cid, sender.as_str());
-        // Phase 2 git-shim: clear binding on task completion.
-        crate::binding::unbind(home, sender.as_str());
+        // Sprint 53 P0-Y: do NOT auto-unbind here. Every kind=report reply
+        // (progress update OR final done) landed in this handler, so the
+        // prior auto-unbind tore down the binding on the first progress
+        // update — Phase 1 trailer stopped firing on subsequent commits,
+        // P0-X release_worktree refused ("no binding"), Phase 4 GC saw
+        // zero candidates (unbind doesn't write released_at; only
+        // release()/release_full() do), and orphan worktrees accumulated.
+        // `release_worktree` MCP tool is now the single source of truth
+        // for binding lifecycle. Sprint 54 candidates: explicit `task_done`
+        // flag in report envelope, or lifecycle rework with auto
+        // release_full on that explicit signal.
         let task_id = args["correlation_id"]
             .as_str()
             .filter(|s| !s.is_empty())

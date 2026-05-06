@@ -319,6 +319,68 @@ fn report_result_emits_with_correlation_id() {
 }
 
 #[test]
+fn bind_persists_across_kind_report_reply() {
+    // Sprint 53 P0-Y: regression guard for the auto-unbind bug general m-42
+    // surfaced. Pre-fix `handle_report_result` ran `binding::unbind(home,
+    // sender)` on every successful kind=report — including progress
+    // updates — tearing down the binding before the agent's next commit
+    // could carry the Phase 1 trailer.
+    //
+    // Post-fix the binding survives the report path entirely and only
+    // `release_worktree` (P0-X MCP tool) clears it.
+    //
+    // Regression-proof: re-add `crate::binding::unbind(home, sender.as_str())`
+    // inside the `if is_ok_result(&result) { ... }` block of
+    // `handle_report_result`, re-run this test → FAIL on the post-condition
+    // assert. Restore (no unbind) → PASS.
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("fleet_report_bind_persists");
+
+    // Pre-condition: agent has an active binding (simulating what
+    // dispatch_auto_bind_lease would have written).
+    crate::binding::bind(&home, "sender", "T-bind-persist", "feat/persist");
+    let pre = crate::binding::read(&home, "sender");
+    assert!(pre.is_some(), "test setup: binding must exist pre-report");
+
+    // Issue a kind=report reply — handle_report_result is the same path
+    // production lands in via handle_unified_send.
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "progress update",
+            "request_kind": "report",
+            "summary": "progress update",
+            "correlation_id": "T-bind-persist",
+        }),
+        "sender",
+    );
+    assert!(
+        is_ok_result(&result),
+        "report_result should succeed: {result}"
+    );
+
+    // Post-condition: binding STILL present. Pre-fix this assertion failed
+    // because of the now-deleted `crate::binding::unbind(home, sender.as_str())`
+    // call.
+    let post = crate::binding::read(&home, "sender");
+    assert!(
+        post.is_some(),
+        "binding must NOT be auto-cleared on kind=report reply — Phase 1 \
+         trailer + P0-X release_worktree both depend on it surviving"
+    );
+    let post = post.expect("post binding");
+    assert_eq!(
+        post["task_id"], "T-bind-persist",
+        "task_id must remain stable, got: {post}"
+    );
+    assert_eq!(post["branch"], "feat/persist", "branch must remain stable");
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn report_result_empty_correlation_id_maps_to_none() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_report_empty");
