@@ -1185,13 +1185,63 @@ async fn ci_check_repo(
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
     // Check if the PR associated with this branch has reached a terminal state.
+    // Skip auto-clear if the watch was just created (< 60s) — the branch may not
+    // be pushed yet, and a stale PR from a previous use of the same branch name
+    // could trigger a false-positive clear (Hotfix E, PR #451 follow-up).
     if let PrState::Terminal { merged } = provider.check_pr_terminal(repo, branch).await {
-        remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
-        tracing::info!(repo, branch, merged, "CI watcher auto-cleared: PR terminal");
-        if merged {
-            crate::status_summary::auto_close_merged_tasks(home, branch);
+        // Grace: don't clear watches younger than 60s (branch not yet pushed).
+        if let Ok(content) = std::fs::read_to_string(watch_path) {
+            if let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(expires_at) = watch["expires_at"].as_str() {
+                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+                        let watch_age = exp.with_timezone(&chrono::Utc)
+                            - chrono::Duration::hours(crate::daemon::ci_watch::WATCH_TTL_HOURS);
+                        let since_creation = chrono::Utc::now().signed_duration_since(watch_age);
+                        if since_creation < chrono::Duration::seconds(60) {
+                            tracing::info!(
+                                repo,
+                                branch,
+                                merged,
+                                "skipping PR-terminal auto-clear — watch too young (<60s)"
+                            );
+                            // Don't clear — let the next poll cycle re-check.
+                            // Fall through to normal poll logic below.
+                        } else {
+                            remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
+                            tracing::info!(
+                                repo,
+                                branch,
+                                merged,
+                                "CI watcher auto-cleared: PR terminal"
+                            );
+                            if merged {
+                                crate::status_summary::auto_close_merged_tasks(home, branch);
+                            }
+                            return Ok(());
+                        }
+                    } else {
+                        remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
+                        tracing::info!(
+                            repo,
+                            branch,
+                            merged,
+                            "CI watcher auto-cleared: PR terminal"
+                        );
+                        if merged {
+                            crate::status_summary::auto_close_merged_tasks(home, branch);
+                        }
+                        return Ok(());
+                    }
+                } else {
+                    remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
+                    tracing::info!(repo, branch, merged, "CI watcher auto-cleared: PR terminal");
+                    if merged {
+                        crate::status_summary::auto_close_merged_tasks(home, branch);
+                    }
+                    return Ok(());
+                }
+            }
         }
-        return Ok(());
     }
 
     let poll_result = provider.poll_runs(repo, branch).await?;
@@ -3014,5 +3064,102 @@ mod tests {
     fn github_new_defaults_to_api_github_com() {
         let provider = super::GitHubCiProvider::new().expect("new");
         assert_eq!(provider.http.base_url, "https://api.github.com");
+    }
+
+    // ── Hotfix E: auto-clear false-positive tests ────────────────────
+
+    #[test]
+    fn auto_clear_skips_young_watch() {
+        // A watch created < 60s ago should NOT be auto-cleared even if
+        // PR terminal is detected (stale PR from previous branch use).
+        let dir = tmp_dir("young-watch");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        // Watch with expires_at = now + TTL (meaning it was just created).
+        let now = chrono::Utc::now();
+        let expires = (now + chrono::Duration::hours(super::WATCH_TTL_HOURS)).to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat-new", "interval_secs": 60,
+            "instance": "agent1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null, "expires_at": expires,
+        });
+        let filename = super::watch_filename("o/r", "feat-new");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
+
+        // Provider says PR terminal (stale PR from old branch use).
+        let provider = MockCiProvider::with_runs(vec![]).with_pr_terminal();
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat-new",
+            "agent1",
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+
+        // Watch must survive (young watch grace).
+        assert!(
+            watch_path.exists(),
+            "young watch (<60s) must NOT be auto-cleared on PR terminal"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_clear_fires_on_old_watch_with_merged_pr() {
+        // A watch created > 60s ago SHOULD be cleared on PR terminal.
+        let dir = tmp_dir("old-watch-clear");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        // Watch with expires_at implying creation > 60s ago.
+        let old_creation = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let expires = (old_creation + chrono::Duration::hours(super::WATCH_TTL_HOURS)).to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat-old", "interval_secs": 60,
+            "instance": "agent1", "last_run_id": null, "head_sha": null,
+            "last_polled_at": null, "expires_at": expires,
+        });
+        let filename = super::watch_filename("o/r", "feat-old");
+        let watch_path = ci_dir.join(&filename);
+        std::fs::write(&watch_path, serde_json::to_string(&watch).unwrap()).ok();
+
+        let provider = MockCiProvider::with_runs(vec![]).with_pr_terminal();
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat-old",
+            "agent1",
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+
+        assert!(
+            !watch_path.exists(),
+            "old watch (>60s) must be cleared on PR terminal"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
