@@ -192,111 +192,119 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    // ── Ordering tests: reject BEFORE delivery (r4 fix) ─────────────
+    // (Earlier "does_not_deliver_to_inbox" tests deleted — superseded by the
+    // delegate_task integration tests below, which exercise the production
+    // dispatch path and are regression-proof against gate-after-send.)
+
+    // ── Integration tests: delegate_task ordering proof ──────────────
+    //
+    // These call the production task-dispatch entry point
+    // (`handle_delegate_task`) — the same function MCP `send` with
+    // `request_kind: "task"` lands in via `handle_unified_send`.
+    //
+    // Regression-proof property: the lease gate sits BEFORE the
+    // `api::call(SEND)` block. When the gate trips (E4.5 main-branch
+    // rejection or LeaseError::Conflict), `handle_delegate_task` must
+    // return an error AND must not deliver the `[delegate_task] ...`
+    // message to the target's inbox via the fallback_deliver path.
+    //
+    // If the gate is moved back after the SEND block, the api::call
+    // returns `Err` in test (no daemon) and `fallback_deliver` writes
+    // the rendered `[delegate_task] implement feature X` line to
+    // `inbox/<target>.jsonl`. Both assertions below trip in that case
+    // (verified manually by removing the gate and re-running).
 
     #[test]
-    fn main_branch_reject_does_not_deliver_to_inbox() {
-        // Q2 ordering: if lease rejects, target must NOT receive message.
-        let home =
-            std::env::temp_dir().join(format!("agend-s53-order-{}-main", std::process::id()));
+    fn delegate_task_main_branch_rejects_without_delivering() {
+        use crate::identity::Sender;
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-s53-integration-{}-main-order",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&home).ok();
-        setup_test_repo(&home, "dev-target");
+        setup_test_repo(&home, "target-agent");
 
-        // Attempt dispatch with main branch → rejected by lease gate.
-        let result = super::dispatch_auto_bind_lease(&home, "dev-target", "T-1", "main");
-        assert!(result.is_err(), "main branch must reject");
+        let args = serde_json::json!({
+            "target_instance": "target-agent",
+            "task": "implement feature X",
+            "task_id": "T-999",
+            "branch": "main",  // ← E4.5 rejection trigger
+        });
+        let sender = Some(Sender::new("lead").expect("sender"));
 
-        // Target's inbox must NOT have any message (gate fires before send).
-        let inbox_path = home.join("inbox").join("dev-target.jsonl");
+        let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+
         assert!(
-            !inbox_path.exists(),
-            "rejected dispatch must not deliver to target inbox"
+            result.get("error").is_some(),
+            "handle_delegate_task must return error when lease rejects main: {result}"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("dispatch rejected"),
+            "error must indicate dispatch rejection (not generic): {result}"
+        );
+
+        let inbox_path = home.join("inbox").join("target-agent.jsonl");
+        let inbox_content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+        assert!(
+            !inbox_content.contains("implement feature X"),
+            "rejected dispatch must NOT deliver message to target inbox. Got: {inbox_content}"
         );
 
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn lease_conflict_reject_does_not_deliver_to_inbox() {
-        // Q2 ordering: lease conflict → no delivery to second target.
-        let home =
-            std::env::temp_dir().join(format!("agend-s53-order-{}-conflict", std::process::id()));
+    fn delegate_task_lease_conflict_rejects_without_delivering() {
+        use crate::identity::Sender;
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-s53-integration-{}-conflict-order",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&home).ok();
         setup_test_repo(&home, "agent-a");
+
         let repo = home.join("workspace").join("agent-a");
         std::fs::write(
             home.join("fleet.yaml"),
             format!("instances:\n  agent-a:\n    backend: claude\n    working_directory: {}\n  agent-b:\n    backend: claude\n    working_directory: {}\n", repo.display(), repo.display()),
         ).ok();
 
-        // First lease succeeds.
-        let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/order");
-        assert!(r1.is_ok());
+        // First lease seeds the worktree pool with feat/end2end for agent-a.
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/end2end");
+        assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
 
-        // Second lease conflicts → rejected.
-        let r2 = super::dispatch_auto_bind_lease(&home, "agent-b", "T-2", "feat/order");
-        assert!(r2.is_err(), "conflict must reject");
-
-        // Agent-b inbox must NOT have message.
-        let inbox_b = home.join("inbox").join("agent-b.jsonl");
-        assert!(
-            !inbox_b.exists(),
-            "rejected dispatch must not deliver to agent-b inbox"
-        );
-
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    // ── Integration test: handle_send_to_instance ordering proof ─────
-    // This test calls the FULL dispatch entry point (not just dispatch_auto_bind_lease).
-    // It would FAIL if the lease gate were moved after api::SEND.
-
-    #[test]
-    fn handle_send_main_branch_rejects_without_delivering() {
-        use crate::identity::Sender;
-
-        let home = std::env::temp_dir().join(format!(
-            "agend-s53-integration-{}-ordering",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&home).ok();
-        setup_test_repo(&home, "target-agent");
-
-        // Create fleet.yaml with target agent.
-        std::fs::write(
-            home.join("fleet.yaml"),
-            format!(
-                "instances:\n  target-agent:\n    backend: claude\n    working_directory: {}\n",
-                home.join("workspace").join("target-agent").display()
-            ),
-        )
-        .ok();
-
-        // Construct args matching production delegate_task envelope.
         let args = serde_json::json!({
-            "target_instance": "target-agent",
-            "message": "implement feature X",
-            "request_kind": "task",
-            "branch": "main",  // ← E4.5 rejection trigger
-            "task_id": "T-999",
+            "target_instance": "agent-b",
+            "task": "implement feature Y",
+            "task_id": "T-2",
+            "branch": "feat/end2end",
         });
-        let sender = Sender::new("lead");
+        let sender = Some(Sender::new("lead").expect("sender"));
 
-        // Call the FULL handle_send_to_instance (production entry point).
-        let result = super::super::comms::handle_send_to_instance(&home, &args, "send", &sender);
+        let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
 
-        // Must return error (lease rejected main branch).
         assert!(
             result.get("error").is_some(),
-            "handle_send must return error for main branch: {result}"
+            "handle_delegate_task must return error on lease conflict: {result}"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("dispatch rejected"),
+            "error must indicate dispatch rejection: {result}"
         );
 
-        // Target's inbox must NOT have the task message (gate fired before send).
-        let inbox_path = home.join("inbox").join("target-agent.jsonl");
+        let inbox_path = home.join("inbox").join("agent-b.jsonl");
         let inbox_content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
         assert!(
-            !inbox_content.contains("implement feature X"),
-            "rejected dispatch must NOT deliver message to target inbox. Got: {inbox_content}"
+            !inbox_content.contains("implement feature Y"),
+            "rejected dispatch must NOT deliver to agent-b inbox. Got: {inbox_content}"
         );
 
         std::fs::remove_dir_all(&home).ok();
