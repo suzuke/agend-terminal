@@ -274,16 +274,22 @@ P2 items deferred and not estimated.
 5. P1-3 + P1-4 dispatched in parallel (independent, both Tier-1)
 6. Sprint 53 close report
 
-## §10 §13 candidate questions for operator
+## §10 §13 questions — operator answers + rationale
 
-1. **Bind failure tolerance**: bind file write error → graceful (no trailer) per §3.3, or hard-fail? Lead recommend graceful; trailer is convenience, lease is not.
-2. **Lease conflict policy**: two dispatches same branch — reject second, or allow with separate worktree path per agent? Lead recommend reject (matches §3.3, prevents racing).
-3. **Bind lifetime**: per-task (release on done) or per-agent-session (release on agent restart only)? Lead recommend per-task — matches `task_id` boundary, cleaner accounting.
-4. **Hotfix C disposition**: delete entirely after P0-2 (if redundant) or keep as defense-in-depth?
-5. **Production smoke CI cost**: real daemon spin-up adds ~30-60s per test. Run on every PR or gate to nightly + merge-gate?
-6. **Phase 4 GC cutover timing**: `AGEND_WORKTREE_GC=1` enable — Sprint 53 close, or separate decision?
-7. **MCP gc-dry-run output format**: human-readable vs JSON for tooling?
-8. **P2 wake**: which P2 items (if any) elevate to Sprint 53 vs defer to Sprint 54?
+Operator m-8: "全採用 lead 建議" for Q1-3; full delegation to lead on Q4-8.
+
+1. **Bind failure tolerance** — **GRACEFUL.** Bind file is convenience metadata; if write fails, dispatch proceeds without trailer rather than blocking the task. Lease is the load-bearing artifact and stays hard-fail per §3.3.
+2. **Lease conflict policy** — **REJECT second dispatch.** Two agents on same branch is a coordination bug, not a feature. Surface as explicit operator-readable error so the conflict is visible, not silently aliased.
+3. **Bind lifetime** — **per-task.** Bound on `delegate_task` parse, released on matching `task done` report. Matches `task_id` boundary cleanly. Per-agent-session would leak across tasks and complicate cleanup on agent restart.
+4. **Hotfix C disposition** — **delete after P0-2 confirms coverage.** Dead code is liability. P0-2 must add tests for all three paths (operator-side dispatch, agent-to-agent dispatch, missing-branch) before deletion. If any path resists testing, Hotfix C stays as defense-in-depth and the gap is documented inline.
+5. **Production smoke CI cost** — **nightly + manual merge gate**, not every PR. Real-daemon spin-up adds 30-60s per test, and CI green on every PR didn't catch dead code anyway. Per-PR smoke would burn cycles without changing the failure mode. Manual operator review at merge time forces deliberate inspection of the smoke output, which is the actual mitigation. Sprint 53 phases each use manual smoke per phase merge.
+6. **Phase 4 GC cutover timing** — **defer to Sprint 54.** `AGEND_WORKTREE_GC=1` deletes worktrees; we need ≥1 week of dry-run logs to confirm no false-positives in production. Sprint 53 close is too early — we'd be cutting over with hours of soak, not days.
+7. **MCP gc-dry-run output format** — **human-readable default, JSON via flag.** Operator interactive use is primary; tooling is secondary. Matches existing MCP tool patterns (e.g., `task list`).
+8. **P2 wake** — **none.** P0+P1 is already 10-13h. P2 items are nice-to-haves; budget discipline matters more than scope creep. Sprint 54 pulls from the P2 queue based on signal at that point. Specifically:
+   - fleet.yaml schema_version: defer (no incompatible change planned in Sprint 53)
+   - kanban view: defer (UX polish, not blocking)
+   - leak process cleanup: defer (no recent operator complaint, can wait)
+   - Sprint 50 post-push hook: defer (workflow already works without it)
 
 ## §11 Estimates summary
 
