@@ -259,6 +259,12 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
     let repo = home.join("workspace").join("agent-a");
     std::fs::write(
             home.join("fleet.yaml"),
+            // allow: shared-source_repo — this test exercises the central
+            // lease registry's cross-agent collision rejection, which fires
+            // precisely when two agents are bound to the same source repo
+            // and dispatch the same branch. The shared `repo.display()` is
+            // the bug condition under test, not an oversight; production
+            // topology is one-clone-per-agent.
             format!("instances:\n  agent-a:\n    backend: claude\n    working_directory: {}\n  agent-b:\n    backend: claude\n    working_directory: {}\n", repo.display(), repo.display()),
         ).ok();
 

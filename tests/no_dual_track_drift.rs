@@ -301,6 +301,10 @@ fn body_contains_raw_string_token(body: &str) -> bool {
 
 /// Collapse whitespace to single spaces so fmt-cosmetic diffs don't
 /// register as drift.
+// allow: dead-code-helper — whitespace-collapse helper, semantically distinct
+// from src/bootstrap/fleet_normalize.rs's `pub(super) fn normalize` which
+// operates on FleetConfig. Different scope, different signature, different
+// purpose; a future `pub fn normalize` in src/ should rename one or both.
 fn normalize(body: &str) -> String {
     body.split_whitespace().collect::<Vec<_>>().join(" ")
 }
