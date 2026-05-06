@@ -613,6 +613,7 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
                     .or_else(|| Some(command.to_string())),
                 working_directory: Some(work_dir.clone()),
                 role,
+                instructions: None,
             };
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 tracing::warn!(error = %e, "failed to persist to fleet.yaml");

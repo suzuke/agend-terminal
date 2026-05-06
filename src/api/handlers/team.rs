@@ -99,6 +99,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
                         backend: Some(be.clone()),
                         working_directory: Some(wd.display().to_string()),
                         role: None,
+                        instructions: None,
                     },
                 )
             })

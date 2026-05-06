@@ -167,7 +167,8 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     doctor::emit_diagnostics(&diags);
 
     let agents = if opts.resolve_agents {
-        agent_resolve::resolve(&config)
+        let fleet_dir = fleet_path.parent().unwrap_or(home);
+        agent_resolve::resolve(&config, fleet_dir)
     } else {
         Vec::new()
     };

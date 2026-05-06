@@ -374,6 +374,7 @@ impl FleetConfig {
             git_branch: inst.git_branch.clone(),
             model,
             worktree: inst.worktree,
+            instructions: inst.instructions.clone(),
         })
     }
 
@@ -434,6 +435,7 @@ pub struct ResolvedInstance {
     pub git_branch: Option<String>,
     pub model: Option<String>,
     pub worktree: Option<bool>,
+    pub instructions: Option<String>,
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -445,6 +447,7 @@ pub struct InstanceYamlEntry {
     pub backend: Option<String>,
     pub working_directory: Option<String>,
     pub role: Option<String>,
+    pub instructions: Option<String>,
 }
 
 /// Atomically write a serde_yaml_ng::Value back to fleet.yaml using temp + fsync + rename.
@@ -515,6 +518,7 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 ("backend", &config.backend),
                 ("working_directory", &config.working_directory),
                 ("role", &config.role),
+                ("instructions", &config.instructions),
             ] {
                 if let Some(ref v) = val {
                     inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));
@@ -702,6 +706,7 @@ instances:
             backend: Some("claude".to_string()),
             working_directory: Some("/tmp/work".to_string()),
             role: Some("developer".to_string()),
+            instructions: Some("./instructions/dev.md".to_string()),
         };
         add_instance_to_yaml(&dir, "new-agent", &entry).expect("add");
         let config = FleetConfig::load(&path).expect("load after add");
@@ -710,6 +715,7 @@ instances:
         assert_eq!(inst.backend, Some(crate::backend::Backend::ClaudeCode));
         assert_eq!(inst.working_directory.as_deref(), Some("/tmp/work"));
         assert_eq!(inst.role.as_deref(), Some("developer"));
+        assert_eq!(inst.instructions.as_deref(), Some("./instructions/dev.md"));
         // existing instance should still be there
         assert!(config.instances.contains_key("existing"));
 
@@ -746,6 +752,7 @@ instances:
             backend: Some("claude".to_string()),
             working_directory: None,
             role: None,
+            instructions: None,
         };
         add_instance_to_yaml(&dir, "first", &entry).expect("add to new");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
@@ -1024,6 +1031,7 @@ instances:
             backend: Some("claude".to_string()),
             working_directory: None,
             role: Some("tester".to_string()),
+            instructions: None,
         };
         add_instance_to_yaml(&dir, "temp-agent", &entry).expect("add");
 
