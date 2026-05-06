@@ -181,6 +181,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // --- Daemon-managed worktree release (Sprint 53 P0-X) ---
         "release_worktree" => worktree::handle_release_worktree(&home, args, &sender),
 
+        // --- Phase 4 GC dry-run visibility (Sprint 53 P1-4) ---
+        "gc_dry_run" => worktree::handle_gc_dry_run(&home, args, &sender),
+
         _ => json!({"error": format!("unknown tool: {tool}")}),
     }
 }

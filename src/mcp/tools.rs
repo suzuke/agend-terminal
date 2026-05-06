@@ -249,6 +249,13 @@ fn worktree_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "agent": {"type": "string", "description": "Agent name whose worktree + binding to release"}
             }, "required": ["agent"]}}),
+        // Sprint 53 P1-4: operator-callable Phase 4 GC visibility. Wraps
+        // worktree_pool::gc_dry_run; non-destructive (Phase 4 cutover stays
+        // gated behind AGEND_WORKTREE_GC=1).
+        json!({"name": "gc_dry_run", "description": "List Phase 4 GC candidates (released, past-grace, daemon-managed worktrees) without deleting them. Non-destructive. Default human format; pass `format=json` for tooling.",
+        "inputSchema": {"type": "object", "properties": {
+            "format": {"type": "string", "enum": ["human", "json"], "description": "Output format (default: human)"}
+        }}}),
     ]
 }
 
@@ -386,10 +393,11 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            27,
-            "Sprint 53 P0-X tool count = 27 (release_worktree added on top of \
-             pane_snapshot's Sprint 33 baseline of 26). Adding/removing a tool \
-             requires updating this assertion. Current tools: {:?}",
+            28,
+            "Sprint 53 P1-4 tool count = 28 (gc_dry_run added on top of \
+             P0-X's 27, which itself was pane_snapshot's Sprint 33 baseline \
+             of 26 + release_worktree). Adding/removing a tool requires \
+             updating this assertion. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
