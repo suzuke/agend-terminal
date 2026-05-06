@@ -341,101 +341,61 @@ pub(super) fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let is_tab = matches!(target, CloseTarget::Tab);
                 *overlay = Overlay::None;
+                // Sprint 53 Smoke 2 r1 (operator m-16 override): TUI close
+                // path delegates to the canonical full-delete flow
+                // `mcp::handlers::instance::full_delete_instance`. DRY with
+                // the MCP `delete_instance` MCP tool — same side-effect set
+                // (PTY kill via delete_transaction, fleet.yaml removal,
+                // Telegram topic delete, working-dir cleanup, team removal).
+                //
+                // Layered on top, `deployments::reconcile_after_close` runs
+                // afterwards so deployment-store metadata + custom-directory
+                // subdirs (the actual Smoke 2 leak) get cleaned via
+                // `cleanup_deployment_dirs` — `full_delete_instance` only
+                // covers the per-instance working_dir which, for custom
+                // `directory:` deployments, was the user-provided-dir branch
+                // of `cleanup_working_dir` and only stripped agend files.
                 if is_tab {
                     let idx = ctx.layout.active;
-                    let closed: Vec<(String, Option<std::path::PathBuf>)> = ctx
+                    let names: Vec<String> = ctx
                         .layout
                         .tabs
                         .get(idx)
                         .into_iter()
                         .flat_map(|t| {
                             t.root().pane_ids().into_iter().filter_map(|id| {
-                                t.root().find_pane(id).and_then(|p| {
-                                    p.fleet_instance_name
-                                        .clone()
-                                        .map(|name| (name, p.working_dir.clone()))
-                                })
+                                t.root()
+                                    .find_pane(id)
+                                    .and_then(|p| p.fleet_instance_name.clone())
                             })
                         })
                         .collect();
-                    for (name, _) in &closed {
-                        super::telegram_hooks::maybe_delete_telegram_topic(
-                            ctx.telegram_state,
-                            ctx.home,
-                            name,
-                        );
+                    for name in &names {
+                        crate::mcp::handlers::instance::full_delete_instance(ctx.home, name);
                     }
-                    if !closed.is_empty() {
-                        let names: Vec<String> = closed.iter().map(|(n, _)| n.clone()).collect();
-                        let _ = crate::fleet::remove_instances_from_yaml(ctx.home, &names);
-                        // Issue #474: TUI close (Ctrl-B x / tab close) bypassed
-                        // deployment teardown, leaving stale entries in
-                        // `deployment list`. Reconcile after fleet.yaml is
-                        // updated: any deployment whose members are all now
-                        // gone gets pruned (entry + team).
+                    if !names.is_empty() {
+                        // Deployment metadata + custom-directory subdir cleanup.
                         let _ = crate::deployments::reconcile_after_close(ctx.home, &names);
                     }
-                    if let Some(tab) = ctx.layout.close_tab(idx) {
-                        for name in tab.root().agent_names() {
-                            super::kill_agent(ctx.home, ctx.registry, &name);
-                        }
-                    }
-                    for (name, wd) in &closed {
-                        if let Some(wd) = wd {
-                            crate::agent_ops::cleanup_working_dir(ctx.home, name, wd);
-                        }
-                        // Smoke 2 fix (post-#475): defensive cleanup at the
-                        // default `home/workspace/<name>` path. Covers panes
-                        // whose `working_dir` is None (so the branch above
-                        // skipped) and deployments with default directory.
-                        // Custom-directory deployments are reaped by the
-                        // `reconcile_after_close` → `cleanup_deployment_dirs`
-                        // path above.
-                        let default_wd = ctx.home.join("workspace").join(name);
-                        if default_wd.exists() {
-                            crate::agent_ops::cleanup_working_dir(ctx.home, name, &default_wd);
-                        }
-                    }
+                    // Layout state is the only piece full_delete_instance
+                    // doesn't touch (it's UI state, not agent state).
+                    let _ = ctx.layout.close_tab(idx);
                     outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
                     let fid = tab.focus_id;
-                    let closed: Option<(String, Option<std::path::PathBuf>)> =
-                        tab.root().find_pane(fid).and_then(|p| {
-                            p.fleet_instance_name
-                                .clone()
-                                .map(|name| (name, p.working_dir.clone()))
-                        });
-                    if let Some((ref fleet_name, _)) = closed {
-                        super::telegram_hooks::maybe_delete_telegram_topic(
-                            ctx.telegram_state,
-                            ctx.home,
-                            fleet_name,
-                        );
-                        let _ = crate::fleet::remove_instance_from_yaml(ctx.home, fleet_name);
-                        // Issue #474: same reconcile hook for single-pane
-                        // close. The reconcile is generic, so even if this
-                        // single instance was the last live member of a
-                        // multi-instance deployment, the entry gets pruned.
+                    let fleet_name: Option<String> = tab
+                        .root()
+                        .find_pane(fid)
+                        .and_then(|p| p.fleet_instance_name.clone());
+                    if let Some(ref name) = fleet_name {
+                        crate::mcp::handlers::instance::full_delete_instance(ctx.home, name);
                         let _ = crate::deployments::reconcile_after_close(
                             ctx.home,
-                            std::slice::from_ref(fleet_name),
+                            std::slice::from_ref(name),
                         );
                     }
-                    if let Some(name) = tab.close_focused() {
-                        super::kill_agent(ctx.home, ctx.registry, &name);
+                    if tab.close_focused().is_some() {
                         outcome.needs_resize = true;
-                    }
-                    if let Some((name, wd)) = closed {
-                        if let Some(ref wd) = wd {
-                            crate::agent_ops::cleanup_working_dir(ctx.home, &name, wd);
-                        }
-                        // Smoke 2 fix (post-#475): same defensive cleanup as
-                        // the Tab branch above. Covers default-path single-
-                        // instance closes and panes with `working_dir = None`.
-                        let default_wd = ctx.home.join("workspace").join(&name);
-                        if default_wd.exists() {
-                            crate::agent_ops::cleanup_working_dir(ctx.home, &name, &default_wd);
-                        }
                     }
                 }
             }
