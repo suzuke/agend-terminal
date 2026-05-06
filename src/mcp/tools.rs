@@ -15,6 +15,7 @@ pub fn tool_definitions() -> Value {
     tools.extend(deploy_tools());
     tools.extend(ci_tools());
     tools.extend(health_tools());
+    tools.extend(worktree_tools());
     json!({"tools": tools})
 }
 
@@ -238,6 +239,19 @@ fn repo_tools() -> Vec<Value> {
     ]
 }
 
+fn worktree_tools() -> Vec<Value> {
+    vec![
+        // Sprint 53 P0-X: release a daemon-managed worktree + clear binding
+        // for `agent`. Idempotent. Only removes worktrees that carry the
+        // `.agend-managed` marker (R14 safety — operator-created worktrees
+        // are left alone). Operator- and agent-callable.
+        json!({"name": "release_worktree", "description": "Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone.",
+            "inputSchema": {"type": "object", "properties": {
+                "agent": {"type": "string", "description": "Agent name whose worktree + binding to release"}
+            }, "required": ["agent"]}}),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,10 +386,10 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            25 + 1,
-            "Sprint 33 tool count = 26 (pane_snapshot added). \
-             Adding/removing a tool requires updating this assertion. \
-             Current tools: {:?}",
+            27,
+            "Sprint 53 P0-X tool count = 27 (release_worktree added on top of \
+             pane_snapshot's Sprint 33 baseline of 26). Adding/removing a tool \
+             requires updating this assertion. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())

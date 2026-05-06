@@ -8,6 +8,15 @@ mod instance;
 mod schedule;
 pub(crate) mod sha_gate;
 mod task;
+mod worktree;
+
+/// Test-only thin shim into `release_worktree`'s production handler. Used by
+/// `worktree_pool::tests::p0x_release_full_via_handle_release_worktree_end_to_end`
+/// to exercise the full MCP dispatch path without setting up a sender.
+#[cfg(test)]
+pub(crate) fn worktree_test_release(home: &std::path::Path, args: &Value) -> Value {
+    worktree::handle_release_worktree(home, args, &None)
+}
 
 use crate::agent_ops::save_metadata;
 use crate::identity::Sender;
@@ -168,6 +177,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             "unwatch" => ci::handle_unwatch_ci(&home, args),
             other => json!({"error": format!("unknown ci action: {other}")}),
         },
+
+        // --- Daemon-managed worktree release (Sprint 53 P0-X) ---
+        "release_worktree" => worktree::handle_release_worktree(&home, args, &sender),
 
         _ => json!({"error": format!("unknown tool: {tool}")}),
     }
