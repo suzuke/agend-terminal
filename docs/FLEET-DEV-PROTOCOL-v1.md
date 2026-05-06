@@ -228,12 +228,13 @@ Don't preemptively prefix `AGEND_GIT_BYPASS=1`. Try bare git, read the deny mess
 Operations on the lifecycle/safety surface the daemon manages directly:
 
 - `git worktree add` / `remove` / `move` — worktree pool is daemon-owned (Phase 3 lease, P0-X release)
-- `git checkout main` from an agent worktree — cross-branch deny, main is daemon-protected
-- `git push origin main` — main protected; CI gates required
+- `git checkout main` from an agent worktree — cross-branch deny in the shim matrix
 - Operator manual cleanup of orphan worktree or orphan binding (no MCP tool yet for some edge cases)
 - Daemon's own internal git command — bypass is set by the daemon to prevent self-recursion through its own shim
 
 If your op isn't on this list and you reach for bypass, you're probably solving the wrong problem.
+
+Note: `git push origin main` is **workflow-prohibited** (PR + CI gates required), but the current shim matrix does not deny it directly. The protection comes from review process, not from the shim. Don't push to main even though `git push origin main` would not trip a shim deny today.
 
 ### 13.3 Why bypass is costly
 
