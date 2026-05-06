@@ -95,11 +95,23 @@ fn read_binding(home: &str, agent: &str) -> Binding {
         Ok(v) => v,
         Err(_) => return Binding::default(), // parse failure = unbound (fail-safe)
     };
-    Binding {
+    let b = Binding {
         task_id: v["task_id"].as_str().map(String::from),
         branch: v["branch"].as_str().map(String::from),
         worktree: v["worktree"].as_str().map(String::from),
+    };
+    // P0-1.6: orphan binding defense.
+    // If binding points to a worktree path that no longer exists (e.g. operator
+    // ran `git worktree remove` after the daemon wrote the binding, or a stale
+    // binding survived a daemon restart), treat the agent as unbound rather
+    // than letting chdir fatal at exec time. Daemon-side reconcile will
+    // eventually clean the stale file; this guard is only a fail-safe.
+    if let Some(ref wt) = b.worktree {
+        if !std::path::Path::new(wt).exists() {
+            return Binding::default();
+        }
     }
+    b
 }
 
 fn is_bound(binding: &Binding) -> bool {

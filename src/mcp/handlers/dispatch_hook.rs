@@ -349,4 +349,100 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── P0-1.6: same agent + different branch must reject ────────────
+    //
+    // Pre-fix scenario: agent-x leased feat/A, then operator (or another
+    // dispatcher) sent a second task with feat/B. worktree::create silently
+    // reused the existing .worktrees/agent-x dir and echoed feat/B back as
+    // the lease branch. dispatch_auto_bind_lease saw Ok and proceeded; the
+    // smoke message landed in agent-x's inbox even though the worktree was
+    // still on feat/A.
+    //
+    // Post-fix: worktree::create runs `git branch --show-current` on the
+    // existing dir; mismatch returns None → lease fails → dispatch rejects
+    // with "dispatch rejected: ..." and the message never reaches the inbox.
+
+    #[test]
+    fn same_agent_different_branch_rejects() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-p01-6-{}-same-agent-diff-branch",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).ok();
+        setup_test_repo(&home, "agent-x");
+
+        // First lease establishes the worktree on feat/A.
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/A");
+        assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+
+        // Second dispatch with a DIFFERENT branch must reject.
+        let r2 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-2", "feat/B");
+        assert!(
+            r2.is_err(),
+            "same-agent different-branch dispatch must reject (P0-1.6): {r2:?}"
+        );
+
+        // Binding still reflects feat/A (T-1) — the rejected dispatch must
+        // not have overwritten it.
+        let binding = home.join("runtime").join("agent-x").join("binding.json");
+        let content = std::fs::read_to_string(&binding).expect("read binding");
+        let v: serde_json::Value = serde_json::from_str(&content).expect("parse binding");
+        assert_eq!(
+            v["branch"], "feat/A",
+            "rejected dispatch must NOT overwrite binding to feat/B"
+        );
+        assert_eq!(v["task_id"], "T-1", "task_id must remain T-1");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn delegate_task_same_agent_different_branch_without_delivering() {
+        use crate::identity::Sender;
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-p01-6-integration-{}-same-agent-diff-branch",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).ok();
+        setup_test_repo(&home, "agent-x");
+
+        // Seed: agent-x already leased on feat/A.
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/A");
+        assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+
+        // Production-realistic: a second delegate_task targeting agent-x with
+        // a different branch must trip the gate before SEND, not deliver the
+        // [delegate_task] message to the inbox.
+        let args = serde_json::json!({
+            "target_instance": "agent-x",
+            "task": "implement feature B",
+            "task_id": "T-2",
+            "branch": "feat/B",
+        });
+        let sender = Some(Sender::new("lead").expect("sender"));
+        let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+
+        assert!(
+            result.get("error").is_some(),
+            "handle_delegate_task must error on same-agent different-branch: {result}"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("dispatch rejected"),
+            "error must indicate dispatch rejection: {result}"
+        );
+
+        let inbox_path = home.join("inbox").join("agent-x.jsonl");
+        let inbox_content = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+        assert!(
+            !inbox_content.contains("implement feature B"),
+            "rejected dispatch must NOT deliver to agent-x inbox. Got: {inbox_content}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

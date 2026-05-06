@@ -98,12 +98,41 @@ pub fn create(
 
     let wt_dir = repo_dir.join(".worktrees").join(instance_name);
 
-    // Already exists — reuse
+    // Already exists — verify actual HEAD before reuse.
+    // P0-1.6: pre-fix this branch echoed `branch` back without verifying the
+    // worktree's actual HEAD. dispatch_auto_bind_lease therefore could not
+    // distinguish "reuse on same branch" (idempotent) from "reuse on different
+    // branch" (lease conflict). Smoke test 2 caught it: a second dispatch with
+    // a different branch silently passed and the message was delivered.
     if wt_dir.exists() {
+        let actual = std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
+            .args(["branch", "--show-current"])
+            .current_dir(&wt_dir)
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            });
+        if actual.as_deref() != Some(branch.as_str()) {
+            tracing::warn!(
+                instance = instance_name,
+                requested = %branch,
+                actual = ?actual,
+                path = %wt_dir.display(),
+                "lease conflict: worktree exists on a different branch — rejecting"
+            );
+            return None;
+        }
         tracing::info!(
             instance = instance_name,
             path = %wt_dir.display(),
-            "reusing existing worktree"
+            branch = %branch,
+            "reusing existing worktree (branch verified)"
         );
         return Some(WorktreeInfo {
             path: wt_dir,
@@ -503,5 +532,37 @@ mod tests {
         assert_eq!(branch, "feat/test-branch");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── P0-1.6: actual HEAD verification on reuse ─────────────────────
+
+    /// Smoke test 2 regression: same agent, different branch → must reject.
+    /// Pre-fix this returned Some with `branch = requested`, falsely echoing
+    /// the requested branch back even though the worktree HEAD was unchanged.
+    #[test]
+    fn reuse_rejects_when_branch_mismatch() {
+        let repo = tmp_repo("reuse-mismatch");
+        let first = create(&repo, "agent1", Some("feat/A")).expect("first lease");
+        assert!(first.path.exists());
+        // Second lease, same instance, DIFFERENT branch → must return None.
+        let second = create(&repo, "agent1", Some("feat/B"));
+        assert!(
+            second.is_none(),
+            "lease must reject when worktree exists on a different branch"
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Idempotent path: same agent, same custom branch → reuse OK.
+    /// Confirms the actual-HEAD check does not break the idempotent re-lease
+    /// semantics that P0-1.5 relies on.
+    #[test]
+    fn reuse_idempotent_same_custom_branch() {
+        let repo = tmp_repo("reuse-idem");
+        let first = create(&repo, "agent1", Some("feat/X")).expect("first lease");
+        let second = create(&repo, "agent1", Some("feat/X")).expect("second lease idempotent");
+        assert_eq!(first.path, second.path);
+        assert_eq!(second.branch, "feat/X");
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
