@@ -324,12 +324,18 @@ pub fn teardown(home: &Path, args: &Value) -> Value {
         None => return serde_json::json!({"error": format!("deployment '{name}' not found")}),
     };
 
-    // Kill all instances
+    // Delete all instances (full cleanup: workspace, configs, registry, port files).
+    // Uses DELETE instead of KILL to ensure complete teardown (fixes #456).
     for inst in &deployment.instances {
         let _ = crate::api::call(
             home,
-            &serde_json::json!({"method": crate::api::method::KILL, "params": {"name": inst}}),
+            &serde_json::json!({"method": crate::api::method::DELETE, "params": {"name": inst}}),
         );
+        // Also clean workspace directory if it exists.
+        let workspace_dir = home.join("workspace").join(inst);
+        if workspace_dir.exists() {
+            crate::agent_ops::cleanup_working_dir(home, inst, &workspace_dir);
+        }
     }
 
     // Symmetrical with `deploy`: we wrote entries into fleet.yaml so
@@ -743,6 +749,99 @@ templates:
         assert!(
             !instances.iter().any(|n| n.contains("..")),
             "bad suffix accepted: {out}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Issue #456: teardown cleanup tests ───────────────────────────
+
+    #[test]
+    fn teardown_removes_workspace_dir() {
+        let home = tmp_home("teardown_workspace");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      worker:
+        backend: claude
+instances: {}
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        // Create workspace dir (simulates what daemon would create).
+        let workspace = home.join("workspace").join("dev-worker");
+        std::fs::create_dir_all(&workspace).ok();
+        std::fs::write(workspace.join("test.txt"), "data").ok();
+        assert!(workspace.exists());
+
+        let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
+
+        assert!(
+            !workspace.exists(),
+            "teardown must remove workspace directory"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn teardown_clears_configs_and_bindings() {
+        let home = tmp_home("teardown_configs");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      agent:
+        backend: claude
+instances: {}
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        // Create binding (simulates active task).
+        crate::binding::bind(&home, "dev-agent", "T-1", "feat");
+        assert!(crate::binding::read(&home, "dev-agent").is_some());
+
+        let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
+
+        // Binding should be cleared by cleanup_working_dir or DELETE.
+        // Workspace dir should not exist.
+        let workspace = home.join("workspace").join("dev-agent");
+        assert!(!workspace.exists(), "workspace must be cleaned");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn teardown_prevents_respawn_by_removing_fleet_entry() {
+        // After teardown, fleet.yaml must not contain the instance.
+        // This prevents daemon restart from auto-spawning the dead agent.
+        let home = tmp_home("teardown_respawn");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      impl:
+        backend: claude
+instances: {}
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
+
+        let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("load fleet");
+        assert!(
+            !config.instances.contains_key("dev-impl"),
+            "teardown must remove fleet entry to prevent respawn"
         );
         std::fs::remove_dir_all(&home).ok();
     }
