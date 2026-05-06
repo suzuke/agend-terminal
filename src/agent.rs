@@ -1141,16 +1141,25 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
     let prefix = agent.inject_prefix.as_bytes();
     let submit = agent.submit_key.as_bytes();
 
+    // S54 fix: strip ANSI sequences before injection to avoid ESC conflict in typed_inject.
+    // The [AGEND-MSG] header contains colors that start with \x1b[, which some
+    // backends (Kiro) or shells interpret as a literal ESC key when typed
+    // slowly, canceling the current input line.
+    let text_str = String::from_utf8_lossy(text);
+    let stripped = strip_ansi(&text_str);
+    let text_bytes = stripped.as_bytes();
+
     if agent.typed_inject {
         // H1: collect all bytes first, then write in short lock bursts.
         // Previous pattern held pty_writer lock for 2ms × N bytes (~20s for 10KB).
-        let all_bytes: Vec<u8> = prefix.iter().chain(text.iter()).copied().collect();
+        let all_bytes: Vec<u8> = prefix.iter().chain(text_bytes.iter()).copied().collect();
         for chunk in all_bytes.chunks(64) {
             let mut w = agent.pty_writer.lock();
-            for &byte in chunk {
-                w.write_all(&[byte])?;
-                w.flush()?;
-            }
+            // Sprint 54 F1: write chunk-at-a-time and flush once. Prevents
+            // the "ESC interpreted as keypress" race by keeping ANSI-free
+            // sequences contiguous.
+            w.write_all(chunk)?;
+            w.flush()?;
             drop(w);
             std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
         }
@@ -1160,13 +1169,14 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
             w.write_all(prefix)?;
             w.flush()?;
         }
-        w.write_all(text)?;
+        w.write_all(text_bytes)?;
         w.flush()?;
         drop(w);
     }
 
-    // Delay before submit
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Delay before submit. Sprint 54: 20ms -> 50ms to ensure TUI framework
+    // has processed the text buffer before Enter arrives.
+    std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Write submit key
     let mut w = agent.pty_writer.lock();
