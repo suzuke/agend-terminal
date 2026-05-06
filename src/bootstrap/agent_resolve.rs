@@ -20,17 +20,25 @@ pub type AgentDef = (
     String,
 );
 
+struct ResolveContext<'a> {
+    fleet_dir: &'a Path,
+    peers: Vec<(String, Option<String>)>,
+}
+
 /// Resolve every instance in `config` into a spawn-ready [`AgentDef`].
 pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path) -> Vec<AgentDef> {
-    let peers: Vec<(String, Option<String>)> = config
-        .instances
-        .iter()
-        .map(|(n, c)| (n.clone(), c.role.clone()))
-        .collect();
+    let ctx = ResolveContext {
+        fleet_dir,
+        peers: config
+            .instances
+            .iter()
+            .map(|(n, c)| (n.clone(), c.role.clone()))
+            .collect(),
+    };
     config
         .instance_names()
         .into_iter()
-        .filter_map(|name| resolve_one(config, fleet_dir, &peers, &name))
+        .filter_map(|name| resolve_one(config, &ctx, &name))
         .collect()
 }
 
@@ -40,12 +48,7 @@ pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path) -> Vec<AgentDef> {
 /// resolved. Side effects (worktree creation, instruction generation) mirror
 /// [`resolve`] so hot-reload-added agents are set up identically to ones
 /// materialized at startup.
-pub(crate) fn resolve_one(
-    config: &FleetConfig,
-    fleet_dir: &Path,
-    peers: &[(String, Option<String>)],
-    name: &str,
-) -> Option<AgentDef> {
+fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Option<AgentDef> {
     let mut resolved = config.resolve_instance(name)?;
 
     if let Some(ref base_dir) = resolved.working_directory {
@@ -87,14 +90,11 @@ pub(crate) fn resolve_one(
     }
 
     if let Some(ref dir) = resolved.working_directory {
-        let extra_instructions = resolved
-            .instructions
-            .as_deref()
-            .and_then(|p| std::fs::read_to_string(fleet_dir.join(p)).ok());
+        let extra_instructions = crate::instructions::resolve_extra_for(&resolved, ctx.fleet_dir);
         let ctx = crate::instructions::AgentContext {
             name,
             role: resolved.role.as_deref(),
-            fleet_peers: peers,
+            fleet_peers: &ctx.peers,
             team: None,
             extra_instructions: extra_instructions.as_deref(),
         };
@@ -167,7 +167,11 @@ mod tests {
             .iter()
             .map(|(n, c)| (n.clone(), c.role.clone()))
             .collect();
-        let result = resolve_one(&config, &dir, &peers, "test-agent");
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            peers,
+        };
+        let result = resolve_one(&config, &ctx, "test-agent");
         assert!(
             result.is_some(),
             "resolve_one must succeed with worktree:false"
@@ -193,7 +197,11 @@ mod tests {
             .iter()
             .map(|(n, c)| (n.clone(), c.role.clone()))
             .collect();
-        let result = resolve_one(&config, &dir, &peers, "test-agent");
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            peers,
+        };
+        let result = resolve_one(&config, &ctx, "test-agent");
         assert!(result.is_some());
         let (_, _, _, _, work_dir, _) = result.unwrap();
         let wd = work_dir.unwrap();
@@ -224,7 +232,11 @@ mod tests {
             .iter()
             .map(|(n, c)| (n.clone(), c.role.clone()))
             .collect();
-        let result = resolve_one(&config, &dir, &peers, "test-agent");
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            peers,
+        };
+        let result = resolve_one(&config, &ctx, "test-agent");
         assert!(result.is_some(), "resolve_one must succeed after prune");
         // Verify prune was attempted — worktree dir should be removed
         // (or at minimum, resolve_one returned the base dir, not the worktree)
@@ -258,7 +270,11 @@ mod tests {
             .iter()
             .map(|(n, c)| (n.clone(), c.role.clone()))
             .collect();
-        let result = resolve_one(&config, &dir, &peers, "test-agent");
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            peers,
+        };
+        let result = resolve_one(&config, &ctx, "test-agent");
         assert!(result.is_some(), "resolve_one should succeed");
         let (_, _, _, _, wd, _) = result.unwrap();
         let generated = std::fs::read_to_string(wd.unwrap().join(".claude/agend.md"))

@@ -32,6 +32,22 @@ pub struct TeamContext<'a> {
     pub members: &'a [String],
 }
 
+/// Resolve extra instructions content from a fleet-relative path string.
+///
+/// Resolution rule is intentionally simple and shared: `fleet_dir.join(path)`.
+/// Missing/unreadable files stay silent and return `None`.
+pub fn resolve_extra_from_path(path: Option<&str>, fleet_dir: &Path) -> Option<String> {
+    path.and_then(|p| std::fs::read_to_string(fleet_dir.join(p)).ok())
+}
+
+/// Resolve extra instructions content for a fully-resolved instance.
+pub fn resolve_extra_for(
+    resolved: &crate::fleet::ResolvedInstance,
+    fleet_dir: &Path,
+) -> Option<String> {
+    resolve_extra_from_path(resolved.instructions.as_deref(), fleet_dir)
+}
+
 /// Minimal .gitignore written on fresh git init: lists agend runtime artifacts
 /// that are per-session state rather than source-controlled content.
 const AGEND_GITIGNORE: &str = "\

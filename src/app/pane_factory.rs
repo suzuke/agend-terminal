@@ -280,10 +280,8 @@ pub(super) fn create_pane_from_resolved(
             orchestrator: t.orchestrator.as_deref(),
             members: t.members.as_slice(),
         });
-    let extra_instructions = resolved
-        .instructions
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(fleet_path.parent().unwrap_or(home).join(p)).ok());
+    let extra_instructions =
+        crate::instructions::resolve_extra_for(resolved, fleet_path.parent().unwrap_or(home));
     let ctx = crate::instructions::AgentContext {
         name: fleet_name,
         role: resolved.role.as_deref(),

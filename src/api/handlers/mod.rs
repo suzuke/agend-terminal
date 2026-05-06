@@ -64,15 +64,14 @@ pub(crate) fn prepare_instructions(
             let role = explicit_role
                 .map(str::to_string)
                 .or_else(|| fleet.instances.get(name).and_then(|c| c.role.clone()));
-            // Resolve extra instructions file relative to fleet.yaml dir.
-            let extra_instr = fleet
-                .instances
-                .get(name)
-                .and_then(|c| c.instructions.as_deref())
-                .and_then(|p| {
-                    let resolved = fleet_path.parent().unwrap_or(home).join(p);
-                    std::fs::read_to_string(resolved).ok()
-                });
+            let fleet_dir = fleet_path.parent().unwrap_or(home);
+            let extra_instr = crate::instructions::resolve_extra_from_path(
+                fleet
+                    .instances
+                    .get(name)
+                    .and_then(|c| c.instructions.as_deref()),
+                fleet_dir,
+            );
             let ctx = crate::instructions::AgentContext {
                 name,
                 role: role.as_deref(),
