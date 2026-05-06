@@ -94,16 +94,29 @@ fn has_allowlist_marker(content_lines: &[&str], line_idx: usize, marker: &str) -
 
 // ── Rule 1: dead-code-helper-pattern ───────────────────────────────
 
-/// Extract names of `pub`, `pub(crate)`, `pub(super)`, and `pub(in ...)` fn
-/// declarations from a Rust source file's text. Matches sync, `async`, and
-/// `const fn`. Returns names in declaration order (deduped on caller side).
+/// Extract names of column-0 `pub`, `pub(crate)`, `pub(super)`, and
+/// `pub(in ...)` fn declarations from a Rust source file's text. Matches
+/// sync, `async`, and `const fn`.
+///
+/// r1 fix (PR #471 reviewer): the **column-0** filter excludes `pub fn`
+/// methods nested inside `impl Type { ... }` blocks. Without this filter,
+/// a test helper named the same as an impl method gets falsely flagged —
+/// calling `helper_name()` in test code never shadows `Type::helper_name()`,
+/// since the latter requires receiver-method syntax. Free functions are
+/// conventionally column-0 in Rust style; an indented public free fn would
+/// already be a refactor candidate.
 fn extract_exposed_fn_names(content: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in content.lines() {
-        let trimmed = line.trim_start();
-        let after_pub = if let Some(rest) = trimmed.strip_prefix("pub ") {
+        // Require `pub`/`pub(...)` at column 0 — symmetric with the
+        // test-side `extract_all_fn_definitions` filter. Indented `pub fn`
+        // inside `impl Type {}` blocks is excluded.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let after_pub = if let Some(rest) = line.strip_prefix("pub ") {
             Some(rest.trim_start())
-        } else if let Some(rest) = trimmed.strip_prefix("pub(") {
+        } else if let Some(rest) = line.strip_prefix("pub(") {
             // pub(crate) / pub(super) / pub(in ::path)
             rest.find(')').map(|i| rest[i + 1..].trim_start())
         } else {
@@ -461,6 +474,70 @@ fn rule1_passes_when_helper_name_is_test_only() {
     assert!(
         v.is_empty(),
         "Rule 1 must NOT flag pure test helpers: {v:?}"
+    );
+    cleanup(&tmp);
+}
+
+#[test]
+fn rule1_ignores_pub_fn_impl_method() {
+    // r1 reviewer regression-proof (PR #471): a `pub fn` nested inside
+    // `impl Type {}` is a method, not a free function. Calling
+    // `helper_name()` in test code never shadows `Type::helper_name()`,
+    // so the lint must NOT flag a test helper that happens to share the
+    // method's bare name. The column-0 filter on `extract_exposed_fn_names`
+    // is what enforces this.
+    let tmp = tempdir();
+    let src = tmp.join("src");
+    let tests = tmp.join("tests");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub struct Thing;\nimpl Thing {\n    pub fn helper_name(&self) {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tests.join("integration.rs"),
+        "fn helper_name() {}\n#[test]\nfn t() {}\n",
+    )
+    .unwrap();
+    let v = rule1_violations(&src, &tests);
+    assert!(
+        v.is_empty(),
+        "Rule 1 must NOT flag impl-method/test-helper name collisions: {v:?}"
+    );
+    cleanup(&tmp);
+}
+
+#[test]
+fn rule1_still_flags_real_free_fn_shadow() {
+    // Positive control: with the column-0 filter, a genuine `pub fn` at
+    // module scope MUST still trip the lint when the test redefines its
+    // name. Asserts the r1 fix doesn't over-narrow detection.
+    let tmp = tempdir();
+    let src = tmp.join("src");
+    let tests = tmp.join("tests");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub fn module_level_fn() {}\nimpl SomeType { pub fn nested(&self) {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tests.join("integration.rs"),
+        "fn module_level_fn() {}\n#[test]\nfn t() {}\n",
+    )
+    .unwrap();
+    let v = rule1_violations(&src, &tests);
+    assert!(
+        !v.is_empty(),
+        "Rule 1 must still flag column-0 pub fn shadowed by test helper"
+    );
+    assert!(
+        v[0].contains("module_level_fn"),
+        "violation must name the module-level fn: {}",
+        v[0]
     );
     cleanup(&tmp);
 }
