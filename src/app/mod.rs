@@ -779,6 +779,7 @@ fn pane_from_menu_item(
                     backend: Some(backend.name().to_string()),
                     working_directory: None,
                     role: None,
+                    instructions: None,
                 },
             ) {
                 tracing::warn!(error = %e, "failed to write fleet.yaml");

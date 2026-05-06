@@ -56,6 +56,7 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
             .map(|b| b.name().to_string()),
         working_directory: None,
         role: Some("Fleet coordinator — routes tasks between agents".to_string()),
+        instructions: None,
     };
     if let Err(e) = fleet::add_instance_to_yaml(home, "general", &entry) {
         tracing::warn!(error = %e, "failed to persist general instance");

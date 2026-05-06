@@ -154,6 +154,12 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(String::from);
+        let instructions = inst_val
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
 
         // Every member gets its own `<directory>/<inst_name>` subdir —
         // same-backend teammates would otherwise clobber each other's
@@ -201,6 +207,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 backend: Some(command.to_string()),
                 working_directory: Some(work_dir),
                 role,
+                instructions,
             },
         ));
         created.push(inst_name);
@@ -596,6 +603,33 @@ templates:
                 .and_then(|i| i.role.clone())
                 .as_deref(),
             Some("orchestrator via alias")
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_persists_instructions_into_fleet_yaml() {
+        let home = tmp_home("instructions_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        instructions: ./instructions/lead.md
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+
+        let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        assert_eq!(
+            reloaded
+                .instances
+                .get("dev-lead")
+                .and_then(|i| i.instructions.as_deref()),
+            Some("./instructions/lead.md")
         );
         std::fs::remove_dir_all(&home).ok();
     }

@@ -167,7 +167,8 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     doctor::emit_diagnostics(&diags);
 
     let agents = if opts.resolve_agents {
-        agent_resolve::resolve(&config)
+        let fleet_dir = fleet_path.parent().unwrap_or(home);
+        agent_resolve::resolve(&config, fleet_dir)
     } else {
         Vec::new()
     };
@@ -266,6 +267,24 @@ mod tests {
             "defaults:\n  backend: claude\ninstances:\n  worker:\n    backend: claude\n",
         )
         .expect("write fleet.yaml");
+        path
+    }
+
+    fn write_fleet_with_extra_instructions(home: &Path) -> PathBuf {
+        let path = home.join("fleet.yaml");
+        let instructions_dir = home.join("instructions");
+        std::fs::create_dir_all(&instructions_dir).expect("mkdir instructions");
+        std::fs::write(
+            instructions_dir.join("dev.md"),
+            "# Extra Instructions\nAlways include rollout checklist.",
+        )
+        .expect("write instructions file");
+        let work_dir = home.join("workspace").join("worker");
+        let yaml = format!(
+            "defaults:\n  backend: claude\ninstances:\n  worker:\n    backend: claude\n    working_directory: {}\n    instructions: ./instructions/dev.md\n",
+            work_dir.display()
+        );
+        std::fs::write(&path, yaml).expect("write fleet with instructions");
         path
     }
 
@@ -437,6 +456,28 @@ mod tests {
                 panic!("must not Attach to a run dir whose api.port is dead");
             }
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn prepare_resolve_agents_applies_extra_instructions_to_generated_file() {
+        let home = tmp_home("resolve_extra_instructions");
+        let fleet = write_fleet_with_extra_instructions(&home);
+        let opts = PrepareOptions {
+            mutate_fleet_yaml: false,
+            init_telegram: false,
+            resolve_agents: true,
+        };
+        let outcome = prepare(&home, &fleet, opts).expect("prepare");
+        let BootstrapOutcome::Owned(_owned) = outcome else {
+            panic!("expected Owned for fresh temp home");
+        };
+        let generated = std::fs::read_to_string(home.join("workspace/worker/.claude/agend.md"))
+            .expect("generated .claude/agend.md");
+        assert!(
+            generated.contains("Always include rollout checklist."),
+            "generated instructions must include extra file content"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

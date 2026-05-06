@@ -47,6 +47,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     backend: Some(backend_name.to_string()),
                     working_directory: None,
                     role: None,
+                    instructions: None,
                 },
             ) {
                 tracing::warn!(name = %inst_name, error = %e, "failed to write fleet.yaml");

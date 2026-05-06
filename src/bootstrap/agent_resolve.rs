@@ -7,7 +7,7 @@
 use crate::backend;
 use crate::fleet::FleetConfig;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Agent spawn tuple consumed by `daemon::run_with_prepared`. Matches the
 /// shape of `daemon::AgentDef`.
@@ -20,12 +20,25 @@ pub type AgentDef = (
     String,
 );
 
+struct ResolveContext<'a> {
+    fleet_dir: &'a Path,
+    peers: Vec<(String, Option<String>)>,
+}
+
 /// Resolve every instance in `config` into a spawn-ready [`AgentDef`].
-pub(super) fn resolve(config: &FleetConfig) -> Vec<AgentDef> {
+pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path) -> Vec<AgentDef> {
+    let ctx = ResolveContext {
+        fleet_dir,
+        peers: config
+            .instances
+            .iter()
+            .map(|(n, c)| (n.clone(), c.role.clone()))
+            .collect(),
+    };
     config
         .instance_names()
         .into_iter()
-        .filter_map(|name| resolve_one(config, &name))
+        .filter_map(|name| resolve_one(config, &ctx, &name))
         .collect()
 }
 
@@ -35,7 +48,7 @@ pub(super) fn resolve(config: &FleetConfig) -> Vec<AgentDef> {
 /// resolved. Side effects (worktree creation, instruction generation) mirror
 /// [`resolve`] so hot-reload-added agents are set up identically to ones
 /// materialized at startup.
-pub(crate) fn resolve_one(config: &FleetConfig, name: &str) -> Option<AgentDef> {
+fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Option<AgentDef> {
     let mut resolved = config.resolve_instance(name)?;
 
     if let Some(ref base_dir) = resolved.working_directory {
@@ -77,7 +90,15 @@ pub(crate) fn resolve_one(config: &FleetConfig, name: &str) -> Option<AgentDef> 
     }
 
     if let Some(ref dir) = resolved.working_directory {
-        crate::instructions::generate(dir, &resolved.backend_command);
+        let extra_instructions = crate::instructions::resolve_extra_for(&resolved, ctx.fleet_dir);
+        let ctx = crate::instructions::AgentContext {
+            name,
+            role: resolved.role.as_deref(),
+            fleet_peers: &ctx.peers,
+            team: None,
+            extra_instructions: extra_instructions.as_deref(),
+        };
+        crate::instructions::generate_with_context(dir, &resolved.backend_command, Some(&ctx));
     }
 
     let mut args = resolved.args;
@@ -141,7 +162,16 @@ mod tests {
         let dir = tmp_dir("wt-false-skip");
         init_git_repo(&dir);
         let config = make_config(&dir, Some(false));
-        let result = resolve_one(&config, "test-agent");
+        let peers: Vec<(String, Option<String>)> = config
+            .instances
+            .iter()
+            .map(|(n, c)| (n.clone(), c.role.clone()))
+            .collect();
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            peers,
+        };
+        let result = resolve_one(&config, &ctx, "test-agent");
         assert!(
             result.is_some(),
             "resolve_one must succeed with worktree:false"
@@ -162,7 +192,16 @@ mod tests {
         let dir = tmp_dir("wt-default");
         init_git_repo(&dir);
         let config = make_config(&dir, None); // default = true
-        let result = resolve_one(&config, "test-agent");
+        let peers: Vec<(String, Option<String>)> = config
+            .instances
+            .iter()
+            .map(|(n, c)| (n.clone(), c.role.clone()))
+            .collect();
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            peers,
+        };
+        let result = resolve_one(&config, &ctx, "test-agent");
         assert!(result.is_some());
         let (_, _, _, _, work_dir, _) = result.unwrap();
         let wd = work_dir.unwrap();
@@ -188,7 +227,16 @@ mod tests {
         assert!(wt_dir.exists(), "worktree must exist before prune");
 
         let config = make_config(&dir, Some(false));
-        let result = resolve_one(&config, "test-agent");
+        let peers: Vec<(String, Option<String>)> = config
+            .instances
+            .iter()
+            .map(|(n, c)| (n.clone(), c.role.clone()))
+            .collect();
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            peers,
+        };
+        let result = resolve_one(&config, &ctx, "test-agent");
         assert!(result.is_some(), "resolve_one must succeed after prune");
         // Verify prune was attempted — worktree dir should be removed
         // (or at minimum, resolve_one returned the base dir, not the worktree)
@@ -198,6 +246,42 @@ mod tests {
             !wd.to_string_lossy().contains(".worktrees"),
             "worktree:false must NOT use .worktrees/ path, got: {}",
             wd.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_one_appends_instance_extra_instructions() {
+        let dir = tmp_dir("extra-instructions");
+        let work_dir = dir.join("work");
+        std::fs::create_dir_all(dir.join("instructions")).unwrap();
+        std::fs::write(
+            dir.join("instructions").join("dev.md"),
+            "# Extra\nAlways mention deployment checklist.",
+        )
+        .unwrap();
+        let yaml = format!(
+            "defaults:\n  backend: claude\ninstances:\n  test-agent:\n    command: claude\n    working_directory: {}\n    instructions: ./instructions/dev.md\n",
+            work_dir.display()
+        );
+        let config: FleetConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let peers: Vec<(String, Option<String>)> = config
+            .instances
+            .iter()
+            .map(|(n, c)| (n.clone(), c.role.clone()))
+            .collect();
+        let ctx = ResolveContext {
+            fleet_dir: &dir,
+            peers,
+        };
+        let result = resolve_one(&config, &ctx, "test-agent");
+        assert!(result.is_some(), "resolve_one should succeed");
+        let (_, _, _, _, wd, _) = result.unwrap();
+        let generated = std::fs::read_to_string(wd.unwrap().join(".claude/agend.md"))
+            .expect("generated instructions file");
+        assert!(
+            generated.contains("Always mention deployment checklist."),
+            "extra instructions must be appended in daemon bootstrap path"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
