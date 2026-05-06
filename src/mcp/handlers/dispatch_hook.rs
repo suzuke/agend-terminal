@@ -1,8 +1,8 @@
-//! Sprint 53 P0-1: dispatch hook — auto-bind + lease on delegate_task.
+//! Sprint 53 P0-1/P0-2: dispatch hook — auto-bind + lease + watch_ci on delegate_task.
 //!
 //! Extracted from comms.rs to stay under 700 LOC file size invariant.
 
-/// Sprint 53 P0-1: auto-bind + lease worktree on delegate_task dispatch.
+/// Sprint 53 P0-1+P0-2: auto-bind + lease worktree + watch_ci on delegate_task dispatch.
 ///
 /// Production call path: app::run_app / daemon::run → MCP tool call →
 /// handle_send → is_task_kind → dispatch_auto_bind_lease.
@@ -12,11 +12,18 @@
 /// - Lease conflict: REJECT dispatch with explicit error (Q2)
 /// - Lease creation fails: REJECT dispatch with explicit error (§3.3)
 /// - Main branch rejected: REJECT dispatch (E4.5)
+/// - watch_ci derive/write failure: log warn, dispatch still OK (P0-2 graceful)
+///
+/// P0-2 consolidation: `repo` is taken from caller-supplied arg first, else
+/// derived from `git remote get-url origin` of source_repo. This replaces the
+/// post-SEND Hotfix C #451 block in comms.rs (deleted as dead code) and gives
+/// agent-to-agent `send` the same auto-watch coverage as operator dispatches.
 pub(crate) fn dispatch_auto_bind_lease(
     home: &std::path::Path,
     target: &str,
     task_id: &str,
     branch: &str,
+    repo: Option<&str>,
 ) -> Result<(), String> {
     // Resolve source repo from target agent's working directory.
     let source_repo = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
@@ -42,7 +49,73 @@ pub(crate) fn dispatch_auto_bind_lease(
         %target, %branch, path = %lease.path.display(),
         "dispatch auto-bind + lease OK"
     );
+
+    // P0-2: auto-watch_ci. Caller arg wins; else derive from source_repo's origin.
+    // Idempotent: skip when watch file already exists (preserves poll state across re-dispatch).
+    // Graceful: any failure (no remote, non-GitHub remote, write error) is logged but does not
+    // reject dispatch — auto-watch is a notification convenience, not load-bearing.
+    let resolved_repo = repo
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| derive_repo_from_remote(&source_repo));
+    if let Some(r) = resolved_repo {
+        let watch_file = home
+            .join("ci-watches")
+            .join(crate::daemon::ci_watch::watch_filename(&r, branch));
+        if !watch_file.exists() {
+            let watch_args = serde_json::json!({"repo": &r, "branch": branch});
+            crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
+            tracing::info!(%target, repo = %r, %branch, "dispatch auto-watch_ci");
+        }
+    }
     Ok(())
+}
+
+/// Parse `owner/repo` from a `git remote get-url origin` output.
+///
+/// Accepts the three formats GitHub commonly serves:
+/// - `https://github.com/owner/repo(.git)`
+/// - `http://github.com/owner/repo(.git)`
+/// - `git@github.com:owner/repo(.git)`
+///
+/// Returns `None` for non-GitHub remotes — `watch_ci` only knows how to poll
+/// GitHub Actions, so silently skipping non-GitHub repos is the right behavior
+/// (the alternative would be writing a stale watch entry the poller can't act on).
+fn parse_github_owner_repo(url: &str) -> Option<String> {
+    let url = url.trim();
+    let stripped = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("git@github.com:"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+    let slug = stripped.trim_end_matches('/').trim_end_matches(".git");
+    // Sanity: must look like `owner/repo` — exactly one '/' and both parts non-empty.
+    let mut parts = slug.split('/');
+    let owner = parts.next()?;
+    let name = parts.next()?;
+    if parts.next().is_some() || owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
+}
+
+/// Run `git remote get-url origin` in `source_repo` and parse the GitHub slug.
+///
+/// Used as the dispatch-time fallback when the caller doesn't pass `repo`
+/// explicitly. Returns `None` if the repo has no `origin` remote, the remote
+/// isn't GitHub, or the git command fails.
+fn derive_repo_from_remote(source_repo: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(source_repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    parse_github_owner_repo(&url)
 }
 
 #[cfg(test)]
@@ -94,7 +167,8 @@ mod tests {
         setup_test_repo(&home, "test-agent");
 
         // Call PRODUCTION function.
-        let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-100", "feat/test");
+        let result =
+            super::dispatch_auto_bind_lease(&home, "test-agent", "T-100", "feat/test", None);
         assert!(result.is_ok(), "dispatch must succeed: {:?}", result.err());
 
         let binding_path = home.join("runtime").join("test-agent").join("binding.json");
@@ -114,7 +188,7 @@ mod tests {
         setup_test_repo(&home, "test-agent");
 
         // Call PRODUCTION function — must reject main branch.
-        let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "main");
+        let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "main", None);
         assert!(result.is_err(), "main branch must REJECT");
         let err = result.expect_err("must be error");
         assert!(err.contains("E4.5"), "error must mention E4.5: {err}");
@@ -145,11 +219,11 @@ mod tests {
         ).ok();
 
         // First dispatch succeeds in agent-a's clone.
-        let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/shared");
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/shared", None);
         assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
 
         // Second dispatch SAME branch DIFFERENT agent → REJECT via central registry.
-        let r2 = super::dispatch_auto_bind_lease(&home, "agent-b", "T-2", "feat/shared");
+        let r2 = super::dispatch_auto_bind_lease(&home, "agent-b", "T-2", "feat/shared", None);
         assert!(
             r2.is_err(),
             "central registry must REJECT cross-agent same-branch, got: {:?}",
@@ -178,11 +252,11 @@ mod tests {
         setup_test_repo(&home, "agent-x");
 
         // First dispatch.
-        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/test");
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/test", None);
         assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
 
         // Same agent re-dispatch same branch with different task_id → idempotent.
-        let r2 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-2", "feat/test");
+        let r2 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-2", "feat/test", None);
         assert!(
             r2.is_ok(),
             "same-agent re-dispatch must be idempotent: {:?}",
@@ -214,7 +288,8 @@ mod tests {
         std::fs::write(&runtime_agent, "blocking file").ok();
 
         // Lease should succeed, bind write should fail gracefully (Q1).
-        let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "feat/graceful");
+        let result =
+            super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "feat/graceful", None);
         assert!(
             result.is_ok(),
             "Q1: bind file error stays graceful, dispatch succeeds: {:?}",
@@ -315,7 +390,7 @@ mod tests {
         ).ok();
 
         // First lease seeds the worktree pool with feat/end2end for agent-a.
-        let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/end2end");
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/end2end", None);
         assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
 
         let args = serde_json::json!({
@@ -373,11 +448,11 @@ mod tests {
         setup_test_repo(&home, "agent-x");
 
         // First lease establishes the worktree on feat/A.
-        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/A");
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/A", None);
         assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
 
         // Second dispatch with a DIFFERENT branch must reject.
-        let r2 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-2", "feat/B");
+        let r2 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-2", "feat/B", None);
         assert!(
             r2.is_err(),
             "same-agent different-branch dispatch must reject (P0-1.6): {r2:?}"
@@ -409,7 +484,7 @@ mod tests {
         setup_test_repo(&home, "agent-x");
 
         // Seed: agent-x already leased on feat/A.
-        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/A");
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/A", None);
         assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
 
         // Production-realistic: a second delegate_task targeting agent-x with
@@ -441,6 +516,199 @@ mod tests {
         assert!(
             !inbox_content.contains("implement feature B"),
             "rejected dispatch must NOT deliver to agent-x inbox. Got: {inbox_content}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 53 P0-2: dispatch-time auto-watch_ci tests ───────────────
+    //
+    // Covers all three Hotfix C #451 deletion-proof paths per PLAN §6 R4:
+    // - explicit repo arg path (operator-side dispatch convention)
+    // - missing-repo path (graceful skip, no false watch entry)
+    // - idempotent re-dispatch path (poll state preservation)
+    // - production smoke gate via handle_delegate_task (agent-to-agent send equivalence)
+    //
+    // Regression-proof: comment out the auto-watch_ci block in
+    // `dispatch_auto_bind_lease` and `delegate_task_with_repo_creates_ci_watch`
+    // FAILS (no watch file). Restore → PASS. See commit message §regression-proof.
+
+    #[test]
+    fn delegate_task_with_repo_creates_ci_watch() {
+        let home =
+            std::env::temp_dir().join(format!("agend-s53-p02-{}-with-repo", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        setup_test_repo(&home, "test-agent");
+
+        // Explicit repo arg → watch_ci must fire.
+        let result = super::dispatch_auto_bind_lease(
+            &home,
+            "test-agent",
+            "T-1",
+            "feat/p02-with-repo",
+            Some("owner/repo"),
+        );
+        assert!(result.is_ok(), "dispatch must succeed: {:?}", result.err());
+
+        let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p02-with-repo");
+        let watch_path = home.join("ci-watches").join(&filename);
+        assert!(
+            watch_path.exists(),
+            "watch file must exist at {}",
+            watch_path.display()
+        );
+        let watch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read watch"))
+                .expect("parse watch");
+        assert_eq!(watch["repo"], "owner/repo");
+        assert_eq!(watch["branch"], "feat/p02-with-repo");
+        assert_eq!(watch["instance"], "test-agent");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn delegate_task_without_repo_no_ci_watch() {
+        // No explicit repo arg AND test repo has no `origin` remote (setup_test_repo
+        // never adds one) → derive_repo_from_remote returns None → no watch entry.
+        // This is the graceful-skip path — better than writing a stale watch
+        // the poller can't act on.
+        let home =
+            std::env::temp_dir().join(format!("agend-s53-p02-{}-no-repo", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        setup_test_repo(&home, "test-agent");
+
+        let result =
+            super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "feat/p02-no-repo", None);
+        assert!(result.is_ok(), "dispatch must succeed: {:?}", result.err());
+
+        // Bind/lease still happened (load-bearing).
+        let binding_path = home.join("runtime").join("test-agent").join("binding.json");
+        assert!(
+            binding_path.exists(),
+            "binding.json must exist (lease succeeded)"
+        );
+
+        // But ci-watches dir must be empty / non-existent (no auto-watch fired).
+        let ci_dir = home.join("ci-watches");
+        let entries: Vec<_> = std::fs::read_dir(&ci_dir)
+            .ok()
+            .map(|rd| rd.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            entries.is_empty(),
+            "no watch must be created when repo undeterminable. Got: {:?}",
+            entries.iter().map(|e| e.path()).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn delegate_task_idempotent_existing_watch() {
+        // Re-dispatch on same agent + branch must reuse the existing watch entry.
+        // The idempotent guard preserves poll state (last_run_id, head_sha,
+        // last_polled_at) so an active poll loop isn't reset mid-flight.
+        let home = std::env::temp_dir().join(format!("agend-s53-p02-{}-idem", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        setup_test_repo(&home, "test-agent");
+
+        let r1 = super::dispatch_auto_bind_lease(
+            &home,
+            "test-agent",
+            "T-1",
+            "feat/p02-idem",
+            Some("owner/repo"),
+        );
+        assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
+
+        let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p02-idem");
+        let watch_path = home.join("ci-watches").join(&filename);
+        assert!(watch_path.exists(), "first dispatch must create watch");
+
+        // Mutate watch state to simulate an in-flight poll, then re-dispatch.
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read")).unwrap();
+        state["last_run_id"] = serde_json::json!(42);
+        state["head_sha"] = serde_json::json!("abc123");
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+        let r2 = super::dispatch_auto_bind_lease(
+            &home,
+            "test-agent",
+            "T-2",
+            "feat/p02-idem",
+            Some("owner/repo"),
+        );
+        assert!(r2.is_ok(), "re-dispatch must succeed: {:?}", r2.err());
+
+        // ci-watches dir must still contain exactly one entry.
+        let ci_dir = home.join("ci-watches");
+        let entry_count = std::fs::read_dir(&ci_dir)
+            .expect("read ci-watches")
+            .flatten()
+            .count();
+        assert_eq!(entry_count, 1, "must remain exactly one watch entry");
+
+        // Poll state must be preserved (idempotent, not overwritten).
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).expect("read")).unwrap();
+        assert_eq!(
+            after["last_run_id"], 42,
+            "re-dispatch must NOT reset poll state"
+        );
+        assert_eq!(after["head_sha"], "abc123");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
+        // Production smoke gate (§5): exercise the actual dispatch entry point
+        // — `handle_delegate_task`, the same function MCP `send` with
+        // `request_kind: "task"` lands in via `handle_unified_send`. This is
+        // the regression-proof check against the failure mode the smoke test
+        // caught: lead-to-dev `send` with branch produced no ci-watches entry.
+        use crate::identity::Sender;
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-s53-p02-integration-{}-with-repo",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).ok();
+        setup_test_repo(&home, "target-agent");
+
+        let args = serde_json::json!({
+            "target_instance": "target-agent",
+            "task": "implement feature X",
+            "task_id": "T-100",
+            "branch": "feat/p02-integration",
+            "repo": "owner/repo",
+        });
+        let sender = Some(Sender::new("lead").expect("sender"));
+
+        let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+
+        // Dispatch should NOT carry the lease-rejection error path.
+        if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
+            // The api::call(SEND) returns Err in test (no daemon), but
+            // fallback_deliver writes to inbox and the wrapper still reports OK
+            // via the dispatch_tracking branch. The lease itself must succeed.
+            assert!(
+                !err.contains("dispatch rejected"),
+                "lease must not reject in this scenario: {err}"
+            );
+        }
+
+        // Production-smoke assertion: ci-watches entry must exist post-dispatch.
+        let filename =
+            crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p02-integration");
+        let watch_path = home.join("ci-watches").join(&filename);
+        assert!(
+            watch_path.exists(),
+            "handle_delegate_task end-to-end must create ci-watches entry. \
+             Path: {} — this is the Hotfix C non-fire regression check.",
+            watch_path.display()
         );
 
         std::fs::remove_dir_all(&home).ok();

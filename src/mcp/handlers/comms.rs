@@ -266,13 +266,20 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     };
     let task_id_str = args["task_id"].as_str();
 
-    // Sprint 53 P0-1: lease gate BEFORE send (Q2 ordering fix).
+    // Sprint 53 P0-1+P0-2: lease + watch_ci gate BEFORE send (Q2 ordering fix).
     // If branch field present, attempt lease first. Reject if lease fails.
+    // P0-2: also auto-fires watch_ci inside dispatch_auto_bind_lease, replacing
+    // the post-SEND Hotfix C #451 block (deleted below).
     if let Some(branch) = args["branch"].as_str() {
         let task_id_val = task_id_str.unwrap_or("");
-        if let Err(e) =
-            super::dispatch_hook::dispatch_auto_bind_lease(home, target, task_id_val, branch)
-        {
+        let repo_arg = args["repo"].as_str();
+        if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease(
+            home,
+            target,
+            task_id_val,
+            branch,
+            repo_arg,
+        ) {
             return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
         }
     }
@@ -348,6 +355,9 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         );
         // Sprint 30: log branch hint for operator visibility when
         // delegate_task carries branch metadata.
+        // P0-2: auto-watch_ci moved into `dispatch_auto_bind_lease` above so it
+        // fires on agent-to-agent `send` too (Hotfix C #451 was post-SEND and
+        // required explicit `repo` arg, which `send`'s schema never carried).
         if let Some(branch) = args["branch"].as_str() {
             tracing::info!(
                 target = %target,
@@ -355,19 +365,6 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 task_id = ?task_id_str,
                 "delegate_task branch hint — implementer should work on this branch"
             );
-
-            // Auto watch_ci for the branch (idempotent — skips if already watching).
-            // Only fires if dispatch includes explicit repo field.
-            if let Some(repo) = args["repo"].as_str() {
-                let watch_file = home
-                    .join("ci-watches")
-                    .join(crate::daemon::ci_watch::watch_filename(repo, branch));
-                if !watch_file.exists() {
-                    let watch_args = serde_json::json!({"repo": repo, "branch": branch});
-                    crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
-                    tracing::info!(%target, %repo, %branch, "auto watch_ci on dispatch");
-                }
-            }
         }
         ux_sink_registry().emit(&UxEvent::Fleet(FleetEvent::DelegateTask {
             from: sender.as_str().to_string(),
