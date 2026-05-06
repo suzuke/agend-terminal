@@ -1044,32 +1044,45 @@ fn handle_pty_close(
 /// Issue #468: dismiss patterns must match anchored regex (line start +
 /// optional TUI prefix), not bare substring. Compiles once per unique pattern
 /// string and reuses the `Arc<Regex>` thereafter so the screen-update hot
-/// loop never re-compiles. Compile errors are logged once and the offending
-/// pattern is skipped — a typo in a backend preset must not crash dispatch.
-fn compile_dismiss_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
-    static CACHE: std::sync::LazyLock<
-        parking_lot::Mutex<std::collections::HashMap<String, std::sync::Arc<regex::Regex>>>,
-    > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+/// loop never re-compiles.
+///
+/// r1 fix (PR #469 reviewer): both successful AND failed compiles are cached.
+/// The cache value is `Option<Arc<Regex>>` — `None` records that the pattern
+/// is permanently invalid, so subsequent lookups skip the compile + log path
+/// entirely. Without this, a typo in a backend preset would re-compile and
+/// re-emit a warn line on every screen-update tick. The warn (not error —
+/// invalid patterns are configurer mistakes, not runtime faults) fires once
+/// per unique bad pattern over the process lifetime.
+static DISMISS_REGEX_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Option<std::sync::Arc<regex::Regex>>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-    let mut cache = CACHE.lock();
-    if let Some(re) = cache.get(pattern) {
-        return Some(std::sync::Arc::clone(re));
+fn compile_dismiss_regex(pattern: &str) -> Option<std::sync::Arc<regex::Regex>> {
+    let mut cache = DISMISS_REGEX_CACHE.lock();
+    if let Some(slot) = cache.get(pattern) {
+        return slot.as_ref().map(std::sync::Arc::clone);
     }
-    match regex::Regex::new(pattern) {
-        Ok(re) => {
-            let arc = std::sync::Arc::new(re);
-            cache.insert(pattern.to_string(), std::sync::Arc::clone(&arc));
-            Some(arc)
-        }
+    let result = match regex::Regex::new(pattern) {
+        Ok(re) => Some(std::sync::Arc::new(re)),
         Err(e) => {
-            tracing::error!(
+            tracing::warn!(
                 pattern,
                 error = %e,
                 "dismiss regex compile failed — pattern ignored"
             );
             None
         }
-    }
+    };
+    cache.insert(pattern.to_string(), result.clone());
+    result
+}
+
+/// Test-only inspection of the dismiss regex cache. Used by the
+/// `invalid_regex_cached_no_relog` test to assert that bad patterns get
+/// cached after first failure (rather than re-compiling on every call).
+#[cfg(test)]
+fn dismiss_regex_cache_contains(pattern: &str) -> bool {
+    DISMISS_REGEX_CACHE.lock().contains_key(pattern)
 }
 
 /// Strip the standard line-anchor prefix to recover the literal hint from a
@@ -1508,6 +1521,49 @@ I see it in the docs but I'm not sure when Gemini shows it.
         assert!(
             try_dismiss_dialog("t", &screen, &test_writer(), &patterns),
             "VTerm-rendered Gemini dialog must match production regex. Screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn invalid_regex_cached_no_relog() {
+        // r1 fix (PR #469 reviewer): a typo in a backend dismiss pattern must
+        // not re-compile + re-log on every screen-update tick. Negative-cache
+        // failed compiles so the warn fires once per unique bad pattern.
+
+        // Use a pattern that the `regex` crate rejects. Unclosed group is
+        // syntactically invalid in every regex flavor.
+        let bad = "(?P<unclosed";
+        // Pre-condition: not yet cached.
+        assert!(
+            !super::dismiss_regex_cache_contains(bad),
+            "test invariant: cache must not pre-contain '{bad}'"
+        );
+
+        let r1 = super::compile_dismiss_regex(bad);
+        assert!(
+            r1.is_none(),
+            "first call on invalid pattern must return None"
+        );
+        assert!(
+            super::dismiss_regex_cache_contains(bad),
+            "first call must populate the negative cache"
+        );
+
+        let r2 = super::compile_dismiss_regex(bad);
+        assert!(
+            r2.is_none(),
+            "second call must also return None (from cache)"
+        );
+
+        // tracing-test capture: the warn must have fired (at least once).
+        // Asserting "exactly once" is brittle across test-runner concurrency,
+        // but the cache assertion above proves the second call did not
+        // re-attempt compile — so the warn cannot have fired again from the
+        // second invocation.
+        assert!(
+            logs_contain("dismiss regex compile failed"),
+            "compile failure must be logged at warn level"
         );
     }
 
