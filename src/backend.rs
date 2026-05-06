@@ -202,12 +202,16 @@ impl Backend {
                 inject_instructions_on_ready: false,
                 ready_timeout_secs: 30,
                 // Issue #468: regex anchored to line start + optional TUI prefix
-                // ([│║|>\s]*) instead of bare substring, so user-typed text or
-                // scrollback containing the phrase mid-line cannot trigger an
-                // unauthorized auto-dismiss.
+                // ([^A-Za-z\n]{0,8}) instead of bare substring, so user-typed
+                // text or scrollback containing the phrase mid-line cannot
+                // trigger an unauthorized auto-dismiss. The prefix class
+                // accepts any non-alpha non-newline byte (covers Ink box-
+                // drawing chars, `>` `)` `(` cursors, digit-bracket choice
+                // rows, etc.) and is length-capped at 8 chars so a long
+                // indent before alpha text cannot match the phrase.
                 dismiss_patterns: &[
-                    (r"(?m)^[│║|>\s]*Yes, I trust", b"\x1b[A\x1b[A\r"),
-                    (r"(?m)^[│║|>\s]*Yes, proceed", b"\x1b[A\x1b[A\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust", b"\x1b[A\x1b[A\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Yes, proceed", b"\x1b[A\x1b[A\r"),
                 ],
                 fresh_args: None, // same as args (no resume in preset)
             },
@@ -232,7 +236,7 @@ impl Backend {
                     // Down moves to "Yes, I accept", Enter confirms
                     // Keys sent with per-byte delay in try_dismiss_dialog
                     // Issue #468: anchored regex (see ClaudeCode comment above).
-                    (r"(?m)^[│║|>\s]*No, exit", b"\x1b[B\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}No, exit", b"\x1b[B\r"),
                 ],
                 fresh_args: None, // same as args
             },
@@ -259,9 +263,9 @@ impl Backend {
                     // macOS openpty doesn't translate LF→CR on input (ConPTY does),
                     // so LF here would silently no-op on mac.
                     // Issue #468: anchored regex (see ClaudeCode comment above).
-                    (r"(?m)^[│║|>\s]*Do you trust", b"\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Do you trust", b"\r"),
                     // Auto-update prompt: "Please restart Codex" → Enter
-                    (r"(?m)^[│║|>\s]*Please restart", b"\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Please restart", b"\r"),
                 ],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
@@ -281,10 +285,10 @@ impl Backend {
                 ready_timeout_secs: 45,
                 dismiss_patterns: &[
                     // Issue #468: anchored regex (see ClaudeCode comment above).
-                    (r"(?m)^[│║|>\s]*Update Available", b"\r"),
-                    (r"(?m)^[│║|>\s]*Skip  Confirm", b"\r"),
-                    (r"(?m)^[│║|>\s]*Update Complete", b"\r"),
-                    (r"(?m)^[│║|>\s]*Please restart", b"\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Update Available", b"\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Skip  Confirm", b"\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Update Complete", b"\r"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Please restart", b"\r"),
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
             },
@@ -306,14 +310,14 @@ impl Backend {
                 // Auto-approve: MCP tools ("3" = all server tools for session),
                 // shell commands ("2" = allow for session).
                 // Issue #468: anchored regex (line start + optional TUI prefix
-                // [│║|>\s]*). Substring match was false-positiving on user
-                // input and scrollback content that contained the phrase
+                // [^A-Za-z\n]{0,8}). Substring match was false-positiving on
+                // user input and scrollback content that contained the phrase
                 // mid-paragraph, auto-injecting `2\n` / `3\n` without consent.
                 // Gemini's Ink-based TUI renders dialogs with `│ ` prefix at
                 // line start, which the anchor accepts.
                 dismiss_patterns: &[
-                    (r"(?m)^[│║|>\s]*Allow execution of MCP tool", b"3\n"),
-                    (r"(?m)^[│║|>\s]*Allow execution of:", b"2\n"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Allow execution of MCP tool", b"3\n"),
+                    (r"(?m)^[^A-Za-z\n]{0,8}Allow execution of:", b"2\n"),
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
             },

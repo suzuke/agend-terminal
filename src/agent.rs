@@ -1089,7 +1089,21 @@ fn dismiss_regex_cache_contains(pattern: &str) -> bool {
 /// dismiss regex. Used by Step 4 (false-positive operator visibility logging).
 /// Returns the input unchanged when no known prefix is present so callers
 /// don't accidentally compare an entire regex against `screen.contains`.
-const DISMISS_REGEX_PREFIX: &str = r"(?m)^[│║|>\s]*";
+///
+/// Issue #468 follow-up (kiro startup hang): the original prefix
+/// `[│║|>\s]*` only covered Ink box-drawing chars and the `>` cursor.
+/// kiro-cli's "Trust All Tools" prompt renders the selected option with
+/// a `) No, exit` (radio-button style cursor), which the narrow class did
+/// not match — dismiss never fired and kiro hung on confirmation.
+///
+/// Bounded-permissive replacement: any non-alpha non-newline byte in the
+/// leading 0–8 chars. The length cap (8) preserves the line-start anchor's
+/// intent — scrollback or user text containing the phrase mid-paragraph is
+/// preceded by alpha chars or a much longer indent, so it cannot match.
+/// The class covers `)`, `(`, `*`, `•`, digits in `[3]`-style choice rows,
+/// and any future cursor variant introduced by a backend's TUI without
+/// requiring a new patch per backend.
+const DISMISS_REGEX_PREFIX: &str = r"(?m)^[^A-Za-z\n]{0,8}";
 
 fn dismiss_literal_hint(pattern: &str) -> &str {
     pattern
@@ -1492,9 +1506,12 @@ mod tests {
     // false-positive tests below FAIL. Restore the regex match → PASS.
 
     /// Production dismiss regex for Gemini's MCP-tool dialog (Issue #468).
-    const GEMINI_MCP_TOOL_REGEX: &str = r"(?m)^[│║|>\s]*Allow execution of MCP tool";
+    const GEMINI_MCP_TOOL_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}Allow execution of MCP tool";
     /// Production dismiss regex for Gemini's shell-execution dialog (Issue #468).
-    const GEMINI_SHELL_REGEX: &str = r"(?m)^[│║|>\s]*Allow execution of:";
+    const GEMINI_SHELL_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}Allow execution of:";
+    /// Production dismiss regex for kiro-cli's "Trust All Tools" prompt
+    /// (Issue #468 follow-up — radio-button cursor `)` was unmatched).
+    const KIRO_TRUST_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}No, exit";
 
     #[test]
     fn issue_468_true_positive_gemini_mcp_dialog() {
@@ -1638,6 +1655,188 @@ I see it in the docs but I'm not sure when Gemini shows it.
             "Allow execution of:",
             "literal hint must strip the standard line-anchor prefix"
         );
+    }
+
+    // ── Issue #468 follow-up: bounded-permissive prefix variants ─────
+
+    /// Kiro startup hang (the bug that prompted this PR): the radio-button
+    /// `)` cursor was outside the original `[│║|>\s]` class, so dismiss
+    /// silently no-op'd and kiro hung on the trust-all-tools confirmation.
+    #[test]
+    fn kiro_trust_dismiss_matches_paren_cursor() {
+        // Reproduces the operator's screenshot of kiro startup: the selected
+        // option is rendered as `) No, exit`, alternatives as ` Yes, ...`.
+        let screen = "\
+Allow Trust All Tools mode?
+
+) No, exit
+  Yes, I accept
+  Yes, and don't ask again
+";
+        let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+        assert!(
+            try_dismiss_dialog("t", screen, &test_writer(), &patterns),
+            "kiro `) No, exit` (radio-button cursor) must match the bounded class"
+        );
+    }
+
+    /// Sanity: the bounded class still accepts the prefixes the original
+    /// `[│║|>\s]` class supported. Box-drawing + `>` cursor + plain space.
+    #[test]
+    fn dismiss_matches_classical_prefixes() {
+        let cases = [
+            "│ No, exit",   // Ink box-drawing
+            "║ No, exit",   // double box-drawing
+            "| No, exit",   // ASCII pipe
+            "> No, exit",   // chevron cursor
+            "  No, exit",   // bare indent
+            ") No, exit",   // radio cursor (the new case)
+            "[3] No, exit", // digit-bracket choice rows
+        ];
+        for screen in cases {
+            let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+            assert!(
+                try_dismiss_dialog("t", screen, &test_writer(), &patterns),
+                "prefix variant must match: {screen:?}"
+            );
+        }
+    }
+
+    /// Length cap proof: a long indent (more than 8 non-alpha chars)
+    /// before the phrase must NOT match. Defends against pathological
+    /// scrollback that happens to start with many non-alpha chars.
+    #[test]
+    fn dismiss_rejects_when_prefix_exceeds_length_cap() {
+        // 9 non-alpha chars ahead of the phrase — exceeds {0,8}.
+        let screen = "         No, exit"; // 9 spaces
+        let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+        assert!(
+            !try_dismiss_dialog("t", screen, &test_writer(), &patterns),
+            "9-char non-alpha prefix must exceed length cap and not match"
+        );
+    }
+
+    /// False-positive regression: alpha char anywhere in the prefix area
+    /// (typical of scrollback/user text) must still be rejected.
+    #[test]
+    fn dismiss_rejects_alpha_char_in_prefix_zone() {
+        // Even though `Pre` is short, an alpha char in the [^A-Za-z\n]{0,8}
+        // window breaks the match — proving mid-paragraph text is safe.
+        let screen = "Pre: No, exit";
+        let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+        assert!(
+            !try_dismiss_dialog("t", screen, &test_writer(), &patterns),
+            "alpha char in prefix zone must invalidate match (regression-safe)"
+        );
+    }
+
+    /// Production smoke: spawn a real kiro-cli process and observe its
+    /// startup screen via VTerm. Asserts that the rendered screen contains
+    /// the kiro trust prompt and that try_dismiss_dialog matches against
+    /// the production regex. Skipped when kiro-cli isn't on PATH so the
+    /// test is safe on CI without forcing a kiro-cli install matrix.
+    ///
+    /// Run locally with:  cargo test -- --ignored kiro_real_spawn
+    ///
+    /// Reader runs on a dedicated thread piping into an mpsc channel —
+    /// portable_pty's `try_clone_reader()` returns a blocking reader, so
+    /// polling for `WouldBlock` would hang forever waiting on a kiro that
+    /// has nothing more to write. The channel + `recv_timeout` pattern is
+    /// the only robust way to bound the wait without a runtime dependency.
+    #[test]
+    #[ignore = "spawns real kiro-cli process; run locally only"]
+    #[cfg(unix)]
+    fn issue_468_kiro_real_spawn_dismiss_smoke() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::sync::mpsc;
+
+        if which::which("kiro-cli").is_err() {
+            eprintln!("SKIP: kiro-cli not on PATH");
+            return;
+        }
+
+        let pty = native_pty_system();
+        let pair = pty
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+
+        let mut cmd = CommandBuilder::new("kiro-cli");
+        cmd.args(["chat", "--trust-all-tools"]);
+        cmd.env("AGEND_GIT_BYPASS", "1");
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn kiro-cli");
+        drop(pair.slave);
+
+        // Reader thread → mpsc channel; main thread polls with timeout.
+        let mut reader = pair.master.try_clone_reader().expect("reader");
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        // fire-and-forget: thread exits when reader hits EOF after child kill.
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut vt = crate::vterm::VTerm::new(80, 24);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(chunk) => vt.process(&chunk),
+                Err(_) => break, // timeout or sender disconnected
+            }
+            if vt.tail_lines(24).contains("No, exit") {
+                break;
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let screen = vt.tail_lines(24);
+        let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+
+        // Two valid outcomes prove kiro startup is no longer hung on the
+        // confirmation screen — the actual user-visible bug being fixed.
+        //
+        // (a) "No, exit" rendered → must match regex (real-spawn dismiss).
+        // (b) Already past confirmation (kiro saved trust from a prior run,
+        //     or `--trust-all-tools` bypassed it) → reaching the ready
+        //     prompt within deadline proves no hang.
+        //
+        // Failure mode: neither marker present within the deadline → kiro
+        // really did hang somewhere unexpected.
+        let saw_prompt = screen.contains("No, exit");
+        let saw_ready = screen.contains("Trust All Tools active")
+            || screen.contains("ask a question or describe a task");
+
+        if saw_prompt {
+            assert!(
+                try_dismiss_dialog("t", &screen, &test_writer(), &patterns),
+                "production regex must match real kiro-cli trust prompt. Screen:\n{screen}"
+            );
+        } else {
+            assert!(
+                saw_ready,
+                "kiro neither rendered the trust prompt nor reached ready state within 5s. \
+                 Screen:\n{screen}"
+            );
+            eprintln!(
+                "SMOKE NOTE: kiro skipped the trust prompt (saved acceptance or --trust-all-tools \
+                 bypass). Synthetic-screen unit tests cover the regex correctness for the \
+                 reported operator screenshot."
+            );
+        }
     }
 
     /// Sprint 21 F-NEW1: verify that `sweep_child_tree` reaches grandchild
