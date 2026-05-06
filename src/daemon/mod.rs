@@ -178,12 +178,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to issue API auth cookie: {e}"))?;
     tracing::info!(path = %run.display(), "run dir");
 
-    // Extract embedded fleet protocol to AGEND_HOME/protocol/.default/
-    crate::protocol::extract_default(home);
-    crate::binding::reconcile_hooks(home);
-    crate::binding::symlink_shim(home);
-    crate::binding::reconcile_orphans(home);
-    crate::worktree_pool::reconcile_orphan_leases(home);
+    // agend-git-shim init now in bootstrap::prepare (shared with app mode).
 
     // Check for previous snapshot if fleet.yaml doesn't exist
     if !home.join("fleet.yaml").exists() {

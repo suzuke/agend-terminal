@@ -178,6 +178,13 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
         None
     };
 
+    // agend-git-shim init (shared by daemon + app mode).
+    crate::protocol::extract_default(home);
+    crate::binding::reconcile_hooks(home);
+    crate::binding::symlink_shim(home);
+    crate::binding::reconcile_orphans(home);
+    crate::worktree_pool::reconcile_orphan_leases(home);
+
     Ok(BootstrapOutcome::Owned(Box::new(OwnedFleet {
         home: home.to_path_buf(),
         fleet_path: fleet_path.to_path_buf(),
