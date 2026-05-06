@@ -25,6 +25,13 @@ pub(crate) fn dispatch_auto_bind_lease(
         .and_then(|r| r.working_directory)
         .unwrap_or_else(|| home.join("workspace").join(target));
 
+    // P0-1.5: central lease registry check — reject if another agent holds this branch.
+    if let Some(other) = crate::binding::scan_existing_branch_binding(home, branch, target) {
+        return Err(format!(
+            "branch '{branch}' already leased by '{other}' — release first or use a different branch"
+        ));
+    }
+
     // Attempt lease (creates worktree + tags as daemon-managed).
     // Lease errors REJECT the dispatch (Q2 + §3.3).
     let lease = crate::worktree_pool::lease(home, &source_repo, target, branch)?;
@@ -127,25 +134,31 @@ mod tests {
         let home =
             std::env::temp_dir().join(format!("agend-s53-prod-{}-conflict", std::process::id()));
         std::fs::create_dir_all(&home).ok();
+        // CRITICAL: each agent has its OWN working_directory (production topology).
         setup_test_repo(&home, "agent-a");
-        // Add agent-b pointing to same repo.
-        let repo = home.join("workspace").join("agent-a");
+        setup_test_repo(&home, "agent-b");
         std::fs::write(
             home.join("fleet.yaml"),
-            format!("instances:\n  agent-a:\n    backend: claude\n    working_directory: {}\n  agent-b:\n    backend: claude\n    working_directory: {}\n", repo.display(), repo.display()),
+            format!("instances:\n  agent-a:\n    backend: claude\n    working_directory: {}\n  agent-b:\n    backend: claude\n    working_directory: {}\n",
+                home.join("workspace").join("agent-a").display(),
+                home.join("workspace").join("agent-b").display()),
         ).ok();
 
-        // First dispatch succeeds (creates branch + worktree).
+        // First dispatch succeeds in agent-a's clone.
         let r1 = super::dispatch_auto_bind_lease(&home, "agent-a", "T-1", "feat/shared");
         assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
 
-        // Second dispatch SAME branch SAME source repo — must REJECT (Q2).
-        // Branch already exists from first lease → git worktree add -b fails.
+        // Second dispatch SAME branch DIFFERENT agent → REJECT via central registry.
         let r2 = super::dispatch_auto_bind_lease(&home, "agent-b", "T-2", "feat/shared");
         assert!(
             r2.is_err(),
-            "lease conflict must REJECT second dispatch, got: {:?}",
+            "central registry must REJECT cross-agent same-branch, got: {:?}",
             r2
+        );
+        let err = r2.expect_err("must err");
+        assert!(
+            err.contains("already leased by 'agent-a'"),
+            "error must name leasing agent: {err}"
         );
 
         // Agent-b binding must NOT exist (Q2: REJECT = no side effects).
@@ -154,6 +167,33 @@ mod tests {
             !binding_b.exists(),
             "rejected dispatch must not create binding"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn same_agent_re_dispatch_idempotent() {
+        let home = std::env::temp_dir().join(format!("agend-s53-prod-{}-idem", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        setup_test_repo(&home, "agent-x");
+
+        // First dispatch.
+        let r1 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-1", "feat/test");
+        assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
+
+        // Same agent re-dispatch same branch with different task_id → idempotent.
+        let r2 = super::dispatch_auto_bind_lease(&home, "agent-x", "T-2", "feat/test");
+        assert!(
+            r2.is_ok(),
+            "same-agent re-dispatch must be idempotent: {:?}",
+            r2.err()
+        );
+
+        // Binding should exist with new task_id.
+        let binding = home.join("runtime").join("agent-x").join("binding.json");
+        let content = std::fs::read_to_string(&binding).expect("read");
+        let v: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(v["task_id"], "T-2", "task_id must update on re-dispatch");
 
         std::fs::remove_dir_all(&home).ok();
     }

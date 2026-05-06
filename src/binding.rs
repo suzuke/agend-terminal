@@ -46,6 +46,34 @@ pub fn unbind(home: &Path, agent: &str) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Returns Some(agent_name) if any other agent has bound this branch.
+/// Used by dispatch_auto_bind_lease to enforce cross-agent branch uniqueness.
+pub fn scan_existing_branch_binding(
+    home: &Path,
+    branch: &str,
+    exclude_agent: &str,
+) -> Option<String> {
+    let runtime_dir = home.join("runtime");
+    let entries = std::fs::read_dir(&runtime_dir).ok()?;
+    for entry in entries.flatten() {
+        let agent = entry.file_name().to_string_lossy().to_string();
+        if agent == exclude_agent {
+            continue;
+        }
+        let binding_path = entry.path().join("binding.json");
+        let Ok(content) = std::fs::read_to_string(&binding_path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if v["branch"].as_str() == Some(branch) {
+            return Some(agent);
+        }
+    }
+    None
+}
+
 /// Read the current binding for an agent (for internal use/tests).
 #[allow(dead_code)] // Used by tests + Phase 2
 pub fn read(home: &Path, agent: &str) -> Option<serde_json::Value> {
