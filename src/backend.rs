@@ -201,9 +201,13 @@ impl Backend {
                 instructions_shared: false,
                 inject_instructions_on_ready: false,
                 ready_timeout_secs: 30,
+                // Issue #468: regex anchored to line start + optional TUI prefix
+                // ([│║|>\s]*) instead of bare substring, so user-typed text or
+                // scrollback containing the phrase mid-line cannot trigger an
+                // unauthorized auto-dismiss.
                 dismiss_patterns: &[
-                    ("Yes, I trust", b"\x1b[A\x1b[A\r"),
-                    ("Yes, proceed", b"\x1b[A\x1b[A\r"),
+                    (r"(?m)^[│║|>\s]*Yes, I trust", b"\x1b[A\x1b[A\r"),
+                    (r"(?m)^[│║|>\s]*Yes, proceed", b"\x1b[A\x1b[A\r"),
                 ],
                 fresh_args: None, // same as args (no resume in preset)
             },
@@ -227,7 +231,8 @@ impl Backend {
                     // Trust-all-tools confirmation: cursor defaults to "No, exit"
                     // Down moves to "Yes, I accept", Enter confirms
                     // Keys sent with per-byte delay in try_dismiss_dialog
-                    ("No, exit", b"\x1b[B\r"),
+                    // Issue #468: anchored regex (see ClaudeCode comment above).
+                    (r"(?m)^[│║|>\s]*No, exit", b"\x1b[B\r"),
                 ],
                 fresh_args: None, // same as args
             },
@@ -253,9 +258,10 @@ impl Backend {
                     // CR (\r), not LF — Ink's keyboard reader treats CR as Enter.
                     // macOS openpty doesn't translate LF→CR on input (ConPTY does),
                     // so LF here would silently no-op on mac.
-                    ("Do you trust", b"\r"),
+                    // Issue #468: anchored regex (see ClaudeCode comment above).
+                    (r"(?m)^[│║|>\s]*Do you trust", b"\r"),
                     // Auto-update prompt: "Please restart Codex" → Enter
-                    ("Please restart", b"\r"),
+                    (r"(?m)^[│║|>\s]*Please restart", b"\r"),
                 ],
                 // Codex: "resume --last" → fresh start drops the resume subcommand
                 fresh_args: Some(&["--dangerously-bypass-approvals-and-sandbox"]),
@@ -274,10 +280,11 @@ impl Backend {
                 inject_instructions_on_ready: false,
                 ready_timeout_secs: 45,
                 dismiss_patterns: &[
-                    ("Update Available", b"\r"),
-                    ("Skip  Confirm", b"\r"),
-                    ("Update Complete", b"\r"),
-                    ("Please restart", b"\r"),
+                    // Issue #468: anchored regex (see ClaudeCode comment above).
+                    (r"(?m)^[│║|>\s]*Update Available", b"\r"),
+                    (r"(?m)^[│║|>\s]*Skip  Confirm", b"\r"),
+                    (r"(?m)^[│║|>\s]*Update Complete", b"\r"),
+                    (r"(?m)^[│║|>\s]*Please restart", b"\r"),
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
             },
@@ -297,10 +304,16 @@ impl Backend {
                 inject_instructions_on_ready: false,
                 ready_timeout_secs: 20,
                 // Auto-approve: MCP tools ("3" = all server tools for session),
-                // shell commands ("2" = allow for session)
+                // shell commands ("2" = allow for session).
+                // Issue #468: anchored regex (line start + optional TUI prefix
+                // [│║|>\s]*). Substring match was false-positiving on user
+                // input and scrollback content that contained the phrase
+                // mid-paragraph, auto-injecting `2\n` / `3\n` without consent.
+                // Gemini's Ink-based TUI renders dialogs with `│ ` prefix at
+                // line start, which the anchor accepts.
                 dismiss_patterns: &[
-                    ("Allow execution of MCP tool", b"3\n"),
-                    ("Allow execution of:", b"2\n"),
+                    (r"(?m)^[│║|>\s]*Allow execution of MCP tool", b"3\n"),
+                    (r"(?m)^[│║|>\s]*Allow execution of:", b"2\n"),
                 ],
                 fresh_args: None, // same as args (resume is in resume_mode, not args)
             },
