@@ -419,6 +419,38 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
             crate::agent_ops::cleanup_working_dir(home, inst, &default_subdir);
         }
     }
+    // Sprint 54 P1-5: best-effort rmdir of the custom-directory parent.
+    // If every member subdir was just removed AND the operator left no
+    // unrelated files there, the parent is now empty — strip it so we
+    // don't leak `/tmp/team-foo/` shells behind. `remove_dir` (NOT
+    // `remove_dir_all`) errors on non-empty, which is exactly what we
+    // want: any operator-dropped file preserves the parent.
+    rmdir_if_empty(custom_root);
+}
+
+/// Best-effort rmdir of an empty directory (Sprint 54 P1-5).
+///
+/// Uses [`std::fs::remove_dir`] (not `remove_dir_all`) so the call
+/// fails non-destructively when the directory still has contents the
+/// daemon didn't put there. Logs an info-level event on success and
+/// debug-level on skip — never returns an error to callers.
+fn rmdir_if_empty(path: &Path) {
+    match std::fs::remove_dir(path) {
+        Ok(()) => tracing::info!(
+            path = %path.display(),
+            "deployment cleanup: removed empty parent dir"
+        ),
+        // Already gone — idempotency-friendly, common on second teardown.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Non-empty (operator dropped files) or permission denied — log
+        // at debug because non-empty is the expected mixed-use case;
+        // unexpected errors are still discoverable via `RUST_LOG=debug`.
+        Err(e) => tracing::debug!(
+            path = %path.display(),
+            error = %e,
+            "deployment cleanup: parent rmdir skipped (likely non-empty)"
+        ),
+    }
 }
 
 /// Issue #474: prune deployment entries whose instances no longer exist in
@@ -1413,6 +1445,116 @@ instances: {}
 
         // Must not panic.
         cleanup_deployment_dirs(&home, &dep);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // Sprint 54 P1-5 — rmdir empty deployment parent. Three contract
+    // gates from dispatch m-20260507033740155107-2:
+    //  1. all-subdirs-removed → parent gone
+    //  2. unrelated file present → parent preserved
+    //  3. running cleanup twice → second call silent
+    //
+    // Empirical regression-proof anchor: commenting out the
+    // `rmdir_if_empty(custom_root)` call at the end of
+    // `cleanup_deployment_dirs` trips test (1) with the FAIL signature
+    // attached to the PR description.
+    // -----------------------------------------------------------------
+
+    fn make_deployment(name: &str, members: &[&str], directory: &Path) -> Deployment {
+        let inst_names: Vec<String> = members.iter().map(|m| format!("{name}-{m}")).collect();
+        Deployment {
+            name: name.to_string(),
+            template: "tpl".to_string(),
+            instances: inst_names,
+            team: None,
+            directory: directory.display().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn cleanup_deployment_dirs_rmdir_parent_when_only_member_subdirs() {
+        // Gate 1: deploy two members into a custom parent → cleanup →
+        // parent must be GONE because both subdirs are removed and
+        // nothing else lives there.
+        let home = tmp_home("p15_rmdir_clean");
+        let custom_root =
+            std::env::temp_dir().join(format!("agend-p15-{}-clean-custom", std::process::id()));
+        std::fs::create_dir_all(&custom_root).unwrap();
+        for member in ["a", "b"] {
+            let inst = format!("p15clean-{member}");
+            let inst_dir = custom_root.join(&inst);
+            std::fs::create_dir_all(&inst_dir).unwrap();
+            std::fs::write(inst_dir.join("sentinel.txt"), "fixture").unwrap();
+        }
+        let dep = make_deployment("p15clean", &["a", "b"], &custom_root);
+
+        cleanup_deployment_dirs(&home, &dep);
+
+        assert!(
+            !custom_root.exists(),
+            "parent must be removed when only deployment subdirs were inside: {custom_root:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&custom_root).ok();
+    }
+
+    #[test]
+    fn cleanup_deployment_dirs_preserves_parent_with_unrelated_file() {
+        // Gate 2: same shape as gate 1 but with an unrelated file
+        // dropped into the parent. The rmdir MUST be skipped — never
+        // strip an operator's own data.
+        let home = tmp_home("p15_rmdir_keep");
+        let custom_root =
+            std::env::temp_dir().join(format!("agend-p15-{}-keep-custom", std::process::id()));
+        std::fs::create_dir_all(&custom_root).unwrap();
+        for member in ["a", "b"] {
+            let inst = format!("p15keep-{member}");
+            let inst_dir = custom_root.join(&inst);
+            std::fs::create_dir_all(&inst_dir).unwrap();
+        }
+        // Operator-dropped file at the parent root.
+        let unrelated = custom_root.join("operator-notes.md");
+        std::fs::write(&unrelated, "do not delete").unwrap();
+        let dep = make_deployment("p15keep", &["a", "b"], &custom_root);
+
+        cleanup_deployment_dirs(&home, &dep);
+
+        assert!(
+            custom_root.exists(),
+            "parent MUST be preserved when it holds unrelated files: {custom_root:?}"
+        );
+        assert!(
+            unrelated.exists(),
+            "operator-dropped file MUST remain on disk: {unrelated:?}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&custom_root).ok();
+    }
+
+    #[test]
+    fn cleanup_deployment_dirs_rmdir_is_idempotent() {
+        // Gate 3: a second cleanup invocation after the first removed
+        // the parent must NOT panic and must NOT log error-level
+        // noise (`NotFound` is mapped to a silent no-op in
+        // `rmdir_if_empty`).
+        let home = tmp_home("p15_rmdir_idem");
+        let custom_root =
+            std::env::temp_dir().join(format!("agend-p15-{}-idem-custom", std::process::id()));
+        std::fs::create_dir_all(&custom_root).unwrap();
+        std::fs::create_dir_all(custom_root.join("p15idem-a")).unwrap();
+        let dep = make_deployment("p15idem", &["a"], &custom_root);
+
+        cleanup_deployment_dirs(&home, &dep);
+        assert!(!custom_root.exists(), "first call must remove parent");
+
+        // Second call — must not panic, must remain a silent no-op.
+        cleanup_deployment_dirs(&home, &dep);
+        assert!(!custom_root.exists(), "parent stays gone after second call");
 
         std::fs::remove_dir_all(&home).ok();
     }
