@@ -16,6 +16,14 @@ include = [
     "src/**/*.rs",
     "build.rs",
     "assets/windows/*",
+    # `src/binding.rs` does `include_str!("../assets/hooks/prepare-commit-msg")`
+    # + `.../prepare-commit-msg.ps1` (Sprint 53 #446 Phase 1 trailer hook).
+    # Same lesson as the `docs/FLEET-DEV-PROTOCOL-v1.md` entry below: the
+    # `cargo publish` verify step builds from the packaged tarball, so
+    # every `include_str!` target must appear here. v0.6.0 publish-blocker
+    # hotfix (silent-drop class 5th instance — human comment alone didn't
+    # prevent a second occurrence; Phase 2 invariant test deferred to v0.6.1).
+    "assets/hooks/*",
     # `src/protocol.rs` does `include_str!("../docs/FLEET-DEV-PROTOCOL-v1.md")`
     # at compile time. Without this entry, `cargo publish`'s verification
     # build (which works on the packaged tarball, not the source tree)
