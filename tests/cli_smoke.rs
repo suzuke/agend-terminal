@@ -27,16 +27,10 @@ fn help_renders_known_subcommands() {
     let output = cmd().arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&output.get_output().stdout);
 
-    // Pin known subcommands (logic-outcome: subcommand presence, not exact wording)
-    for sub in &[
-        "start",
-        "daemon",
-        "app",
-        "mcp",
-        "bugreport",
-        "completions",
-        "stop",
-    ] {
+    // Pin known subcommands (logic-outcome: subcommand presence, not exact wording).
+    // Wave 1 CLI consolidation: `daemon` removed in favor of `start --agents`;
+    // pin the surviving canonical entries.
+    for sub in &["start", "app", "mcp", "bugreport", "completions", "stop"] {
         assert!(
             stdout.contains(sub),
             "help must mention subcommand '{sub}', got:\n{stdout}"

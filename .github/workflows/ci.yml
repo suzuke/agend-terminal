@@ -86,8 +86,10 @@ jobs:
           # Binary invokes at all
           "$BIN" --version
 
-          # Spawn daemon in background with one shell agent
-          "$BIN" daemon "shell:$SHELL_CMD" > daemon.log 2>&1 &
+          # Spawn daemon in background with one shell agent.
+          # Wave 1 CLI consolidation: `daemon` subcommand was removed;
+          # `start --agents <NAME:CMD>...` is the canonical replacement.
+          "$BIN" start --agents "shell:$SHELL_CMD" > daemon.log 2>&1 &
           DAEMON_PID=$!
 
           # Wait up to 30s for api.port to appear

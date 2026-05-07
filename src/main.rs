@@ -177,7 +177,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start daemon with fleet.yaml
+    /// Start daemon with fleet.yaml or explicit `--agents`
     Start {
         /// Run the daemon in the background (detaches from this shell,
         /// stdio → $AGEND_HOME/daemon.log). Parent process exits immediately
@@ -187,10 +187,12 @@ enum Commands {
         /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml).
         #[arg(long)]
         fleet: Option<String>,
-    },
-    /// Start daemon with explicit agent specs (name:cmd ...)
-    Daemon {
-        /// Agent specs in name:command format
+        /// Start with explicit agent specs (`name:command` pairs) instead of
+        /// fleet.yaml. Skips fleet loading; the daemon spawns exactly the
+        /// listed agents. Subsumes the former `daemon` subcommand.
+        ///
+        /// Example: `start --agents dev:claude reviewer:claude shell:/bin/bash`
+        #[arg(long, num_args = 1.., value_name = "NAME:CMD")]
         agents: Vec<String>,
     },
     /// Attach to an agent's terminal (Ctrl+B d to detach)
@@ -206,18 +208,19 @@ enum Commands {
         /// Text to inject
         text: Vec<String>,
     },
-    /// List running agents
-    #[command(alias = "ls")]
+    /// List running agents (use `--detailed` for state/health/cmd, `--json` for JSON)
+    #[command(aliases = ["ls", "status"])]
     List {
-        /// Output as JSON
+        /// Output as JSON. Forces detailed output (full agent record from API).
         #[arg(long)]
         json: bool,
-    },
-    /// Show detailed agent status (state, health)
-    Status {
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
+        /// Show state / health / backend command for each agent. Without this
+        /// flag, `list` reads run-dir port files directly and prints names
+        /// only — useful when the daemon API is briefly unresponsive.
+        /// `--json` implies `--detailed`. Subsumes the former `status` command
+        /// (kept as an alias for backward compatibility).
+        #[arg(long, short = 'd')]
+        detailed: bool,
     },
     /// Connect a local agent to the running daemon
     Connect {
@@ -246,18 +249,12 @@ enum Commands {
         /// Agent name
         name: String,
     },
-    /// Fleet management
-    Fleet {
-        #[command(subcommand)]
-        command: FleetCommands,
-    },
     /// Admin maintenance utilities
     Admin {
         #[command(subcommand)]
         command: AdminCommands,
     },
-    /// Agent CLI — commands for agent-to-agent coordination (JSON output)
-    /// Start MCP stdio server
+    /// Start MCP stdio server (auto-launched by AI backends; not for direct human use)
     Mcp,
     /// Capture backend output for debugging
     Capture {
@@ -268,13 +265,7 @@ enum Commands {
         #[arg(long, default_value = "15")]
         seconds: u64,
     },
-    /// Run tests
-    Test {
-        /// Test suite (mcp, attach, inbox, api, all)
-        #[arg(default_value = "all")]
-        suite: String,
-    },
-    /// Full E2E verification
+    /// E2E verification (use `--quick` for the lightweight subset)
     Verify {
         /// Output as JSON
         #[arg(long)]
@@ -282,11 +273,14 @@ enum Commands {
         /// Filter by backend
         #[arg(long)]
         backend: Option<String>,
+        /// Skip per-backend tests + daemon-spawning tests. Runs only the
+        /// 4 in-process probes (attach, inbox, mcp framing, api). Subsumes
+        /// the former `test` subcommand. Completes in <30s.
+        #[arg(long)]
+        quick: bool,
     },
     /// Health check
     Doctor,
-    /// Show behavioral vs regex state divergence report
-    StateDivergenceReport,
     /// Menu-bar / system-tray resident app (requires `--features tray`).
     #[cfg(feature = "tray")]
     Tray,
@@ -319,17 +313,6 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum FleetCommands {
-    /// Start fleet from config
-    Start {
-        /// Path to fleet config YAML
-        config: Option<String>,
-    },
-    /// Stop all fleet agents
-    Stop,
 }
 
 #[derive(Subcommand)]
@@ -374,7 +357,49 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::App { fleet }) => {
             app::run(fleet.as_deref())?;
         }
-        Some(Commands::Start { detached, fleet }) => {
+        Some(Commands::Start {
+            detached,
+            fleet,
+            agents,
+        }) => {
+            // Wave 1 CLI consolidation: `--agents` subsumes the former
+            // `daemon` subcommand. When provided, skip fleet loading and
+            // spawn the listed agents directly. Mutually exclusive with
+            // a fleet.yaml — bail early if both supplied to avoid
+            // ambiguous start semantics.
+            if !agents.is_empty() {
+                if fleet.is_some() {
+                    anyhow::bail!("`--agents` and `--fleet` are mutually exclusive");
+                }
+                if detached {
+                    anyhow::bail!(
+                        "`--detached` is not supported with `--agents` (no fleet.yaml \
+                         path to register with the supervisor); foreground only"
+                    );
+                }
+                let agents: Vec<_> = agents
+                    .iter()
+                    .map(|a| {
+                        let (name, cmd) = a
+                            .split_once(':')
+                            .map(|(n, c)| (n.to_string(), c.to_string()))
+                            .unwrap_or_else(|| (a.to_string(), a.to_string()));
+                        let (preset_args, submit_key) = backend::Backend::from_command(&cmd)
+                            .map(|b| {
+                                let p = b.preset();
+                                let mut a: Vec<String> =
+                                    p.args.iter().map(|s| s.to_string()).collect();
+                                a.extend(p.resume_mode.args_for());
+                                (a, p.submit_key.to_string())
+                            })
+                            .unwrap_or_else(|| (Vec::new(), "\r".to_string()));
+                        (name, cmd, preset_args, None, None, submit_key)
+                    })
+                    .collect();
+                daemon::run(&home, agents)?;
+                return Ok(());
+            }
+
             let fleet_path = fleet
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join("fleet.yaml"));
@@ -407,39 +432,6 @@ fn main() -> anyhow::Result<()> {
                     )],
                 )?;
             }
-        }
-        Some(Commands::Daemon { agents }) => {
-            let agents: Vec<_> = if agents.is_empty() {
-                vec![(
-                    "shell".into(),
-                    default_shell().into(),
-                    Vec::new(),
-                    None,
-                    None,
-                    "\r".into(),
-                )]
-            } else {
-                agents
-                    .iter()
-                    .map(|a| {
-                        let (name, cmd) = a
-                            .split_once(':')
-                            .map(|(n, c)| (n.to_string(), c.to_string()))
-                            .unwrap_or_else(|| (a.to_string(), a.to_string()));
-                        let (preset_args, submit_key) = backend::Backend::from_command(&cmd)
-                            .map(|b| {
-                                let p = b.preset();
-                                let mut a: Vec<String> =
-                                    p.args.iter().map(|s| s.to_string()).collect();
-                                a.extend(p.resume_mode.args_for());
-                                (a, p.submit_key.to_string())
-                            })
-                            .unwrap_or_else(|| (Vec::new(), "\r".to_string()));
-                        (name, cmd, preset_args, None, None, submit_key)
-                    })
-                    .collect()
-            };
-            daemon::run(&home, agents)?;
         }
         Some(Commands::Connect {
             name,
@@ -512,8 +504,40 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => daemon_not_running_hint(),
             }
         }
-        Some(Commands::List { json }) => {
-            if let Some(run) = daemon::find_active_run_dir(&home) {
+        Some(Commands::List { json, detailed }) => {
+            // Wave 1 CLI consolidation: `--detailed/-d` (or `--json`) shows
+            // state/health/cmd via the daemon API. Plain `list` falls
+            // back to scanning `*.port` files in the run dir — works
+            // even when the daemon API is briefly unresponsive (the
+            // historical reason `list` and `status` were two commands).
+            let want_detailed = detailed || json;
+            if want_detailed {
+                match api::call(&home, &serde_json::json!({"method": api::method::LIST})) {
+                    Ok(resp) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&resp["result"]).unwrap_or_default()
+                            );
+                        } else if let Some(agents) = resp["result"]["agents"].as_array() {
+                            if agents.is_empty() {
+                                println!("No agents running.");
+                            } else {
+                                for a in agents {
+                                    println!(
+                                        "  {}: state={} health={} cmd={}",
+                                        a["name"].as_str().unwrap_or("?"),
+                                        a["agent_state"].as_str().unwrap_or("?"),
+                                        a["health_state"].as_str().unwrap_or("?"),
+                                        a["backend"].as_str().unwrap_or("?")
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => daemon_not_running_hint(),
+                }
+            } else if let Some(run) = daemon::find_active_run_dir(&home) {
                 let agents: Vec<String> = std::fs::read_dir(&run)?
                     .flatten()
                     .filter_map(|e| {
@@ -522,44 +546,11 @@ fn main() -> anyhow::Result<()> {
                     })
                     .filter(|n| n != "api")
                     .collect();
-                if json {
-                    println!("{}", serde_json::json!(agents));
-                } else {
-                    for a in &agents {
-                        println!("  {a}");
-                    }
+                for a in &agents {
+                    println!("  {a}");
                 }
-            } else if json {
-                println!("[]");
             } else {
                 println!("No running daemon found.");
-            }
-        }
-        Some(Commands::Status { json }) => {
-            match api::call(&home, &serde_json::json!({"method": api::method::LIST})) {
-                Ok(resp) => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&resp["result"]).unwrap_or_default()
-                        );
-                    } else if let Some(agents) = resp["result"]["agents"].as_array() {
-                        if agents.is_empty() {
-                            println!("No agents running.");
-                        } else {
-                            for a in agents {
-                                println!(
-                                    "  {}: state={} health={} cmd={}",
-                                    a["name"].as_str().unwrap_or("?"),
-                                    a["agent_state"].as_str().unwrap_or("?"),
-                                    a["health_state"].as_str().unwrap_or("?"),
-                                    a["backend"].as_str().unwrap_or("?")
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(_) => daemon_not_running_hint(),
             }
         }
         Some(Commands::Kill { name }) => {
@@ -575,32 +566,6 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => daemon_not_running_hint(),
             }
         }
-        Some(Commands::Fleet { command }) => match command {
-            FleetCommands::Start { config } => {
-                let fleet_path = config
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join("fleet.yaml"));
-                cli::start_with_fleet(&home, &fleet_path)?;
-            }
-            FleetCommands::Stop => {
-                match api::call(&home, &serde_json::json!({"method": api::method::LIST})) {
-                    Ok(resp) => {
-                        if let Some(agents) = resp["result"]["agents"].as_array() {
-                            for a in agents {
-                                let name = a["name"].as_str().unwrap_or("");
-                                let _ = api::call(
-                                    &home,
-                                    &serde_json::json!({"method": api::method::KILL, "params": {"name": name}}),
-                                );
-                                println!("  Stopped {name}");
-                            }
-                            println!("Fleet stopped ({} agents)", agents.len());
-                        }
-                    }
-                    Err(_) => daemon_not_running_hint(),
-                }
-            }
-        },
         Some(Commands::Admin { command }) => match command {
             AdminCommands::CleanupBranches { yes } => {
                 let repo = std::env::current_dir()?;
@@ -644,31 +609,12 @@ fn main() -> anyhow::Result<()> {
             }
             cli::capture_backend(&b, seconds)?;
         }
-        Some(Commands::Test { suite }) => cli::run_tests(&suite, &home)?,
-        Some(Commands::Verify { json, backend }) => verify::run(&home, json, backend.as_deref())?,
+        Some(Commands::Verify {
+            json,
+            backend,
+            quick,
+        }) => verify::run(&home, json, backend.as_deref(), quick)?,
         Some(Commands::Doctor) => cli::run_doctor(&home)?,
-        Some(Commands::StateDivergenceReport) => {
-            let report = behavioral::divergence_report();
-            if report.is_empty() {
-                println!("No divergence data collected yet. Run the daemon with agents to accumulate data.");
-            } else {
-                println!(
-                    "{:<15} {:>10} {:>10} {:>10} {:>8}",
-                    "Backend", "Total", "Agree", "Diverge", "Rate%"
-                );
-                println!("{}", "-".repeat(58));
-                for (backend, stats) in &report {
-                    println!(
-                        "{:<15} {:>10} {:>10} {:>10} {:>7.1}%",
-                        backend,
-                        stats.total_ticks,
-                        stats.agree,
-                        stats.diverge,
-                        stats.divergence_rate()
-                    );
-                }
-            }
-        }
         #[cfg(feature = "tray")]
         Some(Commands::Tray) => tray::run(&home)?,
         Some(Commands::Demo) => cli::run_demo()?,

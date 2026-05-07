@@ -24,8 +24,10 @@ env = os.environ.copy()
 env["AGEND_CTRLC_SENTINEL"] = str(SENTINEL)
 
 print(f"[test] spawning daemon (new console), sentinel={SENTINEL}")
+# Wave 1 CLI consolidation: `daemon` subcommand was removed;
+# `start --agents <NAME:CMD>...` is the canonical replacement.
 proc = subprocess.Popen(
-    [BIN, "daemon", "sh:cmd"],
+    [BIN, "start", "--agents", "sh:cmd"],
     creationflags=CREATE_NEW_CONSOLE,
     env=env,
 )

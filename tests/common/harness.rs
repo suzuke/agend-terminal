@@ -22,17 +22,45 @@ pub struct AgendHarness {
 impl AgendHarness {
     /// Spawn a real daemon with the given fleet.yaml content.
     /// Waits up to 15s for the API port file to appear.
+    ///
+    /// Wave 1 CLI consolidation: the historical `daemon` subcommand was
+    /// removed. The default spawn now uses `start --agents shell:<default>`
+    /// which gives the same effective behavior (single shell agent, no
+    /// fleet.yaml dependency) without requiring fleet.yaml to be
+    /// non-empty. Tests passing `instances: {}` continue to work
+    /// because `--agents` overrides fleet loading.
     pub fn spawn(home: PathBuf, fleet_yaml: &str) -> Result<Self, String> {
-        Self::spawn_with(home, fleet_yaml, "daemon")
+        Self::spawn_with_args(
+            home,
+            fleet_yaml,
+            &[
+                "start",
+                "--agents",
+                &format!("shell:{}", default_test_shell()),
+            ],
+        )
     }
+
+    /// Spawn with a different subcommand (e.g. `start` to use fleet.yaml).
+    /// Used by `tests/migrated_scripts.rs`; clippy doesn't see the cross-binary
+    /// caller, so the `#[allow(dead_code)]` mirrors the harness's existing
+    /// pattern for `api_call`.
+    #[allow(dead_code)]
     pub fn spawn_with(home: PathBuf, fleet_yaml: &str, subcommand: &str) -> Result<Self, String> {
+        Self::spawn_with_args(home, fleet_yaml, &[subcommand])
+    }
+
+    /// Spawn with arbitrary CLI args. Internal — used by `spawn` to pass
+    /// `start --agents …`. Public callers should prefer `spawn` or
+    /// `spawn_with`.
+    fn spawn_with_args(home: PathBuf, fleet_yaml: &str, args: &[&str]) -> Result<Self, String> {
         std::fs::create_dir_all(&home).map_err(|e| format!("create home: {e}"))?;
         std::fs::write(home.join("fleet.yaml"), fleet_yaml)
             .map_err(|e| format!("write fleet.yaml: {e}"))?;
 
         let binary = binary_path();
         let mut cmd = Command::new(&binary);
-        cmd.args([&subcommand])
+        cmd.args(args)
             .env("AGEND_HOME", &home)
             .env("AGEND_TEST_ISOLATION", "1")
             .stdout(Stdio::piped())
@@ -476,6 +504,19 @@ fn binary_path() -> PathBuf {
     path.pop(); // strip deps/
     path.push("agend-terminal");
     path
+}
+
+/// Wave 1 CLI consolidation: the harness's default spawn now uses
+/// `start --agents shell:<default>` instead of the deleted `daemon`
+/// subcommand. The default shell mirrors `default_shell()` in the main
+/// crate (cmd.exe on Windows, /bin/bash elsewhere) so behavior matches
+/// the pre-Wave-1 semantics.
+fn default_test_shell() -> &'static str {
+    if cfg!(windows) {
+        "cmd.exe"
+    } else {
+        "/bin/bash"
+    }
 }
 
 fn find_run_dir(home: &Path) -> Option<PathBuf> {

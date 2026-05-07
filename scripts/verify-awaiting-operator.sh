@@ -44,7 +44,7 @@ green "  ok"
 
 info "start daemon with silent backend (cat) in $TEST_HOME"
 mkdir -p "$TEST_HOME/workspace"
-AGEND_HOME="$TEST_HOME" "$BIN" daemon silent:cat \
+AGEND_HOME="$TEST_HOME" "$BIN" start --agents silent:cat \
     > "$TEST_HOME/daemon.log" 2>&1 &
 DAEMON_PID=$!
 # Suppress bash's "Terminated:" job-control message when cleanup kills the daemon.
