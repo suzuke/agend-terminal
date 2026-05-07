@@ -123,10 +123,25 @@ pub struct CiRun {
 }
 
 /// Result of polling CI runs for a branch.
+///
+/// Sprint 54 P0-2: the success variant carries the
+/// `X-RateLimit-Remaining` / `X-RateLimit-Limit` quota counters when
+/// the provider exposes them. The tick-loop feeds these into
+/// [`adaptive_interval`] to widen the next poll's effective interval
+/// before the limit is exhausted (preempt vs. recover).
 #[derive(Debug)]
 pub enum CiPollResult {
-    /// Runs retrieved successfully (may be empty).
-    Runs(Vec<CiRun>),
+    /// Runs retrieved successfully (may be empty). Rate-limit fields
+    /// are `None` for providers that don't expose the quota headers
+    /// (currently only GitHub does); callers fall back to the
+    /// configured interval in that case.
+    Runs {
+        runs: Vec<CiRun>,
+        /// Last seen `X-RateLimit-Remaining`. None if header absent.
+        rate_limit_remaining: Option<u64>,
+        /// Last seen `X-RateLimit-Limit`. None if header absent.
+        rate_limit_limit: Option<u64>,
+    },
     /// API-level error (rate limit, auth failure, server error).
     ApiError {
         #[allow(dead_code)]
@@ -214,6 +229,18 @@ impl CiProvider for GitHubCiProvider {
             .get("x-ratelimit-reset")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
+        // Sprint 54 P0-2: capture remaining/limit on every response,
+        // not just rate-limited ones. The watch loop feeds these into
+        // `adaptive_interval` so we widen the next poll BEFORE hitting
+        // the cap, instead of recovering from it.
+        let parse_u64_header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+        };
+        let rate_limit_remaining = parse_u64_header("x-ratelimit-remaining");
+        let rate_limit_limit = parse_u64_header("x-ratelimit-limit");
         let body: serde_json::Value = resp.json().await?;
 
         // Surface API errors (rate-limit, auth, server) instead of
@@ -259,7 +286,11 @@ impl CiProvider for GitHubCiProvider {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(CiPollResult::Runs(runs))
+        Ok(CiPollResult::Runs {
+            runs,
+            rate_limit_remaining,
+            rate_limit_limit,
+        })
     }
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
@@ -454,7 +485,16 @@ impl CiProvider for GitLabCiProvider {
             })
             .unwrap_or_default();
 
-        Ok(CiPollResult::Runs(runs))
+        // Sprint 54 P0-2: GitLab uses different rate-limit headers
+        // (`ratelimit-*` per CiHttpClient::parse_rate_limit_reset). Until
+        // we add per-provider quota mapping, treat headers as absent
+        // here — the throttle path falls through to the configured
+        // baseline.
+        Ok(CiPollResult::Runs {
+            runs,
+            rate_limit_remaining: None,
+            rate_limit_limit: None,
+        })
     }
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
@@ -664,7 +704,14 @@ impl CiProvider for BitbucketCiProvider {
             })
             .unwrap_or_default();
 
-        Ok(CiPollResult::Runs(runs))
+        // Sprint 54 P0-2: Bitbucket Cloud doesn't expose GitHub-style
+        // quota headers. Treat as absent — adaptive_interval falls
+        // through to the configured baseline for non-GitHub providers.
+        Ok(CiPollResult::Runs {
+            runs,
+            rate_limit_remaining: None,
+            rate_limit_limit: None,
+        })
     }
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
@@ -832,6 +879,62 @@ pub fn watch_filename(repo: &str, branch: &str) -> String {
     let mut h = DefaultHasher::new();
     format!("{repo}:{branch}").hash(&mut h);
     format!("{:016x}.json", h.finish())
+}
+
+/// Sprint 54 P0-2: adaptive backoff curve based on remaining quota.
+///
+/// Returns the effective polling interval (in seconds) given the
+/// configured baseline `interval_secs` and the most recent
+/// `X-RateLimit-Remaining` / `X-RateLimit-Limit` observation. The
+/// curve has three zones:
+///
+/// | Zone     | `remaining_pct = remaining / limit` | Multiplier |
+/// |----------|-------------------------------------|------------|
+/// | Healthy  | `> 0.5`                             | `× 1`      |
+/// | Cautious | `0.1 < … ≤ 0.5`                     | `× 2`      |
+/// | Critical | `≤ 0.1`                             | `× 4`      |
+///
+/// **Floor + ceiling**: never below the configured baseline (so
+/// operators can't accidentally tune themselves into permanent
+/// throttle), never above `interval_secs * 4` (so a single critical
+/// watch can't quietly stop polling for an hour).
+///
+/// **Missing headers**: if either `remaining` or `limit` is `None`, or
+/// `limit` is zero, we fall back to the configured baseline. Providers
+/// that don't expose the quota headers (currently GitLab + Bitbucket)
+/// keep their existing behavior.
+///
+/// Pure helper — no IO, no state. The throttle path
+/// ([`watch_is_due`]) consumes the result; the tick-loop persists
+/// `effective_interval_secs` to the watch JSON for diagnostics.
+pub(crate) fn adaptive_interval(
+    interval_secs: u64,
+    remaining: Option<u64>,
+    limit: Option<u64>,
+) -> u64 {
+    // EMPIRICAL REGRESSION-PROOF FLIP (Sprint 54 P0-2): replace the
+    // body below with `let _ = (remaining, limit); return interval_secs;`
+    // to simulate scaling being disabled. Tests
+    // `adaptive_interval_cautious_zone_doubles` and
+    // `adaptive_interval_critical_zone_quadruples` both fail with the
+    // signatures captured in the PR description.
+    let (remaining, limit) = match (remaining, limit) {
+        (Some(r), Some(l)) if l > 0 => (r, l),
+        // Missing headers OR pathological limit=0 ⇒ baseline. We never
+        // ceiling-multiply on absent data — that'd silently widen polls
+        // for non-GitHub providers that don't ship the quota counters.
+        _ => return interval_secs,
+    };
+    // Use *1000 to keep the comparison in integer space — avoids
+    // floating-point edge cases at exact boundaries (0.5 / 0.1).
+    let remaining_x1000 = remaining.saturating_mul(1000) / limit;
+    if remaining_x1000 > 500 {
+        interval_secs
+    } else if remaining_x1000 > 100 {
+        interval_secs.saturating_mul(2)
+    } else {
+        interval_secs.saturating_mul(4)
+    }
 }
 
 /// Pure throttle decision for a CI watch. Returns `true` when the watch
@@ -1036,6 +1139,15 @@ fn check_ci_watches_with_provider(
             }
         }
 
+        // Sprint 54 P0-2: compute adaptive backoff from the most recent
+        // quota counters persisted on the watch file. The poll path
+        // refreshes these on every successful response. First poll has
+        // `None` → `adaptive_interval` falls through to `interval`, so
+        // a fresh watch behaves identically to pre-r0.
+        let prev_remaining = watch["rate_limit_remaining"].as_u64();
+        let prev_limit = watch["rate_limit_limit"].as_u64();
+        let effective_interval = adaptive_interval(interval, prev_remaining, prev_limit);
+
         // Throttle from a dedicated `last_polled_at` (epoch millis) in the
         // watch file itself, not file mtime. mtime conflates "when this
         // file was touched" with "when we last polled" and broke whenever
@@ -1044,7 +1156,7 @@ fn check_ci_watches_with_provider(
         // to work around that. Schema-local state removes both the
         // first-poll-lag quirk and the external-writer fragility.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        if !watch_is_due(watch["last_polled_at"].as_i64(), interval, now_ms) {
+        if !watch_is_due(watch["last_polled_at"].as_i64(), effective_interval, now_ms) {
             continue;
         }
         // Stamp `last_polled_at` BEFORE spawning the GH request so a slow
@@ -1055,6 +1167,9 @@ fn check_ci_watches_with_provider(
         // throttle.
         let mut watch_with_stamp = watch.clone();
         watch_with_stamp["last_polled_at"] = serde_json::json!(now_ms);
+        // P0-2 diagnostic: stamp the effective interval so operators
+        // can read the current backoff zone from the watch file.
+        watch_with_stamp["effective_interval_secs"] = serde_json::json!(effective_interval);
         // M1: atomic write
         let _ = crate::store::atomic_write(
             &path,
@@ -1382,8 +1497,38 @@ async fn ci_check_repo(
             }
             return Err(anyhow::anyhow!("{status}: {message}"));
         }
-        CiPollResult::Runs(r) if r.is_empty() => return Ok(()),
-        CiPollResult::Runs(r) => r,
+        CiPollResult::Runs {
+            runs,
+            rate_limit_remaining,
+            rate_limit_limit,
+        } => {
+            // Sprint 54 P0-2: persist the latest quota counters even on
+            // empty-runs polls, so the next tick's `adaptive_interval`
+            // sees the freshest snapshot. Done before the empty-runs
+            // early return below.
+            if rate_limit_remaining.is_some() || rate_limit_limit.is_some() {
+                if let Ok(content) = std::fs::read_to_string(watch_path) {
+                    if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(r) = rate_limit_remaining {
+                            watch["rate_limit_remaining"] = serde_json::json!(r);
+                        }
+                        if let Some(l) = rate_limit_limit {
+                            watch["rate_limit_limit"] = serde_json::json!(l);
+                        }
+                        let _ = crate::store::atomic_write(
+                            watch_path,
+                            serde_json::to_string_pretty(&watch)
+                                .unwrap_or_default()
+                                .as_bytes(),
+                        );
+                    }
+                }
+            }
+            if runs.is_empty() {
+                return Ok(());
+            }
+            runs
+        }
     };
 
     // Determine the latest head_sha from the newest run.
@@ -1549,6 +1694,72 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
+    }
+
+    // -----------------------------------------------------------------
+    // Sprint 54 P0-2 — adaptive_interval. 3-zone curve based on
+    // remaining quota. Each test pins one of the contract gates from
+    // dispatch m-20260507042300780703-3:
+    //   1. healthy zone (remaining_pct > 0.5) → no scaling
+    //   2. cautious zone (0.1 < … ≤ 0.5)      → ×2
+    //   3. critical zone (≤ 0.1)              → ×4
+    //   4. missing headers                    → fallback to baseline
+    //
+    // Empirical regression-proof: a mutation that always returns the
+    // baseline regardless of remaining_pct trips tests 2 and 3.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn adaptive_interval_healthy_zone_uses_configured_baseline() {
+        // remaining/limit = 1.0 (full quota) ⇒ no scaling, exactly the
+        // configured interval. Mirror this in production: a freshly
+        // booted daemon with full GitHub quota polls at user-configured
+        // cadence, never widening behind the operator's back.
+        assert_eq!(adaptive_interval(60, Some(5000), Some(5000)), 60);
+        // Boundary: just above 50% (501/1000 = 0.501) is still healthy.
+        assert_eq!(adaptive_interval(60, Some(501), Some(1000)), 60);
+    }
+
+    #[test]
+    fn adaptive_interval_cautious_zone_doubles() {
+        // remaining_pct = 0.3 ⇒ ×2 multiplier. The agent is consuming
+        // quota faster than the healthy threshold but isn't critical
+        // yet — preempt by halving poll frequency.
+        assert_eq!(adaptive_interval(60, Some(300), Some(1000)), 120);
+        // Boundary: exactly 50% is cautious (the >0.5 → healthy guard
+        // is strict, so 0.5 falls into the next zone).
+        assert_eq!(adaptive_interval(60, Some(500), Some(1000)), 120);
+        // Boundary: just above 10% (101/1000 = 0.101) is still cautious.
+        assert_eq!(adaptive_interval(60, Some(101), Some(1000)), 120);
+    }
+
+    #[test]
+    fn adaptive_interval_critical_zone_quadruples() {
+        // remaining_pct = 0.05 ⇒ ×4 multiplier. Avoids burning the
+        // last few requests in a cluster. Mirror this in production:
+        // when GitHub returns a low remaining count, the next poll
+        // backs off so the daemon doesn't trip the 60/hr (unauth) or
+        // 5000/hr (auth) cap.
+        assert_eq!(adaptive_interval(60, Some(50), Some(1000)), 240);
+        // Boundary: exactly 10% is critical (the >0.1 → cautious guard
+        // is strict).
+        assert_eq!(adaptive_interval(60, Some(100), Some(1000)), 240);
+        // Pathological: zero remaining still resolves to ×4 (we don't
+        // pretend to know what reset_epoch is — the existing
+        // rate_limit_until path handles that recovery separately).
+        assert_eq!(adaptive_interval(60, Some(0), Some(1000)), 240);
+    }
+
+    #[test]
+    fn adaptive_interval_missing_headers_falls_back_to_configured() {
+        // Either field absent (or zero limit) ⇒ baseline. Producers
+        // that don't emit the GitHub-style headers (GitLab, Bitbucket
+        // Cloud) preserve their existing behavior here.
+        assert_eq!(adaptive_interval(60, None, None), 60);
+        assert_eq!(adaptive_interval(60, Some(5000), None), 60);
+        assert_eq!(adaptive_interval(60, None, Some(5000)), 60);
+        // Pathological limit=0 (avoids div-by-zero, falls through).
+        assert_eq!(adaptive_interval(60, Some(100), Some(0)), 60);
     }
 
     #[test]
@@ -2241,7 +2452,31 @@ mod tests {
     impl MockCiProvider {
         fn with_runs(runs: Vec<CiRun>) -> Self {
             Self {
-                poll_result: Mutex::new(Some(CiPollResult::Runs(runs))),
+                poll_result: Mutex::new(Some(CiPollResult::Runs {
+                    runs,
+                    rate_limit_remaining: None,
+                    rate_limit_limit: None,
+                })),
+                pr_state: Mutex::new(PrState::Open),
+                failure_summary: Mutex::new("Build / Test".to_string()),
+            }
+        }
+
+        /// Sprint 54 P0-2: variant that lets a test seed quota counters
+        /// directly so adaptive-backoff persistence + throttle behavior
+        /// can be exercised end-to-end without an HTTP layer.
+        #[allow(dead_code)]
+        fn with_runs_and_quota(
+            runs: Vec<CiRun>,
+            remaining: Option<u64>,
+            limit: Option<u64>,
+        ) -> Self {
+            Self {
+                poll_result: Mutex::new(Some(CiPollResult::Runs {
+                    runs,
+                    rate_limit_remaining: remaining,
+                    rate_limit_limit: limit,
+                })),
                 pr_state: Mutex::new(PrState::Open),
                 failure_summary: Mutex::new("Build / Test".to_string()),
             }
@@ -2627,7 +2862,7 @@ mod tests {
         );
 
         let runs = match result.expect("poll_runs") {
-            super::CiPollResult::Runs(r) => r,
+            super::CiPollResult::Runs { runs, .. } => runs,
             other => panic!("expected Runs, got: {other:?}"),
         };
         assert_eq!(runs.len(), 2);
@@ -2854,7 +3089,7 @@ mod tests {
             "must send Basic auth header: {req}"
         );
         let runs = match result.expect("poll_runs") {
-            super::CiPollResult::Runs(r) => r,
+            super::CiPollResult::Runs { runs, .. } => runs,
             other => panic!("expected Runs, got: {other:?}"),
         };
         assert_eq!(runs.len(), 2);
