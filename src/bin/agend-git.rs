@@ -247,9 +247,27 @@ fn resolve_real_git() -> String {
 // ── Error + Telemetry ───────────────────────────────────────────────────
 
 fn emit_deny_error(subcmd: &str, reason: &str, agent: &str) {
-    eprintln!("agend-git: ERROR git {subcmd} denied");
-    eprintln!("           agent={agent}, reason: {reason}");
-    eprintln!("           HINT: use the task board to get a worktree assignment, or set AGEND_GIT_BYPASS=1 for emergency override");
+    for line in format_deny_error(subcmd, reason, agent) {
+        eprintln!("{line}");
+    }
+}
+
+/// Sprint 54 P2-4: build the deny-error block as a `Vec<String>` so the
+/// 3-form bypass hint can be unit-tested for env-var-name presence
+/// without capturing stderr. `emit_deny_error` is a thin wrapper that
+/// `eprintln!`s each line. Per `should_bypass` (above), three bypass
+/// forms exist; the hint enumerates all of them so operators don't
+/// have to grep the source to discover the agent-specific or
+/// time-limited variants.
+fn format_deny_error(subcmd: &str, reason: &str, agent: &str) -> Vec<String> {
+    vec![
+        format!("agend-git: ERROR git {subcmd} denied"),
+        format!("           agent={agent}, reason: {reason}"),
+        "           HINT: use the task board for a worktree assignment, or bypass with one of:".to_string(),
+        "             AGEND_GIT_BYPASS=1               one-shot emergency override".to_string(),
+        "             AGEND_GIT_BYPASS_AGENT=<name>    agent-specific exemption (matches AGEND_INSTANCE_NAME)".to_string(),
+        "             AGEND_GIT_BYPASS_UNTIL=<epoch>   time-limited exemption (Unix seconds, not ISO)".to_string(),
+    ]
 }
 
 fn write_git_event(home: &str, agent: &str, subcmd: &str, reason: &str) {
@@ -270,5 +288,30 @@ fn write_git_event(home: &str, agent: &str, subcmd: &str, reason: &str) {
     {
         use std::io::Write;
         let _ = writeln!(f, "{}", event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_deny_error;
+
+    #[test]
+    fn deny_hint_lists_all_three_bypass_forms() {
+        let lines = format_deny_error("commit", "unbound", "dev");
+        let joined = lines.join("\n");
+        for var in [
+            "AGEND_GIT_BYPASS=1",
+            "AGEND_GIT_BYPASS_AGENT=",
+            "AGEND_GIT_BYPASS_UNTIL=",
+        ] {
+            assert!(
+                joined.contains(var),
+                "deny hint must list {var}, got:\n{joined}"
+            );
+        }
+        assert!(
+            joined.contains("epoch") && joined.contains("Unix seconds"),
+            "AGEND_GIT_BYPASS_UNTIL hint must clarify epoch wording (not ISO), got:\n{joined}"
+        );
     }
 }
