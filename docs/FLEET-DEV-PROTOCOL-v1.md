@@ -209,6 +209,7 @@ Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/Aut
 - Branch naming: `feat/`, `fix/`, `docs/`
 - Clean up immediately after merge
 - **Never** `git worktree add <path> main` — locks main, breaks operator builds. Always use `-b <new-branch>`. Recovery: `cd <worktree> && git switch -c <dedicated-branch>`
+- **Generic `bind_self` (Sprint 54 P1-7)**: any agent (lead, dev, reviewer, …) may proactively claim a worktree via `bind_self {repo, branch}` without going through the dispatch hook. Inherits every dispatch invariant — Phase 1 trailers, P0-1.5 cross-agent registry, P0-1.6 actual-HEAD verification, P0-X release_worktree as sole exit, source_repo persistence, auto watch_ci. Use case: lead orchestrator escalating to Path A IMPL on a hot branch. Pair with `release_worktree` to unbind. `main`/`master` rejected with E4.5; cross-agent branch conflicts return `code: cross_agent_conflict`.
 
 ## §11. Tool Quick Reference
 
