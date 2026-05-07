@@ -83,6 +83,51 @@ pub(super) fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) ->
     "general".to_string()
 }
 
+/// Sprint 54 silent-drop hotfix: emit the canonical attachment-download
+/// failure WARN with sender + kind context. Extracted so the test suite
+/// can verify the field shape via `tracing_test` without driving the
+/// full `handle_message` async path.
+///
+/// The pre-hotfix log only carried `file_id` + `error`. Operators
+/// triaging "agent never received this image" needed to grep the
+/// inbox + cross-reference channel logs to identify the sender. This
+/// version emits enough context to identify both the user and the
+/// media kind in one line.
+pub(super) fn emit_download_failure_warn(
+    file_id: &str,
+    error: &str,
+    sender_id: Option<i64>,
+    kind: &crate::channel::event::AttachmentKind,
+) {
+    tracing::warn!(
+        file_id = file_id,
+        error = error,
+        sender_id = ?sender_id,
+        kind = ?kind,
+        "inbound attachment download failed"
+    );
+}
+
+/// Sprint 54 silent-drop hotfix: pick the inbox `text` to enqueue
+/// when an image download just failed. The pre-hotfix code path
+/// produced `text="" attachments=[]` for pure-image-no-caption sends,
+/// which the agent sees as a content-less message it can't action on.
+///
+/// Behavior:
+/// - `initial = ""` (pure image, no caption) → user-visible fallback
+///   `[image attached but download failed]` so the agent at minimum
+///   knows the user tried to send something and can ask for re-send.
+/// - `initial = "<caption>"` → caption passes through unchanged. The
+///   download failure is still surfaced via the WARN, but the user's
+///   own words take precedence.
+pub(super) fn resolve_text_after_image_download_failure(initial: &str) -> String {
+    if initial.is_empty() {
+        "[image attached but download failed]".to_string()
+    } else {
+        initial.to_string()
+    }
+}
+
 async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // Detect topic closure/deletion — auto-delete the corresponding instance
     if msg.forum_topic_closed().is_some() {
@@ -105,7 +150,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         return;
     }
 
-    let text = match msg.text() {
+    let mut text = match msg.text() {
         Some(t) => t.to_string(),
         None => msg.caption().unwrap_or("").to_string(),
     };
@@ -367,6 +412,10 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
 
     // Download inbound attachment if present (async — avoids nested runtime panic).
     let attachments: Vec<crate::channel::event::Attachment> = if let Some(f) = inbound_file {
+        // Sprint 54 silent-drop hotfix: capture `is_image` before `f`
+        // moves into the Ok arm so the Err arm can still decide whether
+        // to apply the image-specific text fallback.
+        let is_image = matches!(f.kind, crate::channel::event::AttachmentKind::Photo);
         let bot = lock_state(state).bot.clone();
         let result = match bot {
             Some(bot) => super::download_file_async(&bot, &home, &instance_name, f.file_id).await,
@@ -382,7 +431,17 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                 original_filename: f.filename,
             }],
             Err(e) => {
-                tracing::warn!(file_id = f.file_id, error = %e, "inbound attachment download failed");
+                emit_download_failure_warn(f.file_id, &e.to_string(), sender_id, &f.kind);
+                // User-visible text fallback for the dominant silent-drop
+                // case (pure image, no caption, download fails). Without
+                // this, the inbox enqueue lands as text="" attachments=[]
+                // — the agent sees a content-less message from a user it
+                // can't action on. Other media kinds (voice/video/doc)
+                // are not yet covered; extend per the same pattern if
+                // reported.
+                if is_image {
+                    text = resolve_text_after_image_download_failure(&text);
+                }
                 vec![]
             }
         }
@@ -476,6 +535,8 @@ pub(super) fn agent_wants_raw_keystrokes(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::*;
+
     #[test]
     fn handle_message_body_has_no_block_on() {
         let src = include_str!("inbound.rs");
@@ -494,6 +555,128 @@ mod tests {
         assert!(
             !body.contains("block_on"),
             "handle_message must not call block_on (nested runtime panic). Found block_on in body."
+        );
+    }
+
+    // ── Sprint 54 silent-drop hotfix: image+no-caption+download-fail ────
+    //
+    // Operator m-9 dispatch m-20260507090314193553-38. The pre-hotfix
+    // path produced `text="" attachments=[]` when the user sent a
+    // pure image with no caption and the download failed (network /
+    // token / size). Agent had nothing to act on; user had no
+    // visibility. Each test pins one of the four contract gates from
+    // the dispatch.
+    //
+    // EMPIRICAL REGRESSION-PROOF ANCHOR: collapsing
+    // `resolve_text_after_image_download_failure` to a no-op (always
+    // return `initial.to_string()`) makes
+    // `caption_empty_download_fail_uses_image_fallback_text` fail
+    // because text stays empty. PR description carries the captured
+    // FAIL signature.
+
+    #[test]
+    fn caption_present_passes_through_unchanged() {
+        // Gate 1: a user who typed a caption shouldn't have the
+        // fallback overwrite their own words on download failure.
+        // The WARN still fires at the call site so operators see why
+        // the attachment is missing.
+        let result = resolve_text_after_image_download_failure("look at this cat");
+        assert_eq!(result, "look at this cat");
+    }
+
+    #[test]
+    fn caption_empty_download_succeeds_no_fallback_needed() {
+        // Gate 2: when download succeeds, the resolver is never
+        // called — the inbox enqueue carries the original (empty)
+        // text + the populated attachment. This test pins the
+        // resolver's behavioral contract (deterministic on empty
+        // input) and the call-site invariant via source inspection
+        // — the resolver call lives inside the `Err(e) =>` arm of
+        // the download match, never on the `Ok(...)` success path.
+        let resolved = resolve_text_after_image_download_failure("");
+        assert_eq!(resolved, "[image attached but download failed]");
+
+        // Source-level invariant: the production call-site (handle_message)
+        // invokes the resolver only inside the Err arm. Skip both the
+        // `fn` definition AND the test-suite call-sites; what remains
+        // are production call-sites, all of which must follow `Err(e)`.
+        let src = include_str!("inbound.rs");
+        let test_module_start = src.find("\nmod tests {").expect("test module must exist");
+        let production_src = &src[..test_module_start];
+
+        let mut iter = production_src.match_indices("resolve_text_after_image_download_failure(");
+        // First production hit is the fn signature itself. Skip.
+        let _ = iter.next();
+        let production_callsites: Vec<_> = iter.collect();
+        assert_eq!(
+            production_callsites.len(),
+            1,
+            "expected exactly one production call-site (in handle_message Err arm); \
+             grep 'resolve_text_after_image_download_failure' to inspect."
+        );
+        let (idx, _) = production_callsites[0];
+        // Look back generously — the call sits ~15 lines inside the
+        // Err arm. 2048 bytes covers comfortable nesting without
+        // accidentally matching unrelated `Err(e) =>` arms outside.
+        let preceding = &production_src[idx.saturating_sub(2048)..idx];
+        assert!(
+            preceding.contains("Err(e) =>"),
+            "production call must live inside the download match's Err arm — \
+             a call from the Ok arm would re-introduce the silent-drop bug"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn caption_empty_download_fail_uses_image_fallback_text() {
+        // Gate 3 (regression-proof anchor): empty caption + download
+        // failure must produce the user-visible fallback text AND
+        // emit the WARN with sender_id + file_id. Both behaviors
+        // matter for the silent-drop class — agents see content,
+        // operators triage causes.
+        let kind = crate::channel::event::AttachmentKind::Photo;
+        emit_download_failure_warn("FILE_ABC", "404 Not Found", Some(12345), &kind);
+        let resolved = resolve_text_after_image_download_failure("");
+        assert_eq!(resolved, "[image attached but download failed]");
+        // tracing-test scans captured records.
+        assert!(
+            logs_contain("inbound attachment download failed"),
+            "WARN must fire so operators see download failures in app.log"
+        );
+        assert!(
+            logs_contain("FILE_ABC"),
+            "WARN must include file_id for triage"
+        );
+        assert!(
+            logs_contain("12345"),
+            "WARN must include sender_id (Sprint 54 enrichment)"
+        );
+    }
+
+    #[test]
+    fn pure_text_no_image_path_unchanged() {
+        // Gate 4: the silent-drop fix targets the image+no-caption
+        // case only. A pure text message hits neither helper because
+        // `inbound_file` is None — the resolver is gated behind
+        // `if is_image`. We pin the source-level invariant: the
+        // resolver call-site is inside `if is_image`, so a non-image
+        // message can never trigger the fallback.
+        let src = include_str!("inbound.rs");
+        // Find the call site (skip the fn definition).
+        let fn_def_marker = "pub(super) fn resolve_text_after_image_download_failure(";
+        let after_def = src
+            .find(fn_def_marker)
+            .map(|i| i + fn_def_marker.len())
+            .expect("resolver definition must exist");
+        let call_site = src[after_def..]
+            .find("resolve_text_after_image_download_failure(")
+            .expect("resolver must be called somewhere")
+            + after_def;
+        // Look back ~256 chars for the `if is_image` guard.
+        let preceding_256 = &src[call_site.saturating_sub(256)..call_site];
+        assert!(
+            preceding_256.contains("if is_image"),
+            "resolver call must be gated behind `if is_image`; found context: {preceding_256}"
         );
     }
 }
