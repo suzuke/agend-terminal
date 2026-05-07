@@ -926,10 +926,10 @@ mod tests {
     fn dispatch_update_team_emits_members_changed() {
         let (port, home, notifier, shutdown) = start_test_server("dispatch-update-team");
         // First create a team via the teams store
-        let store_path = home.join("teams.json");
+        // Sprint 54 fleet-yaml unification: teams live in fleet.yaml.
         std::fs::write(
-            &store_path,
-            r#"{"schema_version":1,"teams":[{"name":"t1","members":["m1"],"created_at":"2026-01-01T00:00:00Z"}]}"#,
+            home.join("fleet.yaml"),
+            "teams:\n  t1:\n    members: [m1]\n    created_at: \"2026-01-01T00:00:00Z\"\n",
         )
         .unwrap();
 
@@ -1315,10 +1315,10 @@ mod tests {
     fn dispatch_update_team_remove_member() {
         let (port, home, notifier, shutdown) = start_test_server("ut-remove");
         // Pre-create team with members
-        let store_path = home.join("teams.json");
+        // Sprint 54 fleet-yaml unification: teams live in fleet.yaml.
         std::fs::write(
-            &store_path,
-            r#"{"schema_version":1,"teams":[{"name":"t1","members":["m1","m2"],"created_at":"2026-01-01T00:00:00Z"}]}"#,
+            home.join("fleet.yaml"),
+            "teams:\n  t1:\n    members: [m1, m2]\n    created_at: \"2026-01-01T00:00:00Z\"\n",
         )
         .unwrap();
 
@@ -1348,10 +1348,10 @@ mod tests {
     fn dispatch_update_team_noop_no_event() {
         let (port, home, notifier, shutdown) = start_test_server("ut-noop");
         // Pre-create team
-        let store_path = home.join("teams.json");
+        // Sprint 54 fleet-yaml unification: teams live in fleet.yaml.
         std::fs::write(
-            &store_path,
-            r#"{"schema_version":1,"teams":[{"name":"t1","members":["m1"],"created_at":"2026-01-01T00:00:00Z"}]}"#,
+            home.join("fleet.yaml"),
+            "teams:\n  t1:\n    members: [m1]\n    created_at: \"2026-01-01T00:00:00Z\"\n",
         )
         .unwrap();
 

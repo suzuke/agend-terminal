@@ -188,6 +188,12 @@ pub struct TeamConfig {
     pub orchestrator: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Sprint 54 fleet-yaml unification: team creation timestamp, preserved
+    /// from the runtime `teams.json` lineage. Optional so existing
+    /// fleet.yaml templates without the field still parse — runtime team
+    /// creation stamps it; operator-edited fleet.yaml entries may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 impl FleetConfig {
@@ -578,6 +584,204 @@ pub fn update_instance_field(
     })
 }
 
+/// Sprint 54 fleet-yaml teams unification: serialize a `TeamConfig` to a
+/// `serde_yaml_ng::Mapping` for round-trip-safe insertion into the
+/// `teams:` block. Mirrors `add_instance_to_yaml`'s manual-mapping
+/// approach (avoids `to_value` re-roundtrip churn that could shift key
+/// ordering between writes).
+fn team_config_to_mapping(config: &TeamConfig) -> serde_yaml_ng::Mapping {
+    let mut team = serde_yaml_ng::Mapping::new();
+    let members_seq: Vec<serde_yaml_ng::Value> = config
+        .members
+        .iter()
+        .map(|m| serde_yaml_ng::Value::String(m.clone()))
+        .collect();
+    team.insert(
+        "members".into(),
+        serde_yaml_ng::Value::Sequence(members_seq),
+    );
+    if let Some(ref orch) = config.orchestrator {
+        team.insert(
+            "orchestrator".into(),
+            serde_yaml_ng::Value::String(orch.clone()),
+        );
+    }
+    if let Some(ref desc) = config.description {
+        team.insert(
+            "description".into(),
+            serde_yaml_ng::Value::String(desc.clone()),
+        );
+    }
+    if let Some(ref ts) = config.created_at {
+        team.insert(
+            "created_at".into(),
+            serde_yaml_ng::Value::String(ts.clone()),
+        );
+    }
+    team
+}
+
+/// Add a new team entry to fleet.yaml `teams:` block. Idempotent on
+/// caller side: returns `Ok(false)` if a team with this name already
+/// exists (so callers can surface the duplicate error to the user
+/// without losing the existing entry); returns `Ok(true)` on insert.
+/// Uses file lock + atomic write — same precedent as `add_instance_to_yaml`.
+pub fn add_team_to_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<bool> {
+    let mut inserted = false;
+    mutate_fleet_yaml(home, "teams: {}\n", |doc| {
+        if doc.get("teams").is_none() {
+            doc["teams"] = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
+        }
+        let teams = doc
+            .get_mut("teams")
+            .and_then(|v| v.as_mapping_mut())
+            .context("teams is not a mapping")?;
+        let key = serde_yaml_ng::Value::String(name.to_string());
+        if teams.contains_key(&key) {
+            return Ok(());
+        }
+        teams.insert(
+            key,
+            serde_yaml_ng::Value::Mapping(team_config_to_mapping(config)),
+        );
+        inserted = true;
+        tracing::info!(%name, "added team to fleet.yaml");
+        Ok(())
+    })?;
+    Ok(inserted)
+}
+
+/// Remove a team entry from fleet.yaml. Returns whether a team was
+/// actually removed (false when no such team existed). Uses file lock
+/// + atomic write — same precedent as `remove_instance_from_yaml`.
+pub fn remove_team_from_yaml(home: &Path, name: &str) -> Result<bool> {
+    let mut removed = false;
+    mutate_fleet_yaml(home, "", |doc| {
+        if let Some(teams) = doc.get_mut("teams").and_then(|v| v.as_mapping_mut()) {
+            if teams
+                .remove(serde_yaml_ng::Value::String(name.to_string()))
+                .is_some()
+            {
+                removed = true;
+                tracing::info!(%name, "removed team from fleet.yaml");
+            }
+        }
+        Ok(())
+    })?;
+    Ok(removed)
+}
+
+/// Replace an existing team's full config in fleet.yaml. Returns
+/// whether the team existed (false when no-op).
+///
+/// Used by `teams::update` + `teams::remove_member_from_all` after
+/// building the desired post-mutation state in memory — single
+/// round-trip, no field-level micro-mutation churn.
+pub fn update_team_in_yaml(home: &Path, name: &str, config: &TeamConfig) -> Result<bool> {
+    let mut existed = false;
+    mutate_fleet_yaml(home, "", |doc| {
+        if let Some(teams) = doc.get_mut("teams").and_then(|v| v.as_mapping_mut()) {
+            let key = serde_yaml_ng::Value::String(name.to_string());
+            if teams.contains_key(&key) {
+                teams.insert(
+                    key,
+                    serde_yaml_ng::Value::Mapping(team_config_to_mapping(config)),
+                );
+                existed = true;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(existed)
+}
+
+/// Sprint 54 fleet-yaml teams unification: one-shot migration from the
+/// legacy `teams.json` runtime store into fleet.yaml's `teams:` block.
+/// Idempotent — re-running is a safe no-op once `teams.json.migrated`
+/// exists. Behavior:
+///
+/// - `teams.json` absent → no-op (already migrated, or fresh install)
+/// - `teams.json` present → load it, merge each team into fleet.yaml
+///   (skip teams already present in fleet.yaml — operator hand-edits win
+///   over runtime store), rename `teams.json` → `teams.json.migrated`
+///   (one-cycle safety, not deletion, per decision body).
+///
+/// Called from daemon startup before any team-touching path runs, so
+/// post-migration `teams::list` / `find_team_for` etc. read the unified
+/// fleet.yaml view.
+pub fn migrate_teams_json_to_yaml(home: &Path) -> Result<()> {
+    let teams_json = home.join("teams.json");
+    if !teams_json.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&teams_json)
+        .with_context(|| format!("read teams.json: {}", teams_json.display()))?;
+    // Defensive parse: empty / malformed file → log + leave file in place,
+    // operator inspects manually rather than losing data.
+    #[derive(Deserialize)]
+    struct LegacyTeamStore {
+        #[serde(default)]
+        teams: Vec<LegacyTeam>,
+    }
+    #[derive(Deserialize)]
+    struct LegacyTeam {
+        name: String,
+        #[serde(default)]
+        members: Vec<String>,
+        #[serde(default)]
+        orchestrator: Option<String>,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        created_at: Option<String>,
+    }
+    let store: LegacyTeamStore = match serde_json::from_str(&content) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %teams_json.display(),
+                "teams.json migration: parse failed, leaving file in place");
+            return Ok(());
+        }
+    };
+    if store.teams.is_empty() {
+        // Empty store — still rename so the no-op-on-rerun branch
+        // catches future startups instantly.
+        let migrated = home.join("teams.json.migrated");
+        std::fs::rename(&teams_json, &migrated)
+            .with_context(|| format!("rename {} → {}", teams_json.display(), migrated.display()))?;
+        tracing::info!("teams.json migration: empty store, renamed to .migrated");
+        return Ok(());
+    }
+    for team in &store.teams {
+        let cfg = TeamConfig {
+            members: team.members.clone(),
+            orchestrator: team.orchestrator.clone(),
+            description: team.description.clone(),
+            created_at: team.created_at.clone(),
+        };
+        // add_team_to_yaml is no-op when team already in fleet.yaml —
+        // operator hand-edits win, runtime store loses on conflict.
+        match add_team_to_yaml(home, &team.name, &cfg) {
+            Ok(true) => tracing::info!(name = %team.name, "migrated team to fleet.yaml"),
+            Ok(false) => tracing::info!(name = %team.name,
+                "team already in fleet.yaml, skipping migration entry"),
+            Err(e) => {
+                tracing::warn!(name = %team.name, error = %e,
+                    "team migration failed, leaving teams.json in place");
+                return Err(e);
+            }
+        }
+    }
+    let migrated = home.join("teams.json.migrated");
+    std::fs::rename(&teams_json, &migrated)
+        .with_context(|| format!("rename {} → {}", teams_json.display(), migrated.display()))?;
+    tracing::info!(
+        count = store.teams.len(),
+        "teams.json migration complete, renamed to .migrated"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -782,6 +986,207 @@ instances:
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
         assert_eq!(config.instances["agent1"].topic_id, Some(42));
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── Sprint 54 fleet-yaml teams unification ─────────────────────────
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-team-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn add_team_to_yaml_creates_entry_and_returns_true() {
+        let dir = tmp_dir("add_team");
+        let cfg = TeamConfig {
+            members: vec!["alice".into(), "bob".into()],
+            orchestrator: Some("alice".into()),
+            description: Some("dev squad".into()),
+            created_at: Some("2026-05-07T00:00:00Z".into()),
+        };
+        let inserted = add_team_to_yaml(&dir, "devs", &cfg).expect("add");
+        assert!(inserted);
+        let loaded = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        let team = loaded.teams.get("devs").expect("team present");
+        assert_eq!(team.members, vec!["alice", "bob"]);
+        assert_eq!(team.orchestrator.as_deref(), Some("alice"));
+        assert_eq!(team.created_at.as_deref(), Some("2026-05-07T00:00:00Z"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_team_to_yaml_duplicate_returns_false_without_overwrite() {
+        let dir = tmp_dir("dup");
+        let cfg1 = TeamConfig {
+            members: vec!["alice".into()],
+            orchestrator: Some("alice".into()),
+            description: None,
+            created_at: Some("2026-05-07T00:00:00Z".into()),
+        };
+        assert!(add_team_to_yaml(&dir, "devs", &cfg1).expect("first"));
+        let cfg2 = TeamConfig {
+            members: vec!["bob".into()],
+            orchestrator: Some("bob".into()),
+            description: None,
+            created_at: Some("2026-05-08T00:00:00Z".into()),
+        };
+        let inserted = add_team_to_yaml(&dir, "devs", &cfg2).expect("dup");
+        assert!(!inserted, "duplicate must report false (no insert)");
+        let loaded = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        let team = loaded.teams.get("devs").expect("team present");
+        assert_eq!(
+            team.members,
+            vec!["alice"],
+            "first writer wins — original entry preserved"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_team_from_yaml_returns_whether_existed() {
+        let dir = tmp_dir("rm_team");
+        let cfg = TeamConfig {
+            members: vec!["alice".into()],
+            orchestrator: Some("alice".into()),
+            description: None,
+            created_at: None,
+        };
+        add_team_to_yaml(&dir, "devs", &cfg).expect("add");
+        assert!(remove_team_from_yaml(&dir, "devs").expect("rm"));
+        let loaded = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        assert!(loaded.teams.is_empty());
+        // Second remove → false
+        assert!(!remove_team_from_yaml(&dir, "devs").expect("rm-again"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_team_in_yaml_replaces_full_config() {
+        let dir = tmp_dir("upd_team");
+        let cfg = TeamConfig {
+            members: vec!["alice".into(), "bob".into()],
+            orchestrator: Some("alice".into()),
+            description: None,
+            created_at: Some("2026-05-07T00:00:00Z".into()),
+        };
+        add_team_to_yaml(&dir, "devs", &cfg).expect("add");
+        // Drop bob, reassign orch to alice (no-op), add carol.
+        let new_cfg = TeamConfig {
+            members: vec!["alice".into(), "carol".into()],
+            orchestrator: Some("alice".into()),
+            description: Some("post-update".into()),
+            created_at: cfg.created_at.clone(),
+        };
+        assert!(update_team_in_yaml(&dir, "devs", &new_cfg).expect("upd"));
+        let loaded = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        let team = loaded.teams.get("devs").expect("team present");
+        assert_eq!(team.members, vec!["alice", "carol"]);
+        assert_eq!(team.description.as_deref(), Some("post-update"));
+        // Update on missing team → false (no insert)
+        let new_cfg2 = TeamConfig {
+            members: vec!["x".into()],
+            orchestrator: None,
+            description: None,
+            created_at: None,
+        };
+        assert!(!update_team_in_yaml(&dir, "nonexistent", &new_cfg2).expect("upd-miss"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_teams_json_to_yaml_moves_teams_and_renames_marker() {
+        let dir = tmp_dir("migrate_present");
+        // Seed legacy teams.json
+        let legacy = r#"{"schema_version":1,"teams":[
+            {"name":"devs","members":["alice","bob"],"orchestrator":"alice","description":"the devs","created_at":"2026-05-07T00:00:00Z"},
+            {"name":"ops","members":["lead"],"orchestrator":"lead","created_at":"2026-05-07T01:00:00Z"}
+        ]}"#;
+        fs::write(dir.join("teams.json"), legacy).unwrap();
+        migrate_teams_json_to_yaml(&dir).expect("migrate");
+        // teams.json renamed
+        assert!(
+            !dir.join("teams.json").exists(),
+            "teams.json must be renamed"
+        );
+        assert!(dir.join("teams.json.migrated").exists(), "marker missing");
+        // fleet.yaml has both teams
+        let loaded = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        assert_eq!(loaded.teams.len(), 2);
+        let devs = loaded.teams.get("devs").expect("devs");
+        assert_eq!(devs.members, vec!["alice", "bob"]);
+        assert_eq!(devs.orchestrator.as_deref(), Some("alice"));
+        assert_eq!(devs.description.as_deref(), Some("the devs"));
+        assert_eq!(devs.created_at.as_deref(), Some("2026-05-07T00:00:00Z"));
+        let ops = loaded.teams.get("ops").expect("ops");
+        assert_eq!(ops.orchestrator.as_deref(), Some("lead"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_teams_json_to_yaml_idempotent_on_rerun() {
+        let dir = tmp_dir("migrate_idempotent");
+        fs::write(
+            dir.join("teams.json"),
+            r#"{"schema_version":1,"teams":[{"name":"devs","members":["a"],"orchestrator":"a","created_at":"x"}]}"#,
+        )
+        .unwrap();
+        migrate_teams_json_to_yaml(&dir).expect("first");
+        // Second run with no teams.json present → no-op, no error.
+        migrate_teams_json_to_yaml(&dir).expect("second");
+        let loaded = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        assert_eq!(loaded.teams.len(), 1, "no duplicate after re-run");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_teams_json_to_yaml_absent_is_noop() {
+        let dir = tmp_dir("migrate_absent");
+        // No teams.json — must not error, must not create fleet.yaml.
+        migrate_teams_json_to_yaml(&dir).expect("absent");
+        assert!(!dir.join("fleet.yaml").exists());
+        assert!(!dir.join("teams.json.migrated").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_teams_json_to_yaml_preserves_existing_fleet_team() {
+        // Operator hand-edited fleet.yaml `teams:` entry must win over
+        // the same-name entry in legacy teams.json — operator wins on
+        // conflict, runtime store loses.
+        let dir = tmp_dir("migrate_conflict");
+        fs::write(
+            dir.join("fleet.yaml"),
+            "teams:\n  devs:\n    members: [hand-edited]\n    orchestrator: hand-edited\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("teams.json"),
+            r#"{"schema_version":1,"teams":[{"name":"devs","members":["alice","bob"],"orchestrator":"alice","created_at":"x"}]}"#,
+        )
+        .unwrap();
+        migrate_teams_json_to_yaml(&dir).expect("migrate");
+        let loaded = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        let team = loaded.teams.get("devs").expect("present");
+        assert_eq!(
+            team.members,
+            vec!["hand-edited"],
+            "operator hand-edit must survive migration: got {:?}",
+            team.members
+        );
+        // teams.json still gets renamed even on conflict (we treat the
+        // store as "consumed" once visited; .migrated marker stops
+        // future re-attempts from clobbering).
+        assert!(dir.join("teams.json.migrated").exists());
         fs::remove_dir_all(&dir).ok();
     }
 

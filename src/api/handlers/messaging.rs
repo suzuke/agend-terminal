@@ -386,37 +386,25 @@ mod tests {
 
     // --- Sprint 37: team isolation gate tests ---
 
-    /// Set up fleet.yaml with given instances and teams.json with given teams.
+    /// Set up fleet.yaml with given instances and teams. Sprint 54
+    /// fleet-yaml unification: teams now live in the `teams:` block of
+    /// fleet.yaml directly (was: separate teams.json runtime store).
     fn setup_team_env(home: &std::path::Path, fleet_instances: &[&str], teams: &[(&str, &[&str])]) {
-        let fleet_yaml = fleet_instances
-            .iter()
-            .map(|n| format!("  {n}:\n    backend: claude"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(
-            home.join("fleet.yaml"),
-            format!("instances:\n{fleet_yaml}\n"),
-        )
-        .ok();
-
-        if !teams.is_empty() {
-            let team_objs: Vec<serde_json::Value> = teams
-                .iter()
-                .map(|(name, members)| {
-                    json!({
-                        "name": name,
-                        "members": members,
-                        "created_at": "2026-01-01T00:00:00Z"
-                    })
-                })
-                .collect();
-            let store = json!({"schema_version": 1, "teams": team_objs});
-            std::fs::write(
-                home.join("teams.json"),
-                serde_json::to_string_pretty(&store).expect("json"),
-            )
-            .ok();
+        let mut yaml = String::from("instances:\n");
+        for n in fleet_instances {
+            yaml.push_str(&format!("  {n}:\n    backend: claude\n"));
         }
+        if !teams.is_empty() {
+            yaml.push_str("teams:\n");
+            for (name, members) in teams {
+                yaml.push_str(&format!("  {name}:\n    members:\n"));
+                for m in members.iter() {
+                    yaml.push_str(&format!("      - {m}\n"));
+                }
+                yaml.push_str("    created_at: \"2026-01-01T00:00:00Z\"\n");
+            }
+        }
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
     }
 
     fn audit_log_contains(home: &std::path::Path, kind: &str) -> bool {

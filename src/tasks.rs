@@ -892,11 +892,17 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Sprint 23 P0 r2 F2 helper — populate `teams.json` store directly
-    /// (bypassing `teams::create` which validates fleet membership). Mirrors
-    /// the in-memory shape `crate::teams::TeamStore` deserialises from disk.
-    fn write_teams_store(home: &std::path::Path, teams_json: &str) {
-        std::fs::write(home.join("teams.json"), teams_json).expect("write teams.json");
+    /// Sprint 54 fleet-yaml unification: teams now live in fleet.yaml's
+    /// `teams:` block (was: separate `teams.json` runtime store).
+    /// Helper writes the dev team directly there, bypassing `teams::create`
+    /// validation paths so tests stay focused on `can_mutate_task` logic.
+    fn write_dev_team_to_fleet(home: &std::path::Path) {
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "teams:\n  dev:\n    members: [dev-lead, dev-impl-2]\n    \
+             orchestrator: dev-lead\n    created_at: \"2026-04-27T00:00:00Z\"\n",
+        )
+        .expect("write fleet.yaml");
     }
 
     #[test]
@@ -904,10 +910,7 @@ mod tests {
         // dev-lead is the orchestrator of the "dev" team; "dev-impl-2"
         // belongs to that team. Cross-team orchestrator path → pass.
         let home = tmp_home("can_mutate_orchestrator");
-        write_teams_store(
-            &home,
-            r#"{"schema_version":1,"teams":[{"name":"dev","members":["dev-lead","dev-impl-2"],"orchestrator":"dev-lead","description":null,"created_at":"2026-04-27T00:00:00Z"}]}"#,
-        );
+        write_dev_team_to_fleet(&home);
         let task = make_test_task(Some("dev-impl-2"));
         assert!(
             can_mutate_task(&home, "dev-lead", &task),
@@ -923,10 +926,7 @@ mod tests {
         // allowed to mutate even though their name doesn't match
         // `task.assignee`.
         let home = tmp_home("can_mutate_team_assignee");
-        write_teams_store(
-            &home,
-            r#"{"schema_version":1,"teams":[{"name":"dev","members":["dev-lead","dev-impl-2"],"orchestrator":"dev-lead","description":null,"created_at":"2026-04-27T00:00:00Z"}]}"#,
-        );
+        write_dev_team_to_fleet(&home);
         let task = make_test_task(Some("dev")); // assignee = team name
         assert!(
             can_mutate_task(&home, "dev-lead", &task),
@@ -1084,6 +1084,11 @@ mod tests {
     #[test]
     fn claim_clears_routed_to() {
         let home = tmp_home("claim_clears_rt");
+        // Sprint 54 fleet-yaml unification: teams::create now writes
+        // to fleet.yaml, so the claim path's instance_exists check fires
+        // (previously fleet.yaml stayed absent → permissive). Pre-seed
+        // instances so the claim by `worker` resolves to a fleet member.
+        write_fleet_yaml(&home, &["lead", "worker"]);
         crate::teams::create(
             &home,
             &serde_json::json!({"name": "devs", "members": ["lead", "worker"], "orchestrator": "lead"}),

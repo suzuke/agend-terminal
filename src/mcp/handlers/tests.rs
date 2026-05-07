@@ -1104,18 +1104,15 @@ fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
     // verify the actual inbox recipient is the orchestrator.
     let _g = fleet_test_guard();
     let home = tmp_home("delegate-team");
-    // fleet.yaml for instance validation, teams.json for team resolution
+    // Sprint 54 fleet-yaml unification: instances + teams both live
+    // in fleet.yaml. resolve_team_orchestrator now reads from there.
     std::fs::write(
         home.join("fleet.yaml"),
-        "instances:\n  dev-lead:\n    backend: claude\n  dev-impl:\n    backend: claude\n",
+        "instances:\n  dev-lead:\n    backend: claude\n  dev-impl:\n    backend: claude\n\
+         teams:\n  dev:\n    members: [dev-lead, dev-impl]\n    \
+         orchestrator: dev-lead\n    created_at: \"2026-01-01T00:00:00Z\"\n",
     )
     .ok();
-    // teams.json is the runtime store used by resolve_team_orchestrator
-    std::fs::write(
-            home.join("teams.json"),
-            r#"{"schema_version":1,"teams":[{"name":"dev","members":["dev-lead","dev-impl"],"orchestrator":"dev-lead","description":null,"created_at":"2026-01-01T00:00:00Z"}]}"#,
-        )
-        .ok();
     std::env::set_var("AGEND_HOME", &home);
 
     let result = handle_tool(
@@ -1577,12 +1574,13 @@ fn test_old_inbox_json_with_interrupt_meta_deserializes_into_force_meta() {
 #[test]
 fn resolve_team_layout_auto_attaches_to_orchestrator() {
     let home = tmp_home("team_attach");
-    let team = serde_json::json!({
-        "name": "dev", "members": ["dev-lead", "dev-impl-1"],
-        "orchestrator": "dev-lead", "created_at": "2026-01-01T00:00:00Z"
-    });
-    let store = serde_json::json!({"teams": [team]});
-    std::fs::write(home.join("teams.json"), store.to_string()).expect("write");
+    // Sprint 54 fleet-yaml unification: teams in fleet.yaml.
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "teams:\n  dev:\n    members: [dev-lead, dev-impl-1]\n    \
+         orchestrator: dev-lead\n    created_at: \"2026-01-01T00:00:00Z\"\n",
+    )
+    .expect("write");
     let (layout, target) = resolve_team_layout(&home, "dev-impl-1", None, None);
     assert_eq!(layout, "split-right");
     assert_eq!(target.as_deref(), Some("dev-lead"));
@@ -1600,12 +1598,13 @@ fn resolve_team_layout_no_team_defaults_to_tab() {
 #[test]
 fn resolve_team_layout_caller_override_preserved() {
     let home = tmp_home("override");
-    let team = serde_json::json!({
-        "name": "dev", "members": ["dev-lead", "dev-impl-1"],
-        "orchestrator": "dev-lead", "created_at": "2026-01-01T00:00:00Z"
-    });
-    let store = serde_json::json!({"teams": [team]});
-    std::fs::write(home.join("teams.json"), store.to_string()).expect("write");
+    // Sprint 54 fleet-yaml unification: teams in fleet.yaml.
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "teams:\n  dev:\n    members: [dev-lead, dev-impl-1]\n    \
+         orchestrator: dev-lead\n    created_at: \"2026-01-01T00:00:00Z\"\n",
+    )
+    .expect("write");
     let layout_val = serde_json::json!("tab");
     let (layout, target) = resolve_team_layout(&home, "dev-impl-1", Some(&layout_val), None);
     assert_eq!(
@@ -2171,16 +2170,12 @@ fn broadcast_with_team_filter_targets_team_members() {
     let _g = fleet_test_guard();
     let home = tmp_home("bcast-team");
     std::env::set_var("AGEND_HOME", &home);
+    // Sprint 54 fleet-yaml unification: instances + teams in fleet.yaml.
     std::fs::write(
         home.join("fleet.yaml"),
-        "instances:\n  sender:\n    backend: claude\n  alice:\n    backend: claude\n  bob:\n    backend: claude\n",
-    )
-    .ok();
-    // Create a team
-    let store = json!({"schema_version": 1, "teams": [{"name": "dev2", "members": ["sender", "alice"], "created_at": "2026-01-01T00:00:00Z"}]});
-    std::fs::write(
-        home.join("teams.json"),
-        serde_json::to_string(&store).expect("json"),
+        "instances:\n  sender:\n    backend: claude\n  alice:\n    backend: claude\n  \
+         bob:\n    backend: claude\nteams:\n  dev2:\n    members: [sender, alice]\n    \
+         created_at: \"2026-01-01T00:00:00Z\"\n",
     )
     .ok();
     let sender = crate::identity::Sender::new("sender").expect("valid sender");
@@ -2474,24 +2469,11 @@ fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
     std::env::set_var("AGEND_HOME", &home);
     std::env::set_var("AGEND_TEST_ISOLATION", "1");
     // Fleet: instance "dev" exists, sender is "lead".
-    let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n  lead:\n    role: Test\n";
+    // Sprint 54 fleet-yaml unification: instances + teams both in fleet.yaml.
+    let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n  \
+                lead:\n    role: Test\nteams:\n  dev:\n    members: [lead, dev]\n    \
+                orchestrator: lead\n    created_at: \"2026-04-30T00:00:00Z\"\n";
     std::fs::write(home.join("fleet.yaml"), yaml).ok();
-    // Team fixture: team named "dev" with orchestrator "lead".
-    let teams = serde_json::json!({
-        "schema_version": 1,
-        "teams": [{
-            "name": "dev",
-            "members": ["lead", "dev"],
-            "orchestrator": "lead",
-            "description": null,
-            "created_at": "2026-04-30T00:00:00Z"
-        }]
-    });
-    std::fs::write(
-        home.join("teams.json"),
-        serde_json::to_string_pretty(&teams).unwrap(),
-    )
-    .ok();
 
     let result = handle_tool(
         "send",
@@ -2526,26 +2508,14 @@ fn m5_regression_via_id_routing() {
     std::env::set_var("AGEND_HOME", &home);
     std::env::set_var("AGEND_TEST_ISOLATION", "1");
     let id = crate::types::InstanceId::new();
+    // Sprint 54 fleet-yaml unification: instances + teams both in fleet.yaml.
     let yaml = format!(
-        "defaults:\n  backend: claude\ninstances:\n  dev:\n    id: \"{}\"\n    role: Test\n  lead:\n    role: Test\n",
+        "defaults:\n  backend: claude\ninstances:\n  dev:\n    id: \"{}\"\n    role: Test\n  \
+         lead:\n    role: Test\nteams:\n  dev:\n    members: [lead, dev]\n    \
+         orchestrator: lead\n    created_at: \"2026-04-30T00:00:00Z\"\n",
         id.full()
     );
     std::fs::write(home.join("fleet.yaml"), &yaml).ok();
-    let teams = serde_json::json!({
-        "schema_version": 1,
-        "teams": [{
-            "name": "dev",
-            "members": ["lead", "dev"],
-            "orchestrator": "lead",
-            "description": null,
-            "created_at": "2026-04-30T00:00:00Z"
-        }]
-    });
-    std::fs::write(
-        home.join("teams.json"),
-        serde_json::to_string_pretty(&teams).unwrap(),
-    )
-    .ok();
 
     let result = handle_tool(
         "send",

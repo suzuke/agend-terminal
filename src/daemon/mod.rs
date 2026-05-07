@@ -208,8 +208,14 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     let home = prepared.home.clone();
     let agents = std::mem::take(&mut prepared.agents);
     let telegram = prepared.telegram.clone();
-    // Reconcile fleet.yaml teams: section → teams.json (additive only)
-    crate::teams::reconcile_teams(&home, &prepared.config);
+    // Sprint 54 fleet-yaml unification: one-shot migrate legacy
+    // teams.json runtime store into fleet.yaml `teams:` block, then
+    // rename teams.json → teams.json.migrated (idempotent — no-op once
+    // .migrated exists). Post-migration, fleet.yaml IS the canonical
+    // store; no separate reconcile step needed.
+    if let Err(e) = crate::fleet::migrate_teams_json_to_yaml(&home) {
+        tracing::warn!(error = %e, "teams.json migration failed at daemon startup");
+    }
     let _owned = prepared;
     run_core(&home, agents, telegram)
 }

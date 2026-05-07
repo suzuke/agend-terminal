@@ -415,28 +415,48 @@ fn replace_instance_returns_error_when_daemon_down() {
 // ---------------------------------------------------------------------------
 // Priority: team > targets > (all). Self is always excluded.
 
-/// Helper: create a team by writing directly to the teams store file.
+/// Helper: create a team by appending it to fleet.yaml's `teams:` block.
+/// Sprint 54 fleet-yaml unification — teams.json is gone; fleet.yaml is
+/// the canonical store. We round-trip through serde_yaml_ng (rather
+/// than string concatenation) so the helper handles both fresh and
+/// pre-populated fleet.yaml correctly.
 fn setup_team(home: &std::path::Path, name: &str, members: &[&str]) {
-    let store_path = home.join("teams.json");
-    let members_json: Vec<Value> = members.iter().map(|m| json!(m)).collect();
-    let store = if store_path.exists() {
-        let content = std::fs::read_to_string(&store_path).unwrap_or_default();
-        serde_json::from_str::<Value>(&content).unwrap_or(json!({"schema_version": 1, "teams": []}))
+    let fleet_path = home.join("fleet.yaml");
+    let mut doc: serde_yaml_ng::Value = if fleet_path.exists() {
+        let content = std::fs::read_to_string(&fleet_path).expect("read fleet.yaml");
+        serde_yaml_ng::from_str(&content).expect("parse fleet.yaml")
     } else {
-        json!({"schema_version": 1, "teams": []})
+        serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new())
     };
-    let mut teams = store["teams"].as_array().cloned().unwrap_or_default();
-    teams.push(json!({
-        "name": name,
-        "members": members_json,
-        "created_at": "2026-01-01T00:00:00Z"
-    }));
-    let new_store = json!({"schema_version": 1, "teams": teams});
+    if doc.get("teams").is_none() {
+        doc["teams"] = serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new());
+    }
+    let teams = doc
+        .get_mut("teams")
+        .and_then(|v| v.as_mapping_mut())
+        .expect("teams mapping");
+    let mut entry = serde_yaml_ng::Mapping::new();
+    let members_seq: Vec<serde_yaml_ng::Value> = members
+        .iter()
+        .map(|m| serde_yaml_ng::Value::String((*m).to_string()))
+        .collect();
+    entry.insert(
+        serde_yaml_ng::Value::String("members".into()),
+        serde_yaml_ng::Value::Sequence(members_seq),
+    );
+    entry.insert(
+        serde_yaml_ng::Value::String("created_at".into()),
+        serde_yaml_ng::Value::String("2026-01-01T00:00:00Z".into()),
+    );
+    teams.insert(
+        serde_yaml_ng::Value::String(name.to_string()),
+        serde_yaml_ng::Value::Mapping(entry),
+    );
     std::fs::write(
-        &store_path,
-        serde_json::to_string_pretty(&new_store).expect("json"),
+        &fleet_path,
+        serde_yaml_ng::to_string(&doc).expect("serialize fleet.yaml"),
     )
-    .expect("write teams.json");
+    .expect("write fleet.yaml");
 }
 
 #[test]

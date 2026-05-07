@@ -145,11 +145,15 @@ pub(super) fn restore_with_reconciliation(
     cols: u16,
     rows: u16,
 ) -> bool {
-    let fleet = fleet::FleetConfig::load(fleet_path).ok();
-    // Reconcile fleet.yaml teams: section → teams.json (additive only)
-    if let Some(ref f) = fleet {
-        crate::teams::reconcile_teams(home, f);
+    // Sprint 54 fleet-yaml unification: one-shot migrate legacy
+    // teams.json runtime store into fleet.yaml `teams:` block. Runs
+    // before fleet.yaml load below so the merged `teams:` section is
+    // visible on first read. Idempotent — no-op once
+    // teams.json.migrated marker exists.
+    if let Err(e) = crate::fleet::migrate_teams_json_to_yaml(home) {
+        tracing::warn!(error = %e, "teams.json migration failed at session startup");
     }
+    let fleet = fleet::FleetConfig::load(fleet_path).ok();
     // Issue #474: defensive reconcile — prune deployment-store entries whose
     // member instances are no longer in fleet.yaml. Catches the case where
     // a previous session closed the last instance via TUI without going
