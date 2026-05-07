@@ -35,7 +35,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 - **Server rate-limit retry stores raw body (Hotfix A/B)** — retry loop loses original 429 body across attempts, masking real error messages. Raw body now stored + replayed on inject. Provenance side-channel messages truncated to Telegram length limits to prevent oversize message drop. (#436, #452, #453)
 - **Issue #456 deployment teardown cleanup gap** — `deployment teardown` cleared the deployment record but left workspace + configs + channel topic registry behind. Full triple-cleanup (workspace + configs + registry). (#459)
 - **Issue #468 — Gemini dismiss patterns substring matched scrollback** — `try_dismiss_dialog` regex matched dialog text inside scrollback buffer, triggering spurious dismissals. Anchored regex with bounded prefix character class. (#469, #472)
-- **`reply` MCP `no active channel` (#488 — first community-reported issue)** — `reply` consistently returned `no active channel` despite valid Telegram messages with the `[user:X via telegram]` prefix arriving correctly. Root cause + fix in this release. (Thanks @changhansung)
+<!-- #488 fix entry pending: hotfix PR in flight at time of this changelog draft.
+     Will be filled in via amendment commit before v0.6.0 tag once the fix
+     PR is merged + smoke verified. -->
+
 - **TUI restart input routing** — Pane struct restoration replaced piecemeal field updates that broke input routing on respawn. (#445, thanks @cheerc)
 - **Telegram ANSI ESC + typed injection optimization** — strip ANSI escape sequences from outbound, optimize typed injection to prevent ESC conflict. (#462, thanks @cheerc)
 
