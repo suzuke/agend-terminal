@@ -142,6 +142,22 @@ Use `send` for all inter-agent messaging:
 
 Use `ci(action: watch)`, not manual polling. Clean up worktree + branch after merge.
 
+**PR open semantics (Sprint 54)**. Implementers MUST open feature PRs as
+**ready** for review by default. The `--draft` flag is reserved for
+exactly three scenarios:
+
+1. **Smoke / verification PRs** that will not be merged (e.g. CI
+   notification path tests). Title prefixes `[smoke]` / `chore: smoke`.
+2. **Explicit work-in-progress** where the implementer needs to push
+   midway and is not yet asking for review. Move to ready before
+   pinging lead/reviewer.
+3. **External-PR patches** where lead is augmenting a community
+   contribution before the upstream PR is merged.
+
+A draft PR is hidden from GitHub's default UI filters, so operator and
+reviewer miss it without explicit checks. Default-ready keeps the
+review pipeline visible.
+
 **Setup-warning surfacing (Sprint 54 P0-4)**. CI-related MCP responses
 may include a top-level `setup_warning` string when no GitHub token is
 reachable (env unset AND `gh` unavailable/unauthed). The daemon polls
