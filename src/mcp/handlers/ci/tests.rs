@@ -347,3 +347,160 @@ fn ci_unwatch_unknown_caller_is_noop_keeps_watch() {
     assert_eq!(subs, vec!["lead"]);
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------
+// Sprint 54 P0-5 — Agent-visible CI health surface. Tests cover all
+// three sub-scopes from dispatch m-20260507045729197032-16:
+//
+//   A. handle_watch_ci response enrichment (rate_limit_active +
+//      rate_limit_until + next_poll_eta)
+//   B. consecutive_skips tracking + stalled/resumed inbox events live
+//      in the daemon-side `bump_consecutive_skips_and_maybe_notify` /
+//      `clear_stall_and_maybe_notify_resumed` helpers; their tests
+//      live in `src/daemon/ci_watch.rs` (this handler doesn't drive
+//      the tick-loop schema).
+//   C. ci status MCP action — caller-scoped + filter semantics +
+//      empty-state shape.
+// ---------------------------------------------------------------------
+
+#[test]
+fn watch_ci_response_includes_health_fields_when_state_populated() {
+    // Sub-scope A gate 1: response carries the new diagnostic fields
+    // even on the first watch. Fresh watches have null poll state, so
+    // `next_poll_eta` is null and `rate_limit_active` is false — but
+    // the FIELDS must exist so agents can pattern-match without
+    // optional-field ladders.
+    let home = std::env::temp_dir().join(format!("agend-p05-A1-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let resp = handle_watch_ci(&home, &args, "lead");
+
+    assert_eq!(resp["watching"].as_bool(), Some(true));
+    assert!(
+        resp.get("rate_limit_active").is_some(),
+        "rate_limit_active must always be present"
+    );
+    assert_eq!(resp["rate_limit_active"].as_bool(), Some(false));
+    assert!(resp["rate_limit_until"].is_null());
+    assert!(resp["next_poll_eta"].is_null());
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn watch_ci_rate_limit_active_when_until_in_future() {
+    // Sub-scope A gate 2: rate_limit_until > now ⇒ rate_limit_active
+    // surfaces true. Hand-craft state to simulate a tick loop having
+    // just stamped rate_limit_until.
+    let home = std::env::temp_dir().join(format!("agend-p05-A2-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    handle_watch_ci(&home, &args, "lead");
+
+    let path = watch_path_for(&home, "owner/repo", "main");
+    let mut watch = read_watch(&path);
+    let future_secs = chrono::Utc::now().timestamp() + 3600;
+    watch["rate_limit_until"] = serde_json::json!(future_secs);
+    watch["last_polled_at"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+    watch["effective_interval_secs"] = serde_json::json!(120);
+    std::fs::write(&path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+    // Re-call watch_ci (idempotent re-subscribe) — response should
+    // reflect the new state.
+    let resp = handle_watch_ci(&home, &args, "lead");
+    assert_eq!(resp["rate_limit_active"].as_bool(), Some(true));
+    assert_eq!(resp["rate_limit_until"].as_i64(), Some(future_secs));
+    assert!(resp["next_poll_eta"].as_i64().is_some());
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn watch_ci_next_poll_eta_null_for_fresh_watch() {
+    // Sub-scope A gate 3: a fresh watch (no last_polled_at yet) has
+    // null next_poll_eta — agents shouldn't be lied to about "when's
+    // the next poll" when no poll has happened yet.
+    let home = std::env::temp_dir().join(format!("agend-p05-A3-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let resp = handle_watch_ci(&home, &args, "lead");
+    assert!(resp["next_poll_eta"].is_null());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---- Sub-scope C: ci status MCP tool ----
+
+#[test]
+fn ci_status_returns_caller_subscribed_watches() {
+    // Sub-scope C gate 1: caller scoping — only watches that include
+    // the caller in `subscribers` come back. A second watch the
+    // caller didn't subscribe to is filtered out.
+    let home = std::env::temp_dir().join(format!("agend-p05-C1-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "o/r1", "branch": "main"}),
+        "lead",
+    );
+    handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "o/r2", "branch": "main"}),
+        "dev",
+    );
+
+    let resp = handle_status_ci(&home, &serde_json::json!({}), "lead");
+    let watches = resp["watches"].as_array().unwrap();
+    assert_eq!(watches.len(), 1, "lead sees only their watch");
+    assert_eq!(watches[0]["repo"].as_str(), Some("o/r1"));
+    assert!(watches[0]
+        .get("rate_limit_active")
+        .and_then(|v| v.as_bool())
+        .is_some());
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ci_status_filter_by_repo_returns_subset() {
+    // Sub-scope C gate 2: optional repo filter narrows to a single
+    // watch even when caller has multiple subscriptions.
+    //
+    // EMPIRICAL REGRESSION-PROOF ANCHOR: if `handle_status_ci`
+    // accidentally drops the `filter_repo` check (e.g. early-return
+    // before the comparison), this test fails because both
+    // subscribed watches surface. PR description captures the FAIL
+    // signature.
+    let home = std::env::temp_dir().join(format!("agend-p05-C2-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "o/alpha", "branch": "main"}),
+        "lead",
+    );
+    handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "o/beta", "branch": "main"}),
+        "lead",
+    );
+
+    let resp = handle_status_ci(&home, &serde_json::json!({"repo": "o/alpha"}), "lead");
+    let watches = resp["watches"].as_array().unwrap();
+    assert_eq!(watches.len(), 1, "filter must narrow to o/alpha only");
+    assert_eq!(watches[0]["repo"].as_str(), Some("o/alpha"));
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn ci_status_no_watches_returns_empty_array_not_error() {
+    // Sub-scope C gate 3: empty-state shape is `{"watches": []}`,
+    // never an error. Agents that pattern-match on `watches.length`
+    // shouldn't have to handle a separate not-found code.
+    let home = std::env::temp_dir().join(format!("agend-p05-C3-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let resp = handle_status_ci(&home, &serde_json::json!({}), "lead");
+    assert!(resp.get("error").is_none());
+    let watches = resp["watches"].as_array().expect("watches array");
+    assert!(watches.is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}

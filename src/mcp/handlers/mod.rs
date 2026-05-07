@@ -175,6 +175,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "ci" => match args["action"].as_str().unwrap_or("") {
             "watch" => ci::handle_watch_ci(&home, args, instance_name),
             "unwatch" => ci::handle_unwatch_ci(&home, args),
+            // Sprint 54 P0-5 (sub-scope C): aggregate health snapshot.
+            "status" => ci::handle_status_ci(&home, args, instance_name),
             other => json!({"error": format!("unknown ci action: {other}")}),
         },
 
