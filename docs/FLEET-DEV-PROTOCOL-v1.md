@@ -134,6 +134,14 @@ Use `send` for all inter-agent messaging:
 
 **Routing**: `target_instance` (single) or `targets` / `team` / `tags` (broadcast)
 
+**Dispatch milestone updates** — when you accept a `task` dispatch, send `kind=update` to the dispatcher at each of these milestones without being asked:
+
+1. **r0 ready** — PR opened (or work artifact handed off), with verbatim links / heads.
+2. **CI all-green** — every CI gate the PR runs has reported success. The `[ci-pass]` watch broadcast does NOT substitute — confirm via your own update so the dispatcher's loop closer fires regardless of their channel state.
+3. **Reviewer verdict received** — VERIFIED / REJECTED / UNVERIFIED, with the reviewer's identity and key finding summary.
+
+Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher relies on these as the loop closer; missing any forces them to poll, which is anti-pattern (see §7).
+
 - Pure ack → use `react` (emoji), not `send`
 - Response channel must match source channel
 - **Router-layer channel discipline (Sprint 52)**: daemon auto-mirrors agent direct text to the corresponding channel. Agent does not need to force `reply` tool — infrastructure handles routing.
@@ -141,6 +149,23 @@ Use `send` for all inter-agent messaging:
 ## §7. CI
 
 Use `ci(action: watch)`, not manual polling. Clean up worktree + branch after merge.
+
+**No manual orchestrator polling**. Orchestrators (lead, general,
+operator-in-the-loop) MUST NOT manually poll PR / CI state via
+`gh pr view`, `gh run list`, repeated `cargo test`, or equivalent.
+Rely on:
+
+1. The dispatchee's `kind=update` milestones (§6) — r0 ready, CI
+   all-green, reviewer verdict.
+2. `ci(action: watch)` fan-out — `[ci-pass]` / `[ci-fail]` /
+   `[ci-watch-stalled]` arrive automatically.
+
+Manual polling masks broken dispatch communication and burns cache /
+rate-limit budget unnecessarily. If a milestone is missing past a
+reasonable window, the correct response is to message the dispatchee
+asking why, not to poll. Polling is also a smell that the dispatch
+brief itself didn't enumerate the expected milestones — fix the
+dispatch, not the symptom.
 
 **PR open semantics (Sprint 54)**. Implementers MUST open feature PRs as
 **ready** for review by default. The `--draft` flag is reserved for
