@@ -844,8 +844,39 @@ fn pane_from_menu_item(
 fn write_to_focused(home: &Path, layout: &mut Layout, registry: &AgentRegistry, bytes: &[u8]) {
     if let Some(pane) = layout.active_tab_mut().and_then(|t| t.focused_pane_mut()) {
         notification_queue::record_input_activity(home, &pane.agent_name);
+        // Sprint 54 P2-3: backend-aware submit detection (claude-first
+        // allowlist). When the keystroke buffer contains the agent's
+        // submit key (`\r` for claude, also matches paste-with-newlines
+        // since the underlying CLI submits on any \r), record a
+        // separate timestamp so the daemon supervisor can detect
+        // "typed but not submitted" against this paired signal. Other
+        // backends gracefully no-op — the supervisor tick reads
+        // `last_submit_at_ms == 0` for them and skips emission per
+        // the explicit backend allowlist there.
+        if pane_input_contains_submit(pane.backend.as_ref(), bytes) {
+            notification_queue::record_submit_activity(home, &pane.agent_name);
+        }
         pane.write_input(registry, bytes);
     }
+}
+
+/// Sprint 54 P2-3: backend-aware submit detection. Returns true iff
+/// the backend is on the submit-detection allowlist AND the keystroke
+/// buffer contains its submit key. Hard-coded claude-only first round
+/// per dispatch — extending to other backends just requires adding
+/// arms to the match.
+fn pane_input_contains_submit(backend: Option<&crate::backend::Backend>, bytes: &[u8]) -> bool {
+    let Some(b) = backend else {
+        return false;
+    };
+    if !matches!(b, crate::backend::Backend::ClaudeCode) {
+        return false;
+    }
+    let submit = b.preset().submit_key.as_bytes();
+    if submit.is_empty() || bytes.len() < submit.len() {
+        return false;
+    }
+    bytes.windows(submit.len()).any(|w| w == submit)
 }
 
 fn sync_notification_state(home: &Path, layout: &mut Layout) {

@@ -123,6 +123,15 @@ pub enum FleetEvent {
         recipients: Vec<String>,
         summary: String,
     },
+    /// Sprint 54 P2-3: operator typed input into an agent's pane but
+    /// has not yet submitted it (no submit-key keystroke since the last
+    /// non-submit keystroke) for at least
+    /// `AGEND_PANE_INPUT_THRESHOLD_SECS` (default 60). Read-only
+    /// diagnostic emitted by the daemon supervisor tick — the agent is
+    /// not interrupted, no prompt injected, no state mutated. Backend
+    /// allowlist applies (claude only, first round); other backends
+    /// gracefully no-op so the event never fires there.
+    PaneInputNotSubmitted { agent: String, typed_age_secs: u64 },
 }
 
 /// Platform-agnostic action chosen by [`select_action`] given a
@@ -247,6 +256,15 @@ pub fn format_fleet_oneliner(fe: &FleetEvent, max_bytes: usize) -> String {
             let tag = format_broadcast_tag(from, recipients);
             (tag, "BROADCAST", summary.clone(), String::new())
         }
+        FleetEvent::PaneInputNotSubmitted {
+            agent,
+            typed_age_secs,
+        } => (
+            format!("[{agent} pane]"),
+            "TYPED-NOT-SUBMITTED",
+            format!("idle {typed_age_secs}s with un-submitted input"),
+            String::new(),
+        ),
     };
 
     // `tag  VERB  <summary>`: verb column is separated by two spaces on

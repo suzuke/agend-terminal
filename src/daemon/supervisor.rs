@@ -36,6 +36,16 @@ pub(crate) struct NotifyTrack {
     consecutive: u32,
 }
 
+/// Sprint 54 P2-3: dedup key for `PaneInputNotSubmitted` emission.
+/// Records the `last_input_epoch_ms` of the most recent emit so the
+/// supervisor doesn't re-fire on every 10-s tick while the operator
+/// stares at typed-but-not-submitted text. Re-arms when a fresh
+/// keystroke updates `last_input_epoch_ms` past the recorded value.
+#[derive(Debug, Default)]
+pub(crate) struct PaneInputTrack {
+    last_emitted_for_typed_ms: i64,
+}
+
 /// Per-agent ServerRateLimit retry state.
 #[derive(Debug, Clone)]
 pub(crate) struct RateLimitRetry {
@@ -81,11 +91,104 @@ pub fn spawn(home: PathBuf, registry: AgentRegistry) {
 fn run_loop(home: PathBuf, registry: AgentRegistry) {
     let mut notify_tracks: HashMap<String, NotifyTrack> = HashMap::new();
     let mut retry_tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+    let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
         process_server_rate_limit_retries(&home, &registry, &mut retry_tracks);
+        check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
     }
+}
+
+/// Sprint 54 P2-3: per-tick check for "typed but not submitted" pane
+/// state. Read-only — emits a `FleetEvent::PaneInputNotSubmitted` when
+/// the threshold is exceeded but does NOT inject prompts, mutate agent
+/// state, or touch the router layer (router = `src/channel/router/*`,
+/// Sprint 49/52 territory). Backend allowlist (claude only, first
+/// round) avoids false-positive flood for backends without
+/// `record_submit_activity` wiring.
+///
+/// Threshold defaults to 60s; override via env
+/// `AGEND_PANE_INPUT_THRESHOLD_SECS`.
+pub(crate) fn check_pane_input_not_submitted(
+    home: &std::path::Path,
+    registry: &AgentRegistry,
+    tracks: &mut HashMap<String, PaneInputTrack>,
+) {
+    let agent_names: Vec<String> = {
+        let reg = agent::lock_registry(registry);
+        reg.keys().cloned().collect()
+    };
+    check_pane_input_not_submitted_for_agents(home, &agent_names, tracks);
+}
+
+/// Sprint 54 P2-3: pure-function variant of
+/// [`check_pane_input_not_submitted`] that takes the agent name list
+/// directly. Lets tests exercise the detection / emission / dedup logic
+/// without standing up a real `AgentRegistry` (which would need a
+/// spawned PTY + child process).
+pub(crate) fn check_pane_input_not_submitted_for_agents(
+    home: &std::path::Path,
+    agent_names: &[String],
+    tracks: &mut HashMap<String, PaneInputTrack>,
+) {
+    let threshold_secs: u64 = std::env::var("AGEND_PANE_INPUT_THRESHOLD_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let threshold_ms = (threshold_secs as i64).saturating_mul(1000);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    for name in agent_names {
+        if !pane_input_backend_supported(home, name) {
+            continue;
+        }
+        let (typed_ms, submit_ms) =
+            crate::notification_queue::read_input_submit_timestamps(home, name);
+        if typed_ms == 0 || typed_ms <= submit_ms {
+            continue;
+        }
+        let typed_age_ms = now_ms.saturating_sub(typed_ms);
+        if typed_age_ms < threshold_ms {
+            continue;
+        }
+        let track = tracks.entry(name.clone()).or_default();
+        if track.last_emitted_for_typed_ms == typed_ms {
+            // Already notified for this exact typing event — wait for a
+            // new keystroke to re-arm.
+            continue;
+        }
+        track.last_emitted_for_typed_ms = typed_ms;
+        let typed_age_secs = (typed_age_ms / 1000).max(0) as u64;
+        crate::channel::sink_registry::registry().emit(&crate::channel::ux_event::UxEvent::Fleet(
+            crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted {
+                agent: name.clone(),
+                typed_age_secs,
+            },
+        ));
+        tracing::info!(
+            agent = %name,
+            typed_age_secs,
+            "pane-input-not-submitted detected (read-only diagnostic)"
+        );
+    }
+}
+
+/// Sprint 54 P2-3: backend allowlist for submit detection. Hard-coded
+/// claude-only first round per dispatch — extending to other backends
+/// requires both wiring `record_submit_activity` in
+/// `app::write_to_focused` AND adding the matching arm here. Resolves
+/// the agent's backend via fleet.yaml so per-instance overrides are
+/// honoured.
+fn pane_input_backend_supported(home: &std::path::Path, agent: &str) -> bool {
+    let Ok(fleet) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) else {
+        return false;
+    };
+    let Some(resolved) = fleet.resolve_instance(agent) else {
+        return false;
+    };
+    crate::backend::Backend::from_command(&resolved.backend_command)
+        .map(|b| matches!(b, crate::backend::Backend::ClaudeCode))
+        .unwrap_or(false)
 }
 
 /// Decide and dispatch member-state-change notify. Returns true if notify sent.
@@ -1055,5 +1158,218 @@ mod tests {
             !body.contains("format_notification"),
             "retry must NOT re-format notification (would add header)"
         );
+    }
+
+    // ─── Sprint 54 P2-3: pane-input-not-submitted detection tests ───
+
+    /// Helper: minimal `UxEventSink` that records every emitted event
+    /// in-memory so the supervisor's emission can be asserted without
+    /// standing up a real channel adapter.
+    struct TestSink {
+        events: parking_lot::Mutex<Vec<crate::channel::ux_event::UxEvent>>,
+    }
+    impl crate::channel::ux_event::UxEventSink for TestSink {
+        fn emit(&self, event: &crate::channel::ux_event::UxEvent) {
+            self.events.lock().push(event.clone());
+        }
+    }
+
+    /// Helper: stand up `home/fleet.yaml` declaring `agent_name` with the
+    /// chosen backend command, then return `home`. Used by the
+    /// pane-input-not-submitted suite so `pane_input_backend_supported`
+    /// resolves the agent against a real fleet config.
+    fn fleet_with_backend(tag: &str, agent_name: &str, backend_cmd: &str) -> std::path::PathBuf {
+        let home = tmp_home(tag);
+        std::fs::write(
+            home.join("fleet.yaml"),
+            format!(
+                "instances:\n  {agent_name}:\n    backend: {backend_cmd}\n    \
+                 working_directory: \"/tmp\"\n"
+            ),
+        )
+        .expect("write fleet.yaml");
+        home
+    }
+
+    /// Helper: pre-populate the agent's metadata with a typed timestamp
+    /// older than `now - threshold_secs` and a (possibly absent) submit
+    /// timestamp. Bypasses `record_input_activity` / `record_submit_activity`
+    /// so tests can set arbitrary epoch-ms values.
+    fn seed_input_submit(home: &std::path::Path, agent: &str, typed_ms: i64, submit_ms: i64) {
+        let meta_dir = home.join("metadata");
+        std::fs::create_dir_all(&meta_dir).ok();
+        let mut meta = serde_json::Map::new();
+        if typed_ms > 0 {
+            meta.insert("last_input_epoch_ms".into(), serde_json::json!(typed_ms));
+        }
+        if submit_ms > 0 {
+            meta.insert("last_submit_epoch_ms".into(), serde_json::json!(submit_ms));
+        }
+        std::fs::write(
+            meta_dir.join(format!("{agent}.json")),
+            serde_json::to_string_pretty(&serde_json::Value::Object(meta)).expect("serialize"),
+        )
+        .expect("write metadata");
+    }
+
+    #[test]
+    fn pane_input_not_submitted_emits_event_when_threshold_exceeded() {
+        // Per-test unique agent name avoids cross-test sink_registry
+        // contamination (cargo test runs in parallel; the global sink
+        // registry sees emissions from every test concurrently).
+        let agent = "claude-agent-pin-emit";
+        let home = fleet_with_backend("pin_emit", agent, "claude");
+        // Typed 5 minutes ago, never submitted → must emit.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        seed_input_submit(&home, agent, now_ms - 300_000, 0);
+        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
+        let sink = std::sync::Arc::new(TestSink {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        crate::channel::sink_registry::registry().register(sink.clone());
+        let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
+        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        let events = sink.events.lock();
+        let matched = events.iter().filter_map(|e| match e {
+            crate::channel::ux_event::UxEvent::Fleet(
+                crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted {
+                    agent: emitted, ..
+                },
+            ) if emitted == agent => Some(()),
+            _ => None,
+        });
+        assert!(
+            matched.count() >= 1,
+            "expected ≥1 PaneInputNotSubmitted event for {agent}, got: {events:?}"
+        );
+        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn pane_input_not_submitted_skips_when_within_threshold() {
+        let agent = "claude-agent-pin-within";
+        let home = fleet_with_backend("pin_within", agent, "claude");
+        // Typed 5s ago — well within default 60s threshold → no emit.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        seed_input_submit(&home, agent, now_ms - 5_000, 0);
+        let sink = std::sync::Arc::new(TestSink {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        crate::channel::sink_registry::registry().register(sink.clone());
+        let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
+        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        let events = sink.events.lock();
+        for e in events.iter() {
+            if let crate::channel::ux_event::UxEvent::Fleet(
+                crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted {
+                    agent: emitted, ..
+                },
+            ) = e
+            {
+                assert_ne!(emitted, agent, "must not emit within threshold");
+            }
+        }
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn pane_input_not_submitted_skips_when_submit_caught_up() {
+        let agent = "claude-agent-pin-submit";
+        let home = fleet_with_backend("pin_submit", agent, "claude");
+        // Typed 5min ago AND submitted 4min ago (submit > 0 and >= typed).
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        seed_input_submit(&home, agent, now_ms - 300_000, now_ms - 240_000);
+        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
+        let sink = std::sync::Arc::new(TestSink {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        crate::channel::sink_registry::registry().register(sink.clone());
+        let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
+        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        let events = sink.events.lock();
+        for e in events.iter() {
+            if let crate::channel::ux_event::UxEvent::Fleet(
+                crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted {
+                    agent: emitted, ..
+                },
+            ) = e
+            {
+                assert_ne!(
+                    emitted, agent,
+                    "must not emit when submit timestamp >= typed"
+                );
+            }
+        }
+        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn pane_input_not_submitted_skips_non_claude_backend() {
+        // kiro-cli is NOT on the submit-detection allowlist (claude-only first round).
+        let agent = "kiro-agent-pin-nonclaude";
+        let home = fleet_with_backend("pin_nonclaude", agent, "kiro-cli");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        seed_input_submit(&home, agent, now_ms - 300_000, 0);
+        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
+        let sink = std::sync::Arc::new(TestSink {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        crate::channel::sink_registry::registry().register(sink.clone());
+        let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
+        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        let events = sink.events.lock();
+        for e in events.iter() {
+            if let crate::channel::ux_event::UxEvent::Fleet(
+                crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted {
+                    agent: emitted, ..
+                },
+            ) = e
+            {
+                assert_ne!(
+                    emitted, agent,
+                    "non-claude backend must be skipped per allowlist"
+                );
+            }
+        }
+        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn pane_input_not_submitted_dedups_per_typed_timestamp() {
+        let agent = "claude-agent-pin-dedup";
+        let home = fleet_with_backend("pin_dedup", agent, "claude");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let typed_ms = now_ms - 300_000;
+        seed_input_submit(&home, agent, typed_ms, 0);
+        std::env::set_var("AGEND_PANE_INPUT_THRESHOLD_SECS", "60");
+        let sink = std::sync::Arc::new(TestSink {
+            events: parking_lot::Mutex::new(Vec::new()),
+        });
+        crate::channel::sink_registry::registry().register(sink.clone());
+        let mut tracks: HashMap<String, PaneInputTrack> = HashMap::new();
+        // Tick once → one emit. Tick again with same metadata → still one.
+        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        check_pane_input_not_submitted_for_agents(&home, &[agent.to_string()], &mut tracks);
+        let events = sink.events.lock();
+        let count = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    crate::channel::ux_event::UxEvent::Fleet(
+                        crate::channel::ux_event::FleetEvent::PaneInputNotSubmitted { agent: emitted, .. },
+                    ) if emitted == agent
+                )
+            })
+            .count();
+        assert_eq!(
+            count, 1,
+            "must dedup repeated ticks for same typed_ms; got {count}"
+        );
+        std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
+        std::fs::remove_dir_all(home).ok();
     }
 }
