@@ -25,24 +25,19 @@ agend-terminal app [--fleet <path>]
 Keybinds: see `src/keybinds.rs`. Prefix `Ctrl+B`, then `c` new tab, `n`/`p` next/prev, `"` / `%` split, `o` focus next pane, `x` close, `z` zoom, `[` scroll mode, `:` command palette, `d` detach, `?` help. Uppercase `D` / `T` open decisions / task overlays. `Space` cycles layout presets.
 
 ### `start`
-Start the daemon using `fleet.yaml`.
+Start the daemon using `fleet.yaml` or explicit `--agents`.
 
 ```
 agend-terminal start [--detached] [--fleet <path>]
+agend-terminal start --agents <name:cmd>...        # ad-hoc, no fleet.yaml
 ```
 - `--detached` — background the daemon (stdio → `$AGEND_HOME/daemon.log`); the foreground process exits once the daemon has published its run dir.
 - `--fleet <path>` — override fleet file. Default: `$AGEND_HOME/fleet.yaml`.
+- `--agents <NAME:CMD>...` — start with explicit agent specs instead of `fleet.yaml`. Mutually exclusive with `--fleet`/`--detached`. Subsumes the former `daemon` subcommand.
 
-On startup: prunes stale git worktrees, auto-creates a `general` instance if a Telegram channel is configured, initializes Telegram, and respawns any crashed agents per `HealthTracker`.
+Example: `agend-terminal start --agents dev:claude reviewer:claude shell:/bin/bash`
 
-### `daemon`
-Start the daemon with explicit agent specs (no `fleet.yaml`).
-
-```
-agend-terminal daemon [agents...]
-# agents are "name:command" pairs
-agend-terminal daemon dev:claude reviewer:claude shell:/bin/bash
-```
+On startup with fleet.yaml: prunes stale git worktrees, auto-creates a `general` instance if a Telegram channel is configured, initializes Telegram, and respawns any crashed agents per `HealthTracker`.
 
 ### `attach`
 Attach to a single agent's PTY (terminal view). `Ctrl+B d` to detach, daemon keeps the agent running.
@@ -58,20 +53,16 @@ Write arbitrary text to an agent's PTY (append `\r` if you need a newline).
 agend-terminal inject <name> <text...>
 ```
 
-### `list` / `ls`
-List running agents.
+### `list` / `ls` / `status`
+List running agents. Plain `list` reads run-dir port files directly (works even when the daemon API is briefly unresponsive). Pass `--detailed`/`-d` (or `--json`, which implies detailed) for state / health / backend info via the daemon API.
 
 ```
-agend-terminal list [--json]
-agend-terminal ls   [--json]
+agend-terminal list [--detailed] [--json]
+agend-terminal ls   [--detailed] [--json]   # alias
+agend-terminal status                       # alias of `list --detailed` (kept for back-compat)
 ```
 
-### `status`
-Detailed per-agent status: state (Idle, Thinking, ToolUse, RateLimit, Crashed, …), health counters, restart history.
-
-```
-agend-terminal status [--json]
-```
+`status` is preserved as a clap alias for `list` post Wave 1 CLI consolidation; new code should prefer `list --detailed`.
 
 ### `connect`
 Register an *already-running* local agent with the daemon (inbox-only — no PTY management). Useful in headless environments or to mix a manually-launched CLI into a running fleet.
@@ -97,14 +88,6 @@ Stop the daemon (also terminates all managed agents).
 agend-terminal stop
 ```
 
-### `fleet`
-Fleet management subcommands.
-
-```
-agend-terminal fleet start [<config>]   # alias for top-level `start`, optional fleet path
-agend-terminal fleet stop               # alias for top-level `stop`
-```
-
 ### `mcp`
 Start the MCP stdio server for the current instance. Intended to be invoked by an agent's backend, not by humans directly — the relevant backend config is auto-written to the agent's working directory by `mcp_config.rs`.
 
@@ -121,19 +104,14 @@ Spawn a backend CLI for N seconds and dump its VTerm screen (ANSI-stripped). Use
 agend-terminal capture --backend <name> [--seconds <N>]    # default 15s
 ```
 
-### `test`
-Internal QA hooks. Available suites: `mcp` (frame format sanity), `attach` (PTY spawn + inject), `inbox` (enqueue/drain), `api` (daemon API probe), `all` (attach + inbox).
-
-```
-agend-terminal test [<suite>]     # default: all
-```
-
 ### `verify`
 Full end-to-end verification across backends (spawns each configured backend, verifies PTY + VTerm + MCP wiring).
 
 ```
-agend-terminal verify [--json] [--backend <name>]
+agend-terminal verify [--json] [--backend <name>] [--quick]
 ```
+
+- `--quick` — skip per-backend tests + daemon-spawning tests; runs only the 4 in-process probes (attach, inbox, mcp framing, api). Completes in <30s. Subsumes the former `test` subcommand.
 
 ### `doctor`
 Health check: home directory, `.env`, `fleet.yaml` parse, active sockets, backend binary presence + version (plus a note if the installed backend version differs from the calibrated one used for state detection).
@@ -162,23 +140,6 @@ Generate a single text file with diagnostics, recent logs, and redacted config. 
 ```
 agend-terminal bugreport
 ```
-
-### `upgrade` (Unix only)
-Hot-upgrade the daemon to a new binary via `agend-supervisor`. Flow: stage new binary → self-test → stop old daemon → start new → wait for ready ping → stabilise for N seconds → commit (or roll back).
-
-```
-agend-terminal upgrade --binary <path> [--to-version <label>] [--yes] \
-                       [--install-supervisor] \
-                       [--stability-secs <N>] [--ready-timeout-secs <N>]
-```
-- `--binary <path>` — path to the new daemon binary (required).
-- `--to-version <label>` — human-visible version label; defaults to the new binary's `--version` output.
-- `--yes` — skip interactive confirmation. Required with `--install-supervisor`.
-- `--install-supervisor` — idempotent bootstrap of the supervisor layout on first upgrade.
-- `--stability-secs <N>` — stability window after switchover, seconds. Default `60`, `0` disables.
-- `--ready-timeout-secs <N>` — ready-ping timeout, seconds. Default `60`, `0` disables.
-
-See `docs/architecture.md` Module 8 for the supervisor design; Windows is not supported (the socket-swap + symlink-rename trick is Unix-only).
 
 ### `completions`
 Print shell completion scripts to stdout.

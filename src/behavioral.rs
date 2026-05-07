@@ -162,6 +162,12 @@ pub struct DivergenceStats {
 impl DivergenceStats {
     /// Divergence rate as percentage (0.0–100.0).
     /// Sprint 27 condition #1: ≤5% gate for behavioral promotion.
+    ///
+    /// Wave 1 CLI consolidation: the standalone `state-divergence-report`
+    /// CLI surface was removed (operator audit decision
+    /// `d-20260507155456191111-0`). The data layer stays intact for any
+    /// future API endpoint or daemon-side consumer.
+    #[allow(dead_code)]
     pub fn divergence_rate(&self) -> f64 {
         if self.total_ticks == 0 {
             0.0
@@ -201,6 +207,11 @@ pub fn reset_divergence() {
     *DIVERGENCE.lock() = None;
 }
 
+/// Wave 1 CLI consolidation: the standalone `state-divergence-report`
+/// CLI surface was removed (operator audit decision
+/// `d-20260507155456191111-0`). Data layer kept intact — future API
+/// endpoint or daemon-side consumer can re-expose if needed.
+#[allow(dead_code)]
 pub fn divergence_report() -> Vec<(String, DivergenceStats)> {
     let guard = DIVERGENCE.lock();
     match guard.as_ref() {

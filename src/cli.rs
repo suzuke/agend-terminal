@@ -1,7 +1,7 @@
 //! CLI helpers: doctor, capture, test runners.
 //! Extracted from main.rs for module split.
 
-use crate::{agent, api, backend, fleet, inbox};
+use crate::{agent, backend, fleet};
 use std::path::Path;
 
 /// Start daemon with fleet.yaml config.
@@ -88,169 +88,11 @@ pub fn capture_backend(b: &backend::Backend, seconds: u64) -> anyhow::Result<()>
 }
 
 // --- QA Tools ---
-
-pub fn run_tests(subcmd: &str, home: &Path) -> anyhow::Result<()> {
-    match subcmd {
-        "mcp" => test_mcp(home)?,
-        "attach" => test_attach(home)?,
-        "inbox" => test_inbox(home)?,
-        "api" => test_api(home)?,
-        "all" => {
-            test_attach(home)?;
-            test_inbox(home)?;
-        }
-        _ => {
-            tracing::error!(%subcmd, "unknown test — available: mcp, attach, inbox, api, all");
-            std::process::exit(1);
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::unwrap_used)]
-fn test_attach(_home: &Path) -> anyhow::Result<()> {
-    tracing::info!("test:attach — spawning bash");
-    let registry = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-    let args: Vec<String> = vec![];
-
-    agent::spawn_agent(
-        &agent::SpawnConfig {
-            name: "test-attach",
-            backend_command: crate::default_shell(),
-            args: &args,
-            spawn_mode: backend::SpawnMode::Fresh,
-            cols: 80,
-            rows: 24,
-            env: None,
-            working_dir: None,
-            submit_key: "\r",
-            home: None,
-            crash_tx: None,
-            shutdown: None,
-        },
-        &registry,
-    )?;
-
-    std::thread::sleep(std::time::Duration::from_secs(1));
-
-    tracing::info!("test:attach — injecting test command");
-    {
-        let reg = registry.lock();
-        let handle = reg.get("test-attach").unwrap();
-        agent::write_to_agent(handle, b"echo AGEND_TEST_OK\r")?;
-    }
-
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
-    let output = {
-        let reg = registry.lock();
-        let handle = reg.get("test-attach").unwrap();
-        let core = handle.core.lock();
-        let dump = core.vterm.dump_screen();
-        String::from_utf8_lossy(&dump).to_string()
-    };
-
-    if output.contains("AGEND_TEST_OK") {
-        tracing::info!("test:attach — PASS — PTY spawn + inject + VTerm output verified");
-    } else {
-        tracing::error!("test:attach — FAIL — 'AGEND_TEST_OK' not found in VTerm output");
-        std::process::exit(1);
-    }
-
-    {
-        let reg = registry.lock();
-        let handle = reg.get("test-attach").unwrap();
-        let mut child = handle.child.lock();
-        let _ = child.kill();
-    }
-
-    tracing::info!("test:attach — cleanup done");
-    Ok(())
-}
-
-fn test_mcp(_home: &Path) -> anyhow::Result<()> {
-    tracing::info!("test:mcp — testing MCP protocol");
-    let init_req = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
-    let init_frame = format!("Content-Length: {}\r\n\r\n{}", init_req.len(), init_req);
-    tracing::info!(
-        bytes = init_frame.len(),
-        "test:mcp — Content-Length frame format OK"
-    );
-    tracing::info!("test:mcp — PASS — MCP framing verified");
-    Ok(())
-}
-
-fn test_inbox(home: &Path) -> anyhow::Result<()> {
-    tracing::info!("test:inbox — testing enqueue + drain");
-
-    let test_name = "test-inbox-agent";
-
-    for i in 1..=3 {
-        inbox::enqueue(
-            home,
-            test_name,
-            inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                thread_id: None,
-                parent_id: None,
-                task_id: None,
-                force_meta: None,
-                correlation_id: None,
-                reviewed_head: None,
-                from: format!("tester-{i}"),
-                text: format!("Message {i}"),
-                kind: None,
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: None,
-                delivery_mode: None,
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-            },
-        )?;
-    }
-
-    let messages = inbox::drain(home, test_name);
-    assert_eq!(
-        messages.len(),
-        3,
-        "Expected 3 messages, got {}",
-        messages.len()
-    );
-    assert_eq!(messages[0].from, "tester-1");
-    assert_eq!(messages[2].text, "Message 3");
-
-    let empty = inbox::drain(home, test_name);
-    assert!(empty.is_empty(), "Inbox should be empty after drain");
-
-    let _ = std::fs::remove_file(home.join("inbox").join(format!("{test_name}.jsonl")));
-
-    tracing::info!("test:inbox — PASS — enqueue + drain + empty verified");
-    Ok(())
-}
-
-fn test_api(home: &Path) -> anyhow::Result<()> {
-    tracing::info!("test:api — checking for running daemon");
-
-    match api::call(home, &serde_json::json!({"method": api::method::LIST})) {
-        Ok(resp) => {
-            let agents = resp["result"]["agents"]
-                .as_array()
-                .map(|a| a.len())
-                .unwrap_or(0);
-            tracing::info!(%agents, "test:api — PASS — API socket responsive");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "test:api — SKIP — daemon not running");
-        }
-    }
-
-    Ok(())
-}
+//
+// Wave 1 CLI consolidation: the standalone `test` subcommand was removed.
+// Its in-process probes (test_attach / test_mcp / test_inbox / test_api)
+// duplicated the equivalents in `verify.rs`; callers now use
+// `verify --quick` which runs the same 4 probes from the verify module.
 
 pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     println!("AgEnD Terminal Doctor\n");

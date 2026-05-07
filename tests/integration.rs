@@ -41,7 +41,10 @@ impl TestDaemon {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("create home");
 
-        let mut args: Vec<&str> = vec!["daemon"];
+        // Wave 1 CLI consolidation: the historical `daemon` subcommand was
+        // removed; `start --agents <name:cmd ...>` is the canonical
+        // replacement.
+        let mut args: Vec<&str> = vec!["start", "--agents"];
         args.extend(agents);
 
         let child = Command::new(binary())

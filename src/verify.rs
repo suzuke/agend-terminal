@@ -73,7 +73,12 @@ fn poll_until(deadline: std::time::Instant, mut check: impl FnMut() -> bool) -> 
     false
 }
 
-pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyhow::Result<()> {
+pub fn run(
+    home: &Path,
+    json_output: bool,
+    backend_filter: Option<&str>,
+    quick: bool,
+) -> anyhow::Result<()> {
     let test_home = home.join("_verify_tmp");
     std::fs::create_dir_all(&test_home)?;
 
@@ -84,6 +89,13 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
         test_backend_config(&test_home),
         test_instructions(&test_home),
     ];
+
+    // Wave 1 CLI consolidation: `--quick` skips daemon spawn + per-backend
+    // tests and runs only the in-process probes above. Subsumes the
+    // former `test` subcommand.
+    if quick {
+        return finalize_results(&test_home, results, json_output);
+    }
 
     // --- Tests that need daemon ---
     // Start a test daemon
@@ -178,9 +190,20 @@ pub fn run(home: &Path, json_output: bool, backend_filter: Option<&str>) -> anyh
         }
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let _ = std::fs::remove_dir_all(&test_home);
 
-    // --- Report ---
+    finalize_results(&test_home, results, json_output)
+}
+
+/// Wave 1 CLI consolidation: extracted from `run()` so `--quick` mode
+/// can return early after the in-process probes without spawning the
+/// test daemon. Cleans up the temp dir and prints the report.
+fn finalize_results(
+    test_home: &Path,
+    results: Vec<TestResult>,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let _ = std::fs::remove_dir_all(test_home);
+
     let passed = results
         .iter()
         .filter(|r| r.passed && !r.detail.starts_with("SKIP"))
