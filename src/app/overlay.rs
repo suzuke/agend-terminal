@@ -380,7 +380,9 @@ pub(super) fn handle_key(
                         // pattern that fed `auto_start_fleet` revival is
                         // gone.
                         if let Err(detail) =
-                            crate::mcp::handlers::instance::full_delete_instance(ctx.home, name)
+                            crate::mcp::handlers::instance_lifecycle::full_delete_instance(
+                                ctx.home, name,
+                            )
                         {
                             tracing::warn!(name, detail = %detail,
                                 "TUI tab close: residual state — operator may need manual cleanup");
@@ -404,7 +406,9 @@ pub(super) fn handle_key(
                         // Sprint 54 P1-B Bug 1: see tab-close branch above
                         // for the Result-vs-warn rationale.
                         if let Err(detail) =
-                            crate::mcp::handlers::instance::full_delete_instance(ctx.home, name)
+                            crate::mcp::handlers::instance_lifecycle::full_delete_instance(
+                                ctx.home, name,
+                            )
                         {
                             tracing::warn!(name, detail = %detail,
                                 "TUI pane close: residual state — operator may need manual cleanup");
