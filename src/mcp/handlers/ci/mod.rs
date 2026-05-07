@@ -254,10 +254,25 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             .unwrap_or_default()
             .as_bytes(),
     );
+    // Sprint 54 P0-5 (sub-scope A): response enrichment — agents see
+    // CI health without polling the watch file. Read state freshly
+    // from `watch` JSON we just composed; populate diagnostic fields
+    // when the data is available, leave as `null` otherwise.
+    let now_secs = chrono::Utc::now().timestamp();
+    let rate_limit_until = watch["rate_limit_until"].as_i64();
+    let rate_limit_active = match rate_limit_until {
+        Some(reset) => reset > now_secs,
+        None => false,
+    };
+    let next_poll_eta = compute_next_poll_eta(&watch);
+
     let mut resp = json!({
         "repo": repo,
         "watching": true,
         "subscribers": subscribers,
+        "rate_limit_active": rate_limit_active,
+        "rate_limit_until": rate_limit_until,
+        "next_poll_eta": next_poll_eta,
     });
     // Sprint 54 P0-4: surface `setup_warning` (canonical field name per
     // FLEET-DEV-PROTOCOL §X) so agents can advise users to install
@@ -267,6 +282,22 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         resp["setup_warning"] = json!(w);
     }
     resp
+}
+
+/// Sprint 54 P0-5 helper: estimate the next poll's epoch-millis tick
+/// from `last_polled_at` + `effective_interval_secs` (or `interval_secs`
+/// when adaptive backoff hasn't been computed yet). Returns `None` for
+/// fresh watches that haven't polled yet.
+///
+/// Pure function — no IO, no global state. Same input shape used by
+/// the `ci status` aggregator below so the two surfaces never disagree.
+fn compute_next_poll_eta(watch: &Value) -> Option<i64> {
+    let last_polled_at = watch["last_polled_at"].as_i64()?;
+    let interval_secs = watch["effective_interval_secs"]
+        .as_u64()
+        .or_else(|| watch["interval_secs"].as_u64())
+        .unwrap_or(60);
+    Some(last_polled_at + (interval_secs as i64) * 1000)
 }
 
 /// `ci unwatch` action: unsubscribe the caller from `repo@branch`.
@@ -349,6 +380,90 @@ pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
         "watching": true,
         "subscribers": subscribers,
     })
+}
+
+/// `ci status` MCP action (Sprint 54 P0-5 sub-scope C). Returns a
+/// snapshot of every CI watch the caller subscribes to, with full
+/// health diagnostics inlined. Optional `repo` / `branch` args narrow
+/// the result; both must match when both are provided.
+///
+/// Caller filtering: agents only see watches they're subscribed to —
+/// avoids leaking lead's polling targets to every dev. The empty
+/// instance name (anonymous CLI) sees all watches.
+pub(super) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let filter_repo = args["repo"].as_str();
+    let filter_branch = args["branch"].as_str();
+    let ci_dir = home.join("ci-watches");
+    let entries = match std::fs::read_dir(&ci_dir) {
+        Ok(e) => e,
+        Err(_) => return json!({"watches": Vec::<Value>::new()}),
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let now_secs = chrono::Utc::now().timestamp();
+
+    let mut out: Vec<Value> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let watch: Value = match std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+        {
+            Some(v) => v,
+            None => continue,
+        };
+        let repo = match watch["repo"].as_str() {
+            Some(r) => r,
+            None => continue,
+        };
+        let branch = watch["branch"].as_str().unwrap_or("main");
+        if let Some(want) = filter_repo {
+            if repo != want {
+                continue;
+            }
+        }
+        if let Some(want) = filter_branch {
+            if branch != want {
+                continue;
+            }
+        }
+        let subscribers = crate::daemon::ci_watch::parse_subscribers(&watch);
+        // Caller scoping: an agent with a name sees only the watches
+        // they're a subscriber of. Anonymous calls (empty instance)
+        // see everything — useful for operator triage via the CLI.
+        if !instance_name.is_empty() && !subscribers.iter().any(|s| s == instance_name) {
+            continue;
+        }
+        let rate_limit_until = watch["rate_limit_until"].as_i64();
+        let rate_limit_active = match rate_limit_until {
+            Some(reset) => reset > now_secs,
+            None => false,
+        };
+        let _ = now_ms; // anchor: keep timestamp-millis consistency with response enrichment
+        out.push(json!({
+            "repo": repo,
+            "branch": branch,
+            "subscribers": subscribers,
+            "rate_limit_active": rate_limit_active,
+            "rate_limit_until": rate_limit_until,
+            "rate_limit_remaining": watch["rate_limit_remaining"].as_u64(),
+            "rate_limit_limit": watch["rate_limit_limit"].as_u64(),
+            "effective_interval_secs": watch["effective_interval_secs"].as_u64(),
+            "interval_secs": watch["interval_secs"].as_u64().unwrap_or(60),
+            "next_poll_eta": compute_next_poll_eta(&watch),
+            "consecutive_skips": watch["consecutive_skips"].as_u64().unwrap_or(0),
+            "stalled_notified": watch["stalled_notified"].as_bool().unwrap_or(false),
+            "stalled_since_ms": watch["stalled_since_ms"].as_i64(),
+            "last_polled_at": watch["last_polled_at"].as_i64(),
+            "last_terminal_seen_at": watch["last_terminal_seen_at"].as_str(),
+            "head_sha": watch["head_sha"].as_str(),
+            "expires_at": watch["expires_at"].as_str(),
+        }));
+    }
+    let mut resp = json!({"watches": out});
+    if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
+        resp["setup_warning"] = json!(w);
+    }
+    resp
 }
 
 #[cfg(test)]

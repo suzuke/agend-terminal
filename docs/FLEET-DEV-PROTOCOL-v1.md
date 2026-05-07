@@ -151,6 +151,17 @@ it appears in a session — it is operator-actionable guidance, not a
 log line. Suggested phrasing: "CI watch responded: <setup_warning>".
 Subsequent occurrences within the same session may be deduplicated.
 
+**Health surface (Sprint 54 P0-5)**. The `ci(action: watch)` response
+and the new `ci(action: status)` aggregator both carry `rate_limit_active`,
+`rate_limit_until`, and `next_poll_eta` so agents can tell whether CI
+polling is healthy without reading watch files. The daemon also
+fans out two inbox event kinds when polling stalls behind a rate-limit
+window: `ci-watch-stalled` after 3 consecutive missed polls (exactly
+once per stall window) and `ci-watch-resumed` on the first successful
+poll afterward. Both events go to every subscriber via the P0-1 fan-out
+contract — no last-write-wins. Surface stalled events promptly; resumed
+events confirm recovery and may be acknowledged silently.
+
 ## §8. Progress Visibility
 
 Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml origin) broadcast with `origin` field. `create_instance` defaults to isolated workspace (`~/.agend-terminal/workspace/<name>`).

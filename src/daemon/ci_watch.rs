@@ -811,6 +811,173 @@ impl CiProvider for BitbucketCiProvider {
 /// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
 pub const WATCH_TTL_HOURS: i64 = 72;
 
+/// Sprint 54 P0-5 (sub-scope B): consecutive rate-limited skips before a
+/// `[ci-watch-stalled]` notification fires. Picked low (3) so a watch
+/// stuck behind a multi-minute reset window surfaces quickly without
+/// over-paging on a one-tick blip.
+pub(crate) const STALL_THRESHOLD: u64 = 3;
+
+/// Sprint 54 P0-5 helper: read existing `consecutive_skips`, increment,
+/// persist, and (if we just crossed `STALL_THRESHOLD` and haven't yet
+/// notified for this window) fan out a `[ci-watch-stalled]` inbox event
+/// to every subscriber. The notify step reuses the P0-1 fan-out
+/// contract — one inbox enqueue per subscriber.
+///
+/// Atomicity: the increment + `stalled_notified` flag move in a single
+/// atomic_write so the next tick can't observe a "skips ≥ threshold,
+/// flag still false" intermediate state and fire a duplicate event.
+fn bump_consecutive_skips_and_maybe_notify(
+    home: &Path,
+    watch_path: &Path,
+    repo: &str,
+    branch: &str,
+    subscribers: &[String],
+    reset_epoch: u64,
+) {
+    let mut watch: serde_json::Value = match std::fs::read_to_string(watch_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+    {
+        Some(v) => v,
+        None => return,
+    };
+    let prev_skips = watch["consecutive_skips"].as_u64().unwrap_or(0);
+    let next_skips = prev_skips.saturating_add(1);
+    watch["consecutive_skips"] = serde_json::json!(next_skips);
+
+    let already_notified = watch["stalled_notified"].as_bool().unwrap_or(false);
+    let should_notify = next_skips >= STALL_THRESHOLD && !already_notified;
+    if should_notify {
+        watch["stalled_notified"] = serde_json::json!(true);
+        // Stamp `stalled_since_ms` only on the first stall write — gives
+        // operators a stable anchor in the inbox payload.
+        if watch["stalled_since_ms"].as_i64().is_none() {
+            watch["stalled_since_ms"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
+        }
+    }
+    let _ = crate::store::atomic_write(
+        watch_path,
+        serde_json::to_string_pretty(&watch)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+
+    if should_notify {
+        let stalled_since_ms = watch["stalled_since_ms"].as_i64();
+        // next_poll_eta = reset_epoch_ms (skip lifts at reset, then
+        // adaptive backoff applies — but reset is the user-visible
+        // "stalled until" moment).
+        let next_poll_eta = (reset_epoch as i64).saturating_mul(1000);
+        let setup_warning = crate::github_token::cached_setup_warning();
+        let body = build_stalled_body(repo, branch, stalled_since_ms, next_poll_eta, setup_warning);
+        fan_out_health_event(home, repo, branch, subscribers, "ci-watch-stalled", body);
+    }
+}
+
+/// Sprint 54 P0-5 helper: clear the stall state on the first successful
+/// poll after a stall window. Fans out `[ci-watch-resumed]` exactly
+/// once per resume — symmetry with the stalled path.
+fn clear_stall_and_maybe_notify_resumed(
+    home: &Path,
+    watch_path: &Path,
+    repo: &str,
+    branch: &str,
+    subscribers: &[String],
+) {
+    let mut watch: serde_json::Value = match std::fs::read_to_string(watch_path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+    {
+        Some(v) => v,
+        None => return,
+    };
+    let was_stalled = watch["stalled_notified"].as_bool().unwrap_or(false);
+    let had_skips = watch["consecutive_skips"].as_u64().unwrap_or(0) > 0;
+    if !was_stalled && !had_skips {
+        return; // common case — no stall in flight, nothing to write.
+    }
+    watch["consecutive_skips"] = serde_json::json!(0);
+    watch["stalled_notified"] = serde_json::json!(false);
+    watch["stalled_since_ms"] = serde_json::Value::Null;
+    let _ = crate::store::atomic_write(
+        watch_path,
+        serde_json::to_string_pretty(&watch)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    if was_stalled {
+        let body =
+            format!("[ci-watch-resumed] {repo}@{branch}: poll resumed after rate-limit backoff");
+        fan_out_health_event(home, repo, branch, subscribers, "ci-watch-resumed", body);
+    }
+}
+
+fn build_stalled_body(
+    repo: &str,
+    branch: &str,
+    stalled_since_ms: Option<i64>,
+    next_poll_eta_ms: i64,
+    setup_warning: Option<&'static str>,
+) -> String {
+    let mut s = format!("[ci-watch-stalled] {repo}@{branch}: rate-limit backoff in effect");
+    if let Some(ts) = stalled_since_ms {
+        if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts) {
+            s.push_str(&format!("\nStalled since: {}", dt.to_rfc3339()));
+        }
+    }
+    if let Some(eta) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(next_poll_eta_ms) {
+        s.push_str(&format!("\nNext poll ETA: {}", eta.to_rfc3339()));
+    }
+    if let Some(w) = setup_warning {
+        s.push_str(&format!("\nSetup hint: {w}"));
+    }
+    s
+}
+
+/// Sprint 54 P0-5: fan out a CI health event to every subscriber.
+/// Mirrors the P0-1 terminal-notify loop — one inbox enqueue per
+/// subscriber so multi-caller watches don't get last-write-wins.
+fn fan_out_health_event(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    subscribers: &[String],
+    kind: &str,
+    body: String,
+) {
+    let repo_branch_key = format!("{repo}@{branch}");
+    let supersede_token = format!("{kind}-{}", chrono::Utc::now().timestamp_millis());
+    for sub in subscribers {
+        crate::inbox::mark_ci_watch_superseded(home, sub, &repo_branch_key, &supersede_token);
+        let _ = crate::inbox::enqueue(
+            home,
+            sub,
+            crate::inbox::InboxMessage {
+                schema_version: 0,
+                id: None,
+                read_at: None,
+                thread_id: None,
+                parent_id: None,
+                task_id: None,
+                force_meta: None,
+                correlation_id: None,
+                reviewed_head: None,
+                from: "system:ci".to_string(),
+                text: body.clone(),
+                kind: Some(kind.to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                channel: None,
+                delivery_mode: None,
+                attachments: vec![],
+                in_reply_to_msg_id: None,
+                in_reply_to_excerpt: None,
+                superseded_by: None,
+                from_id: None,
+            },
+        );
+    }
+}
+
 /// Read the list of subscribed instances from a watch JSON value.
 ///
 /// Schema migration (Sprint 54 P0-1): the canonical source is the
@@ -1135,6 +1302,19 @@ fn check_ci_watches_with_provider(
         // Rate-limit backoff: skip polling until X-RateLimit-Reset time.
         if let Some(reset_epoch) = watch["rate_limit_until"].as_u64() {
             if (chrono::Utc::now().timestamp() as u64) < reset_epoch {
+                // Sprint 54 P0-5 (sub-scope B): increment consecutive_skips
+                // on each rate-limited tick so subscribers see a
+                // `[ci-watch-stalled]` event after STALL_THRESHOLD
+                // consecutive misses. Persist atomically with `stalled_notified`
+                // so the dispatch is exactly-once per stall window.
+                bump_consecutive_skips_and_maybe_notify(
+                    home,
+                    &path,
+                    &repo,
+                    &branch,
+                    &subscribers,
+                    reset_epoch,
+                );
                 continue;
             }
         }
@@ -1524,6 +1704,12 @@ async fn ci_check_repo(
                     }
                 }
             }
+            // Sprint 54 P0-5 (sub-scope B): a successful poll clears
+            // any in-flight stall state. If we previously fired
+            // `[ci-watch-stalled]`, the symmetrical
+            // `[ci-watch-resumed]` event fans out to subscribers
+            // exactly once.
+            clear_stall_and_maybe_notify_resumed(home, watch_path, repo, branch, subscribers);
             if runs.is_empty() {
                 return Ok(());
             }
@@ -3756,5 +3942,207 @@ mod tests {
     fn parse_subscribers_empty_when_no_data() {
         let watch = serde_json::json!({});
         assert!(parse_subscribers(&watch).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Sprint 54 P0-5 (sub-scope B) — consecutive_skips tracking +
+    // stalled/resumed inbox fan-out. Each test pins one of the four
+    // contract gates from dispatch m-20260507045729197032-16.
+    //
+    // EMPIRICAL REGRESSION-PROOF ANCHOR: if the
+    // `if next_skips >= STALL_THRESHOLD && !already_notified` guard
+    // in `bump_consecutive_skips_and_maybe_notify` is dropped, the
+    // "fires exactly once" assertion in
+    // `stalled_event_fires_exactly_once_at_threshold` fails because
+    // every subsequent skip would re-enqueue. PR description carries
+    // the captured FAIL signature.
+    // -----------------------------------------------------------------
+
+    fn p05_temp_home(tag: &str) -> std::path::PathBuf {
+        let dir = tmp_dir(tag);
+        std::fs::create_dir_all(dir.join("ci-watches")).ok();
+        std::fs::create_dir_all(dir.join("inbox")).ok();
+        dir
+    }
+
+    fn p05_write_watch(
+        home: &Path,
+        repo: &str,
+        branch: &str,
+        watch: serde_json::Value,
+    ) -> std::path::PathBuf {
+        let path = home.join("ci-watches").join(watch_filename(repo, branch));
+        std::fs::write(&path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+        path
+    }
+
+    fn p05_read_inbox_lines(home: &Path, instance: &str) -> Vec<String> {
+        let path = home.join("inbox").join(format!("{instance}.jsonl"));
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn consecutive_skips_increments_on_rate_limited_skip() {
+        // Gate 1: each rate-limited skip bumps the counter atomically.
+        let home = p05_temp_home("p05_skip_inc");
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"}],
+            "consecutive_skips": 0,
+        });
+        let path = p05_write_watch(&home, "o/r", "feat", watch);
+        let subscribers = vec!["lead".to_string()];
+
+        let future_reset = (chrono::Utc::now().timestamp() as u64) + 3600;
+        bump_consecutive_skips_and_maybe_notify(
+            &home,
+            &path,
+            "o/r",
+            "feat",
+            &subscribers,
+            future_reset,
+        );
+        bump_consecutive_skips_and_maybe_notify(
+            &home,
+            &path,
+            "o/r",
+            "feat",
+            &subscribers,
+            future_reset,
+        );
+        let watch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(watch["consecutive_skips"].as_u64(), Some(2));
+        // Below threshold: stalled_notified is either absent (None) or
+        // false — both mean "no notify fired yet".
+        let notified = watch["stalled_notified"].as_bool().unwrap_or(false);
+        assert!(!notified, "below threshold ⇒ no notify yet");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn stalled_event_fires_exactly_once_at_threshold() {
+        // Gate 2: at N=3 a [ci-watch-stalled] enqueues; further
+        // tick-skips don't re-fire. This is the regression-proof
+        // anchor — collapsing the guard reveals duplicates.
+        let home = p05_temp_home("p05_stalled_once");
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"}],
+            "consecutive_skips": 0,
+        });
+        let path = p05_write_watch(&home, "o/r", "feat", watch);
+        let subscribers = vec!["lead".to_string()];
+        let future_reset = (chrono::Utc::now().timestamp() as u64) + 3600;
+
+        for _ in 0..5 {
+            bump_consecutive_skips_and_maybe_notify(
+                &home,
+                &path,
+                "o/r",
+                "feat",
+                &subscribers,
+                future_reset,
+            );
+        }
+
+        let lines = p05_read_inbox_lines(&home, "lead");
+        let stalled_count = lines
+            .iter()
+            .filter(|l| l.contains("ci-watch-stalled"))
+            .count();
+        assert_eq!(
+            stalled_count, 1,
+            "exactly one stalled event per stall window (got {stalled_count})"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resumed_event_fires_on_first_successful_clear() {
+        // Gate 3: resume helper fires [ci-watch-resumed] exactly once
+        // and clears the stall state.
+        let home = p05_temp_home("p05_resumed");
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"}],
+            "consecutive_skips": 5,
+            "stalled_notified": true,
+            "stalled_since_ms": 1700000000000_i64,
+        });
+        let path = p05_write_watch(&home, "o/r", "feat", watch);
+        let subscribers = vec!["lead".to_string()];
+
+        clear_stall_and_maybe_notify_resumed(&home, &path, "o/r", "feat", &subscribers);
+        // Second call must be a silent no-op (state already cleared).
+        clear_stall_and_maybe_notify_resumed(&home, &path, "o/r", "feat", &subscribers);
+
+        let watch: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(watch["consecutive_skips"].as_u64(), Some(0));
+        assert_eq!(watch["stalled_notified"].as_bool(), Some(false));
+        assert!(watch["stalled_since_ms"].is_null());
+
+        let lines = p05_read_inbox_lines(&home, "lead");
+        let resumed = lines
+            .iter()
+            .filter(|l| l.contains("ci-watch-resumed"))
+            .count();
+        assert_eq!(resumed, 1, "exactly one resumed event per recovery");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn stalled_and_resumed_fan_out_to_all_subscribers() {
+        // Gate 4: both event types reach every subscriber per the
+        // P0-1 fan-out contract.
+        let home = p05_temp_home("p05_fanout");
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [
+                {"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"},
+                {"instance": "dev",  "subscribed_at": "2026-05-07T00:00:01Z"}
+            ],
+            "consecutive_skips": 0,
+        });
+        let path = p05_write_watch(&home, "o/r", "feat", watch);
+        let subscribers = vec!["lead".to_string(), "dev".to_string()];
+        let future_reset = (chrono::Utc::now().timestamp() as u64) + 3600;
+
+        for _ in 0..STALL_THRESHOLD {
+            bump_consecutive_skips_and_maybe_notify(
+                &home,
+                &path,
+                "o/r",
+                "feat",
+                &subscribers,
+                future_reset,
+            );
+        }
+        for sub in ["lead", "dev"] {
+            let lines = p05_read_inbox_lines(&home, sub);
+            assert!(
+                lines.iter().any(|l| l.contains("ci-watch-stalled")),
+                "{sub} must receive stalled event (fan-out regression)"
+            );
+        }
+
+        clear_stall_and_maybe_notify_resumed(&home, &path, "o/r", "feat", &subscribers);
+        for sub in ["lead", "dev"] {
+            let lines = p05_read_inbox_lines(&home, sub);
+            assert!(
+                lines.iter().any(|l| l.contains("ci-watch-resumed")),
+                "{sub} must receive resumed event"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }

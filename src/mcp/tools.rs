@@ -205,13 +205,13 @@ fn deploy_tools() -> Vec<Value> {
 
 fn ci_tools() -> Vec<Value> {
     vec![
-        json!({"name": "ci", "description": "Manage CI watching. Actions: watch, unwatch.",
+        json!({"name": "ci", "description": "Manage CI watching. Actions: watch, unwatch, status.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["watch", "unwatch"]},
-                "repo": {"type": "string", "description": "GitHub repo (owner/repo)"},
-                "branch": {"type": "string", "description": "Branch to watch (default: main)"},
+                "action": {"type": "string", "enum": ["watch", "unwatch", "status"]},
+                "repo": {"type": "string", "description": "GitHub repo (owner/repo). Required for watch/unwatch; optional filter for status."},
+                "branch": {"type": "string", "description": "Branch to watch (default: main); optional filter for status."},
                 "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"}
-            }, "required": ["action", "repo"]}}),
+            }, "required": ["action"]}}),
     ]
 }
 
