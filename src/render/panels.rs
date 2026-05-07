@@ -9,6 +9,25 @@ use ratatui::Frame;
 use super::overlay::render_overlay_frame;
 use super::panels_fleet::{render_fleet_view, render_monitor_view};
 
+/// Sprint 54 P2-6: convert an RFC 3339 UTC timestamp into a short
+/// runtime-local-timezone display string `MM-DD HH:MM`. Used by the
+/// expanded decision view so a UTC+8 reader doesn't see "yesterday's
+/// date" for a 22:00 UTC event. Store / wire format stays UTC; this
+/// helper is render-only.
+///
+/// Falls back to the original first-10-char slice on parse error so the
+/// pre-fix behaviour is preserved when the input isn't valid RFC 3339
+/// (e.g. legacy fixtures, mid-migration data).
+fn format_local_short(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|d| {
+            d.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| rfc3339.chars().take(10).collect())
+}
+
 pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision], scroll: usize) {
     let count = items.len();
     let title = format!(" Decisions ({count}) | j/k scroll | q close ");
@@ -42,7 +61,7 @@ pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision],
                 format!(
                     "    by {} | {}",
                     d.author,
-                    &d.created_at.get(..10).unwrap_or(&d.created_at)
+                    format_local_short(&d.created_at)
                 ),
                 Style::default().fg(Color::DarkGray),
             )));
@@ -561,5 +580,53 @@ mod tests {
             !output.contains("? help"),
             "Help mode should NOT show '? help' hint, got:\n{output}"
         );
+    }
+
+    // ─── Sprint 54 P2-6 timezone display tests ─────────────────────────
+
+    /// `Z` form parses → render-local conversion → `MM-DD HH:MM` shape
+    /// (5 chars + space + 5 chars = 11 chars, e.g. `05-08 06:00` for
+    /// UTC+8 viewer of `2026-05-07T22:00:00Z`). Shape-only assertion so
+    /// the test passes on every CI runner regardless of TZ.
+    #[test]
+    fn format_local_short_shapes_rfc3339_z_to_md_hm() {
+        let out = super::format_local_short("2026-05-07T22:00:00Z");
+        // Expect "MM-DD HH:MM" — 11 chars: 2 digits, dash, 2 digits,
+        // space, 2 digits, colon, 2 digits.
+        assert_eq!(out.len(), 11, "expected MM-DD HH:MM shape, got {out:?}");
+        let bytes = out.as_bytes();
+        assert!(bytes[0].is_ascii_digit() && bytes[1].is_ascii_digit());
+        assert_eq!(bytes[2], b'-');
+        assert!(bytes[3].is_ascii_digit() && bytes[4].is_ascii_digit());
+        assert_eq!(bytes[5], b' ');
+        assert!(bytes[6].is_ascii_digit() && bytes[7].is_ascii_digit());
+        assert_eq!(bytes[8], b':');
+        assert!(bytes[9].is_ascii_digit() && bytes[10].is_ascii_digit());
+    }
+
+    /// Explicit `+00:00` offset form yields the same shaped output as
+    /// the `Z` form — proves the parser accepts both RFC 3339 variants.
+    #[test]
+    fn format_local_short_explicit_offset_matches_z_form() {
+        let z_form = super::format_local_short("2026-05-07T22:00:00Z");
+        let off_form = super::format_local_short("2026-05-07T22:00:00+00:00");
+        assert_eq!(
+            z_form, off_form,
+            "Z and +00:00 RFC 3339 forms must produce identical local renders"
+        );
+    }
+
+    /// Garbage input falls back to the first-10-char slice — preserves
+    /// the pre-fix behaviour exactly so legacy fixtures / mid-migration
+    /// data render the same as before, just without TZ adjustment.
+    #[test]
+    fn format_local_short_falls_back_on_parse_error() {
+        // Pre-fix slice was `&s.get(..10).unwrap_or(s)` — for a string
+        // shorter than 10 chars `take(10)` collects whatever exists.
+        // 13-char garbage truncates to 10. 10-char garbage stays whole.
+        // Sub-10-char input passes through unchanged.
+        assert_eq!(super::format_local_short("garbage123456"), "garbage123");
+        assert_eq!(super::format_local_short("not-a-date"), "not-a-date");
+        assert_eq!(super::format_local_short("short"), "short");
     }
 }
