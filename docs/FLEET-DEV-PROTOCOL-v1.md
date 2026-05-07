@@ -142,6 +142,15 @@ Use `send` for all inter-agent messaging:
 
 Use `ci(action: watch)`, not manual polling. Clean up worktree + branch after merge.
 
+**Setup-warning surfacing (Sprint 54 P0-4)**. CI-related MCP responses
+may include a top-level `setup_warning` string when no GitHub token is
+reachable (env unset AND `gh` unavailable/unauthed). The daemon polls
+unauthenticated in that state and exhausts the 60 req/hr cap quickly.
+Agents MUST surface `setup_warning` verbatim to the user the first time
+it appears in a session — it is operator-actionable guidance, not a
+log line. Suggested phrasing: "CI watch responded: <setup_warning>".
+Subsequent occurrences within the same session may be deduplicated.
+
 ## §8. Progress Visibility
 
 Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml origin) broadcast with `origin` field. `create_instance` defaults to isolated workspace (`~/.agend-terminal/workspace/<name>`).

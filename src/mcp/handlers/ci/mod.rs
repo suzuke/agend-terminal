@@ -259,8 +259,12 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         "watching": true,
         "subscribers": subscribers,
     });
+    // Sprint 54 P0-4: surface `setup_warning` (canonical field name per
+    // FLEET-DEV-PROTOCOL §X) so agents can advise users to install
+    // `gh` or set `GITHUB_TOKEN`. Only fires when neither env nor
+    // `gh auth` produced a token.
     if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
-        resp["warning"] = json!(w);
+        resp["setup_warning"] = json!(w);
     }
     resp
 }

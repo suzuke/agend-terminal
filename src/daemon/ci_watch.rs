@@ -188,7 +188,11 @@ impl GitHubCiProvider {
                 base_url,
                 "",
                 Some("application/vnd.github+json".to_string()),
-                || std::env::var("GITHUB_TOKEN").ok().map(CiAuth::Bearer),
+                // Sprint 54 P0-4: token resolution now goes through the
+                // centralized cache (env → gh CLI → None). The cache
+                // discovers once per process and never writes back to env,
+                // so child PTYs don't silently inherit a token.
+                || crate::github_token::cached_token().map(CiAuth::Bearer),
             )?,
         })
     }
@@ -219,11 +223,16 @@ impl CiProvider for GitHubCiProvider {
                 .as_str()
                 .unwrap_or("(no message)")
                 .to_string();
+            // Sprint 54 P0-4: hint via the unified token cache. Anything
+            // the cache treats as "no token available" (env unset AND gh
+            // not authed) gets the actionable hint. Reading the cache —
+            // not env — keeps behavior consistent with what auth_fn
+            // actually saw on the wire.
             let hint = if status == 403
-                && std::env::var("GITHUB_TOKEN").is_err()
+                && crate::github_token::cached_token().is_none()
                 && message.to_lowercase().contains("rate limit")
             {
-                " — set GITHUB_TOKEN to raise the unauthenticated 60/hr cap"
+                " — set GITHUB_TOKEN or run `gh auth login` to raise the unauthenticated 60/hr cap"
             } else {
                 ""
             };
@@ -844,36 +853,32 @@ fn watch_is_due(last_polled_at: Option<i64>, interval_secs: u64, now_ms: i64) ->
     }
 }
 
-/// Preventive warning shown in the `watch_ci` MCP response when the
-/// daemon's environment doesn't carry a usable `GITHUB_TOKEN`.
+/// Preventive warning shown in the `watch_ci` MCP response when no
+/// GitHub token is available from any source.
 ///
-/// The daemon reads `GITHUB_TOKEN` on every poll to authenticate against
-/// the GitHub REST API (`ci_check_repo`). Without it, the process falls
-/// back to the unauthenticated 60-requests/hour cap — shared across
-/// every active watch. Five watches on 60-second intervals push ~300
-/// req/hr, so a silent 403 storm is easy to trigger without ever
-/// hitting a single fetch explicitly.
-///
-/// Split as a pure helper so unit tests don't have to serialize over a
-/// shared `std::env` mutation (cf. `watchdog::ENV_LOCK`).
+/// Sprint 54 P0-4: this helper now delegates to
+/// `crate::github_token::cached_setup_warning()` so the wording is in
+/// one place. The argument is unused in production (kept for backward
+/// API compatibility with existing unit tests that drive this with
+/// synthetic input), but the global cache's verdict is what
+/// `handle_watch_ci` actually surfaces. When env is set OR `gh` is
+/// authed, no warning fires.
 pub fn github_token_warning(token: Option<&str>) -> Option<&'static str> {
+    // Pure form retained for the existing in-file unit tests:
+    // "Some(non-blank) ⇒ None, None ⇒ Some(SETUP_WARNING)".
     match token.map(str::trim).filter(|s| !s.is_empty()) {
         Some(_) => None,
-        None => Some(
-            "GITHUB_TOKEN not set — daemon polls GitHub unauthenticated \
-             (60 req/hr, shared by all active watches). \
-             Export GITHUB_TOKEN (e.g. `export GITHUB_TOKEN=$(gh auth token)`) \
-             and restart the daemon so it inherits the value.",
-        ),
+        None => Some(crate::github_token::SETUP_WARNING),
     }
 }
 
-/// `github_token_warning` fed from the daemon's actual env. Separate
-/// from the pure helper so the handler can call this one-liner while
-/// tests drive the pure form with synthetic inputs.
-/// Also serves as the default `token_warning` for [`GitHubCiProvider`].
+/// Production warning surface — reads through the unified token cache.
+/// Used by `handle_watch_ci` to attach `setup_warning` to the MCP
+/// response when no token is reachable. Same source-of-truth as the
+/// auth path in [`GitHubCiProvider::with_base_url`], so the warning
+/// fires iff the next HTTP request would actually go unauthenticated.
 pub fn github_token_warning_from_env() -> Option<&'static str> {
-    github_token_warning(std::env::var("GITHUB_TOKEN").ok().as_deref())
+    crate::github_token::cached_setup_warning()
 }
 
 /// Check CI watch configs and inject failure logs to agents when CI fails.

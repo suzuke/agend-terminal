@@ -24,6 +24,7 @@ mod error;
 mod event_log;
 mod fleet;
 mod framing;
+mod github_token;
 mod health;
 #[allow(dead_code)]
 mod hotspot;
