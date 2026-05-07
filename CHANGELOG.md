@@ -3,6 +3,66 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-07
+
+50+ commits since `0.5.0` over Sprint 53 (`agend-git-shim` Phase 1-5 + production wiring) and Sprint 54 (`ci_watch` reliability overhaul + adaptive backoff + agent-visible health surface). Two themes dominate the release: multi-agent git isolation gets its own enforcement layer, and CI feedback to agents gets enough teeth that operators can trust the polling loop.
+
+### Added
+
+- **`agend-git-shim` (Sprint 53)** — five-phase shim layer between agents and `git`. Phase 1: `prepare-commit-msg` hook auto-appends `Agend-Agent`, `Agend-Branch`, `Agend-Issued-At`, `Agend-Task` trailers (idempotent, skipped when present) (#446). Phase 2: shim binary at `$AGEND_HOME/bin/git` with deny matrix on `worktree add/remove/move`, cross-branch `checkout`, and unbound-context ops; bypass via `AGEND_GIT_BYPASS=1` for legitimate operator overrides (#447). Phase 3: per-agent worktree lease/release lifecycle with `.agend-managed` marker (#449). Phase 4: hourly GC dry-run sweep flags stale worktrees without removing them — operator-driven cutover deferred (#454). Phase 5: hotspot detection telemetry for follow-up tuning (#455). Windows in scope (#448).
+- **Sprint 53 production wiring** — closes the "Phase 1-5 shipped binaries with no caller" gap from §1.4 hard learning. P0-1 dispatch hook auto-binds and leases on `delegate_task` with branch field (#464). P0-1.5 central lease registry rejects cross-agent branch claim conflicts (#465). P0-1.6 worktree reuse verifies actual HEAD before reusing existing checkout (#466). P0-2 wires `watch_ci` into the dispatch hook (consolidates Hotfix C) (#467). P0-3 anti-pattern CI lint gate enforces `dispatch_auto_bind_lease` is the production code path tests must call (#471). P0-X `release_worktree` MCP tool — single source of truth for binding + worktree cleanup, replaces ad-hoc `binding::unbind` calls (#470). P1-4 `gc_dry_run` MCP tool surfaces Phase 4 GC findings to operators (#479).
+- **`ci_watch` multi-caller fan-out (Sprint 54 P0-1)** — `ci watch` MCP action now appends to a `subscribers` array instead of last-write-wins overwrite. Single poll per cycle regardless of subscriber count, terminal classification fans out to all subscribers (no shadow-drop), schema migrates legacy `instance: "X"` to `subscribers: [{instance, subscribed_at}]` with read-fallback for the legacy field. `ci unwatch` removes the caller; deletes the watch file only when subscribers empty. (#484, closes `d-20260506155323776106-0`)
+- **`ci_watch` adaptive backoff (Sprint 54 P0-2)** — three-zone curve based on remaining quota: healthy (>50% remaining) uses configured interval, cautious (10–50%) widens 2×, critical (≤10%) widens 4×. Floor at baseline, ceiling at baseline×4. GitHub provider parses `X-RateLimit-Remaining` / `X-RateLimit-Limit` on every successful response; GitLab + Bitbucket emit `None` (preserves baseline behavior). Watch JSON gains `rate_limit_remaining` / `rate_limit_limit` / `effective_interval_secs` diagnostic fields. Recovery path from rate-limit-until reset is unchanged from Sprint 53 (Hotfix F). (#490)
+- **GitHub token auto-detect (Sprint 54 P0-4)** — daemon resolves auth via `GITHUB_TOKEN` env → `gh auth token` → unauthenticated fallback. Cached in process-wide `OnceLock`; never written back to env (avoids polluting child PTYs). When neither source yields a token, `ci watch` / `ci status` MCP responses include a canonical `setup_warning` field with actionable text. Daemon restart re-discovers; covers `gh auth login` after daemon was already running. (#487, closes `d-20260506171309264856-1`)
+- **Agent-visible CI health surface (Sprint 54 P0-5)** — `ci watch` response gains `rate_limit_active` / `rate_limit_until` / `next_poll_eta` health fields. Daemon fans out `[ci-watch-stalled]` inbox event after 3 consecutive rate-limit skips (exactly once per stall window) and `[ci-watch-resumed]` on the first successful poll afterward — both events go to every subscriber via the P0-1 fan-out contract. New `ci status` MCP action returns caller-scoped 16-field health snapshots with optional `repo` / `branch` filters. (#492)
+- **Sprint 54 P1-5 — `cleanup_deployment_dirs` rmdir empty parent** — best-effort `remove_dir` (non-recursive) on the deployment-directory parent after per-member cleanup; preserves operator-dropped files via the non-empty error path. (#489)
+
+### Changed
+
+- **Worktree lifecycle is daemon-managed** — agents no longer call `git worktree add/remove` directly. Auto bind on dispatch (P0-1), audit trail via Phase 1 trailers, exit via the `release_worktree` MCP tool (P0-X). Crashed agents, stale dispatches, and abandoned branches accumulate into the daemon's GC queue rather than as orphan filesystem entries.
+- **CI watch architecture split** — the `ci_watch` tick loop separates polling (one HTTP request per cycle, owns rate-limit + adaptive backoff + watch state persistence) from notification fan-out (one inbox enqueue per subscriber after terminal classification). Multi-caller flows that used to last-write-wins now compose cleanly. (#484)
+- **`watch_ci` MCP response shape** — `warning` field renamed to canonical `setup_warning` (Sprint 54 P0-4); `subscribers` / `rate_limit_active` / `next_poll_eta` health fields added (P0-5). Pre-Sprint-54 daemons reading post-Sprint-54 watch JSON files still see the legacy `instance` alias for one release cycle.
+- **Default PR open mode is `ready`** — implementers no longer open PRs as draft by default. `--draft` is reserved for smoke / verification PRs that won't merge, explicit work-in-progress, and external-PR augmentation. Drafts are hidden from default GitHub UI filters; default-ready keeps the review pipeline visible. (#491)
+
+### Fixed
+
+- **`comms.rs` auto-unbind on `kind=report` reply path (CRITICAL)** — `binding::unbind` was being invoked on every `kind=report` reply, clearing the agent → branch binding even mid-task. Cascade fixed: Phase 1 trailers fire correctly, orphan worktrees no longer accumulate, P0-X release_worktree is no longer a no-op, Phase 4 GC stops false-flagging legitimate live bindings as suspect. The single-mutation-point invariant for `release_worktree` is now load-bearing. (#477)
+- **TUI close-path skipped deployment teardown (#474)** — `Ctrl+B x` close on a tab/pane bypassed `cleanup_deployment_dirs`, leaking custom-directory subdirs across daemon restarts. Close path now runs `full_delete_instance` per pane + `reconcile_after_close`. (#475, #481)
+- **`ci_watch` fresh-branch classification fix (Hotfix F)** — daemon was auto-clearing fresh-no-PR branches as `merged=true` because `closed_at` freshness was unchecked. PRs in this state now classify as `pending` and continue polling. Fixed with `closed_at > 1h ago = stale, not auto-clear`. (#461)
+- **`ci_watch` no-PR-yet false-positive (Hotfix E)** — branches without a corresponding PR were classified as terminal, dropping notification. 60s grace period + closed_at freshness check. (#458)
+- **`agend-git-shim` app-mode wiring missing (Hotfix D)** — `app::run_app` (CLI) didn't initialize the shim init functions, leaving Phase 1-5 ops dead in user-facing CLI. Init seam moved into `bootstrap::prepare` so both daemon and app paths cover the wiring. (#457)
+- **`watch_ci` auto-watch on dispatch (Hotfix C)** — `delegate_task` with branch field didn't auto-create a `ci-watch` registration. Wired explicitly; later consolidated into Sprint 53 P0-2. (#451, #467)
+- **Server rate-limit retry stores raw body (Hotfix A/B)** — retry loop loses original 429 body across attempts, masking real error messages. Raw body now stored + replayed on inject. Provenance side-channel messages truncated to Telegram length limits to prevent oversize message drop. (#436, #452, #453)
+- **Issue #456 deployment teardown cleanup gap** — `deployment teardown` cleared the deployment record but left workspace + configs + channel topic registry behind. Full triple-cleanup (workspace + configs + registry). (#459)
+- **Issue #468 — Gemini dismiss patterns substring matched scrollback** — `try_dismiss_dialog` regex matched dialog text inside scrollback buffer, triggering spurious dismissals. Anchored regex with bounded prefix character class. (#469, #472)
+- **`reply` MCP `no active channel` (#488 — first community-reported issue)** — `reply` consistently returned `no active channel` despite valid Telegram messages with the `[user:X via telegram]` prefix arriving correctly. Root cause + fix in this release. (Thanks @changhansung)
+- **TUI restart input routing** — Pane struct restoration replaced piecemeal field updates that broke input routing on respawn. (#445, thanks @cheerc)
+- **Telegram ANSI ESC + typed injection optimization** — strip ANSI escape sequences from outbound, optimize typed injection to prevent ESC conflict. (#462, thanks @cheerc)
+
+### Community
+
+This release includes contributions from external contributors:
+
+- **@cheerc** — #445 (TUI Pane restart routing), #462 (ANSI ESC strip), #473 (fleet.yaml instructions wiring), #474 issue (TUI close path)
+- **@changhansung** — first community-reported issue #488 (`reply` MCP no-active-channel)
+
+Thank you for using the project and reporting issues — multi-agent CLI tooling lives or dies on real-world workflows surfacing the gaps.
+
+### Docs
+
+- **FLEET-DEV-PROTOCOL §13 — `AGEND_GIT_BYPASS=1` Usage** — when bypass is required (worktree add/remove on bound paths, daemon-internal git ops), when it isn't (routine operations inside bound worktree pass through cleanly), and the per-scenario hint. (#476)
+- **README "Git Behavior Modification" disclosure** — prominent pre-alpha banner section explaining what gets modified (PATH shim, prepare-commit-msg hook, deny matrix, auto bind/lease), why (multi-agent safety, audit trail, lifecycle hygiene, foot-gun guards), risks (agents see different `git`, commits gain trailers, some commands deny unexpectedly, restart needed for shim updates), and bypass paths. (#478)
+- **FLEET-DEV-PROTOCOL §7 — PR open semantics** — codifies the default-ready policy + three reserved scenarios for `--draft`. (#491)
+- **Sprint 53 PLAN doc + Sprint 54 PLAN doc** — wire-and-cleanup proposal (#463) and reliability+docs sprint proposal (#483, #485 §5.1 amendment, #486 P0-3 absorption note). Public record of the §1.4 hard learning + Path A/C smoke gate classification policy.
+
+### Internal
+
+- **Sprint 53 §1.4 hard learning** — `cargo test green + dual VERIFIED + soak ≠ production wired`. The cushion that caught Sprint 49's deadlock-class regression in pre-IMPL invariants did not catch the dead-code-class regression because no test exercised the actual production entry point (`app::run_app`). Sprint 54 PLAN §5 made production-smoke gates per-phase mandatory; §5.1 carved out parallelizable Path C for non-wiring refactors (`d-20260507004113587226-7`).
+- **Empirical regression-proof discipline** (`d-20260506171720519048-2`) — every Tier-2 fix demonstrates that disabling the production change causes a specific test FAIL; restoring it returns to PASS. Captured FAIL signature attaches to the PR description verbatim.
+- **`release_worktree` is the single source of truth for binding lifecycle** (`d-20260506171736738779-3`) — all comms.rs handlers treat binding state as read-only; only the dispatch hook (init) and `release_worktree` (exit) mutate. The #477 cascade demonstrated the cost of violating this.
+- **Cleanup lifecycle is layered** (`d-20260506171805866878-4`) — three tiers with explicit ownership: per-pane (`full_delete_instance`), per-deployment (`cleanup_deployment_dirs` + `reconcile_after_close`), boot reconcile (`reconcile_orphans`). New cleanup logic must identify which tier owns the new behavior.
+- **Fleet IMPL/review dispatch policy** — only `dev` (IMPL) and `reviewer` (review) are dispatchable; `claude-76f359` / `kiro-cli-*` / `gemini-*` are not designated. Lead Path A escalation when dev is unavailable. Captured in lead-side memory after operator m-57 + m-62 corrections.
+
 ## [0.5.0] — 2026-05-04
 
 ### Added
