@@ -1513,6 +1513,12 @@ mod tests {
     /// (Issue #468 follow-up — radio-button cursor `)` was unmatched).
     const KIRO_TRUST_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}No, exit";
 
+    /// `(regex, keystrokes)` pair for `try_dismiss_dialog` — `Down` then
+    /// `Enter` to dismiss kiro-cli's "Trust All Tools" prompt.
+    fn kiro_trust_patterns() -> Vec<(String, Vec<u8>)> {
+        vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())]
+    }
+
     #[test]
     fn issue_468_true_positive_gemini_mcp_dialog() {
         // Realistic Gemini Ink TUI render: dialog body is wrapped in box-drawing
@@ -1673,7 +1679,7 @@ Allow Trust All Tools mode?
   Yes, I accept
   Yes, and don't ask again
 ";
-        let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+        let patterns = kiro_trust_patterns();
         assert!(
             try_dismiss_dialog("t", screen, &test_writer(), &patterns),
             "kiro `) No, exit` (radio-button cursor) must match the bounded class"
@@ -1694,7 +1700,7 @@ Allow Trust All Tools mode?
             "[3] No, exit", // digit-bracket choice rows
         ];
         for screen in cases {
-            let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+            let patterns = kiro_trust_patterns();
             assert!(
                 try_dismiss_dialog("t", screen, &test_writer(), &patterns),
                 "prefix variant must match: {screen:?}"
@@ -1709,7 +1715,7 @@ Allow Trust All Tools mode?
     fn dismiss_rejects_when_prefix_exceeds_length_cap() {
         // 9 non-alpha chars ahead of the phrase — exceeds {0,8}.
         let screen = "         No, exit"; // 9 spaces
-        let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+        let patterns = kiro_trust_patterns();
         assert!(
             !try_dismiss_dialog("t", screen, &test_writer(), &patterns),
             "9-char non-alpha prefix must exceed length cap and not match"
@@ -1723,7 +1729,7 @@ Allow Trust All Tools mode?
         // Even though `Pre` is short, an alpha char in the [^A-Za-z\n]{0,8}
         // window breaks the match — proving mid-paragraph text is safe.
         let screen = "Pre: No, exit";
-        let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+        let patterns = kiro_trust_patterns();
         assert!(
             !try_dismiss_dialog("t", screen, &test_writer(), &patterns),
             "alpha char in prefix zone must invalidate match (regression-safe)"
@@ -1804,7 +1810,7 @@ Allow Trust All Tools mode?
         let _ = child.wait();
 
         let screen = vt.tail_lines(24);
-        let patterns = vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())];
+        let patterns = kiro_trust_patterns();
 
         // Two valid outcomes prove kiro startup is no longer hung on the
         // confirmation screen — the actual user-visible bug being fixed.
