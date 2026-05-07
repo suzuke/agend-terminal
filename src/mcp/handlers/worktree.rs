@@ -11,6 +11,96 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// MCP tool: `bind_self` (Sprint 54 P1-7).
+///
+/// Lets any instance proactively bind itself to a worktree without going
+/// through the dispatch hook — use case is the lead orchestrator wanting
+/// to claim a worktree for a Path A IMPL escalation, or any agent that
+/// wants to pre-claim a branch before the task arrives.
+///
+/// Required args: `repo` (owner/name string), `branch` (string).
+/// Optional args: none.
+///
+/// Returns:
+/// - On success: `{"bound": true, "worktree_path": "...", "branch": "..."}`.
+/// - On failure: `{"error": "...", "code": "..."}` — `code` mirrors the
+///   underlying lease/bind error class (`E4.5`, `cross_agent_conflict`,
+///   `lease_failed`).
+///
+/// Implementation reuses [`crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease`]
+/// with `task_id="self"` so every Sprint 53/54 invariant (Phase 1
+/// trailers, P0-1.5 cross-agent registry check, P0-1.6 actual-HEAD
+/// verification, P0-X release_worktree as sole exit point, source_repo
+/// persistence in binding.json, auto watch_ci subscription) applies
+/// uniformly. The handler is intentionally a thin shim — bug fixes in
+/// the dispatch path are inherited automatically.
+pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+    let agent = match sender.as_ref().map(Sender::as_str) {
+        Some(a) if !a.is_empty() => a,
+        _ => {
+            return json!({
+                "error": "bind_self requires AGEND_INSTANCE_NAME — anonymous callers cannot bind",
+                "code": "needs_identity"
+            })
+        }
+    };
+    let repo = match args["repo"].as_str() {
+        Some(r) if !r.is_empty() => r,
+        _ => return json!({"error": "missing 'repo'", "code": "missing_arg"}),
+    };
+    let branch = match args["branch"].as_str() {
+        Some(b) if !b.is_empty() => b,
+        _ => return json!({"error": "missing 'branch'", "code": "missing_arg"}),
+    };
+    if !crate::agent_ops::validate_branch(branch) {
+        return json!({
+            "error": format!("invalid branch name '{branch}'"),
+            "code": "invalid_branch"
+        });
+    }
+
+    // task_id="self" — clear distinction from real task IDs in the binding.json
+    // audit trail. The tasks store doesn't need a row for a self-bind; the
+    // string is purely a marker.
+    match crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease(
+        home,
+        agent,
+        "self",
+        branch,
+        Some(repo),
+    ) {
+        Ok(()) => {
+            // Successful bind: read back the worktree path from the binding
+            // file we just wrote so the response reflects authoritative
+            // state, not a recomputation.
+            let binding_path = home.join("runtime").join(agent).join("binding.json");
+            let worktree_path = std::fs::read_to_string(&binding_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v["worktree"].as_str().map(String::from))
+                .unwrap_or_default();
+            json!({
+                "bound": true,
+                "worktree_path": worktree_path,
+                "branch": branch,
+            })
+        }
+        Err(msg) => {
+            // Map dispatch_auto_bind_lease error strings to stable codes so
+            // agents can branch on machine-readable signals instead of
+            // grepping the human message.
+            let code = if msg.contains("E4.5") {
+                "e4_5_protected_branch"
+            } else if msg.contains("already leased") {
+                "cross_agent_conflict"
+            } else {
+                "lease_failed"
+            };
+            json!({"error": msg, "code": code})
+        }
+    }
+}
+
 /// MCP tool: `release_worktree`.
 ///
 /// Required arg: `agent` (string).
@@ -194,6 +284,251 @@ mod tests {
                 .contains("no binding"),
             "error must indicate no binding: {result}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 54 P1-7: bind_self handler tests ─────────────────────────
+    //
+    // These exercise `handle_bind_self` directly — same path the MCP layer
+    // uses. The helper sets up a real git repo + fleet.yaml entry so
+    // `worktree_pool::lease` can actually create the worktree (matches
+    // dispatch_hook/tests.rs setup_test_repo).
+    //
+    // Regression-proof anchor: replace the body of
+    // `dispatch_auto_bind_lease` with `Ok(())` (skip the actual bind) →
+    // `bind_self_creates_binding_and_worktree` fails because binding.json
+    // never gets written. PR description carries the captured FAIL
+    // signature.
+
+    fn p17_setup_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
+        let repo = home.join("workspace").join(agent);
+        std::fs::create_dir_all(&repo).ok();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .ok();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .ok();
+        std::fs::write(
+            home.join("fleet.yaml"),
+            format!(
+                "instances:\n  {agent}:\n    backend: claude\n    working_directory: {}\n",
+                repo.display()
+            ),
+        )
+        .ok();
+        repo
+    }
+
+    fn sender_for(name: &str) -> Option<crate::identity::Sender> {
+        crate::identity::Sender::new(name)
+    }
+
+    #[test]
+    fn bind_self_creates_binding_and_worktree() {
+        // Gate 1: a successful bind_self produces binding.json + worktree
+        // dir + .agend-managed marker. Mirrors the dispatch hook's
+        // happy path because we go through the same helper.
+        //
+        // EMPIRICAL REGRESSION-PROOF ANCHOR: replacing
+        // `dispatch_auto_bind_lease` body with `Ok(())` makes this test
+        // fail with "binding.json must exist after bind_self".
+        let home = std::env::temp_dir().join(format!("agend-p17-self-{}-ok", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        p17_setup_repo(&home, "agent-self");
+
+        let resp = handle_bind_self(
+            &home,
+            &json!({"repo": "owner/name", "branch": "feat/p17"}),
+            &sender_for("agent-self"),
+        );
+        assert_eq!(
+            resp["bound"].as_bool(),
+            Some(true),
+            "bind_self must succeed: {resp}"
+        );
+        let worktree_path = resp["worktree_path"]
+            .as_str()
+            .expect("worktree_path in success response");
+        assert!(!worktree_path.is_empty(), "worktree_path must be populated");
+
+        let binding_path = home.join("runtime").join("agent-self").join("binding.json");
+        assert!(
+            binding_path.exists(),
+            "binding.json must exist after bind_self"
+        );
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(&binding_path).expect("read binding"))
+                .expect("parse binding");
+        assert_eq!(v["branch"].as_str(), Some("feat/p17"));
+        assert_eq!(
+            v["task_id"].as_str(),
+            Some("self"),
+            "self-bind must record task_id=self"
+        );
+
+        // Worktree dir + .agend-managed marker per P0-X / P1-7.
+        let wt = std::path::Path::new(worktree_path);
+        assert!(wt.exists(), "worktree dir must exist: {worktree_path}");
+        assert!(
+            wt.join(".agend-managed").exists(),
+            ".agend-managed marker must exist: {worktree_path}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_self_idempotent_same_agent_same_branch() {
+        // Gate 2: a second bind_self call from the same agent on the
+        // same branch is idempotent. The first lease creates the
+        // worktree; the second sees the existing daemon-managed
+        // worktree on the matching branch and succeeds without
+        // mutating state.
+        let home = std::env::temp_dir().join(format!("agend-p17-self-{}-idem", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        p17_setup_repo(&home, "agent-idem");
+
+        let args = json!({"repo": "owner/name", "branch": "feat/idem"});
+        let r1 = handle_bind_self(&home, &args, &sender_for("agent-idem"));
+        assert_eq!(r1["bound"].as_bool(), Some(true), "first bind: {r1}");
+        let r2 = handle_bind_self(&home, &args, &sender_for("agent-idem"));
+        assert_eq!(
+            r2["bound"].as_bool(),
+            Some(true),
+            "second bind on same branch must be idempotent: {r2}"
+        );
+        assert_eq!(
+            r1["worktree_path"], r2["worktree_path"],
+            "worktree path must be stable across idempotent calls"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_self_rejects_main_branch_with_e4_5() {
+        // Gate 3: protected-branch invariant. Calling bind_self on
+        // 'main' returns the E4.5 rejection from worktree_pool::lease,
+        // mapped to a stable code so agents can branch on it.
+        let home = std::env::temp_dir().join(format!("agend-p17-self-{}-e45", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        p17_setup_repo(&home, "agent-e45");
+
+        let resp = handle_bind_self(
+            &home,
+            &json!({"repo": "owner/name", "branch": "main"}),
+            &sender_for("agent-e45"),
+        );
+        assert!(
+            resp.get("error").is_some(),
+            "main branch must error: {resp}"
+        );
+        assert_eq!(
+            resp["code"].as_str(),
+            Some("e4_5_protected_branch"),
+            "error code must surface E4.5 class: {resp}"
+        );
+
+        // No side-effects on rejection.
+        let binding = home.join("runtime").join("agent-e45").join("binding.json");
+        assert!(
+            !binding.exists(),
+            "rejected bind_self must not write binding.json"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_self_rejects_cross_agent_branch_conflict() {
+        // Gate 4: P0-1.5 cross-agent registry — agent A binds, agent B
+        // attempts the same branch → B is rejected.
+        let home =
+            std::env::temp_dir().join(format!("agend-p17-self-{}-cross", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        p17_setup_repo(&home, "agent-A");
+        p17_setup_repo(&home, "agent-B");
+
+        let r1 = handle_bind_self(
+            &home,
+            &json!({"repo": "owner/name", "branch": "feat/cross"}),
+            &sender_for("agent-A"),
+        );
+        assert_eq!(r1["bound"].as_bool(), Some(true), "A binds first: {r1}");
+
+        let r2 = handle_bind_self(
+            &home,
+            &json!({"repo": "owner/name", "branch": "feat/cross"}),
+            &sender_for("agent-B"),
+        );
+        assert!(
+            r2.get("error").is_some(),
+            "B must be rejected on shared branch: {r2}"
+        );
+        assert_eq!(
+            r2["code"].as_str(),
+            Some("cross_agent_conflict"),
+            "code must be cross_agent_conflict: {r2}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn bind_self_then_release_worktree_clean_state() {
+        // Gate 5: lifecycle round-trip. bind_self creates state;
+        // release_worktree clears it. binding.json + worktree dir +
+        // .agend-managed marker all gone after release.
+        let home =
+            std::env::temp_dir().join(format!("agend-p17-self-{}-cycle", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        p17_setup_repo(&home, "agent-cycle");
+
+        let resp = handle_bind_self(
+            &home,
+            &json!({"repo": "owner/name", "branch": "feat/cycle"}),
+            &sender_for("agent-cycle"),
+        );
+        assert_eq!(resp["bound"].as_bool(), Some(true));
+        let worktree_path = resp["worktree_path"]
+            .as_str()
+            .expect("worktree path")
+            .to_string();
+        let binding = home
+            .join("runtime")
+            .join("agent-cycle")
+            .join("binding.json");
+        assert!(binding.exists());
+
+        let release = handle_release_worktree(&home, &json!({"agent": "agent-cycle"}), &None);
+        assert_eq!(
+            release["released"].as_bool(),
+            Some(true),
+            "release must succeed: {release}"
+        );
+
+        assert!(!binding.exists(), "binding.json must be gone after release");
+        assert!(
+            !std::path::Path::new(&worktree_path).exists(),
+            "worktree dir must be gone after release: {worktree_path}"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 

@@ -241,6 +241,17 @@ fn repo_tools() -> Vec<Value> {
 
 fn worktree_tools() -> Vec<Value> {
     vec![
+        // Sprint 54 P1-7: generic self-bind — any instance can claim a
+        // worktree without going through the dispatch hook. Reuses
+        // `dispatch_auto_bind_lease` so every Sprint 53/54 invariant
+        // (Phase 1 trailers, P0-1.5 cross-agent registry check, P0-1.6
+        // actual-HEAD verification, P0-X release_worktree as sole exit
+        // point, source_repo persistence, auto watch_ci) applies.
+        json!({"name": "bind_self", "description": "Bind the calling agent to a fresh worktree on the named branch. Reuses the dispatch-hook lifecycle so binding.json + worktree + .agend-managed marker + auto watch_ci all land. Rejects 'main'/'master' (E4.5) and cross-agent branch conflicts. Pair with `release_worktree` to unbind.",
+            "inputSchema": {"type": "object", "properties": {
+                "repo": {"type": "string", "description": "GitHub repo (owner/name)"},
+                "branch": {"type": "string", "description": "Branch to bind (must not be main/master)"}
+            }, "required": ["repo", "branch"]}}),
         // Sprint 53 P0-X: release a daemon-managed worktree + clear binding
         // for `agent`. Idempotent. Only removes worktrees that carry the
         // `.agend-managed` marker (R14 safety — operator-created worktrees
@@ -393,10 +404,9 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            28,
-            "Sprint 53 P1-4 tool count = 28 (gc_dry_run added on top of \
-             P0-X's 27, which itself was pane_snapshot's Sprint 33 baseline \
-             of 26 + release_worktree). Adding/removing a tool requires \
+            29,
+            "Sprint 54 P1-7 tool count = 29 (bind_self added on top of \
+             Sprint 53 P1-4's 28). Adding/removing a tool requires \
              updating this assertion. Current tools: {:?}",
             tools
                 .iter()

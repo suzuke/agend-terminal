@@ -180,6 +180,11 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             other => json!({"error": format!("unknown ci action: {other}")}),
         },
 
+        // --- Generic self-bind (Sprint 54 P1-7) — agents can claim a
+        // worktree without going through the dispatch hook. Reuses the
+        // same lifecycle helper so every Sprint 53/54 invariant applies.
+        "bind_self" => worktree::handle_bind_self(&home, args, &sender),
+
         // --- Daemon-managed worktree release (Sprint 53 P0-X) ---
         "release_worktree" => worktree::handle_release_worktree(&home, args, &sender),
 
