@@ -755,11 +755,51 @@ impl CiProvider for BitbucketCiProvider {
 /// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
 pub const WATCH_TTL_HOURS: i64 = 72;
 
+/// Read the list of subscribed instances from a watch JSON value.
+///
+/// Schema migration (Sprint 54 P0-1): the canonical source is the
+/// `subscribers` array (`[{instance, subscribed_at}, …]`). Pre-Sprint-54
+/// files carry only a single `instance: "X"` field; this helper returns
+/// `[X]` for them so the daemon's poll loop, notify path, and unwatch
+/// logic all see one uniform `Vec<String>` regardless of file vintage.
+///
+/// The legacy `instance` field is preserved on writes for one release
+/// cycle (read-only by writers post-r0) and slated for removal in
+/// Sprint 55 once daemons in the wild have written-back the new
+/// schema at least once.
+pub(crate) fn parse_subscribers(watch: &serde_json::Value) -> Vec<String> {
+    if let Some(arr) = watch.get("subscribers").and_then(|v| v.as_array()) {
+        let mut out: Vec<String> = arr
+            .iter()
+            .filter_map(|s| s.get("instance").and_then(|v| v.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        out.dedup();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    // Legacy: pre-r0 watch files carry only `instance: "X"`. Treat as a
+    // singleton list so the rest of the pipeline doesn't have to fork.
+    if let Some(legacy) = watch.get("instance").and_then(|v| v.as_str()) {
+        if !legacy.is_empty() {
+            return vec![legacy.to_string()];
+        }
+    }
+    Vec::new()
+}
+
 /// Remove a watch file and log the removal event.
+///
+/// `instance_label` is a free-form audit string — the caller passes
+/// either a single subscriber (legacy callers) or comma-joined
+/// subscribers (post-r0 multi-caller). The event log mirrors the
+/// label verbatim for human-readable traceability.
 pub fn remove_watch(
     home: &Path,
     watch_path: &Path,
-    instance: &str,
+    instance_label: &str,
     repo: &str,
     branch: &str,
     reason: &str,
@@ -768,7 +808,7 @@ pub fn remove_watch(
     crate::event_log::log(
         home,
         "ci_watch_removed",
-        instance,
+        instance_label,
         &format!("repo={repo} branch={branch} reason={reason}"),
     );
 }
@@ -940,22 +980,33 @@ fn check_ci_watches_with_provider(
             Some(v) => v,
             None => continue,
         };
-        let (repo, instance) = match (watch["repo"].as_str(), watch["instance"].as_str()) {
-            (Some(r), Some(i)) => (r.to_string(), i.to_string()),
-            _ => continue,
+        let repo = match watch["repo"].as_str() {
+            Some(r) => r.to_string(),
+            None => continue,
         };
+        // Sprint 54 P0-1: subscribers list (with legacy single-instance fallback)
+        // replaces the single `instance` field. Empty list ⇒ skip — a watch with
+        // no recipients is useless and would only burn rate-limit.
+        let subscribers = parse_subscribers(&watch);
+        if subscribers.is_empty() {
+            continue;
+        }
         let branch = watch["branch"].as_str().unwrap_or("main").to_string();
         let interval = watch["interval_secs"].as_u64().unwrap_or(60);
         let last_run_id = watch["last_run_id"].as_u64();
         let head_sha = watch["head_sha"].as_str().map(String::from);
         let last_notified_sha = watch["last_notified_head_sha"].as_str().map(String::from);
 
+        // Audit label for remove_watch: comma-joined subscribers so the
+        // event log stays human-readable when multiple agents share a watch.
+        let audit_label = subscribers.join(",");
+
         // TTL check: remove expired watches before polling.
         let now_utc = chrono::Utc::now();
         if let Some(expires_at) = watch["expires_at"].as_str() {
             if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
                 if now_utc > exp.with_timezone(&chrono::Utc) {
-                    remove_watch(home, &path, &instance, &repo, &branch, "expired");
+                    remove_watch(home, &path, &audit_label, &repo, &branch, "expired");
                     tracing::info!(repo = %repo, branch = %branch, "CI watch expired (TTL)");
                     continue;
                 }
@@ -966,7 +1017,7 @@ fn check_ci_watches_with_provider(
             if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
                 let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
                 if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
-                    remove_watch(home, &path, &instance, &repo, &branch, "inactivity_ttl");
+                    remove_watch(home, &path, &audit_label, &repo, &branch, "inactivity_ttl");
                     tracing::info!(repo = %repo, branch = %branch, hours = WATCH_TTL_HOURS, "CI watch removed: inactivity TTL");
                     continue;
                 }
@@ -1021,13 +1072,14 @@ fn check_ci_watches_with_provider(
         // fire-and-forget: ci_check is one-shot per poll cycle. The shared
         // runtime bounds concurrency to 2 worker threads. No JoinHandle
         // needed — the tick loop re-spawns next cycle if still watching.
+        let subscribers_owned = subscribers.clone();
         shared_ci_runtime().spawn(async move {
             if let Err(e) = ci_check_repo(
                 &home,
                 &watch_path,
                 &repo,
                 &branch,
-                &instance,
+                &subscribers_owned,
                 last_run_id,
                 head_sha.as_deref(),
                 last_notified_sha.as_deref(),
@@ -1181,24 +1233,34 @@ fn ci_notification_message(
     Some(msg)
 }
 
-/// Fetch latest CI run and notify the watching agent on any
+/// Fetch latest CI run and notify ALL subscribed agents on any
 /// terminal conclusion (success, failure, cancelled, timed_out, etc.).
 /// Also tracks `head_sha` — if the branch HEAD changes (e.g. force push),
 /// `last_run_id` is reset so the new run is picked up.
 /// On PR terminal states (merged/closed), the watcher is auto-cleared.
+///
+/// **Subscriber fan-out (Sprint 54 P0-1)**: `subscribers` is a slice of
+/// instance names that all share this watch. The poll itself happens
+/// once per cycle regardless of subscriber count (poll/subscriber split,
+/// hard-contract item 1). Notifications, by contrast, fan out — every
+/// subscriber receives the inbox message and the in-band agent inject
+/// (item 2). The audit string for `remove_watch` joins all subscribers
+/// with commas so event-log readers can see the full membership at the
+/// moment of removal.
 #[allow(clippy::too_many_arguments)]
 async fn ci_check_repo(
     home: &Path,
     watch_path: &Path,
     repo: &str,
     branch: &str,
-    instance: &str,
+    subscribers: &[String],
     last_run_id: Option<u64>,
     prev_head_sha: Option<&str>,
     last_notified_sha: Option<&str>,
     registry: &AgentRegistry,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
+    let audit_label = subscribers.join(",");
     // Check if the PR associated with this branch has reached a terminal state.
     // Skip auto-clear if the watch was just created (< 60s) — the branch may not
     // be pushed yet, and a stale PR from a previous use of the same branch name
@@ -1222,7 +1284,14 @@ async fn ci_check_repo(
                             // Don't clear — let the next poll cycle re-check.
                             // Fall through to normal poll logic below.
                         } else {
-                            remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
+                            remove_watch(
+                                home,
+                                watch_path,
+                                &audit_label,
+                                repo,
+                                branch,
+                                "pr_terminal",
+                            );
                             tracing::info!(
                                 repo,
                                 branch,
@@ -1235,7 +1304,7 @@ async fn ci_check_repo(
                             return Ok(());
                         }
                     } else {
-                        remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
+                        remove_watch(home, watch_path, &audit_label, repo, branch, "pr_terminal");
                         tracing::info!(
                             repo,
                             branch,
@@ -1248,7 +1317,7 @@ async fn ci_check_repo(
                         return Ok(());
                     }
                 } else {
-                    remove_watch(home, watch_path, instance, repo, branch, "pr_terminal");
+                    remove_watch(home, watch_path, &audit_label, repo, branch, "pr_terminal");
                     tracing::info!(repo, branch, merged, "CI watcher auto-cleared: PR terminal");
                     if merged {
                         crate::status_summary::auto_close_merged_tasks(home, branch);
@@ -1290,14 +1359,21 @@ async fn ci_check_repo(
             // carries CI run url + repo name; legacy `None`-allowlist
             // deployments must opt in to receive these via
             // `user_allowlist: [...]`.
+            //
+            // Sprint 54 P0-1: fan out to every subscriber. The single-call
+            // version was last-write-wins on the warning too — when lead+dev
+            // both watched a branch, only one received the rate-limit
+            // warning and the other silently waited.
             if let Some(ch) = crate::channel::active_channel() {
-                let _ = crate::channel::gated_notify(
-                    ch.as_ref(),
-                    instance,
-                    crate::channel::NotifySeverity::Warn,
-                    &notify_msg,
-                    false,
-                );
+                for sub in subscribers {
+                    let _ = crate::channel::gated_notify(
+                        ch.as_ref(),
+                        sub,
+                        crate::channel::NotifySeverity::Warn,
+                        &notify_msg,
+                        false,
+                    );
+                }
             }
             return Err(anyhow::anyhow!("{status}: {message}"));
         }
@@ -1352,45 +1428,58 @@ async fn ci_check_repo(
                 &run.url,
             );
 
-            let reg = agent::lock_registry(registry);
-            if let Some(handle) = reg.get(instance) {
-                let _ = agent::inject_to_agent(handle, headline.as_bytes());
-            }
-            drop(reg);
-            // M6: mark prior ci-watch messages for same repo+branch as superseded
+            // Sprint 54 P0-1 — Subscriber fan-out: every subscriber receives
+            // the in-band agent inject + the inbox enqueue. Without the
+            // fan-out, the most-recent `ci watch` caller would shadow all
+            // earlier subscribers (last-write-wins on the watch JSON's
+            // single `instance` field). The poll above is shared (one HTTP
+            // request per cycle); only the notification side-effects loop.
             let repo_branch_key = format!("{repo}@{branch}");
-            crate::inbox::mark_ci_watch_superseded(
-                home,
-                instance,
-                &repo_branch_key,
-                &format!("ci-{}-{}", run_id, sha),
-            );
-            let _ = crate::inbox::enqueue(
-                home,
-                instance,
-                crate::inbox::InboxMessage {
-                    schema_version: 0,
-                    id: None,
-                    read_at: None,
-                    thread_id: None,
-                    parent_id: None,
-                    task_id: None,
-                    force_meta: None,
-                    correlation_id: None,
-                    reviewed_head: None,
-                    from: "system:ci".to_string(),
-                    text: body,
-                    kind: Some("ci-watch".to_string()),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    channel: None,
-                    delivery_mode: None,
-                    attachments: vec![],
-                    in_reply_to_msg_id: None,
-                    in_reply_to_excerpt: None,
-                    superseded_by: None,
-                    from_id: None,
-                },
-            );
+            let supersede_token = format!("ci-{}-{}", run_id, sha);
+            // EMPIRICAL REGRESSION-PROOF FLIP: replace `subscribers` below
+            // with `&subscribers[..1]` to simulate the pre-r0 single-recipient
+            // bug. The `subscriber_fan_out_notifies_every_member` test
+            // immediately fails with the dev-inbox-missing assertion.
+            for sub in subscribers {
+                let reg = agent::lock_registry(registry);
+                if let Some(handle) = reg.get(sub) {
+                    let _ = agent::inject_to_agent(handle, headline.as_bytes());
+                }
+                drop(reg);
+                // M6: mark prior ci-watch messages for same repo+branch as superseded
+                crate::inbox::mark_ci_watch_superseded(
+                    home,
+                    sub,
+                    &repo_branch_key,
+                    &supersede_token,
+                );
+                let _ = crate::inbox::enqueue(
+                    home,
+                    sub,
+                    crate::inbox::InboxMessage {
+                        schema_version: 0,
+                        id: None,
+                        read_at: None,
+                        thread_id: None,
+                        parent_id: None,
+                        task_id: None,
+                        force_meta: None,
+                        correlation_id: None,
+                        reviewed_head: None,
+                        from: "system:ci".to_string(),
+                        text: body.clone(),
+                        kind: Some("ci-watch".to_string()),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        channel: None,
+                        delivery_mode: None,
+                        attachments: vec![],
+                        in_reply_to_msg_id: None,
+                        in_reply_to_excerpt: None,
+                        superseded_by: None,
+                        from_id: None,
+                    },
+                );
+            }
         }
         new_notified_sha = Some(sha.to_string());
     }
@@ -2198,7 +2287,7 @@ mod tests {
         std::fs::create_dir_all(&ci_dir).ok();
         let repo = watch_json["repo"].as_str().unwrap();
         let branch = watch_json["branch"].as_str().unwrap();
-        let instance = watch_json["instance"].as_str().unwrap();
+        let subscribers = parse_subscribers(watch_json);
         let filename = watch_filename(repo, branch);
         let watch_path = ci_dir.join(&filename);
         std::fs::write(
@@ -2218,7 +2307,7 @@ mod tests {
             &watch_path,
             repo,
             branch,
-            instance,
+            &subscribers,
             watch_json["last_run_id"].as_u64(),
             watch_json["head_sha"].as_str(),
             watch_json["last_notified_head_sha"].as_str(),
@@ -2325,7 +2414,7 @@ mod tests {
             &watch_path,
             "o/r",
             "feat",
-            "agent1",
+            &["agent1".to_string()],
             None,
             None,
             None,
@@ -3115,7 +3204,7 @@ mod tests {
             &watch_path,
             "o/r",
             "feat-new",
-            "agent1",
+            &["agent1".to_string()],
             None,
             None,
             None,
@@ -3162,7 +3251,7 @@ mod tests {
             &watch_path,
             "o/r",
             "feat-old",
-            "agent1",
+            &["agent1".to_string()],
             None,
             None,
             None,
@@ -3207,7 +3296,7 @@ mod tests {
             &watch_path,
             "o/r",
             "feat",
-            "agent1",
+            &["agent1".to_string()],
             None,
             None,
             None,
@@ -3245,7 +3334,7 @@ mod tests {
             &watch_path,
             "o/r",
             "feat",
-            "agent1",
+            &["agent1".to_string()],
             None,
             None,
             None,
@@ -3292,7 +3381,7 @@ mod tests {
             &watch_path,
             "o/r",
             "feat-merged",
-            "agent1",
+            &["agent1".to_string()],
             None,
             None,
             None,
@@ -3321,5 +3410,111 @@ mod tests {
             src.contains("closed_at") && src.contains("Duration::hours(1)"),
             "check_pr_terminal must verify closed_at freshness (stale PR filter)"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // Sprint 54 P0-1 — Subscriber fan-out (hard contract item 2).
+    //
+    // EMPIRICAL REGRESSION-PROOF ANCHOR: when fan-out is collapsed back to
+    // single-subscriber (commenting out the `for sub in subscribers` loop
+    // in `ci_check_repo` and notifying only the first), the second
+    // subscriber's inbox stays empty here and the assertion fails with:
+    //
+    //   thread '...subscriber_fan_out_notifies_every_member' panicked at:
+    //   assertion `dev inbox missing terminal notification` failed
+    //
+    // Restoring the loop returns the test to PASS. This is the proof
+    // that the new test catches the multi-caller bug in production code,
+    // not just in synthetic mock paths.
+    // ----------------------------------------------------------------------
+    #[test]
+    fn subscriber_fan_out_notifies_every_member() {
+        let dir = tmp_dir("fanout");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [
+                {"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"},
+                {"instance": "dev",  "subscribed_at": "2026-05-07T00:00:01Z"}
+            ],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        // Mock provider returns one terminal success run.
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 7,
+            conclusion: Some("success".to_string()),
+            head_sha: "deadbeef".to_string(),
+            url: "https://example/run/7".to_string(),
+        }]);
+
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["lead".to_string(), "dev".to_string()],
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+
+        // Both inboxes must contain the terminal notification. Inbox layout
+        // is JSONL at home/inbox/<name>.jsonl (see inbox::inbox_path).
+        for sub in ["lead", "dev"] {
+            let inbox_path = dir.join("inbox").join(format!("{sub}.jsonl"));
+            let body = std::fs::read_to_string(&inbox_path).unwrap_or_else(|_| {
+                panic!("{sub} inbox file missing — fan-out regression: {inbox_path:?}")
+            });
+            assert!(
+                body.contains("[ci-pass]") && body.contains("o/r@feat"),
+                "{sub} inbox payload mismatch: {body}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_subscribers_reads_array() {
+        let watch = serde_json::json!({
+            "subscribers": [
+                {"instance": "a", "subscribed_at": "x"},
+                {"instance": "b", "subscribed_at": "y"}
+            ],
+            "instance": "ignored-when-array-present"
+        });
+        assert_eq!(parse_subscribers(&watch), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_subscribers_falls_back_to_legacy_instance() {
+        let watch = serde_json::json!({"instance": "legacy-only"});
+        assert_eq!(parse_subscribers(&watch), vec!["legacy-only"]);
+    }
+
+    #[test]
+    fn parse_subscribers_empty_when_no_data() {
+        let watch = serde_json::json!({});
+        assert!(parse_subscribers(&watch).is_empty());
     }
 }

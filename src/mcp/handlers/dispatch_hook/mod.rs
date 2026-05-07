@@ -53,7 +53,11 @@ pub(crate) fn dispatch_auto_bind_lease(
     );
 
     // P0-2: auto-watch_ci. Caller arg wins; else derive from source_repo's origin.
-    // Idempotent: skip when watch file already exists (preserves poll state across re-dispatch).
+    // Sprint 54 P0-1: handle_watch_ci is now idempotent + append-aware
+    // (preserves prior poll state, adds caller to `subscribers` only if
+    // not already present). Drop the prior `.exists()` skip — it caused
+    // the second agent dispatched onto the same branch to never get
+    // subscribed when a watch file already existed.
     // Graceful: any failure (no remote, non-GitHub remote, write error) is logged but does not
     // reject dispatch — auto-watch is a notification convenience, not load-bearing.
     let resolved_repo = repo
@@ -61,14 +65,9 @@ pub(crate) fn dispatch_auto_bind_lease(
         .map(str::to_string)
         .or_else(|| derive_repo_from_remote(&source_repo));
     if let Some(r) = resolved_repo {
-        let watch_file = home
-            .join("ci-watches")
-            .join(crate::daemon::ci_watch::watch_filename(&r, branch));
-        if !watch_file.exists() {
-            let watch_args = serde_json::json!({"repo": &r, "branch": branch});
-            crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
-            tracing::info!(%target, repo = %r, %branch, "dispatch auto-watch_ci");
-        }
+        let watch_args = serde_json::json!({"repo": &r, "branch": branch});
+        crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
+        tracing::info!(%target, repo = %r, %branch, "dispatch auto-watch_ci");
     }
     Ok(())
 }
