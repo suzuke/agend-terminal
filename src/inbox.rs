@@ -860,21 +860,99 @@ pub fn deliver(
     notify_agent(home, agent_name, source, text);
 }
 
+/// Sprint 54 silent-drop layer-4 hotfix: aggregate kind counts for the
+/// PTY-inject header `attachments=[…]` field. Returns `None` for empty
+/// so callers can `if let Some(s) = …` without producing trailing
+/// whitespace on no-attachment notifications.
+///
+/// Output format mirrors operator's `m-9` request: `1 photo, 2 document`
+/// — kind labels in lowercase, count-aggregated, comma-joined in a
+/// stable order so test fixtures don't depend on HashMap iteration.
+pub(crate) fn summarize_attachments_for_header(
+    attachments: &[crate::channel::event::Attachment],
+) -> Option<String> {
+    if attachments.is_empty() {
+        return None;
+    }
+    use crate::channel::event::AttachmentKind;
+    let mut counts: [usize; 5] = [0; 5];
+    for a in attachments {
+        let i = match a.kind {
+            AttachmentKind::Photo => 0,
+            AttachmentKind::Voice => 1,
+            AttachmentKind::Document => 2,
+            AttachmentKind::Video => 3,
+            AttachmentKind::Sticker => 4,
+        };
+        counts[i] += 1;
+    }
+    let labels = ["photo", "voice", "document", "video", "sticker"];
+    let parts: Vec<String> = counts
+        .iter()
+        .zip(labels.iter())
+        .filter(|(n, _)| **n > 0)
+        .map(|(n, label)| format!("{n} {label}"))
+        .collect();
+    Some(parts.join(", "))
+}
+
+/// Sprint 54 silent-drop layer-4 hotfix: human-readable body
+/// placeholder used when the inbox message has no text but attachments
+/// are present. Without this, `format_notification_for_inject` in
+/// inline mode produced an empty body — agent saw a content-less
+/// notification it couldn't action on.
+///
+/// Single attachment with `original_filename` → `[1 photo: cat.jpg]`.
+/// Single attachment without filename → `[1 photo attached]`.
+/// Multiple attachments → `[1 photo, 2 document attached]`.
+pub(crate) fn attachment_body_placeholder(
+    attachments: &[crate::channel::event::Attachment],
+) -> String {
+    if attachments.is_empty() {
+        return String::new();
+    }
+    let summary = summarize_attachments_for_header(attachments).unwrap_or_default();
+    if attachments.len() == 1 {
+        if let Some(name) = &attachments[0].original_filename {
+            return format!("[{summary}: {name}]");
+        }
+    }
+    format!("[{summary} attached]")
+}
+
 /// Pure function: build the notification string that will be injected to PTY.
 /// `pointer_only=true` → header-only (no body); `false` → inline text.
+///
+/// Sprint 54 silent-drop layer-4 hotfix: when `attachments` is non-empty,
+/// the header gains an `attachments=[…]` field and (in inline mode)
+/// empty-text notifications get a human-readable body placeholder
+/// instead of producing a content-less PTY inject. `attachments=[]`
+/// preserves pre-r0 behavior so non-Telegram callers stay unaffected.
 pub fn format_notification_for_inject(
     pointer_only: bool,
     source: &NotifySource<'_>,
     text: &str,
+    attachments: &[crate::channel::event::Attachment],
 ) -> String {
+    let attach_summary = summarize_attachments_for_header(attachments);
     if pointer_only {
-        format!(
-            "[{source}] [AGEND-MSG] size={} (use inbox tool){}",
-            text.len(),
-            source.reply_hint()
-        )
+        let mut header = format!(
+            "[{source}] [AGEND-MSG] size={} (use inbox tool)",
+            text.len()
+        );
+        if let Some(s) = &attach_summary {
+            header.push_str(&format!(" attachments=[{s}]"));
+        }
+        header.push_str(&source.reply_hint());
+        header
     } else {
-        let display_text = if text.chars().count() > 200 {
+        // Body-replace path: empty text + non-empty attachments would
+        // produce a content-less inline notification pre-r0. Substitute
+        // the placeholder so the agent at minimum sees what kind of
+        // media is waiting.
+        let display_text = if text.is_empty() && !attachments.is_empty() {
+            attachment_body_placeholder(attachments)
+        } else if text.chars().count() > 200 {
             let truncated: String = text.chars().take(200).collect();
             format!("{truncated}... (run: agend-terminal agent inbox)")
         } else {
@@ -885,6 +963,24 @@ pub fn format_notification_for_inject(
 }
 
 pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
+    notify_agent_with_attachments(home, agent_name, source, text, &[]);
+}
+
+/// Sprint 54 silent-drop layer-4 hotfix: variant of `notify_agent` that
+/// carries attachment metadata into the PTY-inject formatter. Callers
+/// that have an `InboxMessage` with attachments (currently just the
+/// telegram inbound path) use this so the agent sees the canonical
+/// `attachments=[…]` header field + a human-readable body placeholder
+/// when the inbox text is empty. Other callers (`agent_ops::send`,
+/// supervisor notifications) stick with the plain `notify_agent` —
+/// their text-only wrapper passes `&[]` here.
+pub fn notify_agent_with_attachments(
+    home: &Path,
+    agent_name: &str,
+    source: &NotifySource<'_>,
+    text: &str,
+    attachments: &[crate::channel::event::Attachment],
+) {
     // Sprint 24 P1 (F-NEW-DAEMON-HEALTH-CLASSIFIER-1): record this
     // central inject point so the daemon health classifier can
     // distinguish "idle waiting (no input pending)" from "hung
@@ -897,7 +993,8 @@ pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, te
     crate::daemon::heartbeat_pair::update_with(agent_name, |p| {
         p.last_input_at_ms = crate::daemon::heartbeat_pair::now_ms();
     });
-    let notification = format_notification_for_inject(pointer_only_inject(), source, text);
+    let notification =
+        format_notification_for_inject(pointer_only_inject(), source, text, attachments);
     compose_aware_inject(home, agent_name, &notification);
     // Store raw body AFTER inject — overwrites any formatted text the inject
     // handler may have stored. Ensures retry re-injects raw body, not header.
@@ -2437,7 +2534,7 @@ mod tests {
         // Pure function test: pointer_only=true → output contains [AGEND-MSG]
         // + size= but NOT the body text.
         let source = NotifySource::Agent("sender");
-        let s = format_notification_for_inject(true, &source, "secret body text");
+        let s = format_notification_for_inject(true, &source, "secret body text", &[]);
         assert!(
             s.contains("[AGEND-MSG]"),
             "pointer mode must contain [AGEND-MSG]: {s}"
@@ -2457,7 +2554,7 @@ mod tests {
     fn test_notify_agent_default_inline_behavior() {
         // Pure function test: pointer_only=false → output contains the body text.
         let source = NotifySource::Agent("sender");
-        let s = format_notification_for_inject(false, &source, "inline text");
+        let s = format_notification_for_inject(false, &source, "inline text", &[]);
         assert!(
             s.contains("inline text"),
             "default mode must contain body: {s}"
@@ -2693,5 +2790,164 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.from_id, Some("a3k9p2xf".to_string()));
+    }
+
+    // ── Sprint 54 silent-drop layer-4 hotfix: PTY attachment indicator ──
+    //
+    // Operator m-9 dispatch m-20260507131404761875-8. The pre-hotfix
+    // `format_notification_for_inject` ignored attachments entirely:
+    //   - pointer_only=true header had no `attachments=[…]` field
+    //   - pointer_only=false body became empty when text was empty,
+    //     even with attachments present (silent-drop class 4th instance,
+    //     decision `d-20260507125347359886-0`)
+    //
+    // Each test pins one of the contract gates from the dispatch.
+    //
+    // EMPIRICAL REGRESSION-PROOF ANCHOR: replacing
+    // `summarize_attachments_for_header` to always return `None` AND
+    // collapsing the placeholder branch in `format_notification_for_inject`
+    // makes both `…header_carries_attachments_field…` and
+    // `…inline_body_substitutes_placeholder_when_text_empty…` fail.
+    // PR description carries the verbatim FAIL signatures.
+
+    fn p54_attachment(
+        kind: crate::channel::event::AttachmentKind,
+    ) -> crate::channel::event::Attachment {
+        crate::channel::event::Attachment {
+            kind,
+            path: std::path::PathBuf::from("/tmp/p54-fixture"),
+            mime: None,
+            caption: None,
+            size_bytes: Some(50_000),
+            original_filename: None,
+        }
+    }
+
+    fn p54_attachment_with_name(
+        kind: crate::channel::event::AttachmentKind,
+        name: &str,
+    ) -> crate::channel::event::Attachment {
+        let mut a = p54_attachment(kind);
+        a.original_filename = Some(name.to_string());
+        a
+    }
+
+    #[test]
+    fn summarize_attachments_for_header_aggregates_by_kind() {
+        // Layer-4 gate: header `attachments=[…]` field is kind-aggregated
+        // counts in stable order — operator m-9 spec literal:
+        // `attachments=[1 photo, 2 document]`.
+        use crate::channel::event::AttachmentKind;
+        let attachments = vec![
+            p54_attachment(AttachmentKind::Photo),
+            p54_attachment(AttachmentKind::Document),
+            p54_attachment(AttachmentKind::Document),
+        ];
+        let summary = summarize_attachments_for_header(&attachments)
+            .expect("non-empty input must return Some");
+        assert_eq!(
+            summary, "1 photo, 2 document",
+            "kind-aggregated stable order"
+        );
+    }
+
+    #[test]
+    fn summarize_attachments_for_header_returns_none_for_empty() {
+        // Edge: empty input → None so callers don't emit
+        // `attachments=[]` for non-attachment notifications.
+        assert!(summarize_attachments_for_header(&[]).is_none());
+    }
+
+    #[test]
+    fn pointer_only_header_carries_attachments_field_when_present() {
+        // Layer-4 gate (regression-proof anchor): pointer_only=true
+        // header gains `attachments=[…]` when attachments are present.
+        // Pre-r0 produced `[AGEND-MSG] size=N (use inbox tool)` only —
+        // agent had no signal that media was waiting.
+        use crate::channel::event::AttachmentKind;
+        let attachments = vec![
+            p54_attachment(AttachmentKind::Photo),
+            p54_attachment(AttachmentKind::Document),
+        ];
+        let source = NotifySource::Channel("alice", crate::channel::ChannelKind::Telegram);
+        let s = format_notification_for_inject(true, &source, "", &attachments);
+        assert!(
+            s.contains("[AGEND-MSG]"),
+            "pointer mode must keep [AGEND-MSG]: {s}"
+        );
+        assert!(
+            s.contains("attachments=[1 photo, 1 document]"),
+            "header must carry attachments summary: {s}"
+        );
+    }
+
+    #[test]
+    fn pointer_only_header_omits_attachments_field_when_empty() {
+        // Layer-4 gate: empty attachments → no field. Avoids polluting
+        // existing notifications (operator alerts, status keywords)
+        // with an empty marker.
+        let source = NotifySource::Agent("sender");
+        let s = format_notification_for_inject(true, &source, "hello", &[]);
+        assert!(
+            !s.contains("attachments=["),
+            "no attachments field for empty input: {s}"
+        );
+    }
+
+    #[test]
+    fn inline_body_substitutes_placeholder_when_text_empty_with_attachments() {
+        // Layer-4 gate (regression-proof anchor): pointer_only=false +
+        // text="" + attachments non-empty produces a human-readable
+        // placeholder instead of a content-less inline notification.
+        // Without this, the agent received `[user:foo via telegram] `
+        // — empty after the source tag — and had nothing to action on.
+        use crate::channel::event::AttachmentKind;
+        let attachments = vec![p54_attachment_with_name(AttachmentKind::Photo, "cat.jpg")];
+        let source = NotifySource::Channel("alice", crate::channel::ChannelKind::Telegram);
+        let s = format_notification_for_inject(false, &source, "", &attachments);
+        assert!(
+            s.contains("[1 photo: cat.jpg]"),
+            "single-attachment placeholder uses filename: {s}"
+        );
+    }
+
+    #[test]
+    fn inline_body_keeps_text_when_present_with_attachments() {
+        // Layer-4 gate: caption present → text passes through. The
+        // placeholder must NEVER overwrite the user's own words.
+        // Mirrors layer-2 #497 invariant.
+        use crate::channel::event::AttachmentKind;
+        let attachments = vec![p54_attachment(AttachmentKind::Photo)];
+        let source = NotifySource::Channel("alice", crate::channel::ChannelKind::Telegram);
+        let s = format_notification_for_inject(false, &source, "look at this!", &attachments);
+        assert!(
+            s.contains("look at this!"),
+            "caption must pass through: {s}"
+        );
+        assert!(
+            !s.contains("[1 photo"),
+            "placeholder must NOT overwrite caption: {s}"
+        );
+    }
+
+    #[test]
+    fn attachment_body_placeholder_multi_uses_aggregated_summary() {
+        // Layer-4 gate: multi-attachment placeholder uses kind summary
+        // rather than per-file enumeration. Single attachment with no
+        // filename also uses the summary form ("[1 photo attached]").
+        use crate::channel::event::AttachmentKind;
+        let multi = vec![
+            p54_attachment(AttachmentKind::Photo),
+            p54_attachment(AttachmentKind::Document),
+            p54_attachment(AttachmentKind::Document),
+        ];
+        let s = attachment_body_placeholder(&multi);
+        assert_eq!(s, "[1 photo, 2 document attached]");
+
+        let single_no_name = vec![p54_attachment(AttachmentKind::Photo)];
+        assert_eq!(
+            attachment_body_placeholder(&single_no_name),
+            "[1 photo attached]"
+        );
     }
 }
