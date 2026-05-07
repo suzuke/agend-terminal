@@ -121,7 +121,7 @@ Both sprints land in same Sprint 54 cycle so the audit + translation co-evolve a
 |---|---|---|---|---|
 | **P0-1** | ci_watch poll/subscriber split | 2-3d | Tier-2 dual | none |
 | **P0-2** | Rate-limit recovery (catch-up + adaptive backoff) | 1-2d | Tier-2 dual | P0-1 |
-| **P0-3** | Multi-caller subscriber semantics | 1d | Tier-2 dual | P0-1 |
+| ~~**P0-3**~~ | ~~Multi-caller subscriber semantics~~ **DONE — absorbed by P0-1 (PR #484)** | — | — | — |
 | **P0-4** | GITHUB_TOKEN auto-detect from `gh` + setup warning | 0.5d | Tier-1 | none |
 | **P1-1** | Daemon-worktree initial base = origin/main (Path A) | 0.5d | Tier-2 | none |
 | **P1-2** | task_done → release_worktree wiring | 0.5d | Tier-2 | none |
@@ -138,12 +138,12 @@ Both sprints land in same Sprint 54 cycle so the audit + translation co-evolve a
 | **P2-7** | 7 pre-existing flaky tests triage | 1d | Tier-1 | none |
 | **DEFER** | P1-3 phase-2 generic template passthrough (#137 / cheerc #473) | 1-2d | Tier-2 | — | DEFERRED to Sprint 55, depends on settled fleet.yaml schema |
 
-Total effort: P0 ~5-7d, P1 ~3d, P2 ~5-8d. Sprint 54 capacity: 2 weeks ≈ 10 working days. Realistic landing: P0 + P1 + P2-1 (English docs) + P2-4/5/6 (low-effort cleanup). zh-TW + bypass-hint + flaky-test triage carry to Sprint 55 if needed.
+Total effort: P0 ~4-5d (post-P0-3 absorption), P1 ~3d, P2 ~5-8d. Sprint 54 capacity: 2 weeks ≈ 10 working days. Realistic landing: P0 + P1 + P2-1 (English docs) + P2-4/5/6 (low-effort cleanup). zh-TW + bypass-hint + flaky-test triage carry to Sprint 55 if needed.
 
 ### Sequencing
 
-- P0-1 first (architecture seam) → P0-2 + P0-3 in parallel (independent surfaces).
-- P0-4 standalone, can land any time.
+- P0-1 first (architecture seam) — DONE (PR #484) — also delivered P0-3 scope (subscriber semantics) per `d-20260506155323776106-0`.
+- P0-2 + P0-4 in parallel (independent surfaces).
 - P1-* mostly independent, can land any time.
 - P2-1 before P2-2 (zh-TW depends on stable English).
 
