@@ -106,7 +106,7 @@ Tests (75 / ~1770 LOC): hybrid — small inline per sub-module + shared `tests.r
 - PR 2: `telegram-3a` — core transport + inbound — **Tier-2 dual** (high-risk message flow)
 - PR 3: `telegram-3b` — adapter + outbound — Tier-1 single
 
-**Defer to Sprint 49**: full `render` split + remaining `layout` sub-modules (pane / tree / preset / tab).
+**Update (post-merge)**: delivered in Sprint 48 itself per Option B — `layout` sub-modules via PR #414 (Sprint 48 PR 1), `render` split via PR #421 (Sprint 48 PR 4). Original "defer to Sprint 49" plan superseded; Sprint 49 itself was reverted via PR #425.
 
 **Pros**: 80/20 highest-risk file done in Sprint 48; reviewer bandwidth not blown.
 **Cons**: render.rs still 2386 LOC at end of Sprint 48; layout.rs only partially split.
@@ -177,6 +177,8 @@ External callers see `crate::render::X` unchanged. Same for layout, telegram. **
 - `mod.rs` vs `module.rs+module/` style choice — defer to operator §13.
 
 ## §8 §13 candidate questions for operator
+
+> **Update (post-merge)**: Q1+Q2 below referenced Sprint 49 as a deferral target. Resolution: Option B chosen — both `layout` (PR #414) and `render` (PR #421) split delivered in Sprint 48 itself. Sprint 49 was later reverted via PR #425; no work waiting on it.
 
 1. **Phase split option**: A (3 PRs minimal viable, defer render+layout-2 to Sprint 49) vs B (3-4 PRs all 3 files this sprint) vs C (6 PRs all-split this sprint)?
 2. **Sprint 49 plan**: if option A, when ship Sprint 49 (operator m-330 said Sprint 49 = TUI run_app extract — does render/layout-2 split fit?

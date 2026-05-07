@@ -67,7 +67,10 @@ platforms — only the test execution is skipped on Windows.
 
 **Option B**: Isolate the hanging test(s) by running Windows tray tests
 with `--test-threads=1` and a per-test timeout via cargo-nextest. Higher
-effort, deferred to Sprint 49+ if Option A is insufficient.
+effort, deferred indefinitely — Option A proved sufficient: current
+`.github/workflows/ci.yml` runs `cargo test --tests --features tray`
+on all platforms with `timeout-minutes: 30`, no Windows skip needed.
+(Sprint 49 was reverted via PR #425; this Option B never required pickup.)
 
 ## Recommendation
 
