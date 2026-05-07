@@ -154,19 +154,21 @@ pub(crate) trait GhRunner {
 struct DefaultGhRunner;
 impl GhRunner for DefaultGhRunner {
     fn fetch_token(&self) -> Option<String> {
-        // 1. `gh` on PATH? (cheaper than spawning gh and parsing its
-        // "command not found" stderr.)
-        let which = Command::new("which").arg("gh").output().ok()?;
-        if !which.status.success() {
-            return None;
-        }
-        // 2. authed? `gh auth status` exits non-zero when no auth is
-        // configured for any host.
+        // P0-4 r1 portability fix (reviewer m-43): the prior `which gh`
+        // precheck was not portable to Windows (no `which` builtin) and
+        // was redundant — `Command::new("gh").output()` on a missing
+        // binary returns `Err(NotFound)`, which `.ok()?` collapses to
+        // `None` cleanly on every platform. Letting `gh auth status`
+        // be the single missing-or-unauthed signal also keeps the
+        // fallback path symmetric across Linux / macOS / Windows.
+        //
+        // 1. authed? `gh auth status` exits non-zero when gh is missing
+        // OR when no auth is configured for any host.
         let status = Command::new("gh").args(["auth", "status"]).output().ok()?;
         if !status.status.success() {
             return None;
         }
-        // 3. fetch token. Output is plain text (no JSON wrapping).
+        // 2. fetch token. Output is plain text (no JSON wrapping).
         let token_out = Command::new("gh").args(["auth", "token"]).output().ok()?;
         if !token_out.status.success() {
             return None;
@@ -250,6 +252,29 @@ mod tests {
         let cache = TokenCache::discover_with(&env, &gh);
         assert!(cache.token().is_none());
         assert_eq!(cache.source(), TokenSource::None);
+        assert_eq!(cache.setup_warning(), Some(SETUP_WARNING));
+    }
+
+    #[test]
+    fn fetch_token_returns_none_when_gh_command_not_found() {
+        // P0-4 r1 portability gate (per reviewer m-43): the production
+        // DefaultGhRunner relies on `Command::new("gh").output().ok()?`
+        // returning `None` when the `gh` binary is missing — same path
+        // as a non-zero exit. This test pins that contract on the
+        // GhRunner trait surface so a future "always assume gh exists"
+        // regression is caught even on platforms (Windows) where the
+        // prior `which gh` precheck would have silently broken first.
+        struct MissingGh;
+        impl GhRunner for MissingGh {
+            fn fetch_token(&self) -> Option<String> {
+                // Mirrors `Command::new("gh").output()` returning
+                // `Err(NotFound)` when gh isn't on PATH.
+                None
+            }
+        }
+        let cache = TokenCache::discover_with(&StubEnv(None), &MissingGh);
+        assert_eq!(cache.source(), TokenSource::None);
+        assert!(cache.token().is_none());
         assert_eq!(cache.setup_warning(), Some(SETUP_WARNING));
     }
 
