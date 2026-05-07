@@ -449,7 +449,14 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         vec![]
     };
 
-    // Enqueue in inbox
+    // Enqueue in inbox. Sprint 54 silent-drop layer-4 hotfix:
+    // clone attachments before the move so the PTY-inject path
+    // below can carry the same metadata as the inbox JSONL record.
+    // Without this, the notify_agent call would see only `text`
+    // and produce a content-less inline notification when text=""
+    // (pure image, no caption, download succeeded — text is empty
+    // because there's no caption, but attachments has the photo).
+    let notify_attachments = attachments.clone();
     let msg_obj = InboxMessage {
         schema_version: 0,
         id: None,
@@ -482,12 +489,15 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     };
     let _ = inbox::enqueue(&home, &instance_name, msg_obj);
 
-    // Notify agent PTY
-    inbox::notify_agent(
+    // Notify agent PTY — passes attachments through so the PTY
+    // header carries `attachments=[…]` and the inline body shows a
+    // human placeholder when text is empty.
+    inbox::notify_agent_with_attachments(
         &home,
         &instance_name,
         &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
         &text,
+        &notify_attachments,
     );
 
     // Emit UxEvent::UserMsgReceived so the channel adapter can react 👀.
