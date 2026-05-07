@@ -1,8 +1,10 @@
 # MCP Tools Reference
 
-Every agent spawned by `agend-terminal` gets an MCP stdio server wired in automatically (via `mcp_config.rs` writing each backend's config file). The server exposes 39 tools grouped into 11 categories. All tool definitions live in `src/mcp/tools.rs`; the canonical JSON schemas come from there.
+Every agent spawned by `agend-terminal` gets an MCP stdio server wired in automatically (via `mcp_config.rs` writing each backend's config file). The server exposes 29 tools grouped into 11 categories. All tool definitions live in `src/mcp/tools.rs`; the canonical JSON schemas come from there (the unit test `tool_definitions_count_invariant_post_sprint_30` guards the count).
 
 > Legend: **bold** = required parameter. Types match JSON Schema (`string`, `number`, `integer`, `boolean`, `array<string>`).
+
+> **Note:** The per-category counts below reflect logical groupings; some entries pre-date Sprint 30 tool consolidation (e.g. `send_to_instance` / `delegate_task` / `report_result` / `request_information` / `broadcast` are now exposed via the unified `send` action). The authoritative tool count is enforced by the `tool_definitions_count_invariant_post_sprint_30` test in `src/mcp/tools.rs` — currently 29.
 
 ## Categories
 
@@ -260,7 +262,7 @@ Release the daemon-managed worktree and clear the binding for the given agent. I
 
 ### `gc_dry_run` (Sprint 53 P1-4)
 Surface Phase 4 GC findings to operators without removing anything. Returns the list of stale worktrees (no live binding, no `.agend-managed` marker, or marker older than the GC age threshold) plus their reason codes. Operator-driven cutover deferred — read-only by design.
-- No parameters.
+- `format` (string enum: `human` | `json`) — optional output shape; defaults to `human`.
 
 ---
 
