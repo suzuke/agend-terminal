@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Every agent spawned by `agend-terminal` gets an MCP stdio server wired in automatically (via `mcp_config.rs` writing each backend's config file). The server exposes 36 tools grouped into 10 categories. All tool definitions live in `src/mcp/tools.rs`; the canonical JSON schemas come from there.
+Every agent spawned by `agend-terminal` gets an MCP stdio server wired in automatically (via `mcp_config.rs` writing each backend's config file). The server exposes 39 tools grouped into 11 categories. All tool definitions live in `src/mcp/tools.rs`; the canonical JSON schemas come from there.
 
 > Legend: **bold** = required parameter. Types match JSON Schema (`string`, `number`, `integer`, `boolean`, `array<string>`).
 
@@ -18,6 +18,7 @@ Every agent spawned by `agend-terminal` gets an MCP stdio server wired in automa
 | 8 | Deployments | 3 | `deploy_template`, `teardown_deployment`, `list_deployments` |
 | 9 | CI watchers | 2 | `watch_ci`, `unwatch_ci` |
 | 10 | Repo sharing | 2 | `checkout_repo`, `release_repo` |
+| 11 | Worktree binding | 3 | `bind_self`, `release_worktree`, `gc_dry_run` |
 
 ---
 
@@ -241,6 +242,25 @@ Mount another repo as a read-only worktree in your working directory.
 
 ### `release_repo`
 - **`path`** (string)
+
+---
+
+## 11. Worktree Binding
+
+Daemon-managed worktree lifecycle for multi-agent isolation. Each binding pairs an agent with one branch and one filesystem worktree, tracked via `binding.json` + `.agend-managed` marker. Production code path is dispatch-driven (`delegate_task` with `branch`); these tools cover the off-dispatch entries and exits.
+
+### `bind_self` (Sprint 54 P1-7)
+Bind the calling agent to a fresh worktree on the named branch. Reuses the dispatch-hook lifecycle so `binding.json` + worktree + `.agend-managed` marker + auto `watch_ci` registration all land via the same code path. Use when an agent needs a worktree but has nothing to delegate from (recovery, smoke, ad-hoc claim). Pair with `release_worktree` to unbind.
+- **`repo`** (string, `owner/name`), **`branch`** (string)
+- Rejects `main` / `master` (E4.5) and cross-agent branch claim conflicts.
+
+### `release_worktree` (Sprint 53 P0-X)
+Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone.
+- **`agent`** (string)
+
+### `gc_dry_run` (Sprint 53 P1-4)
+Surface Phase 4 GC findings to operators without removing anything. Returns the list of stale worktrees (no live binding, no `.agend-managed` marker, or marker older than the GC age threshold) plus their reason codes. Operator-driven cutover deferred — read-only by design.
+- No parameters.
 
 ---
 
