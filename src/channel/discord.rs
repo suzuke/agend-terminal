@@ -239,7 +239,7 @@ pub(crate) fn build_identify_payload(
 
 /// Returns `true` if the frame is a HEARTBEAT_ACK (opcode 11).
 pub(crate) fn is_heartbeat_ack(raw: &str) -> bool {
-    parse_gateway_opcode(raw).map_or(false, |f| f.op == 11)
+    parse_gateway_opcode(raw).is_some_and(|f| f.op == 11)
 }
 
 /// Map a twilight `Ready` payload to `ChannelEvent::Connected`.
