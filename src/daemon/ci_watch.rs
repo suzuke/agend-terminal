@@ -294,10 +294,20 @@ impl CiProvider for GitHubCiProvider {
     }
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
+        // Sprint 54 Hotfix F gap fix: GitHub's `head=` query parameter
+        // requires `user:ref-name` format. Sending bare `head=feat/foo`
+        // makes the API silently drop the filter and return the most
+        // recently created PR in the repo regardless of branch — that
+        // behavior masked Hotfix F's freshness check (the misrouted PR
+        // was usually fresh enough to pass the 1-hour window) and
+        // produced false `Terminal{merged}` for any branch that had
+        // never had a PR opened. Per GitHub docs:
+        // https://docs.github.com/en/rest/pulls/pulls#list-pull-requests
+        let owner = repo.split('/').next().unwrap_or("");
         let resp: serde_json::Value = match self
             .http
             .get(&format!(
-                "repos/{repo}/pulls?head={branch}&state=all&per_page=1"
+                "repos/{repo}/pulls?head={owner}:{branch}&state=all&per_page=1"
             ))
             .send()
             .await
@@ -309,28 +319,46 @@ impl CiProvider for GitHubCiProvider {
             Err(_) => return PrState::Unknown,
         };
         match resp.as_array().and_then(|a| a.first()) {
-            Some(pr) => match pr["state"].as_str() {
-                Some("closed") => {
-                    // Verify this PR was updated recently (not a stale PR from
-                    // a previous use of the same branch name). If closed_at is
-                    // older than 1 hour, treat as stale → Unknown (pending).
-                    if let Some(closed_at) = pr["closed_at"].as_str() {
-                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(closed_at) {
-                            let age = chrono::Utc::now()
-                                .signed_duration_since(dt.with_timezone(&chrono::Utc));
-                            if age > chrono::Duration::hours(1) {
-                                // Stale PR from previous branch use — not terminal.
-                                return PrState::Unknown;
+            Some(pr) => {
+                // Sprint 54 Hotfix F gap fix (defensive): even with the
+                // correct query format, GitHub may return a PR whose
+                // `head.ref` doesn't match what we asked for (cross-fork
+                // edge cases, schema drift, future API quirks). Treat
+                // mismatch as Unknown rather than trusting the response
+                // — the cost of an extra polling tick is far smaller
+                // than a false auto-clear.
+                if pr["head"]["ref"].as_str() != Some(branch) {
+                    tracing::debug!(
+                        repo,
+                        branch,
+                        returned_ref = ?pr["head"]["ref"].as_str(),
+                        "check_pr_terminal: response head.ref mismatch — returning Unknown"
+                    );
+                    return PrState::Unknown;
+                }
+                match pr["state"].as_str() {
+                    Some("closed") => {
+                        // Verify this PR was updated recently (not a stale PR from
+                        // a previous use of the same branch name). If closed_at is
+                        // older than 1 hour, treat as stale → Unknown (pending).
+                        if let Some(closed_at) = pr["closed_at"].as_str() {
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(closed_at) {
+                                let age = chrono::Utc::now()
+                                    .signed_duration_since(dt.with_timezone(&chrono::Utc));
+                                if age > chrono::Duration::hours(1) {
+                                    // Stale PR from previous branch use — not terminal.
+                                    return PrState::Unknown;
+                                }
                             }
                         }
+                        PrState::Terminal {
+                            merged: pr["merged_at"].as_str().is_some(),
+                        }
                     }
-                    PrState::Terminal {
-                        merged: pr["merged_at"].as_str().is_some(),
-                    }
+                    Some(_) => PrState::Open,
+                    None => PrState::Unknown,
                 }
-                Some(_) => PrState::Open,
-                None => PrState::Unknown,
-            },
+            }
             None => PrState::Unknown,
         }
     }
@@ -4144,5 +4172,150 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 54 Hotfix F gap: malformed GitHub head query ─────────────
+    //
+    // Per RCA m-46: `check_pr_terminal` was sending bare `head=feat/foo`
+    // instead of `head=owner:feat/foo`. GitHub silently dropped the
+    // filter → returned the most recent PR in the repo → Hotfix F's
+    // freshness check passed → false `Terminal{merged}` for fresh-no-PR
+    // branches. The malformed-query swallow is the third concrete
+    // instance of the silent-drop class systematic prevention pattern
+    // (decision `d-20260507100609264367-2`).
+    //
+    // EMPIRICAL REGRESSION-PROOF ANCHOR: dropping the `{owner}:` prefix
+    // from the URL format string trips
+    // `github_check_pr_terminal_uses_owner_prefix_in_head_query`. PR
+    // description carries the verbatim FAIL signature.
+
+    /// Reuse the gitlab_mock_server scaffolding — it's just an HTTP
+    /// listener returning a fixed body, content-type agnostic. Renaming
+    /// to `mock_server` would touch dozens of call sites; sharing the
+    /// fn under a Hotfix-F-specific helper avoids that churn.
+    fn github_mock_server(response_body: &str) -> (u16, std::thread::JoinHandle<()>, MockCapture) {
+        gitlab_mock_server(response_body)
+    }
+
+    #[test]
+    fn github_check_pr_terminal_uses_owner_prefix_in_head_query() {
+        // Hotfix F gap gate 1 (regression-proof anchor): the production
+        // URL must carry `head={owner}:{branch}` per GitHub docs. Empty
+        // PR list is fine — the test only inspects the captured URL.
+        let (port, handle, captured) = github_mock_server("[]");
+        let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let _ = rt.block_on(provider.check_pr_terminal("acme/widgets", "feat/foo"));
+
+        handle.join().expect("mock");
+        let (path, _request) = captured.lock().expect("lock").take().expect("captured");
+
+        assert!(
+            path.contains("/repos/acme/widgets/pulls"),
+            "URL must target the repo's pulls endpoint: {path}"
+        );
+        assert!(
+            path.contains("head=acme:feat/foo"),
+            "URL must use `head={{owner}}:{{branch}}` per GitHub docs (Hotfix F gap fix); got: {path}"
+        );
+        // Defensive: also ensure the legacy bare form is GONE — a
+        // future edit that re-introduced `head={branch}` without the
+        // owner prefix should trip this.
+        assert!(
+            !path.contains("head=feat/foo&"),
+            "URL must NOT use bare `head={{branch}}` (the silent-drop bug); got: {path}"
+        );
+    }
+
+    #[test]
+    fn github_check_pr_terminal_returns_unknown_on_head_ref_mismatch() {
+        // Hotfix F gap gate 2 (defensive): even with the correct URL,
+        // GitHub may return a PR whose head.ref doesn't match what we
+        // asked. The defensive check returns Unknown so we don't
+        // misclassify the asked branch as Terminal based on someone
+        // else's PR data.
+        let mismatched = r#"[{
+            "state": "closed",
+            "closed_at": "2099-01-01T00:00:00Z",
+            "merged_at": "2099-01-01T00:00:00Z",
+            "head": {"ref": "different-branch"}
+        }]"#;
+        let (port, handle, captured) = github_mock_server(mismatched);
+        let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let state = rt.block_on(provider.check_pr_terminal("acme/widgets", "feat/foo"));
+        handle.join().expect("mock");
+        let _ = captured;
+
+        assert!(
+            matches!(state, super::PrState::Unknown),
+            "head.ref mismatch must return Unknown (defensive); got: {state:?}"
+        );
+    }
+
+    #[test]
+    fn github_check_pr_terminal_returns_unknown_on_empty_pr_list() {
+        // Hotfix F gap gate 3 (production-realistic): the bug surfaced
+        // for fresh-no-PR branches, where GitHub correctly returns []
+        // once the head query is well-formed. The state machine must
+        // map empty → Unknown so the auto-clear path doesn't fire.
+        let (port, handle, captured) = github_mock_server("[]");
+        let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let state = rt.block_on(provider.check_pr_terminal("acme/widgets", "fresh-branch-no-pr"));
+        handle.join().expect("mock");
+        let _ = captured;
+
+        assert!(
+            matches!(state, super::PrState::Unknown),
+            "fresh-no-PR branch must return Unknown; got: {state:?}"
+        );
+    }
+
+    #[test]
+    fn github_check_pr_terminal_terminal_on_matching_head_ref_and_recent_close() {
+        // Hotfix F gap gate 4: the happy path still works post-fix —
+        // a closed-and-merged PR matching the head.ref returns
+        // Terminal{merged: true}. Defensive head.ref check + Hotfix F
+        // freshness check both pass.
+        let recent_close = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let body = format!(
+            r#"[{{
+                "state": "closed",
+                "closed_at": "{}",
+                "merged_at": "{}",
+                "head": {{"ref": "feat/foo"}}
+            }}]"#,
+            recent_close.to_rfc3339(),
+            recent_close.to_rfc3339()
+        );
+        let (port, handle, captured) = github_mock_server(&body);
+        let provider = super::GitHubCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
+            .expect("provider");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let state = rt.block_on(provider.check_pr_terminal("acme/widgets", "feat/foo"));
+        handle.join().expect("mock");
+        let _ = captured;
+
+        assert!(
+            matches!(state, super::PrState::Terminal { merged: true }),
+            "matching head.ref + recent merged_at must be Terminal(merged); got: {state:?}"
+        );
     }
 }
