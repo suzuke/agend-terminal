@@ -20,13 +20,22 @@ pub fn tool_definitions() -> Value {
 }
 
 fn channel_tools() -> Vec<Value> {
+    // Sprint 54 #488 hotfix: these handlers depend on daemon-resident
+    // state (ACTIVE_CHANNEL, telegram bot session) and cannot run in
+    // an MCP subprocess context. Tagged `requires_daemon_state: true`
+    // so `proxy_or_local` returns a structured error instead of
+    // falling back to a local handler that would silently produce
+    // misleading errors like `no active channel`.
     vec![
-        json!({"name": "reply", "description": "Reply to the user via the active channel.",
-            "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
-        json!({"name": "react", "description": "React to a message with an emoji.",
-            "inputSchema": {"type": "object", "properties": {"emoji": {"type": "string"}}, "required": ["emoji"]}}),
-        json!({"name": "download_attachment", "description": "Download a file attachment (telegram multimedia: images, audio, documents). Returns local path.",
-            "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}}),
+        json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API.",
+            "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+            "requires_daemon_state": true}),
+        json!({"name": "react", "description": "React to a message with an emoji. Requires daemon API.",
+            "inputSchema": {"type": "object", "properties": {"emoji": {"type": "string"}}, "required": ["emoji"]},
+            "requires_daemon_state": true}),
+        json!({"name": "download_attachment", "description": "Download a file attachment (telegram multimedia: images, audio, documents). Returns local path. Requires daemon API.",
+            "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]},
+            "requires_daemon_state": true}),
     ]
 }
 

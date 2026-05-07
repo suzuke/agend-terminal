@@ -225,6 +225,16 @@ Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/Aut
 | Schedule | `schedule(action: create)` | backend-specific tools |
 | Timeout | `replace_instance` | waiting forever |
 
+**Daemon-state error format (Sprint 54 #488 hotfix)**. Tools that
+depend on daemon-resident state — `reply`, `react`,
+`download_attachment` — never silently fall back to a local handler
+when the daemon is unreachable. They return a structured error of the
+form `tool '<NAME>' requires daemon API; not reachable: <CAUSE>`.
+Agents seeing this prefix should surface the message as-is to the
+user (it's operator-actionable: restart daemon / check socket) rather
+than retry blindly. Stateless tools (`inbox`, `task`, `send`, etc.)
+still fall back gracefully for offline workflows.
+
 ## §12. Workflow Efficiency
 
 ### 12.1 Pipeline Dispatch
