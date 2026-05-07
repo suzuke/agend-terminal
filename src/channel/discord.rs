@@ -737,7 +737,11 @@ mod tests {
         assert!(caps.emits_deletion_events);
         assert!(caps.threads);
         assert!(caps.attachments);
-        assert!(caps.react);
+        // M3: react support is `false` per production `discord_caps()` —
+        // returns NotSupported until implemented. Sprint 54 P2-8b: test
+        // updated to reflect production reality (was: stale aspirational
+        // `assert!(caps.react)`).
+        assert!(!caps.react);
         assert!(caps.edit);
         assert!(caps.typing_indicator);
         assert!(caps.receives_edit_events);
@@ -950,8 +954,8 @@ mod tests {
             "unknown-agent",
             crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
         );
-        assert!(result.is_err(), "unbound instance must error");
-        let err_msg = format!("{}", result.unwrap_err());
+        let err = result.expect_err("unbound instance must error");
+        let err_msg = format!("{err}");
         assert!(
             err_msg.contains("no discord binding"),
             "error must mention binding, got: {err_msg}"
@@ -968,8 +972,8 @@ mod tests {
             "any-agent",
             crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
         );
-        assert!(result.is_err(), "unauthorized channel must reject");
-        let err_msg = format!("{}", result.unwrap_err());
+        let err = result.expect_err("unauthorized channel must reject");
+        let err_msg = format!("{err}");
         assert!(
             err_msg.contains("outbound disabled"),
             "error must mention outbound gate, got: {err_msg}"
@@ -1441,16 +1445,13 @@ mod tests {
     }
 
     /// Keepalive interval constant is reasonable (≤ Discord's shortest
-    /// auto-archive of 3600s).
+    /// auto-archive of 3600s). Compile-time check via `const {}` blocks —
+    /// per `clippy::assertions_on_constants` and Rust 1.79+ const block
+    /// support — so a regression in `KEEPALIVE_INTERVAL_SECS` fails the
+    /// build, not just this test.
     #[test]
     fn discord_keepalive_interval_within_auto_archive_window() {
-        assert!(
-            super::KEEPALIVE_INTERVAL_SECS < 3600,
-            "keepalive must fire before shortest auto-archive (1h)"
-        );
-        assert!(
-            super::KEEPALIVE_INTERVAL_SECS >= 60,
-            "keepalive should not be too aggressive"
-        );
+        const { assert!(super::KEEPALIVE_INTERVAL_SECS < 3600) };
+        const { assert!(super::KEEPALIVE_INTERVAL_SECS >= 60) };
     }
 }
