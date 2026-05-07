@@ -131,6 +131,12 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
             superseded_by: None,
+            // Sprint 54 layer-5: surfaced when caller (handle_broadcast)
+            // is fanning out — None for unicast SEND. Header formatter
+            // emits `broadcast=N team=NAME` from this.
+            broadcast_context: params.get("broadcast_context").and_then(|v| {
+                serde_json::from_value::<crate::inbox::BroadcastContext>(v.clone()).ok()
+            }),
         }
     };
     let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());

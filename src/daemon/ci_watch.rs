@@ -1001,6 +1001,7 @@ fn fan_out_health_event(
                 in_reply_to_excerpt: None,
                 superseded_by: None,
                 from_id: None,
+                broadcast_context: None,
             },
         );
     }
@@ -1841,6 +1842,7 @@ async fn ci_check_repo(
                         in_reply_to_excerpt: None,
                         superseded_by: None,
                         from_id: None,
+                        broadcast_context: None,
                     },
                 );
             }

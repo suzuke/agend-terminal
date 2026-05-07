@@ -217,6 +217,14 @@ pub struct InboxMessage {
     /// Sender's instance ID (UUIDv4) for audit trail. Display: name (id8).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_id: Option<String>,
+    /// Sprint 54 layer-5 broadcast visibility: populated when this message
+    /// arrived via a `send` broadcast (team / targets / tags fan-out).
+    /// Absent on unicast — same conditional pattern as `attachments`. Lets
+    /// recipient agents distinguish "broadcast to N peers" from a direct
+    /// 1-on-1 message at JSON-metadata vantage; the PTY-inject header
+    /// surfaces the same context via `team=` / `broadcast=` fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadcast_context: Option<BroadcastContext>,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).
@@ -228,6 +236,22 @@ pub struct ForceMeta {
     pub reason: String,
     #[serde(alias = "interrupted_at")]
     pub forced_at: String,
+}
+
+/// Sprint 54 layer-5 broadcast visibility: routing-time metadata captured at
+/// `handle_broadcast` and threaded through the SEND path so the recipient
+/// agent can tell broadcast from unicast. `team` is `Some` only for
+/// team-based broadcasts; `targets`/`count` are populated for every fan-out
+/// (including direct `targets=[…]` / `tags=[…]` modes). Routing behavior is
+/// unaffected — this struct is metadata-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BroadcastContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub count: usize,
 }
 
 impl InboxMessage {
@@ -617,6 +641,17 @@ pub fn format_header(msg: &InboxMessage) -> String {
             .collect();
         parts.push(format!("attachments=[{}]", paths.join(",")));
     }
+    // Sprint 54 layer-5 broadcast visibility: surface broadcast routing in
+    // the PTY-inject header so the recipient agent can tell broadcast from
+    // unicast at first glance. `broadcast=N` always emits when context is
+    // present; `team=NAME` only when team-based fan-out (absent for direct
+    // `targets=[…]` / `tags=[…]` modes per qa-test smoke success criteria).
+    if let Some(ref ctx) = msg.broadcast_context {
+        parts.push(format!("broadcast={}", ctx.count));
+        if let Some(ref team) = ctx.team {
+            parts.push(format!("team={}", sanitize_header_value(team)));
+        }
+    }
     if let Some(ref excerpt) = msg.in_reply_to_excerpt {
         parts.push(format!(
             "reply_to_excerpt={}",
@@ -826,6 +861,12 @@ pub fn find_message(home: &Path, msg_id: &str) -> Option<InboxMessage> {
 
 /// Deliver a message: always enqueue to inbox JSONL for persistence,
 /// then inject to PTY (inline or pointer-only depending on feature flag).
+///
+/// Sprint 54 layer-5: `broadcast_context` is `Some` only when the call
+/// originates from a `handle_broadcast` per-target fan-out via the
+/// `agent_ops::send_to` daemon-unavailable fallback. The daemon-available
+/// path goes through `api::handlers::messaging::handle_send` and
+/// constructs its own `InboxMessage` with the same field.
 pub fn deliver(
     home: &Path,
     agent_name: &str,
@@ -833,6 +874,7 @@ pub fn deliver(
     text: &str,
     _submit_key: &str,
     kind: Option<String>,
+    broadcast_context: Option<BroadcastContext>,
 ) {
     let msg = InboxMessage {
         schema_version: 0,
@@ -855,6 +897,7 @@ pub fn deliver(
         in_reply_to_excerpt: None,
         superseded_by: None,
         from_id: None,
+        broadcast_context,
     };
     let _ = enqueue(home, agent_name, msg);
     notify_agent(home, agent_name, source, text);
@@ -1127,6 +1170,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         }
     }
 
@@ -1262,6 +1306,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1286,6 +1331,7 @@ mod tests {
             "short msg",
             "\r",
             None,
+            None,
         );
         let msgs = drain(&home, "agent1");
         assert_eq!(
@@ -1308,6 +1354,7 @@ mod tests {
             &long_text,
             "\r",
             Some("chat".to_string()),
+            None,
         );
         let msgs = drain(&home, "agent1");
         assert_eq!(msgs.len(), 1, "long messages should be enqueued");
@@ -1368,6 +1415,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1399,6 +1447,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1993,6 +2042,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("thread_id"));
@@ -2045,6 +2095,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("[AGEND-MSG]"));
@@ -2080,6 +2131,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("from=from:agent"));
@@ -2120,6 +2172,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2151,6 +2204,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2196,11 +2250,188 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(
             header.contains("attachments=[/tmp/a.jpg,/tmp/b.jpg,/tmp/c.jpg]"),
             "multi-attachment paths must be comma-joined: {header}"
+        );
+    }
+
+    /// Sprint 54 layer-5: regression-proof for qa-test smoke
+    /// 2026-05-07 17:55 UTC — `send(team=qa-test, ...)` recipient PTY
+    /// header must surface the team= field so broadcast is
+    /// distinguishable from unicast at agent vantage. Mutate-revert:
+    /// removing the `format_header` broadcast-context branch leaves
+    /// this test failing with header lacking `team=` / `broadcast=`.
+    #[test]
+    fn test_header_format_includes_team_and_broadcast_when_team_broadcast() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:lead".into(),
+            text: "ping".into(),
+            kind: Some("query".into()),
+            timestamp: "2026-05-07T18:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: Some(BroadcastContext {
+                team: Some("qa-test".to_string()),
+                targets: vec!["kiro-cli-ea377a".into(), "kiro-cli-4e8a78".into()],
+                count: 2,
+            }),
+        };
+        let header = format_header(&msg);
+        assert!(
+            header.contains("broadcast=2"),
+            "team broadcast must surface count: {header}"
+        );
+        assert!(
+            header.contains("team=qa-test"),
+            "team broadcast must surface team name (qa-test smoke success criteria): {header}"
+        );
+    }
+
+    /// Direct `targets=[…]` / `tags=[…]` fan-out has no team — header
+    /// gains `broadcast=N` only, no `team=`.
+    #[test]
+    fn test_header_format_includes_broadcast_only_when_targets_broadcast() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:dev".into(),
+            text: "fyi".into(),
+            kind: None,
+            timestamp: "2026-05-07T18:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: Some(BroadcastContext {
+                team: None,
+                targets: vec!["a".into(), "b".into(), "c".into()],
+                count: 3,
+            }),
+        };
+        let header = format_header(&msg);
+        assert!(header.contains("broadcast=3"), "{header}");
+        assert!(
+            !header.contains("team="),
+            "no-team broadcast must not emit team= field: {header}"
+        );
+    }
+
+    /// Unicast must NOT surface broadcast/team fields — preserves the
+    /// pre-Sprint-54 header shape for non-broadcast callers (the
+    /// majority of SEND traffic).
+    #[test]
+    fn test_header_format_omits_broadcast_fields_when_unicast() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:dev".into(),
+            text: "hi".into(),
+            kind: None,
+            timestamp: "2026-05-07T18:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: None,
+        };
+        let header = format_header(&msg);
+        assert!(
+            !header.contains("broadcast="),
+            "unicast must not emit broadcast= field: {header}"
+        );
+        assert!(
+            !header.contains("team="),
+            "unicast must not emit team= field: {header}"
+        );
+    }
+
+    /// Roundtrip: `broadcast_context` survives serde JSON encoding so the
+    /// inbox JSONL projection (visible via `inbox` MCP tool) matches the
+    /// PTY header. Absent field stays absent (no `null` leak).
+    #[test]
+    fn test_inbox_message_broadcast_context_serde_roundtrip() {
+        let with_ctx = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:lead".into(),
+            text: "t".into(),
+            kind: None,
+            timestamp: "2026-05-07T18:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: Some(BroadcastContext {
+                team: Some("qa-test".to_string()),
+                targets: vec!["a".into(), "b".into()],
+                count: 2,
+            }),
+        };
+        let json = serde_json::to_string(&with_ctx).expect("ser");
+        assert!(json.contains("broadcast_context"));
+        assert!(json.contains("\"team\":\"qa-test\""));
+        let parsed: InboxMessage = serde_json::from_str(&json).expect("deser");
+        let parsed_ctx = parsed.broadcast_context.expect("ctx survived");
+        assert_eq!(parsed_ctx.team.as_deref(), Some("qa-test"));
+        assert_eq!(parsed_ctx.count, 2);
+        assert_eq!(parsed_ctx.targets, vec!["a", "b"]);
+
+        let without_ctx = InboxMessage {
+            broadcast_context: None,
+            ..with_ctx
+        };
+        let json2 = serde_json::to_string(&without_ctx).expect("ser");
+        assert!(
+            !json2.contains("broadcast_context"),
+            "absent field must not serialize as null: {json2}"
         );
     }
 
@@ -2227,6 +2458,7 @@ mod tests {
             in_reply_to_excerpt: Some("[bob] original".into()),
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let h = format_header(&msg);
         assert!(h.contains("reply_to_excerpt=[bob] original"), "{h}");
@@ -2325,6 +2557,7 @@ mod tests {
             in_reply_to_excerpt: Some("[b] line1\nline2".into()),
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let h = format_header(&msg);
         assert!(!h.contains('\n'), "must be single line: {h}");
@@ -2354,6 +2587,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2391,6 +2625,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2433,6 +2668,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2478,6 +2714,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2640,6 +2877,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: InboxMessage = serde_json::from_str(&json).unwrap();
@@ -2696,6 +2934,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         enqueue(&home, agent, msg1).unwrap();
         mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-msg-id");
@@ -2732,6 +2971,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             from_id: None,
+            broadcast_context: None,
         };
         let superseded = InboxMessage {
             schema_version: 0,
@@ -2754,6 +2994,7 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: Some("new-ci".into()),
             from_id: None,
+            broadcast_context: None,
         };
         enqueue(&home, agent, normal).unwrap();
         enqueue(&home, agent, superseded).unwrap();
@@ -2786,6 +3027,7 @@ mod tests {
             in_reply_to_msg_id: None,
             in_reply_to_excerpt: None,
             superseded_by: None,
+            broadcast_context: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");

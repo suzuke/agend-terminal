@@ -190,6 +190,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
                 in_reply_to_excerpt: None,
                 superseded_by: None,
                 from_id: None,
+                broadcast_context: None,
             },
         );
         // Also notify agent PTY so it picks up the summary
@@ -486,6 +487,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         }),
         superseded_by: None,
         from_id: None,
+        broadcast_context: None,
     };
     let _ = inbox::enqueue(&home, &instance_name, msg_obj);
 

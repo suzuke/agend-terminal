@@ -322,6 +322,7 @@ fn test_inbox(home: &Path) -> TestResult {
                 in_reply_to_excerpt: None,
                 superseded_by: None,
                 from_id: None,
+                broadcast_context: None,
             },
         );
     }

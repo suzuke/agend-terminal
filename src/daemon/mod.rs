@@ -910,6 +910,7 @@ pub fn run_task_maintenance(home: &Path) {
                 in_reply_to_excerpt: None,
                 superseded_by: None,
                 from_id: None,
+                broadcast_context: None,
             },
         );
     }
@@ -978,6 +979,7 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                     in_reply_to_excerpt: None,
                     superseded_by: None,
                     from_id: None,
+                    broadcast_context: None,
                 },
             );
         }

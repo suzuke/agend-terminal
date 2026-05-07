@@ -129,6 +129,7 @@ pub(super) fn handle_send_to_instance(
                 in_reply_to_excerpt: None,
                 superseded_by: None,
                 from_id: None,
+                broadcast_context: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
@@ -330,6 +331,7 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 in_reply_to_excerpt: None,
                 superseded_by: None,
                 from_id: None,
+                broadcast_context: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
@@ -462,6 +464,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     in_reply_to_excerpt: None,
                     superseded_by: None,
                     from_id: None,
+                    broadcast_context: None,
                 };
                 crate::agent_ops::fallback_deliver(
                     home,
@@ -536,7 +539,7 @@ pub(super) fn handle_request_information(
     if let Some(ctx) = args["context"].as_str() {
         msg.push_str(&format!("\n\nContext: {ctx}"));
     }
-    send_to(home, sender, target, &msg, "query")
+    send_to(home, sender, target, &msg, "query", None)
 }
 
 pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
@@ -548,7 +551,8 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
         None => return json!({"error": "missing 'message'"}),
     };
     // Resolve targets: team > targets > tags > all
-    let targets: Vec<String> = if let Some(team) = args["team"].as_str() {
+    let team_name = args["team"].as_str().map(String::from);
+    let targets: Vec<String> = if let Some(team) = team_name.as_deref() {
         crate::teams::get_members(home, team)
     } else if let Some(t) = args["targets"].as_array() {
         t.iter()
@@ -562,9 +566,18 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
         .filter(|t| *sender != t.as_str())
         .collect();
     let kind = args["request_kind"].as_str().unwrap_or("update");
+    // Sprint 54 layer-5 broadcast visibility: build context once for the
+    // whole fan-out so each recipient's PTY header gets `broadcast=N`
+    // (and `team=NAME` when team-based) and inbox JSON gets the same
+    // metadata. Routing behavior unchanged.
+    let broadcast_ctx = crate::inbox::BroadcastContext {
+        team: team_name,
+        targets: targets.clone(),
+        count: targets.len(),
+    };
     let mut sent = Vec::new();
     for target in &targets {
-        let _ = send_to(home, sender, target, message, kind);
+        let _ = send_to(home, sender, target, message, kind, Some(&broadcast_ctx));
         sent.push(target.clone());
     }
     if !sent.is_empty() {

@@ -46,13 +46,35 @@ pub fn fallback_deliver(
 ///
 /// `from: &Sender` guarantees a non-empty originator; callers cannot
 /// accidentally stamp messages with `[from:]` (see `src/identity.rs`).
-pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str) -> Value {
+///
+/// Sprint 54 layer-5: `broadcast_context` is `Some` only when the call
+/// originates from `handle_broadcast` per-target loop — it surfaces in the
+/// recipient's `[AGEND-MSG]` header (`broadcast=N team=NAME`) and inbox
+/// JSON metadata so broadcast is distinguishable from unicast at agent
+/// vantage. Routing behavior is unaffected.
+pub fn send_to(
+    home: &Path,
+    from: &Sender,
+    target: &str,
+    text: &str,
+    kind: &str,
+    broadcast_context: Option<&crate::inbox::BroadcastContext>,
+) -> Value {
     let from_str = from.as_str();
+    let mut params = json!({
+        "from": from_str,
+        "target": target,
+        "text": text,
+        "kind": kind,
+    });
+    if let Some(ctx) = broadcast_context {
+        params["broadcast_context"] = serde_json::to_value(ctx).unwrap_or(Value::Null);
+    }
     match crate::api::call(
         home,
         &json!({
             "method": crate::api::method::SEND,
-            "params": { "from": from_str, "target": target, "text": text, "kind": kind }
+            "params": params,
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -77,6 +99,7 @@ pub fn send_to(home: &Path, from: &Sender, target: &str, text: &str, kind: &str)
                 text,
                 &submit_key,
                 None,
+                broadcast_context.cloned(),
             );
             json!({"target": target, "delivery_mode": "inbox_fallback", "note": format!("API unavailable: {e}")})
         }
