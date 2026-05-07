@@ -71,7 +71,7 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "fs", "macros", "ti
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-syn = { version = "2", features = ["parsing", "full"] }
+syn = { version = "2", features = ["parsing", "full", "visit"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 serde_yaml_ng = "0.10"
 
@@ -141,6 +141,10 @@ proptest = "1.4"
 # Used only for asserting that codex_trust_directory writes syntactically
 # valid TOML — the prod code appends raw text, it doesn't depend on this crate.
 toml = "0.8"
+# Sprint 54 P1-A — `tests/cargo_include_invariant.rs` matches resolved
+# `include_str!` paths against `[package].include` glob patterns
+# (e.g. `src/**/*.rs`, `assets/hooks/*`). Test-only.
+glob = "0.3"
 # Log-capture for failure-visibility regression pins (DESIGN-stage-b-ux.md
 # §7 PR-C names `tracing-test` as the sanctioned approach for asserting
 # `tracing::warn!` records are actually emitted).
