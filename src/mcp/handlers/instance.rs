@@ -134,8 +134,15 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
             return json!({"error": "cannot delete the last instance — channel needs at least one instance to receive messages"});
         }
     }
-    full_delete_instance(home, name);
-    json!({"name": name})
+    match full_delete_instance(home, name) {
+        Ok(()) => json!({"name": name}),
+        Err(detail) => json!({
+            "name": name,
+            "error": format!(
+                "delete completed with residual state — fleet may resurrect on next reconcile: {detail}"
+            ),
+        }),
+    }
 }
 
 /// Sprint 53 Smoke 2 r1: shared full single-instance teardown used by both
@@ -162,8 +169,14 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
 /// - **Team membership removal** so a closed instance doesn't leave a
 ///   dangling team-member reference.
 ///
-/// Returns nothing — the MCP handler builds its own success Value.
-pub(crate) fn full_delete_instance(home: &Path, name: &str) {
+/// Returns `Ok(())` when every fleet store is verified clean post-delete.
+/// Returns `Err(detail)` (Sprint 54 P1-B Bug 1 fix — transactional-or-loud)
+/// when any store still holds the name after the cleanup run, so the
+/// caller can surface the residual rather than silently leaving partial
+/// state for `auto_start_fleet` to resurrect on next reconcile. `detail`
+/// is a human-readable string listing the residual stores plus any
+/// per-step error captured during cleanup.
+pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
     let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
     let (topic_id, working_dir) = fleet
         .as_ref()
@@ -174,12 +187,20 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) {
         .unwrap_or((None, None));
     let topic_id = topic_id.or_else(|| telegram::lookup_topic_for_instance(home, name));
 
+    // Sprint 54 P1-B Bug 1: collect per-step errors instead of silently
+    // swallowing them. Each cleanup step runs best-effort so even when
+    // earlier steps fail the later ones still get a chance, but every
+    // surfaced error feeds the final audit so the caller knows which
+    // stores left residual state.
+    let mut step_errors: Vec<String> = Vec::new();
+
     let _ = crate::api::call(
         home,
         &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
     );
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
-        tracing::warn!(error = %e, "failed to remove from fleet.yaml");
+        step_errors.push(format!("fleet.yaml removal: {e}"));
+        tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");
     }
     if let Some(tid) = topic_id {
         telegram::delete_topic(home, tid);
@@ -190,6 +211,78 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) {
         cleanup_working_dir(home, name, wd);
     }
     crate::teams::remove_member_from_all(home, name);
+
+    // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
+    // the name. If any do, surface a loud error instead of returning
+    // success — `auto_start_fleet` revival of a half-deleted instance is
+    // exactly the silent-drop class pattern this fix prevents.
+    let residual = name_residual_anywhere(home, name);
+    if residual.is_empty() && step_errors.is_empty() {
+        return Ok(());
+    }
+    let detail = match (residual.is_empty(), step_errors.is_empty()) {
+        (true, _) => format!("step errors: {}", step_errors.join("; ")),
+        (false, true) => format!("residual stores: {}", residual.join(", ")),
+        (false, false) => format!(
+            "step errors: {}; residual stores: {}",
+            step_errors.join("; "),
+            residual.join(", ")
+        ),
+    };
+    tracing::error!(
+        name,
+        residual = ?residual,
+        step_errors = ?step_errors,
+        "full_delete_instance left residual state — silent-drop class pattern blocked"
+    );
+    Err(detail)
+}
+
+/// Sprint 54 P1-B Bug 1: enumerate every fleet store that still holds
+/// `name` after a delete attempt. Returns the list of store identifiers
+/// (`"fleet.yaml"`, `"metadata"`, etc.) so callers can surface the
+/// residual loudly. Per the P1-B RCA doc (PR #509 squash 66682d2):
+/// three primary stores plus four auxiliary on-disk artefacts where
+/// instance-name-bearing state survives delete; this audit covers them
+/// all so the daemon-process-internal `agent::registry` /
+/// `agent::externals` (which require live registry handles to inspect)
+/// are checked separately by their own callers.
+pub(crate) fn name_residual_anywhere(home: &Path, name: &str) -> Vec<&'static str> {
+    let mut sources: Vec<&'static str> = Vec::new();
+    if let Ok(cfg) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
+        if cfg.instances.contains_key(name) {
+            sources.push("fleet.yaml");
+        }
+        if cfg
+            .teams
+            .values()
+            .any(|t| t.members.iter().any(|m| m == name))
+        {
+            sources.push("fleet.yaml/teams");
+        }
+    }
+    if home.join("metadata").join(format!("{name}.json")).exists() {
+        sources.push("metadata");
+    }
+    if home.join("inbox").join(format!("{name}.jsonl")).exists() {
+        sources.push("inbox");
+    }
+    if home
+        .join("runtime")
+        .join(name)
+        .join("binding.json")
+        .exists()
+    {
+        sources.push("runtime/binding.json");
+    }
+    if home
+        .join("notification-queue")
+        .join(format!("{name}.jsonl"))
+        .exists()
+    {
+        sources.push("notification-queue");
+    }
+    sources
 }
 
 pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
@@ -673,5 +766,182 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
         }
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("spawn failed")}),
         Err(e) => json!({"error": format!("API unavailable: {e}")}),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    //! Sprint 54 P1-B Bug 1 fix: residual-store audit + transactional-or-loud
+    //! `full_delete_instance`. Tests cover the audit fn's per-store
+    //! detection (clean / each-store-positive / multi-source) and the
+    //! delete fn's Result-return contract (Err on residual,
+    //! Ok on clean). `full_delete_instance` reaches into the daemon's
+    //! `api::call` which fails harmlessly with no daemon — we exercise
+    //! the post-cleanup audit branch by pre-seeding residual state
+    //! directly, mirroring the silent-drop class production scenario.
+
+    use super::name_residual_anywhere;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        static C: AtomicU32 = AtomicU32::new(0);
+        let id = C.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-p1b-bug1-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id,
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    #[test]
+    fn name_residual_anywhere_clean_home_returns_empty() {
+        let home = tmp_home("clean");
+        assert!(name_residual_anywhere(&home, "ghost").is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn name_residual_anywhere_detects_fleet_yaml_instance_residual() {
+        let home = tmp_home("fleet_yaml_inst");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  zombie:\n    backend: claude\n",
+        )
+        .unwrap();
+        let sources = name_residual_anywhere(&home, "zombie");
+        assert!(
+            sources.contains(&"fleet.yaml"),
+            "fleet.yaml instances residual must surface, got {sources:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn name_residual_anywhere_detects_fleet_yaml_team_member_residual() {
+        // Sprint 54 PR #507 unification: teams live in fleet.yaml; a
+        // delete that misses team membership cleanup leaves the name
+        // resolvable as a team member, which the audit must surface
+        // separately from the instances: stanza.
+        let home = tmp_home("fleet_yaml_team");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "teams:\n  ops:\n    members: [zombie, alice]\n    orchestrator: alice\n",
+        )
+        .unwrap();
+        let sources = name_residual_anywhere(&home, "zombie");
+        assert!(
+            sources.contains(&"fleet.yaml/teams"),
+            "team-member residual must surface, got {sources:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn name_residual_anywhere_detects_metadata_residual() {
+        let home = tmp_home("metadata");
+        let meta_dir = home.join("metadata");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::write(meta_dir.join("zombie.json"), "{}").unwrap();
+        let sources = name_residual_anywhere(&home, "zombie");
+        assert!(sources.contains(&"metadata"), "got {sources:?}");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn name_residual_anywhere_detects_inbox_residual() {
+        let home = tmp_home("inbox");
+        let inbox_dir = home.join("inbox");
+        std::fs::create_dir_all(&inbox_dir).unwrap();
+        std::fs::write(inbox_dir.join("zombie.jsonl"), "").unwrap();
+        let sources = name_residual_anywhere(&home, "zombie");
+        assert!(sources.contains(&"inbox"), "got {sources:?}");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn name_residual_anywhere_detects_runtime_binding_residual() {
+        let home = tmp_home("binding");
+        let dir = home.join("runtime").join("zombie");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("binding.json"), "{}").unwrap();
+        let sources = name_residual_anywhere(&home, "zombie");
+        assert!(sources.contains(&"runtime/binding.json"), "got {sources:?}");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn name_residual_anywhere_detects_notification_queue_residual() {
+        let home = tmp_home("nq");
+        let dir = home.join("notification-queue");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zombie.jsonl"), "").unwrap();
+        let sources = name_residual_anywhere(&home, "zombie");
+        assert!(sources.contains(&"notification-queue"), "got {sources:?}");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn name_residual_anywhere_returns_multi_source_when_several_stores_dirty() {
+        // Regression-proof: dropping the per-store check must surface
+        // as a missing entry in this list, not as a silent skip.
+        let home = tmp_home("multi");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  zombie:\n    backend: claude\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        std::fs::write(home.join("metadata").join("zombie.json"), "{}").unwrap();
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::write(home.join("inbox").join("zombie.jsonl"), "").unwrap();
+        let sources = name_residual_anywhere(&home, "zombie");
+        for expected in ["fleet.yaml", "metadata", "inbox"] {
+            assert!(
+                sources.contains(&expected),
+                "multi-source audit must include {expected}, got {sources:?}"
+            );
+        }
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn full_delete_instance_returns_err_when_residual_remains_post_cleanup() {
+        // Pre-seed metadata + inbox files before delete; daemon API is
+        // unreachable in the test process, so `api::call` fails
+        // (silently). fleet.yaml removal is also a no-op (no fleet.yaml
+        // present). The post-cleanup audit must surface the
+        // metadata/inbox residual and the fn must return Err.
+        let home = tmp_home("full_residual");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        std::fs::write(home.join("metadata").join("zombie.json"), "{}").unwrap();
+        let result = super::full_delete_instance(&home, "zombie");
+        let err = result.expect_err(
+            "metadata residual after cleanup must surface as Err — silent-drop class blocked",
+        );
+        assert!(
+            err.contains("metadata"),
+            "Err detail must name the residual store, got: {err:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn full_delete_instance_returns_ok_when_no_residual() {
+        // Clean home: no fleet.yaml, no metadata, no inbox — every
+        // cleanup step is a no-op AND the audit reports clean.
+        // `api::call` failure during DELETE is harmless because there's
+        // nothing to clean and the audit returns empty.
+        let home = tmp_home("full_clean");
+        let result = super::full_delete_instance(&home, "ghost");
+        assert!(
+            result.is_ok(),
+            "clean home + clean post-audit must return Ok, got: {result:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 }
