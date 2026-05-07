@@ -167,7 +167,59 @@ Per Sprint 53 §1.4 hard learning + d-20260506080208947938-0:
 | P2-1 | Each verified example block re-runs cleanly at noted HEAD |
 | P2-3 | Bypass-hint message renders correctly when shim denies |
 
-Each smoke produces a verifiable artifact (log line / file / inbox message). No phase merges without smoke pass.
+Each smoke produces a verifiable artifact (log line / file / inbox message).
+
+### §5.1 Smoke gate classification — Path A (strict) vs Path C (parallelizable)
+
+Sprint 53 §1.4 established that "CI green + dual VERIFIED + soak ≠ production wired" because the original PRs lacked a positive caller path in the agent workflow. The hard-learning fix was: smoke pre-merge per phase. Sprint 54 has 17 phases; serializing every phase on operator-restart-then-smoke would multiply Sprint 54 wall-clock by N restart wakeups. This subsection defines when smoke can be deferred safely vs when it MUST gate merge.
+
+**Path C (parallelizable — dual VERIFIED + CI green = mergeable, smoke runs on next operator restart)**
+
+Eligible only if **all three** conditions hold:
+1. Phase touches no new daemon-resident wiring (refactor of existing wired system, additive notification path, or pure logic change)
+2. Empirical regression-proof anchor exercises the **production code path** (not mock / not synthetic — the same fn called by production callers)
+3. Reviewer dual VERIFIED + CI green on all 3 platforms
+
+**Path A (strict — smoke MUST pass before merge)**
+
+Required for any phase that introduces:
+- New wiring (new MCP tool, new dispatch hook, new spawn site, new event subscriber)
+- Lifecycle changes (bind / lease / release / worktree GC / reconcile)
+- Channel changes (`comms.rs`, `channel/`, ci_watch subscriber-set semantics)
+- New cross-process coordination (file locks, atomic_write contracts, etc.)
+
+The §1.4 hard learning was about wire-class changes — Path A reproduces that discipline. Path C carves out refactor-class changes where the production code path is already exercised by tests.
+
+**Process**
+
+- Lead pre-marks each phase as A or C in the IMPL dispatch task summary
+- Phase classifications can be challenged before IMPL begins (dev / reviewer / general)
+- C phases: merge after dual VERIFIED + CI green, smoke runs on next operator restart, hotfix if smoke fails
+- A phases: smoke pass is hard merge gate
+
+**Phase classification (Sprint 54)**
+
+| Phase | Path | Rationale |
+|---|---|---|
+| P0-1 ci_watch poll/subscriber split | **C** | Refactor of existing wired ci_watch; `subscriber_fan_out_notifies_every_member` exercises production `ci_check_repo` |
+| P0-2 Rate-limit recovery hardening | **A** | Touches poll lifecycle + adaptive backoff timing |
+| P0-3 Multi-caller subscriber semantics | **C** if scoped to subscriber-array operations on top of P0-1; **A** if it adds new dispatch-time subscription paths |
+| P0-4 GITHUB_TOKEN auto-detect | **A** | New daemon-startup wiring + agent-visible warning surface |
+| P1-1 Daemon-worktree initial base = origin/main | **A** | Lifecycle (worktree creation path) |
+| P1-2 task_done → release_worktree wiring | **A** | New cross-tool wiring (task lifecycle ↔ worktree lifecycle) |
+| P1-3 release_orphan_worktree edge case | **A** | Lifecycle |
+| P1-4 Boot reconcile expansion | **A** | Lifecycle / startup wiring |
+| P1-5 rmdir empty deployment parent | **C** | Pure logic addition, exercised by reconcile tests |
+| P1-6 Stale telegram pickup ids cleanup | **A** | Channel state |
+| P2-1 Docs Sprint A | **C** | Docs only, no daemon impact |
+| P2-2 Docs Sprint B (zh-TW) | **C** | Docs only |
+| P2-3 bypass-hint helper module | **A** | New shim integration surface |
+| P2-4 KIRO_TRUST_REGEX dedup | **C** | Pure refactor of test constant |
+| P2-5 timezone display fix | **C** | Pure logic on existing render path |
+| P2-6 discord.rs clippy | **C** | Lint cleanup, no behavior change |
+| P2-7 Pre-existing flaky tests triage | **C** | Test-only |
+
+References: `d-20260506171720519048-2` (empirical regression-proof discipline), `d-20260506080208947938-0` §1.4 hard learning.
 
 ---
 
