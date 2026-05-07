@@ -264,8 +264,65 @@ pub(crate) fn is_running_inside_daemon_process() -> bool {
     })
 }
 
+/// Tools whose handlers depend on daemon-resident state
+/// (`ACTIVE_CHANNEL`, telegram bot session, etc.) and therefore CANNOT
+/// fall back to a fresh local handler when the daemon API is
+/// unreachable. A subprocess MCP call hitting these tools without a
+/// daemon round-trip silently produced misleading errors like
+/// `no active channel` (Issue #488).
+///
+/// Sprint 54 hotfix tag list — keep narrow. Tools like `inbox`,
+/// `list_instances`, `task` actions still benefit from local fallback
+/// when the daemon is offline, so they're deliberately excluded.
+fn requires_daemon_state(tool: &str) -> bool {
+    matches!(tool, "reply" | "react" | "download_attachment")
+}
+
+/// Sprint 54 #488 hotfix: classify what to do with the daemon API
+/// response. Pure function — testable without env mutation. The caller
+/// emits the warn (so traced_test sees it) and decides between
+/// returning the daemon's result, returning a structured error
+/// (daemon-state tools), or falling back to the local handler.
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyDecision {
+    /// Daemon answered with ok=true; clone its `result` field.
+    DaemonOk,
+    /// Daemon answered with ok=false. Log the warn, then either
+    /// return structured error (daemon-state tool) or fall back.
+    DaemonOkFalse { api_err: String },
+    /// Daemon API call errored (connect failure / timeout / etc).
+    /// Same fallback / structured-error decision as `DaemonOkFalse`.
+    ConnectFailed { err: String },
+}
+
+fn classify_api_result(api_result: &Result<Value, anyhow::Error>) -> ProxyDecision {
+    match api_result {
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => ProxyDecision::DaemonOk,
+        Ok(resp) => ProxyDecision::DaemonOkFalse {
+            api_err: resp["error"]
+                .as_str()
+                .unwrap_or("(no error field)")
+                .to_string(),
+        },
+        Err(e) => ProxyDecision::ConnectFailed { err: e.to_string() },
+    }
+}
+
+/// Sprint 54 #488 hotfix: build the structured error returned to a
+/// caller for a `requires_daemon_state` tool that couldn't reach the
+/// daemon. Extracted as a pure function so test 3's regression-proof
+/// anchor can verify the exact format string.
+fn daemon_state_unreachable_error(tool: &str, cause: &str) -> Value {
+    json!({
+        "error": format!("tool '{tool}' requires daemon API; not reachable: {cause}")
+    })
+}
+
 /// Try to proxy a tool call through the daemon API port.
-/// Falls back to local handling if the daemon is unavailable.
+/// Falls back to local handling if the daemon is unavailable, EXCEPT
+/// for tools tagged `requires_daemon_state` — those return a structured
+/// error so callers see the real cause instead of a confusing
+/// secondary failure from the local handler.
 /// Short-circuits to direct `handle_tool` when running inside the daemon.
 fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
     // Short-circuit: if we're inside the daemon process, call handle_tool
@@ -283,7 +340,7 @@ fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
 
     let home = crate::home_dir();
 
-    if let Ok(resp) = crate::api::call(
+    let api_result = crate::api::call(
         &home,
         &json!({
             "method": "mcp_tool",
@@ -293,13 +350,48 @@ fn proxy_or_local(tool: &str, args: &Value, instance_name: &str) -> Value {
                 "instance": instance_name
             }
         }),
-    ) {
-        if resp["ok"].as_bool() == Some(true) {
-            return resp["result"].clone();
+    );
+
+    let decision = classify_api_result(&api_result);
+    match decision {
+        ProxyDecision::DaemonOk => {
+            if let Ok(resp) = api_result {
+                return resp["result"].clone();
+            }
+            // Unreachable: classify_api_result returned DaemonOk only
+            // for Ok(_). Conservative fall-through.
+        }
+        ProxyDecision::DaemonOkFalse { api_err } => {
+            // Tier 1 (Issue #488): surface the daemon-side error so
+            // operators can see in app.log why fallback fired.
+            tracing::warn!(
+                tool = %tool,
+                instance = %instance_name,
+                error = %api_err,
+                "MCP daemon API returned ok=false; falling back to local handler"
+            );
+            // Tier 2: daemon-state tools never fall back.
+            if requires_daemon_state(tool) {
+                return daemon_state_unreachable_error(tool, &api_err);
+            }
+        }
+        ProxyDecision::ConnectFailed { err } => {
+            // Tier 1: connect failure observable in app.log.
+            tracing::warn!(
+                tool = %tool,
+                instance = %instance_name,
+                error = %err,
+                "MCP daemon API call failed; falling back to local handler"
+            );
+            // Tier 2: daemon-state tools never fall back.
+            if requires_daemon_state(tool) {
+                return daemon_state_unreachable_error(tool, &err);
+            }
         }
     }
 
-    // Daemon unavailable or returned error — handle locally
+    // Stateless tool OR daemon returned ok=false but tool tolerates
+    // local handling — handle locally.
     handlers::handle_tool(tool, args, instance_name)
 }
 
@@ -370,5 +462,128 @@ mod tests {
         let mut reader = io::BufReader::new(&input[..]);
         let result = read_message(&mut reader).expect("should not error");
         assert_eq!(result.as_deref(), Some("{\"ok\":true}"));
+    }
+
+    // ── Sprint 54 #488 hotfix: reply silent fallback ─────────────────
+    //
+    // Tier 1 (warn surface) + Tier 2 (daemon-state gating). Each test
+    // pins one of the contract gates from dispatch
+    // m-20260507071422376848-27.
+    //
+    // The proxy-path tests use the pure `classify_api_result` helper
+    // (and `daemon_state_unreachable_error`) so they don't need to
+    // bypass `is_running_inside_daemon_process`'s default-pid behavior
+    // (which returns true in test processes that haven't called
+    // `daemon_config::init` — orthogonal to this hotfix).
+    //
+    // EMPIRICAL REGRESSION-PROOF ANCHOR: collapsing
+    // `requires_daemon_state(tool)` to `false` (always allow fallback)
+    // makes
+    // `daemon_state_tool_returns_structured_error_on_connect_fail`
+    // FAIL because the helper short-circuits the daemon-state branch.
+    // PR description carries the captured FAIL signature.
+
+    #[test]
+    fn requires_daemon_state_tags_channel_tools() {
+        // Tier 2 invariant: the canonical tag list. Adding a new
+        // daemon-state tool (e.g. a future `react_with_voice`) needs
+        // a corresponding `matches!` arm + this assertion update.
+        assert!(requires_daemon_state("reply"));
+        assert!(requires_daemon_state("react"));
+        assert!(requires_daemon_state("download_attachment"));
+        // Stateless surface — these MUST NOT be tagged or local
+        // fallback for offline workflows breaks.
+        assert!(!requires_daemon_state("inbox"));
+        assert!(!requires_daemon_state("list_instances"));
+        assert!(!requires_daemon_state("task"));
+        assert!(!requires_daemon_state("send"));
+    }
+
+    #[test]
+    fn classify_api_result_ok_true_returns_daemon_ok() {
+        // Tier 1 gate (a): a daemon Ok response with ok=true is the
+        // happy path — caller returns resp["result"] without warn.
+        let api_result: Result<Value, anyhow::Error> =
+            Ok(json!({"ok": true, "result": {"hello": "world"}}));
+        assert_eq!(classify_api_result(&api_result), ProxyDecision::DaemonOk);
+    }
+
+    #[test]
+    fn classify_api_result_ok_false_returns_daemon_ok_false_with_error_text() {
+        // Tier 1 gate (b): daemon answered but with ok=false — caller
+        // emits warn carrying the daemon-side error text.
+        let api_result: Result<Value, anyhow::Error> =
+            Ok(json!({"ok": false, "error": "queue full"}));
+        match classify_api_result(&api_result) {
+            ProxyDecision::DaemonOkFalse { api_err } => {
+                assert_eq!(api_err, "queue full");
+            }
+            other => panic!("expected DaemonOkFalse, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_api_result_err_returns_connect_failed_with_error_text() {
+        // Tier 1 gate (c): connect failure produces ConnectFailed
+        // with the underlying error text. Caller emits warn carrying
+        // this verbatim so operators can correlate "fallback fired"
+        // with "daemon unreachable at T" in app.log.
+        let api_result: Result<Value, anyhow::Error> =
+            Err(anyhow::anyhow!("connection refused at /tmp/agend.sock"));
+        match classify_api_result(&api_result) {
+            ProxyDecision::ConnectFailed { err } => {
+                assert!(
+                    err.contains("connection refused"),
+                    "ConnectFailed must carry underlying error: {err}"
+                );
+            }
+            other => panic!("expected ConnectFailed, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_state_tool_returns_structured_error_on_connect_fail() {
+        // Tier 2 gate: daemon-state tools (`reply`, `react`,
+        // `download_attachment`) never silently fall back. The
+        // structured error has a stable format string so callers can
+        // pattern-match on the prefix.
+        //
+        // EMPIRICAL REGRESSION-PROOF ANCHOR — see comment block above.
+        let result = daemon_state_unreachable_error("reply", "connection refused");
+        let err = result["error"]
+            .as_str()
+            .expect("structured error must have 'error' field");
+        assert!(
+            err.starts_with("tool 'reply' requires daemon API; not reachable: "),
+            "format mismatch: {err}"
+        );
+        assert!(
+            err.contains("connection refused"),
+            "must carry underlying cause: {err}"
+        );
+        // Tier 2 invariant: the gating predicate keeps the canonical
+        // tag list authoritative — collapsing it to `false` short-
+        // circuits this very gate from `proxy_or_local`. The pure
+        // helper is the proof anchor regardless of test environment.
+        assert!(
+            requires_daemon_state("reply"),
+            "reply must be tagged for the structured error to fire in proxy_or_local"
+        );
+    }
+
+    #[test]
+    fn stateless_tool_keeps_fallback_behavior_invariant() {
+        // Tier 2 gate (regression-proof for non-daemon-state tools):
+        // stateless tools (`inbox`, `task`, `list_instances`, `send`)
+        // are NOT tagged and therefore never go through the
+        // structured-error path. Without this invariant, offline
+        // workflows that rely on local inbox handling silently break
+        // when the daemon is down.
+        for tool in ["inbox", "task", "list_instances", "send"] {
+            assert!(
+                !requires_daemon_state(tool),
+                "{tool} MUST NOT be daemon-state-tagged — fallback is required for offline UX"
+            );
+        }
     }
 }
