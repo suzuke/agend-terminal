@@ -59,7 +59,7 @@ List running agents. Plain `list` reads run-dir port files directly (works even 
 ```
 agend-terminal list [--detailed] [--json]
 agend-terminal ls   [--detailed] [--json]   # alias
-agend-terminal status                       # alias of `list --detailed` (kept for back-compat)
+agend-terminal status                       # alias of `list` (kept for back-compat; use --detailed for state/health/cmd)
 ```
 
 `status` is preserved as a clap alias for `list` post Wave 1 CLI consolidation; new code should prefer `list --detailed`.
