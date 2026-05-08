@@ -5,6 +5,7 @@ pub(crate) mod ci;
 mod comms;
 pub(crate) mod dispatch_hook;
 pub(crate) mod instance;
+pub(crate) mod instance_lifecycle;
 mod schedule;
 pub(crate) mod sha_gate;
 mod task;

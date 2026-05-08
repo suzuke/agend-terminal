@@ -1,8 +1,6 @@
 use crate::agent_ops::{
-    cleanup_working_dir, list_agents, merge_metadata, save_metadata, save_metadata_batch,
-    validate_branch,
+    list_agents, merge_metadata, save_metadata, save_metadata_batch, validate_branch,
 };
-use crate::channel::telegram;
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -134,62 +132,18 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
             return json!({"error": "cannot delete the last instance — channel needs at least one instance to receive messages"});
         }
     }
-    full_delete_instance(home, name);
-    json!({"name": name})
-}
-
-/// Sprint 53 Smoke 2 r1: shared full single-instance teardown used by both
-/// the MCP `delete_instance` handler and the TUI close path
-/// (`app/overlay.rs::Overlay::ConfirmClose`). Covers everything
-/// `handle_delete_instance` historically did EXCEPT the channel-singleton
-/// guard, which stays MCP-only — TUI close is operator-driven and we don't
-/// want to refuse a close because of channel routing.
-///
-/// Side effects, all expected for both call sites:
-/// - **PTY kill + child-tree reap** via `daemon::lifecycle::delete_transaction`
-///   (process-tree kill, synchronous wait-for-exit, registry remove,
-///   active-channel binding drop, configs map remove, IPC port remove,
-///   event log).
-/// - **fleet.yaml entry removal** so daemon restart's `auto_start_fleet`
-///   doesn't resurrect the dead agent.
-/// - **Telegram topic delete** for the resolved per-instance topic — leaving
-///   it would orphan the topic on the chat side.
-/// - **Working-dir cleanup** via `cleanup_working_dir` (the shared
-///   `home/workspace/<name>` whole-tree branch + the user-dir agend-files
-///   branch). Custom-directory deployment subdirs are still cleaned by the
-///   reconcile path's `cleanup_deployment_dirs` after this — see
-///   `app/overlay.rs` for the layering.
-/// - **Team membership removal** so a closed instance doesn't leave a
-///   dangling team-member reference.
-///
-/// Returns nothing — the MCP handler builds its own success Value.
-pub(crate) fn full_delete_instance(home: &Path, name: &str) {
-    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
-    let (topic_id, working_dir) = fleet
-        .as_ref()
-        .and_then(|c| {
-            c.resolve_instance(name)
-                .map(|r| (r.topic_id, r.working_directory))
-        })
-        .unwrap_or((None, None));
-    let topic_id = topic_id.or_else(|| telegram::lookup_topic_for_instance(home, name));
-
-    let _ = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
-    );
-    if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
-        tracing::warn!(error = %e, "failed to remove from fleet.yaml");
+    // Sprint 54 P1-B Bug 1: lifecycle moved to sibling
+    // `instance_lifecycle` module so this file stays under the
+    // `tests/file_size_invariant.rs` 700-LOC ceiling.
+    match super::instance_lifecycle::full_delete_instance(home, name) {
+        Ok(()) => json!({"name": name}),
+        Err(detail) => json!({
+            "name": name,
+            "error": format!(
+                "delete completed with residual state — fleet may resurrect on next reconcile: {detail}"
+            ),
+        }),
     }
-    if let Some(tid) = topic_id {
-        telegram::delete_topic(home, tid);
-    } else {
-        tracing::warn!(%name, "no topic_id found for full_delete_instance — possible orphan");
-    }
-    if let Some(ref wd) = working_dir {
-        cleanup_working_dir(home, name, wd);
-    }
-    crate::teams::remove_member_from_all(home, name);
 }
 
 pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {

@@ -371,7 +371,22 @@ pub(super) fn handle_key(
                         })
                         .collect();
                     for name in &names {
-                        crate::mcp::handlers::instance::full_delete_instance(ctx.home, name);
+                        // Sprint 54 P1-B Bug 1: full_delete_instance now
+                        // returns Result with residual-store audit on
+                        // partial failure. TUI close logs warn (operator
+                        // is right here at the keyboard and can react);
+                        // the MCP path turns the error into JSON for the
+                        // remote caller. Either way the silent-swallow
+                        // pattern that fed `auto_start_fleet` revival is
+                        // gone.
+                        if let Err(detail) =
+                            crate::mcp::handlers::instance_lifecycle::full_delete_instance(
+                                ctx.home, name,
+                            )
+                        {
+                            tracing::warn!(name, detail = %detail,
+                                "TUI tab close: residual state — operator may need manual cleanup");
+                        }
                     }
                     if !names.is_empty() {
                         // Deployment metadata + custom-directory subdir cleanup.
@@ -388,7 +403,16 @@ pub(super) fn handle_key(
                         .find_pane(fid)
                         .and_then(|p| p.fleet_instance_name.clone());
                     if let Some(ref name) = fleet_name {
-                        crate::mcp::handlers::instance::full_delete_instance(ctx.home, name);
+                        // Sprint 54 P1-B Bug 1: see tab-close branch above
+                        // for the Result-vs-warn rationale.
+                        if let Err(detail) =
+                            crate::mcp::handlers::instance_lifecycle::full_delete_instance(
+                                ctx.home, name,
+                            )
+                        {
+                            tracing::warn!(name, detail = %detail,
+                                "TUI pane close: residual state — operator may need manual cleanup");
+                        }
                         let _ = crate::deployments::reconcile_after_close(
                             ctx.home,
                             std::slice::from_ref(name),
