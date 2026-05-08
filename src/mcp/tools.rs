@@ -21,11 +21,15 @@ pub fn tool_definitions() -> Value {
 
 fn channel_tools() -> Vec<Value> {
     // Sprint 54 #488 hotfix: these handlers depend on daemon-resident
-    // state (ACTIVE_CHANNEL, telegram bot session) and cannot run in
-    // an MCP subprocess context. Tagged `requires_daemon_state: true`
-    // so `proxy_or_local` returns a structured error instead of
-    // falling back to a local handler that would silently produce
-    // misleading errors like `no active channel`.
+    // state (ACTIVE_CHANNEL, telegram bot session) and cannot run
+    // outside the daemon process. Tagged `requires_daemon_state: true`
+    // so the `agend-mcp-bridge` proxy surfaces a structured error to
+    // callers when the daemon is unreachable, rather than degrading
+    // to a local fallback that would silently produce misleading
+    // errors like `no active channel`. Sprint 56 Track I-Phase2c
+    // (#531) hard-removed the local-fallback path that this comment
+    // originally described — flag stays valid as a daemon-side
+    // dispatch hint and as the contract the bridge consumes.
     vec![
         json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API.",
             "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},

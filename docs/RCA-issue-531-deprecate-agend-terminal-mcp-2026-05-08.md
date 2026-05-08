@@ -213,11 +213,13 @@ This phase alone resolves #531's reported symptom for new installs and post-upgr
 
 ### Phase 2b — Deprecation (HIGHER RISK, ~30 LOC + doc update)
 
+> **Historical note (added Sprint 57 Wave 1 Track B)**: the "remove in Sprint 57+" timeline below was superseded mid-Sprint-56 by an operator escalation directive (m-20260508141217922488-238) collapsing the deprecation cycle into a single hard-removal at Phase 2c. Phase 2b shipped at PR #544 (commit `cbdac10`) with the loud-FATAL change in step 1 and the doc deprecation notes in step 2; Phase 2c at PR #547 (commit `8725118` on main) hard-removed `Commands::Mcp` instead of waiting for Sprint 57. The Phase 2b plan as written below was followed for steps 1 and 2 only; step 3's "one Sprint" buffer was zeroed.
+
 Conditional on Phase 2a landing first and no operator escalation surfacing:
 
 1. **`mcp_config.rs::bridge_binary_path`**: drop the `agend-terminal mcp` fallback and emit `tracing::error!("FATAL: agend-mcp-bridge missing — install agend-terminal v0.6.X+ which ships both binaries")`. This makes the failure loud rather than silent.
 2. **Update `docs/USAGE.md` / `docs/CLI.md` / `docs/MCP-TOOLS.md`** to recommend `agend-mcp-bridge` and mark `agend-terminal mcp` as deprecated (one Sprint deprecation window before removal).
-3. **Keep `Commands::Mcp` for one Sprint** with a deprecation log line at startup; remove in Sprint 57+.
+3. ~~**Keep `Commands::Mcp` for one Sprint** with a deprecation log line at startup; remove in Sprint 57+.~~ *Superseded by Phase 2c hard-removal — see historical note above.*
 
 ### Out of scope for Phase 2
 
