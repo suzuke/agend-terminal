@@ -1017,7 +1017,13 @@ pub(crate) fn shutdown_sequence(
         pids.push((name, child, pid));
     }
 
-    #[cfg(unix)]
+    // Wait the grace window. On Unix, agents that received SIGTERM
+    // above can exit cleanly during this window (the parallel SIGTERM
+    // signaled all process groups simultaneously). On Windows, no
+    // SIGTERM was sent — but a brief wait still lets agents that
+    // happened to exit on their own (e.g. PTY EOF on parent close)
+    // be reported as clean rather than killed-after-grace, keeping
+    // the metric semantically consistent across platforms.
     std::thread::sleep(SHUTDOWN_GRACE);
 
     // Sprint 57 Wave 3 PR-2: SIGKILL stage. Anything still alive
