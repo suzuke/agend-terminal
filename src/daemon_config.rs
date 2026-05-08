@@ -15,6 +15,12 @@ pub struct DaemonConfig {
     /// Feature flag: pointer-only inbox injection (replaces AGEND_POINTER_ONLY_INJECT env var).
     pub pointer_only_inject: bool,
     /// Daemon PID (replaces AGEND_DAEMON_PID env var).
+    /// Sprint 56 Track I-Phase2c (#531): the previous reader
+    /// (`mcp::is_running_inside_daemon_process`) was removed alongside
+    /// `mcp::run` and `proxy_or_local`. Field retained because the
+    /// `DaemonConfig::default()` constructor populates it from env;
+    /// future daemon-side callers may consume it again.
+    #[allow(dead_code)]
     pub daemon_pid: u32,
 }
 

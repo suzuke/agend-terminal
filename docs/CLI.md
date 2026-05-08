@@ -88,17 +88,15 @@ Stop the daemon (also terminates all managed agents).
 agend-terminal stop
 ```
 
-### `mcp` (DEPRECATED — see `agend-mcp-bridge`)
+### `agend-mcp-bridge` (separate binary)
 
-> **Sprint 56 Track I (#531):** `agend-terminal mcp` is deprecated and will be removed in Sprint 57. The daemon now writes the canonical replacement (`agend-mcp-bridge`) into every backend's mcp.json on every start; operators with hand-edited mcp.json get rewritten automatically by the daemon's atomic upsert. The legacy command emits a `DEPRECATED:` warning when invoked but otherwise still runs for one-Sprint backwards compat. See [Phase 1 RCA](RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md).
-
-Start the MCP stdio server for the current instance. Intended to be invoked by an agent's backend, not by humans directly — the relevant backend config is auto-written to the agent's working directory by `mcp_config.rs`. Post-Sprint-56 operators should invoke `agend-mcp-bridge` directly:
+Start the MCP stdio server for the current instance. Intended to be invoked by an agent's backend, not by humans directly — the relevant backend config is auto-written to the agent's working directory by `mcp_config.rs`. The bridge proxies all tool calls to the running daemon's TCP API; no local-handler fallback exists.
 
 ```
 AGEND_INSTANCE_NAME=<name> agend-mcp-bridge
 ```
 
-Running without `AGEND_INSTANCE_NAME` is allowed but enters standalone mode and emits a warning.
+Running without `AGEND_INSTANCE_NAME` is allowed but enters standalone mode and emits a warning. Sprint 56 Track I (#531) retired the previous `agend-terminal mcp` subcommand; see [Phase 1 RCA](RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md) for the migration history.
 
 ### `capture`
 Spawn a backend CLI for N seconds and dump its VTerm screen (ANSI-stripped). Used for debugging state-detection regexes and onboarding new backends.

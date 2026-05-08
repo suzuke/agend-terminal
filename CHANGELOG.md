@@ -3,6 +3,16 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Removed
+
+- **`agend-terminal mcp` subcommand (Sprint 56 Track I, #531)** — the local-mode stdio JSON-RPC server retired. The `Commands::Mcp` enum variant, `mcp::run` function, ACL machinery, framing helpers, and `proxy_or_local` fallback all deleted from `src/`. Operators with hand-edited mcp.json get the daemon's atomic upsert rewriting their config to use `agend-mcp-bridge` on next start; new installs ship the bridge in release artifacts (Phase 2a, v0.7+). The bridge is the canonical MCP server going forward. Reported by changhansung on Windows 11 + kiro-cli backend; investigated through 4 sequential PRs (Phase 1 RCA / 2a packaging / 2b deprecation / 2c hard removal). See `docs/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md` for the full architectural reasoning.
+
+### Added
+
+- **Bridge runtime invariant (Sprint 56 Track I-Phase2c, #531)** — new `tests/no_local_mcp_mode_invariant.rs::bridge_emits_daemon_error_when_daemon_down` spawns `agend-mcp-bridge` against a clean home with no daemon running and asserts a daemon-related error surfaces in stdout/stderr. Pins the post-removal contract that the bridge has no local-handler fallback path it can silently degrade into.
+
 ## [0.6.0] — 2026-05-07
 
 50+ commits since `0.5.0` over Sprint 53 (`agend-git-shim` Phase 1-5 + production wiring) and Sprint 54 (`ci_watch` reliability overhaul + adaptive backoff + agent-visible health surface). Two themes dominate the release: multi-agent git isolation gets its own enforcement layer, and CI feedback to agents gets enough teeth that operators can trust the polling loop.

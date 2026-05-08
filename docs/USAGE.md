@@ -80,14 +80,6 @@ launches this as a child process based on its MCP config — the
 daemon writes the bridge path into every backend's mcp.json on
 every start.
 
-> **Sprint 56 deprecation note (#531):** `agend-terminal mcp` was
-> the canonical invocation through v0.6. Phase 2a of the migration
-> ships `agend-mcp-bridge` in release artifacts on all 5 platforms;
-> Phase 2b makes the bridge mandatory (the daemon will no longer
-> fall back to the legacy `agend-terminal mcp` command). The legacy
-> command remains for one Sprint with a deprecation warning;
-> Sprint 57 removes it entirely. See [Phase 1 RCA](RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md).
-
 **When to use:** You don't run this directly. It's started
 automatically when an AI agent needs to talk to the daemon.
 
