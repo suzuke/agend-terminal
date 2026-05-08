@@ -45,9 +45,21 @@ impl AgendHarness {
     /// Used by `tests/migrated_scripts.rs`; clippy doesn't see the cross-binary
     /// caller, so the `#[allow(dead_code)]` mirrors the harness's existing
     /// pattern for `api_call`.
+    ///
+    /// Sprint 57 Wave 3 PR-2 (#548 Q1) note: when the subcommand is
+    /// `start`, the harness automatically appends `--foreground` to
+    /// match the harness's monitoring contract (it waits for the
+    /// child to publish its run dir + monitors `child.try_wait()`).
+    /// Without `--foreground`, Q1's detached default would spawn a
+    /// grandchild daemon and exit the parent immediately, defeating
+    /// the harness's startup synchronization.
     #[allow(dead_code)]
     pub fn spawn_with(home: PathBuf, fleet_yaml: &str, subcommand: &str) -> Result<Self, String> {
-        Self::spawn_with_args(home, fleet_yaml, &[subcommand])
+        if subcommand == "start" {
+            Self::spawn_with_args(home, fleet_yaml, &["start", "--foreground"])
+        } else {
+            Self::spawn_with_args(home, fleet_yaml, &[subcommand])
+        }
     }
 
     /// Spawn with arbitrary CLI args. Internal — used by `spawn` to pass
