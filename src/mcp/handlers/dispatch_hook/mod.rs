@@ -25,11 +25,21 @@ pub(crate) fn dispatch_auto_bind_lease(
     branch: &str,
     repo: Option<&str>,
 ) -> Result<(), String> {
-    // Resolve source repo from target agent's working directory.
-    let source_repo = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+    // Sprint 54 P1-B Bug 2 fix Option A: resolve source repo from the
+    // target agent's `source_repo` field first (decoupled per-agent
+    // canonical source), falling back to `working_directory` for
+    // backward compatibility with fleet.yaml that predates the field,
+    // and finally to the `home/workspace/<agent>` stub for instances
+    // that haven't been resolved at all. The fallback chain preserves
+    // pre-fix behaviour for agents whose fleet.yaml hasn't been
+    // hand-edited to opt in.
+    let resolved = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
         .ok()
-        .and_then(|f| f.resolve_instance(target))
-        .and_then(|r| r.working_directory)
+        .and_then(|f| f.resolve_instance(target));
+    let source_repo = resolved
+        .as_ref()
+        .and_then(|r| r.source_repo.clone())
+        .or_else(|| resolved.as_ref().and_then(|r| r.working_directory.clone()))
         .unwrap_or_else(|| home.join("workspace").join(target));
 
     // P0-1.5: central lease registry check — reject if another agent holds this branch.

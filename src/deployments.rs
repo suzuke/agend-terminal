@@ -208,6 +208,8 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 working_directory: Some(work_dir),
                 role,
                 instructions,
+                // Sprint 54 P1-B Bug 2 fix: see instance.rs:593.
+                source_repo: None,
             },
         ));
         created.push(inst_name);

@@ -100,6 +100,8 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
                         working_directory: Some(wd.display().to_string()),
                         role: None,
                         instructions: None,
+                        // Sprint 54 P1-B Bug 2 fix: see instance.rs:593.
+                        source_repo: None,
                     },
                 )
             })

@@ -780,6 +780,8 @@ fn pane_from_menu_item(
                     working_directory: None,
                     role: None,
                     instructions: None,
+                    // Sprint 54 P1-B Bug 2 fix: see instance.rs:593.
+                    source_repo: None,
                 },
             ) {
                 tracing::warn!(error = %e, "failed to write fleet.yaml");

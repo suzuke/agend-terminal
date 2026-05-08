@@ -599,6 +599,12 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
                 working_directory: Some(work_dir.clone()),
                 role,
                 instructions: None,
+                // Sprint 54 P1-B Bug 2 fix: gradient deployment per
+                // general's constraint — daemon auto-write leaves
+                // source_repo None; operator hand-edits fleet.yaml to
+                // opt agents in. Backward-compat preserved via
+                // dispatch_auto_bind_lease's working_directory fallback.
+                source_repo: None,
             };
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 tracing::warn!(error = %e, "failed to persist to fleet.yaml");

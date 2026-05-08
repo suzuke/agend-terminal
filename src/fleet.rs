@@ -155,6 +155,17 @@ pub struct InstanceConfig {
     #[serde(default)]
     pub args: Vec<String>,
     pub working_directory: Option<String>,
+    /// Sprint 54 P1-B Bug 2 fix Option A: source repository path used by
+    /// `dispatch_auto_bind_lease` when creating per-agent worktrees via
+    /// `git worktree add`. Decouples "where the agent's git history
+    /// lives" (this field) from `working_directory` ("where the agent's
+    /// state/home dir lives"), which the daemon auto-writes to a
+    /// per-agent stub workspace at spawn time. When absent, the
+    /// worktree-leasing path falls back to `working_directory` for
+    /// backward compatibility — operators can hand-edit fleet.yaml to
+    /// point at a real source repo (e.g. operator clone) per agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -365,6 +376,24 @@ impl FleetConfig {
         let rows = inst.rows.or(defaults.rows);
         let model = inst.model.clone().or_else(|| defaults.model.clone());
 
+        // Sprint 54 P1-B Bug 2 fix Option A: resolve source_repo into
+        // a PathBuf with the same `~/` expansion treatment as
+        // working_directory. None when fleet.yaml omits the field —
+        // dispatch_auto_bind_lease falls back to working_directory.
+        let source_repo = inst.source_repo.as_ref().map(|d| {
+            if d == "~" {
+                dirs_home().unwrap_or_else(|| PathBuf::from(d))
+            } else if let Some(rest) = d.strip_prefix("~/") {
+                if let Some(home) = dirs_home() {
+                    home.join(rest)
+                } else {
+                    PathBuf::from(d)
+                }
+            } else {
+                PathBuf::from(d)
+            }
+        });
+
         Some(ResolvedInstance {
             name: name.to_string(),
             backend_command: backend_cmd,
@@ -381,6 +410,7 @@ impl FleetConfig {
             model,
             worktree: inst.worktree,
             instructions: inst.instructions.clone(),
+            source_repo,
         })
     }
 
@@ -442,6 +472,11 @@ pub struct ResolvedInstance {
     pub model: Option<String>,
     pub worktree: Option<bool>,
     pub instructions: Option<String>,
+    /// Sprint 54 P1-B Bug 2 fix: resolved source repository path. See
+    /// `InstanceConfig::source_repo` for semantics; this is the
+    /// `PathBuf` form after fleet.yaml string deserialization, used
+    /// directly by `dispatch_auto_bind_lease` and friends.
+    pub source_repo: Option<PathBuf>,
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -454,6 +489,12 @@ pub struct InstanceYamlEntry {
     pub working_directory: Option<String>,
     pub role: Option<String>,
     pub instructions: Option<String>,
+    /// Sprint 54 P1-B Bug 2 fix: optional source-repo path written
+    /// into the fleet.yaml stanza. Daemon auto-write callers leave
+    /// this `None` (gradient deployment per general's constraint —
+    /// only operator hand-edits opt agents in). Callers that DO want
+    /// to seed a default at write time set it explicitly.
+    pub source_repo: Option<String>,
 }
 
 /// Atomically write a serde_yaml_ng::Value back to fleet.yaml using temp + fsync + rename.
@@ -525,6 +566,12 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 ("working_directory", &config.working_directory),
                 ("role", &config.role),
                 ("instructions", &config.instructions),
+                // Sprint 54 P1-B Bug 2 fix: persist source_repo when
+                // caller sets it. Daemon auto-write callers leave it
+                // None per gradient-deployment constraint, so this is
+                // a no-op for them; operator-/test-driven callers can
+                // round-trip the field.
+                ("source_repo", &config.source_repo),
             ] {
                 if let Some(ref v) = val {
                     inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));
@@ -911,6 +958,7 @@ instances:
             working_directory: Some("/tmp/work".to_string()),
             role: Some("developer".to_string()),
             instructions: Some("./instructions/dev.md".to_string()),
+            source_repo: None,
         };
         add_instance_to_yaml(&dir, "new-agent", &entry).expect("add");
         let config = FleetConfig::load(&path).expect("load after add");
@@ -957,6 +1005,7 @@ instances:
             working_directory: None,
             role: None,
             instructions: None,
+            source_repo: None,
         };
         add_instance_to_yaml(&dir, "first", &entry).expect("add to new");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
@@ -1437,6 +1486,7 @@ instances:
             working_directory: None,
             role: Some("tester".to_string()),
             instructions: None,
+            source_repo: None,
         };
         add_instance_to_yaml(&dir, "temp-agent", &entry).expect("add");
 
@@ -2000,5 +2050,169 @@ defaults:
             "writeback should add id field: {content}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── Sprint 54 P1-B Bug 2 fix: source_repo decouple tests ───────
+
+    /// Backward-compat: fleet.yaml that predates the field deserializes
+    /// cleanly. `source_repo` defaults to None — `dispatch_auto_bind_lease`
+    /// will fall back to `working_directory`. Locks the
+    /// `#[serde(default)]` contract.
+    #[test]
+    fn instance_config_deserializes_without_source_repo_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-srf-bc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  legacy-agent:
+    backend: claude
+    working_directory: /tmp/legacy-agent
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let inst = config.instances.get("legacy-agent").expect("inst present");
+        assert!(
+            inst.source_repo.is_none(),
+            "source_repo defaults to None when omitted: {inst:?}"
+        );
+        let resolved = config.resolve_instance("legacy-agent").expect("resolve");
+        assert!(resolved.source_repo.is_none());
+        assert_eq!(
+            resolved
+                .working_directory
+                .as_deref()
+                .map(|p| p.to_str().unwrap_or("")),
+            Some("/tmp/legacy-agent"),
+            "working_directory still resolves for backward-compat callers"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// New field round-trip: when fleet.yaml carries `source_repo`,
+    /// the resolved struct surfaces it as a `PathBuf` distinct from
+    /// `working_directory`. Locks the schema-decouple contract that
+    /// dispatch_auto_bind_lease relies on.
+    #[test]
+    fn instance_config_resolves_source_repo_when_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-srf-set-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  opted-in-agent:
+    backend: claude
+    working_directory: /tmp/opted-in-agent-state
+    source_repo: /tmp/opted-in-agent-source
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("opted-in-agent").expect("resolve");
+        assert_eq!(
+            resolved
+                .source_repo
+                .as_deref()
+                .map(|p| p.to_str().unwrap_or("")),
+            Some("/tmp/opted-in-agent-source"),
+            "source_repo resolves to the explicit fleet.yaml value"
+        );
+        assert_eq!(
+            resolved
+                .working_directory
+                .as_deref()
+                .map(|p| p.to_str().unwrap_or("")),
+            Some("/tmp/opted-in-agent-state"),
+            "working_directory remains the per-agent state-home dir, decoupled from source_repo"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `~/` expansion applies to source_repo with the same treatment
+    /// `working_directory` already gets. Locks parity so operator
+    /// muscle-memory transfers cleanly between the two fields.
+    #[test]
+    fn instance_config_source_repo_tilde_expanded() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-srf-tilde-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let path = write_fleet(
+            &dir,
+            r#"
+instances:
+  tilde-agent:
+    backend: claude
+    source_repo: ~/op-clone
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("load");
+        let resolved = config.resolve_instance("tilde-agent").expect("resolve");
+        let source_repo = resolved.source_repo.expect("source_repo set");
+        let expected_home = dirs::home_dir().expect("home dir");
+        assert_eq!(
+            source_repo,
+            expected_home.join("op-clone"),
+            "~ expansion must match working_directory's behaviour"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Round-trip: writing an `InstanceYamlEntry` with `source_repo`
+    /// set persists the field to disk in a form that re-loads
+    /// identically. Locks the writer-reader symmetry — without this,
+    /// operators editing fleet.yaml could see their `source_repo`
+    /// silently disappear on the next daemon write.
+    #[test]
+    fn add_instance_to_yaml_round_trips_source_repo() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-srf-rt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir_all(&dir).ok();
+        let entry = InstanceYamlEntry {
+            backend: Some("claude".to_string()),
+            working_directory: Some("/tmp/rt-state".to_string()),
+            role: Some("opted-in test agent".to_string()),
+            instructions: None,
+            source_repo: Some("/tmp/rt-source".to_string()),
+        };
+        add_instance_to_yaml(&dir, "rt-agent", &entry).expect("add");
+        let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");
+        assert!(
+            content.contains("source_repo: /tmp/rt-source"),
+            "source_repo must round-trip through the writer: {content}"
+        );
+        let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
+        let resolved = config.resolve_instance("rt-agent").expect("resolve");
+        assert_eq!(
+            resolved
+                .source_repo
+                .as_deref()
+                .map(|p| p.to_str().unwrap_or("")),
+            Some("/tmp/rt-source"),
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 }
