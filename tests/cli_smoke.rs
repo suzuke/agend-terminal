@@ -29,13 +29,24 @@ fn help_renders_known_subcommands() {
 
     // Pin known subcommands (logic-outcome: subcommand presence, not exact wording).
     // Wave 1 CLI consolidation: `daemon` removed in favor of `start --agents`;
-    // pin the surviving canonical entries.
-    for sub in &["start", "app", "mcp", "bugreport", "completions", "stop"] {
+    // Sprint 56 Track I-Phase2c (#531): `mcp` removed in favor of the
+    // separate `agend-mcp-bridge` binary.
+    for sub in &["start", "app", "bugreport", "completions", "stop"] {
         assert!(
             stdout.contains(sub),
             "help must mention subcommand '{sub}', got:\n{stdout}"
         );
     }
+    // Sprint 56 Track I-Phase2c regression-proof: `mcp` MUST NOT reappear
+    // in the top-level help (the canonical entry is the standalone
+    // `agend-mcp-bridge` binary, which clap does not list).
+    assert!(
+        !stdout.lines().any(|l| {
+            let trimmed = l.trim_start();
+            trimmed.starts_with("mcp ") || trimmed == "mcp"
+        }),
+        "Phase2c invariant: top-level help must not list `mcp` subcommand, got:\n{stdout}"
+    );
 }
 
 /// `agend bugreport` with a valid temp AGEND_HOME produces output.
