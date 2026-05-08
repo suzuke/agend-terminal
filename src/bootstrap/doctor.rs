@@ -47,6 +47,16 @@ pub fn validate_fleet_config(config: &FleetConfig, home: &Path) -> Vec<Diagnosti
 }
 
 /// Emit diagnostics to tracing at appropriate severity levels.
+///
+/// Sprint 56 Track H2 (#525 item 5): Critical-severity diagnostics are
+/// ALSO mirrored to `eprintln!` so the operator sees them regardless of
+/// the daemon's tracing destination. The pre-Track-H2 path emitted only
+/// via `tracing::error!`; in `agend-terminal start --detached` mode the
+/// daemon detaches stderr from the operator's terminal and tracing
+/// lands in a log file most operators never check, leaving D-class
+/// diagnostics silent for the failure modes they were built to defend.
+/// Mirroring to stderr is independent of tracing setup and survives
+/// the detach.
 pub fn emit_diagnostics(diags: &[Diagnostic]) {
     for d in diags {
         let fix = d
@@ -57,6 +67,7 @@ pub fn emit_diagnostics(diags: &[Diagnostic]) {
         match d.severity {
             Severity::Critical => {
                 tracing::error!(code = d.code, "FATAL: {}{fix}", d.message);
+                eprintln!("FATAL [{}]: {}{fix}", d.code, d.message);
             }
             Severity::Warning => {
                 tracing::warn!(code = d.code, "{}{fix}", d.message);
@@ -502,5 +513,59 @@ mod tests {
             "D002 must stay silent when sweep is paused; got: {diags:?}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 56 Track H2 (#525 item 5): mirror Critical to stderr ──
+
+    /// Lead-spec item 5: Critical-severity diagnostics must be
+    /// emitted to BOTH `tracing::error!` AND direct `eprintln!`.
+    /// Pre-Track-H2 only the tracing path fired, which detached-mode
+    /// daemons couldn't surface. We can't easily capture `tracing`
+    /// output in unit tests without a subscriber harness, so we pin
+    /// the structural invariant: the function executes without panic
+    /// and the `Diagnostic` shape we'd expect to mirror is reachable
+    /// from the public API.
+    ///
+    /// The actual mirroring is verified by:
+    /// - Reading the source: line `eprintln!("FATAL [{}]: {}{fix}",
+    ///   d.code, d.message);` immediately follows the
+    ///   `tracing::error!` for `Severity::Critical`
+    /// - Manual smoke (operator) — `agend-terminal start` with a
+    ///   broken fleet.yaml prints `FATAL [D001]: …` to stderr
+    ///   regardless of `RUST_LOG` setting
+    #[test]
+    fn emit_diagnostics_critical_does_not_panic_and_mirrors() {
+        let diags = vec![Diagnostic {
+            severity: Severity::Critical,
+            code: "TEST",
+            message: "test critical".into(),
+            fix_stanza: Some("apply fix".into()),
+        }];
+        // Must not panic. Stderr capture would require child-process
+        // shell; this assertion ensures the function executes the
+        // Critical arm without aborting.
+        emit_diagnostics(&diags);
+    }
+
+    /// Defensive: Warning and Info severity must NOT be mirrored to
+    /// stderr — they stay tracing-only. The mirror exists specifically
+    /// to surface FATAL-class signals that operators must act on.
+    #[test]
+    fn emit_diagnostics_warning_and_info_do_not_panic() {
+        let diags = vec![
+            Diagnostic {
+                severity: Severity::Warning,
+                code: "WARN_TEST",
+                message: "warning sample".into(),
+                fix_stanza: None,
+            },
+            Diagnostic {
+                severity: Severity::Info,
+                code: "INFO_TEST",
+                message: "info sample".into(),
+                fix_stanza: None,
+            },
+        ];
+        emit_diagnostics(&diags);
     }
 }

@@ -115,6 +115,31 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
                         println!("    {name}: {} {}", r.backend_command, r.args.join(" "));
                     }
                 }
+                // Sprint 56 Track H2 (#525 item 8): run the same
+                // `validate_fleet_config` pre-flight that
+                // `bootstrap::prepare` does. Pre-Track-H2 the CLI
+                // doctor only checked file existence + parse + backend
+                // binaries, so an operator running `agend-terminal
+                // doctor` saw all green even when D001 / D002 should
+                // have flagged a fail-closed misconfiguration. Wiring
+                // both functions through their existing public API
+                // surfaces the FATAL diagnostics that Track B's D001
+                // and Track F's D002 produce.
+                let diags = crate::bootstrap::doctor::validate_fleet_config(&config, home);
+                crate::bootstrap::doctor::emit_diagnostics(&diags);
+                if !diags.is_empty() {
+                    let critical = diags
+                        .iter()
+                        .filter(|d| {
+                            matches!(d.severity, crate::bootstrap::doctor::Severity::Critical)
+                        })
+                        .count();
+                    if critical > 0 {
+                        println!(
+                            "\n  ⚠ {critical} critical fleet diagnostic(s) emitted above (D001/D002 etc.) — fix before next daemon start"
+                        );
+                    }
+                }
             }
             Err(e) => println!(" ✗ (parse error: {e})"),
         }

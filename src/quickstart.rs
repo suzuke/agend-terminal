@@ -150,6 +150,26 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
     match detect_group(&token) {
         Ok((group_id, group_title)) => {
             println!("✓ {group_title} ({group_id})\n");
+            // Sprint 56 Track H2 (#525 item 3): verify the bot is
+            // admin in the captured group. Topic mode (the only mode
+            // we write — see `generate_fleet_yaml`) calls
+            // `bot.create_forum_topic`, which requires admin. Without
+            // this pre-check, a non-admin bot proceeds through
+            // quickstart silently; bootstrap then fails with
+            // `tracing::error!` on first topic-create attempt and
+            // silently continues. Operator only finds out when
+            // notifications never arrive. Warn-loud non-fatal — the
+            // operator may add the bot as admin later and re-run.
+            match verify_bot_is_admin(&token, group_id) {
+                Ok(true) => println!("  ✓ Bot has admin in group\n"),
+                Ok(false) => println!(
+                    "  ⚠ Bot is NOT admin in group — topic mode requires admin. \
+                     Add the bot as admin in Telegram group settings, then \
+                     re-run quickstart or restart the daemon. Continuing for \
+                     now…\n"
+                ),
+                Err(e) => println!("  ⚠ Could not verify admin status: {e} — continuing anyway\n"),
+            }
             Ok((token, Some(group_id)))
         }
         Err(e) => {
@@ -158,6 +178,48 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
             Ok((token, None))
         }
     }
+}
+
+/// Sprint 56 Track H2 (#525 item 3): verify the bot has admin status
+/// in the given chat by calling `getMe` to learn the bot's user_id,
+/// then `getChatMember` to read the bot's status. Returns `Ok(true)`
+/// for `"administrator"` / `"creator"` (admin equivalents per Bot
+/// API), `Ok(false)` for other statuses, `Err` only when the API
+/// calls themselves fail (network, malformed response). The Err arm
+/// distinguishes "we don't know" from "we know it's not admin"; the
+/// caller surfaces both with different operator hints.
+fn verify_bot_is_admin(token: &str, chat_id: i64) -> anyhow::Result<bool> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let me_url = format!("https://api.telegram.org/bot{token}/getMe");
+        let me: serde_json::Value = reqwest::get(&me_url).await?.json().await?;
+        let bot_id = me["result"]["id"].as_i64().ok_or_else(|| {
+            anyhow::anyhow!("getMe response missing result.id — cannot resolve bot user_id")
+        })?;
+        let url = format!(
+            "https://api.telegram.org/bot{token}/getChatMember?chat_id={chat_id}&user_id={bot_id}"
+        );
+        let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
+        if resp["ok"].as_bool() != Some(true) {
+            anyhow::bail!(
+                "getChatMember failed: {}",
+                resp["description"].as_str().unwrap_or("unknown error")
+            );
+        }
+        let status = resp["result"]["status"].as_str().unwrap_or("");
+        Ok(is_bot_admin_status(status))
+    })
+}
+
+/// Pure helper: classify a Telegram chat-member `status` string into
+/// admin-vs-non-admin. Extracted from [`verify_bot_is_admin`] so the
+/// policy can be unit-tested without HTTP. Per Bot API docs, only
+/// `"administrator"` and `"creator"` carry admin permissions; every
+/// other status (member / restricted / left / kicked) is non-admin.
+fn is_bot_admin_status(status: &str) -> bool {
+    matches!(status, "administrator" | "creator")
 }
 
 fn mask_token(tok: &str) -> String {
@@ -786,6 +848,42 @@ mod tests {
              a covering rule exists further up"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Sprint 56 Track H2 (#525 item 3): admin status classifier ────
+
+    /// Lead-spec item 3: classifier accepts the two Telegram statuses
+    /// that carry admin permissions (`administrator` and `creator`).
+    #[test]
+    fn is_bot_admin_status_classifies_administrator_as_admin() {
+        assert!(is_bot_admin_status("administrator"));
+        assert!(is_bot_admin_status("creator"));
+    }
+
+    /// Lead-spec: any non-admin status (member / restricted / left /
+    /// kicked) must classify as not-admin so the warn-loud path fires
+    /// for operators whose bot was added without admin privileges.
+    #[test]
+    fn is_bot_admin_status_classifies_non_admin_correctly() {
+        for status in ["member", "restricted", "left", "kicked"] {
+            assert!(
+                !is_bot_admin_status(status),
+                "status `{status}` must not classify as admin"
+            );
+        }
+    }
+
+    /// Defensive: empty / unknown statuses must NOT default to admin.
+    /// A future Bot API addition we don't recognize should fall back
+    /// to "warn the operator" rather than silently treat as admin.
+    #[test]
+    fn is_bot_admin_status_unknown_status_treated_as_non_admin() {
+        for status in ["", "owner", "supreme-leader", "ADMIN"] {
+            assert!(
+                !is_bot_admin_status(status),
+                "unknown / case-mismatched status `{status}` must not pass"
+            );
+        }
     }
 
     /// Defensive: pure-pattern matcher pin. Anything outside the
