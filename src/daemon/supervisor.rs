@@ -182,7 +182,21 @@ pub fn spawn(home: PathBuf, registry: AgentRegistry) {
 
 fn run_loop(home: PathBuf, registry: AgentRegistry) {
     let mut notify_tracks: HashMap<String, NotifyTrack> = HashMap::new();
-    let mut retry_tracks: HashMap<String, RateLimitRetry> = HashMap::new();
+    // Sprint 57 Wave 2 Track C (#546 Item 5): hydrate dedup ledger
+    // from `$AGEND_HOME/dedup-state/*.json` so a daemon restart
+    // inside the 60s dedup window with a same-fingerprint repeat
+    // doesn't under-suppress (the latent bug Phase A RCA #549
+    // documented). Missing dir / corrupt files / schema mismatches
+    // are best-effort skipped — daemon startup never aborts on
+    // bad disk state for this surface.
+    let mut retry_tracks: HashMap<String, RateLimitRetry> =
+        crate::daemon::dedup_state::load_all(&home);
+    if !retry_tracks.is_empty() {
+        tracing::info!(
+            count = retry_tracks.len(),
+            "supervisor: hydrated rate-limit dedup ledger from disk"
+        );
+    }
     let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
     loop {
         thread::sleep(TICK);
@@ -562,30 +576,37 @@ pub(crate) fn process_server_rate_limit_retries(
                 let delay = Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
                 tracing::info!(agent = %name, delay_secs = delay.as_secs(), "ServerRateLimit detected, scheduling retry");
                 let fingerprint = fingerprint_input(&input_text);
-                retry_tracks.insert(
-                    name.clone(),
-                    RateLimitRetry {
-                        retry_count: 0,
-                        next_retry_at: now + delay,
-                        input_text,
-                        exhausted: false,
-                        // Track G: phase-1 only schedules — it does not
-                        // inject. Seed `dedup_count = 0` so phase 2's
-                        // first retry can fire (preserves at least one
-                        // re-inject for the keystroke retry case);
-                        // subsequent retries hit the cap=1 boundary and
-                        // are suppressed for the inbox-class case.
-                        fingerprint,
-                        dedup_count: 0,
-                        last_inject_at: now,
-                        dedup_audit_emitted: false,
-                    },
-                );
+                let new_retry = RateLimitRetry {
+                    retry_count: 0,
+                    next_retry_at: now + delay,
+                    input_text,
+                    exhausted: false,
+                    // Track G: phase-1 only schedules — it does not
+                    // inject. Seed `dedup_count = 0` so phase 2's
+                    // first retry can fire (preserves at least one
+                    // re-inject for the keystroke retry case);
+                    // subsequent retries hit the cap=1 boundary and
+                    // are suppressed for the inbox-class case.
+                    fingerprint,
+                    dedup_count: 0,
+                    last_inject_at: now,
+                    dedup_audit_emitted: false,
+                };
+                // Sprint 57 Wave 2 Track C (#546 Item 5): persist on
+                // every mutation so a restart inside the dedup window
+                // sees the in-flight state on the next startup.
+                crate::daemon::dedup_state::save(home, name, &new_retry);
+                retry_tracks.insert(name.clone(), new_retry);
             } else if state == crate::state::AgentState::Ready
                 || state == crate::state::AgentState::Idle
             {
                 // Agent recovered — clear retry tracking.
                 if retry_tracks.remove(name).is_some() {
+                    // Sprint 57 Wave 2 Track C (#546 Item 5): mirror
+                    // in-memory removal to disk so the next startup
+                    // doesn't re-hydrate stale state for an agent
+                    // that already recovered.
+                    crate::daemon::dedup_state::clear(home, name);
                     tracing::info!(agent = %name, "ServerRateLimit retry cleared (agent recovered)");
                 }
             }
@@ -652,6 +673,10 @@ pub(crate) fn process_server_rate_limit_retries(
                 let idx = (retry.retry_count as usize).min(SERVER_RATE_LIMIT_BACKOFF.len() - 1);
                 retry.next_retry_at =
                     Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
+                // Sprint 57 Wave 2 Track C (#546 Item 5): persist
+                // post-suppress so the `dedup_audit_emitted` latch +
+                // `dedup_count` cap-state survive restart.
+                crate::daemon::dedup_state::save(home, name, retry);
                 continue;
             }
             DedupDecision::ForceFreshContent => {
@@ -687,6 +712,10 @@ pub(crate) fn process_server_rate_limit_retries(
                 &format!("gave up after {} retries", SERVER_RATE_LIMIT_MAX_RETRIES),
             );
             retry.exhausted = true;
+            // Sprint 57 Wave 2 Track C (#546 Item 5): persist the
+            // exhausted flag so a restart doesn't re-arm a track
+            // that gave up.
+            crate::daemon::dedup_state::save(home, name, retry);
             continue;
         }
 
@@ -723,9 +752,17 @@ pub(crate) fn process_server_rate_limit_retries(
             let idx = (retry.retry_count as usize).min(SERVER_RATE_LIMIT_BACKOFF.len() - 1);
             retry.next_retry_at =
                 Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
+            // Sprint 57 Wave 2 Track C (#546 Item 5): persist
+            // post-inject so a restart sees the updated
+            // dedup_count + last_inject_at and the dedup window
+            // calculation stays consistent.
+            crate::daemon::dedup_state::save(home, name, retry);
         } else {
             tracing::warn!(agent = %name, "ServerRateLimit: re-inject failed (agent gone?)");
             retry.exhausted = true;
+            // Sprint 57 Wave 2 Track C (#546 Item 5): persist
+            // exhausted-on-failure too.
+            crate::daemon::dedup_state::save(home, name, retry);
         }
     }
 }
