@@ -591,6 +591,28 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Some(Commands::Mcp) => {
+            // Sprint 56 Track I-Phase2b (#531): `agend-terminal mcp` is
+            // deprecated and will be removed in Sprint 57+. Phase 1 RCA
+            // identified this command as the silent-drop class root for
+            // Windows operators (proxy-fail + daemon-state-required-tool
+            // gate at `mcp/mod.rs:374-388`). Phase 2a shipped the
+            // canonical replacement (`agend-mcp-bridge`) in release
+            // artifacts; Phase 2b emits a deprecation warning here so
+            // operators with hand-edited mcp.json see one clear signal
+            // before Sprint 57's hard removal. The body still runs to
+            // preserve one-Sprint backwards compat — daemon's atomic
+            // mcp.json upsert clobbers their hand-edits with the bridge
+            // path on next start, so this code path becomes unreachable
+            // in normal operation soon after the upgrade.
+            eprintln!(
+                "DEPRECATED: `agend-terminal mcp` is deprecated and will be removed in Sprint 57. \
+                 Update mcp.json to invoke `agend-mcp-bridge` directly. The agend-terminal \
+                 daemon's atomic mcp.json upsert rewrites hand-edited configs to use the bridge \
+                 automatically on next start (Sprint 56 Track I-Phase2a)."
+            );
+            tracing::warn!(
+                "DEPRECATED `agend-terminal mcp` invocation — Sprint 57 will remove. See #531."
+            );
             let instance_name = std::env::var("AGEND_INSTANCE_NAME").unwrap_or_default();
             if instance_name.is_empty() {
                 tracing::warn!("AGEND_INSTANCE_NAME not set, running in standalone mode");

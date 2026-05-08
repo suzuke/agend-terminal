@@ -14,24 +14,57 @@ use anyhow::Result;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
-/// Get the agend-terminal binary path for MCP server config.
-fn binary_path() -> String {
-    std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "agend-terminal".to_string())
-}
-
 /// Get the agend-mcp-bridge binary path. Lives alongside the main binary.
-/// Falls back to the main binary with `mcp` arg if bridge not found.
+///
+/// Sprint 56 Track I-Phase2b (#531): the previous "fall back to
+/// `agend-terminal mcp` if bridge missing" behaviour is removed. Phase
+/// 1 RCA (`docs/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md`)
+/// identified the fallback as the load-bearing failure path: backends
+/// spawned with `agend-terminal mcp` route through `mcp::run`'s
+/// `proxy_or_local`, which for daemon-state-required tools (`reply` /
+/// `react` / `download_attachment`) returns a structured error rather
+/// than falling back to local. Operators on Windows experienced the
+/// "no active channel" failure mode whenever the daemon's atomic
+/// upsert overwrote their hand-edited mcp.json with the fallback
+/// command.
+///
+/// Phase 2a shipped the bridge in release artifacts; Phase 2b drops
+/// the fallback so a missing bridge is loud and explicit. Operators
+/// who somehow ship without the bridge get an immediate FATAL log +
+/// the daemon writes an unrunnable `command:` (intentional — better
+/// than silently writing the broken local-mode command). Reinstall
+/// from v0.7+ release artifacts (which Phase 2a ships) resolves.
 fn bridge_binary_path() -> (String, Vec<&'static str>) {
     if let Ok(exe) = std::env::current_exe() {
-        let bridge = exe.with_file_name("agend-mcp-bridge");
+        let bridge = exe.with_file_name(if cfg!(windows) {
+            "agend-mcp-bridge.exe"
+        } else {
+            "agend-mcp-bridge"
+        });
         if bridge.exists() {
             return (bridge.display().to_string(), vec![]);
         }
+        tracing::error!(
+            expected_path = %bridge.display(),
+            "FATAL: agend-mcp-bridge binary not found alongside agend-terminal. \
+             Reinstall from v0.7+ release artifacts which ship both binaries, \
+             or ensure your build packaging includes agend-mcp-bridge."
+        );
+        eprintln!(
+            "FATAL: agend-mcp-bridge missing at {}. Reinstall from v0.7+ release artifacts.",
+            bridge.display()
+        );
+        // Return a clearly-broken command rather than silently falling
+        // back to `agend-terminal mcp` (the pre-Phase-2b regression
+        // path). Backends will fail loudly on the next mcp.json read.
+        return (bridge.display().to_string(), vec![]);
     }
-    // Fallback: use main binary with --mcp flag (pre-Option-F behaviour)
-    (binary_path(), vec!["mcp"])
+    // current_exe() failure is essentially unreachable in production
+    // but the diagnostic still beats silent fallback.
+    tracing::error!(
+        "FATAL: std::env::current_exe() failed — cannot locate agend-mcp-bridge binary"
+    );
+    ("agend-mcp-bridge".to_string(), vec![])
 }
 
 /// Get the AGEND_HOME value.

@@ -121,3 +121,85 @@ fn cargo_declares_agend_mcp_bridge_bin_target() {
          build itself failed if both are missing."
     );
 }
+
+// ── Sprint 56 Track I-Phase2b (#531): no fallback to local mode ──
+
+const MCP_CONFIG_RS: &str = include_str!("../src/mcp_config.rs");
+const MAIN_RS: &str = include_str!("../src/main.rs");
+
+#[test]
+fn bridge_binary_path_does_not_fall_back_to_local_mode() {
+    // Phase 2b removes the `(binary_path(), vec!["mcp"])` fallback
+    // line that previously fired whenever the bridge binary wasn't
+    // alongside the main binary. Operators on the broken Windows
+    // path always landed there — that's the load-bearing #531 fix.
+    //
+    // We pin the absence of `vec!["mcp"]` (the fallback's tell) in
+    // `mcp_config.rs::bridge_binary_path`. A future regression that
+    // accidentally restores the fallback would re-introduce the
+    // silent-drop class fault on Windows.
+    assert!(
+        !MCP_CONFIG_RS.contains("vec![\"mcp\"]"),
+        "Phase 2b fail-loud invariant: src/mcp_config.rs must not \
+         contain the `vec![\"mcp\"]` fallback that previously made \
+         backends spawn `agend-terminal mcp` instead of the bridge. \
+         See docs/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md."
+    );
+}
+
+#[test]
+fn commands_mcp_emits_deprecation_warning_in_one_sprint_window() {
+    // Phase 2b keeps `Commands::Mcp` enum + handler for one-Sprint
+    // backwards compat (Sprint 57+ removes outright per dispatch).
+    // The handler must emit a deprecation eprintln so operators with
+    // hand-edited mcp.json see ONE clear signal before the Sprint 57
+    // removal lands.
+    let mcp_arm_idx = MAIN_RS
+        .find("Some(Commands::Mcp)")
+        .expect("main.rs must still carry the Commands::Mcp arm during deprecation window");
+    let arm_end_relative = MAIN_RS[mcp_arm_idx + 1..]
+        .find("Some(Commands::")
+        .expect("at least one more Commands variant must follow Mcp");
+    let arm_section = &MAIN_RS[mcp_arm_idx..mcp_arm_idx + 1 + arm_end_relative];
+    assert!(
+        arm_section.contains("DEPRECATED"),
+        "Phase 2b deprecation invariant: Commands::Mcp arm must emit \
+         a `DEPRECATED:`-prefixed eprintln so operators see one clear \
+         deprecation signal before Sprint 57's removal."
+    );
+    assert!(
+        arm_section.contains("Sprint 57"),
+        "Deprecation message must name the removal Sprint so operators \
+         have a concrete migration deadline."
+    );
+}
+
+#[test]
+fn mcp_config_emits_fatal_when_bridge_missing() {
+    // Pin the FATAL log + eprintln pair in `bridge_binary_path` so a
+    // future edit can't silently swap them back to a fallback path.
+    let bbp_idx = MCP_CONFIG_RS
+        .find("fn bridge_binary_path()")
+        .expect("bridge_binary_path() helper must still exist");
+    let bbp_end = MCP_CONFIG_RS[bbp_idx..]
+        .find("\nfn ")
+        .map(|n| bbp_idx + n)
+        .unwrap_or(MCP_CONFIG_RS.len());
+    let bbp_body = &MCP_CONFIG_RS[bbp_idx..bbp_end];
+    assert!(
+        bbp_body.contains("FATAL"),
+        "bridge_binary_path must emit a FATAL log when the bridge is \
+         missing — Phase 2b's fail-loud contract. Body was:\n{bbp_body}"
+    );
+    // Specific signal: tracing::error! at FATAL level for daemon log,
+    // eprintln! for direct stderr (independent of tracing config —
+    // mirrors Track H2 #525 item 5 pattern).
+    assert!(
+        bbp_body.contains("tracing::error!"),
+        "Must emit tracing::error! for daemon-log audit trail."
+    );
+    assert!(
+        bbp_body.contains("eprintln!"),
+        "Must emit eprintln! for direct-stderr visibility."
+    );
+}
