@@ -496,6 +496,7 @@ fn print_next_steps(home: &Path) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
