@@ -65,17 +65,14 @@ fn five_tool_sample_all_routed_through_handle_tool() {
     }
 }
 
-/// Verify the proxy_or_local function tries daemon API first.
-#[test]
-fn proxy_or_local_tries_daemon_first() {
-    let src = std::fs::read_to_string("src/mcp/mod.rs").expect("read mcp/mod.rs");
-    assert!(
-        src.contains(r#""method": "mcp_tool""#),
-        "proxy_or_local must try mcp_tool API method"
-    );
-    // Also verify short-circuit exists
-    assert!(
-        src.contains("is_running_inside_daemon_process()"),
-        "proxy_or_local must check daemon short-circuit"
-    );
-}
+// Sprint 56 Track I-Phase2c (#531): the
+// `proxy_or_local_tries_daemon_first` test was deleted here when its
+// subject (`proxy_or_local` + `is_running_inside_daemon_process` in
+// `src/mcp/mod.rs`) was removed alongside the `agend-terminal mcp`
+// subcommand. The "daemon-first" semantics it pinned have moved to
+// `src/bin/agend-mcp-bridge.rs` (the canonical wire entry point); the
+// equivalent invariants are pinned by:
+//   - `proxy_handler_calls_handle_tool_directly` (above) — daemon side
+//   - `bridge_unwraps_daemon_response_for_tools_call` (above) — wire side
+//   - `tests/no_local_mcp_mode_invariant.rs::bridge_emits_daemon_error_when_daemon_down`
+//     — runtime invariant that the bridge has NO local-handler fallback
