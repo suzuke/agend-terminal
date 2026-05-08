@@ -151,12 +151,12 @@ Migration is **not zero-cost**:
 ### Existing MCP-related test files
 
 `tests/`:
-- `mcp_bridge_client_handshake.rs` — bridge protocol parity vs `agend-terminal mcp`.
+- `mcp_bridge_client_handshake.rs` — bridge protocol handshake + framing.
 - `mcp_bridge_idle_reconnect.rs` — bridge-side reconnect logic.
-- `mcp_characterization.rs` — input/output shape pinning.
-- `mcp_proxy_behavioral_parity.rs` / `mcp_proxy_lifecycle.rs` / `mcp_proxy_parity.rs` — `proxy_or_local` correctness.
-- `mcp_roundtrip.rs` — end-to-end roundtrip.
+- `mcp_proxy_behavioral_parity.rs` / `mcp_proxy_lifecycle.rs` / `mcp_proxy_parity.rs` — bridge-vs-daemon parity.
 - `mcp_subprocess_is_zero_state.rs` — pins that the MCP subprocess starts with no fleet state.
+
+Phase 2c (#531) note: `tests/mcp_characterization.rs`, `tests/mcp_roundtrip.rs`, and `tests/pane_snapshot_wire_format.rs` were deleted alongside the `agend-terminal mcp` subcommand and `proxy_or_local` helper. They pinned behavior that no longer exists. Validation invariants moved to handler-level unit tests under `src/mcp/handlers/`; the wire path is now pinned by the bridge tests above + `tests/no_local_mcp_mode_invariant.rs::bridge_emits_daemon_error_when_daemon_down`.
 
 The test suite covers bridge↔daemon parity comprehensively. What is **NOT covered**: the on-disk `mcp_config.rs` output never has `agend-terminal mcp` in production builds. There's no invariant test that catches the packaging gap.
 

@@ -47,7 +47,7 @@ CI mirrors these steps on Ubuntu + macOS + Windows (`.github/workflows/ci.yml`).
 ## Testing Expectations
 
 - **Bug fix** → regression test that fails before the fix and passes after. `tests/integration.rs` for daemon-level behavior; per-module `#[cfg(test)]` for unit tests.
-- **New MCP tool** → exercise it in `tests/mcp_roundtrip.rs`.
+- **New MCP tool** → unit-test the handler under `src/mcp/handlers/` and exercise the bridge wire path in `tests/mcp_bridge_client_handshake.rs` (handshake/framing) or `tests/mcp_proxy_parity.rs` (daemon-proxy parity). The legacy `agend-terminal mcp` subcommand was hard-removed in Sprint 56 Track I-Phase2c (#531); `agend-mcp-bridge` is the canonical wire entry point.
 - **New CLI flag** → cover it in `tests/integration.rs` or a focused unit test.
 - **Test fixtures** — use `std::env::temp_dir()` + `std::process::id()` for isolation, never hardcode `/tmp/...`. Tests that must clean up should `drop` the temp dir explicitly or use scope guards.
 
