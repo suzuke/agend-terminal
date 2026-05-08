@@ -16,8 +16,17 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+// Sprint 57 Wave 3 PR-3 (#548 Phase 3) — `COUNTER` + `tmp_home` are
+// only consumed by the platform-gated `macos_tests` / `linux_tests`
+// submodules below. On Windows neither submodule compiles, so
+// clippy `--all-targets` flags the helpers as dead code. The
+// `#[allow]` annotations document the platform-conditional usage
+// pattern; removing them would force per-platform helper duplication
+// for the same test infrastructure.
+#[allow(dead_code)]
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+#[allow(dead_code)]
 fn tmp_home(tag: &str) -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
