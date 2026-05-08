@@ -105,6 +105,46 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Sprint 56 Track H3 (#525 items 7 + 16 + 17): operator response to
+/// a failed format/verify check. The same enum drives both the
+/// format-validation path and the verify_bot-failure path so the
+/// flow stays consistent across the two error classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenChoice {
+    /// Re-prompt for a fresh token (Item 16 retry loop entry).
+    ReEnter,
+    /// Skip telegram setup entirely; return early without ever
+    /// reaching detect_group's 3-minute long-poll (Item 17 short-
+    /// circuit).
+    Skip,
+    /// Proceed despite the warning (operator's escape hatch — covers
+    /// the rare case where the format check is over-strict or a
+    /// network blip caused verify_bot to fail spuriously).
+    Continue,
+}
+
+/// Sprint 56 Track H3 (#525 item 6): operator response after the
+/// 3-minute getUpdates poll times out. Three branches mirroring the
+/// post-fail UX of TokenChoice but scoped to the post-timeout case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutChoice {
+    /// Re-arm the 3-minute getUpdates wait. Operator may have
+    /// forgotten to send a group message and wants to retry.
+    Retry,
+    /// Skip the group capture; quickstart writes fleet.yaml without
+    /// `group_id` and the operator can hand-fill it later.
+    Skip,
+    /// Abort quickstart entirely.
+    Quit,
+}
+
+/// Sprint 56 Track H3 (#525 item 16): cap on the token re-enter
+/// loop. Past this many bad-format / verify-failure attempts, the
+/// operator is quietly nudged toward Skip rather than allowed to
+/// keep retrying indefinitely. 3 attempts mirrors the existing
+/// SERVER_RATE_LIMIT_MAX_RETRIES convention.
+const MAX_TOKEN_RETRIES: u32 = 3;
+
 /// Full Telegram setup flow — BotFather → token → group detection.
 fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
     println!("  ── Telegram Setup ──\n");
@@ -112,71 +152,189 @@ fn telegram_setup(_home: &Path) -> anyhow::Result<(String, Option<i64>)> {
     println!("  2. Send /newbot and follow instructions");
     println!("  3. Copy the bot token\n");
 
-    let token = prompt("  Bot token (Enter to skip): ")?;
-    let token = token.trim().to_string();
+    // Sprint 56 Track H3 (#525 items 7 + 16 + 17): wrap the token-
+    // acquisition path in a retry loop. The operator gets up to
+    // MAX_TOKEN_RETRIES re-enter attempts before the loop nudges
+    // toward Skip; bad format and verify_bot failures both route
+    // through the same `TokenChoice` prompt so the UX stays
+    // consistent.
+    let mut attempt = 0_u32;
+    let token = loop {
+        attempt += 1;
+        let token = prompt("  Bot token (Enter to skip): ")?;
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            println!("\n  Skipping Telegram. Configure later in fleet.yaml.\n");
+            return Ok((String::new(), None));
+        }
 
-    if token.is_empty() {
-        println!("\n  Skipping Telegram. Configure later in fleet.yaml.\n");
-        return Ok((String::new(), None));
+        if !is_valid_token_format(&token) {
+            // Item 7: prompt instead of silent-continue.
+            println!("  ⚠ Token format looks wrong (expected <digits>:<35+ chars>).");
+            match prompt_token_choice(attempt)? {
+                TokenChoice::ReEnter => continue,
+                TokenChoice::Skip => {
+                    println!("\n  Skipping Telegram. Configure later in fleet.yaml.\n");
+                    return Ok((String::new(), None));
+                }
+                TokenChoice::Continue => {
+                    // fall through to verify_bot — operator may have a
+                    // legitimate format the matcher rejects.
+                }
+            }
+        }
+
+        print!("  Verifying bot... ");
+        io::stdout().flush().ok();
+        match verify_bot(&token) {
+            Ok(bot_name) => {
+                println!("✓ @{bot_name}\n");
+                break token;
+            }
+            Err(e) => {
+                // Item 17: short-circuit instead of silent-continue
+                // into a 3-minute getUpdates poll on an unverified
+                // token. The same `TokenChoice` prompt drives the
+                // recovery — Re-enter loops back, Skip exits, Continue
+                // proceeds anyway (escape hatch for transient
+                // verify_bot failures).
+                println!("⚠ {e}");
+                match prompt_token_choice(attempt)? {
+                    TokenChoice::ReEnter => continue,
+                    TokenChoice::Skip => {
+                        println!("\n  Skipping Telegram. Configure later in fleet.yaml.\n");
+                        return Ok((String::new(), None));
+                    }
+                    TokenChoice::Continue => break token,
+                }
+            }
+        }
+    };
+
+    println!("  Add the bot to your Telegram group (as admin).");
+    println!("  Then send any message in the group.\n");
+
+    // Sprint 56 Track H3 (#525 item 6): wrap detect_group in a
+    // post-timeout Retry/Skip/Quit prompt instead of silently
+    // falling through to "set group_id manually".
+    loop {
+        print!("  Waiting for group message (3 min timeout)... ");
+        io::stdout().flush().ok();
+        match detect_group(&token) {
+            Ok((group_id, group_title)) => {
+                println!("✓ {group_title} ({group_id})\n");
+                // Sprint 56 Track H2 (#525 item 3): verify the bot is
+                // admin in the captured group. Topic mode (the only mode
+                // we write — see `generate_fleet_yaml`) calls
+                // `bot.create_forum_topic`, which requires admin. Without
+                // this pre-check, a non-admin bot proceeds through
+                // quickstart silently; bootstrap then fails with
+                // `tracing::error!` on first topic-create attempt and
+                // silently continues. Operator only finds out when
+                // notifications never arrive. Warn-loud non-fatal — the
+                // operator may add the bot as admin later and re-run.
+                match verify_bot_is_admin(&token, group_id) {
+                    Ok(true) => println!("  ✓ Bot has admin in group\n"),
+                    Ok(false) => println!(
+                        "  ⚠ Bot is NOT admin in group — topic mode requires admin. \
+                         Add the bot as admin in Telegram group settings, then \
+                         re-run quickstart or restart the daemon. Continuing for \
+                         now…\n"
+                    ),
+                    Err(e) => {
+                        println!("  ⚠ Could not verify admin status: {e} — continuing anyway\n")
+                    }
+                }
+                return Ok((token, Some(group_id)));
+            }
+            Err(e) => {
+                println!("timeout: {e}");
+                match prompt_timeout_choice()? {
+                    TimeoutChoice::Retry => {
+                        println!();
+                        continue;
+                    }
+                    TimeoutChoice::Skip => {
+                        println!("\n  Set group_id manually in fleet.yaml later.\n");
+                        return Ok((token, None));
+                    }
+                    TimeoutChoice::Quit => {
+                        anyhow::bail!("quickstart aborted by operator after group-detect timeout");
+                    }
+                }
+            }
+        }
     }
+}
 
-    // M1: validate telegram bot token format: <digits>:<alphanumeric+_->
-    let valid_format = token.split_once(':').is_some_and(|(num, rest)| {
+/// Sprint 56 Track H3 (#525 item 7): pure check for the Bot API
+/// token shape `<digits>:<alphanumeric+_-, ≥30 chars>`. Extracted
+/// from the previous inline check in `telegram_setup` so the format
+/// policy can be unit-tested without entering the prompt loop.
+fn is_valid_token_format(token: &str) -> bool {
+    token.split_once(':').is_some_and(|(num, rest)| {
         num.len() >= 8
             && num.chars().all(|c| c.is_ascii_digit())
             && rest.len() >= 30
             && rest
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    });
-    if !valid_format {
-        println!(
-            "  ⚠ Token format looks wrong (expected <digits>:<35+ chars>). Continuing anyway.\n"
-        );
+    })
+}
+
+/// Sprint 56 Track H3 (#525 items 7 + 16 + 17): prompt the operator
+/// to choose how to recover from a bad token format / verify
+/// failure. Reads stdin once via [`prompt`]; the answer is parsed
+/// through [`parse_token_choice`] (pure helper) so the response
+/// matrix is unit-testable without stdin.
+///
+/// `attempt_number` carries the 1-indexed retry count so the prompt
+/// can nudge toward Skip past `MAX_TOKEN_RETRIES`.
+fn prompt_token_choice(attempt_number: u32) -> anyhow::Result<TokenChoice> {
+    let nudge = if attempt_number >= MAX_TOKEN_RETRIES {
+        format!(" (attempt {attempt_number}/{MAX_TOKEN_RETRIES} — Skip recommended)")
+    } else {
+        String::new()
+    };
+    let raw = prompt(&format!(
+        "  [R]e-enter token / [S]kip telegram / [C]ontinue anyway?{nudge}: "
+    ))?;
+    Ok(parse_token_choice(&raw))
+}
+
+/// Pure parser: classify operator's `R`/`S`/`C` answer (case-
+/// insensitive). Anything unrecognized defaults to `Skip` — the
+/// safest choice when the operator gave an ambiguous answer (skip
+/// rather than continue with an unverified token).
+fn parse_token_choice(input: &str) -> TokenChoice {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "r" | "re-enter" | "reenter" => TokenChoice::ReEnter,
+        "c" | "continue" => TokenChoice::Continue,
+        // Default (including empty / "s" / "skip" / unrecognized) →
+        // Skip. The empty-Enter default deliberately sends the
+        // operator down the safe path.
+        _ => TokenChoice::Skip,
     }
+}
 
-    print!("  Verifying bot... ");
-    io::stdout().flush().ok();
-    match verify_bot(&token) {
-        Ok(bot_name) => println!("✓ @{bot_name}\n"),
-        Err(e) => println!("⚠ {e}\n"),
-    }
+/// Sprint 56 Track H3 (#525 item 6): prompt the operator to choose
+/// how to recover from a 3-minute getUpdates poll timeout. Same
+/// shape as [`prompt_token_choice`]; parses through
+/// [`parse_timeout_choice`].
+fn prompt_timeout_choice() -> anyhow::Result<TimeoutChoice> {
+    let raw = prompt("  [R]etry / [S]kip telegram for now / [Q]uit: ")?;
+    Ok(parse_timeout_choice(&raw))
+}
 
-    println!("  Add the bot to your Telegram group (as admin).");
-    println!("  Then send any message in the group.\n");
-    print!("  Waiting for group message (3 min timeout)... ");
-    io::stdout().flush().ok();
-
-    match detect_group(&token) {
-        Ok((group_id, group_title)) => {
-            println!("✓ {group_title} ({group_id})\n");
-            // Sprint 56 Track H2 (#525 item 3): verify the bot is
-            // admin in the captured group. Topic mode (the only mode
-            // we write — see `generate_fleet_yaml`) calls
-            // `bot.create_forum_topic`, which requires admin. Without
-            // this pre-check, a non-admin bot proceeds through
-            // quickstart silently; bootstrap then fails with
-            // `tracing::error!` on first topic-create attempt and
-            // silently continues. Operator only finds out when
-            // notifications never arrive. Warn-loud non-fatal — the
-            // operator may add the bot as admin later and re-run.
-            match verify_bot_is_admin(&token, group_id) {
-                Ok(true) => println!("  ✓ Bot has admin in group\n"),
-                Ok(false) => println!(
-                    "  ⚠ Bot is NOT admin in group — topic mode requires admin. \
-                     Add the bot as admin in Telegram group settings, then \
-                     re-run quickstart or restart the daemon. Continuing for \
-                     now…\n"
-                ),
-                Err(e) => println!("  ⚠ Could not verify admin status: {e} — continuing anyway\n"),
-            }
-            Ok((token, Some(group_id)))
-        }
-        Err(e) => {
-            println!("timeout: {e}\n");
-            println!("  Set group_id manually in fleet.yaml later.\n");
-            Ok((token, None))
-        }
+/// Pure parser for the timeout-choice prompt. Anything unrecognized
+/// defaults to `Skip` so the operator's setup completes (with
+/// `group_id` left for hand-fill) rather than aborts on an ambiguous
+/// answer.
+fn parse_timeout_choice(input: &str) -> TimeoutChoice {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "r" | "retry" => TimeoutChoice::Retry,
+        "q" | "quit" => TimeoutChoice::Quit,
+        _ => TimeoutChoice::Skip,
     }
 }
 
@@ -848,6 +1006,132 @@ mod tests {
              a covering rule exists further up"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── Sprint 56 Track H3 (#525 items 6 + 7 + 16 + 17): token flow ──
+
+    /// Lead-spec item 7: `is_valid_token_format` accepts the canonical
+    /// Bot API token shape `<≥8 digits>:<≥30 alphanumeric/_/->`.
+    #[test]
+    fn is_valid_token_format_accepts_canonical_shape() {
+        assert!(is_valid_token_format(&format!(
+            "12345678:{}",
+            "a".repeat(35)
+        )));
+        // Real-world shape with mixed alphanum + `_` + `-`.
+        assert!(is_valid_token_format(&format!(
+            "1234567890:{}",
+            "AaBbCc1234567890_-AaBbCc1234567890"
+        )));
+    }
+
+    /// Lead-spec item 7: malformed token shapes (short digits / short
+    /// suffix / missing colon / wrong charset) must reject so the
+    /// operator gets the [R]e-enter / [S]kip / [C]ontinue prompt.
+    #[test]
+    fn is_valid_token_format_rejects_malformed_shapes() {
+        // Short digit prefix.
+        assert!(!is_valid_token_format(&format!("123:{}", "x".repeat(35))));
+        // Short alpha suffix.
+        assert!(!is_valid_token_format(&format!(
+            "12345678:{}",
+            "x".repeat(10)
+        )));
+        // Missing colon.
+        assert!(!is_valid_token_format(&format!(
+            "12345678{}",
+            "x".repeat(35)
+        )));
+        // Non-digit prefix.
+        assert!(!is_valid_token_format(&format!(
+            "abcdefgh:{}",
+            "x".repeat(35)
+        )));
+        // Disallowed char (`!`) in suffix.
+        assert!(!is_valid_token_format(&format!(
+            "12345678:{}!",
+            "x".repeat(34)
+        )));
+        // Empty.
+        assert!(!is_valid_token_format(""));
+    }
+
+    /// Lead-spec items 7 + 17: parser maps `R` / `r` / `re-enter` to
+    /// `ReEnter`. Case-insensitive so a fast-typing operator's
+    /// uppercase response works.
+    #[test]
+    fn parse_token_choice_classifies_reenter() {
+        for input in ["r", "R", "re-enter", "ReEnter", "  R  "] {
+            assert_eq!(
+                parse_token_choice(input),
+                TokenChoice::ReEnter,
+                "input `{input}` must classify as ReEnter"
+            );
+        }
+    }
+
+    /// Lead-spec items 7 + 17: parser maps `C` / `continue` to
+    /// `Continue`. Operator escape hatch.
+    #[test]
+    fn parse_token_choice_classifies_continue() {
+        for input in ["c", "C", "continue", "Continue"] {
+            assert_eq!(
+                parse_token_choice(input),
+                TokenChoice::Continue,
+                "input `{input}` must classify as Continue"
+            );
+        }
+    }
+
+    /// Lead-spec items 7 + 17 + defensive: empty / unknown / `S`
+    /// inputs default to `Skip` (safest path on ambiguous answer).
+    #[test]
+    fn parse_token_choice_defaults_to_skip() {
+        for input in ["", "s", "S", "skip", "yes", "  ", "?"] {
+            assert_eq!(
+                parse_token_choice(input),
+                TokenChoice::Skip,
+                "input `{input}` must default to Skip"
+            );
+        }
+    }
+
+    /// Lead-spec item 6: parser maps `R` to Retry, `Q` to Quit,
+    /// everything else to Skip (default-safe).
+    #[test]
+    fn parse_timeout_choice_classifies_three_branches() {
+        // Retry
+        for input in ["r", "R", "retry", "Retry", "  r  "] {
+            assert_eq!(
+                parse_timeout_choice(input),
+                TimeoutChoice::Retry,
+                "input `{input}` must classify as Retry"
+            );
+        }
+        // Quit
+        for input in ["q", "Q", "quit", "Quit"] {
+            assert_eq!(
+                parse_timeout_choice(input),
+                TimeoutChoice::Quit,
+                "input `{input}` must classify as Quit"
+            );
+        }
+        // Skip default (empty / unknown / `S`).
+        for input in ["", "s", "S", "skip", "abort", "  "] {
+            assert_eq!(
+                parse_timeout_choice(input),
+                TimeoutChoice::Skip,
+                "input `{input}` must default to Skip"
+            );
+        }
+    }
+
+    /// Defensive: MAX_TOKEN_RETRIES is the cap that drives the
+    /// "(attempt N/M — Skip recommended)" nudge. Pin it so a future
+    /// edit doesn't accidentally drop the loop bound.
+    #[test]
+    fn max_token_retries_is_three() {
+        assert_eq!(MAX_TOKEN_RETRIES, 3);
     }
 
     // ── Sprint 56 Track H2 (#525 item 3): admin status classifier ────
