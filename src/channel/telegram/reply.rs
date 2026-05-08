@@ -494,9 +494,9 @@ instances:
         std::env::set_var("SPRINT56_FAKE_TOKEN", "fake");
 
         let new_id = -1009999999999_i64;
-        set_forced_send_error(anyhow::Error::from(teloxide::RequestError::MigrateToChatId(
-            teloxide::types::ChatId(new_id),
-        )));
+        set_forced_send_error(anyhow::Error::from(
+            teloxide::RequestError::MigrateToChatId(teloxide::types::ChatId(new_id)),
+        ));
 
         // The forced-error injector is single-use: the first send call
         // consumes the migration error, the migration handler heals
