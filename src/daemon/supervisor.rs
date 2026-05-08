@@ -616,10 +616,19 @@ pub(crate) fn process_server_rate_limit_retries(
                 // Same fingerprint within window + cap reached. Emit
                 // the audit event exactly once per fingerprint-window
                 // so the operator sees "we suppressed redundant
-                // replays" without log spam, then mark the track
-                // exhausted: there is no value in continuing to
-                // evaluate the same fingerprint through the rest of
-                // the schedule.
+                // replays" without log spam.
+                //
+                // Sprint 56 Track G fixup (reviewer m-20260508105911342800-114):
+                // do NOT mark the track exhausted here. The dispatch
+                // intent is "suppress redundant SAME-fingerprint replays
+                // while preserving fresh-content retries during the
+                // same rate-limit episode". Permanently exhausting on
+                // first Suppress would block any later operator-typed
+                // input from reaching `ForceFreshContent` until
+                // Ready/Idle recovery clears the track. Instead, we
+                // advance `next_retry_at` to the next backoff slot so
+                // the next tick re-evaluates the (possibly-changed)
+                // fingerprint without busy-looping.
                 if !retry.dedup_audit_emitted {
                     tracing::info!(
                         agent = %name,
@@ -640,7 +649,9 @@ pub(crate) fn process_server_rate_limit_retries(
                     );
                     retry.dedup_audit_emitted = true;
                 }
-                retry.exhausted = true;
+                let idx = (retry.retry_count as usize).min(SERVER_RATE_LIMIT_BACKOFF.len() - 1);
+                retry.next_retry_at =
+                    Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[idx]);
                 continue;
             }
             DedupDecision::ForceFreshContent => {
@@ -887,6 +898,13 @@ mod tests {
     /// We cover the latch behaviour via a state assertion: after the
     /// retry loop applies a Suppress decision, `dedup_audit_emitted`
     /// must flip to true.
+    ///
+    /// Sprint 56 Track G fixup (reviewer m-20260508105911342800-114):
+    /// the post-condition here changed — the Suppress arm now ADVANCES
+    /// `next_retry_at` rather than setting `exhausted = true`, so a
+    /// later fingerprint change can still reach `ForceFreshContent`.
+    /// `exhausted` remains false; the audit latch is what carries the
+    /// "we already emitted" signal for this fingerprint-window.
     #[test]
     fn inject_capped_per_fingerprint_emits_audit() {
         let mut retry = fresh_retry("notification body");
@@ -898,12 +916,94 @@ mod tests {
             !retry.dedup_audit_emitted,
             "latch starts unset before the retry loop applies the decision"
         );
-        // The retry loop's Suppress arm flips the latch and marks the
-        // track exhausted; we simulate the load-bearing post-condition.
+        // The retry loop's Suppress arm flips the latch and advances
+        // `next_retry_at`; it does NOT mark the track exhausted.
         retry.dedup_audit_emitted = true;
-        retry.exhausted = true;
+        retry.next_retry_at = Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
         assert!(retry.dedup_audit_emitted);
-        assert!(retry.exhausted);
+        assert!(
+            !retry.exhausted,
+            "Suppress must NOT permanently exhaust the track — fresh \
+             content arriving in the same rate-limit episode must still \
+             be able to reach ForceFreshContent"
+        );
+    }
+
+    /// Reviewer regression test (m-20260508105911342800-114): after a
+    /// Suppress event, a subsequent fingerprint change must be able to
+    /// reach `ForceFreshContent`. Pre-fixup the Suppress arm set
+    /// `retry.exhausted = true`, the loop short-circuited at line 598's
+    /// `if retry.exhausted` guard, and operator-typed input mid-rate-
+    /// limit-episode never got replayed until Ready/Idle recovery. The
+    /// fix preserves track aliveness post-Suppress.
+    #[test]
+    fn suppress_does_not_block_subsequent_fresh_content() {
+        let mut retry = fresh_retry("original notification body");
+        retry.dedup_count = NOTIFICATION_DEDUP_CAP;
+
+        // Phase 1: same-fingerprint inject hits cap → Suppress.
+        let now1 = retry.last_inject_at + Duration::from_secs(5);
+        assert_eq!(
+            dedup_decision(&retry, retry.fingerprint, now1),
+            DedupDecision::Suppress,
+            "same-fp + in-window + cap-reached must Suppress"
+        );
+        // Caller's effect on the Suppress arm (post-fixup): latch
+        // audit, advance next_retry_at, do NOT exhaust.
+        retry.dedup_audit_emitted = true;
+        retry.next_retry_at = Instant::now() + Duration::from_secs(SERVER_RATE_LIMIT_BACKOFF[0]);
+        assert!(
+            !retry.exhausted,
+            "post-Suppress the track must remain alive so later fresh \
+             content can route through ForceFreshContent"
+        );
+
+        // Phase 2: operator types something new mid-rate-limit-episode.
+        // Fingerprint changes → ForceFreshContent regardless of
+        // dedup_count or audit latch state.
+        let new_fp = fingerprint_input("operator typed this AFTER the cap-hit");
+        let now2 = now1 + Duration::from_secs(2);
+        assert_eq!(
+            dedup_decision(&retry, new_fp, now2),
+            DedupDecision::ForceFreshContent,
+            "fingerprint change after Suppress must reach ForceFreshContent — \
+             the regression the fixup defends"
+        );
+    }
+
+    /// Reviewer pin (m-20260508105911342800-114): same-fingerprint
+    /// retries continue to be capped after the first Suppress event.
+    /// The fixup must NOT loosen the dedup cap — only remove the
+    /// exhaustion side-effect. A second tick at the same fingerprint
+    /// inside the window still resolves to `Suppress`.
+    #[test]
+    fn suppress_keeps_capped_for_same_fingerprint_until_window_expires() {
+        let mut retry = fresh_retry("the same notification");
+        retry.dedup_count = NOTIFICATION_DEDUP_CAP;
+        retry.dedup_audit_emitted = true; // latched from a prior Suppress
+
+        // Tick 1: still in window, same fingerprint → Suppress.
+        let mid_window = retry.last_inject_at + Duration::from_secs(20);
+        assert_eq!(
+            dedup_decision(&retry, retry.fingerprint, mid_window),
+            DedupDecision::Suppress
+        );
+        // Tick 2: closer to window edge, same fingerprint → still Suppress.
+        let near_edge =
+            retry.last_inject_at + Duration::from_secs(NOTIFICATION_DEDUP_WINDOW_SECS - 1);
+        assert_eq!(
+            dedup_decision(&retry, retry.fingerprint, near_edge),
+            DedupDecision::Suppress
+        );
+        // Tick 3: past window → AllowAfterWindowReset (cap NOT bypassed,
+        // just the per-window counter resets). Pins that the cap can
+        // only relax via window expiry, not via Suppress's side-effects.
+        let past_window =
+            retry.last_inject_at + Duration::from_secs(NOTIFICATION_DEDUP_WINDOW_SECS + 1);
+        assert_eq!(
+            dedup_decision(&retry, retry.fingerprint, past_window),
+            DedupDecision::AllowAfterWindowReset
+        );
     }
 
     /// Lead-spec #5: keystroke retry case — the dedup gate doesn't
