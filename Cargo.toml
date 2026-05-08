@@ -24,6 +24,13 @@ include = [
     # hotfix (silent-drop class 5th instance — human comment alone didn't
     # prevent a second occurrence; Phase 2 invariant test deferred to v0.6.1).
     "assets/hooks/*",
+    # Sprint 57 Wave 3 PR-3 (#548 Phase 3): `src/service/*.rs` does
+    # `include_str!("../../assets/service/launchd.plist.template")`
+    # + systemd.service.template + scheduler.task.xml.template for
+    # the `agend-terminal service install` cross-platform helper.
+    # Without these the `cargo publish` verify build fails on a
+    # silent-drop-class missing-asset error.
+    "assets/service/*",
     # `src/protocol.rs` does `include_str!("../docs/FLEET-DEV-PROTOCOL-v1.md")`
     # at compile time. Without this entry, `cargo publish`'s verification
     # build (which works on the packaged tarball, not the source tree)

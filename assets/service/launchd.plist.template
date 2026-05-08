@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Sprint 57 Wave 3 PR-3 (#548 Phase 3) — macOS launchd plist template.
+User-level service (no admin required). Loaded via:
+  launchctl load -w ~/Library/LaunchAgents/com.agend-terminal.daemon.plist
+
+Placeholders (substituted at install time by service::install):
+  __LABEL__       = "com.agend-terminal.daemon"
+  __EXECUTABLE__  = absolute path to the agend-terminal binary
+  __HOME__        = absolute path to AGEND_HOME
+  __LOG__         = absolute path to daemon stdout/stderr log
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__EXECUTABLE__</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AGEND_HOME</key>
+        <string>__HOME__</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
