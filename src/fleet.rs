@@ -529,6 +529,36 @@ pub struct InstanceYamlEntry {
     /// require operator-supplied GitHub identities; operator hand-edits
     /// or fleet.yaml templates opt agents in.
     pub github_login: Option<String>,
+    /// Sprint 56 Track E (#450): process args mirror of
+    /// [`InstanceConfig::args`]. `Some(vec![])` is meaningful (operator
+    /// asks for an empty arglist explicitly); `None` means "don't
+    /// override defaults". Template deployments populate from the
+    /// template stanza's `args:` field; operator hand-edits round-trip
+    /// through the writer.
+    pub args: Option<Vec<String>>,
+    /// Sprint 56 Track E (#450): backend model mirror of
+    /// [`InstanceConfig::model`] (e.g. "opus", "sonnet"). Surfaces as
+    /// the `--model` flag for backends that honour it.
+    pub model: Option<String>,
+    /// Sprint 56 Track E (#450): process env mirror of
+    /// [`InstanceConfig::env`]. Same `Option` semantics as `args`:
+    /// `None` = no override, `Some(empty)` = explicit empty map.
+    pub env: Option<std::collections::HashMap<String, String>>,
+    /// Sprint 56 Track E (#450): ready-state regex mirror of
+    /// [`InstanceConfig::ready_pattern`]. Backends that wait for a
+    /// pattern before considering the agent live read this.
+    pub ready_pattern: Option<String>,
+    /// Sprint 56 Track E (#450): custom command override mirror of
+    /// [`InstanceConfig::command`]. Templates that need a non-backend
+    /// invocation (`command: my-script.sh`) flow through this. Falls
+    /// back to `backend` when unset.
+    pub command: Option<String>,
+    /// Sprint 56 Track E (#450): per-instance worktree opt-out mirror
+    /// of [`InstanceConfig::worktree`]. Templates with reviewer /
+    /// orchestrator roles that never commit set this to `Some(false)`
+    /// so the worktree pool skips creation. Defaults to auto-create
+    /// when `None` or `Some(true)`.
+    pub worktree: Option<bool>,
 }
 
 /// Atomically write a serde_yaml_ng::Value back to fleet.yaml using temp + fsync + rename.
@@ -612,10 +642,42 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 // Sprint 56 Track F (#496): same pattern — operator-set
                 // GitHub login round-trips, daemon auto-writers omit.
                 ("github_login", &config.github_login),
+                // Sprint 56 Track E (#450): scalar-string passthroughs
+                // for the new template parameters. `args` / `env` /
+                // `worktree` need typed serialization and are emitted
+                // separately below.
+                ("model", &config.model),
+                ("ready_pattern", &config.ready_pattern),
+                ("command", &config.command),
             ] {
                 if let Some(ref v) = val {
                     inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));
                 }
+            }
+            // Sprint 56 Track E (#450): typed-value passthroughs.
+            // Template deployments often populate these from the
+            // template stanza; operator hand-edits round-trip through
+            // these writers symmetrically with `add_instance_to_yaml`'s
+            // scalar-string loop above.
+            if let Some(ref args) = config.args {
+                let seq: Vec<serde_yaml_ng::Value> = args
+                    .iter()
+                    .map(|s| serde_yaml_ng::Value::String(s.clone()))
+                    .collect();
+                inst.insert("args".into(), serde_yaml_ng::Value::Sequence(seq));
+            }
+            if let Some(ref env_map) = config.env {
+                let mut env_yaml = serde_yaml_ng::Mapping::new();
+                for (k, v) in env_map {
+                    env_yaml.insert(
+                        serde_yaml_ng::Value::String(k.clone()),
+                        serde_yaml_ng::Value::String(v.clone()),
+                    );
+                }
+                inst.insert("env".into(), serde_yaml_ng::Value::Mapping(env_yaml));
+            }
+            if let Some(worktree) = config.worktree {
+                inst.insert("worktree".into(), serde_yaml_ng::Value::Bool(worktree));
             }
             instances.insert(
                 serde_yaml_ng::Value::String(name.to_string()),
@@ -1030,6 +1092,12 @@ instances:
             source_repo: None,
             repo: None,
             github_login: None,
+            args: None,
+            model: None,
+            env: None,
+            ready_pattern: None,
+            command: None,
+            worktree: None,
         };
         add_instance_to_yaml(&dir, "new-agent", &entry).expect("add");
         let config = FleetConfig::load(&path).expect("load after add");
@@ -1079,6 +1147,12 @@ instances:
             source_repo: None,
             repo: None,
             github_login: None,
+            args: None,
+            model: None,
+            env: None,
+            ready_pattern: None,
+            command: None,
+            worktree: None,
         };
         add_instance_to_yaml(&dir, "first", &entry).expect("add to new");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
@@ -1680,6 +1754,12 @@ instances:
             source_repo: None,
             repo: None,
             github_login: None,
+            args: None,
+            model: None,
+            env: None,
+            ready_pattern: None,
+            command: None,
+            worktree: None,
         };
         add_instance_to_yaml(&dir, "temp-agent", &entry).expect("add");
 
@@ -2392,6 +2472,12 @@ instances:
             source_repo: Some("/tmp/rt-source".to_string()),
             repo: None,
             github_login: None,
+            args: None,
+            model: None,
+            env: None,
+            ready_pattern: None,
+            command: None,
+            worktree: None,
         };
         add_instance_to_yaml(&dir, "rt-agent", &entry).expect("add");
         let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");

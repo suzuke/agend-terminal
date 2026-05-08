@@ -105,6 +105,12 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
                         // Sprint 55 P0-B EC4: see instance.rs (gradient).
                         repo: None,
                         github_login: None,
+                        args: None,
+                        model: None,
+                        env: None,
+                        ready_pattern: None,
+                        command: None,
+                        worktree: None,
                     },
                 )
             })

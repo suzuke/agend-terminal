@@ -610,6 +610,12 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
                 // remote OR fork-vs-upstream disambiguation.
                 repo: None,
                 github_login: None,
+                args: None,
+                model: None,
+                env: None,
+                ready_pattern: None,
+                command: None,
+                worktree: None,
             };
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 tracing::warn!(error = %e, "failed to persist to fleet.yaml");

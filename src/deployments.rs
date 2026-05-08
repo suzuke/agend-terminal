@@ -160,6 +160,59 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(String::from);
+        // Sprint 56 Track E (#450): pass-through six template
+        // parameters that the prior schema silently discarded. Scalars
+        // mirror the role/instructions trim → filter-empty → None
+        // pattern so a blank YAML field doesn't write a blank stanza.
+        // `args` / `env` use sequence / mapping shape; empty maps to
+        // None so a missing field is never re-written as `args: []`.
+        let template_args = inst_val
+            .get("args")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<String>>()
+            })
+            .filter(|v| !v.is_empty());
+        let template_model = inst_val
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let template_env = inst_val
+            .get("env")
+            .and_then(|v| v.as_mapping())
+            .map(|m| {
+                let mut out = std::collections::HashMap::new();
+                for (k, v) in m {
+                    if let (Some(k), Some(v)) = (k.as_str(), v.as_str()) {
+                        out.insert(k.to_string(), v.to_string());
+                    }
+                }
+                out
+            })
+            .filter(|m| !m.is_empty());
+        let template_ready_pattern = inst_val
+            .get("ready_pattern")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        // `command:` template field is preserved verbatim into the
+        // YamlEntry's `command` slot so a custom non-backend invocation
+        // (e.g. `command: my-script.sh`) round-trips. Note that the
+        // existing `command` / `backend` fallback above derives the
+        // SPAWN-time backend label; this passthrough is the durable
+        // YAML record.
+        let template_command = inst_val
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let template_worktree = inst_val.get("worktree").and_then(|v| v.as_bool());
 
         // Every member gets its own `<directory>/<inst_name>` subdir —
         // same-backend teammates would otherwise clobber each other's
@@ -213,6 +266,17 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 // Sprint 55 P0-B EC4: see instance.rs (gradient).
                 repo: None,
                 github_login: None,
+                // Sprint 56 Track E (#450): six template-parameter
+                // passthroughs. Each is `None` when the template stanza
+                // omits the field, preserving Sprint 21+ "no override"
+                // semantics for backwards compat with existing
+                // templates that don't declare them.
+                args: template_args,
+                model: template_model,
+                env: template_env,
+                ready_pattern: template_ready_pattern,
+                command: template_command,
+                worktree: template_worktree,
             },
         ));
         created.push(inst_name);
@@ -734,6 +798,276 @@ templates:
                 .and_then(|i| i.instructions.as_deref()),
             Some("./instructions/lead.md")
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 56 Track E (#450): template params passthrough ──────────
+
+    #[test]
+    fn deploy_persists_args_into_fleet_yaml() {
+        let home = tmp_home("args_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      worker:
+        backend: claude
+        args:
+          - --resume
+          - --model
+          - opus
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let inst = reloaded.instances.get("dev-worker").expect("dev-worker");
+        assert_eq!(
+            inst.args,
+            vec![
+                "--resume".to_string(),
+                "--model".to_string(),
+                "opus".to_string()
+            ]
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_persists_model_into_fleet_yaml() {
+        let home = tmp_home("model_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      specialist:
+        backend: claude
+        model: opus
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let inst = reloaded
+            .instances
+            .get("dev-specialist")
+            .expect("dev-specialist");
+        assert_eq!(inst.model.as_deref(), Some("opus"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_persists_env_into_fleet_yaml() {
+        let home = tmp_home("env_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      worker:
+        backend: claude
+        env:
+          MCP_SERVER_URL: https://example.com
+          DEBUG: "1"
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let inst = reloaded.instances.get("dev-worker").expect("dev-worker");
+        assert_eq!(
+            inst.env.get("MCP_SERVER_URL").map(|s| s.as_str()),
+            Some("https://example.com")
+        );
+        assert_eq!(inst.env.get("DEBUG").map(|s| s.as_str()), Some("1"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_persists_ready_pattern_into_fleet_yaml() {
+        let home = tmp_home("ready_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      worker:
+        backend: claude
+        ready_pattern: "ready for input"
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let inst = reloaded.instances.get("dev-worker").expect("dev-worker");
+        assert_eq!(inst.ready_pattern.as_deref(), Some("ready for input"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_persists_worktree_opt_out_into_fleet_yaml() {
+        // reviewer / orchestrator roles often want `worktree: false` so
+        // the worktree pool skips creation. Template passthrough must
+        // preserve this signal.
+        let home = tmp_home("worktree_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      reviewer:
+        backend: claude
+        worktree: false
+      impl:
+        backend: claude
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reviewer = reloaded
+            .instances
+            .get("dev-reviewer")
+            .expect("dev-reviewer");
+        assert_eq!(
+            reviewer.worktree,
+            Some(false),
+            "reviewer must round-trip `worktree: false`"
+        );
+        let imp = reloaded.instances.get("dev-impl").expect("dev-impl");
+        assert!(
+            imp.worktree.is_none(),
+            "instance without `worktree:` field must stay None for default auto-create behavior"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_persists_command_into_fleet_yaml() {
+        // `command:` template field — non-backend custom invocation.
+        let home = tmp_home("command_persist");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      script:
+        backend: claude
+        command: ./scripts/my-runner.sh
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let inst = reloaded.instances.get("dev-script").expect("dev-script");
+        assert_eq!(
+            inst.command.as_deref(),
+            Some("./scripts/my-runner.sh"),
+            "custom command must round-trip via the template passthrough"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_omits_template_params_when_not_set_backwards_compat() {
+        // Critical backwards-compat invariant: existing templates that
+        // declare none of args/model/env/ready_pattern/command/worktree
+        // must continue to deploy unchanged. The fleet.yaml stanza for
+        // the deployed instance must have NO sentinel values for those
+        // fields — operator can't tell whether they were "passed
+        // through as None" vs "never declared" otherwise.
+        let home = tmp_home("compat_omit");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        role: orchestrator
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let inst = reloaded.instances.get("dev-lead").expect("dev-lead");
+        assert!(
+            inst.args.is_empty(),
+            "args must default to empty Vec when template doesn't declare it"
+        );
+        assert!(inst.model.is_none(), "model must stay None");
+        assert!(inst.env.is_empty(), "env must default to empty HashMap");
+        assert!(inst.ready_pattern.is_none(), "ready_pattern must stay None");
+        assert!(
+            inst.worktree.is_none(),
+            "worktree must stay None (preserves default auto-create behavior)"
+        );
+        // `command` is a special case — the existing fallback at
+        // deploy()'s line 142-146 reads `command` OR `backend` for the
+        // SPAWN-time backend label; the template-passthrough path only
+        // captures it when the operator explicitly declared `command:`.
+        // A template with only `backend: claude` writes neither field
+        // value into the durable command slot.
+        assert!(
+            inst.command.is_none(),
+            "command must stay None when template only declared `backend:`"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn deploy_passes_all_six_params_simultaneously() {
+        // End-to-end pin: a template that declares all six new fields
+        // round-trips every one through fleet.yaml. Defends against a
+        // future regression where one passthrough is silently dropped
+        // (e.g. someone removes the template_args binding without
+        // updating the constructor).
+        let home = tmp_home("all_six");
+        let yaml = r#"
+templates:
+  full:
+    instances:
+      worker:
+        backend: claude
+        args:
+          - --resume
+        model: sonnet
+        env:
+          API_KEY_VAR: KEY
+        ready_pattern: "now ready"
+        command: my-runner
+        worktree: false
+"#;
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        let _ = deploy(
+            &home,
+            "caller",
+            &serde_json::json!({"template": "full", "directory": home.display().to_string()}),
+        );
+        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let inst = reloaded.instances.get("full-worker").expect("full-worker");
+        assert_eq!(inst.args, vec!["--resume".to_string()]);
+        assert_eq!(inst.model.as_deref(), Some("sonnet"));
+        assert_eq!(inst.env.get("API_KEY_VAR").map(|s| s.as_str()), Some("KEY"));
+        assert_eq!(inst.ready_pattern.as_deref(), Some("now ready"));
+        assert_eq!(inst.command.as_deref(), Some("my-runner"));
+        assert_eq!(inst.worktree, Some(false));
         std::fs::remove_dir_all(&home).ok();
     }
 

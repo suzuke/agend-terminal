@@ -62,6 +62,12 @@ fn auto_create_general(config: &mut FleetConfig, home: &Path, persist: bool) {
         // Sprint 55 P0-B EC4: see instance.rs (gradient).
         repo: None,
         github_login: None,
+        args: None,
+        model: None,
+        env: None,
+        ready_pattern: None,
+        command: None,
+        worktree: None,
     };
     if let Err(e) = fleet::add_instance_to_yaml(home, "general", &entry) {
         tracing::warn!(error = %e, "failed to persist general instance");
