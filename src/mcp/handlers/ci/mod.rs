@@ -157,9 +157,57 @@ pub(super) fn handle_release_repo(args: &Value) -> Value {
 /// caller is added to a `subscribers` array if not already present, and
 /// existing poll state (`last_run_id`, `head_sha`, etc.) is preserved.
 pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let repo = match args["repo"].as_str() {
+    // Sprint 55 P0-B: when caller omits `repo` arg, auto-derive from
+    // sender's binding.json source_repo (set by `bind_self` /
+    // `dispatch_auto_bind_lease`). EC1: surface explicit error if
+    // neither path nor binding present (no silent cwd-derivation). EC15:
+    // validate the binding's source_repo path still exists before reading.
+    let derived_repo: Option<String>;
+    let repo: &str = match args["repo"].as_str().filter(|s| !s.is_empty()) {
         Some(r) => r,
-        None => return json!({"error": "missing 'repo'"}),
+        None => {
+            let binding = home
+                .join("runtime")
+                .join(instance_name)
+                .join("binding.json");
+            let Ok(content) = std::fs::read_to_string(&binding) else {
+                return json!({
+                    "error": "ci(watch) needs explicit 'repo' arg OR active binding (call bind_self first)",
+                    "code": "no_binding_no_repo"
+                });
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&content) else {
+                return json!({
+                    "error": "binding.json corrupt — re-bind or pass explicit 'repo'",
+                    "code": "binding_corrupt"
+                });
+            };
+            let Some(src) = v["source_repo"].as_str().filter(|s| !s.is_empty()) else {
+                return json!({
+                    "error": "binding has no source_repo — pass explicit 'repo' arg",
+                    "code": "no_binding_no_repo"
+                });
+            };
+            let src_path = std::path::Path::new(src);
+            if !src_path.exists() {
+                return json!({
+                    "error": format!("binding source_repo '{src}' no longer exists — re-bind or pass explicit 'repo'"),
+                    "code": "source_repo_path_deleted"
+                });
+            }
+            match crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(src_path) {
+                Some(r) => {
+                    derived_repo = Some(r);
+                    derived_repo.as_deref().unwrap_or("")
+                }
+                None => {
+                    return json!({
+                        "error": format!("could not derive owner/repo from '{src}' origin remote — pass explicit 'repo' arg or set fleet.yaml `repo:` override"),
+                        "code": "non_github_remote_no_override"
+                    });
+                }
+            }
+        }
     };
     let branch = args["branch"].as_str().unwrap_or("main");
     let interval = args["interval_secs"].as_u64().unwrap_or(60);

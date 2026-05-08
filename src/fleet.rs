@@ -166,6 +166,13 @@ pub struct InstanceConfig {
     /// point at a real source repo (e.g. operator clone) per agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo: Option<String>,
+    /// Sprint 55 P0-B EC4 — explicit GitHub `owner/name` override for non-
+    /// GitHub remotes (where `parse_github_owner_repo` would return `None`)
+    /// or fork/upstream disambiguation. When present, takes precedence over
+    /// derivation from `source_repo`'s origin. When absent, daemon falls
+    /// back to `derive_repo_from_remote(source_repo)` per existing behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -411,6 +418,9 @@ impl FleetConfig {
             worktree: inst.worktree,
             instructions: inst.instructions.clone(),
             source_repo,
+            // Sprint 55 P0-B EC4: optional explicit GitHub `owner/name`
+            // override; copied through unchanged.
+            repo: inst.repo.clone(),
         })
     }
 
@@ -477,6 +487,9 @@ pub struct ResolvedInstance {
     /// `PathBuf` form after fleet.yaml string deserialization, used
     /// directly by `dispatch_auto_bind_lease` and friends.
     pub source_repo: Option<PathBuf>,
+    /// Sprint 55 P0-B EC4: optional GitHub `owner/name` override copied
+    /// through from `InstanceConfig::repo`. See that field for semantics.
+    pub repo: Option<String>,
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -495,6 +508,10 @@ pub struct InstanceYamlEntry {
     /// only operator hand-edits opt agents in). Callers that DO want
     /// to seed a default at write time set it explicitly.
     pub source_repo: Option<String>,
+    /// Sprint 55 P0-B EC4: optional explicit `owner/name` override per
+    /// `InstanceConfig::repo`. Daemon auto-write callers leave this
+    /// `None` (gradient deployment); operator hand-edits opt agents in.
+    pub repo: Option<String>,
 }
 
 /// Atomically write a serde_yaml_ng::Value back to fleet.yaml using temp + fsync + rename.
@@ -572,6 +589,9 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 // a no-op for them; operator-/test-driven callers can
                 // round-trip the field.
                 ("source_repo", &config.source_repo),
+                // Sprint 55 P0-B EC4: same pattern — operator-set repo
+                // override round-trips, daemon auto-writers omit.
+                ("repo", &config.repo),
             ] {
                 if let Some(ref v) = val {
                     inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));
@@ -959,6 +979,7 @@ instances:
             role: Some("developer".to_string()),
             instructions: Some("./instructions/dev.md".to_string()),
             source_repo: None,
+            repo: None,
         };
         add_instance_to_yaml(&dir, "new-agent", &entry).expect("add");
         let config = FleetConfig::load(&path).expect("load after add");
@@ -1006,6 +1027,7 @@ instances:
             role: None,
             instructions: None,
             source_repo: None,
+            repo: None,
         };
         add_instance_to_yaml(&dir, "first", &entry).expect("add to new");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
@@ -1487,6 +1509,7 @@ instances:
             role: Some("tester".to_string()),
             instructions: None,
             source_repo: None,
+            repo: None,
         };
         add_instance_to_yaml(&dir, "temp-agent", &entry).expect("add");
 
@@ -2197,6 +2220,7 @@ instances:
             role: Some("opted-in test agent".to_string()),
             instructions: None,
             source_repo: Some("/tmp/rt-source".to_string()),
+            repo: None,
         };
         add_instance_to_yaml(&dir, "rt-agent", &entry).expect("add");
         let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");

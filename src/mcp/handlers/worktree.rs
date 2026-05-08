@@ -44,10 +44,6 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             })
         }
     };
-    let repo = match args["repo"].as_str() {
-        Some(r) if !r.is_empty() => r,
-        _ => return json!({"error": "missing 'repo'", "code": "missing_arg"}),
-    };
     let branch = match args["branch"].as_str() {
         Some(b) if !b.is_empty() => b,
         _ => return json!({"error": "missing 'branch'", "code": "missing_arg"}),
@@ -59,15 +55,36 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
         });
     }
 
+    // Sprint 55 P0-B EC9: dual-arg shape with two-sprint deprecation cycle.
+    // - `source_repo: <local path>` (NEW unified shape; daemon derives owner/repo)
+    // - `repo: "owner/name"` (legacy GitHub slug; warn-log; removed Sprint 57)
+    // Both present → reject as `ambiguous_args`. Neither → fleet.yaml fallback chain.
+    let source_repo_arg = args["source_repo"].as_str().filter(|s| !s.is_empty());
+    let repo_arg = args["repo"].as_str().filter(|s| !s.is_empty());
+    if source_repo_arg.is_some() && repo_arg.is_some() {
+        return json!({
+            "error": "both 'source_repo' and 'repo' provided — pass exactly one",
+            "code": "ambiguous_args"
+        });
+    }
+    if repo_arg.is_some() {
+        tracing::warn!(
+            %agent,
+            "bind_self(repo=...) is deprecated; use bind_self(source_repo=<local-path>) — Sprint 55 warning, Sprint 57 removal"
+        );
+    }
+    let source_repo_path = source_repo_arg.map(std::path::PathBuf::from);
+
     // task_id="self" — clear distinction from real task IDs in the binding.json
     // audit trail. The tasks store doesn't need a row for a self-bind; the
     // string is purely a marker.
-    match crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease(
+    match crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease_with_source(
         home,
         agent,
         "self",
         branch,
-        Some(repo),
+        repo_arg,
+        source_repo_path.as_deref(),
     ) {
         Ok(()) => {
             // Successful bind: read back the worktree path from the binding

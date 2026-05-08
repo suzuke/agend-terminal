@@ -199,3 +199,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;
+
+// Sprint 55 P0-B tests in sibling file (Sprint 54 PR #517 / Sprint 55 PR #522/#526 precedent).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod p0b_tests;
