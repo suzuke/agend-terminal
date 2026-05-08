@@ -43,6 +43,10 @@ pub fn install(shutdown: Arc<AtomicBool>, shutdown_tx: crossbeam_channel::Sender
             );
         }
         tracing::info!("shutting down (signal received)");
+        // Sprint 57 Wave 3 PR-2 (#548 Q6): record reason taxonomy
+        // BEFORE flipping the shutdown flag so the shutdown sequence
+        // sees the right value when it reads.
+        crate::daemon::record_shutdown_reason(crate::daemon::ShutdownReason::Signal);
         shutdown.store(true, Ordering::Relaxed);
         let _ = shutdown_tx.try_send(());
     }) {

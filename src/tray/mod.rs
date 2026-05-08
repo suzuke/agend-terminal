@@ -26,7 +26,7 @@ use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
 };
 
-use crate::{api, bootstrap::daemon_spawn};
+use crate::api;
 
 use self::autostart::{Autostart, Platform as AutostartPlatform};
 use self::terminal::{OpenInTerminal, Platform as TerminalPlatform};
@@ -117,20 +117,46 @@ fn solid_icon(rgba: [u8; 4]) -> Icon {
     Icon::from_rgba(buf, W, H).expect("32x32 RGBA buffer is always valid")
 }
 
-/// Probe the daemon via `api::call(LIST)`; if it's not up, spawn a
-/// detached one (blocks up to 5s for readiness). Tray stays usable
-/// even if spawn fails — the user can still Quit.
-fn bootstrap_daemon(home: &Path) {
-    if api::call(home, &json!({"method": api::method::LIST})).is_ok() {
-        // Adopted running daemon.
-        return;
+/// Sprint 57 Wave 3 PR-2 (#548 Q7) check_daemon_state: probe the
+/// daemon via `api::call(LIST)` and report Online vs Offline. The
+/// tray no longer spawns the daemon directly — daemon spawn is
+/// consolidated to CLI `start` per Q7. When the tray detects
+/// Offline, the menu surfaces a "Start daemon" item that shells
+/// out to `agend-terminal start` (which itself owns the
+/// detached-default semantics from Q1).
+fn check_daemon_state(home: &Path) -> StatusKind {
+    match api::call(home, &json!({"method": api::method::LIST})) {
+        Ok(resp) => StatusKind::from_response(&resp),
+        Err(_) => StatusKind::Offline,
     }
-    if let Err(e) = daemon_spawn::spawn_detached(home, None) {
-        // Non-fatal: tray still starts so the user can Quit / inspect.
-        // Without a status menu yet (lands in follow-on), surface the
-        // failure on stderr — `agend-terminal tray` is usually run in a
-        // terminal during the MVP phase.
-        eprintln!("tray: daemon spawn failed: {e}");
+}
+
+/// Sprint 57 Wave 3 PR-2 (#548 Q7) tray "Start daemon" menu action:
+/// shell out to `agend-terminal start` instead of spawning the
+/// daemon directly. The CLI `start` command's default is detached
+/// service mode (Q1 default-flip), so the spawned process becomes
+/// a free-standing daemon and the tray's launch shell exits
+/// immediately. Failures surface to stderr — the tray stays usable
+/// so the operator can retry / inspect / Quit.
+fn start_daemon_via_cli() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("tray: failed to resolve current_exe for daemon start: {e}");
+            return;
+        }
+    };
+    let result = std::process::Command::new(&exe).arg("start").spawn();
+    match result {
+        Ok(_child) => {
+            tracing::info!(
+                exe = %exe.display(),
+                "tray: shelled out to `agend-terminal start` for daemon launch"
+            );
+        }
+        Err(e) => {
+            eprintln!("tray: `{} start` spawn failed: {e}", exe.display());
+        }
     }
 }
 
@@ -153,7 +179,11 @@ fn shutdown_daemon(home: &Path) {
 /// but nothing ever reads it back.
 #[allow(unused_assignments, unused_variables)]
 pub fn run(home: &Path) -> anyhow::Result<()> {
-    bootstrap_daemon(home);
+    // Sprint 57 Wave 3 PR-2 (#548 Q7): tray no longer spawns the
+    // daemon on startup. Probe via `check_daemon_state`; if Offline,
+    // surface a "Start daemon" menu item that shells out to CLI
+    // `start` (consolidates spawn entry to CLI per Q7).
+    let initial_state = check_daemon_state(home);
     let home: PathBuf = home.to_path_buf();
 
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
@@ -185,18 +215,28 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         false
     });
 
-    // Menu: disabled status label, separator, Open App, Launch-at-login
-    // toggle, Quit.
+    // Menu: disabled status label, separator, Start daemon (Wave 3
+    // PR-2 #548 Q7), Open App, Launch-at-login toggle, Quit.
+    //
+    // The "Start daemon" item is always present; it shells out to
+    // `agend-terminal start` and lets that command's detached-default
+    // semantics (Q1) own the actual lifecycle. When the daemon is
+    // already up the click is harmless — the CLI's own discovery
+    // prevents double-start. Tray's role is reduced to status widget +
+    // GUI launcher per Q7.
     let menu = Menu::new();
-    let status_item = MenuItem::new("starting…", false, None);
+    let status_item = MenuItem::new(initial_state.label(), false, None);
+    let start_daemon_item = MenuItem::new("Start daemon", true, None);
     let open_app_item = MenuItem::new("Open App", true, None);
     let autostart_item = CheckMenuItem::new("Launch at login", true, autostart_on, None);
     let quit_item = MenuItem::new("Quit agend-terminal", true, None);
     menu.append(&status_item)?;
     menu.append(&tray_icon::menu::PredefinedMenuItem::separator())?;
+    menu.append(&start_daemon_item)?;
     menu.append(&open_app_item)?;
     menu.append(&autostart_item)?;
     menu.append(&quit_item)?;
+    let start_daemon_id = start_daemon_item.id().clone();
     let open_app_id = open_app_item.id().clone();
     let autostart_id = autostart_item.id().clone();
     let quit_id = quit_item.id().clone();
@@ -256,6 +296,14 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
                 if ev.id == quit_id {
                     shutdown_daemon(&home);
                     *control_flow = ControlFlow::Exit;
+                } else if ev.id == start_daemon_id {
+                    // Sprint 57 Wave 3 PR-2 (#548 Q7): shell out to
+                    // CLI `start`. The CLI's detached-default
+                    // semantics (Q1) own the actual lifecycle —
+                    // tray's job here ends as soon as the spawn
+                    // returns. The status poller picks up the new
+                    // daemon on the next POLL_INTERVAL tick.
+                    start_daemon_via_cli();
                 } else if ev.id == open_app_id {
                     // Best-effort: surface PATH / spawn errors on stderr but
                     // keep the tray alive so the user can retry or Quit.

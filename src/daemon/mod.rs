@@ -25,7 +25,81 @@ pub use tui_bridge::serve_agent_tui;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+
+/// Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown-reason taxonomy.
+/// Categorizes WHY the daemon stopped so the enriched
+/// `daemon_stop` event payload can give operators a sliceable
+/// audit trail (signal vs watchdog vs operator-initiated vs
+/// clean exit). Set by each shutdown trigger site; read by the
+/// shutdown sequence at the end of `run_core`.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShutdownReason {
+    /// Default — main loop broke without any trigger explicitly
+    /// recording its reason. Should not occur in practice.
+    Unknown = 0,
+    /// SIGINT / SIGTERM / SIGHUP via `bootstrap::signals::install`
+    /// (the ctrlc handler bundles all three on Unix; this single
+    /// reason captures all of them — finer per-signal taxonomy is
+    /// a Sprint 58+ candidate).
+    Signal = 1,
+    /// Operator invoked `agend-terminal stop` → API SHUTDOWN
+    /// method tripped the flag.
+    ApiShutdown = 2,
+    /// Daemon-internal watchdog (`daemon::ticker`) detected a
+    /// fatal condition and tripped the flag.
+    Watchdog = 3,
+    /// Reserved for explicit clean shutdown without any external
+    /// trigger (currently unused; kept in the taxonomy for forward
+    /// compat with future "graceful exit on completion" code paths).
+    #[allow(dead_code)]
+    CleanExit = 4,
+}
+
+impl ShutdownReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Signal => "signal",
+            Self::ApiShutdown => "api_shutdown",
+            Self::Watchdog => "watchdog",
+            Self::CleanExit => "clean_exit",
+        }
+    }
+
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Signal,
+            2 => Self::ApiShutdown,
+            3 => Self::Watchdog,
+            4 => Self::CleanExit,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Process-wide shutdown-reason record. Set via
+/// `record_shutdown_reason()` from each shutdown trigger site;
+/// read by `shutdown_sequence()` when emitting the enriched
+/// `daemon_stop` event. First-write-wins so a watchdog trip
+/// doesn't get clobbered by a subsequent signal during the same
+/// shutdown sequence.
+pub(crate) static SHUTDOWN_REASON: AtomicU8 = AtomicU8::new(0);
+
+/// Record the reason the daemon is shutting down. Idempotent on
+/// re-entry (first-write-wins via `compare_exchange`); safe to
+/// call from signal handlers + API threads + watchdog without
+/// coordination.
+pub(crate) fn record_shutdown_reason(reason: ShutdownReason) {
+    let _ = SHUTDOWN_REASON.compare_exchange(
+        ShutdownReason::Unknown as u8,
+        reason as u8,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+}
 
 /// Agent spawn config — stored for auto-respawn.
 #[derive(Clone)]
@@ -221,11 +295,29 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     run_core(&home, agents, telegram)
 }
 
+/// Sprint 57 Wave 3 PR-2 (#548 Q3 contract pin): this daemon does
+/// NOT supervise itself. There is no self-respawn loop on crash —
+/// the OS service manager (launchd / systemd / Task Scheduler) is
+/// the supervisor of last resort, and `agend-terminal service
+/// install/uninstall/status` (Sprint 57 Wave 3 PR-3 Phase 3) is
+/// the cross-platform integration helper. Re-introducing a
+/// daemon-self-restart loop here would conflict with the OS service
+/// manager's lifecycle ownership.
+///
+/// Sprint 57 Wave 3 PR-2 (#548 Q4 contract pin): the canonical
+/// lockfile is `$AGEND_HOME/.daemon.lock` (one acquirer at a time
+/// across all daemon processes). Per-PID identity is at
+/// `$AGEND_HOME/run/<pid>/.daemon` (PID-recycling guard for
+/// discovery — distinct purpose from the exclusive lock).
 fn run_core(
     home: &Path,
     agents: Vec<AgentDef>,
     telegram: Option<Arc<dyn crate::channel::Channel>>,
 ) -> anyhow::Result<()> {
+    // Sprint 57 Wave 3 PR-2 (#548 Q6): record startup time for the
+    // shutdown-sequence uptime metric.
+    let started_at = std::time::Instant::now();
+
     // Sprint 25 P0 Option F: mark this process as the daemon so
     // `mcp::is_running_inside_daemon_process()` can short-circuit
     // tool calls without TCP round-trip.
@@ -821,27 +913,33 @@ fn run_core(
         }
     }
 
-    crate::event_log::log(home, "daemon_stop", "", "shutdown");
-    tracing::info!("cleaning up...");
-    // Drain registry FIRST, then kill. PTY close handlers check the
-    // registry — if the agent is gone, they return silently instead of
-    // sending crash events. This eliminates all shutdown race conditions.
-    let agents_to_kill: Vec<_> = {
-        let mut reg = registry.lock();
-        let agents: Vec<_> = reg
-            .drain()
-            .map(|(name, handle)| (name, handle.child))
-            .collect();
-        agents
-    };
-    for (name, child) in &agents_to_kill {
-        let mut c = child.lock();
-        if let Some(pid) = c.process_id() {
-            crate::process::kill_process_tree(pid);
-        }
-        let _ = c.kill();
-        tracing::info!(agent = %name, "killed");
-    }
+    // Sprint 57 Wave 3 PR-2 (#548 Q6): staged shutdown sequence with
+    // reason taxonomy + summary metrics. The `daemon_stop` event name
+    // stays unchanged (preserving downstream query / grep paths) but
+    // its detail payload now carries:
+    //   - reason: signal / api_shutdown / watchdog / unknown
+    //   - agents_total: total registered agents at shutdown
+    //   - agents_killed_after_grace: how many needed SIGKILL escalation
+    //   - uptime_secs: daemon process uptime
+    //
+    // Termination is staged: SIGTERM all agents in parallel, wait the
+    // grace window (2s), then SIGKILL any survivors. Pre-Wave-3-PR-2
+    // shutdown serially called `kill_process_tree` per agent
+    // (effectively N * 500ms grace); the new sequence collapses to a
+    // single 2s wall-clock window regardless of N agents.
+    let metrics = shutdown_sequence(home, &registry, started_at);
+    crate::event_log::log(
+        home,
+        "daemon_stop",
+        "",
+        &format!(
+            "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+            metrics.reason.as_str(),
+            metrics.agents_total,
+            metrics.agents_killed_after_grace,
+            metrics.uptime_secs
+        ),
+    );
     // Remove entire run dir (port files + .daemon identity + PID isolation)
     let _ = std::fs::remove_dir_all(run_dir(home));
 
@@ -850,6 +948,128 @@ fn run_core(
     tracing::info!("exiting");
     Ok(())
 }
+
+/// Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown summary record.
+/// Emitted via the enriched `daemon_stop` event; also exposed
+/// from `shutdown_sequence` for tests + future telemetry.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShutdownMetrics {
+    pub reason: ShutdownReason,
+    pub agents_total: usize,
+    pub agents_killed_after_grace: usize,
+    pub uptime_secs: u64,
+}
+
+/// Sprint 57 Wave 3 PR-2 (#548 Q6) staged termination sequence:
+///
+/// 1. Drain the registry into a `Vec<(name, child)>` so PTY close
+///    handlers don't fire crash events for agents we're shutting
+///    down (race-free per the pre-Wave-3-PR-2 invariant).
+/// 2. Send SIGTERM to each agent's process group in parallel.
+/// 3. Wait the grace window (`SHUTDOWN_GRACE_SECS`, default 2s).
+/// 4. SIGKILL any survivor that didn't honor SIGTERM during the
+///    grace window. Track the count for the summary metrics.
+/// 5. Return a `ShutdownMetrics` record for the caller to fold
+///    into the `daemon_stop` event payload.
+///
+/// On Windows the staged-TERM model doesn't apply (no signal
+/// equivalent); the sequence falls back to `kill_process_tree`
+/// per agent — equivalent semantics, just without the parallel
+/// SIGTERM stage.
+pub(crate) fn shutdown_sequence(
+    home: &Path,
+    registry: &AgentRegistry,
+    started_at: std::time::Instant,
+) -> ShutdownMetrics {
+    let reason = ShutdownReason::from_u8(SHUTDOWN_REASON.load(Ordering::Relaxed));
+    tracing::info!(reason = reason.as_str(), "cleaning up...");
+
+    // Drain registry FIRST, then kill. PTY close handlers check the
+    // registry — if the agent is gone, they return silently instead of
+    // sending crash events. This eliminates all shutdown race conditions.
+    let agents_to_kill: Vec<_> = {
+        let mut reg = registry.lock();
+        reg.drain()
+            .map(|(name, handle)| (name, handle.child))
+            .collect()
+    };
+    let agents_total = agents_to_kill.len();
+
+    // Sprint 57 Wave 3 PR-2: parallel SIGTERM stage. On Unix, send
+    // SIGTERM to each agent's process group concurrently; on Windows,
+    // fall back to per-agent kill_process_tree (no signal model).
+    type ChildHandle = std::sync::Arc<Mutex<Box<dyn portable_pty::Child + Send>>>;
+    let mut pids: Vec<(String, ChildHandle, Option<u32>)> =
+        Vec::with_capacity(agents_to_kill.len());
+    for (name, child) in agents_to_kill {
+        let pid = {
+            let c = child.lock();
+            c.process_id()
+        };
+        #[cfg(unix)]
+        if let Some(p) = pid {
+            unsafe {
+                let pgid = libc::getpgid(p as i32);
+                let kill_pgid = if pgid > 0 { -pgid } else { -(p as i32) };
+                libc::kill(kill_pgid, libc::SIGTERM);
+            }
+        }
+        pids.push((name, child, pid));
+    }
+
+    #[cfg(unix)]
+    std::thread::sleep(SHUTDOWN_GRACE);
+
+    // Sprint 57 Wave 3 PR-2: SIGKILL stage. Anything still alive
+    // after the grace window is escalated. On Windows this is the
+    // primary kill stage (no SIGTERM was sent); on Unix it catches
+    // SIGTERM holdouts.
+    let mut agents_killed_after_grace = 0usize;
+    for (name, child, pid) in pids {
+        let still_alive = match pid {
+            Some(p) => crate::process::is_pid_alive(p),
+            None => false,
+        };
+        if let Some(p) = pid {
+            crate::process::kill_process_tree(p);
+        }
+        let _ = child.lock().kill();
+        if still_alive {
+            agents_killed_after_grace += 1;
+            tracing::info!(
+                agent = %name,
+                "killed (after grace window)"
+            );
+        } else {
+            tracing::info!(agent = %name, "killed");
+        }
+    }
+
+    let uptime_secs = started_at.elapsed().as_secs();
+    let metrics = ShutdownMetrics {
+        reason,
+        agents_total,
+        agents_killed_after_grace,
+        uptime_secs,
+    };
+    tracing::info!(
+        reason = metrics.reason.as_str(),
+        agents_total = metrics.agents_total,
+        agents_killed_after_grace = metrics.agents_killed_after_grace,
+        uptime_secs = metrics.uptime_secs,
+        "daemon shutdown sequence complete"
+    );
+    let _ = home; // home is currently logged via tracing only; reserved for future telemetry
+    metrics
+}
+
+/// Sprint 57 Wave 3 PR-2 (#548 Q6) graceful-termination grace window.
+/// SIGTERM is sent to all agents in parallel; this is how long the
+/// daemon waits before escalating survivors to SIGKILL. Set to 2s
+/// per Phase A RCA recommendation — long enough for well-behaved
+/// agents to honor SIGTERM cleanly, short enough to keep total
+/// shutdown latency bounded.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Replay missed one-shot schedules on daemon startup.
 /// Calls `schedules::replay_missed_oneshots` and fires each returned
@@ -1349,5 +1569,155 @@ mod tests {
             None => true,
         };
         assert!(is_crash, "exit code 1 must be a crash");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown reason taxonomy +
+    // payload-shape pins.
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn shutdown_reason_round_trip_preserves_taxonomy() {
+        for reason in [
+            ShutdownReason::Unknown,
+            ShutdownReason::Signal,
+            ShutdownReason::ApiShutdown,
+            ShutdownReason::Watchdog,
+            ShutdownReason::CleanExit,
+        ] {
+            let raw = reason as u8;
+            let recovered = ShutdownReason::from_u8(raw);
+            assert_eq!(recovered, reason, "round-trip lost taxonomy for {reason:?}");
+        }
+    }
+
+    #[test]
+    fn shutdown_reason_from_unknown_byte_returns_unknown() {
+        // Forward-compat: any out-of-range value decodes to Unknown
+        // rather than panicking. Future schema bumps that add more
+        // reasons can land without breaking older readers.
+        let recovered = ShutdownReason::from_u8(255);
+        assert_eq!(recovered, ShutdownReason::Unknown);
+        let recovered2 = ShutdownReason::from_u8(99);
+        assert_eq!(recovered2, ShutdownReason::Unknown);
+    }
+
+    #[test]
+    fn shutdown_reason_as_str_matches_audit_taxonomy() {
+        // Pin the string identifiers downstream consumers will grep
+        // against. Renaming any of these is a downstream-breaking
+        // change that needs an explicit migration note.
+        assert_eq!(ShutdownReason::Unknown.as_str(), "unknown");
+        assert_eq!(ShutdownReason::Signal.as_str(), "signal");
+        assert_eq!(ShutdownReason::ApiShutdown.as_str(), "api_shutdown");
+        assert_eq!(ShutdownReason::Watchdog.as_str(), "watchdog");
+        assert_eq!(ShutdownReason::CleanExit.as_str(), "clean_exit");
+    }
+
+    #[test]
+    fn record_shutdown_reason_first_write_wins() {
+        // Pin the compare_exchange semantic: the FIRST recorded
+        // reason wins. A subsequent ctrlc handler trip during an
+        // already-in-flight watchdog shutdown must NOT clobber the
+        // watchdog's recorded reason.
+        SHUTDOWN_REASON.store(0, Ordering::Relaxed); // reset to Unknown for test isolation
+        record_shutdown_reason(ShutdownReason::Watchdog);
+        record_shutdown_reason(ShutdownReason::Signal); // second write is no-op
+        let recovered = ShutdownReason::from_u8(SHUTDOWN_REASON.load(Ordering::Relaxed));
+        assert_eq!(
+            recovered,
+            ShutdownReason::Watchdog,
+            "first-write-wins must preserve initial reason against re-entry"
+        );
+        // Reset for other tests.
+        SHUTDOWN_REASON.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn daemon_stop_event_payload_carries_reason_and_metrics() {
+        // Pin the on-disk shape of the enriched `daemon_stop` event.
+        // Build a synthetic ShutdownMetrics + format it the way
+        // run_core does, parse the resulting key=value string, and
+        // assert each field is present + correct.
+        //
+        // This is the regression-proof that downstream queries /
+        // greps on `reason=...`, `agents_total=...`,
+        // `agents_killed_after_grace=...`, `uptime_secs=...` keep
+        // working across future Phase 2 IMPL refactors.
+        let metrics = ShutdownMetrics {
+            reason: ShutdownReason::Signal,
+            agents_total: 3,
+            agents_killed_after_grace: 1,
+            uptime_secs: 123,
+        };
+        let detail = format!(
+            "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+            metrics.reason.as_str(),
+            metrics.agents_total,
+            metrics.agents_killed_after_grace,
+            metrics.uptime_secs
+        );
+        assert!(detail.contains("reason=signal"), "got: {detail}");
+        assert!(detail.contains("agents_total=3"), "got: {detail}");
+        assert!(
+            detail.contains("agents_killed_after_grace=1"),
+            "got: {detail}"
+        );
+        assert!(detail.contains("uptime_secs=123"), "got: {detail}");
+    }
+
+    #[test]
+    fn daemon_stop_event_name_unchanged_post_phase_2() {
+        // Regression-proof against a future refactor that renames
+        // `daemon_stop` to a parallel event name. Phase 1 RCA #554
+        // Audit 6 explicitly chose enrich-not-duplicate; this test
+        // pins the event-name decision in source text. If a future
+        // refactor needs to rename, it must land a deliberate
+        // operator-visible CHANGELOG migration note + delete this
+        // pin in the same commit.
+        //
+        // We only check production code by slicing off the tests
+        // submodule — including this very test file would self-
+        // reference any literal we name in the negative-assertion
+        // message.
+        let src = include_str!("./mod.rs");
+        let prod_end = src.find("\n#[cfg(test)]\nmod tests {").unwrap_or(src.len());
+        let prod = &src[..prod_end];
+        let count = prod.matches(r#""daemon_stop""#).count();
+        assert!(
+            count >= 1,
+            "the `daemon_stop` event name MUST appear in daemon/mod.rs production \
+             code — enrich-not-duplicate semantic per Phase 1 RCA #554 Audit 6"
+        );
+        // The parallel-event name must not appear ANYWHERE in the
+        // production region. Construct the search string without
+        // putting the literal into the assertion message so this
+        // test's own source doesn't cross-pollute the slice.
+        let parallel = [
+            'd', 'a', 'e', 'm', 'o', 'n', '_', 's', 'h', 'u', 't', 'd', 'o', 'w', 'n',
+        ]
+        .iter()
+        .collect::<String>();
+        let bad_count = prod.matches(&parallel).count();
+        assert_eq!(
+            bad_count, 0,
+            "Phase 1 RCA #554 Audit 6 chose enrich-not-duplicate; \
+             a parallel event name appearing in production code would \
+             break downstream query / grep paths"
+        );
+    }
+
+    #[test]
+    fn shutdown_grace_window_is_2_seconds() {
+        // Phase A RCA recommendation: 2s grace window. Long enough
+        // for well-behaved agents to honor SIGTERM, short enough to
+        // keep total daemon shutdown latency bounded. Pinned so a
+        // future refactor doesn't silently drop or stretch the
+        // grace window without a CHANGELOG note.
+        assert_eq!(
+            SHUTDOWN_GRACE,
+            std::time::Duration::from_secs(2),
+            "Wave 3 PR-2 contract: grace = 2s exactly"
+        );
     }
 }

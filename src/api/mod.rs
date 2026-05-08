@@ -326,6 +326,10 @@ fn handle_session(
             method::MCP_TOOLS_LIST => handlers::mcp_proxy::handle_mcp_tools_list(params, &ctx),
             method::SHUTDOWN => {
                 tracing::info!("API shutdown requested");
+                // Sprint 57 Wave 3 PR-2 (#548 Q6): record API-shutdown
+                // reason BEFORE flipping the flag so the shutdown
+                // sequence sees the right taxonomy when it reads.
+                crate::daemon::record_shutdown_reason(crate::daemon::ShutdownReason::ApiShutdown);
                 shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
                 json!({"ok": true})
             }

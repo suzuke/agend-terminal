@@ -209,6 +209,13 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 /// daemon is mid-bootstrap and hasn't bound its port yet; deleting would
 /// clobber its state (#7). Return `None` on failure and let the caller's
 /// lock acquisition + `sweep_stale_run_dirs` distinguish dead from starting.
+/// Sprint 57 Wave 3 PR-2 (#548 Q2 contract pin): daemon discovery is
+/// dual-layer — `find_active_run_dir` provides the lockfile/PID
+/// evidence and `probe_api` provides the live-TCP evidence. Both
+/// must pass before we attach. This is the contract; do NOT
+/// degrade to lockfile-only OR API-only without re-validating
+/// discovery semantics across PID-recycling, kill -9, and stale
+/// rundir scenarios.
 fn try_attach(home: &Path, fleet_path: &Path) -> Result<Option<AttachedFleet>> {
     let Some(run_dir) = crate::daemon::find_active_run_dir(home) else {
         return Ok(None);

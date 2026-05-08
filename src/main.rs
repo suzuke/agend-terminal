@@ -179,17 +179,25 @@ struct Cli {
 enum Commands {
     /// Start daemon with fleet.yaml or explicit `--agents`
     Start {
-        /// Run the daemon in the background (detaches from this shell,
-        /// stdio → $AGEND_HOME/daemon.log). Parent process exits immediately
-        /// once the daemon has published its run dir.
+        /// Run the daemon in the foreground (blocks the calling shell, stdio
+        /// stays attached to the terminal).
+        ///
+        /// Sprint 57 Wave 3 PR-2 (#548 Q1): `start` now defaults to detached
+        /// service mode. Pass `--foreground` to keep the legacy blocking
+        /// behaviour — useful for one-shot demos, debugging the daemon's
+        /// own logs, or running under a process supervisor (systemd / launchd
+        /// / Task Scheduler) that owns the lifecycle. Hard cut-over per Q5
+        /// — there is no `--legacy-foreground-default` opt-out.
         #[arg(long)]
-        detached: bool,
+        foreground: bool,
         /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml).
         #[arg(long)]
         fleet: Option<String>,
         /// Start with explicit agent specs (`name:command` pairs) instead of
         /// fleet.yaml. Skips fleet loading; the daemon spawns exactly the
-        /// listed agents. Subsumes the former `daemon` subcommand.
+        /// listed agents. Subsumes the former `daemon` subcommand. Implies
+        /// `--foreground` (no fleet.yaml path → can't register with the
+        /// supervisor in detached mode).
         ///
         /// Example: `start --agents dev:claude reviewer:claude shell:/bin/bash`
         #[arg(long, num_args = 1.., value_name = "NAME:CMD")]
@@ -356,10 +364,17 @@ fn main() -> anyhow::Result<()> {
             app::run(fleet.as_deref())?;
         }
         Some(Commands::Start {
-            detached,
+            foreground,
             fleet,
             agents,
         }) => {
+            // Sprint 57 Wave 3 PR-2 (#548 Q1): default-flip to detached
+            // service mode. `--foreground` is the new opt-out flag.
+            // `--agents` always implies foreground (no fleet.yaml path
+            // to register with the supervisor in detached mode), so the
+            // detach branch only fires when a fleet path is in play.
+            let force_foreground = foreground || !agents.is_empty();
+
             // Wave 1 CLI consolidation: `--agents` subsumes the former
             // `daemon` subcommand. When provided, skip fleet loading and
             // spawn the listed agents directly. Mutually exclusive with
@@ -368,12 +383,6 @@ fn main() -> anyhow::Result<()> {
             if !agents.is_empty() {
                 if fleet.is_some() {
                     anyhow::bail!("`--agents` and `--fleet` are mutually exclusive");
-                }
-                if detached {
-                    anyhow::bail!(
-                        "`--detached` is not supported with `--agents` (no fleet.yaml \
-                         path to register with the supervisor); foreground only"
-                    );
                 }
                 let agents: Vec<_> = agents
                     .iter()
@@ -401,7 +410,8 @@ fn main() -> anyhow::Result<()> {
             let fleet_path = fleet
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join("fleet.yaml"));
-            if detached {
+            if !force_foreground {
+                // Sprint 57 Wave 3 PR-2 (#548 Q1) default branch: detach.
                 // Spawn self as a background process and exit. Child inherits
                 // a clean environment from the parent shell but runs in its
                 // own process group so this shell's Ctrl+C doesn't reach it.
