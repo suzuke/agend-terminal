@@ -6,7 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{apply_substitutions, ServiceState, UninstallOutcome, LAUNCHD_TEMPLATE, SERVICE_LABEL};
+use super::{
+    apply_substitutions, xml_escape, ServiceState, UninstallOutcome, LAUNCHD_TEMPLATE,
+    SERVICE_LABEL,
+};
 
 /// Resolve the absolute path to the LaunchAgent plist for the
 /// current user. `~/Library/LaunchAgents/com.agend-terminal.daemon.plist`.
@@ -22,13 +25,23 @@ pub(super) fn plist_path() -> Result<PathBuf, String> {
 pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     let plist = plist_path()?;
     let log_path = home.join("daemon.log");
+    // Sprint 57 Wave 3 PR-3 r2 (Tier-2 Pass 2 fixup): XML-escape every
+    // substituted value before splicing into the plist template.
+    // Paths containing `&` (e.g. macOS network shares) or `<`, `>`,
+    // `"`, `'` (rare but legal in user paths) would otherwise produce
+    // malformed plist that `launchctl load -w` rejects with cryptic
+    // errors. Pure entity-escape; safe even when no special chars.
+    let exe_escaped = xml_escape(&exe.display().to_string());
+    let home_escaped = xml_escape(&home.display().to_string());
+    let log_escaped = xml_escape(&log_path.display().to_string());
+    let label_escaped = xml_escape(SERVICE_LABEL);
     let resolved = apply_substitutions(
         LAUNCHD_TEMPLATE,
         &[
-            ("__LABEL__", SERVICE_LABEL),
-            ("__EXECUTABLE__", &exe.display().to_string()),
-            ("__HOME__", &home.display().to_string()),
-            ("__LOG__", &log_path.display().to_string()),
+            ("__LABEL__", label_escaped.as_str()),
+            ("__EXECUTABLE__", exe_escaped.as_str()),
+            ("__HOME__", home_escaped.as_str()),
+            ("__LOG__", log_escaped.as_str()),
         ],
     );
     if let Some(parent) = plist.parent() {

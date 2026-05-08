@@ -310,6 +310,68 @@ fn templates_invoke_start_foreground_so_service_owns_lifecycle() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Sprint 57 Wave 3 PR-3 r2 (#548 Phase 3, Tier-2 Pass 2 fixup) —
+// format-aware escaping integration pins. Reach into the bin's
+// service module via the test crate's `agend_terminal::service`
+// re-export... wait, the bin doesn't re-export. Pin via source-text
+// invariants on the production-side escaping wiring instead.
+// ---------------------------------------------------------------------
+
+#[test]
+fn macos_install_path_invokes_xml_escape() {
+    // Source-text pin: the macOS install function MUST call
+    // xml_escape on each substituted value. Pre-r2 it fed raw paths
+    // straight into apply_substitutions, producing malformed plist
+    // for paths with `&`/`<`/`>`/`"`/`'`.
+    let macos_rs = include_str!("../src/service/macos.rs");
+    assert!(
+        macos_rs.contains("xml_escape("),
+        "src/service/macos.rs MUST call xml_escape on substituted values \
+         (Tier-2 Pass 2 fixup — Class-A cross-platform escaping bug)"
+    );
+}
+
+#[test]
+fn linux_install_path_invokes_systemd_quote() {
+    // Source-text pin: the Linux install function MUST call
+    // systemd_quote on the executable + home paths. Pre-r2 it fed
+    // raw paths into ExecStart= which would mis-tokenize at any
+    // whitespace.
+    let linux_rs = include_str!("../src/service/linux.rs");
+    assert!(
+        linux_rs.contains("systemd_quote("),
+        "src/service/linux.rs MUST call systemd_quote on substituted values \
+         (Tier-2 Pass 2 fixup — ExecStart= tokenization bug)"
+    );
+}
+
+#[test]
+fn windows_install_path_invokes_xml_escape() {
+    let windows_rs = include_str!("../src/service/windows.rs");
+    assert!(
+        windows_rs.contains("xml_escape("),
+        "src/service/windows.rs MUST call xml_escape on substituted values \
+         (Tier-2 Pass 2 fixup — Task Scheduler XML escaping bug)"
+    );
+}
+
+#[test]
+fn service_mod_exports_both_escape_helpers() {
+    // Cross-cutting: both helpers must be in service::mod.rs
+    // as the single source of truth. Per-platform modules import
+    // from there.
+    let mod_rs = include_str!("../src/service/mod.rs");
+    assert!(
+        mod_rs.contains("pub fn xml_escape("),
+        "service::mod.rs MUST define `xml_escape` helper"
+    );
+    assert!(
+        mod_rs.contains("pub fn systemd_quote("),
+        "service::mod.rs MUST define `systemd_quote` helper"
+    );
+}
+
 #[test]
 fn cargo_toml_includes_service_assets() {
     // Pin: the published crate ships the templates so `cargo publish`

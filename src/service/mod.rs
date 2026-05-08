@@ -80,12 +80,73 @@ pub const SYSTEMD_TEMPLATE: &str = include_str!("../../assets/service/systemd.se
 pub const WINDOWS_TEMPLATE: &str = include_str!("../../assets/service/scheduler.task.xml.template");
 
 /// Substitute `__PLACEHOLDER__` tokens in a template body. Pure
-/// helper — used by all three per-platform install paths.
+/// helper — caller is responsible for format-appropriate escaping
+/// of the substitution values (see `xml_escape` for launchd/plist
+/// and Task Scheduler XML, and `systemd_quote` for systemd
+/// ExecStart tokenization-safety). The Wave 3 PR-3 r1 review
+/// (Tier-2 Pass 2) caught a Class-A cross-platform bug where this
+/// helper was being called with raw paths, producing malformed XML
+/// or mis-tokenized systemd ExecStart on values containing `&`,
+/// `<`, `>`, `"`, `'`, or whitespace.
 pub fn apply_substitutions(template: &str, substitutions: &[(&str, &str)]) -> String {
     let mut out = template.to_string();
     for (placeholder, value) in substitutions {
         out = out.replace(placeholder, value);
     }
+    out
+}
+
+/// Sprint 57 Wave 3 PR-3 r2 (#548 Phase 3, Tier-2 Pass 2 fixup):
+/// XML entity-escape a text-node value for inclusion in plist /
+/// Task Scheduler XML templates. Order matters — `&` must be
+/// substituted FIRST to avoid double-escaping subsequent entities.
+///
+/// Covers the full attribute-value-safe set: `& < > " '`. Values
+/// inside `<string>...</string>` and `<UserId>...</UserId>` text
+/// nodes only need `&`, `<`, `>` strictly, but escaping the quote
+/// chars too keeps the helper safe for both text and attribute
+/// contexts (the templates use both).
+pub fn xml_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Sprint 57 Wave 3 PR-3 r2 (#548 Phase 3, Tier-2 Pass 2 fixup):
+/// systemd ExecStart-safe quoting for executable / argument paths.
+/// Per systemd.exec(5) "Command lines": values containing
+/// whitespace or special chars must be `"`-quoted, with internal
+/// `"` escaped as `\"` and `\` escaped as `\\`.
+///
+/// Strategy: if the value contains nothing requiring quoting
+/// (alphanumeric + `/_.-`), return as-is. Otherwise wrap in `"..."`
+/// with `\` and `"` backslash-escaped inside.
+pub fn systemd_quote(value: &str) -> String {
+    let needs_quoting = value
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '.' | '-')));
+    if !needs_quoting {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len() + 4);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str(r"\\"),
+            '"' => out.push_str(r#"\""#),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
     out
 }
 
@@ -260,5 +321,109 @@ mod tests {
         assert!(WINDOWS_TEMPLATE.contains("<RunLevel>LeastPrivilege</RunLevel>"));
         // Restart-on-failure parity with systemd's on-failure semantic.
         assert!(WINDOWS_TEMPLATE.contains("<RestartOnFailure>"));
+    }
+
+    // -----------------------------------------------------------------
+    // Sprint 57 Wave 3 PR-3 r2 (#548 Phase 3, Tier-2 Pass 2 fixup) —
+    // format-aware escaping helpers.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn xml_escape_handles_all_five_special_chars_in_correct_order() {
+        // `&` MUST be replaced FIRST or subsequent entity replacements
+        // double-escape (e.g. `<` → `&lt;` becomes `&amp;lt;`).
+        // The implementation iterates char-by-char so order is implicit
+        // — pin the round-trip behaviour explicitly.
+        let raw = "a&b<c>d\"e'f";
+        let escaped = xml_escape(raw);
+        assert_eq!(escaped, "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+    }
+
+    #[test]
+    fn xml_escape_no_op_on_safe_string() {
+        // Plain ASCII alnum + path chars round-trip unchanged.
+        let safe = "/Users/dev/.agend/agend-terminal";
+        assert_eq!(xml_escape(safe), safe);
+    }
+
+    #[test]
+    fn xml_escape_preserves_unicode() {
+        // Non-ASCII chars are passed through unchanged. macOS / Windows
+        // user paths can contain CJK / other Unicode and these are
+        // valid XML content (UTF-8 / UTF-16 native).
+        let unicode = "/Users/開發/.agend";
+        assert_eq!(xml_escape(unicode), unicode);
+    }
+
+    #[test]
+    fn systemd_quote_no_op_on_safe_path() {
+        // Alphanumeric + `/_.-` paths don't need quoting per
+        // systemd.exec(5).
+        let safe = "/usr/local/bin/agend-terminal";
+        assert_eq!(systemd_quote(safe), safe);
+    }
+
+    #[test]
+    fn systemd_quote_wraps_path_with_spaces() {
+        // The Class-A bug: a path with spaces splits into multiple
+        // tokens at ExecStart= time. Wrap in `"..."` to preserve as
+        // single token.
+        let with_space = "/Users/Test User/.cargo/bin/agend-terminal";
+        let quoted = systemd_quote(with_space);
+        assert_eq!(quoted, r#""/Users/Test User/.cargo/bin/agend-terminal""#);
+    }
+
+    #[test]
+    fn systemd_quote_escapes_internal_quotes_and_backslashes() {
+        // Belt-and-braces: a path containing literal `"` or `\` (rare
+        // on Unix but legal) gets the chars escaped inside the wrapping
+        // quotes per systemd's exec quoting rules.
+        let weird = r#"/path with "quote" and\back"#;
+        let quoted = systemd_quote(weird);
+        assert_eq!(quoted, r#""/path with \"quote\" and\\back""#);
+    }
+
+    #[test]
+    fn systemd_quote_handles_hyphen_underscore_dot_in_basename() {
+        // Common conventional filename chars shouldn't trigger
+        // wrapping — keeps systemd unit files readable when no
+        // special handling is needed.
+        let conventional = "/usr/local/bin/agend-terminal_helper.v2";
+        assert_eq!(systemd_quote(conventional), conventional);
+    }
+
+    #[test]
+    fn xml_escape_under_substitution_produces_well_formed_plist_fragment() {
+        // Empirical regression-proof: the path that crashed pre-r2
+        // (`__EXECUTABLE__` containing `&`) round-trips through
+        // xml_escape + apply_substitutions and lands as a valid XML
+        // text-node value.
+        let template = "<string>__EXECUTABLE__</string>";
+        let raw = "/path/with&ampersand/agend-terminal";
+        let escaped = xml_escape(raw);
+        let resolved = apply_substitutions(template, &[("__EXECUTABLE__", escaped.as_str())]);
+        assert_eq!(
+            resolved,
+            "<string>/path/with&amp;ampersand/agend-terminal</string>"
+        );
+        // Negative pin: raw `&` would be invalid XML.
+        assert!(!resolved.contains("with&ampersand/"));
+    }
+
+    #[test]
+    fn systemd_quote_under_substitution_preserves_argv_safety() {
+        // Empirical regression-proof: the path that crashed pre-r2
+        // (whitespace in `__EXECUTABLE__`) round-trips through
+        // systemd_quote + apply_substitutions and produces an
+        // ExecStart= line that systemd will tokenize as a SINGLE
+        // executable + the literal `start --foreground` args.
+        let template = "ExecStart=__EXECUTABLE__ start --foreground";
+        let raw = "/Users/Test User/.cargo/bin/agend-terminal";
+        let quoted = systemd_quote(raw);
+        let resolved = apply_substitutions(template, &[("__EXECUTABLE__", quoted.as_str())]);
+        assert_eq!(
+            resolved,
+            r#"ExecStart="/Users/Test User/.cargo/bin/agend-terminal" start --foreground"#
+        );
     }
 }

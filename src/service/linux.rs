@@ -6,7 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{apply_substitutions, ServiceState, UninstallOutcome, SYSTEMD_TEMPLATE, SYSTEMD_UNIT};
+use super::{
+    apply_substitutions, systemd_quote, ServiceState, UninstallOutcome, SYSTEMD_TEMPLATE,
+    SYSTEMD_UNIT,
+};
 
 /// `~/.config/systemd/user/agend-terminal-daemon.service`.
 /// Honors `XDG_CONFIG_HOME` if set, otherwise `~/.config`.
@@ -24,11 +27,19 @@ pub(super) fn unit_path() -> Result<PathBuf, String> {
 
 pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     let unit = unit_path()?;
+    // Sprint 57 Wave 3 PR-3 r2 (Tier-2 Pass 2 fixup): systemd-quote
+    // the executable + home paths so values containing whitespace or
+    // special chars survive ExecStart= / Environment= tokenization.
+    // Per systemd.exec(5) "Command lines": values needing quoting
+    // get wrapped in `"..."` with internal `"` and `\` escaped.
+    // Paths without special chars round-trip unchanged.
+    let exe_quoted = systemd_quote(&exe.display().to_string());
+    let home_quoted = systemd_quote(&home.display().to_string());
     let resolved = apply_substitutions(
         SYSTEMD_TEMPLATE,
         &[
-            ("__EXECUTABLE__", &exe.display().to_string()),
-            ("__HOME__", &home.display().to_string()),
+            ("__EXECUTABLE__", exe_quoted.as_str()),
+            ("__HOME__", home_quoted.as_str()),
         ],
     );
     if let Some(parent) = unit.parent() {

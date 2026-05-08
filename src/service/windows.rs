@@ -4,7 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{apply_substitutions, ServiceState, UninstallOutcome, WINDOWS_TASK, WINDOWS_TEMPLATE};
+use super::{
+    apply_substitutions, xml_escape, ServiceState, UninstallOutcome, WINDOWS_TASK, WINDOWS_TEMPLATE,
+};
 
 /// Where we cache the rendered task XML on disk so `status` can
 /// detect "installed" by file presence + so a re-install regenerates
@@ -29,12 +31,20 @@ fn current_windows_user() -> String {
 pub(super) fn install(home: &Path, exe: &Path) -> Result<PathBuf, String> {
     let xml_path = task_xml_path(home);
     let user = current_windows_user();
+    // Sprint 57 Wave 3 PR-3 r2 (Tier-2 Pass 2 fixup): XML-escape every
+    // substituted value before splicing into the Task Scheduler XML
+    // template. Windows usernames containing `&` (rare but legal) or
+    // paths containing `<`, `>`, `"`, `'` would otherwise produce
+    // malformed XML that `schtasks /XML` rejects with cryptic errors.
+    let exe_escaped = xml_escape(&exe.display().to_string());
+    let home_escaped = xml_escape(&home.display().to_string());
+    let user_escaped = xml_escape(&user);
     let resolved = apply_substitutions(
         WINDOWS_TEMPLATE,
         &[
-            ("__EXECUTABLE__", &exe.display().to_string()),
-            ("__HOME__", &home.display().to_string()),
-            ("__USER__", &user),
+            ("__EXECUTABLE__", exe_escaped.as_str()),
+            ("__HOME__", home_escaped.as_str()),
+            ("__USER__", user_escaped.as_str()),
         ],
     );
     if let Some(parent) = xml_path.parent() {
