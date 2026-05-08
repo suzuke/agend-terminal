@@ -780,6 +780,22 @@ fn run_core(
     {
         let cfgs = configs.lock();
         let mut seen = std::collections::HashSet::new();
+        // Sprint 57 Wave 4 (#546 Item 4): residual worktrees now live
+        // under `$AGEND_HOME/worktrees/<agent>/<branch>/` (the new
+        // canonical layout), so the residual scan is repo-independent.
+        // `list_residual(home)` returns agent-name dirs found there;
+        // `list_legacy_residual(repo)` separately surfaces any
+        // pre-Wave-4 entries still under `<repo>/.worktrees/` for
+        // operator cleanup. Both surface to the same audit log line.
+        let central_residual = crate::worktree::list_residual(home);
+        if !central_residual.is_empty() {
+            tracing::info!(
+                location = %home.join("worktrees").display(),
+                residual = ?central_residual,
+                "residual agent worktrees found under $AGEND_HOME/worktrees/ \
+                 (cleared on next bind_self/release_worktree cycle)"
+            );
+        }
         for config in cfgs.values() {
             // Use worktree_source (original repo) if available, otherwise working_dir
             let repo = config
@@ -788,12 +804,16 @@ fn run_core(
                 .or(config.working_dir.as_ref());
             if let Some(dir) = repo {
                 if seen.insert(dir.clone()) {
-                    let residual = crate::worktree::list_residual(dir);
+                    let residual = crate::worktree::list_legacy_residual(dir);
                     if !residual.is_empty() {
-                        tracing::info!(
+                        tracing::warn!(
                             repo = %dir.display(),
                             residual = ?residual,
-                            "residual worktrees found (use `git worktree remove` to clean)"
+                            "Sprint 57 Wave 4 (#546 Item 4): legacy worktrees detected at \
+                             <repo>/.worktrees/<agent>/ — operator cleanup recommended. \
+                             New worktrees land at $AGEND_HOME/worktrees/<agent>/<branch>/. \
+                             Manual cleanup: `git -C <repo> worktree remove <repo>/.worktrees/<agent>` \
+                             then re-bind via task dispatch or bind_self."
                         );
                     }
                 }

@@ -562,7 +562,10 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
             return json!({"error": format!("invalid branch name '{branch}'")});
         }
         let wd = std::path::PathBuf::from(&work_dir);
-        if let Some(info) = crate::worktree::create(&wd, name, Some(branch)) {
+        // Sprint 57 Wave 4 (#546 Item 4): worktree creation now takes
+        // `home` so the canonical external layout
+        // `$AGEND_HOME/worktrees/<agent>/<branch>/` resolves correctly.
+        if let Some(info) = crate::worktree::create(home, &wd, name, Some(branch)) {
             work_dir = info.path.display().to_string();
         }
     }

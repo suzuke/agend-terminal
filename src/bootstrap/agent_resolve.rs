@@ -22,13 +22,17 @@ pub type AgentDef = (
 
 struct ResolveContext<'a> {
     fleet_dir: &'a Path,
+    /// Sprint 57 Wave 4 (#546 Item 4): AGEND_HOME for the new
+    /// external worktree layout `$AGEND_HOME/worktrees/<agent>/<branch>/`.
+    home: &'a Path,
     peers: Vec<(String, Option<String>)>,
 }
 
 /// Resolve every instance in `config` into a spawn-ready [`AgentDef`].
-pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path) -> Vec<AgentDef> {
+pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path, home: &Path) -> Vec<AgentDef> {
     let ctx = ResolveContext {
         fleet_dir,
+        home,
         peers: config
             .instances
             .iter()
@@ -62,7 +66,8 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
         if let Some(ref base_dir) = resolved.working_directory {
             if crate::worktree::is_git_repo(base_dir) {
                 let custom_branch = resolved.git_branch.as_deref();
-                if let Some(info) = crate::worktree::create(base_dir, name, custom_branch) {
+                if let Some(info) = crate::worktree::create(ctx.home, base_dir, name, custom_branch)
+                {
                     resolved.working_directory = Some(info.path);
                 }
             }
@@ -70,19 +75,31 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
     } else if let Some(ref base_dir) = resolved.working_directory {
         // worktree: false — auto-prune existing worktree if present.
         // Pre-flight: reject if uncommitted changes exist (protect work).
+        // Sprint 57 Wave 4 (#546 Item 4): the canonical worktree path
+        // is now `$AGEND_HOME/worktrees/<agent>/<branch>/`. Auto-prune
+        // here is scoped to the default-branch shape `agend/<agent>`
+        // (the path `worktree::create` synthesizes when no custom
+        // branch is supplied). Custom-branch worktrees that the
+        // operator created via task dispatch / bind_self stay put on
+        // worktree:false toggle; manual `release_worktree` is the
+        // cleanup path for those. This matches the pre-Wave-4 narrow
+        // scope (the legacy auto-prune also only knew the agent name).
         if crate::worktree::is_git_repo(base_dir) {
-            let wt_dir = base_dir.join(".worktrees").join(name);
-            if wt_dir.exists() {
-                if crate::worktree::has_uncommitted_changes(&wt_dir) {
+            let default_branch = format!("agend/{name}");
+            let wt_path = crate::worktree::worktree_path(ctx.home, name, &default_branch);
+            if wt_path.exists() {
+                if crate::worktree::has_uncommitted_changes(&wt_path) {
                     tracing::error!(
                         instance = name,
-                        worktree = %wt_dir.display(),
+                        worktree = %wt_path.display(),
                         "FATAL: worktree opt-out rejected — uncommitted changes in worktree. \
                          Commit or stash changes before setting worktree: false. \
                          Instance will NOT start."
                     );
                     return None; // Refuse instance start — operator must resolve
-                } else if let Err(e) = crate::worktree::remove_worktree(base_dir, name) {
+                } else if let Err(e) =
+                    crate::worktree::remove_worktree(ctx.home, base_dir, name, &default_branch)
+                {
                     tracing::warn!(instance = name, error = %e, "auto-prune worktree failed");
                 }
             }
@@ -169,6 +186,7 @@ mod tests {
             .collect();
         let ctx = ResolveContext {
             fleet_dir: &dir,
+            home: &dir,
             peers,
         };
         let result = resolve_one(&config, &ctx, "test-agent");
@@ -199,6 +217,7 @@ mod tests {
             .collect();
         let ctx = ResolveContext {
             fleet_dir: &dir,
+            home: &dir,
             peers,
         };
         let result = resolve_one(&config, &ctx, "test-agent");
@@ -206,11 +225,22 @@ mod tests {
         let (_, _, _, _, work_dir, _) = result.unwrap();
         let wd = work_dir.unwrap();
         // Default worktree: working_directory should be redirected to
-        // .worktrees/test-agent/ (worktree creation succeeded)
+        // the new external layout `$AGEND_HOME/worktrees/test-agent/<branch>/`
+        // per Sprint 57 Wave 4 (#546 Item 4). The test home == dir,
+        // so we look for `<dir>/worktrees/test-agent/...`.
+        let wd_str = wd.to_string_lossy();
         assert!(
-            wd.to_string_lossy().contains(".worktrees")
-                || wd.to_string_lossy().contains("test-agent"),
-            "default worktree must redirect to .worktrees/ subdir, got: {}",
+            wd_str.contains("worktrees") && wd_str.contains("test-agent"),
+            "default worktree must redirect to $AGEND_HOME/worktrees/<agent>/<branch>/ \
+             external layout, got: {}",
+            wd.display()
+        );
+        // Regression-proof against the legacy in-repo layout: working_dir
+        // must NOT live under `<source_repo>/.worktrees/`.
+        assert!(
+            !wd_str.contains(".worktrees"),
+            "Wave 4: worktree must NOT live under <source_repo>/.worktrees/ \
+             (legacy layout), got: {}",
             wd.display()
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -220,8 +250,16 @@ mod tests {
     fn resolve_one_worktree_false_prunes_clean_existing_worktree() {
         let dir = tmp_dir("wt-false-prune");
         init_git_repo(&dir);
-        // Create a fake worktree dir
-        let wt_dir = dir.join(".worktrees").join("test-agent");
+        // Sprint 57 Wave 4 (#546 Item 4): worktrees live external at
+        // `$AGEND_HOME/worktrees/<agent>/<branch>/`. Set up the new
+        // layout for the prune test rather than the legacy
+        // `<source_repo>/.worktrees/`. The default branch is
+        // `agend/<agent>` per `worktree::create`'s fallback.
+        let wt_dir = dir
+            .join("worktrees")
+            .join("test-agent")
+            .join("agend")
+            .join("test-agent");
         std::fs::create_dir_all(&wt_dir).unwrap();
         init_git_repo(&wt_dir);
         assert!(wt_dir.exists(), "worktree must exist before prune");
@@ -234,6 +272,7 @@ mod tests {
             .collect();
         let ctx = ResolveContext {
             fleet_dir: &dir,
+            home: &dir,
             peers,
         };
         let result = resolve_one(&config, &ctx, "test-agent");
@@ -242,9 +281,15 @@ mod tests {
         // (or at minimum, resolve_one returned the base dir, not the worktree)
         let (_, _, _, _, work_dir, _) = result.unwrap();
         let wd = work_dir.unwrap();
+        let wd_str = wd.to_string_lossy();
         assert!(
-            !wd.to_string_lossy().contains(".worktrees"),
-            "worktree:false must NOT use .worktrees/ path, got: {}",
+            !wd_str.contains("/worktrees/test-agent/"),
+            "worktree:false must NOT redirect into the new external worktree layout, got: {}",
+            wd.display()
+        );
+        assert!(
+            !wd_str.contains(".worktrees"),
+            "worktree:false must NOT use legacy <repo>/.worktrees/ path, got: {}",
             wd.display()
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -272,6 +317,7 @@ mod tests {
             .collect();
         let ctx = ResolveContext {
             fleet_dir: &dir,
+            home: &dir,
             peers,
         };
         let result = resolve_one(&config, &ctx, "test-agent");

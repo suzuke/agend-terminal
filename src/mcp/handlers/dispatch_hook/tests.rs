@@ -170,11 +170,12 @@ fn bind_file_error_stays_graceful() {
     );
 
     // Worktree was created (lease succeeded).
+    // Sprint 57 Wave 4 (#546 Item 4): worktrees now live at
+    // `<home>/worktrees/<agent>/<branch>/` external to source_repo.
     let wt = home
-        .join("workspace")
+        .join("worktrees")
         .join("test-agent")
-        .join(".worktrees")
-        .join("test-agent");
+        .join("feat/graceful");
     assert!(wt.exists(), "worktree must be created even if bind fails");
 
     std::fs::remove_dir_all(&home).ok();

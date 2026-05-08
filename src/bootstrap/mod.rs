@@ -168,7 +168,7 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
 
     let agents = if opts.resolve_agents {
         let fleet_dir = fleet_path.parent().unwrap_or(home);
-        agent_resolve::resolve(&config, fleet_dir)
+        agent_resolve::resolve(&config, fleet_dir, home)
     } else {
         Vec::new()
     };

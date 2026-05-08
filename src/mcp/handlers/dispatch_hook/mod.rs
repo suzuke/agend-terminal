@@ -87,6 +87,29 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         ));
     }
 
+    // Sprint 57 Wave 4 (#546 Item 4): same-agent different-branch
+    // conflict check. Pre-Wave-4 this was enforced implicitly by
+    // `worktree::create`'s reuse-path rejection — the legacy
+    // `<repo>/.worktrees/<agent>/` was a single path per agent, so
+    // a second create call on a different branch tripped the
+    // "exists + HEAD mismatch" guard. Wave 4's branch-segmented
+    // `<home>/worktrees/<agent>/<branch>/` puts each (agent, branch)
+    // at a distinct path, so the implicit guard no longer fires.
+    // The semantic is preserved here at the binding layer: if the
+    // target already holds a binding on a DIFFERENT branch, the new
+    // dispatch must reject (operator must `release_worktree` first).
+    if let Some(existing) = crate::binding::read(home, target) {
+        if let Some(existing_branch) = existing.get("branch").and_then(|v| v.as_str()) {
+            if existing_branch != branch {
+                return Err(format!(
+                    "agent '{target}' already bound to branch '{existing_branch}' — \
+                     release_worktree first before re-binding to '{branch}' \
+                     (lease conflict per P0-1.6 semantic, preserved through Wave 4 #546 Item 4)"
+                ));
+            }
+        }
+    }
+
     // Attempt lease (creates worktree + tags as daemon-managed).
     // Lease errors REJECT the dispatch (Q2 + §3.3).
     let lease = crate::worktree_pool::lease(home, &source_repo, target, branch)?;

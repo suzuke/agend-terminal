@@ -34,8 +34,10 @@ pub fn lease(
         ));
     }
 
-    // Create worktree using existing infrastructure.
-    let info = match crate::worktree::create(source_repo, agent, Some(branch)) {
+    // Create worktree using existing infrastructure. Sprint 57 Wave 4
+    // (#546 Item 4): the new external layout requires `home` to
+    // resolve the canonical path `$AGEND_HOME/worktrees/<agent>/<branch>/`.
+    let info = match crate::worktree::create(home, source_repo, agent, Some(branch)) {
         Some(info) => info,
         None => return Err(format!("failed to create worktree for {agent}@{branch}")),
     };

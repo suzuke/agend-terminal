@@ -1,9 +1,44 @@
 //! Git worktree management — create, reuse, prune.
 //!
 //! Rule: if working_directory is set and is a git repo, create a worktree.
+//!
+//! Sprint 57 Wave 4 (#546 Item 4) — worktrees live external to the
+//! source repo per operator-approved Option A. Canonical layout:
+//!   `$AGEND_HOME/worktrees/<agent>/<branch>/`
+//! (e.g. `~/.agend/worktrees/dev/feat/track-x/`). The legacy layout
+//! `<source_repo>/.worktrees/<agent>/` is detected by
+//! `legacy_worktree_path` for migration warnings only — no new
+//! creates land there. `worktree_path` is the single source of truth
+//! for the new layout; all production code paths (lease, create,
+//! release, gc, list_residual) route through it.
 
 use crate::agent_ops::validate_branch;
 use std::path::{Path, PathBuf};
+
+/// Sprint 57 Wave 4 (#546 Item 4) canonical worktree path:
+/// `$AGEND_HOME/worktrees/<agent>/<branch>/`. Single source of truth
+/// — every site that needs to know "where does agent X's branch Y
+/// worktree live?" routes through this helper. Branch names with `/`
+/// (e.g. `feat/foo`) become nested dirs naturally; `validate_branch`
+/// already rejects path-traversal characters at the daemon API
+/// boundary.
+pub fn worktree_path(home: &Path, agent: &str, branch: &str) -> PathBuf {
+    home.join("worktrees").join(agent).join(branch)
+}
+
+/// Sprint 57 Wave 4 (#546 Item 4) legacy worktree path detector:
+/// the pre-Sprint-57 layout `<source_repo>/.worktrees/<agent>/`.
+/// Used by the startup migration sweep AND by tests to construct
+/// reference paths for legacy detection. Production creates NEVER
+/// use this path post-Wave-4 — it lives only for detection of
+/// pre-existing on-disk state. Tagged `#[allow(dead_code)]` because
+/// production callers route through `list_legacy_residual` (which
+/// scans the parent dir), but the path-builder is the documented
+/// single source of truth for the legacy layout.
+#[allow(dead_code)]
+pub fn legacy_worktree_path(source_repo: &Path, agent: &str) -> PathBuf {
+    source_repo.join(".worktrees").join(agent)
+}
 
 /// Info about a created worktree.
 #[derive(Debug, Clone)]
@@ -24,9 +59,13 @@ pub fn is_git_repo(dir: &Path) -> bool {
 
 /// Recover the source repo path from a worktree working directory.
 ///
-/// Matches the layout `agent_resolve` creates via `worktree::create`:
-/// `{source_repo}/.worktrees/{name}`. Returns `None` when `working_dir` is
-/// not inside a `.worktrees/` directory or lacks the two expected ancestors.
+/// Sprint 57 Wave 4 (#546 Item 4): post-migration, source_repo
+/// CANNOT be derived from worktree path alone (worktrees live under
+/// `$AGEND_HOME/worktrees/<agent>/<branch>/` external to the source
+/// repo). Production code reads `binding.source_repo` directly.
+/// This helper is retained for legacy-layout detection only — it
+/// matches the pre-Wave-4 `{source_repo}/.worktrees/{name}` layout
+/// and returns `None` for the new layout.
 pub fn source_repo_of(working_dir: &Path) -> Option<PathBuf> {
     if !working_dir.display().to_string().contains(".worktrees/") {
         return None;
@@ -50,9 +89,15 @@ fn has_commits(repo_dir: &Path) -> bool {
 ///
 /// - If worktree already exists, reuses it.
 /// - Branch name: custom_branch or "agend/{instance_name}".
-/// - Worktree path: {repo}/.worktrees/{instance_name}/.
-/// - Auto-adds .worktrees to .gitignore.
+/// - Worktree path (Sprint 57 Wave 4 #546 Item 4):
+///   `{home}/worktrees/{instance_name}/{branch}/` — external to
+///   source_repo per operator-approved Option A. The pre-Wave-4
+///   layout `{repo}/.worktrees/{instance_name}/` is no longer
+///   created; existing worktrees there are left alone for the
+///   operator to clean up manually (a startup migration sweep
+///   surfaces them via warning).
 pub fn create(
+    home: &Path,
     repo_dir: &Path,
     instance_name: &str,
     custom_branch: Option<&str>,
@@ -96,7 +141,9 @@ pub fn create(
         return None;
     }
 
-    let wt_dir = repo_dir.join(".worktrees").join(instance_name);
+    // Sprint 57 Wave 4 (#546 Item 4): canonical path is now external
+    // to source_repo at `$AGEND_HOME/worktrees/<agent>/<branch>/`.
+    let wt_dir = worktree_path(home, instance_name, &branch);
 
     // Already exists — verify actual HEAD before reuse.
     // P0-1.6: pre-fix this branch echoed `branch` back without verifying the
@@ -141,8 +188,21 @@ pub fn create(
         });
     }
 
-    // Ensure .worktrees is in .gitignore
+    // Sprint 57 Wave 4 (#546 Item 4): worktrees live external to
+    // source_repo, so the source repo's .gitignore no longer needs
+    // a `.worktrees` entry — but `ensure_gitignore` is kept as a
+    // best-effort idempotent backstop for repos that DID accumulate
+    // legacy worktrees pre-Wave-4. New creates land at
+    // `$AGEND_HOME/worktrees/...` which is outside the source tree
+    // entirely, so .gitignore there is moot for new path.
     ensure_gitignore(repo_dir);
+
+    // Worktree's parent dir must exist before `git worktree add`
+    // runs against it. Branches with `/` (e.g. `feat/foo`) become
+    // nested dirs naturally via create_dir_all.
+    if let Some(parent) = wt_dir.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
 
     // Try creating worktree: first with -b (new branch), fallback without -b (existing branch)
     let output = std::process::Command::new("git")
@@ -263,8 +323,19 @@ pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
 /// Remove a worktree and its tracking branch. Returns Ok(()) on success,
 /// Err with message on failure. Pre-flight: caller must check
 /// `has_uncommitted_changes` first.
-pub fn remove_worktree(repo_dir: &Path, worktree_name: &str) -> Result<(), String> {
-    let wt_dir = repo_dir.join(".worktrees").join(worktree_name);
+///
+/// Sprint 57 Wave 4 (#546 Item 4): operates on the new external
+/// layout `$AGEND_HOME/worktrees/<agent>/<branch>/`. Caller must
+/// supply `home`, `agent`, and `branch` so the canonical path can
+/// be resolved without re-deriving it from any remembered
+/// `<source_repo>/.worktrees/...` literal.
+pub fn remove_worktree(
+    home: &Path,
+    repo_dir: &Path,
+    agent: &str,
+    branch: &str,
+) -> Result<(), String> {
+    let wt_dir = worktree_path(home, agent, branch);
     if !wt_dir.exists() {
         return Ok(()); // already gone
     }
@@ -280,14 +351,15 @@ pub fn remove_worktree(repo_dir: &Path, worktree_name: &str) -> Result<(), Strin
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git worktree remove: {}", stderr.trim()));
     }
-    // Delete tracking branch agend/<name>
-    let branch = format!("agend/{worktree_name}");
+    // Delete tracking branch agend/<agent> (legacy default-branch shape).
+    // Custom branches are not auto-deleted — operator workflow.
+    let default_branch = format!("agend/{agent}");
     let _ = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
-        .args(["branch", "-D", &branch])
+        .args(["branch", "-D", &default_branch])
         .current_dir(repo_dir)
         .output();
-    tracing::info!(worktree = worktree_name, "auto-pruned worktree + branch");
+    tracing::info!(agent, branch, "auto-pruned worktree + branch");
     Ok(())
 }
 
@@ -321,8 +393,36 @@ pub fn checkout_branch(worktree_dir: &Path, branch: &str) -> Result<(), String> 
     Err(format!("git switch -c {branch}: {}", stderr.trim()))
 }
 
-pub fn list_residual(repo_dir: &Path) -> Vec<String> {
-    let wt_base = repo_dir.join(".worktrees");
+/// Sprint 57 Wave 4 (#546 Item 4): list agent names present under
+/// `$AGEND_HOME/worktrees/`. The `repo_dir` parameter is retained
+/// for API compatibility with pre-Wave-4 callers but the new layout
+/// is repo-independent — agent dirs live under the central daemon
+/// state, not per-repo. For callers wanting legacy detection,
+/// `list_legacy_residual` keeps the pre-Wave-4 semantics.
+pub fn list_residual(home: &Path) -> Vec<String> {
+    let wt_base = home.join("worktrees");
+    if !wt_base.exists() {
+        return Vec::new();
+    }
+    std::fs::read_dir(&wt_base)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Sprint 57 Wave 4 (#546 Item 4): list pre-Wave-4 legacy worktree
+/// agent names present under `<source_repo>/.worktrees/`. Used by
+/// the startup migration sweep to surface operator-actionable
+/// warnings. Returns empty Vec for repos that never had legacy
+/// worktrees or have already been cleaned up.
+pub fn list_legacy_residual(source_repo: &Path) -> Vec<String> {
+    let wt_base = source_repo.join(".worktrees");
     if !wt_base.exists() {
         return Vec::new();
     }
@@ -366,6 +466,7 @@ fn ensure_gitignore(repo_dir: &Path) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -406,6 +507,21 @@ mod tests {
         dir
     }
 
+    /// Sprint 57 Wave 4 (#546 Item 4): test home dir distinct from
+    /// the test repo dir so the new external worktree layout
+    /// `<home>/worktrees/<agent>/<branch>/` is verifiable in isolation.
+    fn tmp_home(name: &str) -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-wt-home-{}-{}-{}",
+            std::process::id(),
+            name,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
     #[test]
     fn test_is_git_repo() {
         let repo = tmp_repo("is_git");
@@ -416,64 +532,86 @@ mod tests {
 
     #[test]
     fn test_create_worktree() {
+        let home = tmp_home("create");
         let repo = tmp_repo("create");
-        let info = create(&repo, "agent1", None);
+        let info = create(&home, &repo, "agent1", None);
         assert!(info.is_some());
         let info = info.expect("worktree created");
         assert!(info.path.exists());
         assert_eq!(info.branch, "agend/agent1");
         assert_eq!(info.source_repo, repo);
+        // Sprint 57 Wave 4 (#546 Item 4): worktree must live under
+        // `<home>/worktrees/<agent>/<branch>/`, NOT `<repo>/.worktrees/`.
+        let expected = home.join("worktrees").join("agent1").join("agend/agent1");
+        assert_eq!(
+            info.path, expected,
+            "worktree path must follow new external layout"
+        );
 
-        // .gitignore should contain .worktrees
+        // .gitignore is still touched as a back-compat backstop for
+        // legacy worktrees pre-Wave-4 — the entry exists even though
+        // new creates land outside the source repo.
         let gitignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap_or_default();
         assert!(gitignore.contains(".worktrees"));
 
+        std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
     fn test_reuse_existing_worktree() {
+        let home = tmp_home("reuse");
         let repo = tmp_repo("reuse");
-        let info1 = create(&repo, "agent1", None);
+        let info1 = create(&home, &repo, "agent1", None);
         assert!(info1.is_some());
-        let info2 = create(&repo, "agent1", None);
+        let info2 = create(&home, &repo, "agent1", None);
         assert!(info2.is_some());
         assert_eq!(info1.expect("i1").path, info2.expect("i2").path);
+        std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
     fn test_non_git_returns_none() {
+        let home = tmp_home("nongit");
         let dir = std::env::temp_dir().join(format!("agend-wt-test-nongit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
-        assert!(create(&dir, "agent1", None).is_none());
+        assert!(create(&home, &dir, "agent1", None).is_none());
+        std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn test_custom_branch() {
+        let home = tmp_home("custom_branch");
         let repo = tmp_repo("custom_branch");
-        let info = create(&repo, "agent1", Some("my-feature"));
+        let info = create(&home, &repo, "agent1", Some("my-feature"));
         assert!(info.is_some());
         assert_eq!(info.expect("i").branch, "my-feature");
+        std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
     fn test_list_residual() {
+        let home = tmp_home("residual");
         let repo = tmp_repo("residual");
-        create(&repo, "agent1", None);
-        create(&repo, "agent2", None);
-        let residual = list_residual(&repo);
+        create(&home, &repo, "agent1", None);
+        create(&home, &repo, "agent2", None);
+        // Sprint 57 Wave 4 (#546 Item 4): list_residual now scans the
+        // CENTRAL `$AGEND_HOME/worktrees/` location (repo-independent).
+        let residual = list_residual(&home);
         assert_eq!(residual.len(), 2);
         assert!(residual.contains(&"agent1".to_string()));
         assert!(residual.contains(&"agent2".to_string()));
+        std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
     fn test_empty_repo_gets_initial_commit() {
         // git init without any commit — should auto-create initial commit
+        let home = tmp_home("empty");
         let dir = std::env::temp_dir().join(format!(
             "agend-wt-test-empty-{}-{}",
             std::process::id(),
@@ -489,9 +627,10 @@ mod tests {
         // No commit — HEAD is invalid
         assert!(!has_commits(&dir));
         // create() should handle this gracefully
-        let info = create(&dir, "agent1", None);
+        let info = create(&home, &dir, "agent1", None);
         assert!(info.is_some(), "worktree should be created in empty repo");
         assert!(has_commits(&dir), "initial commit should exist now");
+        std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -539,17 +678,35 @@ mod tests {
     /// Smoke test 2 regression: same agent, different branch → must reject.
     /// Pre-fix this returned Some with `branch = requested`, falsely echoing
     /// the requested branch back even though the worktree HEAD was unchanged.
+    ///
+    /// Sprint 57 Wave 4 (#546 Item 4): the new external layout puts each
+    /// (agent, branch) at a distinct path, so a different branch creates a
+    /// different worktree dir. The "reject on mismatch" semantic still
+    /// applies WHEN the same path is reused — but with branch in the path,
+    /// the second `create` lands at a NEW location and the conflict check
+    /// (which fires only when `wt_dir.exists()`) doesn't trigger. Pin the
+    /// updated semantic: same-agent-different-branch creates a SECOND
+    /// worktree at the second branch's path, leaving the first untouched.
     #[test]
     fn reuse_rejects_when_branch_mismatch() {
+        let home = tmp_home("reuse-mismatch");
         let repo = tmp_repo("reuse-mismatch");
-        let first = create(&repo, "agent1", Some("feat/A")).expect("first lease");
+        let first = create(&home, &repo, "agent1", Some("feat/A")).expect("first lease");
         assert!(first.path.exists());
-        // Second lease, same instance, DIFFERENT branch → must return None.
-        let second = create(&repo, "agent1", Some("feat/B"));
+        // Second lease, same instance, DIFFERENT branch → lands at a
+        // distinct path under the new layout; the first remains intact.
+        let second = create(&home, &repo, "agent1", Some("feat/B"));
         assert!(
-            second.is_none(),
-            "lease must reject when worktree exists on a different branch"
+            second.is_some(),
+            "Wave 4: same agent on a different branch lands at a distinct path"
         );
+        let second = second.expect("second lease");
+        assert_ne!(
+            first.path, second.path,
+            "different-branch worktrees must occupy different paths"
+        );
+        assert!(first.path.exists(), "first worktree must remain intact");
+        std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
 
@@ -558,11 +715,163 @@ mod tests {
     /// semantics that P0-1.5 relies on.
     #[test]
     fn reuse_idempotent_same_custom_branch() {
+        let home = tmp_home("reuse-idem");
         let repo = tmp_repo("reuse-idem");
-        let first = create(&repo, "agent1", Some("feat/X")).expect("first lease");
-        let second = create(&repo, "agent1", Some("feat/X")).expect("second lease idempotent");
+        let first = create(&home, &repo, "agent1", Some("feat/X")).expect("first lease");
+        let second =
+            create(&home, &repo, "agent1", Some("feat/X")).expect("second lease idempotent");
         assert_eq!(first.path, second.path);
         assert_eq!(second.branch, "feat/X");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Sprint 57 Wave 4 (#546 Item 4) — path layout invariants.
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn worktree_path_resolves_to_agend_terminal_external_location() {
+        // Pin the canonical layout: `<home>/worktrees/<agent>/<branch>/`.
+        let home = std::path::Path::new("/test/home");
+        let path = worktree_path(home, "dev", "feat/track-x");
+        assert_eq!(
+            path,
+            std::path::Path::new("/test/home/worktrees/dev/feat/track-x")
+        );
+    }
+
+    #[test]
+    fn worktree_path_handles_simple_branch_without_slash() {
+        let home = std::path::Path::new("/test/home");
+        let path = worktree_path(home, "dev", "feat-test");
+        assert_eq!(
+            path,
+            std::path::Path::new("/test/home/worktrees/dev/feat-test")
+        );
+    }
+
+    #[test]
+    fn legacy_worktree_path_returns_pre_wave4_layout() {
+        // Pin the legacy detector returns the pre-Wave-4 path shape;
+        // production NEVER creates here, but the helper is the single
+        // source of truth for migration warnings.
+        let repo = std::path::Path::new("/test/repo");
+        let path = legacy_worktree_path(repo, "dev");
+        assert_eq!(path, std::path::Path::new("/test/repo/.worktrees/dev"));
+    }
+
+    #[test]
+    fn path_layout_invariant_against_regression() {
+        // Regression-proof: ensure the new path is NOT under the
+        // source repo. This is the load-bearing invariant Wave 4
+        // ships — re-introducing `<repo>/.worktrees/<agent>/` as the
+        // production path would silently undo the migration.
+        let home = std::env::temp_dir().join(format!(
+            "agend-wt-invariant-home-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let repo = std::env::temp_dir().join(format!(
+            "agend-wt-invariant-repo-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = worktree_path(&home, "agent-x", "feat-x");
+        assert!(
+            path.starts_with(&home),
+            "new layout MUST live under home, got: {}",
+            path.display()
+        );
+        assert!(
+            !path.starts_with(&repo),
+            "new layout MUST NOT live under source_repo, got: {}",
+            path.display()
+        );
+        let path_str = path.display().to_string();
+        assert!(
+            !path_str.contains(".worktrees"),
+            "Wave 4: path must NOT contain `.worktrees` (legacy layout marker), got: {}",
+            path_str
+        );
+    }
+
+    #[test]
+    fn list_residual_scans_central_worktrees_dir_not_legacy() {
+        // Defensive: list_residual MUST scan `<home>/worktrees/`, not
+        // `<repo>/.worktrees/`. Plant entries in BOTH locations and
+        // verify only the central one is reported.
+        let home = tmp_home("residual-scan");
+        let repo = tmp_repo("residual-scan");
+
+        // Central (new layout) — should be reported.
+        std::fs::create_dir_all(home.join("worktrees").join("dev").join("feat-a")).unwrap();
+        std::fs::create_dir_all(home.join("worktrees").join("lead").join("main-mirror")).unwrap();
+
+        // Legacy (old layout) — must NOT be reported by list_residual.
+        std::fs::create_dir_all(repo.join(".worktrees").join("ghost-agent")).unwrap();
+
+        let new_residual = list_residual(&home);
+        assert_eq!(
+            new_residual.len(),
+            2,
+            "central scan must surface both new-layout entries, got: {new_residual:?}"
+        );
+        assert!(new_residual.contains(&"dev".to_string()));
+        assert!(new_residual.contains(&"lead".to_string()));
+        assert!(
+            !new_residual.contains(&"ghost-agent".to_string()),
+            "legacy entries must NOT be reported by central scan"
+        );
+
+        // Legacy entries surface via the dedicated legacy scanner.
+        let legacy = list_legacy_residual(&repo);
+        assert!(legacy.contains(&"ghost-agent".to_string()));
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn migration_handles_legacy_source_repo_worktrees() {
+        // Migration shape per Wave 4 dispatch: detect-and-warn (NOT
+        // auto-migrate, because `git worktree`'s gitdir pointer +
+        // cross-fs renames make safe automatic migration risky).
+        // Pin: legacy_worktree_path + list_legacy_residual together
+        // give operators an actionable surface for manual cleanup.
+        let repo = tmp_repo("migration-detect");
+        let agent = "alpha";
+
+        // Plant a legacy worktree directly on disk.
+        let legacy = legacy_worktree_path(&repo, agent);
+        std::fs::create_dir_all(&legacy).unwrap();
+
+        // Detection works.
+        let detected = list_legacy_residual(&repo);
+        assert!(
+            detected.contains(&agent.to_string()),
+            "legacy detection must surface the planted worktree"
+        );
+
+        // Path helper agrees with the scan.
+        assert_eq!(
+            legacy_worktree_path(&repo, agent),
+            repo.join(".worktrees").join(agent)
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn migration_idempotent_no_legacy_worktrees() {
+        // Pin: list_legacy_residual on a repo that never had legacy
+        // worktrees returns empty (no spurious warnings).
+        let repo = tmp_repo("migration-clean");
+        let detected = list_legacy_residual(&repo);
+        assert!(
+            detected.is_empty(),
+            "no legacy worktrees → no spurious detections, got: {detected:?}"
+        );
         std::fs::remove_dir_all(&repo).ok();
     }
 }
