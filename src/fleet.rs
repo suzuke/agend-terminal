@@ -633,6 +633,35 @@ pub fn remove_instances_from_yaml(home: &Path, names: &[String]) -> Result<()> {
     })
 }
 
+/// Atomically rewrite `channel.group_id` after a Telegram supergroup
+/// migration. Mirrors [`update_instance_field`] for the top-level
+/// `channel:` block; uses the same file lock + atomic write path so a
+/// concurrent fleet read never observes a torn write.
+///
+/// The mutator is a no-op (Ok(())) when `channel:` is absent or its
+/// `type` is not `telegram` — the migration error handler is the only
+/// caller and it only fires on the telegram send path, so the no-op
+/// branches are defensive belt-and-suspenders rather than intended
+/// flow.
+pub fn update_channel_telegram_group_id(home: &Path, new_group_id: i64) -> Result<()> {
+    mutate_fleet_yaml(home, "", |doc| {
+        if let Some(channel) = doc.get_mut("channel").and_then(|v| v.as_mapping_mut()) {
+            let is_telegram = channel
+                .get(serde_yaml_ng::Value::String("type".into()))
+                .and_then(|v| v.as_str())
+                == Some("telegram");
+            if is_telegram {
+                channel.insert(
+                    serde_yaml_ng::Value::String("group_id".into()),
+                    serde_yaml_ng::Value::Number(new_group_id.into()),
+                );
+                tracing::info!(new_group_id, "fleet.yaml channel.group_id rewritten");
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Update a specific field of an instance in fleet.yaml. Uses file lock + atomic write.
 pub fn update_instance_field(
     home: &Path,
@@ -1057,6 +1086,124 @@ instances:
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
         assert_eq!(config.instances["agent1"].topic_id, Some(42));
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─── Sprint 56 Track A — supergroup migration self-heal ────────────
+
+    fn channel_yaml(group_id: i64) -> String {
+        format!(
+            r#"channel:
+  type: telegram
+  bot_token_env: AGEND_BOT_TOKEN
+  group_id: {group_id}
+  mode: topic
+  user_allowlist:
+    - 42
+instances:
+  agent1:
+    command: /bin/bash
+"#
+        )
+    }
+
+    fn read_channel_group_id(home: &Path) -> Option<i64> {
+        let text = std::fs::read_to_string(home.join("fleet.yaml")).ok()?;
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
+        doc.get("channel")
+            .and_then(|c| c.get("group_id"))
+            .and_then(|v| v.as_i64())
+    }
+
+    #[test]
+    fn update_channel_telegram_group_id_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-migrate-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        write_fleet(&dir, &channel_yaml(-100111));
+        let new_id = -1009999999999_i64;
+
+        update_channel_telegram_group_id(&dir, new_id).expect("update channel.group_id");
+
+        assert_eq!(read_channel_group_id(&dir), Some(new_id));
+        // Sibling fields and instances must survive the rewrite.
+        let text = std::fs::read_to_string(dir.join("fleet.yaml")).unwrap();
+        assert!(text.contains("bot_token_env: AGEND_BOT_TOKEN"));
+        assert!(text.contains("mode: topic"));
+        assert!(text.contains("user_allowlist"));
+        assert!(text.contains("agent1"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_channel_telegram_group_id_idempotent_same_value() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-migrate-idem-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let new_id = -1008888888888_i64;
+        write_fleet(&dir, &channel_yaml(new_id));
+
+        update_channel_telegram_group_id(&dir, new_id).expect("idempotent rewrite");
+        update_channel_telegram_group_id(&dir, new_id).expect("idempotent twice");
+
+        assert_eq!(read_channel_group_id(&dir), Some(new_id));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_channel_telegram_group_id_noop_on_non_telegram_channel() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-migrate-discord-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        write_fleet(
+            &dir,
+            r#"channel:
+  type: discord
+  bot_token_env: AGEND_DISCORD_BOT_TOKEN
+  guild_id: 12345
+"#,
+        );
+
+        update_channel_telegram_group_id(&dir, -100777).expect("noop on discord");
+
+        // No `group_id` on a discord channel — must not have been
+        // injected by the telegram-only helper.
+        let text = std::fs::read_to_string(dir.join("fleet.yaml")).unwrap();
+        assert!(
+            !text.contains("group_id"),
+            "telegram helper must not mutate discord channel: {text}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn update_channel_telegram_group_id_noop_when_no_channel_block() {
+        // Self-heal helper is no-op-friendly: callers don't have to
+        // pre-check, the disk write simply does nothing if there's no
+        // channel block to mutate.
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-migrate-no-channel-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        write_fleet(
+            &dir,
+            r#"instances:
+  agent1:
+    command: /bin/bash
+"#,
+        );
+
+        update_channel_telegram_group_id(&dir, -100777).expect("noop when no channel");
+        // fleet.yaml must still parse and not have a synthesized channel.
+        let text = std::fs::read_to_string(dir.join("fleet.yaml")).unwrap();
+        assert!(!text.contains("channel:"), "must not synthesize channel");
         fs::remove_dir_all(&dir).ok();
     }
 

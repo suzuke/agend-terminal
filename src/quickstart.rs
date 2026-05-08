@@ -203,6 +203,33 @@ fn verify_bot(token: &str) -> anyhow::Result<String> {
     })
 }
 
+/// Classify a single `chat` payload from `getUpdates` against the
+/// quickstart's "topic mode" requirement. Pure function — pulled out
+/// of `detect_group` so the chat-type policy can be unit-tested
+/// without HTTP. Returns:
+///   - `Ok(Some((id, title)))` for an accepted supergroup
+///   - `Err(...)` for an explicit reject (regular group; Topics required
+///     but the chat hasn't been upgraded yet — issue #523 first half)
+///   - `Ok(None)` for irrelevant chat types (private, channel, etc.)
+///     — keep scanning the update stream for a matching chat.
+fn classify_quickstart_chat(chat: &serde_json::Value) -> anyhow::Result<Option<(i64, String)>> {
+    let chat_type = chat["type"].as_str().unwrap_or("");
+    let title = chat["title"].as_str().unwrap_or("Unknown Group");
+    match chat_type {
+        "supergroup" => {
+            let id = chat["id"].as_i64().unwrap_or(0);
+            Ok(Some((id, title.to_string())))
+        }
+        "group" => anyhow::bail!(
+            "Group '{title}' is a regular group, but topic mode requires a \
+             supergroup. Open the group settings in Telegram and enable Topics \
+             (this upgrades the group to a supergroup), then send another message \
+             and re-run quickstart."
+        ),
+        _ => Ok(None),
+    }
+}
+
 fn detect_group(token: &str) -> anyhow::Result<(i64, String)> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -213,11 +240,8 @@ fn detect_group(token: &str) -> anyhow::Result<(i64, String)> {
         if let Some(updates) = resp["result"].as_array() {
             for update in updates {
                 if let Some(chat) = update.get("message").and_then(|m| m.get("chat")) {
-                    let chat_type = chat["type"].as_str().unwrap_or("");
-                    if chat_type == "supergroup" || chat_type == "group" {
-                        let id = chat["id"].as_i64().unwrap_or(0);
-                        let title = chat["title"].as_str().unwrap_or("Unknown Group").to_string();
-                        return Ok((id, title));
+                    if let Some(hit) = classify_quickstart_chat(chat)? {
+                        return Ok(hit);
                     }
                 }
             }
@@ -424,6 +448,48 @@ mod tests {
             "general instance must be present"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 56 Track A — chat-type guard for issue #523 ────────────
+
+    fn fake_chat(chat_type: &str, id: i64, title: &str) -> serde_json::Value {
+        serde_json::json!({"type": chat_type, "id": id, "title": title})
+    }
+
+    #[test]
+    fn classify_supergroup_returns_id_and_title() {
+        let chat = fake_chat("supergroup", -1001234567890, "AgEnD Ops");
+        let result = classify_quickstart_chat(&chat).expect("supergroup must accept");
+        assert_eq!(result, Some((-1001234567890, "AgEnD Ops".to_string())));
+    }
+
+    #[test]
+    fn classify_regular_group_rejects_with_topics_hint() {
+        let chat = fake_chat("group", -123, "Old Group");
+        let err = classify_quickstart_chat(&chat).expect_err("regular group must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("supergroup") && msg.contains("Topics"),
+            "rejection must explain the upgrade requirement: {msg}"
+        );
+        assert!(
+            msg.contains("Old Group"),
+            "rejection should name the group so the operator knows which to upgrade: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_private_chat_returns_none_keeps_scanning() {
+        // Private/channel hits are not errors — quickstart's update loop
+        // should keep scanning for a supergroup match.
+        for ct in ["private", "channel", ""] {
+            let chat = fake_chat(ct, 42, "irrelevant");
+            assert_eq!(
+                classify_quickstart_chat(&chat).expect("non-group types must not error"),
+                None,
+                "type={ct}"
+            );
+        }
     }
 
     /// Snapshot test: commented-out channel section also mentions

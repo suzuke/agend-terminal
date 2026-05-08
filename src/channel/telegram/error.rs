@@ -120,6 +120,72 @@ pub(crate) fn handle_send_failure(
     true
 }
 
+/// Classify a Telegram send error as "the bound chat was migrated to a
+/// supergroup". The Bot API returns `migrate_to_chat_id` in the response
+/// parameters when the configured `group_id` points at a regular group
+/// that has been upgraded — typically because the operator enabled
+/// Topics, which forces a supergroup. teloxide-core decodes that
+/// parameter into [`teloxide::RequestError::MigrateToChatId`]; we match
+/// on the typed variant rather than the description string so the
+/// classifier is independent of locale / Bot API copy changes.
+pub(crate) fn is_supergroup_migration_error(err: &anyhow::Error) -> bool {
+    extract_migrated_chat_id(err).is_some()
+}
+
+/// Pull the new supergroup chat_id out of a migration error.
+///
+/// Returns `Some(new_id)` for [`RequestError::MigrateToChatId`], `None`
+/// otherwise. Callers use this to (a) classify and (b) read the new
+/// `-100…` prefixed id in a single pass.
+pub(crate) fn extract_migrated_chat_id(err: &anyhow::Error) -> Option<i64> {
+    err.downcast_ref::<teloxide::RequestError>().and_then(|e| {
+        if let teloxide::RequestError::MigrateToChatId(teloxide::types::ChatId(id)) = e {
+            Some(*id)
+        } else {
+            None
+        }
+    })
+}
+
+/// Self-heal path for supergroup migration: extract the new chat_id,
+/// atomically rewrite `channel.group_id` in `fleet.yaml`, and update
+/// `state.group_id` in-memory so cached-state callers (`Channel::send`,
+/// `apply_fleet_action`) pick up the new id without a daemon restart.
+///
+/// Returns `Some(new_id)` when applied (caller may retry the failed
+/// send with the new id). Returns `None` when (a) the error is not a
+/// migration error, or (b) yaml persistence failed — in case (b) we log
+/// and give up; the next migration error will retry persistence so the
+/// daemon doesn't loop forever on a disk-IO failure.
+///
+/// `state` is `Option` because callers reached from non-state-aware
+/// paths (`try_telegram_reply_from`) only have `home` to work with;
+/// `fleet.yaml` is the source of truth, so a `None` call still heals
+/// disk state and the next state-aware send picks up the fresh value.
+pub(crate) fn handle_supergroup_migration(
+    home: &Path,
+    state: Option<&Arc<Mutex<TelegramState>>>,
+    err: &anyhow::Error,
+) -> Option<i64> {
+    let new_id = extract_migrated_chat_id(err)?;
+    tracing::warn!(
+        new_chat_id = new_id,
+        "telegram chat migrated to supergroup — rewriting fleet.yaml channel.group_id"
+    );
+    if let Err(e) = crate::fleet::update_channel_telegram_group_id(home, new_id) {
+        tracing::error!(
+            %e, new_chat_id = new_id,
+            "failed to persist migrated group_id to fleet.yaml — next migration error will retry"
+        );
+        return None;
+    }
+    if let Some(state) = state {
+        let mut s = lock_state(state);
+        s.group_id = teloxide::types::ChatId(new_id);
+    }
+    Some(new_id)
+}
+
 /// Lightweight self-heal for a stale topic: strip the dead topic_id from
 /// the on-disk registry and fleet.yaml, create a fresh forum topic, and
 /// persist the new mapping. Does NOT delete the instance (unlike
@@ -370,6 +436,130 @@ instances:
         let reg_after = load_topic_registry(&home);
         assert!(!reg_after.values().any(|v| v == FLEET_BINDING_SENTINEL));
         assert_eq!(reg_after.get(&100), Some(&"at-dev-1".to_string()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 56 Track A — supergroup migration self-heal ────────────
+
+    fn migration_err(new_id: i64) -> anyhow::Error {
+        anyhow::Error::from(teloxide::RequestError::MigrateToChatId(
+            teloxide::types::ChatId(new_id),
+        ))
+    }
+
+    fn write_telegram_fleet_yaml(home: &std::path::Path, group_id: i64, mode: &str) {
+        let yaml = format!(
+            "channel:\n  type: telegram\n  bot_token_env: AGEND_BOT_TOKEN\n  group_id: {group_id}\n  mode: {mode}\n  user_allowlist:\n  - 42\n"
+        );
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+    }
+
+    fn channel_group_id_from_yaml(home: &std::path::Path) -> Option<i64> {
+        let text = std::fs::read_to_string(home.join("fleet.yaml")).ok()?;
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
+        doc.get("channel")
+            .and_then(|c| c.get("group_id"))
+            .and_then(|v| v.as_i64())
+    }
+
+    #[test]
+    fn classifier_matches_typed_migrate_to_chat_id() {
+        let err = migration_err(-1001234567890);
+        assert!(is_supergroup_migration_error(&err));
+        assert_eq!(extract_migrated_chat_id(&err), Some(-1001234567890));
+    }
+
+    #[test]
+    fn classifier_rejects_unrelated_request_errors() {
+        // RetryAfter is also a RequestError but not a migration.
+        let err = anyhow::Error::from(teloxide::RequestError::RetryAfter(
+            teloxide::types::Seconds::from_seconds(5),
+        ));
+        assert!(!is_supergroup_migration_error(&err));
+        assert_eq!(extract_migrated_chat_id(&err), None);
+    }
+
+    #[test]
+    fn classifier_rejects_anyhow_string_errors() {
+        // Stringly-typed errors (anyhow::anyhow!) carry no typed
+        // RequestError payload — match must miss, not false-positive.
+        for msg in [
+            "network timeout",
+            "Bad Request: message thread not found",
+            "Too Many Requests: retry after 5",
+            "Bad Request: chat upgraded to supergroup", // legacy description text alone
+        ] {
+            let err = anyhow::anyhow!(msg.to_string());
+            assert!(
+                !is_supergroup_migration_error(&err),
+                "must not match string-only: {msg}"
+            );
+            assert_eq!(extract_migrated_chat_id(&err), None);
+        }
+    }
+
+    #[test]
+    fn handle_migration_persists_to_fleet_yaml_and_returns_new_id() {
+        let home = tmp_home("migration-persist");
+        write_telegram_fleet_yaml(&home, -100111111, "topic");
+        let new_id = -1009999999999_i64;
+
+        let applied = handle_supergroup_migration(&home, None, &migration_err(new_id));
+
+        assert_eq!(applied, Some(new_id));
+        assert_eq!(channel_group_id_from_yaml(&home), Some(new_id));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn handle_migration_with_state_mutates_in_memory_group_id() {
+        let home = tmp_home("migration-state");
+        write_telegram_fleet_yaml(&home, -100111111, "topic");
+        let new_id = -1008888888888_i64;
+        let state = Arc::new(Mutex::new(TelegramState::new(
+            "tok",
+            -100111111,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        )));
+
+        let applied = handle_supergroup_migration(&home, Some(&state), &migration_err(new_id));
+
+        assert_eq!(applied, Some(new_id));
+        assert_eq!(lock_state(&state).group_id.0, new_id);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn handle_migration_returns_none_for_unrelated_error() {
+        let home = tmp_home("migration-unrelated");
+        write_telegram_fleet_yaml(&home, -100222222, "topic");
+        let unrelated = anyhow::anyhow!("network timeout");
+
+        let applied = handle_supergroup_migration(&home, None, &unrelated);
+
+        assert!(applied.is_none());
+        // fleet.yaml must not be mutated when the error is unrelated.
+        assert_eq!(channel_group_id_from_yaml(&home), Some(-100222222));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn handle_migration_is_idempotent_when_yaml_already_has_new_id() {
+        // If a parallel send already healed fleet.yaml, the second call's
+        // mutate_fleet_yaml is a no-op-style overwrite (same value); the
+        // function must still return Some(new_id) so the caller retries
+        // the original send rather than treating it as fatal.
+        let home = tmp_home("migration-idempotent");
+        let new_id = -1007777777777_i64;
+        write_telegram_fleet_yaml(&home, new_id, "topic");
+
+        let applied = handle_supergroup_migration(&home, None, &migration_err(new_id));
+
+        assert_eq!(applied, Some(new_id));
+        assert_eq!(channel_group_id_from_yaml(&home), Some(new_id));
         std::fs::remove_dir_all(&home).ok();
     }
 

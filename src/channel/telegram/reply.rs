@@ -127,6 +127,23 @@ pub(super) fn try_telegram_reply_from(
     match telegram_reply_send_inner(&ch, instance_name, topic_id, text) {
         Ok(msg_id) => Ok((msg_id, ch.group_id)),
         Err(e) => {
+            // Supergroup migration must be checked before topic-deleted:
+            // a migrated chat returns `MigrateToChatId` regardless of
+            // whether the topic still exists, and we want to heal the
+            // chat-level error before classifying topic state on the
+            // (now-orphaned) old chat_id.
+            if handle_supergroup_migration(home, None, &e).is_some() {
+                if let Ok((new_ch, _)) = resolve_channel_from(home) {
+                    tracing::info!(
+                        instance = %instance_name,
+                        old_chat_id = ch.group_id,
+                        new_chat_id = new_ch.group_id,
+                        "retrying send after supergroup migration"
+                    );
+                    return telegram_reply_send_inner(&new_ch, instance_name, topic_id, text)
+                        .map(|msg_id| (msg_id, new_ch.group_id));
+                }
+            }
             if let Some(stale_tid) = topic_id {
                 if is_topic_deleted_error(&e) {
                     if let Some(new_tid) =
@@ -442,6 +459,99 @@ instances:
         );
 
         std::env::remove_var("SPRINT23_P1_FAKE_TOKEN2");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 56 Track A — supergroup migration self-heal ───────────
+
+    fn read_channel_group_id(home: &std::path::Path) -> Option<i64> {
+        let text = std::fs::read_to_string(home.join("fleet.yaml")).ok()?;
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
+        doc.get("channel")
+            .and_then(|c| c.get("group_id"))
+            .and_then(|v| v.as_i64())
+    }
+
+    #[test]
+    fn try_telegram_reply_from_persists_migrated_chat_id_to_fleet_yaml() {
+        let _g = channel_env_test_guard();
+        let home = tmp_home("reply-migration-persist");
+        let yaml = "\
+channel:
+  type: telegram
+  bot_token_env: SPRINT56_FAKE_TOKEN
+  group_id: -100111111
+  mode: topic
+  user_allowlist:
+    - 42
+instances:
+  agent-x:
+    command: /bin/true
+    topic_id: 42
+";
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        register_topic(&home, 42, "agent-x");
+        std::env::set_var("SPRINT56_FAKE_TOKEN", "fake");
+
+        let new_id = -1009999999999_i64;
+        set_forced_send_error(anyhow::Error::from(teloxide::RequestError::MigrateToChatId(
+            teloxide::types::ChatId(new_id),
+        )));
+
+        // The forced-error injector is single-use: the first send call
+        // consumes the migration error, the migration handler heals
+        // fleet.yaml, then the retry's real send hits "Invalid bot
+        // token" (fake token). We assert on the load-bearing side-effect
+        // (fleet.yaml rewritten) rather than `is_ok()`, mirroring the
+        // existing `try_telegram_reply_from_invalidates_on_topic_deleted`
+        // pattern at this site.
+        let _ = try_telegram_reply_from(&home, "agent-x", "hello");
+
+        // fleet.yaml channel.group_id rewritten to the migrated id.
+        assert_eq!(read_channel_group_id(&home), Some(new_id));
+        // Topic registry untouched — migration is chat-level, not topic-level.
+        let reg = load_topic_registry(&home);
+        assert_eq!(
+            reg.get(&42),
+            Some(&"agent-x".to_string()),
+            "migration must not invalidate topic; reg={reg:?}"
+        );
+
+        std::env::remove_var("SPRINT56_FAKE_TOKEN");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn try_telegram_reply_from_unrelated_error_does_not_rewrite_channel_group_id() {
+        let _g = channel_env_test_guard();
+        let home = tmp_home("reply-migration-no-mutate");
+        let yaml = "\
+channel:
+  type: telegram
+  bot_token_env: SPRINT56_FAKE_TOKEN_2
+  group_id: -100222222
+  mode: topic
+  user_allowlist:
+    - 42
+instances:
+  agent-x:
+    command: /bin/true
+    topic_id: 42
+";
+        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        register_topic(&home, 42, "agent-x");
+        std::env::set_var("SPRINT56_FAKE_TOKEN_2", "fake");
+
+        set_forced_send_error(anyhow::anyhow!("Too Many Requests: retry after 5"));
+
+        let res = try_telegram_reply_from(&home, "agent-x", "hello");
+        assert!(res.is_err(), "unrelated error must propagate");
+
+        // Original group_id preserved — RetryAfter must not trigger
+        // migration self-heal.
+        assert_eq!(read_channel_group_id(&home), Some(-100222222));
+
+        std::env::remove_var("SPRINT56_FAKE_TOKEN_2");
         std::fs::remove_dir_all(&home).ok();
     }
 
