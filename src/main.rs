@@ -43,12 +43,12 @@ mod protocol;
 mod quickstart;
 mod render;
 mod schedules;
+mod service;
 mod snapshot;
 mod state;
 mod status_summary;
 mod store;
 mod sync;
-#[allow(dead_code)]
 mod sync_audit;
 mod task_events;
 mod tasks;
@@ -285,6 +285,16 @@ enum Commands {
         #[arg(long)]
         quick: bool,
     },
+    /// Sprint 57 Wave 3 PR-3 (#548 Phase 3): cross-platform OS service
+    /// integration. `install` registers the daemon as a user-level
+    /// service (macOS launchd / Linux systemd user / Windows Task
+    /// Scheduler at-logon task). `uninstall` removes it. `status`
+    /// queries the platform service manager for running / stopped /
+    /// not_installed. No admin / root required on any platform.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
     /// Health check
     Doctor,
     /// Menu-bar / system-tray resident app (requires `--features tray`).
@@ -330,6 +340,23 @@ enum AdminCommands {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// Sprint 57 Wave 3 PR-3 (#548 Phase 3) — `agend-terminal service`
+/// subcommand actions. Maps to `service::install / uninstall / status`.
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Register the daemon with the OS service manager so it auto-
+    /// starts at user login and restarts on crash. User-level on all
+    /// supported platforms (no admin / root required). Idempotent:
+    /// re-running regenerates the template + re-registers.
+    Install,
+    /// Remove the OS-level service registration. Idempotent on missing
+    /// install (returns success with `was_installed: false`).
+    Uninstall,
+    /// Query the OS service manager for current state. Reports
+    /// running / stopped / not_installed.
+    Status,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -615,6 +642,42 @@ fn main() -> anyhow::Result<()> {
             backend,
             quick,
         }) => verify::run(&home, json, backend.as_deref(), quick)?,
+        Some(Commands::Service { action }) => match action {
+            ServiceAction::Install => match service::install(&home) {
+                Ok(path) => {
+                    println!("service installed: {}", path.display());
+                }
+                Err(e) => {
+                    eprintln!("agend-terminal service install: {e}");
+                    std::process::exit(1);
+                }
+            },
+            ServiceAction::Uninstall => match service::uninstall(&home) {
+                Ok(outcome) => {
+                    if outcome.was_installed {
+                        println!("service uninstalled");
+                    } else {
+                        println!("service was not installed (idempotent no-op)");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("agend-terminal service uninstall: {e}");
+                    std::process::exit(1);
+                }
+            },
+            ServiceAction::Status => match service::status(&home) {
+                Ok(state) => {
+                    println!("service status: {}", state.as_str());
+                    if matches!(state, service::ServiceState::NotInstalled) {
+                        std::process::exit(2);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("agend-terminal service status: {e}");
+                    std::process::exit(1);
+                }
+            },
+        },
         Some(Commands::Doctor) => cli::run_doctor(&home)?,
         #[cfg(feature = "tray")]
         Some(Commands::Tray) => tray::run(&home)?,

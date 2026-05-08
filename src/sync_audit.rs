@@ -23,6 +23,7 @@ pub fn mark_router_thread() {
 }
 
 /// Check if the current thread is marked as the router thread.
+#[allow(dead_code)] // macro-only consumer in production builds; used by tests
 pub fn is_router_thread() -> bool {
     IS_ROUTER_THREAD.get()
 }
@@ -61,6 +62,7 @@ pub fn assert_lock_tier(tier: u8, lock_name: &str) {
 
 /// Record that a lock at `tier` has been acquired.
 #[inline]
+#[allow(dead_code)] // consumed by `lock_tier_assert!` macro + test paths
 pub fn lock_acquired(tier: u8) {
     if !cfg!(debug_assertions) && std::env::var("AGEND_LOCK_AUDIT").is_err() {
         return;
@@ -73,6 +75,7 @@ pub fn lock_acquired(tier: u8) {
 
 /// Record that a lock at `tier` has been released.
 #[inline]
+#[allow(dead_code)] // consumed by test paths; release builds don't pair release w/ acquire
 pub fn lock_released(tier: u8) {
     if !cfg!(debug_assertions) && std::env::var("AGEND_LOCK_AUDIT").is_err() {
         return;

@@ -1,0 +1,33 @@
+# Sprint 57 Wave 3 PR-3 (#548 Phase 3) — Linux systemd user unit template.
+# User-level service (no admin / no root required). Installed via:
+#   systemctl --user enable --now agend-terminal-daemon.service
+#
+# Placeholders (substituted at install time by service::install):
+#   __EXECUTABLE__  = absolute path to the agend-terminal binary
+#   __HOME__        = absolute path to AGEND_HOME
+
+[Unit]
+Description=agend-terminal daemon (user-level)
+Documentation=https://github.com/suzuke/agend-terminal
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=__EXECUTABLE__ start --foreground
+Environment=AGEND_HOME=__HOME__
+# Sprint 57 Wave 3 PR-2 (#548 Q3): the daemon does NOT supervise itself.
+# systemd is the supervisor of last resort. Restart=on-failure ensures
+# operator-visible crashes get respawned by systemd, but Q6 graceful
+# shutdown (SIGTERM → 2s grace → SIGKILL) maps cleanly to systemd's
+# stop semantics.
+Restart=on-failure
+RestartSec=5s
+# Match the daemon's own SHUTDOWN_GRACE plus a safety margin so
+# systemd's TimeoutStopSec doesn't escalate before the daemon's
+# own staged termination completes.
+TimeoutStopSec=10s
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
