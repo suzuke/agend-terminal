@@ -51,7 +51,9 @@ pub use ux_event::{select_action, FleetEvent, NoopUxSink, UxAction, UxEvent, UxE
 
 use crate::agent::AgentRegistry;
 use anyhow::Result;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Supporting types for trait methods added in PR-AE3
@@ -111,16 +113,56 @@ pub enum NotifySeverity {
 // Process-wide active channel registry
 // ---------------------------------------------------------------------------
 
-static ACTIVE_CHANNEL: OnceLock<Arc<dyn Channel>> = OnceLock::new();
+// Sprint 55 P0-A r1: HashMap registry keyed by `Channel::kind()` to
+// realize the Variant-extend multi-channel routing contract per design
+// doc + reviewer Finding #1. Production keeps single-channel-fleet
+// behavior intact (one entry → `active_channel()` returns it); the
+// post-discord-broadens future state has telegram + discord both
+// registered and `lookup_channel_by_name` routes deterministically.
+static CHANNELS: OnceLock<parking_lot::RwLock<HashMap<&'static str, Arc<dyn Channel>>>> =
+    OnceLock::new();
 
-/// Register the process-wide active channel. Called once during bootstrap.
-pub fn register_active_channel(channel: Arc<dyn Channel>) {
-    let _ = ACTIVE_CHANNEL.set(channel);
+fn channels_registry() -> &'static parking_lot::RwLock<HashMap<&'static str, Arc<dyn Channel>>> {
+    CHANNELS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
 }
 
-/// Get the process-wide active channel, if one has been registered.
-pub fn active_channel() -> Option<&'static Arc<dyn Channel>> {
-    ACTIVE_CHANNEL.get()
+/// Register a channel by its `kind()` discriminator. Same-kind
+/// re-registration replaces the prior entry — this keeps the production
+/// single-bootstrap-call contract intact and enables test isolation
+/// across cases.
+pub fn register_active_channel(channel: Arc<dyn Channel>) {
+    let kind = channel.kind();
+    channels_registry().write().insert(kind, channel);
+}
+
+/// Get THE active channel when exactly one is registered — preserves
+/// pre-P0-A single-channel-fleet semantic. Returns `None` when zero OR
+/// multiple channels are registered: in the multi-channel fleet,
+/// callers MUST disambiguate via [`lookup_channel_by_name`] with the
+/// explicit kind.
+///
+/// Sprint 56+ may add a `primary_channel()` concept with operator-
+/// designated default; deferred from P0-A scope.
+pub fn active_channel() -> Option<Arc<dyn Channel>> {
+    let g = channels_registry().read();
+    if g.len() == 1 {
+        g.values().next().cloned()
+    } else {
+        None
+    }
+}
+
+/// Sprint 55 P0-A — look up a registered channel by its `kind()`
+/// discriminator (e.g. `"telegram"`, `"discord"`). Real HashMap lookup;
+/// delivers the Variant-extend multi-channel routing contract.
+pub fn lookup_channel_by_name(name: &str) -> Option<Arc<dyn Channel>> {
+    channels_registry().read().get(name).cloned()
+}
+
+/// Sprint 55 P0-A — test-only: clear all registered channels.
+#[cfg(test)]
+pub fn reset_active_channel_for_test() {
+    channels_registry().write().clear();
 }
 
 /// Typed channel kind — replaces magic strings like `"telegram"`.

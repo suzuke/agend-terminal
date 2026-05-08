@@ -1859,6 +1859,7 @@ fn pane_snapshot_target_not_found_returns_error() {
 #[test]
 fn reply_no_active_channel_returns_error() {
     let _g = fleet_test_guard();
+    crate::channel::reset_active_channel_for_test();
     let home = tmp_home("reply-no-ch");
     std::env::set_var("AGEND_HOME", &home);
     std::fs::write(
@@ -1878,6 +1879,7 @@ fn reply_no_active_channel_returns_error() {
 #[test]
 fn react_no_active_channel_returns_error() {
     let _g = fleet_test_guard();
+    crate::channel::reset_active_channel_for_test();
     let home = tmp_home("react-no-ch");
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool("react", &json!({"emoji": "👍"}), "sender");
