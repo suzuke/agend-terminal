@@ -256,11 +256,16 @@ fn worktree_tools() -> Vec<Value> {
         // (Phase 1 trailers, P0-1.5 cross-agent registry check, P0-1.6
         // actual-HEAD verification, P0-X release_worktree as sole exit
         // point, source_repo persistence, auto watch_ci) applies.
+        // Sprint 55 P0-B: dual-arg shape (handler at worktree.rs:24-27) —
+        // schema exposes both `source_repo` (preferred) and legacy `repo`
+        // with `required` relaxed to `branch` only. Handler enforces
+        // mutual exclusivity at runtime via `ambiguous_args` code.
         json!({"name": "bind_self", "description": "Bind the calling agent to a fresh worktree on the named branch. Reuses the dispatch-hook lifecycle so binding.json + worktree + .agend-managed marker + auto watch_ci all land. Rejects 'main'/'master' (E4.5) and cross-agent branch conflicts. Pair with `release_worktree` to unbind.",
             "inputSchema": {"type": "object", "properties": {
-                "repo": {"type": "string", "description": "GitHub repo (owner/name)"},
+                "source_repo": {"type": "string", "description": "Local path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Sprint 55 P0-B preferred form. Mutually exclusive with `repo` (handler rejects both via `ambiguous_args` code)."},
+                "repo": {"type": "string", "description": "GitHub repo (owner/name). Legacy form retained for one-Sprint deprecation window — emits warn-log; removal Sprint 57. Mutually exclusive with `source_repo`."},
                 "branch": {"type": "string", "description": "Branch to bind (must not be main/master)"}
-            }, "required": ["repo", "branch"]}}),
+            }, "required": ["branch"]}}),
         // Sprint 53 P0-X: release a daemon-managed worktree + clear binding
         // for `agent`. Idempotent. Only removes worktrees that carry the
         // `.agend-managed` marker (R14 safety — operator-created worktrees
