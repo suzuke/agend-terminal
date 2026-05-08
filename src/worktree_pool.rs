@@ -241,11 +241,38 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
         }
     }
 
+    // Sprint 55 P0-B EC7: capture branch + derive owner/repo BEFORE
+    // unbind so we can scope the ci-watch unsubscribe by exact
+    // `(repo, branch)` pair. Without the repo predicate, a same-branch-
+    // name on a DIFFERENT repo (e.g. `feat-x` on `org/repo-a` + `feat-x`
+    // on `org/repo-b`) would bleed cross-repo on release.
+    let released_branch = binding["branch"].as_str().map(String::from);
+    let released_repo = binding["source_repo"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| {
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(std::path::Path::new(
+                s,
+            ))
+        });
+
     // Always clear the binding (partial cleanup OK per spec — except when we
     // bailed early on the unmanaged-worktree safety gate above).
     crate::binding::unbind(home, agent);
     out.binding_removed = true;
     out.released = true;
+
+    // Sprint 55 P0-B EC7: best-effort ci-watch unsubscribe scoped to
+    // exact `(released_repo, released_branch)` pair. Removes `agent`
+    // from each matching watch's subscriber array; deletes the watch
+    // file when the array empties. Failure here is logged but does NOT
+    // mutate ReleaseOutcome — release semantics already succeeded.
+    // When released_repo can't be derived (non-GitHub remote / no
+    // origin), the loop is a no-op — leaking a stale subscription
+    // beats cross-repo unsubscribe.
+    if let (Some(branch), Some(repo)) = (released_branch, released_repo) {
+        unsubscribe_ci_watches_for_release(home, agent, &repo, &branch);
+    }
 
     crate::event_log::log(
         home,
@@ -260,6 +287,67 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
     );
 
     out
+}
+
+/// Sprint 55 P0-B EC7 (r1: repo+branch exact match per reviewer m-99) —
+/// scan ci-watches dir, remove `agent` from any watch whose
+/// `(repo, branch)` pair matches the released agent's exactly. If
+/// `agent` was the last subscriber → delete the watch file entirely;
+/// otherwise rewrite it with the shrunk subscriber list. Best-effort:
+/// failures (read/parse/write) are logged but never abort release.
+fn unsubscribe_ci_watches_for_release(
+    home: &Path,
+    agent: &str,
+    released_repo: &str,
+    released_branch: &str,
+) {
+    let ci_dir = home.join("ci-watches");
+    let Ok(entries) = std::fs::read_dir(&ci_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if watch["repo"].as_str() != Some(released_repo)
+            || watch["branch"].as_str() != Some(released_branch)
+        {
+            continue; // unrelated watch (different repo OR branch) — leave untouched
+        }
+        let mut subs: Vec<String> = crate::daemon::ci_watch::parse_subscribers(&watch);
+        let before = subs.len();
+        subs.retain(|s| s != agent);
+        if subs.len() == before {
+            continue; // agent wasn't subscribed; nothing to do
+        }
+        if subs.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            tracing::info!(%agent, branch = %released_branch, path = %path.display(),
+                "ci-watch unsubscribed last subscriber → removed watch file");
+            continue;
+        }
+        let subs_json: Vec<serde_json::Value> = subs
+            .iter()
+            .map(|name| serde_json::json!({"instance": name}))
+            .collect();
+        watch["subscribers"] = serde_json::json!(subs_json);
+        watch["instance"] = serde_json::json!(subs.first().cloned().unwrap_or_default());
+        let _ = crate::store::atomic_write(
+            &path,
+            serde_json::to_string_pretty(&watch)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        tracing::info!(%agent, branch = %released_branch, remaining = subs.len(),
+            "ci-watch unsubscribed agent; subscribers shrunk");
+    }
 }
 
 /// Pin a worktree (operator override — prevents GC in Phase 4).

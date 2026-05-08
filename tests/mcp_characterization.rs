@@ -170,8 +170,11 @@ const MISSING_PARAM_CASES: &[(&str, &str, &str)] = &[
     ("download_attachment", r#"{}"#, "missing"),
     ("repo", r#"{"action":"checkout"}"#, "missing"),
     ("repo", r#"{"action":"checkout"}"#, "missing"),
-    ("ci", r#"{"action":"watch"}"#, "missing"),
-    ("ci", r#"{"action":"watch"}"#, "missing"),
+    // Sprint 55 P0-B: ci(watch) without repo arg now consults sender's
+    // binding for auto-derivation. With no binding present → structured
+    // `no_binding_no_repo` error (message contains "needs").
+    ("ci", r#"{"action":"watch"}"#, "needs"),
+    ("ci", r#"{"action":"watch"}"#, "needs"),
 ];
 
 #[test]

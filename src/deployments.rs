@@ -210,6 +210,8 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 instructions,
                 // Sprint 54 P1-B Bug 2 fix: see instance.rs:593.
                 source_repo: None,
+                // Sprint 55 P0-B EC4: see instance.rs (gradient).
+                repo: None,
             },
         ));
         created.push(inst_name);

@@ -605,6 +605,10 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
                 // opt agents in. Backward-compat preserved via
                 // dispatch_auto_bind_lease's working_directory fallback.
                 source_repo: None,
+                // Sprint 55 P0-B EC4: same gradient — daemon leaves
+                // `repo` override None; operator opts in for non-GitHub
+                // remote OR fork-vs-upstream disambiguation.
+                repo: None,
             };
             if let Err(e) = crate::fleet::add_instance_to_yaml(home, name, &entry) {
                 tracing::warn!(error = %e, "failed to persist to fleet.yaml");

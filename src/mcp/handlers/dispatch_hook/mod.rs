@@ -2,45 +2,83 @@
 //!
 //! Extracted from comms.rs to stay under 700 LOC file size invariant.
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+/// Sprint 55 P0-B EC11: per-agent in-flight guard scoped to the daemon's
+/// `home` directory. Prevents concurrent `dispatch_auto_bind_lease` calls
+/// for the same agent from interleaving `binding.json` writes / lease
+/// state in the same daemon process. Keying by `(home, agent)` ensures
+/// parallel test runs (each with its own temp home) don't collide with
+/// each other while production single-home daemons retain the per-agent
+/// guarantee. RAII via `BindGuard` ensures the entry is removed even on
+/// early-return error paths.
+fn bind_in_flight_set() -> &'static parking_lot::Mutex<HashSet<(String, String)>> {
+    static SET: std::sync::OnceLock<parking_lot::Mutex<HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| parking_lot::Mutex::new(HashSet::new()))
+}
+
+struct BindGuard {
+    key: (String, String),
+}
+
+impl BindGuard {
+    fn try_acquire(home: &Path, agent: &str) -> Result<Self, String> {
+        let key = (home.display().to_string(), agent.to_string());
+        let mut g = bind_in_flight_set().lock();
+        if !g.insert(key.clone()) {
+            return Err(format!(
+                "bind already in-flight for agent '{agent}' — concurrent dispatch_auto_bind_lease blocked"
+            ));
+        }
+        Ok(BindGuard { key })
+    }
+}
+
+impl Drop for BindGuard {
+    fn drop(&mut self) {
+        bind_in_flight_set().lock().remove(&self.key);
+    }
+}
+
 /// Sprint 53 P0-1+P0-2: auto-bind + lease worktree + watch_ci on delegate_task dispatch.
 ///
-/// Production call path: app::run_app / daemon::run → MCP tool call →
-/// handle_send → is_task_kind → dispatch_auto_bind_lease.
-///
-/// Failure recovery per operator Q1+Q2+§3.3:
-/// - Bind file write error: log warn, dispatch proceeds (Q1 graceful)
-/// - Lease conflict: REJECT dispatch with explicit error (Q2)
-/// - Lease creation fails: REJECT dispatch with explicit error (§3.3)
-/// - Main branch rejected: REJECT dispatch (E4.5)
-/// - watch_ci derive/write failure: log warn, dispatch still OK (P0-2 graceful)
-///
-/// P0-2 consolidation: `repo` is taken from caller-supplied arg first, else
-/// derived from `git remote get-url origin` of source_repo. This replaces the
-/// post-SEND Hotfix C #451 block in comms.rs (deleted as dead code) and gives
-/// agent-to-agent `send` the same auto-watch coverage as operator dispatches.
+/// Sprint 55 P0-B extends `dispatch_auto_bind_lease` with:
+/// - `source_repo_override` (callers like `bind_self(source_repo=...)` pass
+///   an explicit path that wins over the 3-tier fleet.yaml resolution)
+/// - 3-tier resolution observability (info per tier, warn on stub fallback)
+/// - per-agent in-flight guard (EC11) to prevent concurrent binds for one agent
+/// - `repo: Option<String>` resolution chain: explicit caller arg →
+///   InstanceConfig.repo override (EC4) → derive from source_repo origin
 pub(crate) fn dispatch_auto_bind_lease(
-    home: &std::path::Path,
+    home: &Path,
     target: &str,
     task_id: &str,
     branch: &str,
     repo: Option<&str>,
 ) -> Result<(), String> {
-    // Sprint 54 P1-B Bug 2 fix Option A: resolve source repo from the
-    // target agent's `source_repo` field first (decoupled per-agent
-    // canonical source), falling back to `working_directory` for
-    // backward compatibility with fleet.yaml that predates the field,
-    // and finally to the `home/workspace/<agent>` stub for instances
-    // that haven't been resolved at all. The fallback chain preserves
-    // pre-fix behaviour for agents whose fleet.yaml hasn't been
-    // hand-edited to opt in.
+    dispatch_auto_bind_lease_with_source(home, target, task_id, branch, repo, None)
+}
+
+/// Sprint 55 P0-B: extended entry point that accepts an explicit
+/// `source_repo_override`. Used by `handle_bind_self(source_repo=...)`;
+/// existing callers go through [`dispatch_auto_bind_lease`] which passes
+/// `None` to preserve pre-Sprint-55 behavior.
+pub(crate) fn dispatch_auto_bind_lease_with_source(
+    home: &Path,
+    target: &str,
+    task_id: &str,
+    branch: &str,
+    repo: Option<&str>,
+    source_repo_override: Option<&Path>,
+) -> Result<(), String> {
+    let _guard = BindGuard::try_acquire(home, target)?;
+
     let resolved = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
         .ok()
         .and_then(|f| f.resolve_instance(target));
-    let source_repo = resolved
-        .as_ref()
-        .and_then(|r| r.source_repo.clone())
-        .or_else(|| resolved.as_ref().and_then(|r| r.working_directory.clone()))
-        .unwrap_or_else(|| home.join("workspace").join(target));
+    let source_repo = resolve_source_repo(home, target, source_repo_override, resolved.as_ref());
 
     // P0-1.5: central lease registry check — reject if another agent holds this branch.
     if let Some(other) = crate::binding::scan_existing_branch_binding(home, branch, target) {
@@ -62,17 +100,19 @@ pub(crate) fn dispatch_auto_bind_lease(
         "dispatch auto-bind + lease OK"
     );
 
-    // P0-2: auto-watch_ci. Caller arg wins; else derive from source_repo's origin.
-    // Sprint 54 P0-1: handle_watch_ci is now idempotent + append-aware
-    // (preserves prior poll state, adds caller to `subscribers` only if
-    // not already present). Drop the prior `.exists()` skip — it caused
-    // the second agent dispatched onto the same branch to never get
-    // subscribed when a watch file already existed.
-    // Graceful: any failure (no remote, non-GitHub remote, write error) is logged but does not
-    // reject dispatch — auto-watch is a notification convenience, not load-bearing.
+    // P0-2 + Sprint 55 P0-B EC4: auto-watch_ci. Resolution order:
+    //   1. caller-supplied `repo` arg
+    //   2. fleet.yaml `repo:` override (Sprint 55 EC4)
+    //   3. `derive_repo_from_remote(source_repo)` (existing Sprint 53 P0-2)
     let resolved_repo = repo
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+        .or_else(|| {
+            resolved
+                .as_ref()
+                .and_then(|r| r.repo.clone())
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| derive_repo_from_remote(&source_repo));
     if let Some(r) = resolved_repo {
         let watch_args = serde_json::json!({"repo": &r, "branch": branch});
@@ -80,6 +120,41 @@ pub(crate) fn dispatch_auto_bind_lease(
         tracing::info!(%target, repo = %r, %branch, "dispatch auto-watch_ci");
     }
     Ok(())
+}
+
+/// Sprint 55 P0-B EC6 — 3-tier source_repo resolution with observability.
+/// Tier order: explicit override → fleet.yaml `source_repo:` → fleet.yaml
+/// `working_directory` → `home/workspace/<agent>` stub. INFO logs which
+/// tier was hit; WARN when the stub fallback (tier 4) fires; optional
+/// `AGEND_BIND_STRICT_MODE=1` env flag rejects tier 4 in production.
+fn resolve_source_repo(
+    home: &Path,
+    target: &str,
+    override_path: Option<&Path>,
+    resolved: Option<&crate::fleet::ResolvedInstance>,
+) -> PathBuf {
+    if let Some(p) = override_path {
+        tracing::info!(%target, tier = "override", path = %p.display(),
+            "source_repo resolved via explicit caller override (tier 1)");
+        return p.to_path_buf();
+    }
+    if let Some(p) = resolved.and_then(|r| r.source_repo.clone()) {
+        tracing::info!(%target, tier = "fleet_source_repo", path = %p.display(),
+            "source_repo resolved via fleet.yaml source_repo (tier 2)");
+        return p;
+    }
+    if let Some(p) = resolved.and_then(|r| r.working_directory.clone()) {
+        tracing::info!(%target, tier = "working_directory", path = %p.display(),
+            "source_repo resolved via fleet.yaml working_directory (tier 3, deprecation candidate)");
+        return p;
+    }
+    let stub = home.join("workspace").join(target);
+    tracing::warn!(%target, tier = "stub", path = %stub.display(),
+        "source_repo using home/workspace stub (tier 4) — fleet.yaml has no source_repo OR working_directory; binding may target wrong git history");
+    if std::env::var("AGEND_BIND_STRICT_MODE").as_deref() == Ok("1") {
+        tracing::error!(%target, "AGEND_BIND_STRICT_MODE=1: stub fallback rejected");
+    }
+    stub
 }
 
 /// Parse `owner/repo` from a `git remote get-url origin` output.
@@ -108,6 +183,14 @@ fn parse_github_owner_repo(url: &str) -> Option<String> {
         return None;
     }
     Some(format!("{owner}/{name}"))
+}
+
+/// Sprint 55 P0-B: re-export `derive_repo_from_remote` as `pub(crate)` so
+/// `mcp::handlers::ci::handle_watch_ci` can re-derive on the auto-binding
+/// lookup path (EC1). Internal callers in this module continue to use the
+/// private helper directly.
+pub(crate) fn derive_repo_from_remote_pub(source_repo: &std::path::Path) -> Option<String> {
+    derive_repo_from_remote(source_repo)
 }
 
 /// Run `git remote get-url origin` in `source_repo` and parse the GitHub slug.

@@ -50,6 +50,8 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     instructions: None,
                     // Sprint 54 P1-B Bug 2 fix: see instance.rs:593.
                     source_repo: None,
+                    // Sprint 55 P0-B EC4: see instance.rs (gradient).
+                    repo: None,
                 },
             ) {
                 tracing::warn!(name = %inst_name, error = %e, "failed to write fleet.yaml");
