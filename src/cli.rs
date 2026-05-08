@@ -336,9 +336,17 @@ pub fn run_demo() -> anyhow::Result<()> {
     println!("  ✓ Demo complete!\n");
     println!("  With real AI backends, agents use MCP tools to autonomously");
     println!("  delegate_task, report_result, and coordinate.\n");
-    println!("  Next:");
-    println!("    agend-terminal doctor     # Check backends");
-    println!("    agend-terminal start      # Start fleet");
+    // Sprint 56 Track H4 (#525 item 11): demo trailing → quickstart
+    // funnel. Pre-Track-H4 the demo's "Next:" block listed `doctor`
+    // and `start` but skipped quickstart, leaving operators trying
+    // to start a fleet without ever running the interactive setup
+    // that writes fleet.yaml + .env. Add `quickstart` as the
+    // canonical first step for production setup.
+    println!("  Want to run your own fleet?");
+    println!("    agend-terminal quickstart # Interactive setup (.env + fleet.yaml)\n");
+    println!("  Other useful commands:");
+    println!("    agend-terminal doctor     # Check backends + fleet config");
+    println!("    agend-terminal start      # Start fleet (after quickstart)");
     println!();
 
     Ok(())

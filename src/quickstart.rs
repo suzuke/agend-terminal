@@ -10,10 +10,17 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     // Step 1: Detect backends
     let backends = detect_backends();
     if backends.is_empty() {
+        // Sprint 56 Track H4 (#525 item 13): list all five supported
+        // backends, not just three. Pre-Track-H4 the message stopped
+        // at three (Claude / codex / gemini-cli) so operators with a
+        // Kiro or OpenCode preference saw "no supported backends" and
+        // had no install hint pointing them at their tool.
         println!("  No supported backends found. Install one of:");
-        println!("    npm install -g @anthropic-ai/claude-code");
-        println!("    npm install -g @anthropic-ai/codex");
-        println!("    npm install -g @anthropic-ai/gemini-cli");
+        println!("    Claude Code   npm install -g @anthropic-ai/claude-code");
+        println!("    codex         npm install -g @openai/codex");
+        println!("    Gemini CLI    npm install -g @google/gemini-cli");
+        println!("    Kiro CLI      see https://kiro.dev for installer");
+        println!("    OpenCode      see https://opencode.ai for installer");
         println!();
         return Ok(());
     }
@@ -549,8 +556,14 @@ fn save_env_token(home: &Path, token: &str) -> anyhow::Result<()> {
             return Ok(());
         }
         println!("  .env already has AGEND_BOT_TOKEN={}", mask_token(old));
-        let answer = prompt("  Update token? (Y/n): ")?;
-        if answer.trim().eq_ignore_ascii_case("n") {
+        // Sprint 56 Track H4 (#525 item 14): destructive prompts default
+        // to `N` (preserve operator data); non-destructive prompts
+        // default to `Y` (the convenient path). Updating an existing
+        // token overwrites stored credentials → destructive →
+        // (y/N). Only an explicit `y` proceeds; Enter/N/anything-else
+        // keeps the current token.
+        let answer = prompt("  Update token? (y/N): ")?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
             println!("  Keeping existing token.\n");
             return Ok(());
         }
@@ -744,6 +757,21 @@ fn check_compatibility(yaml_content: &str, new_backend: &Backend, new_group_id: 
 }
 
 fn print_next_steps(home: &Path) {
+    // Sprint 56 Track H4 (#525 item 12): pre-Track-H4 the Next Steps
+    // block jumped straight to `agend-terminal start` without any
+    // mention of the three first-day pitfalls operators hit (#525
+    // items 1, 2, 3). The "Before you start" block surfaces them
+    // up front so an operator scanning the output catches the
+    // gotchas before the silent-drop fallout starts.
+    println!("  ── Before you start ──\n");
+    println!("  Three first-day gotchas to double-check (see issue #525):");
+    println!("    1. `user_allowlist` must list YOUR Telegram user_id —");
+    println!("       an empty list (`[]`) silently drops every reply.");
+    println!("    2. The bot must be admin in your Telegram group —");
+    println!("       topic mode requires admin to call create_forum_topic.");
+    println!("    3. Topic mode requires a SUPERGROUP — enabling Topics");
+    println!("       on a regular group migrates it to a supergroup with a");
+    println!("       new id; quickstart now refuses regular groups upfront.\n");
     println!("  ── Next Steps ──\n");
     println!("  1. Edit fleet.yaml to add more instances:");
     println!("     {}\n", home.join("fleet.yaml").display());
@@ -1168,6 +1196,79 @@ mod tests {
                 "unknown / case-mismatched status `{status}` must not pass"
             );
         }
+    }
+
+    // ── Sprint 56 Track H4 (#525 items 11-14): docs polish pins ───
+
+    /// Item 14: destructive prompts default to capital N (preserve
+    /// operator data); non-destructive default to capital Y (the
+    /// convenient path). `Update token?` was the inconsistent case
+    /// pre-H4 — destructive but Y-defaulted. This pin asserts the
+    /// source's prompt string tracks the rule by anchoring on the
+    /// destructive shape. A future regression that flipped the
+    /// default back to Y without flipping the eq_ignore_ascii_case
+    /// check would slide silently otherwise; text-anchor catches it
+    /// at the prompt level.
+    #[test]
+    fn update_token_prompt_uses_destructive_lowercase_y_capital_n_default() {
+        const SOURCE: &str = include_str!("quickstart.rs");
+        // The prompt literal must include `(y/N)` (lower y, capital N
+        // = destructive default per the H4 rule).
+        assert!(
+            SOURCE.contains("Update token? (y/N)"),
+            "Update token prompt must default to N (destructive: \
+             overwrites stored credential)"
+        );
+        // The check must be `eq_ignore_ascii_case(\"y\")` — only an
+        // explicit `y` proceeds; Enter / N / anything-else preserves
+        // the existing token. A `eq_ignore_ascii_case(\"n\")` check
+        // (the pre-H4 form) would mean "default Y", contradicting
+        // the (y/N) prompt.
+        assert!(
+            SOURCE.contains("!answer.trim().eq_ignore_ascii_case(\"y\")"),
+            "Update-token check must be `!eq_ignore_ascii_case(\"y\")` \
+             so default and N both keep the existing token"
+        );
+    }
+
+    /// Item 13: no-supported-backends list must enumerate all 5
+    /// backends (Claude / codex / Kiro / OpenCode / Gemini). Pre-H4
+    /// the list stopped at three.
+    #[test]
+    fn no_backends_message_lists_all_five_supported_backends() {
+        const SOURCE: &str = include_str!("quickstart.rs");
+        for backend in ["Claude Code", "codex", "Gemini CLI", "Kiro", "OpenCode"] {
+            assert!(
+                SOURCE.contains(backend),
+                "no-supported-backends message must mention `{backend}` \
+                 — H4 expanded the list from 3 to 5"
+            );
+        }
+    }
+
+    /// Item 12: `print_next_steps` must include a "Before you start"
+    /// block with the three first-day pitfalls (allowlist / admin /
+    /// supergroup) before the action steps.
+    #[test]
+    fn next_steps_includes_before_you_start_pitfalls_block() {
+        const SOURCE: &str = include_str!("quickstart.rs");
+        assert!(
+            SOURCE.contains("Before you start"),
+            "print_next_steps must include the `Before you start` \
+             pitfalls block — H4 fix for #525 item 12"
+        );
+        assert!(
+            SOURCE.contains("user_allowlist"),
+            "Before-you-start block must mention user_allowlist gotcha"
+        );
+        assert!(
+            SOURCE.contains("admin"),
+            "Before-you-start block must mention bot-admin gotcha"
+        );
+        assert!(
+            SOURCE.contains("SUPERGROUP") || SOURCE.contains("supergroup"),
+            "Before-you-start block must mention supergroup gotcha"
+        );
     }
 
     /// Defensive: pure-pattern matcher pin. Anything outside the
