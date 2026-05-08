@@ -196,6 +196,17 @@ pub struct InstanceConfig {
     /// Content is appended to the generated agent instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Sprint 56 Track F (#496): operator-controlled GitHub username for
+    /// this instance. Lets `task_sweep`'s authorship gate compare
+    /// `pr.author_login` against the right namespace — without this
+    /// mapping, the gate compared GitHub user names against agend
+    /// instance names (e.g. `cheerc` vs `dev-lead`) and silently
+    /// rejected every cross-namespace mismatch. When `None`, the sweep
+    /// falls back to direct string compare for backwards compatibility
+    /// with deployments where instance name happens to equal the
+    /// operator's GitHub login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_login: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -512,6 +523,12 @@ pub struct InstanceYamlEntry {
     /// `InstanceConfig::repo`. Daemon auto-write callers leave this
     /// `None` (gradient deployment); operator hand-edits opt agents in.
     pub repo: Option<String>,
+    /// Sprint 56 Track F (#496): GitHub login mapping per
+    /// `InstanceConfig::github_login`. Daemon auto-write callers leave
+    /// this `None` so existing instance creation paths don't suddenly
+    /// require operator-supplied GitHub identities; operator hand-edits
+    /// or fleet.yaml templates opt agents in.
+    pub github_login: Option<String>,
 }
 
 /// Atomically write a serde_yaml_ng::Value back to fleet.yaml using temp + fsync + rename.
@@ -592,6 +609,9 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
                 // Sprint 55 P0-B EC4: same pattern — operator-set repo
                 // override round-trips, daemon auto-writers omit.
                 ("repo", &config.repo),
+                // Sprint 56 Track F (#496): same pattern — operator-set
+                // GitHub login round-trips, daemon auto-writers omit.
+                ("github_login", &config.github_login),
             ] {
                 if let Some(ref v) = val {
                     inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));
@@ -1009,6 +1029,7 @@ instances:
             instructions: Some("./instructions/dev.md".to_string()),
             source_repo: None,
             repo: None,
+            github_login: None,
         };
         add_instance_to_yaml(&dir, "new-agent", &entry).expect("add");
         let config = FleetConfig::load(&path).expect("load after add");
@@ -1057,6 +1078,7 @@ instances:
             instructions: None,
             source_repo: None,
             repo: None,
+            github_login: None,
         };
         add_instance_to_yaml(&dir, "first", &entry).expect("add to new");
         let config = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
@@ -1657,6 +1679,7 @@ instances:
             instructions: None,
             source_repo: None,
             repo: None,
+            github_login: None,
         };
         add_instance_to_yaml(&dir, "temp-agent", &entry).expect("add");
 
@@ -2368,6 +2391,7 @@ instances:
             instructions: None,
             source_repo: Some("/tmp/rt-source".to_string()),
             repo: None,
+            github_login: None,
         };
         add_instance_to_yaml(&dir, "rt-agent", &entry).expect("add");
         let content = std::fs::read_to_string(dir.join("fleet.yaml")).expect("read");

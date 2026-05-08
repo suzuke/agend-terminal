@@ -163,7 +163,7 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     // Doctor pre-flight: detect operator pitfalls in fleet.yaml and emit
     // actionable diagnostics before any agents spawn. Sprint 23 P1 —
     // deferred from Sprint 22 P0 PR #230.
-    let diags = doctor::validate_fleet_config(&config);
+    let diags = doctor::validate_fleet_config(&config, home);
     doctor::emit_diagnostics(&diags);
 
     let agents = if opts.resolve_agents {

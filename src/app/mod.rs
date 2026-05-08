@@ -784,6 +784,7 @@ fn pane_from_menu_item(
                     source_repo: None,
                     // Sprint 55 P0-B EC4: see instance.rs (gradient).
                     repo: None,
+                    github_login: None,
                 },
             ) {
                 tracing::warn!(error = %e, "failed to write fleet.yaml");

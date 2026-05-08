@@ -212,6 +212,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
                 source_repo: None,
                 // Sprint 55 P0-B EC4: see instance.rs (gradient).
                 repo: None,
+                github_login: None,
             },
         ));
         created.push(inst_name);

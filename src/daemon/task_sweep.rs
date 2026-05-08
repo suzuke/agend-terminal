@@ -77,6 +77,16 @@ fn load_config(home: &Path) -> SweepConfig {
     crate::store::load(&config_path(home))
 }
 
+/// Sprint 56 Track F (#496): public loader for the doctor's D002 check.
+/// Same implementation as the private `load_config` — exposed so
+/// `bootstrap::doctor::check_task_sweep_github_login_mapping` can read
+/// the sweep state without re-implementing the deserialization. Returns
+/// the default (`repo: None`) when the file is missing, mirroring the
+/// tick body's "no-op when unconfigured" semantics.
+pub fn load_sweep_config_for_doctor(home: &Path) -> SweepConfig {
+    load_config(home)
+}
+
 fn save_config(home: &Path, cfg: &SweepConfig) -> anyhow::Result<()> {
     crate::store::save_atomic(&config_path(home), cfg)
 }
@@ -112,6 +122,51 @@ impl TaskSweep {
 
 // ── Tick body ───────────────────────────────────────────────────────
 
+/// Sprint 56 Track F (#496): resolve an agend-local instance name to its
+/// configured GitHub login via `fleet.yaml`'s per-instance
+/// `github_login` field. Returns `None` when fleet config is absent /
+/// malformed, the instance is not declared, or the field is omitted —
+/// the sweep then falls back to direct string compare for backwards
+/// compatibility with deployments where instance name happens to equal
+/// the GitHub login.
+fn resolve_github_login<'a>(
+    fleet: Option<&'a crate::fleet::FleetConfig>,
+    instance_name: &str,
+) -> Option<&'a str> {
+    fleet?.instances.get(instance_name)?.github_login.as_deref()
+}
+
+/// Sprint 56 Track F (#496): pure helper for the sweep's authorship
+/// gate. Returns `true` iff `pr_login` matches either the task creator
+/// or the task assignee, after each is resolved through the fleet's
+/// `github_login` mapping (with a direct-compare fall-back for
+/// instances that have no mapping configured).
+///
+/// Compat invariant: when no fleet config is loaded, or no instance has
+/// `github_login` set, the helper degrades to the pre-Track-F behavior
+/// — direct string compare against the agend instance name. This
+/// preserves existing deployments where the instance name happens to
+/// equal the operator's GitHub login. Operators can opt into the
+/// stricter mapping per-instance.
+fn compute_author_ok(
+    pr_login: &str,
+    task: &crate::tasks::Task,
+    fleet: Option<&crate::fleet::FleetConfig>,
+) -> bool {
+    let creator = task.created_by.as_str();
+    let creator_login = resolve_github_login(fleet, creator).unwrap_or(creator);
+    if pr_login.eq_ignore_ascii_case(creator_login) {
+        return true;
+    }
+    if let Some(assignee) = task.assignee.as_deref() {
+        let assignee_login = resolve_github_login(fleet, assignee).unwrap_or(assignee);
+        if pr_login.eq_ignore_ascii_case(assignee_login) {
+            return true;
+        }
+    }
+    false
+}
+
 fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     let cfg = load_config(home);
     if cfg.paused {
@@ -126,6 +181,16 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     if prs.is_empty() {
         return Ok(());
     }
+
+    // Sprint 56 Track F (#496): load fleet config so the authorship gate
+    // below can resolve `task.created_by` / `task.assignee` (agend-local
+    // instance names) into `github_login` GitHub usernames before
+    // comparing against `pr.author_login`. Pre-Track-F the gate compared
+    // disjoint namespaces and silently rejected every cross-namespace
+    // mismatch — see `docs/RCA-issue-496-task-sweep-no-auto-close-2026-05-08.md`.
+    // `Option<FleetConfig>` because a missing/malformed fleet.yaml must
+    // not abort the sweep — fall back to direct compare for compat.
+    let fleet_cfg = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
 
     // Snapshot of currently-open tasks. Read from tasks::list_all (the
     // PR2 bridge-phase legacy reader); PR3 cutover switches this to
@@ -197,19 +262,20 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
             // task creator OR assignee must match. Defends pre-PR-220
             // `update_decision` bug class where a malicious PR body could
             // close another agent's task.
-            let creator = task.created_by.as_str();
-            let assignee = task.assignee.as_deref();
-            let author_ok = pr.author_login.eq_ignore_ascii_case(creator)
-                || assignee
-                    .map(|a| pr.author_login.eq_ignore_ascii_case(a))
-                    .unwrap_or(false);
+            //
+            // Sprint 56 Track F (#496): the comparison is against the
+            // GitHub username, not the agend-local instance name. The
+            // pure helper `compute_author_ok` resolves creator/assignee
+            // via the fleet's `github_login` mapping with a fall-back to
+            // a direct string compare for compat — see helper docs.
+            let author_ok = compute_author_ok(&pr.author_login, task, fleet_cfg.as_ref());
             if !author_ok {
                 tracing::warn!(
                     pr = pr.number,
                     marker = %marker,
                     pr_author = %pr.author_login,
-                    task_creator = creator,
-                    task_assignee = ?assignee,
+                    task_creator = task.created_by.as_str(),
+                    task_assignee = ?task.assignee.as_deref(),
                     "sweep: PR.user.login not authorised to close — rejected"
                 );
                 continue;
@@ -435,6 +501,133 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── Sprint 56 Track F (#496): authorship gate via github_login ──
+
+    fn task_with(created_by: &str, assignee: Option<&str>) -> crate::tasks::Task {
+        crate::tasks::Task {
+            id: "t-1-1".into(),
+            title: "x".into(),
+            description: String::new(),
+            status: "open".into(),
+            priority: "normal".into(),
+            assignee: assignee.map(str::to_string),
+            routed_to: None,
+            created_by: created_by.into(),
+            depends_on: Vec::new(),
+            result: None,
+            created_at: "2026-05-08T00:00:00Z".into(),
+            updated_at: "2026-05-08T00:00:00Z".into(),
+            due_at: None,
+            branch: None,
+        }
+    }
+
+    fn fleet_with_login(instance: &str, github_login: &str) -> crate::fleet::FleetConfig {
+        let mut instances = std::collections::HashMap::new();
+        instances.insert(
+            instance.into(),
+            crate::fleet::InstanceConfig {
+                github_login: Some(github_login.into()),
+                ..Default::default()
+            },
+        );
+        crate::fleet::FleetConfig {
+            instances,
+            ..Default::default()
+        }
+    }
+
+    /// Lead-spec #1: with `github_login: alice` mapped on instance `dev`,
+    /// a PR by `alice` against a task created by `dev` must close.
+    #[test]
+    fn mapping_present_compares_against_github_login() {
+        let task = task_with("dev", None);
+        let fleet = fleet_with_login("dev", "alice");
+        assert!(compute_author_ok("alice", &task, Some(&fleet)));
+        // Case-insensitive — GitHub usernames are.
+        assert!(compute_author_ok("Alice", &task, Some(&fleet)));
+    }
+
+    /// Lead-spec #2: no `github_login` mapping AND no fleet config — the
+    /// helper falls back to direct string compare against the agend
+    /// instance name. Compat path for deployments where instance name
+    /// happens to equal the operator's GitHub login (the implicit
+    /// assumption pre-Track-F).
+    #[test]
+    fn mapping_absent_falls_back_to_direct_compare() {
+        let task = task_with("dev", None);
+        // No fleet at all.
+        assert!(compute_author_ok("dev", &task, None));
+        assert!(!compute_author_ok("alice", &task, None));
+        // Fleet present but no mapping for this instance.
+        let mut fleet = crate::fleet::FleetConfig::default();
+        fleet.instances.insert(
+            "other".into(),
+            crate::fleet::InstanceConfig {
+                github_login: Some("bob".into()),
+                ..Default::default()
+            },
+        );
+        assert!(compute_author_ok("dev", &task, Some(&fleet)));
+        assert!(!compute_author_ok("alice", &task, Some(&fleet)));
+    }
+
+    /// Lead-spec #3: when `github_login: alice` is mapped, a PR by `bob`
+    /// must NOT close — the security gate (PR-220 defense) is preserved
+    /// even after Track F's namespace fix.
+    #[test]
+    fn mapping_present_mismatch_does_not_close() {
+        let task = task_with("dev", None);
+        let fleet = fleet_with_login("dev", "alice");
+        assert!(!compute_author_ok("bob", &task, Some(&fleet)));
+        // The PR author equals the agend instance name string but the
+        // mapping says the real login is `alice` — direct-name match
+        // must NOT bypass the mapping when one is configured.
+        assert!(!compute_author_ok("dev", &task, Some(&fleet)));
+    }
+
+    /// Mapping resolves through the assignee branch too — a task claimed
+    /// by `dev-impl` with `github_login: bob` must accept a PR by `bob`
+    /// even when the creator's mapping doesn't match.
+    #[test]
+    fn mapping_resolves_assignee_branch() {
+        let task = task_with("lead", Some("dev-impl"));
+        let mut fleet = crate::fleet::FleetConfig::default();
+        fleet.instances.insert(
+            "lead".into(),
+            crate::fleet::InstanceConfig {
+                github_login: Some("alice".into()),
+                ..Default::default()
+            },
+        );
+        fleet.instances.insert(
+            "dev-impl".into(),
+            crate::fleet::InstanceConfig {
+                github_login: Some("bob".into()),
+                ..Default::default()
+            },
+        );
+        assert!(compute_author_ok("alice", &task, Some(&fleet))); // creator branch
+        assert!(compute_author_ok("bob", &task, Some(&fleet))); // assignee branch
+        assert!(!compute_author_ok("eve", &task, Some(&fleet))); // neither
+    }
+
+    /// Resolver: returns mapped login when fleet has it.
+    #[test]
+    fn resolve_github_login_returns_mapped() {
+        let fleet = fleet_with_login("dev", "alice");
+        assert_eq!(resolve_github_login(Some(&fleet), "dev"), Some("alice"));
+    }
+
+    /// Resolver: returns None when instance is not in the fleet (so the
+    /// caller's fall-back path engages rather than a false-negative).
+    #[test]
+    fn resolve_github_login_returns_none_for_unknown_instance() {
+        let fleet = fleet_with_login("dev", "alice");
+        assert_eq!(resolve_github_login(Some(&fleet), "ghost"), None);
+        assert_eq!(resolve_github_login(None, "dev"), None);
     }
 
     /// Must-have #1 — HTML-comment injection: a directive hidden inside
