@@ -1989,7 +1989,11 @@ fn watch_ci_valid_repo_returns_watching() {
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
         "ci",
-        &json!({"action": "watch", "repo": "owner/repo", "branch": "main"}),
+        // Sprint 57 Wave 2 Track B (#546 Item 3): branch swapped from
+        // "main" to "feat-test" because handle_watch_ci now rejects
+        // protected refs at the E4.5 gate. The happy-path assertion
+        // is unaffected — any non-protected branch suffices.
+        &json!({"action": "watch", "repo": "owner/repo", "branch": "feat-test"}),
         "sender",
     );
     assert_eq!(

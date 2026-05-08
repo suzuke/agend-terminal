@@ -212,6 +212,21 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let branch = args["branch"].as_str().unwrap_or("main");
     let interval = args["interval_secs"].as_u64().unwrap_or(60);
 
+    // Sprint 57 Wave 2 Track B (#546 Item 3) — E4.5 protected-ref
+    // gate. Closes the bypass that let any agent subscribe to `main`
+    // (or `master`) CI by calling `ci action=watch` directly. Mirrors
+    // the worktree-lease gate in `worktree_pool::lease`; both go
+    // through `agent_ops::is_protected_ref` so the protected set is
+    // edited in exactly one place. The "main" default at the line
+    // above is the backstop the gate catches when callers omit both
+    // `branch` and explicit-protected branch — both flows land here.
+    if crate::agent_ops::is_protected_ref(branch) {
+        return json!({
+            "error": format!("E4.5 violation: ci action=watch rejects protected branch '{branch}' — use lead/operator dashboards for protected-ref CI surveillance, not per-agent subscriptions"),
+            "code": "e4_5_protected_branch"
+        });
+    }
+
     // Reject unsupported providers early with operator-actionable error.
     if args["ci_provider"].as_str() == Some("bitbucket_server") {
         return json!({"error": "Bitbucket Server not yet supported — track Sprint 41+ candidate. Use bitbucket_cloud for Bitbucket Cloud repos."});

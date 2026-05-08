@@ -24,8 +24,11 @@ pub fn lease(
     agent: &str,
     branch: &str,
 ) -> Result<WorktreeLease, String> {
-    // E4.5: reject main branch lease.
-    if branch == "main" || branch == "master" {
+    // E4.5: reject protected-branch lease. Single source of truth for
+    // the protected set is `agent_ops::is_protected_ref` so adding a
+    // new protected ref propagates here and to every other E4.5 site
+    // (Sprint 57 Wave 2 Track B #546 Item 3).
+    if crate::agent_ops::is_protected_ref(branch) {
         return Err(format!(
             "E4.5 violation: cannot lease worktree for protected branch '{branch}'"
         ));
@@ -241,38 +244,22 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
         }
     }
 
-    // Sprint 55 P0-B EC7: capture branch + derive owner/repo BEFORE
-    // unbind so we can scope the ci-watch unsubscribe by exact
-    // `(repo, branch)` pair. Without the repo predicate, a same-branch-
-    // name on a DIFFERENT repo (e.g. `feat-x` on `org/repo-a` + `feat-x`
-    // on `org/repo-b`) would bleed cross-repo on release.
-    let released_branch = binding["branch"].as_str().map(String::from);
-    let released_repo = binding["source_repo"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| {
-            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(std::path::Path::new(
-                s,
-            ))
-        });
-
     // Always clear the binding (partial cleanup OK per spec — except when we
     // bailed early on the unmanaged-worktree safety gate above).
     crate::binding::unbind(home, agent);
     out.binding_removed = true;
     out.released = true;
 
-    // Sprint 55 P0-B EC7: best-effort ci-watch unsubscribe scoped to
-    // exact `(released_repo, released_branch)` pair. Removes `agent`
-    // from each matching watch's subscriber array; deletes the watch
-    // file when the array empties. Failure here is logged but does NOT
-    // mutate ReleaseOutcome — release semantics already succeeded.
-    // When released_repo can't be derived (non-GitHub remote / no
-    // origin), the loop is a no-op — leaking a stale subscription
-    // beats cross-repo unsubscribe.
-    if let (Some(branch), Some(repo)) = (released_branch, released_repo) {
-        unsubscribe_ci_watches_for_release(home, agent, &repo, &branch);
-    }
+    // Sprint 57 Wave 2 Track B (#546 Item 2): unsubscribe `agent` from
+    // EVERY ci-watch they appear on, not just the binding-branch entry.
+    // The Sprint 55 P0-B EC7 helper was scoped to the exact
+    // `(released_repo, released_branch)` pair derived from binding.json
+    // — but agents may have added ad-hoc watches outside their
+    // binding-branch (e.g. `ci action=watch repo=… branch=main` to
+    // follow upstream during a closeout cycle). Those leaked across
+    // release until this enumerator landed. Best-effort: failures are
+    // logged but never abort release.
+    unsubscribe_all_ci_watches_for_agent(home, agent);
 
     crate::event_log::log(
         home,
@@ -289,18 +276,21 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
     out
 }
 
-/// Sprint 55 P0-B EC7 (r1: repo+branch exact match per reviewer m-99) —
-/// scan ci-watches dir, remove `agent` from any watch whose
-/// `(repo, branch)` pair matches the released agent's exactly. If
-/// `agent` was the last subscriber → delete the watch file entirely;
-/// otherwise rewrite it with the shrunk subscriber list. Best-effort:
-/// failures (read/parse/write) are logged but never abort release.
-fn unsubscribe_ci_watches_for_release(
-    home: &Path,
-    agent: &str,
-    released_repo: &str,
-    released_branch: &str,
-) {
+/// Sprint 57 Wave 2 Track B (#546 Item 2) — scan ci-watches dir,
+/// remove `agent` from EVERY watch whose subscriber list contains
+/// them. Replaces the Sprint 55 P0-B EC7 single-(repo, branch)-pair
+/// helper that left ad-hoc watches outside the binding-branch
+/// orphaned on release. Agent names are unique within the fleet so
+/// removing the name from any matching watch is always correct on
+/// release; the cross-repo bleed risk that the EC7 r1 review flagged
+/// only applies when the predicate is "branch matches" — `agent`
+/// matches doesn't have that ambiguity.
+///
+/// Per-watch behaviour: if `agent` was the last subscriber → delete
+/// the watch file entirely; otherwise rewrite it with the shrunk
+/// subscriber list. Best-effort: read/parse/write failures are
+/// logged but never abort release.
+fn unsubscribe_all_ci_watches_for_agent(home: &Path, agent: &str) {
     let ci_dir = home.join("ci-watches");
     let Ok(entries) = std::fs::read_dir(&ci_dir) else {
         return;
@@ -316,11 +306,8 @@ fn unsubscribe_ci_watches_for_release(
         let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) else {
             continue;
         };
-        if watch["repo"].as_str() != Some(released_repo)
-            || watch["branch"].as_str() != Some(released_branch)
-        {
-            continue; // unrelated watch (different repo OR branch) — leave untouched
-        }
+        let watch_branch = watch["branch"].as_str().unwrap_or("?").to_string();
+        let watch_repo = watch["repo"].as_str().unwrap_or("?").to_string();
         let mut subs: Vec<String> = crate::daemon::ci_watch::parse_subscribers(&watch);
         let before = subs.len();
         subs.retain(|s| s != agent);
@@ -329,7 +316,7 @@ fn unsubscribe_ci_watches_for_release(
         }
         if subs.is_empty() {
             let _ = std::fs::remove_file(&path);
-            tracing::info!(%agent, branch = %released_branch, path = %path.display(),
+            tracing::info!(%agent, repo = %watch_repo, branch = %watch_branch, path = %path.display(),
                 "ci-watch unsubscribed last subscriber → removed watch file");
             continue;
         }
@@ -345,7 +332,7 @@ fn unsubscribe_ci_watches_for_release(
                 .unwrap_or_default()
                 .as_bytes(),
         );
-        tracing::info!(%agent, branch = %released_branch, remaining = subs.len(),
+        tracing::info!(%agent, repo = %watch_repo, branch = %watch_branch, remaining = subs.len(),
             "ci-watch unsubscribed agent; subscribers shrunk");
     }
 }
@@ -1022,5 +1009,140 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!wt.exists(), "worktree must be deleted with flag");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // Sprint 57 Wave 2 Track B (#546 Item 2) — release_worktree must
+    // unsubscribe the released agent from EVERY ci-watch they appear
+    // on, not just the binding-branch entry.
+    // ------------------------------------------------------------------
+
+    /// Helper: write a synthetic ci-watch JSON listing the given
+    /// subscribers on `(repo, branch)`. Returns the watch path.
+    fn write_ci_watch(
+        home: &std::path::Path,
+        repo: &str,
+        branch: &str,
+        subscribers: &[&str],
+    ) -> PathBuf {
+        let ci_dir = home.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
+        let path = ci_dir.join(&filename);
+        let subs: Vec<serde_json::Value> = subscribers
+            .iter()
+            .map(|s| serde_json::json!({"instance": *s}))
+            .collect();
+        let watch = serde_json::json!({
+            "repo": repo,
+            "branch": branch,
+            "interval_secs": 60,
+            "subscribers": subs,
+            "instance": subscribers.first().copied().unwrap_or(""),
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&watch).unwrap()).ok();
+        path
+    }
+
+    /// Read a ci-watch JSON's subscriber `instance` strings. Returns
+    /// empty Vec if file missing or parse fails — `assert` on the
+    /// caller handles the missing-file case as appropriate.
+    fn read_ci_watch_subscribers(path: &std::path::Path) -> Vec<String> {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return Vec::new();
+        };
+        crate::daemon::ci_watch::parse_subscribers(&watch)
+    }
+
+    #[test]
+    fn release_worktree_unsubscribes_all_agent_ci_watches() {
+        // Reproduces the gap shape documented in PR #549 Phase A RCA:
+        // the EC7 helper only unsubscribed the binding-branch watch,
+        // leaving any ad-hoc watches (e.g. an agent watching `main`
+        // during a closeout cycle) orphaned on release.
+        //
+        // Setup: agent `dev` is bound to `feat-track-x`, the auto-
+        // watch for that branch is in place, AND the agent has added
+        // an extra watch on `main` (cross-branch, to follow upstream).
+        // A different agent `lead` shares both watches.
+        let home = tmp_home("p0x-unsubscribe-all");
+        let repo = tmp_repo("p0x-unsubscribe-all-repo");
+        let l = lease(&home, &repo, "dev", "feat-track-x").expect("lease");
+        assert!(l.path.exists(), "pre: worktree must exist");
+
+        // Auto-watch for binding-branch (lease path skipped explicit
+        // ci_watch creation; pre-populate to mirror real fleet state
+        // post-`dispatch_auto_bind_lease` which auto-installs it).
+        let auto_watch = write_ci_watch(&home, "owner/repo", "feat-track-x", &["dev", "lead"]);
+        // Ad-hoc cross-branch watch on `main` (lead also subscribed
+        // so we can verify per-agent shrink without file deletion).
+        let main_watch = write_ci_watch(&home, "owner/repo", "main", &["dev", "lead"]);
+        // Watch the agent isn't subscribed to — must remain untouched.
+        let bystander = write_ci_watch(&home, "owner/repo", "feat-bystander", &["lead"]);
+
+        let outcome = release_full(&home, "dev");
+
+        assert!(outcome.released, "release must succeed");
+        assert!(outcome.binding_removed, "binding must be cleared");
+
+        // Auto-watch: dev was 1 of 2 subscribers → file persists, lead remains.
+        let auto_subs = read_ci_watch_subscribers(&auto_watch);
+        assert_eq!(
+            auto_subs,
+            vec!["lead".to_string()],
+            "binding-branch watch must shrink to remaining subscriber, not be deleted"
+        );
+
+        // Main watch: dev was the orphan vector — must also shrink.
+        // Pre-Sprint-57-Wave-2 this assertion FAILED (dev stayed
+        // subscribed to main); the fix makes it pass.
+        let main_subs = read_ci_watch_subscribers(&main_watch);
+        assert_eq!(
+            main_subs,
+            vec!["lead".to_string()],
+            "ad-hoc cross-branch watch must also shrink — Item 2 regression-proof"
+        );
+
+        // Bystander: dev was never subscribed → file untouched.
+        assert!(bystander.exists(), "bystander watch must survive untouched");
+        let bystander_subs = read_ci_watch_subscribers(&bystander);
+        assert_eq!(
+            bystander_subs,
+            vec!["lead".to_string()],
+            "bystander subscriber list must be unchanged"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_worktree_deletes_watch_when_last_subscriber_unsubscribes() {
+        // Defensive bonus pin: agent is the SOLE subscriber to a
+        // cross-branch watch. Release must delete the watch file
+        // entirely (not leave an empty subscribers array).
+        let home = tmp_home("p0x-unsubscribe-last");
+        let repo = tmp_repo("p0x-unsubscribe-last-repo");
+        let _l = lease(&home, &repo, "dev", "feat-x").expect("lease");
+
+        let solo_watch = write_ci_watch(&home, "owner/repo", "main", &["dev"]);
+
+        release_full(&home, "dev");
+
+        assert!(
+            !solo_watch.exists(),
+            "watch with no remaining subscribers must be deleted entirely"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 }

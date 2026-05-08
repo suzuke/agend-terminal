@@ -1201,7 +1201,127 @@ pub fn detect_provider_from_remote(repo: &str) -> (&'static str, bool) {
     }
 }
 
+/// Sprint 57 Wave 2 Track B (#546 Item 1 + Item 3 migration) —
+/// scan ci-watches dir, remove any watch that:
+///   1. has `expires_at < now` (absolute TTL elapsed),
+///   2. has `last_terminal_seen_at` older than `WATCH_TTL_HOURS`
+///      (inactivity TTL elapsed), or
+///   3. targets a protected ref per `agent_ops::is_protected_ref`
+///      (E4.5 migration — closes the ci_watch-on-main bypass that
+///      Sprint 56's `handle_watch_ci` left open until Wave 2 Track B
+///      gated it).
+///
+/// The poll loop (`check_ci_watches_with_provider`) already enforces
+/// (1) and (2) lazily on every per-watch tick, but only for watches
+/// it actively polls — a watch can persist on disk indefinitely if
+/// the upstream branch is gone or no agent is currently polling it.
+/// This eager helper closes that gap by walking the entire dir
+/// without entering the poll path.
+///
+/// Returns the number of watches removed. Best-effort: read/parse
+/// failures skip the entry rather than aborting the sweep.
+pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
+    let ci_dir = home.join("ci-watches");
+    let Ok(entries) = std::fs::read_dir(&ci_dir) else {
+        return 0;
+    };
+    let now_utc = chrono::Utc::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        let repo = watch["repo"].as_str().unwrap_or("?");
+        let branch = watch["branch"].as_str().unwrap_or("?");
+        let audit_label = parse_subscribers(&watch).join(",");
+
+        // (3) E4.5 protected-ref migration — applied first because a
+        // protected-ref watch is invalid regardless of TTL state.
+        if crate::agent_ops::is_protected_ref(branch) {
+            remove_watch(
+                home,
+                &path,
+                &audit_label,
+                repo,
+                branch,
+                &format!("{sweep_origin}_protected_branch_migration"),
+            );
+            tracing::info!(repo = %repo, branch = %branch, sweep = %sweep_origin,
+                "ci_watch removed (E4.5 protected-branch migration)");
+            removed += 1;
+            continue;
+        }
+
+        // (1) absolute TTL.
+        if let Some(expires_at) = watch["expires_at"].as_str() {
+            if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
+                if now_utc > exp.with_timezone(&chrono::Utc) {
+                    remove_watch(
+                        home,
+                        &path,
+                        &audit_label,
+                        repo,
+                        branch,
+                        &format!("{sweep_origin}_expired"),
+                    );
+                    tracing::info!(repo = %repo, branch = %branch, sweep = %sweep_origin,
+                        "ci_watch removed (absolute TTL elapsed)");
+                    removed += 1;
+                    continue;
+                }
+            }
+        }
+
+        // (2) inactivity TTL.
+        if let Some(last_seen) = watch["last_terminal_seen_at"].as_str() {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
+                let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
+                if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
+                    remove_watch(
+                        home,
+                        &path,
+                        &audit_label,
+                        repo,
+                        branch,
+                        &format!("{sweep_origin}_inactivity_ttl"),
+                    );
+                    tracing::info!(repo = %repo, branch = %branch, hours = WATCH_TTL_HOURS,
+                        sweep = %sweep_origin,
+                        "ci_watch removed (inactivity TTL elapsed)");
+                    removed += 1;
+                    continue;
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// Sprint 57 Wave 2 Track B (#546 Item 1) — daemon-startup eager
+/// sweep. Runs once before the tick loop begins so stale entries
+/// from a prior daemon process don't outlive the restart. Idempotent;
+/// re-runs are no-ops once the dir is clean.
+pub fn startup_sweep(home: &Path) {
+    let removed = gc_stale_watches(home, "startup_sweep");
+    if removed > 0 {
+        tracing::info!(removed, "ci_watch startup sweep complete");
+    }
+}
+
 pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
+    // Sprint 57 Wave 2 Track B (#546 Item 1) — eager per-tick GC pass
+    // BEFORE the poll loop. The lazy expiry inside the poll body still
+    // runs (Sprint 53/54 era), but it can only see watches actively
+    // being polled. This pass closes the "stale on disk after upstream
+    // branch deletion" gap.
+    let _ = gc_stale_watches(home, "eager_gc");
     check_ci_watches_with_provider(home, registry, |watch| {
         let ci_url = watch
             .get("ci_provider_url")
@@ -2574,7 +2694,15 @@ mod tests {
             "past-expires_at watch must be removed"
         );
         let log = std::fs::read_to_string(dir.join("event-log.jsonl")).unwrap_or_default();
-        assert!(log.contains("reason=expired"), "reason must be expired");
+        // Sprint 57 Wave 2 Track B (#546 Item 1): the eager per-tick GC
+        // pass at the top of `check_ci_watches` removes the watch first
+        // and emits `reason=eager_gc_expired`; the legacy lazy expiry
+        // emits `reason=expired`. Either substring is correct evidence
+        // that the absolute-TTL path fired.
+        assert!(
+            log.contains("expired"),
+            "reason must include 'expired'; got:\n{log}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -3509,7 +3637,7 @@ mod tests {
             &dir,
             &serde_json::json!({
                 "repo": "myws/myrepo",
-                "branch": "main",
+                "branch": "feat-test",
                 "ci_provider": "bitbucket_server",
             }),
             "test-inst",
@@ -4319,5 +4447,180 @@ mod tests {
             matches!(state, super::PrState::Terminal { merged: true }),
             "matching head.ref + recent merged_at must be Terminal(merged); got: {state:?}"
         );
+    }
+
+    // -------------------------------------------------------------
+    // Sprint 57 Wave 2 Track B (#546 Items 1+3) — startup sweep,
+    // per-tick eager GC, and protected-ref migration via
+    // `gc_stale_watches` / `startup_sweep`.
+    // -------------------------------------------------------------
+
+    /// Helper for the new GC tests — write a synthetic watch JSON to
+    /// disk under `home/ci-watches/<filename>`. Returns the file path.
+    fn write_watch(
+        home: &std::path::Path,
+        repo: &str,
+        branch: &str,
+        watch: &serde_json::Value,
+    ) -> std::path::PathBuf {
+        let ci_dir = home.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let filename = super::watch_filename(repo, branch);
+        let path = ci_dir.join(&filename);
+        std::fs::write(&path, serde_json::to_string(watch).unwrap()).ok();
+        path
+    }
+
+    #[test]
+    fn ci_watch_ttl_expires_stale_entries_on_startup_sweep() {
+        // Direct gc_stale_watches call simulates the daemon-startup
+        // path that runs before the tick loop spins up. An expired
+        // (absolute TTL elapsed) entry must be removed AND the event
+        // log must record the removal with the startup_sweep origin.
+        let home = tmp_dir("startup-sweep-ttl");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat-stale", "interval_secs": 60,
+            "subscribers": [{"instance": "agent-x"}],
+            "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": past,
+            "last_terminal_seen_at": null,
+        });
+        let path = write_watch(&home, "o/r", "feat-stale", &watch);
+
+        super::startup_sweep(&home);
+
+        assert!(
+            !path.exists(),
+            "expired watch must be removed by startup sweep"
+        );
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("ci_watch_removed"),
+            "removal event must log; got:\n{log}"
+        );
+        assert!(
+            log.contains("startup_sweep_expired"),
+            "reason must include startup_sweep origin; got:\n{log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn ci_watch_ttl_eager_gc_per_tick() {
+        // Per-tick path: `check_ci_watches` calls `gc_stale_watches`
+        // BEFORE the poll loop. A watch with `expires_at` in the past
+        // but no subscribers list (so the legacy poll body would
+        // continue rather than expire it) must still be removed by
+        // the eager GC.
+        let home = tmp_dir("eager-gc-ttl");
+        let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat-stale-eager", "interval_secs": 60,
+            // empty subscribers — poll loop would `continue` past it
+            // without expiring; eager GC must catch it anyway.
+            "subscribers": [],
+            "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": past,
+            "last_terminal_seen_at": null,
+        });
+        let path = write_watch(&home, "o/r", "feat-stale-eager", &watch);
+
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        super::check_ci_watches(&home, &registry);
+
+        assert!(
+            !path.exists(),
+            "eager GC must remove expired watch even when subscribers list is empty"
+        );
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("eager_gc_expired"),
+            "per-tick eager-GC origin must appear in log; got:\n{log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn migrate_existing_main_watches_at_startup() {
+        // Item 3 migration: any pre-existing watch with branch=main
+        // (or master) was created before the E4.5 gate landed in
+        // handle_watch_ci. Startup sweep must remove it regardless
+        // of TTL state so the bypass is closed retroactively.
+        let home = tmp_dir("migrate-main-watches");
+        let watch_main = serde_json::json!({
+            "repo": "owner/repo", "branch": "main", "interval_secs": 60,
+            "subscribers": [{"instance": "general"}],
+            "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            // Fresh expires_at — would NOT trip the TTL paths.
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_master = serde_json::json!({
+            "repo": "owner/legacy-repo", "branch": "master", "interval_secs": 60,
+            "subscribers": [{"instance": "lead"}],
+            "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_feat = serde_json::json!({
+            "repo": "owner/repo", "branch": "feat-not-touched", "interval_secs": 60,
+            "subscribers": [{"instance": "dev"}],
+            "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let path_main = write_watch(&home, "owner/repo", "main", &watch_main);
+        let path_master = write_watch(&home, "owner/legacy-repo", "master", &watch_master);
+        let path_feat = write_watch(&home, "owner/repo", "feat-not-touched", &watch_feat);
+
+        super::startup_sweep(&home);
+
+        assert!(
+            !path_main.exists(),
+            "main watch must be migrated/removed by startup sweep"
+        );
+        assert!(
+            !path_master.exists(),
+            "master watch must be migrated/removed by startup sweep"
+        );
+        assert!(path_feat.exists(), "non-protected watch must be preserved");
+
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("startup_sweep_protected_branch_migration"),
+            "migration reason must surface in audit log; got:\n{log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_stale_watches_idempotent_on_clean_dir() {
+        // Defensive bonus pin: re-running the sweep on an already-
+        // clean dir must be a no-op (zero removals, zero log entries).
+        let home = tmp_dir("gc-idempotent");
+        let watch = serde_json::json!({
+            "repo": "o/r", "branch": "feat-fresh", "interval_secs": 60,
+            "subscribers": [{"instance": "dev"}],
+            "last_run_id": null, "head_sha": null,
+            "last_polled_at": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let path = write_watch(&home, "o/r", "feat-fresh", &watch);
+
+        let n1 = super::gc_stale_watches(&home, "test_pass1");
+        let n2 = super::gc_stale_watches(&home, "test_pass2");
+
+        assert_eq!(n1, 0, "first sweep on fresh dir must remove nothing");
+        assert_eq!(n2, 0, "second sweep is idempotent");
+        assert!(path.exists(), "fresh watch must survive both sweeps");
+        std::fs::remove_dir_all(&home).ok();
     }
 }

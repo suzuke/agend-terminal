@@ -185,9 +185,14 @@ fn ec7_release_full_unsubscribes_matching_branch() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+// Sprint 57 Wave 2 Track B (#546 Item 2) — release_full unsubscribes
+// the agent from EVERY watch they appear on, including ad-hoc cross-
+// branch watches. Replaces the EC7 r1 reviewer-driven pin that scoped
+// the unsubscribe to the binding-branch only; that scope let agents
+// leak orphan watches across release.
 #[test]
-fn ec7_release_full_leaves_unrelated_watches_untouched() {
-    let home = tmp_home("ec7-unrelated");
+fn release_full_unsubscribes_agent_from_cross_branch_watches_too() {
+    let home = tmp_home("ec7-cross-branch-now-unsubscribed");
     setup_git_repo(&home, "alpha");
     let _ = super::dispatch_hook::dispatch_auto_bind_lease(
         &home,
@@ -196,24 +201,30 @@ fn ec7_release_full_leaves_unrelated_watches_untouched() {
         "feat-ec7u",
         Some("o/r"),
     );
-    // Different branch: must remain after release of feat-ec7u.
-    let other_path = write_ci_watch(&home, "o/r", "main", &["alpha"]);
+    // Seed an ad-hoc cross-branch watch (e.g. agent followed `dev`
+    // for a sibling task). Pre-Sprint-57-Wave-2 this leaked across
+    // release; the new agent-keyed enumerator must clean it up.
+    let other_path = write_ci_watch(&home, "o/r", "dev", &["alpha"]);
 
     crate::worktree_pool::release_full(&home, "alpha");
 
-    let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&other_path).unwrap()).unwrap();
-    let subs = crate::daemon::ci_watch::parse_subscribers(&v);
-    assert_eq!(subs, vec!["alpha".to_string()], "unrelated watch untouched");
+    // alpha was the sole subscriber → file deleted entirely.
+    assert!(
+        !other_path.exists(),
+        "cross-branch watch must be removed when releasing the sole subscriber agent"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
-// EC7 r1 (reviewer m-99): the unsubscribe predicate must match exact
-// `(repo, branch)` — same branch name on different repos must NOT
-// cross-bleed when one is released.
+// Sprint 57 Wave 2 Track B (#546 Item 2) — replaces the previous EC7 r1
+// pin (`ec7_release_full_does_not_unsubscribe_same_branch_different_repo`).
+// Agent names are unique within the fleet, so the cross-repo concern
+// the EC7 r1 reviewer raised does not apply to agent-keyed
+// unsubscribe: removing `alpha` from any watch where they appear is
+// always correct on release.
 #[test]
-fn ec7_release_full_does_not_unsubscribe_same_branch_different_repo() {
-    let home = tmp_home("ec7-cross-repo");
+fn release_full_unsubscribes_agent_from_cross_repo_watches_too() {
+    let home = tmp_home("ec7-cross-repo-now-unsubscribed");
     setup_git_repo_with_remote(&home, "alpha", "https://github.com/o/repo-a.git");
     let _ = super::dispatch_hook::dispatch_auto_bind_lease(
         &home,
@@ -222,21 +233,24 @@ fn ec7_release_full_does_not_unsubscribe_same_branch_different_repo() {
         "feat-x",
         Some("o/repo-a"),
     );
-    // Same branch name on a DIFFERENT repo. Must remain after release of
-    // alpha (which is bound to o/repo-a).
+    // Same branch name on a DIFFERENT repo (e.g. agent watched
+    // upstream's feat-x for cross-repo coordination). Must shrink to
+    // remaining subscribers on release.
     let cross_repo_path = write_ci_watch(&home, "o/repo-b", "feat-x", &["alpha", "bob"]);
-    // Also seed alpha's own repo-a watch so we can confirm THIS one shrinks.
+    // alpha's own repo-a watch so we can confirm both shrink.
     let own_path = write_ci_watch(&home, "o/repo-a", "feat-x", &["alpha", "bob"]);
 
     crate::worktree_pool::release_full(&home, "alpha");
 
+    // BOTH watches shrink — agent-keyed unsubscribe doesn't care
+    // about repo/branch matching the binding.
     let cross: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cross_repo_path).unwrap()).unwrap();
     let cross_subs = crate::daemon::ci_watch::parse_subscribers(&cross);
     assert_eq!(
         cross_subs,
-        vec!["alpha".to_string(), "bob".to_string()],
-        "same-branch different-repo watch UNTOUCHED — alpha bleed prevented"
+        vec!["bob".to_string()],
+        "same-branch different-repo watch must also shrink — agent name is unique fleet-wide"
     );
 
     let own: serde_json::Value =
@@ -536,7 +550,12 @@ fn ci_watch_uses_binding_source_repo_when_repo_arg_absent() {
     // ci(watch) with NO repo arg — handler reads binding's source_repo + derives
     // owner/repo via `derive_repo_from_remote_pub`. Origin is configured to
     // `https://github.com/o/r.git` so derive returns `o/r`.
-    let result = super::ci::handle_watch_ci(&home, &json!({}), "alpha");
+    //
+    // Sprint 57 Wave 2 Track B (#546 Item 3): branch field is now
+    // explicit because the default-to-"main" path is rejected by the
+    // new E4.5 gate. Any non-protected branch exercises the auto-derive
+    // logic this test pins.
+    let result = super::ci::handle_watch_ci(&home, &json!({"branch": "feat-auto"}), "alpha");
     assert_eq!(
         result["repo"], "o/r",
         "auto-derive must resolve to 'o/r' from origin URL: {result}"

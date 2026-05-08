@@ -123,12 +123,12 @@ fn ci_watch_appends_subscriber_idempotent_distinct_callers() {
     // was the Sprint 53 multi-caller bug.
     let home = std::env::temp_dir().join(format!("agend-watch-append-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
 
     handle_watch_ci(&home, &args, "lead");
     handle_watch_ci(&home, &args, "dev");
 
-    let watch = read_watch(&watch_path_for(&home, "owner/repo", "main"));
+    let watch = read_watch(&watch_path_for(&home, "owner/repo", "feat-test"));
     let subs: Vec<&str> = watch["subscribers"]
         .as_array()
         .expect("subscribers array")
@@ -149,13 +149,13 @@ fn ci_watch_double_subscribe_same_caller_is_idempotent() {
     // the strict mathematical sense — `f(f(x)) == f(x)`.
     let home = std::env::temp_dir().join(format!("agend-watch-dup-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
 
     handle_watch_ci(&home, &args, "lead");
     handle_watch_ci(&home, &args, "lead");
     handle_watch_ci(&home, &args, "lead");
 
-    let watch = read_watch(&watch_path_for(&home, "owner/repo", "main"));
+    let watch = read_watch(&watch_path_for(&home, "owner/repo", "feat-test"));
     let subs = watch["subscribers"].as_array().unwrap();
     assert_eq!(subs.len(), 1, "duplicate subscribe must collapse");
     assert_eq!(subs[0]["instance"].as_str(), Some("lead"));
@@ -169,12 +169,12 @@ fn ci_watch_preserves_poll_state_on_resubscribe() {
     // duplicate notification.
     let home = std::env::temp_dir().join(format!("agend-watch-state-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
 
     handle_watch_ci(&home, &args, "lead");
 
     // Simulate the daemon's poll-loop having stamped state.
-    let path = watch_path_for(&home, "owner/repo", "main");
+    let path = watch_path_for(&home, "owner/repo", "feat-test");
     let mut watch = read_watch(&path);
     watch["last_run_id"] = serde_json::json!(42_u64);
     watch["last_polled_at"] = serde_json::json!(1_700_000_000_000_i64);
@@ -207,12 +207,12 @@ fn ci_watch_legacy_instance_field_migrates_on_resubscribe() {
     let home = std::env::temp_dir().join(format!("agend-watch-migrate-{}", std::process::id()));
     let ci_dir = home.join("ci-watches");
     std::fs::create_dir_all(&ci_dir).ok();
-    let path = watch_path_for(&home, "owner/repo", "main");
+    let path = watch_path_for(&home, "owner/repo", "feat-test");
 
     // Hand-craft a legacy watch file (no subscribers array).
     let legacy = serde_json::json!({
         "repo": "owner/repo",
-        "branch": "main",
+        "branch": "feat-test",
         "interval_secs": 60,
         "instance": "lead",
         "last_run_id": 100,
@@ -227,7 +227,7 @@ fn ci_watch_legacy_instance_field_migrates_on_resubscribe() {
     // Trigger migration via a fresh subscribe.
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "owner/repo", "branch": "main"}),
+        &serde_json::json!({"repo": "owner/repo", "branch": "feat-test"}),
         "dev",
     );
 
@@ -256,16 +256,16 @@ fn ci_unwatch_removes_caller_only_when_others_remain() {
     // and writes the file back. Watch file is NOT deleted.
     let home = std::env::temp_dir().join(format!("agend-unwatch-keep-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
     handle_watch_ci(&home, &args, "lead");
     handle_watch_ci(&home, &args, "dev");
 
-    let path = watch_path_for(&home, "owner/repo", "main");
+    let path = watch_path_for(&home, "owner/repo", "feat-test");
     assert!(path.exists());
 
     let unwatch_args = serde_json::json!({
         "repo": "owner/repo",
-        "branch": "main",
+        "branch": "feat-test",
         "instance": "lead",
     });
     let resp = handle_unwatch_ci(&home, &unwatch_args);
@@ -297,15 +297,15 @@ fn ci_unwatch_deletes_file_when_subscribers_empty() {
     // branch nobody cares about anymore.
     let home = std::env::temp_dir().join(format!("agend-unwatch-delete-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
     handle_watch_ci(&home, &args, "lead");
 
-    let path = watch_path_for(&home, "owner/repo", "main");
+    let path = watch_path_for(&home, "owner/repo", "feat-test");
     assert!(path.exists());
 
     let unwatch_args = serde_json::json!({
         "repo": "owner/repo",
-        "branch": "main",
+        "branch": "feat-test",
         "instance": "lead",
     });
     let resp = handle_unwatch_ci(&home, &unwatch_args);
@@ -322,13 +322,13 @@ fn ci_unwatch_unknown_caller_is_noop_keeps_watch() {
     // way to clobber lead's watch via dev's typo).
     let home = std::env::temp_dir().join(format!("agend-unwatch-noop-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
     handle_watch_ci(&home, &args, "lead");
 
-    let path = watch_path_for(&home, "owner/repo", "main");
+    let path = watch_path_for(&home, "owner/repo", "feat-test");
     let unwatch_args = serde_json::json!({
         "repo": "owner/repo",
-        "branch": "main",
+        "branch": "feat-test",
         "instance": "stranger",
     });
     handle_unwatch_ci(&home, &unwatch_args);
@@ -372,7 +372,7 @@ fn watch_ci_response_includes_health_fields_when_state_populated() {
     // optional-field ladders.
     let home = std::env::temp_dir().join(format!("agend-p05-A1-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
     let resp = handle_watch_ci(&home, &args, "lead");
 
     assert_eq!(resp["watching"].as_bool(), Some(true));
@@ -394,10 +394,10 @@ fn watch_ci_rate_limit_active_when_until_in_future() {
     // just stamped rate_limit_until.
     let home = std::env::temp_dir().join(format!("agend-p05-A2-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
     handle_watch_ci(&home, &args, "lead");
 
-    let path = watch_path_for(&home, "owner/repo", "main");
+    let path = watch_path_for(&home, "owner/repo", "feat-test");
     let mut watch = read_watch(&path);
     let future_secs = chrono::Utc::now().timestamp() + 3600;
     watch["rate_limit_until"] = serde_json::json!(future_secs);
@@ -422,7 +422,7 @@ fn watch_ci_next_poll_eta_null_for_fresh_watch() {
     // the next poll" when no poll has happened yet.
     let home = std::env::temp_dir().join(format!("agend-p05-A3-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
-    let args = serde_json::json!({"repo": "owner/repo", "branch": "main"});
+    let args = serde_json::json!({"repo": "owner/repo", "branch": "feat-test"});
     let resp = handle_watch_ci(&home, &args, "lead");
     assert!(resp["next_poll_eta"].is_null());
     std::fs::remove_dir_all(&home).ok();
@@ -439,12 +439,12 @@ fn ci_status_returns_caller_subscribed_watches() {
     std::fs::create_dir_all(&home).ok();
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "o/r1", "branch": "main"}),
+        &serde_json::json!({"repo": "o/r1", "branch": "feat-test"}),
         "lead",
     );
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "o/r2", "branch": "main"}),
+        &serde_json::json!({"repo": "o/r2", "branch": "feat-test"}),
         "dev",
     );
 
@@ -474,12 +474,12 @@ fn ci_status_filter_by_repo_returns_subset() {
     std::fs::create_dir_all(&home).ok();
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "o/alpha", "branch": "main"}),
+        &serde_json::json!({"repo": "o/alpha", "branch": "feat-test"}),
         "lead",
     );
     handle_watch_ci(
         &home,
-        &serde_json::json!({"repo": "o/beta", "branch": "main"}),
+        &serde_json::json!({"repo": "o/beta", "branch": "feat-test"}),
         "lead",
     );
 
@@ -502,5 +502,102 @@ fn ci_status_no_watches_returns_empty_array_not_error() {
     assert!(resp.get("error").is_none());
     let watches = resp["watches"].as_array().expect("watches array");
     assert!(watches.is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------
+// Sprint 57 Wave 2 Track B (#546 Item 3) — handle_watch_ci E4.5 gate.
+// ---------------------------------------------------------------------
+
+fn watch_test_home(tag: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!("agend-watch-e45-{}-{}", std::process::id(), tag));
+    std::fs::create_dir_all(&home).ok();
+    home
+}
+
+#[test]
+fn handle_watch_ci_rejects_protected_refs() {
+    // Both `main` and `master` must surface the canonical
+    // `e4_5_protected_branch` error code so callers can branch on
+    // it the same way `bind_self` callers do.
+    for branch in &["main", "master"] {
+        let home = watch_test_home(&format!("reject-{branch}"));
+        let resp = super::handle_watch_ci(
+            &home,
+            &serde_json::json!({"repo": "owner/repo", "branch": branch}),
+            "dev",
+        );
+        assert!(
+            resp["error"].as_str().is_some(),
+            "branch={branch} must error, got {resp}"
+        );
+        assert_eq!(
+            resp["code"].as_str(),
+            Some("e4_5_protected_branch"),
+            "branch={branch} error code must be e4_5_protected_branch, got {resp}"
+        );
+
+        // No side-effect on rejection: ci-watches dir must not gain
+        // a new file for the protected branch.
+        let ci_dir = home.join("ci-watches");
+        if let Ok(rd) = std::fs::read_dir(&ci_dir) {
+            let n: usize = rd.count();
+            assert_eq!(
+                n, 0,
+                "rejected ci_watch must not write a watch file (branch={branch})"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[test]
+fn handle_watch_ci_default_branch_does_not_silently_set_main() {
+    // The handler defaults `branch` to "main" when the caller omits
+    // it. After the Item 3 gate, that default-then-create flow must
+    // be rejected with the same E4.5 error rather than silently
+    // creating a watch on main. Pin against re-introduction of the
+    // silent-default behavior.
+    let home = watch_test_home("default-no-silent-main");
+    let resp = super::handle_watch_ci(
+        &home,
+        // NO branch field — exercises the `unwrap_or("main")`.
+        &serde_json::json!({"repo": "owner/repo"}),
+        "dev",
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("e4_5_protected_branch"),
+        "default-branch path must hit the E4.5 gate, got {resp}"
+    );
+
+    let ci_dir = home.join("ci-watches");
+    if let Ok(rd) = std::fs::read_dir(&ci_dir) {
+        assert_eq!(rd.count(), 0, "no watch file must be created on rejection");
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn handle_watch_ci_accepts_non_protected_branch() {
+    // Defensive bonus pin: a feature branch must still be accepted
+    // post-gate (the gate must be a CHECK not a refusal-of-all).
+    let home = watch_test_home("accept-feature");
+    let resp = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repo": "owner/repo",
+            "branch": "feat/sprint57-wave2-track-b",
+            "interval_secs": 60_u64,
+        }),
+        "dev",
+    );
+    // Either Ok shape OR a different error — but NOT
+    // e4_5_protected_branch.
+    let code = resp["code"].as_str().unwrap_or("");
+    assert_ne!(
+        code, "e4_5_protected_branch",
+        "non-protected branch must NOT trip E4.5 gate, got {resp}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }

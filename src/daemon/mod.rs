@@ -344,6 +344,12 @@ fn run_core(
     // one-shots and recurring crons.
     replay_missed_at_startup(home, &registry);
 
+    // Sprint 57 Wave 2 Track B (#546 Items 1+3) — eager ci-watch
+    // sweep at daemon startup: removes any expired or protected-ref
+    // watch left behind by a prior daemon process before the first
+    // tick fires. Idempotent.
+    crate::daemon::ci_watch::startup_sweep(home);
+
     let mut last_snapshot_json = String::new();
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)

@@ -230,6 +230,16 @@ pub fn validate_branch(branch: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '_' || c == '-' || c == '.')
 }
 
+/// E4.5 protected-branch invariant. Returns `true` for branches that
+/// agents MUST NOT lease, watch, or otherwise hold a per-agent
+/// concept of interest in. The canonical set is `main` and `master`;
+/// extending the set here propagates to every E4.5 enforcement site
+/// (currently `worktree_pool::lease` for worktree leases and
+/// `mcp::handlers::ci::handle_watch_ci` for CI watch subscriptions).
+pub fn is_protected_ref(branch: &str) -> bool {
+    matches!(branch, "main" | "master")
+}
+
 // ---------------------------------------------------------------------------
 // Working-directory cleanup (CANONICAL 19-entry list)
 // ---------------------------------------------------------------------------
@@ -393,6 +403,41 @@ mod tests {
     #[test]
     fn branch_rejects_empty() {
         assert!(!validate_branch(""));
+    }
+
+    // --- is_protected_ref (E4.5 invariant — Sprint 57 Wave 2 Track B #546) ---
+
+    #[test]
+    fn is_protected_ref_main_and_master() {
+        assert!(is_protected_ref("main"));
+        assert!(is_protected_ref("master"));
+    }
+
+    #[test]
+    fn is_protected_ref_rejects_feature_branches() {
+        assert!(!is_protected_ref("feature/x"));
+        assert!(!is_protected_ref("sprint57-track-b"));
+        assert!(!is_protected_ref("release/v1.0.0"));
+        assert!(!is_protected_ref("hotfix"));
+    }
+
+    #[test]
+    fn is_protected_ref_case_sensitive_by_design() {
+        // Git refs ARE case-sensitive on case-sensitive filesystems;
+        // matching the literal lowercase "main"/"master" is intentional.
+        // Anything else (Main, MAIN, Master) is a different ref and not
+        // protected by this invariant.
+        assert!(!is_protected_ref("Main"));
+        assert!(!is_protected_ref("MAIN"));
+        assert!(!is_protected_ref("Master"));
+    }
+
+    #[test]
+    fn is_protected_ref_rejects_empty_and_substrings() {
+        assert!(!is_protected_ref(""));
+        assert!(!is_protected_ref("mainline"));
+        assert!(!is_protected_ref("upstream-main"));
+        assert!(!is_protected_ref("master/dev"));
     }
 
     #[test]
