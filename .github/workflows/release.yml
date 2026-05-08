@@ -79,14 +79,23 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz agend-terminal
+          # Sprint 56 Track I-Phase2a (#531): bundle agend-mcp-bridge
+          # alongside agend-terminal so backends spawned by the daemon's
+          # mcp_config can find it next to the main binary. Without
+          # this, mcp_config::bridge_binary_path falls back to
+          # `agend-terminal mcp` and reply / react / download_attachment
+          # land on the daemon-state-unreachable error path on Windows.
+          tar czf ../../../agend-terminal-${{ matrix.target }}.tar.gz agend-terminal agend-mcp-bridge
 
       - name: Package (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
+          # Sprint 56 Track I-Phase2a (#531): same dual-binary packaging
+          # as the Unix tar arm. PowerShell's Compress-Archive `-Path`
+          # accepts a comma-separated array of file paths.
           Compress-Archive `
-            -Path target/${{ matrix.target }}/release/agend-terminal.exe `
+            -Path "target/${{ matrix.target }}/release/agend-terminal.exe","target/${{ matrix.target }}/release/agend-mcp-bridge.exe" `
             -DestinationPath agend-terminal-${{ matrix.target }}.zip
 
       - name: Upload artifact
@@ -131,6 +140,12 @@ jobs:
           mkdir -p AppDir/usr/share/applications
           mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
           cp target/release/agend-terminal AppDir/usr/bin/agend-terminal
+          # Sprint 56 Track I-Phase2a (#531): ship the bridge binary
+          # alongside the main one inside the AppImage. Same rationale
+          # as the tar/zip arms above — without this, the AppImage
+          # operators hit the same #531 fallback-to-`agend-terminal
+          # mcp` failure mode for daemon-state-required tools.
+          cp target/release/agend-mcp-bridge AppDir/usr/bin/agend-mcp-bridge
           cp assets/appimage/agend-terminal.desktop AppDir/usr/share/applications/agend-terminal.desktop
           # Resize 1024x1024 master → 256x256 for hicolor + AppImage root
           convert assets/appimage/agend-terminal.png -resize 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/agend-terminal.png
