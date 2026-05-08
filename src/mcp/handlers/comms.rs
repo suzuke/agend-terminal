@@ -268,20 +268,28 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     let task_id_str = args["task_id"].as_str();
 
     // Sprint 53 P0-1+P0-2: lease + watch_ci gate BEFORE send (Q2 ordering fix).
-    // If branch field present, attempt lease first. Reject if lease fails.
-    // P0-2: also auto-fires watch_ci inside dispatch_auto_bind_lease, replacing
-    // the post-SEND Hotfix C #451 block (deleted below).
+    // P0-2: auto-fires watch_ci inside dispatch_auto_bind_lease (replaces
+    // post-SEND Hotfix C #451). Sprint 55 P0-C: `bind: false` arg skips the
+    // auto-bind for read-only RCA/audit/design tasks; absence defaults to
+    // current auto-bind-on-branch behavior (50+ existing sites preserved).
     if let Some(branch) = args["branch"].as_str() {
         let task_id_val = task_id_str.unwrap_or("");
-        let repo_arg = args["repo"].as_str();
-        if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease(
-            home,
-            target,
-            task_id_val,
-            branch,
-            repo_arg,
-        ) {
-            return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
+        if dispatch_should_skip_auto_bind(args) {
+            tracing::info!(
+                %target, %branch, task_id = %task_id_val,
+                "dispatch_auto_bind_lease skipped (bind: false)"
+            );
+        } else {
+            let repo_arg = args["repo"].as_str();
+            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease(
+                home,
+                target,
+                task_id_val,
+                branch,
+                repo_arg,
+            ) {
+                return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
+            }
         }
     }
 
@@ -674,3 +682,16 @@ pub(super) fn handle_describe_thread(home: &Path, args: &Value) -> Value {
     let msgs = crate::inbox::get_thread(home, thread_id, instance);
     json!({"thread_id": thread_id, "messages": msgs, "count": msgs.len()})
 }
+
+/// Sprint 55 P0-C — true when the caller passed `bind: false`, signaling
+/// a read-only RCA/audit/design dispatch that should NOT trigger
+/// `dispatch_auto_bind_lease`. Default (absent or `Some(true)`) preserves
+/// the auto-bind behavior all 50+ existing dispatch sites rely on.
+fn dispatch_should_skip_auto_bind(args: &Value) -> bool {
+    args["bind"].as_bool() == Some(false)
+}
+
+// Sprint 55 P0-C — helper tests in sibling file (file_size_invariant ceiling).
+#[cfg(test)]
+#[path = "comms_p0c_tests.rs"]
+mod p0c_tests;

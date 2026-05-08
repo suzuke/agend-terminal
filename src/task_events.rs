@@ -207,6 +207,13 @@ pub enum TaskEvent {
         /// **v2** — git branch the implementer should work on.
         #[serde(default)]
         branch: Option<String>,
+        /// **Sprint 55 P0-C** — opt-out flag for daemon auto-bind on
+        /// dispatch. `Some(false)` skips `dispatch_auto_bind_lease` so
+        /// read-only RCA/audit/design tasks don't waste a worktree.
+        /// `None` (absent) or `Some(true)` preserves current auto-bind
+        /// behavior. v1 envelopes default to `None` via serde.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bind: Option<bool>,
     },
     Claimed {
         task_id: TaskId,
@@ -410,6 +417,10 @@ pub struct TaskRecord {
     pub routed_to: Option<InstanceName>,
     pub result: Option<String>,
     pub branch: Option<String>,
+    /// Sprint 55 P0-C — opt-out flag for daemon auto-bind on dispatch.
+    /// `Some(false)` means RCA/audit/design class; auto-bind was skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bind: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -480,6 +491,7 @@ impl TaskBoardState {
                 depends_on,
                 routed_to,
                 branch,
+                bind,
                 ..
             } => {
                 self.tasks
@@ -502,6 +514,7 @@ impl TaskBoardState {
                         routed_to: routed_to.clone(),
                         result: None,
                         branch: branch.clone(),
+                        bind: *bind,
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -875,6 +888,7 @@ mod tests {
             depends_on: Vec::new(),
             routed_to: None,
             branch: None,
+            bind: None,
         }
     }
 
@@ -1336,6 +1350,7 @@ mod tests {
                 depends_on: Vec::new(),
                 routed_to: None,
                 branch: None,
+                bind: None,
             },
         )
         .unwrap();
@@ -1409,6 +1424,7 @@ mod tests {
                     depends_on: Vec::new(),
                     routed_to: None,
                     branch: None,
+                    bind: None,
                 },
                 "Claimed" => TaskEvent::Claimed {
                     task_id: tid.clone(),
@@ -1600,6 +1616,7 @@ mod tests {
                 depends_on: Vec::new(),
                 routed_to: None,
                 branch: None,
+                bind: None,
             },
         )
         .unwrap();
@@ -1677,6 +1694,7 @@ mod tests {
                     depends_on: Vec::new(),
                     routed_to: None,
                     branch: None,
+                    bind: None,
                 },
             },
             // Sweep Linked appears BEFORE operator Claimed in file order
@@ -1798,5 +1816,64 @@ mod tests {
         );
         let deser: TaskEventEnvelope = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(deser.emitter_id, None);
+    }
+
+    // ── Sprint 55 P0-C — bind opt-out flag schema tests ─────────────
+
+    #[test]
+    fn created_event_v1_envelope_default_bind_none() {
+        // Pre-P0-C envelopes have no `bind` field; serde must default to
+        // None so existing tasks.json migrations + any v1 log replay
+        // continue to work exactly as before.
+        let v1_json = r#"{
+            "kind": "Created",
+            "task_id": "t-v1",
+            "title": "v1 task",
+            "description": "",
+            "priority": "normal",
+            "owner": null,
+            "due_at": null,
+            "depends_on": [],
+            "routed_to": null,
+            "branch": null
+        }"#;
+        let event: TaskEvent = serde_json::from_str(v1_json).expect("v1 envelope must deserialize");
+        match event {
+            TaskEvent::Created { bind, .. } => assert_eq!(bind, None),
+            _ => panic!("expected Created variant"),
+        }
+    }
+
+    #[test]
+    fn created_event_round_trips_bind_some_false_through_replay() {
+        // Append a Created event with bind=Some(false), replay the log,
+        // and verify TaskRecord.bind preserves the opt-out signal end to
+        // end (event log → apply → in-memory record).
+        let home = tmp_home("p0c_bind_round_trip");
+        let inst = InstanceName::from("dev");
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: TaskId::from("t-rca"),
+                title: "rca task".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: Some(false),
+            },
+        )
+        .unwrap();
+        let state = replay(&home).expect("replay");
+        let task = state
+            .tasks
+            .get(&TaskId::from("t-rca"))
+            .expect("task in state");
+        assert_eq!(task.bind, Some(false));
+        std::fs::remove_dir_all(&home).ok();
     }
 }

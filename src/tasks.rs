@@ -312,6 +312,10 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
                 .as_ref()
                 .map(|s| crate::task_events::InstanceName(s.clone())),
             branch: t.branch.clone(),
+            // Sprint 55 P0-C: legacy migration has no bind value; default
+            // to None which preserves current auto-bind on subsequent
+            // dispatches referencing this task_id.
+            bind: None,
         });
         // Emit the minimum status-transition events to bring the task to
         // its current legacy status. The replay-derived view post-PR3
@@ -546,6 +550,9 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     .as_ref()
                     .map(|s| crate::task_events::InstanceName(s.clone())),
                 branch: args["branch"].as_str().map(String::from),
+                // Sprint 55 P0-C: opt-out flag for daemon auto-bind on
+                // dispatch. None = default auto-bind behavior preserved.
+                bind: args["bind"].as_bool(),
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => serde_json::json!({"id": id, "status": "created"}),
@@ -1418,6 +1425,7 @@ mod tests {
                 branch: None,
                 depends_on: vec![crate::task_events::TaskId("t-B".into())],
                 routed_to: None,
+                bind: None,
             },
         )
         .unwrap();
@@ -1434,6 +1442,7 @@ mod tests {
                 branch: None,
                 depends_on: vec![crate::task_events::TaskId("t-A".into())],
                 routed_to: None,
+                bind: None,
             },
         )
         .unwrap();
