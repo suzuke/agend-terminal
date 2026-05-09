@@ -508,6 +508,7 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 /// Entry for adding a dynamic instance to fleet.yaml.
+#[derive(Default)]
 pub struct InstanceYamlEntry {
     pub backend: Option<String>,
     pub working_directory: Option<String>,
@@ -609,7 +610,285 @@ pub fn add_instance_to_yaml(home: &Path, name: &str, config: &InstanceYamlEntry)
     add_instances_to_yaml(home, &[(name, config)])
 }
 
+/// Sprint 58 Wave 2 PR-2 (#525-9 / #16) field categorization for the
+/// 3-tier fleet.yaml merge contract. Each known field maps to one of
+/// two classes; unknown fields default to `OperatorHandEdit` so
+/// operator additions are preserved by default.
+///
+/// - `DaemonManaged`: daemon is the source of truth. On merge, daemon
+///   value OVERWRITES whatever the operator may have hand-edited.
+///   Hand-editing these fields is futile — daemon will rewrite on
+///   next mutation. Used for daemon-derived identifiers and
+///   bookkeeping fields.
+/// - `OperatorHandEdit`: operator-controlled. On merge, operator's
+///   value WINS over daemon-supplied value when they differ. If the
+///   field is unset operator-side, daemon's value lands. If both
+///   sides specify different values, the merger surfaces a 真衝突
+///   error per the operator-resolved baseline rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldClass {
+    DaemonManaged,
+    OperatorHandEdit,
+}
+
+/// Sprint 58 Wave 2 PR-2 (#525-9 / #16): hardcoded classification.
+/// Per general scope FINAL LOCK + dispatch hint, the per-field
+/// metadata could live as a `#[fleet_yaml(...)]` macro attribute,
+/// but the hardcoded list is simpler and keeps the merge contract
+/// auditable from a single function.
+///
+/// The list reflects the operator-resolved baseline: daemon
+/// authoritatively writes identity / bookkeeping / migration
+/// fields; everything else is operator-controlled.
+pub fn instance_field_class(field: &str) -> FieldClass {
+    match field {
+        // Daemon-derived bookkeeping: identity, telegram topic,
+        // git_branch (managed by worktree lease lifecycle), env
+        // (template-deployed), source_repo (binding-derived),
+        // worktree opt-out flag (lease-managed).
+        //
+        // Note that `command` / `args` / `model` / `ready_pattern`
+        // are deliberately operator-managed — operators may want to
+        // override the template's defaults per-instance, and
+        // template re-deploys should NOT clobber those overrides.
+        "id" | "topic_id" | "git_branch" | "source_repo" => FieldClass::DaemonManaged,
+        _ => FieldClass::OperatorHandEdit,
+    }
+}
+
+/// Sprint 58 Wave 2 PR-2 (#525-9 / #16): 真衝突 — same operator-hand-
+/// edit field has incompatible values from both sides. The merger
+/// surfaces this as a recoverable error so the operator can resolve
+/// manually rather than silently corrupting either intent.
+#[derive(Debug, Clone)]
+pub struct FieldConflict {
+    pub instance: String,
+    pub field: String,
+    pub operator_value: String,
+    pub daemon_value: String,
+}
+
+impl std::fmt::Display for FieldConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "fleet.yaml merge conflict — instance `{}` field `{}`: operator has `{}`, daemon proposed `{}`. \
+             Hand-edit fleet.yaml to resolve, OR delete the field to accept daemon's value.",
+            self.instance, self.field, self.operator_value, self.daemon_value
+        )
+    }
+}
+
+/// Sprint 58 Wave 2 PR-2 (#525-9 / #16): merge a new daemon-side
+/// `InstanceYamlEntry` into an existing on-disk YAML mapping per
+/// the 3-tier baseline rules:
+///
+/// 1. **DaemonManaged field** + daemon value present →
+///    OVERWRITE existing.
+/// 2. **OperatorHandEdit field** + daemon value present:
+///    - Existing absent → write daemon value.
+///    - Existing matches daemon value → no-op.
+///    - Existing differs from daemon value → 真衝突 → return
+///      `Err(FieldConflict)` (caller surfaces via diff output).
+/// 3. **Field absent on daemon side** → preserve existing
+///    (deep-merge default; never clobber operator additions).
+///
+/// Returns `Ok(())` on successful merge, or `Err(FieldConflict)` for
+/// the first 真衝突 detected (callers may iterate or aggregate).
+pub fn merge_instance_into_existing(
+    name: &str,
+    existing: &mut serde_yaml_ng::Mapping,
+    config: &InstanceYamlEntry,
+) -> Result<(), FieldConflict> {
+    use serde_yaml_ng::Value;
+
+    // Helper: classify-then-merge for scalar string fields.
+    let merge_string = |existing: &mut serde_yaml_ng::Mapping,
+                        field: &str,
+                        daemon_value: &Option<String>|
+     -> Result<(), FieldConflict> {
+        let Some(new_v) = daemon_value else {
+            return Ok(()); // daemon doesn't supply, preserve existing
+        };
+        let class = instance_field_class(field);
+        let key = Value::String(field.to_string());
+        match (class, existing.get(&key)) {
+            (FieldClass::DaemonManaged, _) => {
+                existing.insert(key, Value::String(new_v.clone()));
+                Ok(())
+            }
+            (FieldClass::OperatorHandEdit, None) => {
+                existing.insert(key, Value::String(new_v.clone()));
+                Ok(())
+            }
+            (FieldClass::OperatorHandEdit, Some(Value::String(old_v))) if old_v == new_v => {
+                Ok(()) // no-op, identical value
+            }
+            (FieldClass::OperatorHandEdit, Some(old)) => {
+                let old_str = match old {
+                    Value::String(s) => s.clone(),
+                    other => format!("{other:?}"),
+                };
+                Err(FieldConflict {
+                    instance: name.to_string(),
+                    field: field.to_string(),
+                    operator_value: old_str,
+                    daemon_value: new_v.clone(),
+                })
+            }
+        }
+    };
+
+    for (field, value) in [
+        ("backend", &config.backend),
+        ("working_directory", &config.working_directory),
+        ("role", &config.role),
+        ("instructions", &config.instructions),
+        ("source_repo", &config.source_repo),
+        ("repo", &config.repo),
+        ("github_login", &config.github_login),
+        ("model", &config.model),
+        ("ready_pattern", &config.ready_pattern),
+        ("command", &config.command),
+    ] {
+        merge_string(existing, field, value)?;
+    }
+
+    // Typed-value fields (Sprint 56 Track E): args / env / worktree.
+    // Each follows the same 3-tier rule. For args (Vec<String>) and
+    // env (HashMap), conflict detection compares serialized form.
+    if let Some(ref args) = config.args {
+        let key = Value::String("args".into());
+        let new_seq: Vec<Value> = args.iter().map(|s| Value::String(s.clone())).collect();
+        let new_value = Value::Sequence(new_seq.clone());
+        let class = instance_field_class("args");
+        match (class, existing.get(&key)) {
+            (FieldClass::DaemonManaged, _) => {
+                existing.insert(key, new_value);
+            }
+            (FieldClass::OperatorHandEdit, None) => {
+                existing.insert(key, new_value);
+            }
+            (FieldClass::OperatorHandEdit, Some(old)) if old == &new_value => {
+                // identical
+            }
+            (FieldClass::OperatorHandEdit, Some(old)) => {
+                return Err(FieldConflict {
+                    instance: name.to_string(),
+                    field: "args".into(),
+                    operator_value: format!("{old:?}"),
+                    daemon_value: format!("{new_value:?}"),
+                });
+            }
+        }
+    }
+    if let Some(ref env_map) = config.env {
+        let key = Value::String("env".into());
+        let mut new_env = serde_yaml_ng::Mapping::new();
+        for (k, v) in env_map {
+            new_env.insert(Value::String(k.clone()), Value::String(v.clone()));
+        }
+        let new_value = Value::Mapping(new_env.clone());
+        let class = instance_field_class("env");
+        match (class, existing.get(&key)) {
+            (FieldClass::DaemonManaged, _) => {
+                existing.insert(key, new_value);
+            }
+            (FieldClass::OperatorHandEdit, None) => {
+                existing.insert(key, new_value);
+            }
+            (FieldClass::OperatorHandEdit, Some(old)) if old == &new_value => {
+                // identical
+            }
+            (FieldClass::OperatorHandEdit, Some(old)) => {
+                return Err(FieldConflict {
+                    instance: name.to_string(),
+                    field: "env".into(),
+                    operator_value: format!("{old:?}"),
+                    daemon_value: format!("{new_value:?}"),
+                });
+            }
+        }
+    }
+    if let Some(worktree) = config.worktree {
+        let key = Value::String("worktree".into());
+        let new_value = Value::Bool(worktree);
+        let class = instance_field_class("worktree");
+        match (class, existing.get(&key)) {
+            (FieldClass::DaemonManaged, _) => {
+                existing.insert(key, new_value);
+            }
+            (FieldClass::OperatorHandEdit, None) => {
+                existing.insert(key, new_value);
+            }
+            (FieldClass::OperatorHandEdit, Some(old)) if old == &new_value => {
+                // identical
+            }
+            (FieldClass::OperatorHandEdit, Some(old)) => {
+                return Err(FieldConflict {
+                    instance: name.to_string(),
+                    field: "worktree".into(),
+                    operator_value: format!("{old:?}"),
+                    daemon_value: format!("{new_value:?}"),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Build a fresh instance mapping from an `InstanceYamlEntry` (no
+/// existing on-disk content). Extracted helper so the merge path
+/// and the new-instance path share the field-emission logic.
+fn build_instance_mapping(config: &InstanceYamlEntry) -> serde_yaml_ng::Mapping {
+    let mut inst = serde_yaml_ng::Mapping::new();
+    for (key, val) in [
+        ("backend", &config.backend),
+        ("working_directory", &config.working_directory),
+        ("role", &config.role),
+        ("instructions", &config.instructions),
+        ("source_repo", &config.source_repo),
+        ("repo", &config.repo),
+        ("github_login", &config.github_login),
+        ("model", &config.model),
+        ("ready_pattern", &config.ready_pattern),
+        ("command", &config.command),
+    ] {
+        if let Some(ref v) = val {
+            inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));
+        }
+    }
+    if let Some(ref args) = config.args {
+        let seq: Vec<serde_yaml_ng::Value> = args
+            .iter()
+            .map(|s| serde_yaml_ng::Value::String(s.clone()))
+            .collect();
+        inst.insert("args".into(), serde_yaml_ng::Value::Sequence(seq));
+    }
+    if let Some(ref env_map) = config.env {
+        let mut env_yaml = serde_yaml_ng::Mapping::new();
+        for (k, v) in env_map {
+            env_yaml.insert(
+                serde_yaml_ng::Value::String(k.clone()),
+                serde_yaml_ng::Value::String(v.clone()),
+            );
+        }
+        inst.insert("env".into(), serde_yaml_ng::Value::Mapping(env_yaml));
+    }
+    if let Some(worktree) = config.worktree {
+        inst.insert("worktree".into(), serde_yaml_ng::Value::Bool(worktree));
+    }
+    inst
+}
+
 /// Add multiple instance entries to fleet.yaml in a single lock+write cycle.
+///
+/// Sprint 58 Wave 2 PR-2 (#525-9 / #16): this is now MERGE-aware
+/// per the operator-resolved 3-tier baseline rules. New instance
+/// names land as fresh mappings; existing instance names trigger
+/// `merge_instance_into_existing` which respects DaemonManaged vs
+/// OperatorHandEdit field classification + surfaces 真衝突 errors.
 pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -623,67 +902,38 @@ pub fn add_instances_to_yaml(home: &Path, entries: &[(&str, &InstanceYamlEntry)]
             .and_then(|v| v.as_mapping_mut())
             .context("instances is not a mapping")?;
 
+        let mut conflicts: Vec<FieldConflict> = Vec::new();
+
         for (name, config) in entries {
-            let mut inst = serde_yaml_ng::Mapping::new();
-            for (key, val) in [
-                ("backend", &config.backend),
-                ("working_directory", &config.working_directory),
-                ("role", &config.role),
-                ("instructions", &config.instructions),
-                // Sprint 54 P1-B Bug 2 fix: persist source_repo when
-                // caller sets it. Daemon auto-write callers leave it
-                // None per gradient-deployment constraint, so this is
-                // a no-op for them; operator-/test-driven callers can
-                // round-trip the field.
-                ("source_repo", &config.source_repo),
-                // Sprint 55 P0-B EC4: same pattern — operator-set repo
-                // override round-trips, daemon auto-writers omit.
-                ("repo", &config.repo),
-                // Sprint 56 Track F (#496): same pattern — operator-set
-                // GitHub login round-trips, daemon auto-writers omit.
-                ("github_login", &config.github_login),
-                // Sprint 56 Track E (#450): scalar-string passthroughs
-                // for the new template parameters. `args` / `env` /
-                // `worktree` need typed serialization and are emitted
-                // separately below.
-                ("model", &config.model),
-                ("ready_pattern", &config.ready_pattern),
-                ("command", &config.command),
-            ] {
-                if let Some(ref v) = val {
-                    inst.insert(key.into(), serde_yaml_ng::Value::String(v.clone()));
+            let key = serde_yaml_ng::Value::String(name.to_string());
+            // Sprint 58 Wave 2 PR-2: if the instance already exists,
+            // merge into it per the 3-tier rules. Otherwise, build a
+            // fresh mapping.
+            if let Some(serde_yaml_ng::Value::Mapping(existing)) = instances.get_mut(&key) {
+                if let Err(conflict) = merge_instance_into_existing(name, existing, config) {
+                    conflicts.push(conflict);
                 }
+                tracing::info!(%name, "merged instance update into fleet.yaml");
+            } else {
+                let inst = build_instance_mapping(config);
+                instances.insert(key, serde_yaml_ng::Value::Mapping(inst));
+                tracing::info!(%name, "added new instance to fleet.yaml");
             }
-            // Sprint 56 Track E (#450): typed-value passthroughs.
-            // Template deployments often populate these from the
-            // template stanza; operator hand-edits round-trip through
-            // these writers symmetrically with `add_instance_to_yaml`'s
-            // scalar-string loop above.
-            if let Some(ref args) = config.args {
-                let seq: Vec<serde_yaml_ng::Value> = args
-                    .iter()
-                    .map(|s| serde_yaml_ng::Value::String(s.clone()))
-                    .collect();
-                inst.insert("args".into(), serde_yaml_ng::Value::Sequence(seq));
+        }
+
+        if !conflicts.is_empty() {
+            // Surface 真衝突 — operator must hand-resolve before
+            // daemon's view lands. Format the diff as multi-line
+            // for operator readability.
+            let mut diff_lines: Vec<String> = Vec::with_capacity(conflicts.len());
+            for c in &conflicts {
+                diff_lines.push(format!("  - {c}"));
             }
-            if let Some(ref env_map) = config.env {
-                let mut env_yaml = serde_yaml_ng::Mapping::new();
-                for (k, v) in env_map {
-                    env_yaml.insert(
-                        serde_yaml_ng::Value::String(k.clone()),
-                        serde_yaml_ng::Value::String(v.clone()),
-                    );
-                }
-                inst.insert("env".into(), serde_yaml_ng::Value::Mapping(env_yaml));
-            }
-            if let Some(worktree) = config.worktree {
-                inst.insert("worktree".into(), serde_yaml_ng::Value::Bool(worktree));
-            }
-            instances.insert(
-                serde_yaml_ng::Value::String(name.to_string()),
-                serde_yaml_ng::Value::Mapping(inst),
-            );
-            tracing::info!(%name, "added instance to fleet.yaml");
+            return Err(anyhow::anyhow!(
+                "fleet.yaml merge conflict ({} field(s)):\n{}",
+                conflicts.len(),
+                diff_lines.join("\n")
+            ));
         }
         Ok(())
     })
@@ -2495,5 +2745,354 @@ instances:
             Some("/tmp/rt-source"),
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Sprint 58 Wave 2 PR-2 (#525-9 / #16) — fleet.yaml merge logic
+    // tests covering the operator-resolved 3-tier baseline rules.
+    // ─────────────────────────────────────────────────────────────
+
+    fn merge_tmp_home(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-fleet-merge-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn read_yaml(home: &std::path::Path) -> serde_yaml_ng::Value {
+        let content = std::fs::read_to_string(home.join("fleet.yaml")).expect("read");
+        serde_yaml_ng::from_str(&content).expect("parse")
+    }
+
+    #[test]
+    fn instance_field_class_categorizes_daemon_managed() {
+        // Pin the categorization: daemon-managed identity / bookkeeping
+        // fields must round-trip via DaemonManaged. A future addition
+        // that drops one of these would silently break the merge
+        // contract.
+        for field in &["id", "topic_id", "git_branch", "source_repo"] {
+            assert_eq!(
+                instance_field_class(field),
+                FieldClass::DaemonManaged,
+                "field `{field}` must be DaemonManaged per operator-resolved baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn instance_field_class_categorizes_operator_hand_edit_default() {
+        // Default to OperatorHandEdit for any unknown field —
+        // operator's additions get preserved automatically.
+        for field in &[
+            "backend",
+            "working_directory",
+            "role",
+            "instructions",
+            "command",
+            "args",
+            "env",
+            "model",
+            "ready_pattern",
+            "display_name",
+            "github_login",
+            "repo",
+            "worktree",
+            "totally_new_field_we_dont_know_about",
+        ] {
+            assert_eq!(
+                instance_field_class(field),
+                FieldClass::OperatorHandEdit,
+                "field `{field}` must default to OperatorHandEdit"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_overwrites_daemon_managed_fields_when_changed_by_daemon() {
+        // Lead spec — Rule 1: DaemonManaged + daemon supplies →
+        // OVERWRITE existing.
+        let home = merge_tmp_home("rule-1-overwrite");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  dev:\n    backend: claude\n    source_repo: /old/path\n    role: \
+             developer\n",
+        )
+        .unwrap();
+
+        let entry = InstanceYamlEntry {
+            backend: None,
+            working_directory: None,
+            role: None,
+            source_repo: Some("/new/path".into()),
+            ..Default::default()
+        };
+        add_instances_to_yaml(&home, &[("dev", &entry)]).unwrap();
+
+        let v = read_yaml(&home);
+        let dev = &v["instances"]["dev"];
+        assert_eq!(
+            dev["source_repo"], "/new/path",
+            "DaemonManaged field MUST be overwritten"
+        );
+        assert_eq!(
+            dev["role"], "developer",
+            "OperatorHandEdit unchanged value preserved"
+        );
+        assert_eq!(dev["backend"], "claude");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_deep_merges_operator_hand_edit_fields_preserves_operator_additions() {
+        // Lead spec — Rule 2: operator-added fields daemon doesn't
+        // know about must survive the merge unchanged.
+        let home = merge_tmp_home("rule-2-deep-merge");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  dev:\n    backend: claude\n    role: developer\n    custom_operator_field: \
+             my-special-value\n    display_name: Friendly Dev\n",
+        )
+        .unwrap();
+
+        // Daemon writes a partial update that doesn't touch operator's
+        // custom_operator_field or display_name.
+        let entry = InstanceYamlEntry {
+            backend: Some("claude".into()), // same as existing — no-op
+            ..Default::default()
+        };
+        add_instances_to_yaml(&home, &[("dev", &entry)]).unwrap();
+
+        let v = read_yaml(&home);
+        let dev = &v["instances"]["dev"];
+        assert_eq!(dev["custom_operator_field"], "my-special-value");
+        assert_eq!(dev["display_name"], "Friendly Dev");
+        assert_eq!(dev["role"], "developer");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_errors_on_incompatible_concurrent_changes_with_diff_output() {
+        // Lead spec — Rule 3: 真衝突 same operator-hand-edit field
+        // both sides changed incompatibly → error with diff.
+        let home = merge_tmp_home("rule-3-conflict");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  dev:\n    backend: claude\n    role: senior-dev\n",
+        )
+        .unwrap();
+
+        // Daemon proposes a different role — incompatible with operator's.
+        let entry = InstanceYamlEntry {
+            role: Some("lead".into()),
+            ..Default::default()
+        };
+        let result = add_instances_to_yaml(&home, &[("dev", &entry)]);
+        assert!(
+            result.is_err(),
+            "incompatible operator-edit field MUST error"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("merge conflict") || err.contains("conflict"),
+            "error must mention merge conflict; got: {err}"
+        );
+        assert!(err.contains("dev"), "error must name the affected instance");
+        assert!(
+            err.contains("role"),
+            "error must name the conflicting field"
+        );
+        assert!(
+            err.contains("senior-dev") && err.contains("lead"),
+            "error must show diff (operator value + daemon value); got: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_idempotent_when_no_changes() {
+        // Daemon writes the same values that are already on disk —
+        // no error, no spurious churn.
+        let home = merge_tmp_home("idempotent");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  dev:\n    backend: claude\n    role: developer\n    source_repo: /x\n",
+        )
+        .unwrap();
+        let entry = InstanceYamlEntry {
+            backend: Some("claude".into()),
+            role: Some("developer".into()),
+            source_repo: Some("/x".into()),
+            ..Default::default()
+        };
+        let result = add_instances_to_yaml(&home, &[("dev", &entry)]);
+        assert!(
+            result.is_ok(),
+            "idempotent merge MUST succeed: {:?}",
+            result
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_handles_first_time_against_operator_hand_edits() {
+        // Migration path: operator hand-edited fleet.yaml BEFORE
+        // daemon ever wrote it. Daemon's first write must NOT clobber
+        // operator's hand-edits — only fill in fields daemon
+        // explicitly supplies.
+        let home = merge_tmp_home("first-time-migration");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  reviewer:\n    backend: claude\n    role: code-reviewer\n    \
+             instructions: ./reviewer-instructions.md\n",
+        )
+        .unwrap();
+
+        // Daemon's first write only sets source_repo (DaemonManaged).
+        let entry = InstanceYamlEntry {
+            source_repo: Some("/Users/dev/.agend".into()),
+            ..Default::default()
+        };
+        add_instances_to_yaml(&home, &[("reviewer", &entry)]).unwrap();
+
+        let v = read_yaml(&home);
+        let reviewer = &v["instances"]["reviewer"];
+        // Operator hand-edits preserved.
+        assert_eq!(reviewer["backend"], "claude");
+        assert_eq!(reviewer["role"], "code-reviewer");
+        assert_eq!(reviewer["instructions"], "./reviewer-instructions.md");
+        // Daemon's contribution landed.
+        assert_eq!(reviewer["source_repo"], "/Users/dev/.agend");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_new_instance_creates_fresh_entry() {
+        // Daemon adds a brand-new instance not in fleet.yaml — fresh
+        // mapping created from the entry.
+        let home = merge_tmp_home("new-instance");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  existing:\n    backend: claude\n",
+        )
+        .unwrap();
+        let entry = InstanceYamlEntry {
+            backend: Some("kiro-cli".into()),
+            role: Some("auditor".into()),
+            ..Default::default()
+        };
+        add_instances_to_yaml(&home, &[("auditor", &entry)]).unwrap();
+
+        let v = read_yaml(&home);
+        assert_eq!(v["instances"]["auditor"]["backend"], "kiro-cli");
+        assert_eq!(v["instances"]["auditor"]["role"], "auditor");
+        // Existing instance untouched.
+        assert_eq!(v["instances"]["existing"]["backend"], "claude");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_daemon_managed_overwrite_does_not_emit_conflict_error() {
+        // Defensive bonus: even when operator hand-edited a
+        // DaemonManaged field with a different value, the merge
+        // overwrites silently (no 真衝突 error). Daemon-managed
+        // fields are AUTHORITATIVE — the operator can't object,
+        // and the merge contract says daemon wins.
+        let home = merge_tmp_home("daemon-managed-no-error");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  dev:\n    backend: claude\n    source_repo: /operator-edit\n",
+        )
+        .unwrap();
+        let entry = InstanceYamlEntry {
+            source_repo: Some("/daemon-authoritative".into()),
+            ..Default::default()
+        };
+        let result = add_instances_to_yaml(&home, &[("dev", &entry)]);
+        assert!(
+            result.is_ok(),
+            "DaemonManaged field overwrite MUST NOT 真衝突: {:?}",
+            result
+        );
+        let v = read_yaml(&home);
+        assert_eq!(
+            v["instances"]["dev"]["source_repo"], "/daemon-authoritative",
+            "DaemonManaged value should be authoritative"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_preserves_yaml_field_ordering_for_operator_readability() {
+        // Defensive bonus: the merge must preserve YAML key ordering
+        // (serde_yaml_ng's IndexMap-backed Mapping does this by
+        // default). Pin the behaviour so a future refactor doesn't
+        // accidentally switch to a HashMap-backed mapping that would
+        // randomize order on every write.
+        let home = merge_tmp_home("ordering");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  dev:\n    role: developer\n    backend: claude\n    \
+             working_directory: /workspace/dev\n",
+        )
+        .unwrap();
+
+        // Daemon writes nothing new — but the round-trip should
+        // preserve the original key order.
+        let entry = InstanceYamlEntry {
+            backend: Some("claude".into()),
+            ..Default::default()
+        };
+        add_instances_to_yaml(&home, &[("dev", &entry)]).unwrap();
+
+        let content = std::fs::read_to_string(home.join("fleet.yaml")).unwrap();
+        // role should come before backend in the rewritten file.
+        let role_pos = content.find("role:").expect("role present");
+        let backend_pos = content.find("backend:").expect("backend present");
+        assert!(
+            role_pos < backend_pos,
+            "field order should be preserved across merge round-trip; got:\n{content}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn merge_handles_multiple_instances_atomically() {
+        // Defensive bonus: the merge function operates on multiple
+        // instances in one lock+write cycle. If ANY instance has
+        // a 真衝突, the entire write should be rejected (or all
+        // succeed). Pin the all-or-nothing semantic.
+        let home = merge_tmp_home("multi-atomic");
+        std::fs::write(
+            home.join("fleet.yaml"),
+            "instances:\n  alpha:\n    role: senior-dev\n  beta:\n    role: junior-dev\n",
+        )
+        .unwrap();
+
+        let entry_alpha = InstanceYamlEntry {
+            role: Some("lead".into()), // conflict with senior-dev
+            ..Default::default()
+        };
+        let entry_beta = InstanceYamlEntry {
+            role: Some("junior-dev".into()), // identical, no conflict
+            ..Default::default()
+        };
+        let result =
+            add_instances_to_yaml(&home, &[("alpha", &entry_alpha), ("beta", &entry_beta)]);
+        // Alpha conflict surfaces — but the conflict mention should
+        // still indicate which instance.
+        assert!(result.is_err(), "any conflict must abort the whole batch");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("alpha"),
+            "conflict report must name the conflicting instance; got: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
