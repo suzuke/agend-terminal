@@ -342,7 +342,13 @@ fn install_one(source: &Path, target: &Path, backend: &str) -> InstallOutcome {
             };
         }
         if is_symlink {
-            let _ = std::fs::remove_file(target);
+            // Cross-platform symlink removal: Unix uses `remove_file`
+            // (symlink is a regular file from rmdir's perspective);
+            // Windows directory symlinks require `remove_dir`. Try
+            // `remove_file` first (Unix happy path), fall back to
+            // `remove_dir` for Windows directory symlinks. Either
+            // succeeds or both have already-gone semantics.
+            let _ = std::fs::remove_file(target).or_else(|_| std::fs::remove_dir(target));
         } else {
             let _ = std::fs::remove_dir_all(target);
         }
