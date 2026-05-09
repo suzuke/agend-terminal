@@ -10,7 +10,7 @@ use super::state::telegram_runtime;
 /// (`fleet.yaml` keys are slugs; underscores-bracketing is reserved).
 /// See [`init_from_config`] orphan-cleanup filter and fleet-binding
 /// resolution.
-pub(super) const FLEET_BINDING_SENTINEL: &str = "__fleet__";
+pub(crate) const FLEET_BINDING_SENTINEL: &str = "__fleet__";
 
 pub(super) fn topic_registry_path(home: &Path) -> PathBuf {
     home.join("topics.json")
@@ -102,21 +102,115 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     }
 }
 
+/// Sprint 59 Wave 2 PR-IMPL (F2 — α-shared helper): query whether
+/// the bot has `can_manage_topics` permission in the chat. Returns
+/// `false` on any error path (network failure / not-an-admin /
+/// permission-introspection failure) so callers default to safe-
+/// skip rather than risking a permission-denied API call mid-flight.
+///
+/// Used by [`delete_topic`] (α-c surfacing) and the (γ) `--cleanup`
+/// flag pre-call check.
+pub fn can_manage_topics_for(bot: &teloxide::Bot, chat_id: teloxide::types::ChatId) -> bool {
+    let me = match telegram_runtime().block_on(async { bot.get_me().await }) {
+        Ok(me) => me,
+        Err(_) => return false,
+    };
+    let member =
+        match telegram_runtime().block_on(async { bot.get_chat_member(chat_id, me.id).await }) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+    match member.kind {
+        teloxide::types::ChatMemberKind::Administrator(admin) => admin.can_manage_topics,
+        teloxide::types::ChatMemberKind::Owner(_) => true, // chat owners have all rights
+        _ => false,
+    }
+}
+
+/// Sprint 59 Wave 2 PR-IMPL (F2 — α-c): outcome of a `delete_topic`
+/// call, surfaced to callers so the (γ) `--cleanup` flag and
+/// future operator-driven cleanup paths can distinguish silent-
+/// success from permission-denied-skip from genuine error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteTopicOutcome {
+    /// Topic was deleted successfully on chat side + unregistered
+    /// from `topics.json`.
+    Deleted,
+    /// Bot lacks `can_manage_topics` permission. Topic remains in
+    /// chat AND in `topics.json` (operator must manually delete via
+    /// Telegram UI OR fix bot permissions then retry).
+    PermissionDenied,
+    /// Telegram API returned a non-permission error (network,
+    /// rate limit, transient). Topic state on chat side is
+    /// indeterminate; registry left untouched so a retry can
+    /// re-attempt cleanup.
+    ApiError(String),
+    /// Channel resolution failed (no telegram channel configured
+    /// or bot token missing). Topic remains in registry; no chat-
+    /// side attempt was made.
+    ChannelUnavailable,
+}
+
 /// Delete a forum topic.
-pub fn delete_topic(home: &std::path::Path, topic_id: i32) {
+///
+/// Sprint 59 Wave 2 PR-IMPL (F2 — α-c): replaces the prior
+/// `let _ = ...` swallowing with explicit match arms that
+/// distinguish permission errors (warn-log with actionable hint)
+/// from generic errors (error-log with full chain). Returns
+/// [`DeleteTopicOutcome`] so callers can branch on outcome.
+///
+/// Pre-flight permission check via [`can_manage_topics_for`]
+/// short-circuits the API call when the bot lacks the
+/// `can_manage_topics` admin right — avoids a guaranteed-fail
+/// API roundtrip + surfaces the actionable hint immediately.
+pub fn delete_topic(home: &std::path::Path, topic_id: i32) -> DeleteTopicOutcome {
     let ch = match super::resolve_channel_only_from(home) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => {
+            tracing::warn!(
+                topic_id,
+                "delete_topic: telegram channel unavailable — skipping"
+            );
+            return DeleteTopicOutcome::ChannelUnavailable;
+        }
     };
+    let bot = teloxide::Bot::new(&ch.token);
+    let chat_id = teloxide::types::ChatId(ch.group_id);
+
+    if !can_manage_topics_for(&bot, chat_id) {
+        tracing::warn!(
+            topic_id,
+            "delete_topic skipped: bot lacks can_manage_topics permission. \
+             Grant via Telegram → Chat → Manage admins → bot name → enable \
+             'Manage topics'. Topic remains in chat AND topics.json registry."
+        );
+        return DeleteTopicOutcome::PermissionDenied;
+    }
+
     let tid = teloxide::types::ThreadId(teloxide::types::MessageId(topic_id));
-    let _ = telegram_runtime().block_on(async {
-        let bot = teloxide::Bot::new(&ch.token);
-        let chat_id = teloxide::types::ChatId(ch.group_id);
+    let result = telegram_runtime().block_on(async {
+        // close_forum_topic is best-effort — close errors are
+        // non-fatal because the subsequent delete_forum_topic
+        // will close the topic anyway.
         let _ = bot.close_forum_topic(chat_id, tid).await;
         bot.delete_forum_topic(chat_id, tid).await
     });
-    unregister_topic(home, topic_id);
-    tracing::info!(topic_id, "deleted topic");
+    match result {
+        Ok(_) => {
+            unregister_topic(home, topic_id);
+            tracing::info!(topic_id, "delete_topic: deleted topic + unregistered");
+            DeleteTopicOutcome::Deleted
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            tracing::error!(
+                topic_id,
+                error = %err_str,
+                "delete_topic: API error — topic NOT deleted, registry unchanged for retry"
+            );
+            DeleteTopicOutcome::ApiError(err_str)
+        }
+    }
 }
 
 #[cfg(test)]

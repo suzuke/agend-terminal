@@ -1,9 +1,9 @@
 //! Telegram credential resolution — loads bot token + group id from fleet.yaml.
 
 /// Resolved Telegram channel credentials — avoids repeated fleet.yaml loads.
-pub(super) struct TelegramCreds {
-    pub(super) token: String,
-    pub(super) group_id: i64,
+pub(crate) struct TelegramCreds {
+    pub(crate) token: String,
+    pub(crate) group_id: i64,
 }
 
 pub(super) fn resolve_channel() -> anyhow::Result<(TelegramCreds, crate::fleet::FleetConfig)> {
@@ -59,6 +59,6 @@ pub(super) fn resolve_channel_only() -> anyhow::Result<TelegramCreds> {
 /// topics the user observed were exactly this: the positive-pin dispatch
 /// test creating a team via the API, reaching the topic helper, and the
 /// unscoped resolver loading the real fleet.yaml instead of the test's.
-pub(super) fn resolve_channel_only_from(home: &std::path::Path) -> anyhow::Result<TelegramCreds> {
+pub(crate) fn resolve_channel_only_from(home: &std::path::Path) -> anyhow::Result<TelegramCreds> {
     resolve_channel_from(home).map(|(ch, _)| ch)
 }

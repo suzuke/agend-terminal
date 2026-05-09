@@ -15,6 +15,7 @@
 mod agent_resolve;
 pub mod daemon_spawn;
 pub(crate) mod doctor;
+pub(crate) mod doctor_topics;
 mod fleet_normalize;
 pub mod signals;
 mod telegram_init;

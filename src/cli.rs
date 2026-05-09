@@ -547,6 +547,120 @@ fn get_screen_lines(
 // only needs strict ordering, not absolute mtime values.
 // ─────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────
+// Sprint 59 Wave 2 PR-IMPL (F2 — γ): `agend-terminal doctor topics`
+// — operator-callable diagnostic for telegram topic state.
+// Backed by `crate::bootstrap::doctor_topics`.
+// ─────────────────────────────────────────────────────────────────
+
+/// Options surface for `cli::run_doctor_topics`. Mirrors the clap
+/// args at `Commands::Doctor { action: Some(DoctorAction::Topics { ... }) }`
+/// so the cli entry-point is a thin shim.
+pub struct DoctorTopicsOptions<'a> {
+    pub cleanup: bool,
+    pub format: &'a str,
+    pub yes: bool,
+    pub prefer_fleet: bool,
+    pub prefer_registry: bool,
+}
+
+/// Run the topics-diagnostic doctor flow. Pure read in the default
+/// case; calls `execute_cleanup` when `--cleanup` is set.
+pub fn run_doctor_topics(home: &Path, opts: DoctorTopicsOptions) -> anyhow::Result<()> {
+    use crate::bootstrap::doctor_topics::{
+        classify, execute_cleanup, render_human, render_json, CleanupAction, DriftResolution,
+    };
+
+    if opts.prefer_fleet && opts.prefer_registry {
+        anyhow::bail!("--prefer-fleet and --prefer-registry are mutually exclusive; pick one");
+    }
+
+    let mut report = classify(home);
+
+    // Probe `can_manage_topics` permission so the human/json output
+    // can surface it. Best-effort: failures fall back to `None`.
+    report.can_manage_topics = probe_can_manage_topics(home);
+
+    // Always print the inspection output — operator sees state
+    // before any cleanup acts.
+    let output = match opts.format {
+        "json" => render_json(&report),
+        "human" | _ => render_human(&report),
+    };
+    println!("{output}");
+
+    if !opts.cleanup {
+        return Ok(());
+    }
+
+    // Cleanup gate: confirmation prompt unless --yes.
+    if !opts.yes {
+        eprintln!(
+            "About to act on stale_registry / drift_fleet / orphan entries above. \
+             Continue? (y/N): "
+        );
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let trimmed = input.trim().to_lowercase();
+        if trimmed != "y" && trimmed != "yes" {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let drift_resolution = if opts.prefer_fleet {
+        DriftResolution::PreferFleet
+    } else if opts.prefer_registry {
+        DriftResolution::PreferRegistry
+    } else {
+        DriftResolution::LeaveDrift
+    };
+
+    let actions = execute_cleanup(home, &report, drift_resolution);
+    println!("\nCleanup actions ({}):", actions.len());
+    for action in &actions {
+        match action {
+            CleanupAction::DeletedFromChatAndRegistry {
+                topic_id,
+                instance_name,
+            } => println!("  ✓ deleted topic {topic_id} ({instance_name}) — chat + registry"),
+            CleanupAction::UnregisteredOnly {
+                topic_id,
+                instance_name,
+            } => println!("  ✓ updated registry for {topic_id} ({instance_name}) — chat unchanged"),
+            CleanupAction::SkippedNoPermission {
+                topic_id,
+                instance_name,
+            } => println!("  ⚠ skipped {topic_id} ({instance_name}) — bot lacks can_manage_topics"),
+            CleanupAction::SkippedNeedsResolution {
+                topic_id,
+                instance_name,
+                reason,
+            } => println!("  ⚠ skipped {topic_id} ({instance_name}) — {reason}"),
+            CleanupAction::SkippedApiError {
+                topic_id,
+                instance_name,
+                error,
+            } => println!("  ✗ skipped {topic_id} ({instance_name}) — API error: {error}"),
+        }
+    }
+    Ok(())
+}
+
+/// Probe `can_manage_topics` for the configured telegram channel.
+/// Returns `None` when the channel is unconfigured (no telegram
+/// section in fleet.yaml OR bot token unavailable). The probe is
+/// network-bound; expensive failures (rate limit, network blip)
+/// fall back to `Some(false)` to err on the safe side (cleanup
+/// will skip rather than try-and-fail).
+fn probe_can_manage_topics(home: &Path) -> Option<bool> {
+    use crate::channel::telegram::{can_manage_topics_for, resolve_channel_only_from};
+    let ch = resolve_channel_only_from(home).ok()?;
+    let bot = teloxide::Bot::new(&ch.token);
+    let chat_id = teloxide::types::ChatId(ch.group_id);
+    Some(can_manage_topics_for(&bot, chat_id))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod helper_staleness_tests {

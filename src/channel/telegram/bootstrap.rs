@@ -101,22 +101,35 @@ pub fn init_from_config(
         }
     }
 
-    // Auto-create topics for instances without topic_id
+    // Auto-create topics for instances without topic_id.
+    //
+    // Sprint 59 Wave 2 PR-IMPL (F2 — α-a' track-on-create refactor):
+    // route through `create_topic_for_instance` instead of inline
+    // `bot.create_forum_topic`. This closes S1 (duplicate accumulation
+    // on registry-state loss): `create_topic_for_instance` at
+    // topic_registry.rs:74-79 already implements idempotent same-
+    // name reuse — if a topic with the same instance name is in
+    // `topics.json`, it returns the existing topic_id rather than
+    // calling the create API again. Bootstrap now benefits from
+    // the same dedup. Combined with the existing orphan-cleanup at
+    // bootstrap.rs:71-78 (which scans topics.json for retired
+    // instances), the (α-a)+(α-b) pair from RCA design collapses
+    // into a single track-on-create flow + existing orphan scan.
+    //
+    // Note: chat-side enumeration to detect "duplicate-named topic
+    // already exists in chat but not in topics.json" remains
+    // technically impossible per teloxide 0.11.2 + Telegram Bot API
+    // gap (no list_forum_topics method). That edge case requires
+    // operator intervention via the (γ) `agend-terminal doctor
+    // topics` surface (Sprint 60+ candidate: teloxide upgrade
+    // evaluation if a future Bot API version exposes enumeration).
     for (name, inst) in &config.instances {
         if name == "general" && inst.topic_id.is_none() {
             topic_map.insert("general".to_string(), 1);
         } else if inst.topic_id.is_none() {
-            tracing::info!(instance = %name, "creating topic");
-            match telegram_runtime().block_on(async {
-                bot.create_forum_topic(chat_id, name, teloxide::types::Rgb::from_u32(0x6FB9F0), "")
-                    .await
-            }) {
-                Ok(topic) => {
-                    let tid = topic.thread_id.0 .0;
-                    tracing::info!(instance = %name, topic_id = tid, "created topic");
-                    topic_map.insert(name.clone(), tid);
-                }
-                Err(e) => tracing::error!(instance = %name, error = %e, "failed to create topic"),
+            tracing::info!(instance = %name, "auto-creating topic via track-on-create");
+            if let Some(tid) = create_topic_for_instance(home, name) {
+                topic_map.insert(name.clone(), tid);
             }
         }
     }

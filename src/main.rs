@@ -295,8 +295,11 @@ enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Health check
-    Doctor,
+    /// Health check (or `doctor topics` for telegram topic state diagnostic)
+    Doctor {
+        #[command(subcommand)]
+        action: Option<DoctorAction>,
+    },
     /// Menu-bar / system-tray resident app (requires `--features tray`).
     #[cfg(feature = "tray")]
     Tray,
@@ -344,6 +347,41 @@ enum AdminCommands {
 
 /// Sprint 57 Wave 3 PR-3 (#548 Phase 3) — `agend-terminal service`
 /// subcommand actions. Maps to `service::install / uninstall / status`.
+/// Sprint 59 Wave 2 PR-IMPL (F2 — γ): subcommands for `agend-terminal
+/// doctor`. Default (no subcommand) runs the existing fleet-wide
+/// health check; `topics` adds telegram topic state diagnostic +
+/// optional cleanup.
+#[derive(Subcommand)]
+enum DoctorAction {
+    /// Diagnose telegram topic state (live / drift_fleet / stale_registry / orphan).
+    /// Pair with `--cleanup` to act on stale/drift/orphan entries (chat-mutating
+    /// operations gated by bot's `can_manage_topics` permission).
+    Topics {
+        /// Act on stale/drift/orphan entries (registry update + chat-side delete).
+        /// Requires the bot to have `can_manage_topics` permission for chat-mutating
+        /// operations on `orphan` entries; without permission, those skip with warn.
+        #[arg(long)]
+        cleanup: bool,
+        /// Output format: `human` (default, multi-line table) or `json` (structured
+        /// for piping into other tools).
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Skip interactive confirmation prompt for `--cleanup`.
+        #[arg(long)]
+        yes: bool,
+        /// For `drift_fleet` entries during `--cleanup`: take fleet.yaml as
+        /// authoritative (update topics.json to match). Mutually exclusive with
+        /// `--prefer-registry`.
+        #[arg(long)]
+        prefer_fleet: bool,
+        /// For `drift_fleet` entries during `--cleanup`: take topics.json as
+        /// authoritative (update fleet.yaml to match). Mutually exclusive with
+        /// `--prefer-fleet`.
+        #[arg(long)]
+        prefer_registry: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum ServiceAction {
     /// Register the daemon with the OS service manager so it auto-
@@ -678,7 +716,28 @@ fn main() -> anyhow::Result<()> {
                 }
             },
         },
-        Some(Commands::Doctor) => cli::run_doctor(&home)?,
+        Some(Commands::Doctor { action: None }) => cli::run_doctor(&home)?,
+        Some(Commands::Doctor {
+            action:
+                Some(DoctorAction::Topics {
+                    cleanup,
+                    format,
+                    yes,
+                    prefer_fleet,
+                    prefer_registry,
+                }),
+        }) => {
+            cli::run_doctor_topics(
+                &home,
+                cli::DoctorTopicsOptions {
+                    cleanup,
+                    format: &format,
+                    yes,
+                    prefer_fleet,
+                    prefer_registry,
+                },
+            )?;
+        }
         #[cfg(feature = "tray")]
         Some(Commands::Tray) => tray::run(&home)?,
         Some(Commands::Demo) => cli::run_demo()?,
