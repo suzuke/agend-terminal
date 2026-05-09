@@ -5,60 +5,7 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{err_needs_identity, is_ok_result};
-
-/// Sprint 58 Wave 4 PR-1 (#2 engineering anti-stall): structural
-/// gate ensuring every `send kind=task` dispatch carries an explicit
-/// `task_id`. Closes the Wave 3 PR-1 dispatch protocol gap where
-/// task-board IDs and `send` calls weren't structurally tied — a
-/// lead could create a task entry but forget to dispatch with
-/// `task_id=...`, leaving the recipient with no correlation handle.
-///
-/// Returns the rejection error message on failure (with operator-
-/// actionable hint) so callers can surface it as a structured
-/// `code: "task_id_required"` response.
-fn validate_task_id_present(args: &Value) -> Result<(), String> {
-    let task_id = args["task_id"].as_str().unwrap_or("");
-    if task_id.is_empty() {
-        return Err(
-            "send kind=task requires 'task_id' — first call task action=create to obtain a \
-             't-...' id, then send kind=task task_id=t-... (Sprint 58 Wave 4 anti-stall \
-             contract)"
-                .to_string(),
-        );
-    }
-    if !is_valid_task_id_shape(task_id) {
-        return Err(format!(
-            "send kind=task: 'task_id' value '{task_id}' has invalid shape — task_id must \
-             start with 't-' and contain only ASCII alphanumeric / hyphen / underscore \
-             characters (length 4-128). Did you mean to call task action=create first?"
-        ));
-    }
-    Ok(())
-}
-
-/// Cheap shape check for task_id strings. The auto-generated form
-/// is `t-<14-digit-timestamp>-<seq>`; operator-supplied entries
-/// can use any reasonable identifier as long as it starts with the
-/// `t-` prefix. We accept ASCII alphanumeric + `-_` after the
-/// prefix to allow operator names like `t-sprint58-wave4-pr1`.
-///
-/// Rejects: empty, missing prefix, control characters, length
-/// outside 4-128 (catches obvious typos without rejecting valid
-/// IDs).
-fn is_valid_task_id_shape(s: &str) -> bool {
-    if s.len() < 4 || s.len() > 128 {
-        return false;
-    }
-    let Some(rest) = s.strip_prefix("t-") else {
-        return false;
-    };
-    if rest.is_empty() {
-        return false;
-    }
-    rest.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
+use super::{anti_stall::check_kind_task_requires_task_id, err_needs_identity, is_ok_result};
 
 /// Sprint 30: unified `send` handler. Routes to existing handlers based on
 /// `request_kind` or infers from args (targets/team → broadcast, task field
@@ -77,21 +24,9 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
         }
     }
 
-    // Sprint 58 Wave 4 PR-1 (#2 engineering anti-stall): every
-    // `kind=task` dispatch must carry an explicit `task_id` so the
-    // recipient + observer agents can correlate the dispatch back
-    // to the task board entry. The Wave 3 PR-1 incident (lead
-    // created a task board entry but never dispatched with explicit
-    // task_id reference; dev idle-waited 100+ min) is structurally
-    // eliminated here. Validation runs BEFORE broadcast routing so
-    // both single-target and broadcast `kind=task` paths share the
-    // gate.
-    if args["request_kind"].as_str() == Some("task") {
-        if let Err(msg) = validate_task_id_present(&args) {
-            return json!({"error": msg, "code": "task_id_required"});
-        }
+    if let Some(err) = check_kind_task_requires_task_id(&args) {
+        return err;
     }
-
     // Broadcast mode: targets/team/tags present
     if args.get("targets").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
         return handle_broadcast(home, &args, sender);

@@ -1,5 +1,6 @@
 //! MCP tool dispatch — handle_tool() routes tool calls to implementations.
 
+mod anti_stall;
 mod binding_state;
 mod channel;
 pub(crate) mod ci;
