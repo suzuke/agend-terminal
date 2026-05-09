@@ -42,6 +42,35 @@ impl Drop for BindGuard {
     }
 }
 
+/// Sprint 58 Wave 3 PR-2 (#8): peek whether a `(home, agent)` pair is
+/// currently in the bind-in-flight set. Used by `binding_state` to
+/// report whether a concurrent `dispatch_auto_bind_lease` is active for
+/// the agent — operator-facing introspection for race-condition debug.
+pub(crate) fn is_bind_in_flight(home: &Path, agent: &str) -> bool {
+    let key = (home.display().to_string(), agent.to_string());
+    bind_in_flight_set().lock().contains(&key)
+}
+
+/// Sprint 58 Wave 3 PR-2 (#9): defensively remove an `(home, agent)`
+/// entry from the bind-in-flight set. The `BindGuard::drop` impl
+/// already does this on every normal exit path, but a panic between
+/// `try_acquire` and the implicit `Drop` can in theory leak an entry,
+/// blocking re-bind. `release_full` calls this as a safety net so a
+/// hard release truly leaves no stale daemon-side state at any layer.
+pub(crate) fn clear_bind_in_flight(home: &Path, agent: &str) {
+    let key = (home.display().to_string(), agent.to_string());
+    let removed = bind_in_flight_set().lock().remove(&key);
+    if removed {
+        tracing::warn!(
+            %agent,
+            home = %home.display(),
+            "release_full cleared a stale bind-in-flight entry — \
+             a prior dispatch_auto_bind_lease panicked between guard \
+             acquisition and drop. Investigate logs for the panic."
+        );
+    }
+}
+
 /// Sprint 53 P0-1+P0-2: auto-bind + lease worktree + watch_ci on delegate_task dispatch.
 ///
 /// Sprint 55 P0-B extends `dispatch_auto_bind_lease` with:

@@ -278,6 +278,16 @@ fn worktree_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "agent": {"type": "string", "description": "Agent name whose worktree + binding to release"}
             }, "required": ["agent"]}}),
+        // Sprint 58 Wave 3 PR-2 (#8): daemon-side binding diagnostic.
+        // Operator + agent introspection surface for lease-block recovery
+        // debugging. Reports binding.json + on-disk worktree state +
+        // ci-watch subscriptions + bind-in-flight guard + cross-branch
+        // holders in one call. Pairs with `release_worktree`'s
+        // comprehensive cleanup (#9).
+        json!({"name": "binding_state", "description": "Report the structured daemon-side bind state for an agent: binding.json content, worktree existence + .agend-managed marker, ci-watch subscriptions, bind-in-flight guard, and cross-branch holders. Operator + agent introspection surface; non-destructive. Pairs with release_worktree.",
+            "inputSchema": {"type": "object", "properties": {
+                "agent": {"type": "string", "description": "Agent name to inspect"}
+            }, "required": ["agent"]}}),
         // Sprint 53 P1-4: operator-callable Phase 4 GC visibility. Wraps
         // worktree_pool::gc_dry_run; non-destructive (Phase 4 cutover stays
         // gated behind AGEND_WORKTREE_GC=1).
@@ -422,9 +432,9 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            29,
-            "Sprint 54 P1-7 tool count = 29 (bind_self added on top of \
-             Sprint 53 P1-4's 28). Adding/removing a tool requires \
+            30,
+            "Sprint 58 Wave 3 PR-2 tool count = 30 (binding_state added on \
+             top of Sprint 54 P1-7's 29). Adding/removing a tool requires \
              updating this assertion. Current tools: {:?}",
             tools
                 .iter()

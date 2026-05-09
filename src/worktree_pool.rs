@@ -252,6 +252,16 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
     out.binding_removed = true;
     out.released = true;
 
+    // Sprint 58 Wave 3 PR-2 (#9): defensive comprehensive cleanup of
+    // every daemon-side bind-tracking layer, not just on-disk
+    // `binding.json`. The dispatch-hook bind-in-flight set is RAII-
+    // managed via `BindGuard::drop` — but a panic between guard
+    // acquisition and the implicit `Drop` can leave a stale entry
+    // that blocks re-bind silently. Since `release_full` is the
+    // single source of truth for "agent is now released", it's the
+    // right place to clear in-memory state too.
+    crate::mcp::handlers::dispatch_hook::clear_bind_in_flight(home, agent);
+
     // Sprint 57 Wave 2 Track B (#546 Item 2): unsubscribe `agent` from
     // EVERY ci-watch they appear on, not just the binding-branch entry.
     // The Sprint 55 P0-B EC7 helper was scoped to the exact
