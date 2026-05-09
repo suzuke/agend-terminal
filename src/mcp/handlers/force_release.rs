@@ -116,7 +116,7 @@ pub(crate) fn handle_force_release_worktree(
         "released": true,
         "dir_existed": dir_existed,
         "dir_removed": dir_removed,
-        "binding_outcome": serde_json::to_value(&binding_outcome).unwrap_or_else(|_| json!(null)),
+        "binding_outcome": serde_json::to_value(&binding_outcome).unwrap_or(Value::Null),
     })
 }
 
