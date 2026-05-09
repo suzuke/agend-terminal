@@ -226,11 +226,12 @@ under the LOC ceiling.
 (r1 update: scope shifted slightly — (α-a) reframed from "delete_instance fallback" (already-existing, no work needed) to "bootstrap pre-check" (~70-110 LOC). (α-c) refocused on delete_topic permission surfacing only (~50-80 LOC). Combined total moves from ~460-750 to ~490-770. The 770 ceiling is 20 LOC above the 750 IMPL-gate threshold — reviewer should flag if this requires the "split into 2 PRs" surface-block in §8.2 condition #4.)
 
 Predicted file touches:
-- `src/channel/telegram/topic_registry.rs` (delete_topic permission gate + error surfacing)
-- `src/channel/telegram/bootstrap.rs` (orphan-cleanup extension)
-- `src/mcp/handlers/instance_lifecycle.rs` (lookup_topic_for_instance fallback)
-- `src/bootstrap/doctor_topics.rs` (NEW — classification logic)
-- `src/cli.rs` (subcommand wiring)
+- `src/channel/telegram/topic_registry.rs` (delete_topic permission gate + error surfacing — addresses S4 via (α-c))
+- `src/channel/telegram/bootstrap.rs` (auto-create same-named-topic pre-check + orphan-cleanup extension — addresses S1 via (α-a) + S2 via (α-b))
+- `src/bootstrap/doctor_topics.rs` (NEW — (γ) classification logic with precedence-ordered taxonomy)
+- `src/cli.rs` (subcommand wiring for `agend-terminal doctor topics [--cleanup]`)
+
+(`src/mcp/handlers/instance_lifecycle.rs` NOT touched — line 64 fallback already provides the topic_id resolution per r1 §2 S1 reframe note. No change expected on this path.)
 
 ---
 
@@ -255,23 +256,27 @@ upper bound modestly exceeds 750), IMPL dispatch follows automatically
 per Wave 2 sequencing context. The conditional task is
 `t-20260509090003452174-17` (referenced in lead's m-20260509152716671697-225).
 
-**Threshold flag (r1)**: the upper-bound 770 LOC is 20 LOC above the
-750 ceiling. If reviewer judges this margin as insufficient, fall back
-to surface-block condition #4 below (split (α) and (γ) into 2 sequential
-PRs).
+**Threshold acceptance (r1 → r2)**: the upper-bound 770 LOC is 20 LOC
+above the original 750 ceiling. Per reviewer Tier-1 conditional VERIFIED
+intent (m-20260509161333869887-255) + lead recommendation
+(m-20260509161254...), the +20 LOC margin is **accepted**: split-condition
+#4 below triggers only if a subsequent estimate moves materially beyond
+770 (e.g. > 850 LOC reveals during IMPL). The single-combined-PR
+dispatch shape proceeds at ~490-770.
 
 Dispatch shape: single combined IMPL PR for (α) + (γ) (estimated
-~460-750 LOC) OR split into 2 sequential PRs if reviewer flags a
-clean (α)/(γ) scope-split during VERIFIED verdict.
+~490-770 LOC, accepted threshold per above) OR split into 2 sequential
+PRs only if a re-estimate during IMPL materially exceeds 770 OR
+reviewer flags a clean (α)/(γ) scope-split during VERIFIED verdict.
 
 ### 8.2 Surface-block criteria (escalate to lead)
 
 Surface to lead/general for triage if RCA-stage investigation
 reveals:
 1. `(α-c)` requires NEW file-watch infrastructure to be reactive (current proposal defers to bootstrap reload) — adds Sprint 60 `notify` crate dependency or similar.
-2. `bot.get_chat` doesn't enumerate forum topics in the teloxide API surface — `(α-b)` enriched orphan-cleanup design changes shape.
+2. `bot.get_chat` doesn't enumerate forum topics in the teloxide API surface — `(α-a)` bootstrap pre-check + `(α-b)` enriched orphan-cleanup design changes shape; may force fallback to `(γ)` operator-driven cleanup as the recovery surface.
 3. Permission-check helper requires `bot.get_chat_administrators` enumeration which is rate-limited under heavy fleet sizes — needs caching layer.
-4. Combined LOC estimate exceeds 750 — split (α) and (γ) into separate PRs with sequential reviewer cycles.
+4. Combined LOC estimate moves materially beyond the accepted 770 ceiling (e.g. > 850 LOC) — split (α) and (γ) into separate PRs with sequential reviewer cycles. (Per §8.1 threshold-acceptance note: 770 is the new ceiling; 750 was the original target but +20 LOC margin already accepted.)
 5. `(γ)` `--cleanup` interactive prompt conflicts with daemon-mode semantics (doctor runs in non-TTY contexts) — needs `--yes` mandatory + UX redesign.
 
 ### 8.3 Q2=(C) protocol compliance
