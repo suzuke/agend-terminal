@@ -204,6 +204,11 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // Sprint 59 Wave 1 PR-2 (#10+#12 watchdog cluster): per-agent +
     // fleet-wide idle thresholds, throttled to 5min scans.
     let mut idle_watchdog_tracker = crate::daemon::idle_watchdog::IdleWatchdogTracker::default();
+    // Sprint 59 Wave 1 PR-4-recover ((B) decision default with
+    // timeout): tracks pending operator decisions, fires auto-default
+    // on timeout. 5min throttle matches anti-stall cadence.
+    let mut decision_timeout_tracker =
+        crate::daemon::decision_timeout::DecisionTimeoutTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -211,6 +216,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
         anti_stall_tracker.maybe_scan(&home);
         idle_watchdog_tracker.maybe_scan(&home);
+        decision_timeout_tracker.maybe_scan(&home);
     }
 }
 
