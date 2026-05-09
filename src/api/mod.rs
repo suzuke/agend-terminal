@@ -267,6 +267,14 @@ fn handle_session(
     }
 
     loop {
+        // Sprint 60 W1 PR-3 (#P0-3): the `restart_daemon` MCP handler
+        // sets `RESTART_PENDING` (process-wide static) since MCP
+        // handlers don't carry the shutdown flag in HandlerCtx. Bridge
+        // it here so the main daemon loop notices and breaks.
+        if crate::daemon::RESTART_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+            shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
             break;

@@ -9,6 +9,7 @@ pub(crate) mod dispatch_hook;
 mod force_release;
 pub(crate) mod instance;
 pub(crate) mod instance_lifecycle;
+mod restart;
 mod schedule;
 pub(crate) mod sha_gate;
 mod task;
@@ -199,6 +200,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "force_release_worktree" => {
             force_release::handle_force_release_worktree(&home, args, &sender)
         }
+
+        // --- Sprint 60 W1 PR-3 (#P0-3): operator restart MCP tool ---
+        "restart_daemon" => restart::handle_restart_daemon(&home, args, &sender),
 
         // --- Daemon binding-state diagnostic (Sprint 58 Wave 3 PR-2 #8) ---
         "binding_state" => binding_state::handle_binding_state(&home, args, &sender),

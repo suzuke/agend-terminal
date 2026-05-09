@@ -295,6 +295,19 @@ fn worktree_tools() -> Vec<Value> {
                 "agent": {"type": "string", "description": "Agent name (worktree owner)"},
                 "branch": {"type": "string", "description": "Branch name (worktree subdirectory)"}
             }, "required": ["agent", "branch"]}}),
+        // Sprint 60 W1 PR-3 (#P0-3): operator-initiated restart MCP tool.
+        // Closes the operator-restart-required SPOF that drove the
+        // Sprint 59 PR-4 (P3) abandon path. Sets RESTART_PENDING +
+        // records OperatorRestart shutdown reason; the daemon's main
+        // loop notices, runs shutdown_sequence, and re-execs self
+        // (Unix) or spawns + exits (Windows). On-disk state (binding
+        // metadata, topic registry, fleet.yaml) is preserved across
+        // restart automatically since it's already on disk; PTY
+        // agents are killed and operator re-attaches post-restart
+        // (MVP scope).
+        json!({"name": "restart_daemon", "description": "Trigger a programmatic daemon restart with minimal-state-preservation semantics. Records OperatorRestart shutdown reason, drains the API loop, runs the standard shutdown sequence (terminates PTY agents), then re-execs self with the same args (Unix) or spawn-and-exit (Windows). On-disk state (binding metadata, topic registry, fleet.yaml) is preserved automatically; operators re-attach PTY agents post-restart. Idempotent (concurrent calls return code=already_pending). Sprint 60 W1 PR-3 closes the operator-restart-required SPOF that drove the Sprint 59 PR-4 (P3) abandon path.",
+            "inputSchema": {"type": "object", "properties": {}, "required": []},
+            "requires_daemon_state": true}),
         // Sprint 58 Wave 3 PR-2 (#8): daemon-side binding diagnostic.
         // Operator + agent introspection surface for lease-block recovery
         // debugging. Reports binding.json + on-disk worktree state +
@@ -449,14 +462,12 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            31,
-            "Sprint 59 Wave 1 PR-5 tool count = 31 (force_release_worktree \
-             added on top of Sprint 58 Wave 3 PR-2's 30). The dispatch \
-             m-20260509125352834800-192 anticipated 32 with PR-4 #570 also \
-             bumping; on review, PR-4 only adds optional params to the \
-             existing `reply` tool (no new entry → tool array length \
-             unchanged), so the correct post-PR-5 count is 31. PR-4's \
-             rebase will not adjust this assertion. Current tools: {:?}",
+            32,
+            "Sprint 60 W1 PR-3 tool count = 32 (restart_daemon added \
+             on top of Sprint 59 Wave 1 PR-5's 31). Operator restart \
+             MCP tool closes the operator-restart-required SPOF that \
+             drove the Sprint 59 PR-4 (P3) abandon path. Current \
+             tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())

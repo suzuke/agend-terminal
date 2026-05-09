@@ -31,7 +31,7 @@ pub use tui_bridge::serve_agent_tui;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown-reason taxonomy.
@@ -62,6 +62,11 @@ pub(crate) enum ShutdownReason {
     /// compat with future "graceful exit on completion" code paths).
     #[allow(dead_code)]
     CleanExit = 4,
+    /// Sprint 60 W1 PR-3 (#P0-3): operator-initiated restart via the
+    /// `restart_daemon` MCP tool. Differs from `ApiShutdown` in that
+    /// `run_core` re-execs self after the shutdown sequence rather
+    /// than returning to the bootstrap layer.
+    OperatorRestart = 5,
 }
 
 impl ShutdownReason {
@@ -72,6 +77,7 @@ impl ShutdownReason {
             Self::ApiShutdown => "api_shutdown",
             Self::Watchdog => "watchdog",
             Self::CleanExit => "clean_exit",
+            Self::OperatorRestart => "operator_restart",
         }
     }
 
@@ -81,6 +87,7 @@ impl ShutdownReason {
             2 => Self::ApiShutdown,
             3 => Self::Watchdog,
             4 => Self::CleanExit,
+            5 => Self::OperatorRestart,
             _ => Self::Unknown,
         }
     }
@@ -93,6 +100,17 @@ impl ShutdownReason {
 /// doesn't get clobbered by a subsequent signal during the same
 /// shutdown sequence.
 pub(crate) static SHUTDOWN_REASON: AtomicU8 = AtomicU8::new(0);
+
+/// Sprint 60 W1 PR-3 (#P0-3): operator-restart pending flag. The
+/// `restart_daemon` MCP handler sets this after recording
+/// `ShutdownReason::OperatorRestart`. The API session loop bridges
+/// this to the local `shutdown` Arc<AtomicBool> so the main loop
+/// breaks; after `shutdown_sequence` runs, `run_core` re-execs self
+/// when this flag is set instead of returning to the bootstrap
+/// layer. Process-wide static so MCP handlers (which don't carry the
+/// shutdown flag in their HandlerCtx) can trigger the restart path
+/// without API-layer plumbing.
+pub(crate) static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Record the reason the daemon is shutting down. Idempotent on
 /// re-entry (first-write-wins via `compare_exchange`); safe to
@@ -951,8 +969,66 @@ fn run_core(
 
     // Give threads time to flush logs and close connections
     std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Sprint 60 W1 PR-3 (#P0-3): operator-initiated restart. After
+    // shutdown_sequence has terminated agents and we've flushed
+    // logs, re-exec self if RESTART_PENDING was set. exec() replaces
+    // the current process image in-place on Unix; on Windows we
+    // spawn a fresh process and exit. Either way, the new daemon
+    // comes up clean and re-reads on-disk state (binding metadata,
+    // topic registry, fleet.yaml) — operators re-attach PTY agents
+    // post-restart per the MVP scope.
+    if RESTART_PENDING.load(Ordering::Acquire) {
+        tracing::info!("operator-initiated restart: re-execing self");
+        exec_self_for_restart();
+        // exec_self_for_restart returns only on failure; fall through
+        // to normal exit so the operator gets a clean stop instead of
+        // a zombie process.
+        tracing::warn!("re-exec failed; falling back to normal exit");
+    }
+
     tracing::info!("exiting");
     Ok(())
+}
+
+/// Sprint 60 W1 PR-3 (#P0-3): re-exec the daemon with the same args
+/// after `RESTART_PENDING` was set. On Unix uses `execvp` via
+/// `CommandExt::exec` (atomic process-image replacement, preserves
+/// PID); on Windows spawns a fresh process and exits the current one
+/// (no `execvp` equivalent). Returns only on error — the success
+/// case never returns because the process image has been replaced
+/// (Unix) or `exit(0)` was called (Windows).
+fn exec_self_for_restart() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "current_exe() failed during restart");
+            return;
+        }
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        // exec only returns on error.
+        tracing::error!(error = %err, exe = %exe.display(), "execvp failed");
+    }
+
+    #[cfg(not(unix))]
+    {
+        match std::process::Command::new(&exe).args(&args).spawn() {
+            Ok(_child) => {
+                // New daemon has been spawned; exit current process so
+                // operators see a single clean transition.
+                std::process::exit(0);
+            }
+            Err(e) => {
+                tracing::error!(error = %e, exe = %exe.display(), "spawn-restart failed");
+            }
+        }
+    }
 }
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown summary record.
