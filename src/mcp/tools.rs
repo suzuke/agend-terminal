@@ -46,19 +46,19 @@ fn channel_tools() -> Vec<Value> {
 fn comm_tools() -> Vec<Value> {
     vec![
         // --- Unified send (Sprint 30: 5→1 consolidation) ---
-        json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast.",
+        json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast. Sprint 58 Wave 4 PR-1: kind=task dispatches MUST include task_id (call task action=create first to obtain a 't-...' id).",
             "inputSchema": {"type": "object", "properties": {
                 "target_instance": {"type": "string", "description": "Target instance name (single recipient)"},
                 "targets": {"type": "array", "items": {"type": "string"}, "description": "Multiple targets (broadcast mode)"},
                 "team": {"type": "string", "description": "Team name (broadcast to team)"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
                 "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query)"},
-                "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior)"},
+                "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). NOTE: kind=task requires task_id (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
                 "requires_reply": {"type": "boolean"},
                 "task_summary": {"type": "string"},
                 "success_criteria": {"type": "string", "description": "For task delegation"},
                 "context": {"type": "string"},
-                "task_id": {"type": "string", "description": "Task board ID for correlation"},
+                "task_id": {"type": "string", "description": "Task board ID for correlation. REQUIRED when request_kind=task — caller must obtain via `task action=create` and reference the resulting `t-...` id, closing the Wave 3 PR-1 dispatch protocol gap."},
                 "correlation_id": {"type": "string"},
                 "parent_id": {"type": "string"},
                 "thread_id": {"type": "string"},

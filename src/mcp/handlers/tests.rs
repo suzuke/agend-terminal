@@ -239,7 +239,7 @@ fn delegate_task_emits_fleet_event() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "message": "do the thing", "request_kind": "task"}),
+        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     // Must have succeeded (API-path or fallback); both populate "target".
@@ -260,9 +260,15 @@ fn delegate_task_emits_fleet_event() {
             assert_eq!(from, "sender");
             assert_eq!(to, "target");
             assert_eq!(summary, "do the thing");
-            // Pin: `delegate_task` has no id slot; correlation surfaces
-            // later via `report_result.correlation_id`. Must be None.
-            assert!(task_id.is_none(), "task_id must be None for delegate");
+            // Sprint 58 Wave 4 PR-1: kind=task dispatches MUST carry an
+            // explicit task_id (anti-stall contract). The fixture
+            // passes "t-test-fixture", so the FleetEvent surfaces it
+            // — closes the Wave 3 PR-1 dispatch correlation gap.
+            assert_eq!(
+                task_id.as_deref(),
+                Some("t-test-fixture"),
+                "task_id must surface from request → FleetEvent post-Wave-4"
+            );
         }
         other => panic!("expected DelegateTask, got {other:?}"),
     }
@@ -645,7 +651,7 @@ fn delegate_task_main_response_clean_when_provenance_fails() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "message": "do the thing", "request_kind": "task"}),
+        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
 
@@ -711,7 +717,7 @@ fn delegate_task_provenance_failure_logs_tracing_warn() {
     // provenance via SEND params; API layer handles injection.
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task"}),
+        &json!({"target_instance": "target", "task": "do the thing", "message": "do the thing", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     // Send may fail (no daemon) — provenance warn only fires on success path.
@@ -1117,7 +1123,7 @@ fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "dev", "task": "test task", "message": "test task", "request_kind": "task", "message": "test task", "request_kind": "task"}),
+        &json!({"target_instance": "dev", "task": "test task", "message": "test task", "request_kind": "task", "task_id": "t-test-fixture", "message": "test task", "request_kind": "task", "task_id": "t-test-fixture"}),
         "dev-impl",
     );
     // Should not error — team resolved to dev-lead.
@@ -1245,7 +1251,7 @@ fn test_delegate_task_busy_returns_structured_response() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "new work", "message": "new work", "request_kind": "task", "message": "new work", "request_kind": "task"}),
+        &json!({"target_instance": "target", "task": "new work", "message": "new work", "request_kind": "task", "task_id": "t-test-fixture", "message": "new work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     assert_eq!(result["busy"], true, "must return busy: {result}");
@@ -1283,7 +1289,7 @@ fn test_delegate_task_force_true_bypasses_busy_gate() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "force": true, "force_reason": "critical bug"}),
+        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "force": true, "force_reason": "critical bug"}),
         "sender",
     );
     assert!(
@@ -1332,7 +1338,7 @@ fn test_delegate_task_force_true_without_reason_rejected() {
 
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "force": true}),
+        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "force": true}),
         "sender",
     );
     assert!(
@@ -1356,7 +1362,7 @@ fn test_delegate_task_idle_target_normal_delivery() {
     // No claimed tasks for target
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "message": "normal work", "request_kind": "task"}),
+        &json!({"target_instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     assert!(
@@ -1381,7 +1387,7 @@ fn test_delegate_task_second_reviewer_flag_requires_reason() {
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "review PR", "message": "review PR", "request_kind": "task", "second_reviewer": true}),
+        &json!({"target_instance": "target", "task": "review PR", "message": "review PR", "request_kind": "task", "task_id": "t-test-fixture", "second_reviewer": true}),
         "sender",
     );
     assert!(
@@ -1439,7 +1445,7 @@ fn test_delegate_task_no_second_reviewer_flag_default_behavior() {
     std::env::set_var("AGEND_HOME", &home);
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "message": "normal work", "request_kind": "task"}),
+        &json!({"target_instance": "target", "task": "normal work", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture", "message": "normal work", "request_kind": "task", "task_id": "t-test-fixture"}),
         "sender",
     );
     // No second_reviewer flag → no error related to it
@@ -1533,7 +1539,7 @@ fn test_delegate_task_old_interrupt_true_still_works() {
     // Use OLD names: interrupt + reason
     let result = handle_tool(
         "send",
-        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "interrupt": true, "reason": "legacy caller"}),
+        &json!({"target_instance": "target", "task": "urgent", "message": "urgent", "request_kind": "task", "task_id": "t-test-fixture", "interrupt": true, "reason": "legacy caller"}),
         "sender",
     );
     // Should bypass busy gate (backwards-compat) + emit deprecation warning
@@ -1811,7 +1817,7 @@ fn test_isolation_active_after_setup_recorder() {
 #[test]
 fn send_kind_task_maps_message_field_to_task() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
-    let args = json!({"target_instance": "dev", "message": "do X", "request_kind": "task"});
+    let args = json!({"target_instance": "dev", "message": "do X", "request_kind": "task", "task_id": "t-test-fixture"});
     let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender));
     // Whatever error/success we observe, it must NOT be the field-name bug:
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
@@ -2485,7 +2491,7 @@ fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
         "send",
         &json!({
             "target_instance": "dev",
-            "request_kind": "task",
+            "request_kind": "task", "task_id": "t-test-fixture",
             "message": "do something"
         }),
         "lead",
@@ -2527,7 +2533,7 @@ fn m5_regression_via_id_routing() {
         "send",
         &json!({
             "target_instance": "dev",
-            "request_kind": "task",
+            "request_kind": "task", "task_id": "t-test-fixture",
             "message": "do something"
         }),
         "lead",
@@ -2600,4 +2606,303 @@ fn bandaid_removed_invariant() {
         !comms_src.contains("instances.contains_key"),
         "P1 bandaid pattern `instances.contains_key` must be removed from comms.rs"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Sprint 58 Wave 4 PR-1 (#2 engineering anti-stall) — kind=task
+// must carry an explicit task_id. Closes the Wave 3 PR-1 dispatch
+// protocol gap (lead created a task entry but didn't dispatch with
+// explicit task_id reference; dev idle-waited 100+ min). Tests pin
+// the structural gate so future refactors can't re-introduce the
+// gap.
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn send_kind_task_without_task_id_rejects_with_clear_error() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-no-id");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "task": "do the thing",
+            "message": "do the thing",
+            "request_kind": "task",
+            // task_id intentionally omitted
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    let code = result["code"].as_str().unwrap_or("");
+    assert!(
+        err.contains("task_id"),
+        "rejection must mention task_id: {result}"
+    );
+    assert_eq!(
+        code, "task_id_required",
+        "rejection must surface structured code: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_task_with_task_id_succeeds() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-with-id");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "task": "do the thing",
+            "message": "do the thing",
+            "request_kind": "task",
+            "task_id": "t-test-fixture",
+        }),
+        "sender",
+    );
+    assert!(
+        is_ok_result(&result),
+        "kind=task with task_id must succeed: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_query_without_task_id_still_works() {
+    // The anti-stall gate scopes to kind=task only — kind=query
+    // should remain unaffected.
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-query-ok");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "what's the status?",
+            "request_kind": "query",
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("task_id"),
+        "kind=query must NOT trigger task_id gate: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_update_without_task_id_still_works() {
+    // The anti-stall gate scopes to kind=task only — kind=update
+    // should remain unaffected.
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-update-ok");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "checkpoint reached",
+            "request_kind": "update",
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("task_id"),
+        "kind=update must NOT trigger task_id gate: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_report_without_task_id_still_works() {
+    // The anti-stall gate scopes to kind=task only — kind=report
+    // (which uses correlation_id, not task_id) must remain unaffected.
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-report-ok");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "review verdict: VERIFIED",
+            "request_kind": "report",
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("task_id"),
+        "kind=report must NOT trigger task_id gate: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_with_invalid_task_id_format_rejects() {
+    // Format validation: task_id must start with `t-` and contain
+    // only ASCII alphanumeric / hyphen / underscore (length 4-128).
+    // A bare empty string is caught earlier (handled by the
+    // "task_id_required" branch). This test pins the *shape* check
+    // for malformed-but-non-empty inputs.
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-bad-format");
+
+    let bad_ids = [
+        "no-prefix",     // missing t- prefix
+        "t-",            // empty after prefix
+        "t-with spaces", // ASCII whitespace not allowed
+        "t-bad/path",    // forward slash not allowed
+        "x",             // too short
+    ];
+    for bad in &bad_ids {
+        let result = handle_tool(
+            "send",
+            &json!({
+                "target_instance": "target",
+                "task": "do",
+                "message": "do",
+                "request_kind": "task",
+                "task_id": bad,
+            }),
+            "sender",
+        );
+        let err = result["error"].as_str().unwrap_or("");
+        assert!(
+            err.contains("task_id") && err.contains("invalid shape"),
+            "malformed task_id `{bad}` must be rejected with shape error: {result}"
+        );
+    }
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn error_message_includes_actionable_hint_text() {
+    // UX pin: the rejection message must explicitly tell the operator
+    // *how to recover* — i.e. mention `task action=create`. Without
+    // this hint, the error is just blame; with it, it's a recipe.
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-hint");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "task": "do",
+            "message": "do",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("task action=create"),
+        "rejection must guide caller to task action=create: {result}"
+    );
+    assert!(
+        err.contains("t-"),
+        "rejection must reference the t-... id prefix shape: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_kind_task_broadcast_path_also_requires_task_id() {
+    // Defensive bonus: the gate runs BEFORE broadcast routing in
+    // handle_unified_send, so kind=task on a broadcast (targets
+    // array OR team) is also gated. Without this, an operator could
+    // bypass the contract by adding a `targets` field.
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-broadcast");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "targets": ["alpha", "beta"],
+            "message": "do",
+            "request_kind": "task",
+            // task_id intentionally omitted
+        }),
+        "sender",
+    );
+    assert_eq!(
+        result["code"].as_str(),
+        Some("task_id_required"),
+        "broadcast kind=task must also require task_id: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_default_kind_without_task_id_still_works() {
+    // Defensive: when request_kind is omitted entirely, the
+    // anti-stall gate must NOT fire. This is the most common
+    // legacy call shape (plain instance-to-instance message).
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-default-kind");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "message": "plain message",
+            // request_kind intentionally omitted → defaults
+        }),
+        "sender",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        !err.contains("task_id"),
+        "missing request_kind must NOT trigger task_id gate: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn task_id_required_error_uses_stable_code_for_machine_consumption() {
+    // Defensive: agents may branch on `code: "task_id_required"`
+    // programmatically (e.g. retry with task action=create then
+    // re-dispatch). Pin the code string against accidental rename.
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("anti-stall-stable-code");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "target_instance": "target",
+            "task": "do",
+            "message": "do",
+            "request_kind": "task",
+        }),
+        "sender",
+    );
+    assert_eq!(
+        result["code"].as_str(),
+        Some("task_id_required"),
+        "stable code surface for machine-readable retry logic: {result}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
 }
