@@ -26,6 +26,21 @@ pub struct Task {
     /// dispatch; reviewer uses this to scope `checkout_repo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — RFC3339
+    /// timestamp captured the first time `status` transitions to
+    /// `in_progress` via `TaskEvent::InProgress`. Used by the
+    /// daemon-side anti-stall scanner to compute elapsed time
+    /// against `eta_secs`. `None` for tasks that never reached
+    /// in_progress OR pre-existed Sprint 59 schema migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<String>,
+    /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — operator-
+    /// supplied estimate of seconds to completion. The anti-stall
+    /// scanner emits a `task_stalled` inbox event when elapsed time
+    /// since `last_progress_at` exceeds `eta_secs * 1.5`. `None`
+    /// means "no stall detection for this task" — emit suppressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<i64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -178,6 +193,8 @@ fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         updated_at: r.updated_at.clone(),
         due_at: r.due_at.clone(),
         branch: r.branch.clone(),
+        dispatched_at: r.dispatched_at.clone(),
+        eta_secs: r.eta_secs,
     }
 }
 
@@ -312,6 +329,10 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
                 .as_ref()
                 .map(|s| crate::task_events::InstanceName(s.clone())),
             branch: t.branch.clone(),
+            // Sprint 59 Wave 1 PR-1: legacy migration has no eta value;
+            // default to None — disables stall detection on migrated
+            // tasks (pre-watchdog tasks weren't created with an ETA).
+            eta_secs: None,
             // Sprint 55 P0-C: legacy migration has no bind value; default
             // to None which preserves current auto-bind on subsequent
             // dispatches referencing this task_id.
@@ -553,6 +574,10 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 // Sprint 55 P0-C: opt-out flag for daemon auto-bind on
                 // dispatch. None = default auto-bind behavior preserved.
                 bind: args["bind"].as_bool(),
+                // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog):
+                // optional operator-supplied ETA in seconds. None
+                // disables stall detection for the task.
+                eta_secs: args["eta_secs"].as_i64(),
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => serde_json::json!({"id": id, "status": "created"}),
@@ -880,6 +905,8 @@ mod tests {
             updated_at: "2026-04-27T00:00:00Z".into(),
             due_at: None,
             branch: None,
+            dispatched_at: None,
+            eta_secs: None,
         }
     }
 
@@ -1426,6 +1453,7 @@ mod tests {
                 depends_on: vec![crate::task_events::TaskId("t-B".into())],
                 routed_to: None,
                 bind: None,
+                eta_secs: None,
             },
         )
         .unwrap();
@@ -1443,6 +1471,7 @@ mod tests {
                 depends_on: vec![crate::task_events::TaskId("t-A".into())],
                 routed_to: None,
                 bind: None,
+                eta_secs: None,
             },
         )
         .unwrap();
@@ -2089,6 +2118,8 @@ mod tests {
                     updated_at: chrono::Utc::now().to_rfc3339(),
                     due_at: None,
                     branch: None,
+                    dispatched_at: None,
+                    eta_secs: None,
                 });
             }
             Ok(())
@@ -2151,6 +2182,8 @@ mod tests {
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 due_at: None,
                 branch: None,
+                dispatched_at: None,
+                eta_secs: None,
             });
             Ok(())
         })

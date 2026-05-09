@@ -214,6 +214,14 @@ pub enum TaskEvent {
         /// behavior. v1 envelopes default to `None` via serde.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bind: Option<bool>,
+        /// **Sprint 59 Wave 1 PR-1 (#9 task stall watchdog)** —
+        /// optional operator-supplied estimate of seconds to
+        /// completion. Anti-stall scanner emits `task_stalled` inbox
+        /// event when elapsed since `last_progress_at` exceeds
+        /// `eta_secs * 1.5`. `None` disables stall detection. v1
+        /// envelopes default to `None` via serde.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        eta_secs: Option<i64>,
     },
     Claimed {
         task_id: TaskId,
@@ -421,6 +429,19 @@ pub struct TaskRecord {
     /// `Some(false)` means RCA/audit/design class; auto-bind was skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<bool>,
+    /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — RFC3339
+    /// timestamp captured when the task first transitions to
+    /// `in_progress`. Set in the `TaskEvent::InProgress` arm of
+    /// [`TaskBoardState::apply`]; idempotent (only first transition
+    /// records the timestamp).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<String>,
+    /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — operator-
+    /// supplied estimate of seconds to completion, sourced from the
+    /// `eta_secs` field on `TaskEvent::Created` (or a future
+    /// `EtaUpdated` event if the contract evolves).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -492,6 +513,7 @@ impl TaskBoardState {
                 routed_to,
                 branch,
                 bind,
+                eta_secs,
                 ..
             } => {
                 self.tasks
@@ -515,6 +537,8 @@ impl TaskBoardState {
                         result: None,
                         branch: branch.clone(),
                         bind: *bind,
+                        dispatched_at: None,
+                        eta_secs: *eta_secs,
                     });
             }
             TaskEvent::Claimed { by, .. } => {
@@ -530,7 +554,17 @@ impl TaskBoardState {
                 if let Some(t) = self.tasks.get_mut(&task_id) {
                     t.status = TaskStatus::InProgress;
                     t.owner = Some(by.clone());
-                    t.updated_at = touch_at;
+                    t.updated_at = touch_at.clone();
+                    // Sprint 59 Wave 1 PR-1: set dispatched_at on FIRST
+                    // transition to InProgress. Subsequent re-entries
+                    // (e.g. after a Released → Claimed → InProgress
+                    // cycle) leave the original dispatched_at intact —
+                    // the anti-stall scanner cares about "when did the
+                    // task start being worked on", not the latest
+                    // checkpoint.
+                    if t.dispatched_at.is_none() {
+                        t.dispatched_at = Some(touch_at);
+                    }
                 }
             }
             TaskEvent::Verified { .. } => {
@@ -889,6 +923,7 @@ mod tests {
             routed_to: None,
             branch: None,
             bind: None,
+            eta_secs: None,
         }
     }
 
@@ -1351,6 +1386,7 @@ mod tests {
                 routed_to: None,
                 branch: None,
                 bind: None,
+                eta_secs: None,
             },
         )
         .unwrap();
@@ -1425,6 +1461,7 @@ mod tests {
                     routed_to: None,
                     branch: None,
                     bind: None,
+                    eta_secs: None,
                 },
                 "Claimed" => TaskEvent::Claimed {
                     task_id: tid.clone(),
@@ -1617,6 +1654,7 @@ mod tests {
                 routed_to: None,
                 branch: None,
                 bind: None,
+                eta_secs: None,
             },
         )
         .unwrap();
@@ -1695,6 +1733,7 @@ mod tests {
                     routed_to: None,
                     branch: None,
                     bind: None,
+                    eta_secs: None,
                 },
             },
             // Sweep Linked appears BEFORE operator Claimed in file order
@@ -1865,6 +1904,7 @@ mod tests {
                 routed_to: None,
                 branch: None,
                 bind: Some(false),
+                eta_secs: None,
             },
         )
         .unwrap();
@@ -1874,6 +1914,203 @@ mod tests {
             .get(&TaskId::from("t-rca"))
             .expect("task in state");
         assert_eq!(task.bind, Some(false));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — schema field
+    // tests pinning eta_secs round-trip + dispatched_at semantics.
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn task_schema_dispatched_at_set_on_status_in_progress_transition() {
+        // Lead spec name: dispatched_at must be auto-set the FIRST
+        // time the task transitions to in_progress.
+        let home = tmp_home("schema-dispatched-at");
+        let inst = InstanceName::from("test");
+        let tid = TaskId::from("t-disp");
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "x".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: Some(60),
+            },
+        )
+        .unwrap();
+        // Pre-claim: dispatched_at is None.
+        let pre = replay(&home).unwrap();
+        let pre_t = pre.tasks.get(&tid).unwrap();
+        assert!(pre_t.dispatched_at.is_none(), "pre-claim: no dispatched_at");
+
+        append(
+            &home,
+            &inst,
+            TaskEvent::Claimed {
+                task_id: tid.clone(),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        // Post-claim, pre-in_progress: still None.
+        let mid = replay(&home).unwrap();
+        assert!(mid.tasks.get(&tid).unwrap().dispatched_at.is_none());
+
+        append(
+            &home,
+            &inst,
+            TaskEvent::InProgress {
+                task_id: tid.clone(),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        // Post-in_progress: dispatched_at is set.
+        let post = replay(&home).unwrap();
+        let post_t = post.tasks.get(&tid).unwrap();
+        assert!(
+            post_t.dispatched_at.is_some(),
+            "in_progress must set dispatched_at: {post_t:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_schema_dispatched_at_idempotent_on_subsequent_in_progress() {
+        // Defensive: a Released → Claimed → InProgress cycle must
+        // NOT overwrite the original dispatched_at — anti-stall
+        // scanner cares about "when did work first start", not the
+        // latest checkpoint.
+        let home = tmp_home("schema-disp-idem");
+        let inst = InstanceName::from("test");
+        let tid = TaskId::from("t-disp-idem");
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "x".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: Some(60),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Claimed {
+                task_id: tid.clone(),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::InProgress {
+                task_id: tid.clone(),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        let first_dispatched = replay(&home)
+            .unwrap()
+            .tasks
+            .get(&tid)
+            .unwrap()
+            .dispatched_at
+            .clone();
+        assert!(first_dispatched.is_some());
+
+        // Release → Claim → InProgress again. dispatched_at must
+        // remain unchanged.
+        append(
+            &home,
+            &inst,
+            TaskEvent::Released {
+                task_id: tid.clone(),
+                reason: "test".into(),
+            },
+        )
+        .unwrap();
+        append(
+            &home,
+            &inst,
+            TaskEvent::Claimed {
+                task_id: tid.clone(),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        // Sleep briefly so a hypothetical overwrite would surface
+        // as a different timestamp.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        append(
+            &home,
+            &inst,
+            TaskEvent::InProgress {
+                task_id: tid.clone(),
+                by: inst.clone(),
+            },
+        )
+        .unwrap();
+        let second_dispatched = replay(&home)
+            .unwrap()
+            .tasks
+            .get(&tid)
+            .unwrap()
+            .dispatched_at
+            .clone();
+        assert_eq!(
+            first_dispatched, second_dispatched,
+            "dispatched_at must NOT be overwritten on re-entry"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn task_schema_eta_secs_round_trips_from_created_event() {
+        // Defensive: eta_secs supplied at Created event must
+        // surface on TaskRecord post-replay.
+        let home = tmp_home("schema-eta-rt");
+        let inst = InstanceName::from("test");
+        let tid = TaskId::from("t-eta-rt");
+        append(
+            &home,
+            &inst,
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "x".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: None,
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: None,
+                bind: None,
+                eta_secs: Some(7200),
+            },
+        )
+        .unwrap();
+        let task = replay(&home).unwrap().tasks.get(&tid).cloned().unwrap();
+        assert_eq!(task.eta_secs, Some(7200), "eta_secs must round-trip");
         std::fs::remove_dir_all(&home).ok();
     }
 }

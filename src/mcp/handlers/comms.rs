@@ -5,7 +5,7 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{anti_stall::check_kind_task_requires_task_id, err_needs_identity, is_ok_result};
+use super::{anti_stall::enforce_anti_stall_invariants, err_needs_identity, is_ok_result};
 
 /// Sprint 30: unified `send` handler. Routes to existing handlers based on
 /// `request_kind` or infers from args (targets/team → broadcast, task field
@@ -24,7 +24,7 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
         }
     }
 
-    if let Some(err) = check_kind_task_requires_task_id(&args) {
+    if let Some(err) = enforce_anti_stall_invariants(home, &args) {
         return err;
     }
     // Broadcast mode: targets/team/tags present

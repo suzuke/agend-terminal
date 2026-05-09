@@ -198,11 +198,16 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         );
     }
     let mut pane_input_tracks: HashMap<String, PaneInputTrack> = HashMap::new();
+    // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog): per-loop
+    // tracker that throttles the anti-stall scan to once every
+    // TICKS_PER_SCAN supervisor ticks (10s × 30 = 5min).
+    let mut anti_stall_tracker = crate::daemon::anti_stall::AntiStallTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
         process_server_rate_limit_retries(&home, &registry, &mut retry_tracks);
         check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
+        anti_stall_tracker.maybe_scan(&home);
     }
 }
 
