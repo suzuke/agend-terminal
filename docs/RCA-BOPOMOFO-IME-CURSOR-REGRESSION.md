@@ -50,7 +50,15 @@ if focused && pane.scroll_offset == 0 {
 
 `src/vterm.rs::cursor_pos()` last semantic change traces to Sprint 21 (a2acf75, 2025) or earlier; no Sprint 48-and-later commit modifies it.
 
-`git log 834f30d..fc859a3 -- 'src/render/*.rs' src/vterm.rs` returns one cursor-unrelated change: #514 (UTC→local timezone display in expanded decision view, Sprint 54 P2-6). No other render-touching commit in the post-split window through current main fc859a3.
+`git log 834f30d..fc859a3 -- 'src/render/*.rs' src/vterm.rs` returns three render-touching commits in the post-split window through current main fc859a3. Per-commit hunk inspection (`git show <sha> -- 'src/render/*.rs'`):
+
+- **33545c8** (#567 task stall watchdog, Sprint 59 Wave 1 PR-1) — touches `src/render/panels.rs` + `src/render/panels_fleet.rs`. All three hunks (`panels.rs` @@-485+/+541, `panels_fleet.rs` @@-214) sit inside `mod tests { }` blocks adding `dispatched_at: None, eta_secs: None` to `Task` struct test-fixture literals. Mechanical test-fixture updates following a `Task` schema extension; no production render code change. Cursor-unrelated.
+
+- **0394405** (#514 UTC→local timezone display in expanded decision view, Sprint 54 P2-6) — touches `src/render/panels.rs`. Adds a `format_local_short` helper (RFC 3339 → `MM-DD HH:MM` local-timezone string) used by `render_decisions` for the decision-list display. No cursor-emit / cursor-track / focus-handling code path touched. Cursor-unrelated.
+
+- **2f90cb4** (#432 Anthropic server-side rate-limit auto-retry) — touches `src/render/core_render.rs`. Sole hunk: 4-line extension of the `state_color` function adding `AgentState::ServerRateLimit` to the `Color::Indexed(208)` arm alongside `ContextFull | RateLimit`. The cursor-emit gate at the post-split `core_render.rs:400` `render_pane` function is in a different function and is not touched. Cursor-unrelated.
+
+None of the three modify cursor-emit, cursor-track, or focus-handling code paths. The byte-identical-to-pre-split claim above (`render_pane` cursor-emit gate at `core_render.rs:400-407` matches pre-split `render.rs:485-490`) therefore stands.
 
 `Cargo.toml` history shows `crossterm = "0.28"` and `ratatui = "0.29"` pinned, with no version bump in the post-Sprint-48 window.
 
