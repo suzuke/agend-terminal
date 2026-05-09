@@ -18,20 +18,23 @@ exceeds estimate).
 
 | # | Symptom | Reproduction |
 |---|---|---|
-| **S1** | Same-named duplicate topics accumulate. | Operator: `delete_instance dev`, then `create_instance dev`. The original topic is NOT deleted; a new topic with the same name is created alongside. After 3 cycles: 3 "dev" topics in the chat. |
-| **S2** | Stale topics survive daemon restart. | Operator: `agend-terminal stop` mid-sprint with N agents, then restart with `fleet.yaml` listing only N-1 agents (one was retired without a clean delete). The retired agent's topic remains in the chat indefinitely. |
-| **S3** | Topic ID drift between `topics.json` and `fleet.yaml.topic_id`. | Operator hand-edits `fleet.yaml.<agent>.topic_id` to a stale value; daemon restart picks up the stale ID, creates a NEW topic anyway, and now both IDs are tracked separately (one in `topics.json`, one in `fleet.yaml`). |
-| **S4** | Bot lacking `can_manage_topics` permission produces silent failure on cleanup attempts. | Operator's bot was originally added without forum permissions. `delete_topic()` calls `bot.delete_forum_topic` which returns API error, current code silently swallows via `let _ = ... .await`. Operator sees no signal. |
+| **S1** | Daemon restart auto-create produces duplicate-named topics when registry state is lost or partial. | Operator: corrupt or delete `topics.json` between daemon runs (e.g. `~/.agend-terminal/topics.json` accidentally truncated, OR fleet.yaml hand-edited to clear `topic_id`). On restart, bootstrap reads neither source has a topic_id for instance "dev", calls `bot.create_forum_topic` unconditionally — but the OLD "dev" topic still exists in the chat from the previous run. Telegram allows duplicate-named topics; now the chat has two "dev" topics (one stale, one fresh). Over multiple lossy-restart cycles: 3+ "dev" topics accumulate. |
+| **S2** | Stale topics survive daemon restart when `topics.json` mapping is lost. | Operator: `agend-terminal stop` mid-sprint with N agents, then restart with `fleet.yaml` listing only N-1 agents (one was retired without a clean delete) AND `topics.json` no longer has the retired agent's mapping (registry corruption / manual cleanup). The bootstrap orphan-cleanup at `bootstrap.rs:71-78` only enumerates `topics.json` entries — topics that exist on the chat side but lack a `topics.json` mapping are NEVER detected. The retired agent's chat topic remains indefinitely. |
+| **S3** | Topic ID drift between `topics.json` and `fleet.yaml.topic_id`. | Operator hand-edits `fleet.yaml.<agent>.topic_id` to a stale value; daemon restart reads BOTH sources at `bootstrap.rs:87-102`, merging them into `topic_map`. If the same instance is keyed in fleet.yaml with one tid and `topics.json` with another, the merge collapses to fleet.yaml's value (later overwrite), but `topics.json` retains the stale entry — the next daemon restart re-merges the stale entry, perpetuating the drift. |
+| **S4** | Bot lacking `can_manage_topics` permission produces silent failure on cleanup attempts. | Operator's bot was originally added without forum permissions. `delete_topic()` calls `bot.close_forum_topic` (`let _ = ... .await`) and `bot.delete_forum_topic`, both of which return API errors that the code does not match-on or surface. Operator sees no signal; topics linger in the chat and the registry. |
 | **S5** | Operator has no operator-callable surface to inspect or batch-clean topic state — must read `topics.json` + cross-reference Telegram chat manually. |
 
 ---
 
 ## 2. Root cause(s)
 
-### S1 — Same-named duplicates on recreate
-- **Source**: `src/mcp/handlers/instance_lifecycle.rs:82` calls `telegram::delete_topic(home, tid)` ONLY when the instance had a `topic_id` recorded in `fleet.yaml`. If `delete_instance` is called on an instance whose topic_id wasn't yet flushed to `fleet.yaml` (race: fast delete after create), no cleanup fires.
-- **Source**: `src/channel/telegram/adapter.rs:264` runs `delete_topic` on the `Channel::delete_instance` outbound op — but the op fires only when the adapter is informed of the lifecycle event, which doesn't always happen synchronously with `instance_lifecycle::handle_delete_instance`.
-- **Gap**: there's no canonical "instance N deleted → topic-cleanup" guarantee path that holds for ALL deletion code paths (MCP handler / fleet.yaml hand-edit / bootstrap orphan cleanup).
+### S1 — Bootstrap restart auto-create doesn't pre-check chat for same-named existing topic
+- **Source**: `src/channel/telegram/bootstrap.rs:104-122` (auto-create loop) calls `bot.create_forum_topic(chat_id, name, ...)` whenever an instance has no `topic_id` in either `fleet.yaml.<inst>.topic_id` (line 87-91) or `topics.json` (line 94-102). It does NOT first query the chat to ask "does a topic with this exact name already exist?".
+- **Telegram API behaviour**: `create_forum_topic` succeeds even when a same-named topic already exists in the chat — Telegram allows duplicate names. There is no client-side dedup.
+- **Trigger condition**: any registry-state loss between daemon runs that drops the `topic_id` for an instance whose topic still exists on chat. Real-world causes: corrupted `topics.json` (truncated mid-write before atomic rename, manual `rm`), operator hand-edit of `fleet.yaml` clearing `topic_id`, fresh daemon working dir against a chat that already has topics.
+- **Gap**: bootstrap auto-create needs a "search live chat for same-named topic" pre-check OR a "query existing forum topics" enumeration to reuse rather than recreate.
+
+(Note: the `delete_instance` path at `src/mcp/handlers/instance_lifecycle.rs:55-85` is robust — line 64's fallback `topic_id.or_else(|| telegram::lookup_topic_for_instance(home, name))` covers the pre-fleet.yaml-flush race, line 81-85 calls `delete_topic` when EITHER source has the id, line 84 surfaces a tracing warn on the genuine "no record anywhere" case. This path is not the S1 gap source — bootstrap is.)
 
 ### S2 — Restart-resurrected stale topics
 - **Source**: `src/channel/telegram/bootstrap.rs:71-78` runs orphan-cleanup, but only matches against `config.instances.keys()` from the CURRENT `fleet.yaml`. If a topic was created for an instance, that instance was hand-removed from `fleet.yaml` between two daemon runs, AND the `topics.json` registry retained the topic_id → orphan-cleanup deletes it. **However**, the cleanup excludes `tid != 1` and `inst_name != FLEET_BINDING_SENTINEL`, AND requires `topics.json` to know about the topic. Topics created via direct API call but never recorded in `topics.json` are never enumerated.
@@ -58,9 +61,9 @@ permission-checked, observable topic-cleanup operation.
 ### 3.1 Trigger detection
 
 Three trigger sites:
-- **(α-a) MCP `delete_instance` handler** — `src/mcp/handlers/instance_lifecycle.rs::handle_delete_instance`. Already calls `delete_topic` at line 82; ensure it ALSO catches the case where `topic_id` is in `topics.json` but not yet in `fleet.yaml` (S1 root cause). Look up via `lookup_topic_for_instance` if `fleet.yaml.topic_id.is_none()`.
+- **(α-a) Bootstrap restart auto-create — pre-check live chat for same-named topic** (S1 fix). At `src/channel/telegram/bootstrap.rs:104-122`, before calling `bot.create_forum_topic`, query the chat for existing forum topics and reuse a same-named match if found (record into `topics.json` + `fleet.yaml.<inst>.topic_id`). The teloxide `Bot::get_chat` may not directly expose forum topic enumeration — investigation note: `getForumTopicIconStickers` is for icons, not topic listing; the Telegram Bot API has limited surface for "list all forum topics". If no native enumeration: fall back to `topics.json` re-scan + the (α-b) orphan-cleanup extension as the dedup mechanism. *Possible scope risk: surface gap if teloxide doesn't expose the needed API.* Alternative if blocked: rely on (γ) operator-driven cleanup as the recovery surface, document the limitation in compat strategy.
 - **(α-b) `bootstrap::init_from_config` orphan-cleanup pass** — already exists at line 71-82. Extend the loop to ALSO query the live Telegram chat for forum topics, compare against `topics.json` + `fleet.yaml`, and delete any "in chat but not tracked" topics that match an `instance_names` historical pattern. Defer cross-chat orphans to (γ) doctor surface (out of scope for (α) auto-path).
-- **(α-c) Fleet-config-change watcher (NEW)** — when `fleet.yaml` is mutated (instance removed via hand-edit), trigger a reconciliation pass on next daemon tick. Implementation: leverage existing `fleet::FleetConfig::load` reload pattern; on detected diff, schedule `delete_topic(stale_tid)` for any removed instance. *Possible scope risk: file-watch infra.* Alternative: defer to next `bootstrap::init_from_config` run (less responsive but zero new infra).
+- **(α-c) Delete path permission surfacing** (S4 fix). `src/channel/telegram/topic_registry.rs:106-120` `delete_topic` currently swallows API errors via `let _ = ... .await`. Replace with explicit match arms that distinguish permission errors (warn-log with actionable hint) from generic errors (error-log with full chain). The MCP `delete_instance` path already has the topic_id resolution robust per code line 64 + 81-83, so this fix surfaces failures rather than re-tracing the resolution path. (NOTE: this is what (α-a) was originally drafted as in r0 — that draft was based on a stale code reading that the line-64 fallback didn't exist; reviewer corrected. r1 reframes (α-a) to bootstrap-side as the actual S1 gap.)
 
 ### 3.2 Permission check
 
@@ -120,12 +123,25 @@ batch cleanup.
 
 Default mode: read-only inspection.
 - Loads `topics.json`, `fleet.yaml.instances.<>.topic_id`, queries live Telegram chat for current topic list.
-- Classifies each topic into:
-  - **`live`** — present in `topics.json` AND `fleet.yaml.topic_id` AND in chat.
-  - **`stale_registry`** — in `topics.json` but NOT in chat (topic deleted out-of-band).
-  - **`stale_chat`** — in chat but NOT in `topics.json` (topic created out-of-band).
-  - **`drift_fleet`** — `fleet.yaml.topic_id` ≠ `topics.json[<inst>]` (write-side desync from S3).
-  - **`orphan`** — in `topics.json` mapping to instance name not in `fleet.yaml`.
+- Classifies each topic with **explicit precedence-ordered assignment** (no overlapping classifications):
+
+#### Classification algorithm (precedence-ordered, first-match wins)
+
+For each (topic_id, instance_name) candidate observed across the 3 sources (topics.json / fleet.yaml.topic_id / live chat enumeration), apply rules in this order; assign the first matching class:
+
+1. **`live`** — present in `topics.json` AND `fleet.yaml.<inst>.topic_id == topic_id` AND in chat. (All three anchors agree.)
+2. **`drift_fleet`** — present in `topics.json` AND in chat AND `fleet.yaml.<inst>.topic_id` exists BUT `≠ topic_id`. (Two of three agree; fleet.yaml is desynced.)
+3. **`stale_registry`** — present in `topics.json` AND `fleet.yaml.<inst>.topic_id == topic_id` (or absent) BUT NOT in chat. (Topic deleted out-of-band; registry retained the mapping.)
+4. **`orphan`** — present in `topics.json` mapping to instance name **not in `fleet.yaml`** (regardless of chat presence). (Instance retired without registry cleanup.)
+5. **`stale_chat`** — present in chat AND NOT in `topics.json` AND no `fleet.yaml.<inst>.topic_id == topic_id` match. (Topic created out-of-band; never tracked.)
+
+Notes on precedence:
+- `drift_fleet` checked BEFORE `stale_registry` because both are tied to a `topics.json` entry; drift is the more specific case (chat-present + fleet mismatch) and should be surfaced separately so the operator can resolve the desync explicitly.
+- `orphan` checked BEFORE `stale_chat` because an orphan's chat presence is irrelevant to the classification — the defining property is "instance no longer in fleet.yaml". An orphan that's also chat-deleted would be classified `orphan` (not `stale_registry` + `orphan`).
+- `live` and `drift_fleet` are mutually exclusive by construction (live requires fleet.yaml match; drift_fleet requires fleet.yaml mismatch).
+- `stale_registry` and `orphan` are mutually exclusive: stale_registry requires the instance to BE in fleet.yaml (else it would be orphan); orphan requires the instance NOT in fleet.yaml.
+
+Each topic appears in exactly one classification. The taxonomy enumerates all observable states across the 3-source state space.
 
 Output: human-readable table OR JSON list.
 
@@ -196,16 +212,18 @@ under the LOC ceiling.
 
 | Part | Prod LOC | Test LOC | Total | Tier |
 |---|---|---|---|---|
-| (α-a) `delete_instance` topic_id fallback (lookup_topic_for_instance) | 10-20 | 30-50 | 40-70 | Tier-1 single primary |
+| (α-a) bootstrap restart auto-create same-named-topic pre-check | 30-50 | 40-60 | 70-110 | Tier-1 single primary |
 | (α-b) bootstrap orphan-cleanup extension (live-chat enumeration) | 30-50 | 40-60 | 70-110 | Tier-1 single primary |
-| (α-c) fleet-config-change watcher (deferred to bootstrap reload, NOT file-watch) | 10-20 | 30-50 | 40-70 | Tier-1 single primary |
-| (α) Permission check helper + delete_topic surfacing | 30-50 | 40-60 | 70-110 | Tier-1 single primary |
-| **(α) total** | **~80-140** | **~140-220** | **~220-360** | **Tier-1** |
-| (γ) doctor_topics module (classification + format) | 100-150 | 60-100 | 160-250 | Tier-1 single primary |
+| (α-c) delete path permission surfacing (delete_topic error matches) | 20-30 | 30-50 | 50-80 | Tier-1 single primary |
+| (α) shared permission-check helper (`can_manage_topics_for`) | 20-30 | 20-30 | 40-60 | Tier-1 single primary |
+| **(α) total** | **~100-160** | **~130-200** | **~230-360** | **Tier-1** |
+| (γ) doctor_topics module (classification + format, precedence-ordered) | 110-160 | 70-110 | 180-270 | Tier-1 single primary |
 | (γ) cli.rs integration | 10-20 | 10-20 | 20-40 | Tier-1 single primary |
 | (γ) `--cleanup` flag (delete_topic per classification, confirmation prompt) | 30-50 | 30-50 | 60-100 | Tier-1 single primary |
-| **(γ) total** | **~140-220** | **~100-170** | **~240-390** | **Tier-1** |
-| **Combined (α)+(γ)** | **~220-360** | **~240-390** | **~460-750** | **Tier-1** |
+| **(γ) total** | **~150-230** | **~110-180** | **~260-410** | **Tier-1** |
+| **Combined (α)+(γ)** | **~250-390** | **~240-380** | **~490-770** | **Tier-1** |
+
+(r1 update: scope shifted slightly — (α-a) reframed from "delete_instance fallback" (already-existing, no work needed) to "bootstrap pre-check" (~70-110 LOC). (α-c) refocused on delete_topic permission surfacing only (~50-80 LOC). Combined total moves from ~460-750 to ~490-770. The 770 ceiling is 20 LOC above the 750 IMPL-gate threshold — reviewer should flag if this requires the "split into 2 PRs" surface-block in §8.2 condition #4.)
 
 Predicted file touches:
 - `src/channel/telegram/topic_registry.rs` (delete_topic permission gate + error surfacing)
@@ -232,9 +250,15 @@ Predicted file touches:
 ### 8.1 IMPL dispatch criteria (auto-trigger)
 
 If RCA reviewer verdict = VERIFIED AND scope estimate from §6 holds
-(<= ~750 LOC combined for both parts), IMPL dispatch follows
-automatically per Wave 2 sequencing context. The conditional task
-is `t-20260509090003452174-17` (referenced in lead's m-20260509152716671697-225).
+(<= ~750 LOC combined for both parts — r1 estimate is ~490-770, the
+upper bound modestly exceeds 750), IMPL dispatch follows automatically
+per Wave 2 sequencing context. The conditional task is
+`t-20260509090003452174-17` (referenced in lead's m-20260509152716671697-225).
+
+**Threshold flag (r1)**: the upper-bound 770 LOC is 20 LOC above the
+750 ceiling. If reviewer judges this margin as insufficient, fall back
+to surface-block condition #4 below (split (α) and (γ) into 2 sequential
+PRs).
 
 Dispatch shape: single combined IMPL PR for (α) + (γ) (estimated
 ~460-750 LOC) OR split into 2 sequential PRs if reviewer flags a
