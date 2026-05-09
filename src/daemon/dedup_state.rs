@@ -65,6 +65,46 @@
 //! - Write failure: logged via `tracing::warn`, supervisor continues
 //!   with the in-memory state (best-effort persistence; correctness
 //!   degrades to pre-Track-C behavior — acceptable).
+//!
+//! ## Schema-evolution contract (Sprint 58 Wave 1 PR-2 #5)
+//!
+//! Per Track C Pass 2 reviewer non-blocking note + Sprint 58 P1
+//! follow-up, the schema-evolution contract is **forward-only with
+//! upgrade-time skip-on-mismatch**:
+//!
+//! - **v(N) reading v(N) file** → full round-trip, all fields
+//!   preserved.
+//! - **v(N+1) reading v(N) file** → forward-compatible IF the
+//!   v(N+1) reader uses `#[serde(default)]` for any v(N+1)-added
+//!   field. The deserialize lands sensible defaults for the missing
+//!   fields rather than panicking. This module's struct carries
+//!   `#[serde(default)]` on all v1 fields as a forward-prep measure
+//!   so any v2 reader that adds new fields with their own defaults
+//!   can deserialize v1 files cleanly without strict-equality
+//!   schema bumps.
+//! - **v(N) reading v(N+1) file** → `load_all` checks
+//!   `schema_version != SCHEMA_VERSION` and SKIPS the entry with a
+//!   `tracing::warn` event. NO downgrade-attempt logic — the
+//!   contract is forward-only. An older daemon that sees a newer-
+//!   version file (e.g. operator briefly downgraded after an
+//!   upgrade) treats the agent as "no persistent dedup state" and
+//!   falls back to in-memory cap rearm, exactly matching pre-
+//!   Track-C behaviour for that single agent. Correct fail-open
+//!   semantic.
+//!
+//! **Downgrade / mixed-version continuity is NOT guaranteed.** If
+//! a future v2 reader needs to interoperate with v1 readers running
+//! in parallel (e.g. multi-binary deploys mid-rollout), explicit
+//! version-handling logic must be added at v2+. The current
+//! contract trades that flexibility for simpler v1 mechanics.
+//!
+//! Why `#[serde(default)]` lands on v1 fields NOW rather than
+//! lazily at v2-introduction time: centralizing the forward-prep
+//! into the v1 schema avoids future migration churn AND pins the
+//! round-trip via tests, so a future contributor adding v2 fields
+//! has a green-field surface to extend without breaking v1's
+//! round-trip semantics. Tagged at the field level rather than the
+//! struct level so each addition is reviewed individually.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,20 +121,45 @@ const SCHEMA_VERSION: u32 = 1;
 /// Sub-directory of `$AGEND_HOME` that holds per-agent JSON files.
 pub(crate) const DEDUP_STATE_DIR: &str = "dedup-state";
 
-#[derive(Debug, Serialize, Deserialize)]
+/// On-disk schema for the per-agent dedup ledger.
+///
+/// Sprint 58 Wave 1 PR-2 (#5) forward-compat: every field carries
+/// `#[serde(default)]` so a future v2 reader that adds new fields
+/// (with their own `#[serde(default)]`) can deserialize v1 files
+/// without strict-deserialize failure. Each default lands the
+/// pre-Track-C zero-state for that field — equivalent to "no prior
+/// dedup state for this agent" — which fail-opens the dedup gate
+/// to the in-memory cap-rearm behaviour for a missing field. This
+/// preserves the Phase A correctness invariant (cap honoured for
+/// any complete v(N) → v(N) round-trip) while allowing v2+ readers
+/// to extend the schema without breaking v1 file compatibility.
+///
+/// See module-level rustdoc "Schema-evolution contract" section
+/// for the full forward-only-upgrade guarantees and downgrade
+/// caveats.
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct OnDisk {
+    #[serde(default)]
     schema_version: u32,
+    #[serde(default)]
     agent: String,
     /// Hex-formatted u64 (`"0x{:016x}"`) so JSON readers handle the
     /// full 64-bit range without precision loss.
+    #[serde(default)]
     fingerprint: String,
+    #[serde(default)]
     dedup_count: u32,
     /// `last_inject_at` as Unix-epoch microseconds. Reconstructed to
     /// `Instant` on load via `SystemTime::now()` delta.
+    #[serde(default)]
     last_inject_at_unix_micros: i64,
+    #[serde(default)]
     dedup_audit_emitted: bool,
+    #[serde(default)]
     retry_count: u32,
+    #[serde(default)]
     exhausted: bool,
+    #[serde(default)]
     input_text: String,
 }
 
@@ -612,6 +677,161 @@ mod tests {
         let dev = loaded.get("dev").unwrap();
         assert_eq!(dev.input_text, "v2-different");
         assert_eq!(dev.dedup_count, 1);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ----- Sprint 58 Wave 1 PR-2 (#5) forward-compat pins -----
+
+    #[test]
+    fn dedup_state_v1_file_with_extra_unknown_fields_round_trips() {
+        // Forward-compat: a hypothetical v2 file with extra
+        // unknown fields must NOT trip a strict-deserialize
+        // failure when read by a v1 reader. serde-json by default
+        // ignores unknown fields on Deserialize (not
+        // `deny_unknown_fields`), so an extra field round-trips as
+        // a no-op. Pin the behaviour explicitly so any future
+        // refactor that adds `#[serde(deny_unknown_fields)]`
+        // breaks this test loud and proud.
+        let home = tmp_home("v2-extra-fields");
+        let dir = home.join(DEDUP_STATE_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Plant a synthetic file with an extra `v2_only_field`
+        // that doesn't exist in the v1 OnDisk struct.
+        let body = serde_json::json!({
+            "schema_version": 1,
+            "agent": "dev",
+            "fingerprint": "0x1234567890abcdef",
+            "dedup_count": 1,
+            "last_inject_at_unix_micros": 1_700_000_000_000_000_i64,
+            "dedup_audit_emitted": true,
+            "retry_count": 1,
+            "exhausted": false,
+            "input_text": "hello",
+            // v2-hypothetical extra fields that v1 reader must ignore
+            "v2_some_new_field": "future-value",
+            "v2_another_field": 42_i64,
+        });
+        std::fs::write(
+            dir.join("dev.json"),
+            serde_json::to_string_pretty(&body).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_all(&home);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "v1 reader must accept v2-with-extra-fields file gracefully"
+        );
+        let dev = loaded.get("dev").expect("dev present");
+        assert_eq!(dev.dedup_count, 1);
+        assert_eq!(dev.input_text, "hello");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn dedup_state_serde_default_attribute_present_for_all_fields() {
+        // Source-text invariant pin: every OnDisk field MUST carry
+        // `#[serde(default)]`. A future PR adding a v2 field
+        // without the annotation would re-introduce strict-
+        // deserialize failure on v1 files missing the new field —
+        // this test catches that class of regression at compile-
+        // adjacent time.
+        let src = include_str!("dedup_state.rs");
+        // Slice off the tests submodule so a hypothetical literal
+        // in test source doesn't cross-pollute the count.
+        let prod_end = src.find("\n#[cfg(test)]").unwrap_or(src.len());
+        let prod = &src[..prod_end];
+
+        // Each field should appear preceded by `#[serde(default)]`
+        // on its own line. Pin each field name explicitly:
+        for field in &[
+            "schema_version: u32",
+            "agent: String",
+            "fingerprint: String",
+            "dedup_count: u32",
+            "last_inject_at_unix_micros: i64",
+            "dedup_audit_emitted: bool",
+            "retry_count: u32",
+            "exhausted: bool",
+            "input_text: String",
+        ] {
+            // Find the field; verify the preceding line carries the
+            // attribute. Approach: locate field, look back ~50 chars
+            // for `#[serde(default)]`.
+            let pos = prod
+                .find(field)
+                .unwrap_or_else(|| panic!("field `{field}` missing from OnDisk struct"));
+            let lookback_start = pos.saturating_sub(60);
+            let preceding = &prod[lookback_start..pos];
+            assert!(
+                preceding.contains("#[serde(default)]"),
+                "field `{field}` must carry `#[serde(default)]` for forward-compat \
+                 (Sprint 58 Wave 1 PR-2 #5). Preceding context: {preceding}"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_state_v1_round_trip_with_default_constructed_struct_succeeds() {
+        // Defensive pin: an OnDisk built from `Default::default()`
+        // (i.e. all-zero fields, schema_version = 0) round-trips
+        // through serialize → deserialize cleanly. This catches
+        // any future refactor that breaks the Default + serde
+        // contract.
+        let zero = OnDisk::default();
+        let json = serde_json::to_string(&zero).unwrap();
+        let parsed: OnDisk = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.schema_version, 0);
+        assert_eq!(parsed.agent, "");
+        assert_eq!(parsed.dedup_count, 0);
+        assert!(!parsed.exhausted);
+    }
+
+    #[test]
+    fn dedup_state_load_all_skips_v2_file_with_unknown_schema_version() {
+        // Pin the forward-only contract: a v(N) reader sees a
+        // v(N+k) file with `schema_version: 99` and SKIPS it
+        // (rather than crashing or trying to interpret it as v1).
+        // Existing `load_all` logic already does this; pin the
+        // empirical behaviour so the schema-evolution contract
+        // documented in the module rustdoc has a regression-proof
+        // test anchor.
+        let home = tmp_home("v2-skip");
+        let dir = home.join(DEDUP_STATE_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Plant: one valid v1 + one v2-version (unknown to this reader).
+        save(&home, "ok", &make_retry("ok", 0));
+        let v2_body = serde_json::json!({
+            "schema_version": 99,
+            "agent": "future",
+            "fingerprint": "0xdeadbeefcafebabe",
+            "dedup_count": 5,
+            "last_inject_at_unix_micros": 1_700_000_000_000_000_i64,
+            "dedup_audit_emitted": false,
+            "retry_count": 0,
+            "exhausted": false,
+            "input_text": "from-the-future",
+        });
+        std::fs::write(
+            dir.join("future.json"),
+            serde_json::to_string_pretty(&v2_body).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_all(&home);
+        assert!(
+            loaded.contains_key("ok"),
+            "valid v1 entry must load cleanly"
+        );
+        assert!(
+            !loaded.contains_key("future"),
+            "future v(N+k) entry must be skipped per forward-only contract"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
