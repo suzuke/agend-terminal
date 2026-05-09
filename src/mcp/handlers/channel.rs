@@ -6,6 +6,40 @@ use std::sync::Arc;
 pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Value {
     let text = args["text"].as_str().unwrap_or("").to_string();
     tracing::info!(from = %instance_name, %text, "reply");
+
+    // Sprint 59 Wave 1 PR-4 ((B) decision default with timeout):
+    // dual-purpose hook on every reply call.
+    //
+    // (1) When `default_action` + `timeout_secs` are set, record a
+    //     pending operator decision sidecar — the daemon scheduler
+    //     auto-fires the default after the timeout window.
+    // (2) Otherwise, treat this reply as a potential operator
+    //     override that resolves any prior pending decision from
+    //     the same sender (clears the timeout fire).
+    //
+    // Backwards-compat preserved: the existing reply path runs
+    // regardless of which branch fires, so legacy callers that
+    // never pass either field continue blocking on the operator's
+    // explicit reply as before.
+    let default_action = args["default_action"]
+        .as_str()
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    let timeout_secs = args["timeout_secs"].as_i64().filter(|&t| t > 0);
+    let mut decision_id: Option<String> = None;
+    let mut resolved_id: Option<String> = None;
+    if let (Some(action), Some(secs)) = (default_action.as_deref(), timeout_secs) {
+        decision_id = crate::daemon::decision_timeout::record_pending_decision(
+            home,
+            instance_name,
+            action,
+            secs,
+        );
+    } else {
+        resolved_id =
+            crate::daemon::decision_timeout::mark_resolved_for_sender(home, instance_name);
+    }
+
     let fleet_path = home.join("fleet.yaml");
     if !fleet_path.exists() {
         return json!({"error": "No fleet.yaml — cannot send reply"});
@@ -44,7 +78,18 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
             crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
                 p.mirror_skip_until_next_turn = true;
             });
-            json!({ "message_id": msg.id })
+            // Sprint 59 Wave 1 PR-4: surface the pending-decision /
+            // resolved-decision IDs so caller observability is
+            // complete (operator can reference IDs, agent can verify
+            // its override-resolution landed).
+            let mut response = json!({ "message_id": msg.id });
+            if let Some(id) = decision_id {
+                response["pending_decision_id"] = json!(id);
+            }
+            if let Some(id) = resolved_id {
+                response["resolved_decision_id"] = json!(id);
+            }
+            response
         }
         Err(crate::channel::ChannelError::NotSupported(op)) => {
             tracing::warn!(

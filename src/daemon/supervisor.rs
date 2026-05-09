@@ -202,12 +202,18 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // tracker that throttles the anti-stall scan to once every
     // TICKS_PER_SCAN supervisor ticks (10s × 30 = 5min).
     let mut anti_stall_tracker = crate::daemon::anti_stall::AntiStallTracker::default();
+    // Sprint 59 Wave 1 PR-4 ((B) decision default with timeout):
+    // tracks pending operator decisions, fires auto-default on
+    // timeout. 5min throttle matches anti-stall cadence.
+    let mut decision_timeout_tracker =
+        crate::daemon::decision_timeout::DecisionTimeoutTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
         process_server_rate_limit_retries(&home, &registry, &mut retry_tracks);
         check_pane_input_not_submitted(&home, &registry, &mut pane_input_tracks);
         anti_stall_tracker.maybe_scan(&home);
+        decision_timeout_tracker.maybe_scan(&home);
     }
 }
 

@@ -31,8 +31,12 @@ fn channel_tools() -> Vec<Value> {
     // originally described — flag stays valid as a daemon-side
     // dispatch hint and as the contract the bridge consumes.
     vec![
-        json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API.",
-            "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+        json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API. Sprint 59 Wave 1 PR-4 ((B) decision default with timeout): when both `default_action` and `timeout_secs` are set, the daemon records a pending operator decision sidecar and auto-fires the default after the timeout window. Subsequent reply calls without `default_action` resolve the pending decision (operator override / explicit answer arrived).",
+            "inputSchema": {"type": "object", "properties": {
+                "text": {"type": "string"},
+                "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
+                "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."}
+            }, "required": ["text"]},
             "requires_daemon_state": true}),
         json!({"name": "react", "description": "React to a message with an emoji. Requires daemon API.",
             "inputSchema": {"type": "object", "properties": {"emoji": {"type": "string"}}, "required": ["emoji"]},
