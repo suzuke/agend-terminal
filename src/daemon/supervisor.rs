@@ -209,6 +209,12 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // on timeout. 5min throttle matches anti-stall cadence.
     let mut decision_timeout_tracker =
         crate::daemon::decision_timeout::DecisionTimeoutTracker::default();
+    // Sprint 59 Wave 2 PR-3 (#13 deployment-cadence proactive helper-
+    // staleness): periodically reuses cli::classify_helper_staleness
+    // and pings general+lead when a helper goes stale, closing the
+    // operator-pull gap from Sprint 58 PR-1 #11.
+    let mut helper_staleness_tracker =
+        crate::daemon::helper_staleness_watchdog::HelperStalenessWatchdogTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -217,6 +223,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         anti_stall_tracker.maybe_scan(&home);
         idle_watchdog_tracker.maybe_scan(&home);
         decision_timeout_tracker.maybe_scan(&home);
+        helper_staleness_tracker.maybe_scan(&home);
     }
 }
 

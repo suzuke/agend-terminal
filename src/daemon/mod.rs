@@ -7,6 +7,7 @@ pub(crate) mod cron_tick;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
 pub(crate) mod heartbeat_pair;
+pub(crate) mod helper_staleness_watchdog;
 pub(crate) mod idle_watchdog;
 pub(crate) mod legacy_backfill;
 pub(crate) mod lifecycle;
