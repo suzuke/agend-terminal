@@ -305,18 +305,37 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-// ── P0-1.6: same agent + different branch must reject ────────────
+// ── P0-1.6 + Sprint 57 Wave 4 (#546 Item 4): same agent + different ──
+// branch must reject — across the architectural-layer shift.
 //
-// Pre-fix scenario: agent-x leased feat/A, then operator (or another
+// Pre-Wave-4 scenario: agent-x leased feat/A, then operator (or another
 // dispatcher) sent a second task with feat/B. worktree::create silently
-// reused the existing .worktrees/agent-x dir and echoed feat/B back as
+// reused the existing `.worktrees/agent-x` dir and echoed feat/B back as
 // the lease branch. dispatch_auto_bind_lease saw Ok and proceeded; the
 // smoke message landed in agent-x's inbox even though the worktree was
 // still on feat/A.
 //
-// Post-fix: worktree::create runs `git branch --show-current` on the
-// existing dir; mismatch returns None → lease fails → dispatch rejects
-// with "dispatch rejected: ..." and the message never reaches the inbox.
+// P0-1.6 fix: worktree::create runs `git branch --show-current` on the
+// existing dir; mismatch returns None → lease fails → dispatch rejects.
+//
+// Sprint 57 Wave 4 (#546 Item 4) architectural-layer shift: worktrees
+// now live at `$AGEND_HOME/worktrees/<agent>/<branch>/` external to the
+// source repo. With branch-segmented paths, each (agent, branch) pair
+// occupies a DISTINCT path — so the P0-1.6 reuse-path-rejection guard
+// at `worktree::create` no longer fires (different branch → different
+// dir → no existing-dir-with-mismatch state to detect).
+//
+// The conflict semantic is preserved EXPLICITLY at the binding layer
+// in `dispatch_auto_bind_lease_with_source` (Wave 4 PR #555):
+//   if let Some(existing) = crate::binding::read(home, target) {
+//       if existing.branch != requested_branch { return Err(...) }
+//   }
+// Same outcome (same-agent-different-branch dispatch rejects), different
+// implementation. The existing tests below are agnostic to which layer
+// enforces the guard — they pin the OUTCOME, not the mechanism — so they
+// continue to pass post-Wave-4. Sprint 58 Wave 1 PR-3 (#15) adds
+// explicit Wave-4-layer pins below to make the new dispatch-layer check
+// architecturally addressable for future maintainers.
 
 #[test]
 fn same_agent_different_branch_rejects() {
@@ -586,6 +605,158 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
         "handle_delegate_task end-to-end must create ci-watches entry. \
              Path: {} — this is the Hotfix C non-fire regression check.",
         watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Sprint 58 Wave 1 PR-3 (#15) — explicit post-Wave-4 dispatch-layer
+// guard pins.
+//
+// Wave 4 (#546 Item 4 / PR #555) shifted the same-agent-different-
+// branch conflict guard from worktree::create's reuse-path
+// rejection (P0-1.6 era) to dispatch_auto_bind_lease_with_source's
+// binding::read branch-mismatch check. The P0-1.6 tests above
+// continue to pass because they pin the OUTCOME, but the IMPLEMENT-
+// ATION-layer pin is missing. These tests close that audit gap.
+// ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn dispatch_auto_bind_lease_rejects_same_agent_different_branch_post_wave_4() {
+    // Architectural pin: post-Wave-4 the conflict guard fires at
+    // the BINDING layer (binding::read branch mismatch), NOT at the
+    // worktree::create reuse-path. The two layers produce the same
+    // outcome but the regression-proof is layer-specific.
+    //
+    // If a future refactor were to remove the binding-layer check
+    // assuming worktree::create still has it, this test would fail
+    // catastrophically because Wave 4's branch-segmented paths put
+    // each (agent, branch) at a DISTINCT location — so the
+    // worktree::create guard CANNOT fire (no existing-dir for
+    // feat/B when feat/A is bound, they're separate dirs).
+    let home = std::env::temp_dir().join(format!(
+        "agend-s58-w1pr3-{}-binding-layer-pin",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-y");
+
+    // Lease feat/A — establishes binding.json + worktree at
+    // <home>/worktrees/agent-y/feat/A/ per Wave 4 layout.
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-y", "T-1", "feat/A", None);
+    assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+
+    // Pre-Wave-4 was a single-path-per-agent layout, so a second
+    // lease on feat/B would have hit worktree::create's existing-
+    // dir guard. Post-Wave-4, feat/B's path is DIFFERENT from
+    // feat/A's path — the worktree::create layer can't see the
+    // conflict. The dispatch layer's binding::read check is what
+    // catches it.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-y", "T-2", "feat/B", None);
+    assert!(
+        r2.is_err(),
+        "Wave 4 architectural pin: dispatch-layer guard MUST reject \
+         same-agent-different-branch even though worktree paths are now distinct: {r2:?}"
+    );
+
+    // Error message must mention the rejection cause for operator
+    // diagnostics — preserves the human-readable error contract
+    // across the architectural shift.
+    let err = r2.unwrap_err();
+    assert!(
+        err.contains("agent-y") && err.contains("feat/A"),
+        "rejection error must mention the existing binding's agent + branch: {err}"
+    );
+
+    // Binding still reflects feat/A — the rejected dispatch must
+    // NOT have overwritten it.
+    let binding = home.join("runtime").join("agent-y").join("binding.json");
+    let content = std::fs::read_to_string(&binding).expect("read binding");
+    let v: serde_json::Value = serde_json::from_str(&content).expect("parse binding");
+    assert_eq!(
+        v["branch"], "feat/A",
+        "rejected dispatch must NOT overwrite binding to feat/B"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn dispatch_auto_bind_lease_idempotent_same_agent_same_branch_post_wave_4() {
+    // Confirmatory positive case: same agent + SAME branch must
+    // remain idempotent across the architectural shift. Wave 4's
+    // branch-segmented path puts the second-call's would-be
+    // worktree at the SAME location as the first, so worktree::
+    // create reuses it; the binding-layer check sees identical
+    // branch, allows the dispatch through.
+    let home = std::env::temp_dir().join(format!(
+        "agend-s58-w1pr3-{}-idem-positive",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-z");
+
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-z", "T-1", "feat/idem", None);
+    assert!(r1.is_ok(), "first lease must succeed: {r1:?}");
+
+    // Same agent + same branch + new task_id — must be idempotent
+    // (re-dispatch landing on the same binding).
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-z", "T-2", "feat/idem", None);
+    assert!(
+        r2.is_ok(),
+        "same-agent same-branch must remain idempotent post-Wave-4: {r2:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn release_worktree_then_rebind_different_branch_succeeds_post_wave_4() {
+    // Defensive bonus pin: after release_worktree, a subsequent
+    // dispatch on a DIFFERENT branch must succeed (no orphan
+    // binding blocks it). Wave 4 + Sprint 56 Track G's
+    // unsubscribe_all_ci_watches_for_agent / release_full path
+    // should fully clean up the agent's binding so a fresh
+    // different-branch dispatch lands cleanly.
+    //
+    // This pins the release-then-rebind cycle that operators
+    // use during Sprint-closeout transitions (e.g. release Track A
+    // worktree, immediately bind Track B on a different branch).
+    let home = std::env::temp_dir().join(format!(
+        "agend-s58-w1pr3-{}-release-rebind",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "agent-cycle");
+
+    // Initial bind to feat/A
+    let r1 = super::dispatch_auto_bind_lease(&home, "agent-cycle", "T-1", "feat/A", None);
+    assert!(r1.is_ok(), "initial lease must succeed: {r1:?}");
+
+    // Release the worktree (mirrors operator's release_worktree
+    // MCP tool call between sprints).
+    let outcome = crate::worktree_pool::release_full(&home, "agent-cycle");
+    assert!(outcome.released, "release_full must succeed: {outcome:?}");
+
+    // Now re-bind to a DIFFERENT branch. Must succeed because the
+    // prior binding is gone.
+    let r2 = super::dispatch_auto_bind_lease(&home, "agent-cycle", "T-2", "feat/B", None);
+    assert!(
+        r2.is_ok(),
+        "release-then-rebind cycle must succeed across different branches: {r2:?}"
+    );
+
+    // Binding now reflects feat/B (the fresh state).
+    let binding = home
+        .join("runtime")
+        .join("agent-cycle")
+        .join("binding.json");
+    let content = std::fs::read_to_string(&binding).expect("read binding");
+    let v: serde_json::Value = serde_json::from_str(&content).expect("parse binding");
+    assert_eq!(
+        v["branch"], "feat/B",
+        "post-release rebind must establish new branch binding"
     );
 
     std::fs::remove_dir_all(&home).ok();
