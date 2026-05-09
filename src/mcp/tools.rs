@@ -272,7 +272,8 @@ fn worktree_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "source_repo": {"type": "string", "description": "Local path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Sprint 55 P0-B preferred form. Mutually exclusive with `repo` (handler rejects both via `ambiguous_args` code)."},
                 "repo": {"type": "string", "description": "GitHub repo (owner/name). Legacy form retained for one-Sprint deprecation window — emits warn-log; removal Sprint 57. Mutually exclusive with `source_repo`."},
-                "branch": {"type": "string", "description": "Branch to bind (must not be main/master)"}
+                "branch": {"type": "string", "description": "Branch to bind (must not be main/master)"},
+                "rebase_mode": {"type": "boolean", "description": "Sprint 60 W1 PR-1: atomic recover-and-bind. When true, releases self's stale on-disk worktree dir + binding state before lease — closes the lease_failed recovery path without an explicit release_worktree call. Cross-agent isolation preserved (rejects branches leased by another agent)."}
             }, "required": ["branch"]}}),
         // Sprint 53 P0-X: release a daemon-managed worktree + clear binding
         // for `agent`. Idempotent. Only removes worktrees that carry the

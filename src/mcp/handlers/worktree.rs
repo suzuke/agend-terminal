@@ -75,6 +75,13 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     }
     let source_repo_path = source_repo_arg.map(std::path::PathBuf::from);
 
+    if args["rebase_mode"].as_bool().unwrap_or(false) {
+        if let Err(e) = crate::mcp::handlers::force_release::rebase_clean_self(home, agent, branch)
+        {
+            return json!({"error": e, "code": "path_outside_pool"});
+        }
+    }
+
     // task_id="self" — clear distinction from real task IDs in the binding.json
     // audit trail. The tasks store doesn't need a row for a self-bind; the
     // string is purely a marker.
