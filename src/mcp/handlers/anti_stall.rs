@@ -10,19 +10,28 @@
 //! Extracted from `comms.rs` to keep that file under the 700 LOC
 //! handler invariant (`tests/file_size_invariant.rs`).
 
+use crate::identity::Sender;
 use serde_json::{json, Value};
 
-/// One-shot anti-stall gate + hook for the unified `send` handler.
-/// Returns `Some(error json)` when `request_kind=task` is rejected
-/// (Wave 4 PR-1 contract — missing/malformed task_id), `None`
-/// otherwise. As a side-effect on the OK path, touches the task's
-/// progress sidecar (Sprint 59 Wave 1 PR-1 hooks (a)+(c)) so the
-/// daemon-side anti-stall scanner sees the task as alive.
+/// One-shot anti-stall gate + progress + idle-watchdog hook for
+/// the unified `send` handler. Returns `Some(error json)` when
+/// `request_kind=task` is rejected (Wave 4 PR-1 contract —
+/// missing/malformed task_id), `None` otherwise. As side-effects
+/// on the OK path:
+/// - Wave 1 PR-1: touches the task's progress sidecar when
+///   `task_id` or `correlation_id` is present, so the per-task
+///   ETA scanner sees the task as alive.
+/// - Wave 1 PR-2: touches the sender's agent-activity sidecar
+///   so the dev-vantage 60min + fleet-vantage 30min idle
+///   watchdogs see the agent as making forward progress.
 ///
-/// Folding both behaviors into one helper keeps the comms.rs call
-/// site a single line, which matters for the 700 LOC handler
-/// invariant (`tests/file_size_invariant.rs`).
-pub(super) fn enforce_anti_stall_invariants(home: &std::path::Path, args: &Value) -> Option<Value> {
+/// Folding all behaviors into one helper keeps the comms.rs call
+/// site a single line under the 700 LOC handler invariant.
+pub(super) fn enforce_send_invariants(
+    home: &std::path::Path,
+    args: &Value,
+    sender: &Option<Sender>,
+) -> Option<Value> {
     // Wave 4 PR-1 gate: kind=task without task_id rejected.
     if args["request_kind"].as_str() == Some("task") {
         if let Err(msg) = validate_task_id_present(args) {
@@ -43,6 +52,10 @@ pub(super) fn enforce_anti_stall_invariants(home: &std::path::Path, args: &Value
             crate::daemon::task_progress::ProgressSource::Broadcast
         };
         crate::daemon::task_progress::touch(home, task_id, source);
+    }
+    // Wave 1 PR-2 idle watchdog: touch sender's activity sidecar.
+    if let Some(s) = sender {
+        crate::daemon::idle_watchdog::touch_agent_activity(home, s.as_str());
     }
     None
 }

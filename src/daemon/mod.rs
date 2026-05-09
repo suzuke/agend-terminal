@@ -6,6 +6,7 @@ pub(crate) mod ci_watch;
 pub(crate) mod cron_tick;
 pub(crate) mod dedup_state;
 pub(crate) mod heartbeat_pair;
+pub(crate) mod idle_watchdog;
 pub(crate) mod legacy_backfill;
 pub(crate) mod lifecycle;
 pub(crate) mod poll_reminder;
