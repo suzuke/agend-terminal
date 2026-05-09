@@ -215,6 +215,13 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // operator-pull gap from Sprint 58 PR-1 #11.
     let mut helper_staleness_tracker =
         crate::daemon::helper_staleness_watchdog::HelperStalenessWatchdogTracker::default();
+    // Sprint 60 W1 PR-2 (#P0-2 daemon hot-reload tool registry): 5th
+    // tracker. Detects when the daemon binary at current_exe() has
+    // been refreshed AFTER the running process started — running
+    // process's MCP tool registry then lags the on-disk binary's
+    // compiled-in registry. Closes the PR-5 → PR-4 chicken-and-egg loop.
+    let mut mcp_registry_tracker =
+        crate::daemon::mcp_registry_watcher::McpRegistryWatcherTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -224,6 +231,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         idle_watchdog_tracker.maybe_scan(&home);
         decision_timeout_tracker.maybe_scan(&home);
         helper_staleness_tracker.maybe_scan(&home);
+        mcp_registry_tracker.maybe_scan(&home);
     }
 }
 

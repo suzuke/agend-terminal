@@ -11,6 +11,7 @@ pub(crate) mod helper_staleness_watchdog;
 pub(crate) mod idle_watchdog;
 pub(crate) mod legacy_backfill;
 pub(crate) mod lifecycle;
+pub(crate) mod mcp_registry_watcher;
 pub(crate) mod poll_reminder;
 pub(crate) mod router;
 pub(crate) mod supervisor;
