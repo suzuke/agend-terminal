@@ -1872,6 +1872,13 @@ async fn ci_check_repo(
     // If head_sha changed (force push), reset last_run_id so we pick up new runs.
     let effective_last_run_id = if prev_head_sha.is_some_and(|prev| prev != current_sha) {
         tracing::info!(repo, branch, old_sha = ?prev_head_sha, new_sha = current_sha, "head_sha changed, resetting run tracking");
+        // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — progress
+        // hook (b): when a watched branch advances to a new SHA,
+        // look up any agent binding whose `branch` matches and
+        // touch the bound task's progress sidecar. This is the
+        // PR-push signal that suppresses stall warnings while
+        // the operator is making forward progress on the branch.
+        let _ = crate::daemon::task_progress::touch_progress_for_branch(home, branch);
         None
     } else {
         last_run_id

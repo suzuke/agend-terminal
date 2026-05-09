@@ -12,19 +12,39 @@
 
 use serde_json::{json, Value};
 
-/// One-shot gate for the unified `send` handler: returns `Some(error
-/// json)` when `request_kind=task` and `task_id` is missing or
-/// malformed, `None` otherwise. Folding the kind check into the gate
-/// keeps the comms.rs call site a single line, which matters for the
-/// 700 LOC handler invariant (`tests/file_size_invariant.rs`).
-pub(super) fn check_kind_task_requires_task_id(args: &Value) -> Option<Value> {
-    if args["request_kind"].as_str() != Some("task") {
-        return None;
+/// One-shot anti-stall gate + hook for the unified `send` handler.
+/// Returns `Some(error json)` when `request_kind=task` is rejected
+/// (Wave 4 PR-1 contract — missing/malformed task_id), `None`
+/// otherwise. As a side-effect on the OK path, touches the task's
+/// progress sidecar (Sprint 59 Wave 1 PR-1 hooks (a)+(c)) so the
+/// daemon-side anti-stall scanner sees the task as alive.
+///
+/// Folding both behaviors into one helper keeps the comms.rs call
+/// site a single line, which matters for the 700 LOC handler
+/// invariant (`tests/file_size_invariant.rs`).
+pub(super) fn enforce_anti_stall_invariants(home: &std::path::Path, args: &Value) -> Option<Value> {
+    // Wave 4 PR-1 gate: kind=task without task_id rejected.
+    if args["request_kind"].as_str() == Some("task") {
+        if let Err(msg) = validate_task_id_present(args) {
+            return Some(json!({"error": msg, "code": "task_id_required"}));
+        }
     }
-    match validate_task_id_present(args) {
-        Ok(()) => None,
-        Err(msg) => Some(json!({"error": msg, "code": "task_id_required"})),
+    // Wave 1 PR-1 hooks (a)+(c): any send carrying task_id (or
+    // correlation_id for kind=report verdict) touches the progress
+    // sidecar.
+    let task_id = args["task_id"]
+        .as_str()
+        .or_else(|| args["correlation_id"].as_str())
+        .unwrap_or("");
+    if !task_id.is_empty() {
+        let source = if args["request_kind"].as_str() == Some("report") {
+            crate::daemon::task_progress::ProgressSource::CiVerdict
+        } else {
+            crate::daemon::task_progress::ProgressSource::Broadcast
+        };
+        crate::daemon::task_progress::touch(home, task_id, source);
     }
+    None
 }
 
 /// Returns the rejection error message on failure (with operator-
