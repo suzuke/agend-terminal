@@ -44,6 +44,7 @@ mod quickstart;
 mod render;
 mod schedules;
 mod service;
+mod skills;
 mod snapshot;
 mod state;
 mod status_summary;
@@ -300,6 +301,14 @@ enum Commands {
         #[command(subcommand)]
         action: Option<DoctorAction>,
     },
+    /// Sprint 60 W2 PR-1 (#P1-1): manage shared skills used by all 5
+    /// backends (Claude Code / Codex / Gemini / OpenCode / Kiro CLI).
+    /// Skills live in `<home>/skills/<name>/` and are surfaced to each
+    /// agent via per-backend symlinks (or copies on Windows) at launch.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
     /// Menu-bar / system-tray resident app (requires `--features tray`).
     #[cfg(feature = "tray")]
     Tray,
@@ -342,6 +351,45 @@ enum AdminCommands {
         /// Actually delete branches (default is dry-run preview).
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// Sprint 60 W2 PR-1 (#P1-1): subcommands for `agend-terminal skills`.
+#[derive(Subcommand)]
+enum SkillsAction {
+    /// Add a skill from a local directory or git URL. The skill name
+    /// is derived from the source basename. Idempotent — re-adding
+    /// overwrites the existing copy.
+    Add {
+        /// Local path or git URL (https://, git@, ssh://, *.git).
+        source: String,
+    },
+    /// Remove a skill from the unified source. Idempotent — calling
+    /// on a missing skill is a no-op.
+    Remove {
+        /// Skill name (directory name under `<home>/skills/`).
+        name: String,
+    },
+    /// List installed skills with source/version metadata from
+    /// `<home>/skills-lock.json`.
+    List,
+    /// Re-fetch a skill from its lock-recorded source (or all skills
+    /// if no name is given). Path sources re-copy from disk; git
+    /// sources re-clone.
+    Update {
+        /// Skill name. Omit to update every skill in the lock.
+        name: Option<String>,
+    },
+    /// Install all unified-source skills into the given working
+    /// directory's backend skill paths (.claude/skills/, .codex/skills/,
+    /// .gemini/skills/, .opencode/skills/, .kiro/skills/). Symlinks
+    /// on Unix; copies with `.agend-skills-managed` marker on Windows.
+    /// Pre-existing non-managed directories are preserved (operator
+    /// hand-crafted skills are never clobbered).
+    Install {
+        /// Agent working directory. Skills will be installed at the
+        /// 5 backend-conventional paths under this directory.
+        working_dir: String,
     },
 }
 
@@ -738,6 +786,13 @@ fn main() -> anyhow::Result<()> {
                 },
             )?;
         }
+        Some(Commands::Skills { action }) => match action {
+            SkillsAction::Add { source } => cli::run_skills_add(&home, &source)?,
+            SkillsAction::Remove { name } => cli::run_skills_remove(&home, &name)?,
+            SkillsAction::List => cli::run_skills_list(&home)?,
+            SkillsAction::Update { name } => cli::run_skills_update(&home, name.as_deref())?,
+            SkillsAction::Install { working_dir } => cli::run_skills_install(&home, &working_dir)?,
+        },
         #[cfg(feature = "tray")]
         Some(Commands::Tray) => tray::run(&home)?,
         Some(Commands::Demo) => cli::run_demo()?,

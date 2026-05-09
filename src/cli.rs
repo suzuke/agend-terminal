@@ -661,6 +661,132 @@ fn probe_can_manage_topics(home: &Path) -> Option<bool> {
     Some(can_manage_topics_for(&bot, chat_id))
 }
 
+// ── Sprint 60 W2 PR-1 (#P1-1) — agend skills CLI subcommands ──────────
+
+/// `agend skills add <source>`.
+pub fn run_skills_add(home: &Path, source: &str) -> anyhow::Result<()> {
+    let skill = crate::skills::add(home, source)?;
+    println!(
+        "added skill '{}'\n  source: {}\n  version: {}",
+        skill.name,
+        if skill.source.is_empty() {
+            "(unrecorded)"
+        } else {
+            &skill.source
+        },
+        if skill.version.is_empty() {
+            "(unpinned)"
+        } else {
+            &skill.version
+        },
+    );
+    Ok(())
+}
+
+/// `agend skills remove <name>`.
+pub fn run_skills_remove(home: &Path, name: &str) -> anyhow::Result<()> {
+    crate::skills::remove(home, name)?;
+    println!("removed skill '{name}' (idempotent)");
+    Ok(())
+}
+
+/// `agend skills list`.
+pub fn run_skills_list(home: &Path) -> anyhow::Result<()> {
+    let skills = crate::skills::list(home)?;
+    if skills.is_empty() {
+        println!(
+            "no skills installed under {}",
+            crate::skills::skills_root(home).display()
+        );
+        return Ok(());
+    }
+    println!(
+        "installed skills (under {}):",
+        crate::skills::skills_root(home).display()
+    );
+    for skill in skills {
+        println!(
+            "  - {}  source={}  version={}",
+            skill.name,
+            if skill.source.is_empty() {
+                "(unrecorded)".to_string()
+            } else {
+                skill.source
+            },
+            if skill.version.is_empty() {
+                "(unpinned)".to_string()
+            } else {
+                skill.version
+            },
+        );
+    }
+    Ok(())
+}
+
+/// `agend skills install <working_dir>`.
+pub fn run_skills_install(home: &Path, working_dir: &str) -> anyhow::Result<()> {
+    let wd = std::path::PathBuf::from(working_dir);
+    if !wd.exists() {
+        return Err(anyhow::anyhow!(
+            "working_dir does not exist: {}",
+            wd.display()
+        ));
+    }
+    let outcomes = crate::skills::install_for_agent(home, &wd)?;
+    println!("installed skills into {}:", wd.display());
+    for o in outcomes {
+        match o.mode {
+            crate::skills::InstallMode::Symlink => {
+                println!("  ✓ {} (symlink) → {}", o.backend, o.target.display())
+            }
+            crate::skills::InstallMode::Copy => {
+                println!("  ✓ {} (copy) → {}", o.backend, o.target.display())
+            }
+            crate::skills::InstallMode::Skipped => println!(
+                "  - {} (skipped: {})",
+                o.backend,
+                o.skipped_reason.unwrap_or_default()
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// `agend skills update [<name>]` — update one or all.
+pub fn run_skills_update(home: &Path, name: Option<&str>) -> anyhow::Result<()> {
+    if let Some(n) = name {
+        let skill = crate::skills::update(home, n)?;
+        println!(
+            "updated skill '{}'\n  source: {}\n  version: {}",
+            skill.name, skill.source, skill.version
+        );
+        return Ok(());
+    }
+    let outcomes = crate::skills::update_all(home);
+    if outcomes.is_empty() {
+        println!("no skills to update — `skills add` first");
+        return Ok(());
+    }
+    let mut failures = 0;
+    for (name, result) in &outcomes {
+        match result {
+            Ok(skill) => println!("  ✓ {} → version={}", name, skill.version),
+            Err(e) => {
+                failures += 1;
+                eprintln!("  ✗ {name}: {e}");
+            }
+        }
+    }
+    if failures > 0 {
+        return Err(anyhow::anyhow!(
+            "{}/{} skills failed to update",
+            failures,
+            outcomes.len()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod helper_staleness_tests {

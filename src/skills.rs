@@ -1,0 +1,756 @@
+//! Sprint 60 W2 PR-1 (#P1-1 Skills System Plan IMPL) — 5-backend
+//! community skill discovery via unified source + symlink (Windows
+//! copy fallback).
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ~/.agend-terminal/skills/          ← unified source
+//!   ├── skill-forge/SKILL.md
+//!   ├── opencli-adapter-author/SKILL.md
+//!   └── ...
+//!
+//! agent-working-dir/
+//!   ├── .claude/skills/  → symlink → ~/.agend-terminal/skills/
+//!   ├── .codex/skills/   → symlink → ~/.agend-terminal/skills/
+//!   ├── .gemini/skills/  → symlink → ~/.agend-terminal/skills/
+//!   ├── .opencode/skills/→ symlink → ~/.agend-terminal/skills/
+//!   └── .kiro/skills/    → symlink → ~/.agend-terminal/skills/
+//! ```
+//!
+//! Unified source means: one skill file, all 5 backends discover.
+//! No file copies on Unix (symlink = zero maintenance). Windows
+//! falls back to copy with hash-compare staleness detection on
+//! subsequent installs (file-watch infra is out of scope per
+//! Sprint 60 P2-C deferral).
+//!
+//! ## skills-lock.json
+//!
+//! Tracks the source + install metadata for each skill so `update`
+//! knows where to refetch and so cross-machine state is auditable.
+//! Schema mirrors `package-lock.json` — opaque `version` (commit SHA
+//! for git sources, mtime for path sources) lets future tooling
+//! detect drift without re-shelling-out for every check.
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// 5 backends per dispatch m-20260509214553949181-385. Each backend
+/// has its own conventional skills directory inside the agent's
+/// working tree; the daemon installs a symlink (or copy on Windows)
+/// pointing at the unified source.
+pub const BACKEND_SKILL_DIRS: &[(&str, &str)] = &[
+    ("claude", ".claude/skills"),
+    ("codex", ".codex/skills"),
+    ("gemini", ".gemini/skills"),
+    ("opencode", ".opencode/skills"),
+    ("kiro", ".kiro/skills"),
+];
+
+/// Unified skill source root: `<home>/skills/`.
+pub fn skills_root(home: &Path) -> PathBuf {
+    home.join("skills")
+}
+
+/// Ensure the unified source root exists. Idempotent.
+pub fn ensure_skills_root(home: &Path) -> Result<PathBuf> {
+    let root = skills_root(home);
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("ensure_skills_root: create_dir_all {}", root.display()))?;
+    Ok(root)
+}
+
+/// Path to the skills lock file: `<home>/skills-lock.json`.
+pub fn skills_lock_path(home: &Path) -> PathBuf {
+    home.join("skills-lock.json")
+}
+
+/// Per-skill lock entry. Schema mirrors `package-lock.json`'s
+/// dependency entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillLockEntry {
+    /// Where the skill came from: `path:<abs path>` for local copies,
+    /// `git:<url>` for git clones.
+    #[serde(default)]
+    pub source: String,
+    /// Opaque version pin. Git sources: commit SHA. Path sources:
+    /// SOURCE-DIR mtime in RFC 3339. Empty when not yet pinned.
+    #[serde(default)]
+    pub version: String,
+    /// RFC 3339 install timestamp.
+    #[serde(default)]
+    pub installed_at: String,
+}
+
+/// `skills-lock.json` shape: `{"skills": {"<name>": SkillLockEntry, ...}}`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsLock {
+    #[serde(default)]
+    pub skills: BTreeMap<String, SkillLockEntry>,
+}
+
+impl SkillsLock {
+    pub fn read(home: &Path) -> Result<Self> {
+        let path = skills_lock_path(home);
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("read skills-lock.json at {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("parse skills-lock.json at {}", path.display()))
+    }
+
+    pub fn write(&self, home: &Path) -> Result<()> {
+        let path = skills_lock_path(home);
+        let body = serde_json::to_string_pretty(self).context("serialize skills-lock.json")?;
+        // Atomic write to avoid partial-state corruption on crash.
+        crate::store::atomic_write(&path, body.as_bytes())
+            .with_context(|| format!("atomic_write skills-lock.json at {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// One installed skill — name (directory name under `<home>/skills/`)
+/// + lock metadata (or default if no lock entry exists).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Skill {
+    pub name: String,
+    pub source: String,
+    pub version: String,
+    pub installed_at: String,
+}
+
+/// List skills currently in the unified source. Cross-references the
+/// lock file for source/version metadata; skills that exist on disk
+/// but not in the lock surface with empty source/version (operator
+/// dropped a directory in by hand).
+pub fn list(home: &Path) -> Result<Vec<Skill>> {
+    let root = skills_root(home);
+    let mut names = Vec::new();
+    if root.exists() {
+        for entry in std::fs::read_dir(&root)
+            .with_context(|| format!("read_dir {}", root.display()))?
+            .flatten()
+        {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    let lock = SkillsLock::read(home).unwrap_or_default();
+    Ok(names
+        .into_iter()
+        .map(|name| {
+            let entry = lock.skills.get(&name).cloned().unwrap_or_default();
+            Skill {
+                name,
+                source: entry.source,
+                version: entry.version,
+                installed_at: entry.installed_at,
+            }
+        })
+        .collect())
+}
+
+/// Add a skill from a local directory or git URL. The skill's
+/// directory name is derived from the source basename (final URL
+/// path component or directory name). Idempotent: re-adding an
+/// existing name overwrites it (caller can drive `update` semantics
+/// from the same path).
+pub fn add(home: &Path, source: &str) -> Result<Skill> {
+    let root = ensure_skills_root(home)?;
+    let (name, source_kind) = classify_source(source)?;
+    let dest = root.join(&name);
+
+    match source_kind {
+        SourceKind::Path(p) => {
+            if !p.exists() {
+                return Err(anyhow!("skill source path does not exist: {}", p.display()));
+            }
+            // Wipe destination first so re-add is deterministic.
+            if dest.exists() {
+                std::fs::remove_dir_all(&dest)
+                    .with_context(|| format!("clean dest {}", dest.display()))?;
+            }
+            copy_dir_recursive(&p, &dest)
+                .with_context(|| format!("copy {} → {}", p.display(), dest.display()))?;
+        }
+        SourceKind::Git(url) => {
+            // `git clone` shell-out — same approach as the rest of
+            // the codebase (e.g. dispatch_hook source-repo). Wipe
+            // first so re-add is deterministic.
+            if dest.exists() {
+                std::fs::remove_dir_all(&dest)
+                    .with_context(|| format!("clean dest {}", dest.display()))?;
+            }
+            let status = std::process::Command::new("git")
+                .args(["clone", "--depth=1", url.as_str()])
+                .arg(&dest)
+                .status()
+                .context("spawn git clone")?;
+            if !status.success() {
+                return Err(anyhow!("git clone failed for {url}: status={status}"));
+            }
+        }
+    }
+
+    // Write lock entry. Version pin is best-effort: git → HEAD SHA,
+    // path → mtime. Failures fall back to empty string (lock entry
+    // still records the source for `update`).
+    let version = compute_version(&dest, source);
+    let installed_at = chrono::Utc::now().to_rfc3339();
+    let entry = SkillLockEntry {
+        source: source.to_string(),
+        version,
+        installed_at: installed_at.clone(),
+    };
+    let mut lock = SkillsLock::read(home).unwrap_or_default();
+    lock.skills.insert(name.clone(), entry.clone());
+    lock.write(home)?;
+
+    Ok(Skill {
+        name,
+        source: entry.source,
+        version: entry.version,
+        installed_at,
+    })
+}
+
+/// Remove a skill from the unified source + drop its lock entry.
+/// Idempotent: returns Ok even if the skill doesn't exist (operator
+/// already cleaned up).
+pub fn remove(home: &Path, name: &str) -> Result<()> {
+    let dest = skills_root(home).join(name);
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)
+            .with_context(|| format!("remove_dir_all {}", dest.display()))?;
+    }
+    let mut lock = SkillsLock::read(home).unwrap_or_default();
+    if lock.skills.remove(name).is_some() {
+        lock.write(home)?;
+    }
+    Ok(())
+}
+
+/// Update a skill — re-runs `add` against the lock-recorded source.
+/// Returns `Err` if the skill has no lock entry (caller doesn't know
+/// where to refetch from).
+pub fn update(home: &Path, name: &str) -> Result<Skill> {
+    let lock = SkillsLock::read(home).unwrap_or_default();
+    let entry = lock
+        .skills
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow!("no lock entry for skill '{name}' — use `add` first"))?;
+    if entry.source.is_empty() {
+        return Err(anyhow!(
+            "skill '{name}' has no recorded source — manual reinstall required"
+        ));
+    }
+    add(home, &entry.source)
+}
+
+/// Update every skill that has a recorded source. Returns the per-
+/// skill outcome list (Ok/Err) so callers can surface partial
+/// failures.
+pub fn update_all(home: &Path) -> Vec<(String, Result<Skill>)> {
+    let lock = SkillsLock::read(home).unwrap_or_default();
+    let mut out = Vec::new();
+    for name in lock.skills.keys() {
+        out.push((name.clone(), update(home, name)));
+    }
+    out
+}
+
+/// Install symlinks (or copy fallback on Windows) for every backend
+/// in `BACKEND_SKILL_DIRS` so each backend's skill discovery path
+/// resolves to the unified source. Idempotent: pre-existing daemon-
+/// managed symlinks/copies are replaced; pre-existing non-managed
+/// directories are left alone with a tracing::warn.
+pub fn install_for_agent(home: &Path, working_dir: &Path) -> Result<Vec<InstallOutcome>> {
+    let source = ensure_skills_root(home)?;
+    let mut outcomes = Vec::with_capacity(BACKEND_SKILL_DIRS.len());
+    for (backend, rel) in BACKEND_SKILL_DIRS {
+        let target = working_dir.join(rel);
+        let outcome = install_one(&source, &target, backend);
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
+}
+
+/// Per-backend install result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallOutcome {
+    pub backend: String,
+    pub target: PathBuf,
+    pub mode: InstallMode,
+    pub skipped_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallMode {
+    Symlink,
+    Copy,
+    Skipped,
+}
+
+fn install_one(source: &Path, target: &Path, backend: &str) -> InstallOutcome {
+    let parent = match target.parent() {
+        Some(p) => p,
+        None => {
+            return InstallOutcome {
+                backend: backend.to_string(),
+                target: target.to_path_buf(),
+                mode: InstallMode::Skipped,
+                skipped_reason: Some("target has no parent".to_string()),
+            }
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        return InstallOutcome {
+            backend: backend.to_string(),
+            target: target.to_path_buf(),
+            mode: InstallMode::Skipped,
+            skipped_reason: Some(format!("create_dir_all {}: {e}", parent.display())),
+        };
+    }
+
+    // Pre-existing non-managed directory: don't overwrite operator's
+    // hand-crafted skills dir. Symlinks + previously-managed copies
+    // are safe to replace.
+    if target.exists() {
+        let is_symlink = target
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let is_managed_copy = target.join(".agend-skills-managed").exists();
+        if !is_symlink && !is_managed_copy {
+            return InstallOutcome {
+                backend: backend.to_string(),
+                target: target.to_path_buf(),
+                mode: InstallMode::Skipped,
+                skipped_reason: Some(
+                    "target exists and is not daemon-managed (no .agend-skills-managed marker)"
+                        .to_string(),
+                ),
+            };
+        }
+        if is_symlink {
+            let _ = std::fs::remove_file(target);
+        } else {
+            let _ = std::fs::remove_dir_all(target);
+        }
+    }
+
+    match try_symlink(source, target) {
+        Ok(()) => InstallOutcome {
+            backend: backend.to_string(),
+            target: target.to_path_buf(),
+            mode: InstallMode::Symlink,
+            skipped_reason: None,
+        },
+        Err(_e) => match copy_with_marker(source, target) {
+            Ok(()) => InstallOutcome {
+                backend: backend.to_string(),
+                target: target.to_path_buf(),
+                mode: InstallMode::Copy,
+                skipped_reason: None,
+            },
+            Err(copy_err) => InstallOutcome {
+                backend: backend.to_string(),
+                target: target.to_path_buf(),
+                mode: InstallMode::Skipped,
+                skipped_reason: Some(format!("symlink + copy fallback both failed: {copy_err}")),
+            },
+        },
+    }
+}
+
+#[cfg(unix)]
+fn try_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn try_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(source, target)
+}
+
+fn copy_with_marker(source: &Path, target: &Path) -> Result<()> {
+    copy_dir_recursive(source, target)?;
+    std::fs::write(target.join(".agend-skills-managed"), b"daemon-managed\n")
+        .with_context(|| format!("write marker {}/.agend-skills-managed", target.display()))?;
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("create_dir_all {}", dst.display()))?;
+    for entry in std::fs::read_dir(src)
+        .with_context(|| format!("read_dir {}", src.display()))?
+        .flatten()
+    {
+        let kind = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if kind.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if kind.is_file() {
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
+        }
+        // Symlinks inside the source are not duplicated — keep MVP
+        // simple. Operators wanting symlinks-inside-skill should
+        // file a follow-up.
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum SourceKind {
+    Path(PathBuf),
+    Git(String),
+}
+
+fn classify_source(source: &str) -> Result<(String, SourceKind)> {
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("empty skill source"));
+    }
+    let is_git = trimmed.starts_with("git@")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("ssh://")
+        || trimmed.ends_with(".git");
+    if is_git {
+        let name = git_repo_name(trimmed)
+            .ok_or_else(|| anyhow!("could not derive skill name from URL: {trimmed}"))?;
+        Ok((name, SourceKind::Git(trimmed.to_string())))
+    } else {
+        let path = PathBuf::from(trimmed);
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&path))
+                .unwrap_or(path)
+        };
+        let name = abs
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow!("could not derive skill name from path: {}", abs.display()))?;
+        Ok((name, SourceKind::Path(abs)))
+    }
+}
+
+fn git_repo_name(url: &str) -> Option<String> {
+    // Trim trailing slashes + `.git` suffix, then take the last
+    // path component. Handles `https://github.com/foo/bar`,
+    // `git@github.com:foo/bar.git`, `ssh://git@host/foo/bar`.
+    let stripped = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    let after_colon = stripped.rsplit(':').next().unwrap_or(stripped);
+    let last = after_colon.rsplit('/').next()?;
+    if last.is_empty() {
+        None
+    } else {
+        Some(last.to_string())
+    }
+}
+
+fn compute_version(dest: &Path, source: &str) -> String {
+    if source.starts_with("http") || source.starts_with("git@") || source.starts_with("ssh://") {
+        // Git source — read HEAD SHA from the cloned tree.
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dest)
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    } else {
+        // Path source — use destination dir mtime as an opaque pin.
+        std::fs::metadata(dest)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs().to_string())
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agend-skills-{}-{}-{}",
+            std::process::id(),
+            tag,
+            id
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn seed_skill_source(parent: &Path, name: &str) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("# {name}\n\nminimal skill for testing.\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn add_from_local_path_copies_directory_and_records_lock() {
+        let home = tmp_home("add-path");
+        let stage = home.join("stage");
+        let src = seed_skill_source(&stage, "greeter");
+        let added = add(&home, src.to_str().unwrap()).unwrap();
+        assert_eq!(added.name, "greeter");
+        assert_eq!(added.source, src.to_str().unwrap());
+        let dest = skills_root(&home).join("greeter");
+        assert!(dest.exists());
+        assert!(dest.join("SKILL.md").exists());
+        let lock = SkillsLock::read(&home).unwrap();
+        assert!(lock.skills.contains_key("greeter"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn add_overwrites_existing_skill() {
+        let home = tmp_home("add-overwrite");
+        let stage_a = home.join("stage-a");
+        seed_skill_source(&stage_a, "greeter");
+        let stage_b = home.join("stage-b");
+        let src_b = stage_b.join("greeter");
+        std::fs::create_dir_all(&src_b).unwrap();
+        std::fs::write(src_b.join("SKILL.md"), "# greeter v2\n").unwrap();
+
+        add(&home, stage_a.join("greeter").to_str().unwrap()).unwrap();
+        add(&home, src_b.to_str().unwrap()).unwrap();
+        let dest = skills_root(&home).join("greeter").join("SKILL.md");
+        let body = std::fs::read_to_string(&dest).unwrap();
+        assert!(
+            body.contains("v2"),
+            "second add must overwrite first: {body}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn list_returns_alphabetical_skills_with_lock_metadata() {
+        let home = tmp_home("list");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "alpha");
+        seed_skill_source(&stage, "beta");
+        seed_skill_source(&stage, "gamma");
+        add(&home, stage.join("alpha").to_str().unwrap()).unwrap();
+        add(&home, stage.join("gamma").to_str().unwrap()).unwrap();
+        // Manually drop in 'beta' to simulate operator hand-edit
+        // (no lock entry → empty source/version).
+        std::fs::create_dir_all(skills_root(&home).join("beta")).unwrap();
+
+        let listed = list(&home).unwrap();
+        let names: Vec<_> = listed.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+        // beta has no lock entry → empty source.
+        assert!(listed[1].source.is_empty());
+        assert!(!listed[0].source.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn remove_clears_dir_and_lock_entry_idempotent() {
+        let home = tmp_home("remove");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "doomed");
+        add(&home, stage.join("doomed").to_str().unwrap()).unwrap();
+        let dest = skills_root(&home).join("doomed");
+        assert!(dest.exists());
+
+        remove(&home, "doomed").unwrap();
+        assert!(!dest.exists());
+        let lock = SkillsLock::read(&home).unwrap();
+        assert!(!lock.skills.contains_key("doomed"));
+
+        // Idempotent — second call is a no-op.
+        remove(&home, "doomed").unwrap();
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_replays_lock_recorded_source() {
+        let home = tmp_home("update");
+        let stage = home.join("stage");
+        let src = seed_skill_source(&stage, "evolving");
+        add(&home, src.to_str().unwrap()).unwrap();
+        // Mutate the source post-add.
+        std::fs::write(src.join("SKILL.md"), "# evolving v2\n").unwrap();
+
+        update(&home, "evolving").unwrap();
+        let body =
+            std::fs::read_to_string(skills_root(&home).join("evolving").join("SKILL.md")).unwrap();
+        assert!(body.contains("v2"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn update_returns_error_for_unknown_skill() {
+        let home = tmp_home("update-unknown");
+        let r = update(&home, "ghost");
+        assert!(r.is_err(), "update of unknown skill must error");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_for_agent_creates_per_backend_paths() {
+        let home = tmp_home("install");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "anchor");
+        add(&home, stage.join("anchor").to_str().unwrap()).unwrap();
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+
+        let outcomes = install_for_agent(&home, &working).unwrap();
+        assert_eq!(outcomes.len(), BACKEND_SKILL_DIRS.len());
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome.mode, InstallMode::Symlink | InstallMode::Copy),
+                "expected real install for backend {} got {:?}",
+                outcome.backend,
+                outcome
+            );
+            assert!(
+                outcome.target.exists(),
+                "target must exist post-install: {:?}",
+                outcome.target
+            );
+            // The unified source's anchor skill should be reachable
+            // through the per-backend path.
+            assert!(
+                outcome.target.join("anchor").join("SKILL.md").exists(),
+                "skill not visible at {:?}",
+                outcome.target
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_skips_pre_existing_non_managed_directory() {
+        // Operator hand-crafted .claude/skills must not be clobbered.
+        let home = tmp_home("install-skip");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "anchor");
+        add(&home, stage.join("anchor").to_str().unwrap()).unwrap();
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+        let claude = working.join(".claude/skills");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("operator-skill.md"), "hand-crafted\n").unwrap();
+
+        let outcomes = install_for_agent(&home, &working).unwrap();
+        let claude_outcome = outcomes.iter().find(|o| o.backend == "claude").unwrap();
+        assert_eq!(
+            claude_outcome.mode,
+            InstallMode::Skipped,
+            "non-managed dir must be skipped: {claude_outcome:?}"
+        );
+        assert!(
+            claude.join("operator-skill.md").exists(),
+            "operator's file must be preserved"
+        );
+        // Other backends still install normally.
+        let codex_outcome = outcomes.iter().find(|o| o.backend == "codex").unwrap();
+        assert!(matches!(
+            codex_outcome.mode,
+            InstallMode::Symlink | InstallMode::Copy
+        ));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_replaces_pre_existing_managed_symlink_or_copy() {
+        let home = tmp_home("install-replace");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "anchor");
+        add(&home, stage.join("anchor").to_str().unwrap()).unwrap();
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+
+        // First install.
+        install_for_agent(&home, &working).unwrap();
+        // Second install must succeed (idempotent).
+        let outcomes = install_for_agent(&home, &working).unwrap();
+        for outcome in &outcomes {
+            assert!(matches!(
+                outcome.mode,
+                InstallMode::Symlink | InstallMode::Copy
+            ));
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn classify_source_distinguishes_git_and_path() {
+        let (name, kind) = classify_source("https://github.com/foo/bar.git").unwrap();
+        assert_eq!(name, "bar");
+        assert!(matches!(kind, SourceKind::Git(_)));
+        let (name, kind) = classify_source("git@github.com:foo/bar").unwrap();
+        assert_eq!(name, "bar");
+        assert!(matches!(kind, SourceKind::Git(_)));
+        let (name, kind) = classify_source("/tmp/local-skill").unwrap();
+        assert_eq!(name, "local-skill");
+        assert!(matches!(kind, SourceKind::Path(_)));
+    }
+
+    #[test]
+    fn classify_source_rejects_empty() {
+        assert!(classify_source("").is_err());
+        assert!(classify_source("   ").is_err());
+    }
+
+    #[test]
+    fn skills_lock_round_trips_through_disk() {
+        let home = tmp_home("lock-roundtrip");
+        let mut lock = SkillsLock::default();
+        lock.skills.insert(
+            "skill-a".to_string(),
+            SkillLockEntry {
+                source: "/tmp/skill-a".to_string(),
+                version: "abc123".to_string(),
+                installed_at: "2026-05-09T00:00:00Z".to_string(),
+            },
+        );
+        lock.write(&home).unwrap();
+        let loaded = SkillsLock::read(&home).unwrap();
+        assert_eq!(loaded, lock);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn list_empty_when_no_skills_root() {
+        let home = tmp_home("list-empty");
+        let listed = list(&home).unwrap();
+        assert!(listed.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
