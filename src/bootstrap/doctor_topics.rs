@@ -695,7 +695,7 @@ mod tests {
         // Registry should now reflect fleet.yaml's topic_id (99).
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&99), Some(&"alpha".to_string()));
-        assert!(reg.get(&42).is_none());
+        assert!(!reg.contains_key(&42));
         std::fs::remove_dir_all(&home).ok();
     }
 

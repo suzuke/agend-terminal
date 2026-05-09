@@ -585,7 +585,7 @@ pub fn run_doctor_topics(home: &Path, opts: DoctorTopicsOptions) -> anyhow::Resu
     // before any cleanup acts.
     let output = match opts.format {
         "json" => render_json(&report),
-        "human" | _ => render_human(&report),
+        _ => render_human(&report),
     };
     println!("{output}");
 
