@@ -6,6 +6,7 @@ mod channel;
 pub(crate) mod ci;
 mod comms;
 pub(crate) mod dispatch_hook;
+mod force_release;
 pub(crate) mod instance;
 pub(crate) mod instance_lifecycle;
 mod schedule;
@@ -190,6 +191,14 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 
         // --- Daemon-managed worktree release (Sprint 53 P0-X) ---
         "release_worktree" => worktree::handle_release_worktree(&home, args, &sender),
+
+        // --- Force-release stale worktree dir (Sprint 59 Wave 1 PR-5
+        //     emergency cherry-pick — closes BYPASS escape hatch by
+        //     making the bind_self lease_failed recovery path daemon-
+        //     managed).
+        "force_release_worktree" => {
+            force_release::handle_force_release_worktree(&home, args, &sender)
+        }
 
         // --- Daemon binding-state diagnostic (Sprint 58 Wave 3 PR-2 #8) ---
         "binding_state" => binding_state::handle_binding_state(&home, args, &sender),

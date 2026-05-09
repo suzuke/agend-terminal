@@ -278,6 +278,18 @@ fn worktree_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "agent": {"type": "string", "description": "Agent name whose worktree + binding to release"}
             }, "required": ["agent"]}}),
+        // Sprint 59 Wave 1 PR-5 emergency cherry-pick: closes the
+        // bind_self lease_failed recovery path so callers never
+        // resort to AGEND_GIT_BYPASS=1 to clean stale on-disk
+        // worktree dirs (operator Q2=(C) bypass-free permanent
+        // protocol). Required when the binding state was already
+        // released but the on-disk dir lingers (e.g. prior PR cycle
+        // crashed mid-cleanup).
+        json!({"name": "force_release_worktree", "description": "Force-release a stale daemon-managed worktree directory — cleans <home>/worktrees/<agent>/<branch>/ on disk + runs the standard release_full to clear any lingering binding state. Idempotent. Refuses to clean paths outside the daemon worktree pool. Sprint 59 Wave 1 PR-5 emergency cherry-pick supporting Q2=(C) bypass-free permanent protocol.",
+            "inputSchema": {"type": "object", "properties": {
+                "agent": {"type": "string", "description": "Agent name (worktree owner)"},
+                "branch": {"type": "string", "description": "Branch name (worktree subdirectory)"}
+            }, "required": ["agent", "branch"]}}),
         // Sprint 58 Wave 3 PR-2 (#8): daemon-side binding diagnostic.
         // Operator + agent introspection surface for lease-block recovery
         // debugging. Reports binding.json + on-disk worktree state +
@@ -432,10 +444,14 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            30,
-            "Sprint 58 Wave 3 PR-2 tool count = 30 (binding_state added on \
-             top of Sprint 54 P1-7's 29). Adding/removing a tool requires \
-             updating this assertion. Current tools: {:?}",
+            31,
+            "Sprint 59 Wave 1 PR-5 tool count = 31 (force_release_worktree \
+             added on top of Sprint 58 Wave 3 PR-2's 30). The dispatch \
+             m-20260509125352834800-192 anticipated 32 with PR-4 #570 also \
+             bumping; on review, PR-4 only adds optional params to the \
+             existing `reply` tool (no new entry → tool array length \
+             unchanged), so the correct post-PR-5 count is 31. PR-4's \
+             rebase will not adjust this assertion. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
