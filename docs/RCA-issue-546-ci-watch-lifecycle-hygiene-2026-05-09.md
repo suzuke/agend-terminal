@@ -63,9 +63,16 @@ Concrete failure modes:
 2. **Agent released without unsubscribe (see Item 2)**: subscriber array is
    non-empty but the agent is gone. Watch keeps polling → fine for TTL, but
    wastes API budget.
-3. **Daemon restart immediately followed by branch-delete**: watch file on
-   disk has expired `expires_at`, but no poll tick has run yet because the
-   branch is now 404. The file persists indefinitely.
+3. **Daemon restart with the upstream branch already 404**: the per-tick
+   poll fires, but the GitHub API call returns 404 for the deleted branch.
+   The 404 response handler returns before reaching the per-watch
+   expiry-check branch (which only fires on successful CI verdict
+   responses), so a watch with `expires_at < now` persists indefinitely
+   on disk until either (a) the agent re-creates a same-name branch and
+   the next poll sees a non-404 response that flows into the expiry
+   check, or (b) an out-of-band sweep removes it. Sprint 63 W1 PR-1
+   tightening note: pre-Sprint-57-W2-Track-B, no out-of-band sweep
+   existed; the file persisted forever.
 4. **No audit-log event** is emitted when a watch expires (the lazy `remove`
    at ci_watch.rs:1310 has no `event_log::log` call alongside it). Operator
    has no signal of cleanup activity.
@@ -84,6 +91,16 @@ Two-step:
 
 Add `event_log::log(home, "ci_watch_expired", &watch.repo, &reason)` next to
 each removal so operators can trace lifecycle events.
+
+### Status as of Sprint 57 W2 Track B (post-RCA mitigation)
+
+`daemon::ci_watch::gc_stale_watches` (`src/daemon/ci_watch.rs:1223`) implements
+both steps above. The eager sweep walks `$AGEND_HOME/ci-watches/*.json`
+without entering the poll path, applies (1) absolute TTL / (2) inactivity
+TTL / (3) protected-ref migration in precedence order, and emits
+`tracing::info!` per removal. Failure modes 1-3 above are mitigated; the
+"persists indefinitely" tail of failure mode 3 only applies to pre-Sprint-
+57-W2-Track-B daemon versions.
 
 ### Tests gap
 
