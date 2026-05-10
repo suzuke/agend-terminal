@@ -426,4 +426,137 @@ mod tests {
             r#"ExecStart="/Users/Test User/.cargo/bin/agend-terminal" start --foreground"#
         );
     }
+
+    // ── Sprint 63 W1 PR-4 (Sprint 58 P2 #1) — xml/plist parser round-trip ──
+    //
+    // Per Sprint 57 Phase 3 #557 Pass 2 reviewer note: verify that
+    // values escaped via `xml_escape` for insertion into plist /
+    // Task Scheduler XML templates round-trip cleanly through XML
+    // entity decoding. The escape direction is covered by existing
+    // tests (lines 332-411); the unescape side wasn't previously
+    // exercised, leaving a contract gap if a future contributor
+    // changed the escape rules without updating consumer behaviour.
+
+    /// Test-only XML entity unescape — inverse of `xml_escape`. Pins
+    /// the contract: escape → unescape == identity for any input.
+    /// Used only by these tests; production code never unescapes
+    /// (consumers are real plist parsers like `launchctl` and Task
+    /// Scheduler).
+    ///
+    /// Uses an absolute-byte-index walk over `value` (rather than
+    /// `char_indices` reassignment) so jumping past a multi-byte
+    /// entity preserves byte-position semantics correctly across
+    /// multiple entities in one input.
+    fn xml_unescape(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut out = String::with_capacity(value.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'&' {
+                let rest = &value[i..];
+                if rest.starts_with("&amp;") {
+                    out.push('&');
+                    i += "&amp;".len();
+                    continue;
+                } else if rest.starts_with("&lt;") {
+                    out.push('<');
+                    i += "&lt;".len();
+                    continue;
+                } else if rest.starts_with("&gt;") {
+                    out.push('>');
+                    i += "&gt;".len();
+                    continue;
+                } else if rest.starts_with("&quot;") {
+                    out.push('"');
+                    i += "&quot;".len();
+                    continue;
+                } else if rest.starts_with("&apos;") {
+                    out.push('\'');
+                    i += "&apos;".len();
+                    continue;
+                }
+                // Unknown entity → preserve `&` as-is, advance one
+                // byte. xml_escape never produces this; appearing
+                // here means the input wasn't produced by xml_escape.
+                out.push('&');
+                i += 1;
+                continue;
+            }
+            // Non-`&` byte: walk the next char (handles multi-byte
+            // utf-8 sequences correctly).
+            let ch = value[i..]
+                .chars()
+                .next()
+                .expect("i < bytes.len() invariant");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    #[test]
+    fn xml_escape_round_trips_alphanumeric_unchanged() {
+        let raw = "agend-terminal-v1.0_alpha-build42";
+        let escaped = xml_escape(raw);
+        assert_eq!(escaped, raw, "alphanumeric must not be escaped");
+        assert_eq!(xml_unescape(&escaped), raw, "round-trip identity");
+    }
+
+    #[test]
+    fn xml_escape_round_trips_all_five_entity_chars() {
+        // Every entity-escape rule in xml_escape exercised + inverse.
+        let raw = r#"name=foo&bar<baz>qux"id"='1'"#;
+        let escaped = xml_escape(raw);
+        // Forward: every special char converted.
+        assert!(escaped.contains("&amp;"));
+        assert!(escaped.contains("&lt;"));
+        assert!(escaped.contains("&gt;"));
+        assert!(escaped.contains("&quot;"));
+        assert!(escaped.contains("&apos;"));
+        // Reverse: clean round-trip back to raw.
+        assert_eq!(xml_unescape(&escaped), raw);
+    }
+
+    #[test]
+    fn xml_escape_round_trips_unicode_and_mixed() {
+        // Unicode passes through untouched on both legs.
+        let raw = "Téstüser/路徑with&special<chars>";
+        let escaped = xml_escape(raw);
+        assert_eq!(xml_unescape(&escaped), raw);
+        // Sanity: at least one char did get escaped.
+        assert!(escaped.contains("&amp;"));
+        assert!(escaped.contains("&lt;"));
+    }
+
+    #[test]
+    fn xml_escape_round_trips_plist_fragment_under_substitution() {
+        // End-to-end: full plist-fragment template + value with all 5
+        // special chars → substitute → unescape just the value back to
+        // raw. Mirrors the launchd consumer path: launchctl parses
+        // the template's XML entities back to text, which must equal
+        // the original raw input.
+        let template = "<string>__EXECUTABLE__</string>";
+        let raw = r#"/usr/local/bin/with & < > " ' all/specials"#;
+        let escaped = xml_escape(raw);
+        let resolved = apply_substitutions(template, &[("__EXECUTABLE__", escaped.as_str())]);
+        // Strip the wrapper to recover just the escaped value, then
+        // unescape and verify identity with raw input.
+        let inner = resolved
+            .strip_prefix("<string>")
+            .and_then(|s| s.strip_suffix("</string>"))
+            .expect("template wrappers preserved");
+        assert_eq!(xml_unescape(inner), raw);
+    }
+
+    #[test]
+    fn xml_unescape_passes_through_unrecognized_entities() {
+        // Defensive: xml_unescape is only an inverse of xml_escape's
+        // exact 5-entity mapping. Any other `&...;` sequence (e.g. a
+        // numeric `&#65;` or future-added `&nbsp;`) preserves as-is.
+        // Pins behaviour so a future contributor adding a new entity
+        // to xml_escape MUST also update xml_unescape (test fails
+        // loudly via the previous round-trip tests).
+        let weird = "this &nbsp; is not in our escape set";
+        assert_eq!(xml_unescape(weird), weird);
+    }
 }
