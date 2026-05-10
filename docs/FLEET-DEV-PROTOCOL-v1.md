@@ -164,7 +164,7 @@ Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher 
 
 ## §7. CI
 
-Use `ci(action: watch)`, not manual polling. Clean up worktree + branch after merge.
+Use `ci(action: watch)` for ongoing monitoring, not manual polling. Exception: merge-gate final verification requires one-shot `gh pr checks <PR#>` per §3.3.1. Clean up worktree + branch after merge.
 
 **No manual orchestrator polling**. Orchestrators (lead, general,
 operator-in-the-loop) MUST NOT manually poll PR / CI state via
@@ -260,7 +260,8 @@ Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/Aut
 | Record decisions | `decision(action: post)` | Markdown files |
 | Assign work | `send(kind: task)` + `task(action: create)` | only one |
 | Report results | `send(kind: report)` | free-text |
-| CI | `ci(action: watch)` | `gh pr checks` |
+| CI monitoring | `ci(action: watch)` | manual `gh run list` loops |
+| CI merge gate | `gh pr checks <PR#>` | trusting dev self-report |
 | Wait state | `set_waiting_on` | prose |
 | Health check | `describe_instance` | guessing |
 | Schedule | `schedule(action: create)` | backend-specific tools |
