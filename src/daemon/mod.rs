@@ -1381,13 +1381,26 @@ fn spawn_and_register_agent(
     // pre-existing non-managed dirs + replaces managed ones per Sprint 60
     // #581 contract).
     if let Some(wd) = working_dir.as_deref() {
-        match crate::skills::install_for_agent(home, wd) {
+        // Sprint 61 W1 PR-2 (#P0-2): consult fleet.yaml for per-instance
+        // skills override. None → install all (W1 PR-1 default); Some(vec)
+        // → install only the named skills (Some(empty) opts the agent
+        // out of skills entirely).
+        let skills_filter: Option<Vec<String>> =
+            crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                .ok()
+                .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
+        match crate::skills::install_for_agent(home, wd, skills_filter.as_deref()) {
             Ok(outcomes) => {
                 let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
                     .iter()
                     .map(|o| (o.backend.as_str(), o.mode))
                     .collect();
-                tracing::info!(agent = %name, ?modes, "skills auto-install complete");
+                tracing::info!(
+                    agent = %name,
+                    ?modes,
+                    filter = ?skills_filter,
+                    "skills auto-install complete"
+                );
             }
             Err(e) => {
                 tracing::warn!(agent = %name, error = %e, "skills auto-install failed, proceeding without skills");
