@@ -736,7 +736,7 @@ fn release_worktree_then_rebind_different_branch_succeeds_post_wave_4() {
 
     // Release the worktree (mirrors operator's release_worktree
     // MCP tool call between sprints).
-    let outcome = crate::worktree_pool::release_full(&home, "agent-cycle");
+    let outcome = crate::worktree_pool::release_full(&home, "agent-cycle", false);
     assert!(outcome.released, "release_full must succeed: {outcome:?}");
 
     // Now re-bind to a DIFFERENT branch. Must succeed because the

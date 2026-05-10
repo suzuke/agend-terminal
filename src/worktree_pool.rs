@@ -99,7 +99,80 @@ pub struct ReleaseOutcome {
     pub released: bool,
     pub worktree_removed: bool,
     pub binding_removed: bool,
+    pub branch_deleted: bool,
+    pub branch_cleanup_skipped_reason: Option<String>,
     pub error: Option<String>,
+}
+
+/// Attempt to delete a local branch if it has been merged into main or its
+/// remote tracking ref is gone (squash-merge detection).
+///
+/// Returns `(deleted, skip_reason)`:
+/// - `(true, None)` — branch was deleted
+/// - `(false, Some(reason))` — branch was NOT deleted, reason explains why
+fn cleanup_merged_branch(source_repo: &Path, branch: &str, dry_run: bool) -> (bool, Option<String>) {
+    // Never delete protected branches.
+    if crate::agent_ops::is_protected_ref(branch) {
+        return (false, Some(format!("branch '{branch}' is protected")));
+    }
+
+    // Check if branch is ancestor of main (fast-forward or true merge).
+    let is_merged = std::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", branch, "main"])
+        .current_dir(source_repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // Check if remote tracking ref is gone (squash-merge detection).
+    let is_gone = {
+        let remote_name = std::process::Command::new("git")
+            .args(["config", &format!("branch.{branch}.remote")])
+            .current_dir(source_repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !remote_name.is_empty() {
+            let remote_ref = format!("refs/remotes/{remote_name}/{branch}");
+            let exists = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", &remote_ref])
+                .current_dir(source_repo)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(true);
+            !exists
+        } else {
+            false
+        }
+    };
+
+    if !is_merged && !is_gone {
+        return (false, Some("branch not merged into main".to_string()));
+    }
+
+    if dry_run {
+        return (false, Some(format!("dry-run: would delete branch '{branch}'")));
+    }
+
+    // Delete the local branch.
+    let del = std::process::Command::new("git")
+        .args(["branch", "-D", branch])
+        .current_dir(source_repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    match del {
+        Ok(o) if o.status.success() => (true, None),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            (false, Some(format!("git branch -D failed: {stderr}")))
+        }
+        Err(e) => (false, Some(format!("git branch -D failed: {e}"))),
+    }
 }
 
 /// Hard-release an agent's daemon-managed worktree + binding.
@@ -125,8 +198,9 @@ pub struct ReleaseOutcome {
 /// Partial cleanup: if the worktree path is missing or `git worktree remove`
 /// fails, the binding is still cleared so the agent is not stuck in a
 /// half-released state.
-pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
+pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     let mut out = ReleaseOutcome::default();
+    let mut managed_verified = false;
 
     let Some(binding) = crate::binding::read(home, agent) else {
         // Idempotent no-op on second call. Per spec: not fatal.
@@ -190,6 +264,7 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
             // git worktree remove --force, run from the OWNING repo's cwd
             // so the registry entry is cleaned up alongside the directory.
             // AGEND_GIT_BYPASS=1 bypasses the shim's worktree-deny matrix.
+            managed_verified = true;
             let mut cmd = std::process::Command::new("git");
             cmd.args([
                 "worktree",
@@ -272,6 +347,23 @@ pub fn release_full(home: &Path, agent: &str) -> ReleaseOutcome {
     // release until this enumerator landed. Best-effort: failures are
     // logged but never abort release.
     unsubscribe_all_ci_watches_for_agent(home, agent);
+
+    // Issue #611: auto-cleanup merged local branch after release.
+    // Read branch + source_repo from the binding we captured earlier.
+    // Only proceed if we verified the .agend-managed marker (Finding 2).
+    let branch = binding["branch"].as_str().unwrap_or("");
+    let sr_str = binding["source_repo"].as_str().unwrap_or("");
+    if !managed_verified {
+        out.branch_cleanup_skipped_reason = Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
+    } else if !branch.is_empty() && !sr_str.is_empty() {
+        let (deleted, skip_reason) = cleanup_merged_branch(Path::new(sr_str), branch, dry_run);
+        out.branch_deleted = deleted;
+        out.branch_cleanup_skipped_reason = skip_reason;
+    } else if branch.is_empty() {
+        out.branch_cleanup_skipped_reason = Some("no branch in binding".to_string());
+    } else {
+        out.branch_cleanup_skipped_reason = Some("no source_repo in binding".to_string());
+    }
 
     crate::event_log::log(
         home,
@@ -639,7 +731,7 @@ mod tests {
         assert!(crate::binding::read(&home, "agent-h").is_some());
         assert!(is_daemon_managed(&l.path));
 
-        let outcome = release_full(&home, "agent-h");
+        let outcome = release_full(&home, "agent-h", false);
 
         assert!(outcome.released, "happy path must report released");
         assert!(outcome.worktree_removed, "worktree must be removed");
@@ -657,9 +749,9 @@ mod tests {
         let home = tmp_home("p0x-idem");
         let repo = tmp_repo("p0x-idem-repo");
         lease(&home, &repo, "agent-i", "feat/idem").expect("lease");
-        let r1 = release_full(&home, "agent-i");
+        let r1 = release_full(&home, "agent-i", false);
         assert!(r1.released, "first call must release");
-        let r2 = release_full(&home, "agent-i");
+        let r2 = release_full(&home, "agent-i", false);
         assert!(!r2.released, "second call must report no release");
         assert!(
             r2.error.as_deref().unwrap_or("").contains("no binding"),
@@ -674,7 +766,7 @@ mod tests {
     fn p0x_release_full_missing_binding_graceful() {
         let home = tmp_home("p0x-missing-binding");
         // No lease, no binding written. Calling release on a fresh agent.
-        let outcome = release_full(&home, "ghost-agent");
+        let outcome = release_full(&home, "ghost-agent", false);
         assert!(!outcome.released);
         assert!(!outcome.worktree_removed);
         assert!(!outcome.binding_removed);
@@ -704,7 +796,7 @@ mod tests {
         assert!(!l.path.exists(), "pre: worktree must be gone");
         assert!(crate::binding::read(&home, "agent-mw").is_some());
 
-        let outcome = release_full(&home, "agent-mw");
+        let outcome = release_full(&home, "agent-mw", false);
         assert!(outcome.released, "must still release: {:?}", outcome);
         assert!(outcome.binding_removed, "binding must be cleared");
         assert!(
@@ -743,7 +835,7 @@ mod tests {
         // Sanity: no marker.
         assert!(!is_daemon_managed(&unmanaged_wt));
 
-        let outcome = release_full(&home, "agent-u");
+        let outcome = release_full(&home, "agent-u", false);
         assert!(
             !outcome.released,
             "unmanaged worktree must NOT be released: {:?}",
@@ -801,7 +893,7 @@ mod tests {
         let repo = tmp_repo("p0x-registry-happy-repo");
         let _l = lease(&home, &repo, "agent-r", "feat/registry").expect("lease");
 
-        let outcome = release_full(&home, "agent-r");
+        let outcome = release_full(&home, "agent-r", false);
         assert!(outcome.released);
         assert!(outcome.worktree_removed);
         assert_no_prunable_registry(&repo, "happy-path");
@@ -847,7 +939,7 @@ mod tests {
             "test setup invariant: dir-removed worktree must show as prunable pre-release. Output:\n{pre_stdout}"
         );
 
-        let outcome = release_full(&home, "agent-rm");
+        let outcome = release_full(&home, "agent-rm", false);
         assert!(outcome.released);
         assert!(outcome.binding_removed);
 
@@ -1100,7 +1192,7 @@ mod tests {
         // Watch the agent isn't subscribed to — must remain untouched.
         let bystander = write_ci_watch(&home, "owner/repo", "feat-bystander", &["lead"]);
 
-        let outcome = release_full(&home, "dev");
+        let outcome = release_full(&home, "dev", false);
 
         assert!(outcome.released, "release must succeed");
         assert!(outcome.binding_removed, "binding must be cleared");
@@ -1147,12 +1239,132 @@ mod tests {
 
         let solo_watch = write_ci_watch(&home, "owner/repo", "main", &["dev"]);
 
-        release_full(&home, "dev");
+        release_full(&home, "dev", false);
 
         assert!(
             !solo_watch.exists(),
             "watch with no remaining subscribers must be deleted entirely"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── Issue #611: branch cleanup tests ────────────────────────────────
+
+    #[test]
+    fn release_full_deletes_merged_branch() {
+        let home = tmp_home("611-merged");
+        let repo = tmp_repo("611-merged-repo");
+        // Lease creates the branch + worktree.
+        let l = lease(&home, &repo, "agent-611m", "feat/merged").expect("lease");
+        // Add a commit on the feature branch via the worktree.
+        std::process::Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "feat"])
+            .current_dir(&l.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        // Merge feat/merged into main from the source repo (without checking it out).
+        std::process::Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=t@t", "merge", "feat/merged", "--no-ff", "-m", "merge"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+
+        let outcome = release_full(&home, "agent-611m", false);
+
+        assert!(outcome.released);
+        assert!(outcome.branch_deleted, "merged branch must be deleted: {:?}", outcome);
+        assert!(outcome.branch_cleanup_skipped_reason.is_none());
+        // Verify branch is actually gone from the repo.
+        let branch_exists = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "feat/merged"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(!branch_exists, "branch must not exist in repo after cleanup");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_full_preserves_unmerged_branch() {
+        let home = tmp_home("611-unmerged");
+        let repo = tmp_repo("611-unmerged-repo");
+        // Lease creates the branch + worktree.
+        let l = lease(&home, &repo, "agent-611u", "feat/unmerged").expect("lease");
+        // Add a commit on the feature branch (not merged into main).
+        std::process::Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "wip"])
+            .current_dir(&l.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+
+        let outcome = release_full(&home, "agent-611u", false);
+
+        assert!(outcome.released);
+        assert!(!outcome.branch_deleted, "unmerged branch must NOT be deleted");
+        assert_eq!(
+            outcome.branch_cleanup_skipped_reason.as_deref(),
+            Some("branch not merged into main")
+        );
+        // Verify branch still exists.
+        let branch_exists = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "feat/unmerged"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(branch_exists, "unmerged branch must still exist in repo");
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_full_dry_run_does_not_delete_branch() {
+        let home = tmp_home("611-dryrun");
+        let repo = tmp_repo("611-dryrun-repo");
+        // Lease creates the branch + worktree.
+        let l = lease(&home, &repo, "agent-611d", "feat/dryrun").expect("lease");
+        // Add a commit and merge into main.
+        std::process::Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "feat"])
+            .current_dir(&l.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.name=test", "-c", "user.email=t@t", "merge", "feat/dryrun", "--no-ff", "-m", "merge"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+
+        let outcome = release_full(&home, "agent-611d", true);
+
+        assert!(outcome.released);
+        assert!(!outcome.branch_deleted, "dry-run must NOT delete branch");
+        assert_eq!(
+            outcome.branch_cleanup_skipped_reason.as_deref(),
+            Some("dry-run: would delete branch 'feat/dryrun'")
+        );
+        // Verify branch still exists.
+        let branch_exists = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "feat/dryrun"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(branch_exists, "branch must survive dry-run");
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();

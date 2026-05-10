@@ -150,7 +150,8 @@ pub(crate) fn handle_release_worktree(
     if let Err(e) = crate::agent::validate_name(agent) {
         return json!({"error": e});
     }
-    let outcome = crate::worktree_pool::release_full(home, agent);
+    let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    let outcome = crate::worktree_pool::release_full(home, agent, dry_run);
     serde_json::to_value(&outcome).unwrap_or_else(|_| json!({"error": "serialize failed"}))
 }
 
