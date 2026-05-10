@@ -5,9 +5,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-10
+
 ### Removed
 
 - **`agend-terminal mcp` subcommand (Sprint 56 Track I, #531)** — the local-mode stdio JSON-RPC server retired. The `Commands::Mcp` enum variant, `mcp::run` function, ACL machinery, framing helpers, and `proxy_or_local` fallback all deleted from `src/`. Operators with hand-edited mcp.json get the daemon's atomic upsert rewriting their config to use `agend-mcp-bridge` on next start; new installs ship the bridge in release artifacts (Phase 2a, v0.7+). The bridge is the canonical MCP server going forward. Reported by changhansung on Windows 11 + kiro-cli backend; investigated through 4 sequential PRs (Phase 1 RCA / 2a packaging / 2b deprecation / 2c hard removal). See `docs/RCA-issue-531-deprecate-agend-terminal-mcp-2026-05-08.md` for the full architectural reasoning.
+- **`ensure_gitignore` worktree helper (#602, #604)** — `src/worktree.rs::ensure_gitignore` auto-injected `.worktrees` into project `.gitignore` as a back-compat backstop for pre-Sprint-57-Wave-4 layouts. Post-Wave-4 worktrees live outside the repo (under `$AGEND_HOME/worktrees/`), making this inject redundant + polluting user `.gitignore`. Removed callsite + helper + obsolete test assert (-42 LOC). Reported by @cheerc.
 
 ### Added
 
