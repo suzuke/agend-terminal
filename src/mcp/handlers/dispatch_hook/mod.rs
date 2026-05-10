@@ -195,6 +195,12 @@ fn resolve_source_repo(
             "source_repo resolved via fleet.yaml source_repo (tier 2)");
         return p;
     }
+    // Tier 2.5: team source_repo
+    if let Some(p) = resolve_team_source_repo(home, target) {
+        tracing::info!(%target, tier = "team_source_repo", path = %p.display(),
+            "source_repo resolved via team source_repo (tier 2.5)");
+        return p;
+    }
     if let Some(p) = resolved.and_then(|r| r.working_directory.clone()) {
         tracing::info!(%target, tier = "working_directory", path = %p.display(),
             "source_repo resolved via fleet.yaml working_directory (tier 3, deprecation candidate)");
@@ -207,6 +213,17 @@ fn resolve_source_repo(
         tracing::error!(%target, "AGEND_BIND_STRICT_MODE=1: stub fallback rejected");
     }
     stub
+}
+
+/// Resolve source_repo from the agent's team configuration.
+pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathBuf> {
+    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok()?;
+    for (_name, cfg) in &fleet.teams {
+        if cfg.members.contains(&agent.to_string()) {
+            return cfg.source_repo.clone();
+        }
+    }
+    None
 }
 
 /// Parse `owner/repo` from a `git remote get-url origin` output.

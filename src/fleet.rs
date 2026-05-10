@@ -232,6 +232,8 @@ pub struct TeamConfig {
     /// creation stamps it; operator-edited fleet.yaml entries may omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<std::path::PathBuf>,
 }
 
 impl FleetConfig {
@@ -1055,6 +1057,12 @@ fn team_config_to_mapping(config: &TeamConfig) -> serde_yaml_ng::Mapping {
             serde_yaml_ng::Value::String(ts.clone()),
         );
     }
+    if let Some(ref sr) = config.source_repo {
+        team.insert(
+            "source_repo".into(),
+            serde_yaml_ng::Value::String(sr.display().to_string()),
+        );
+    }
     team
 }
 
@@ -1195,6 +1203,7 @@ pub fn migrate_teams_json_to_yaml(home: &Path) -> Result<()> {
             orchestrator: team.orchestrator.clone(),
             description: team.description.clone(),
             created_at: team.created_at.clone(),
+            source_repo: None,
         };
         // add_team_to_yaml is no-op when team already in fleet.yaml —
         // operator hand-edits win, runtime store loses on conflict.
@@ -1586,6 +1595,7 @@ instances:
             orchestrator: Some("alice".into()),
             description: Some("dev squad".into()),
             created_at: Some("2026-05-07T00:00:00Z".into()),
+            source_repo: None,
         };
         let inserted = add_team_to_yaml(&dir, "devs", &cfg).expect("add");
         assert!(inserted);
@@ -1605,6 +1615,7 @@ instances:
             orchestrator: Some("alice".into()),
             description: None,
             created_at: Some("2026-05-07T00:00:00Z".into()),
+            source_repo: None,
         };
         assert!(add_team_to_yaml(&dir, "devs", &cfg1).expect("first"));
         let cfg2 = TeamConfig {
@@ -1612,6 +1623,7 @@ instances:
             orchestrator: Some("bob".into()),
             description: None,
             created_at: Some("2026-05-08T00:00:00Z".into()),
+            source_repo: None,
         };
         let inserted = add_team_to_yaml(&dir, "devs", &cfg2).expect("dup");
         assert!(!inserted, "duplicate must report false (no insert)");
@@ -1633,6 +1645,7 @@ instances:
             orchestrator: Some("alice".into()),
             description: None,
             created_at: None,
+            source_repo: None,
         };
         add_team_to_yaml(&dir, "devs", &cfg).expect("add");
         assert!(remove_team_from_yaml(&dir, "devs").expect("rm"));
@@ -1651,6 +1664,7 @@ instances:
             orchestrator: Some("alice".into()),
             description: None,
             created_at: Some("2026-05-07T00:00:00Z".into()),
+            source_repo: None,
         };
         add_team_to_yaml(&dir, "devs", &cfg).expect("add");
         // Drop bob, reassign orch to alice (no-op), add carol.
@@ -1659,6 +1673,7 @@ instances:
             orchestrator: Some("alice".into()),
             description: Some("post-update".into()),
             created_at: cfg.created_at.clone(),
+            source_repo: None,
         };
         assert!(update_team_in_yaml(&dir, "devs", &new_cfg).expect("upd"));
         let loaded = FleetConfig::load(&dir.join("fleet.yaml")).expect("load");
@@ -1671,6 +1686,7 @@ instances:
             orchestrator: None,
             description: None,
             created_at: None,
+            source_repo: None,
         };
         assert!(!update_team_in_yaml(&dir, "nonexistent", &new_cfg2).expect("upd-miss"));
         fs::remove_dir_all(&dir).ok();

@@ -185,6 +185,7 @@ fn team_tools() -> Vec<Value> {
                 "name": {"type": "string"}, "members": {"type": "array", "items": {"type": "string"}},
                 "orchestrator": {"type": "string", "description": "Team orchestrator — must be a member."},
                 "description": {"type": "string"},
+                "source_repo": {"type": "string", "description": "Source repository path for the team."},
                 "add": {"type": "array", "items": {"type": "string"}},
                 "remove": {"type": "array", "items": {"type": "string"}}
             }, "required": ["action"]}}),
