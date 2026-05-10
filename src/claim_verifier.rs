@@ -197,6 +197,7 @@ fn git_diff_files(repo_dir: &Path, base: &str, head: &str) -> Result<Vec<String>
     let output = std::process::Command::new("git")
         .args(["diff", "--name-only", &format!("{base}..{head}")])
         .current_dir(repo_dir)
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map_err(|e| format!("git diff failed: {e}"))?;
     if !output.status.success() {
@@ -223,6 +224,7 @@ fn git_diff_path_empty(
     let output = std::process::Command::new("git")
         .args(["diff", &format!("{base}..{head}"), "--", path])
         .current_dir(repo_dir)
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map_err(|e| format!("git diff failed: {e}"))?;
     if !output.status.success() {
@@ -460,6 +462,7 @@ fn git_show_and_fmt(repo_dir: &Path, rev: &str, path: &str) -> Result<String, St
     let show = std::process::Command::new("git")
         .args(["show", &format!("{rev}:{path}")])
         .current_dir(repo_dir)
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .map_err(|e| format!("git show failed: {e}"))?;
     if !show.status.success() {
@@ -707,6 +710,7 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "test@test.com")
                 .env("GIT_COMMITTER_NAME", "test")
                 .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .env("AGEND_GIT_BYPASS", "1")
                 .output()
                 .unwrap()
         };
@@ -722,6 +726,7 @@ mod tests {
         let o = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .unwrap();
         String::from_utf8_lossy(&o.stdout).trim().to_string()
@@ -731,6 +736,7 @@ mod tests {
         std::process::Command::new("git")
             .args(["add", "."])
             .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .unwrap();
         std::process::Command::new("git")
@@ -740,6 +746,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "test@test.com")
             .env("GIT_COMMITTER_NAME", "test")
             .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .unwrap();
     }
