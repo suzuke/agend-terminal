@@ -118,6 +118,7 @@ Impl pushes PR then immediately starts next task. Reviewer issues verdict then i
 - dev-lead uses `schedule(action: create)` for auto-poll (30min fallback)
 - Takeover requires 4 criteria independently verified (heartbeat stale ≥1h, last_input frozen, idle state, zero activity)
 - Merge must atomically include `git worktree remove` + `git branch -D`
+- Post-merge: orchestrator verifies main CI green before reporting task completion upstream. Failed main CI = immediate P0 (revert or hotfix).
 - Orchestrator owns `ci(action: watch)` for own-orchestrated branches
 - Stuck-agent timeout: see §9 timeout staircase
 
@@ -269,7 +270,13 @@ Push PR then immediately start next task. Depth ≤ 2. Must branch from main (no
 Start review on PR push. `reviewed_head` is a snapshot; subsequent commits reset verdict.
 
 ### 12.3 Task Close
-`in_progress` → `verified` (reviewer) → `done` (dev-lead merge). Three states, no skipping.
+`in_progress` → `verified` (reviewer) → merge (CI green per §3.3.1) → post-merge main CI green → `done`.
+
+**Post-merge verification**: After squash-merge, orchestrator MUST verify main branch CI passes:
+```
+gh run list -b main --limit 1
+```
+or wait for ci_watch [ci-pass] on main. Only declare task `done` after main CI is confirmed green. If main CI fails post-merge, immediately investigate and fix (revert if necessary).
 
 ### 12.4 Worktree Mandatory
 Impl/reviewer must use worktrees. `git worktree add -b <branch> <path> origin/main`. **Never** `git worktree add <path> main`.
