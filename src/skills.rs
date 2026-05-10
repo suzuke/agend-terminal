@@ -341,6 +341,85 @@ fn stage_filtered_source(home: &Path, source: &Path, allowlist: &[String]) -> Re
     Ok(stage)
 }
 
+/// Sprint 62 W1 PR-2 (#P0-2): GC report — what `cleanup_stale_stages`
+/// found and acted on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StageGcReport {
+    pub candidates: usize,
+    pub deleted: usize,
+    pub preserved_recent: usize,
+    pub preserved_excluded: usize,
+}
+
+/// Sprint 62 W1 PR-2 (#P0-2): GC stale `<home>/.skills-stage/<digest>/`
+/// directories. Closes the Sprint 61 #586 reviewer minor caveat
+/// (stage dirs accumulate without GC) and the Sprint 62 PLAN review
+/// reviewer minor add (TOCTOU safety via same-run exclusion).
+///
+/// - `retention_secs`: stages with mtime older than this threshold are
+///   eligible for deletion. Recommended 7-day window for daemon-init
+///   invocation.
+/// - `exclude_digests`: stage dir names to never delete (currently-
+///   resolved stages from same run, per reviewer minor add). Empty
+///   when invoked at daemon-init (no installs have happened yet);
+///   non-empty for any future periodic-GC site.
+///
+/// Returns counts so callers can log/test the GC outcome. Fail-open:
+/// IO failures during a single dir removal log warn + continue;
+/// missing stage root short-circuits with empty report.
+pub fn cleanup_stale_stages(
+    home: &Path,
+    retention_secs: u64,
+    exclude_digests: &[String],
+) -> Result<StageGcReport> {
+    let stage_root = home.join(".skills-stage");
+    let mut report = StageGcReport::default();
+    let entries = match std::fs::read_dir(&stage_root) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => {
+            return Err(anyhow!("read_dir {}: {}", stage_root.display(), e));
+        }
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        report.candidates += 1;
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if exclude_digests.iter().any(|d| d == &name) {
+            report.preserved_excluded += 1;
+            continue;
+        }
+        let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+        let elapsed = mtime
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if elapsed < retention_secs {
+            report.preserved_recent += 1;
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                report.deleted += 1;
+                tracing::info!(stage = %name, elapsed_secs = elapsed,
+                    "skills-stage GC: removed stale stage dir");
+            }
+            Err(e) => {
+                tracing::warn!(stage = %name, error = %e,
+                    "skills-stage GC: removal failed, skipping");
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// SHA-256 prefix digest used for the filtered-source stage path.
 /// 16 hex chars = first 8 bytes of SHA-256 output → 64 bits of
 /// collision resistance, sufficient at the daemon's scale (collision
@@ -1041,6 +1120,80 @@ mod tests {
             "stage dir {:?} must end with SHA-256 prefix {expected}",
             stage_dir
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 62 W1 PR-2 (#P0-2) — skills-stage GC ────────────────────
+
+    fn seed_aged_stage(home: &Path, name: &str, age_secs: u64) {
+        let path = home.join(".skills-stage").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("marker"), b"stage").unwrap();
+        let now = std::time::SystemTime::now();
+        let back = now - std::time::Duration::from_secs(age_secs);
+        let secs = back
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let dt = chrono::DateTime::<chrono::Utc>::from(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+        );
+        // touch -t format: [[CC]YY]MMDDhhmm[.ss]
+        let arg = dt.format("%Y%m%d%H%M.%S").to_string();
+        let _ = std::process::Command::new("touch")
+            .args(["-t", &arg])
+            .arg(&path)
+            .status();
+    }
+
+    #[test]
+    fn cleanup_stale_stages_deletes_aged_dirs_above_threshold() {
+        let home = tmp_home("gc-aged");
+        std::fs::create_dir_all(home.join(".skills-stage").join("fresh")).unwrap();
+        std::fs::write(
+            home.join(".skills-stage").join("fresh").join("marker"),
+            b"x",
+        )
+        .unwrap();
+        seed_aged_stage(&home, "ancient", 8 * 24 * 60 * 60);
+
+        let report = cleanup_stale_stages(&home, 7 * 24 * 60 * 60, &[]).unwrap();
+        assert_eq!(report.candidates, 2);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.preserved_recent, 1);
+        assert_eq!(report.preserved_excluded, 0);
+        assert!(home.join(".skills-stage").join("fresh").exists());
+        assert!(!home.join(".skills-stage").join("ancient").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_stale_stages_excludes_named_digests_from_deletion() {
+        // Reviewer minor add: same-run exclusion prevents TOCTOU
+        // deletion of just-staged. Excluded dirs preserved even if
+        // older than retention threshold.
+        let home = tmp_home("gc-exclude");
+        seed_aged_stage(&home, "active-stage", 8 * 24 * 60 * 60);
+        seed_aged_stage(&home, "stale-stage", 8 * 24 * 60 * 60);
+
+        let exclude = vec!["active-stage".to_string()];
+        let report = cleanup_stale_stages(&home, 7 * 24 * 60 * 60, &exclude).unwrap();
+        assert_eq!(report.candidates, 2);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.preserved_recent, 0);
+        assert_eq!(report.preserved_excluded, 1);
+        assert!(home.join(".skills-stage").join("active-stage").exists());
+        assert!(!home.join(".skills-stage").join("stale-stage").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_stale_stages_returns_empty_report_when_root_missing() {
+        // Daemon-init invocation on fresh AgEnD home (no .skills-
+        // stage dir created yet). Must return empty report, not error.
+        let home = tmp_home("gc-no-root");
+        let report = cleanup_stale_stages(&home, 7 * 24 * 60 * 60, &[]).unwrap();
+        assert_eq!(report, StageGcReport::default());
         std::fs::remove_dir_all(&home).ok();
     }
 }

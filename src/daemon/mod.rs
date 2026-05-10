@@ -348,6 +348,19 @@ fn run_core(
     // G3 H1: replaced set_var with DaemonConfig init (thread-safe).
     crate::daemon_config::init(crate::daemon_config::DaemonConfig::default());
 
+    // Sprint 62 W1 PR-2 (#P0-2 skills-stage GC): sweep stale
+    // <home>/.skills-stage/<digest>/ dirs older than 7 days. Runs
+    // BEFORE any spawn_and_register_agent invocation so concurrent
+    // install_for_agent never races with the GC. Empty exclusion
+    // list at this site (no installs have happened yet); periodic-
+    // GC sites added later would pass currently-resolved digests.
+    // Best-effort: failures log + continue, never block boot.
+    const SKILLS_STAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+    match crate::skills::cleanup_stale_stages(home, SKILLS_STAGE_RETENTION_SECS, &[]) {
+        Ok(report) => tracing::info!(?report, "skills-stage GC: daemon-init sweep complete"),
+        Err(e) => tracing::warn!(error = %e, "skills-stage GC: daemon-init sweep failed"),
+    }
+
     // Sprint 24 P0 PR2 — bridge-phase legacy migration. Walks tasks.json
     // and emits canonical Created (+ status transition) events into
     // task_events.jsonl. Idempotent: re-run is a no-op via tail-scan
