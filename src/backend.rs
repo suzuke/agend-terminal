@@ -296,7 +296,7 @@ impl Backend {
                 command: "gemini",
                 args: &["--yolo"],
                 ready_pattern: "Type your message|YOLO",
-                submit_key: "\n\r",
+                submit_key: "\r",
                 inject_prefix: "\r",
                 typed_inject: true,
                 resume_mode: ResumeMode::Fixed {
