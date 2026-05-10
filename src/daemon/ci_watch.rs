@@ -1643,6 +1643,31 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
     result
 }
 
+/// Aggregate conclusion for all runs matching a given head_sha.
+/// Returns None if any run is still in-progress (conclusion is None).
+/// Returns Some("failure") if any run failed.
+/// Returns Some("success") only if all runs succeeded.
+/// Returns None if no runs match.
+pub(crate) fn aggregate_conclusion_for_sha<'a>(
+    runs: &'a [CiRun],
+    sha: &str,
+) -> Option<&'a str> {
+    let matching: Vec<&CiRun> = runs.iter().filter(|r| r.head_sha == sha).collect();
+    if matching.is_empty() {
+        return None;
+    }
+    if matching.iter().any(|r| r.conclusion.is_none()) {
+        return None;
+    }
+    if matching.iter().any(|r| r.conclusion.as_deref() == Some("failure")) {
+        return Some("failure");
+    }
+    if let Some(r) = matching.iter().find(|r| r.conclusion.as_deref() != Some("success")) {
+        return r.conclusion.as_deref();
+    }
+    Some("success")
+}
+
 /// Pure function: build the inbox body text for a CI notification.
 /// Headline + optional failure detail + run URL.
 pub(crate) fn build_inbox_body(
@@ -1894,18 +1919,23 @@ async fn ci_check_repo(
     }
 
     let mut max_notified_id = effective_last_run_id.unwrap_or(0);
-    for &idx in &to_notify {
-        if runs[idx].id > max_notified_id {
-            max_notified_id = runs[idx].id;
-        }
-    }
 
     let deduped = dedupe_notifications_by_head_sha(&runs, &to_notify, last_notified_sha);
     let mut new_notified_sha = last_notified_sha.map(String::from);
 
     for (idx, run_id, sha) in &deduped {
         let run = &runs[*idx];
-        let conclusion = run.conclusion.as_deref();
+        // Issue #608: use aggregate conclusion across ALL runs for this sha,
+        // not just the single deduped run's conclusion.
+        let conclusion = aggregate_conclusion_for_sha(&runs, sha);
+        if conclusion.is_none() {
+            // Some runs for this sha are still in-progress — skip, don't update tracking.
+            continue;
+        }
+        // Only advance max_notified_id for runs we actually emit.
+        if *run_id > max_notified_id {
+            max_notified_id = *run_id;
+        }
 
         if let Some(headline) = ci_notification_message(repo, branch, conclusion, None, Some(sha)) {
             let failure_detail = if conclusion == Some("failure") {
@@ -4629,5 +4659,49 @@ mod tests {
         assert_eq!(n2, 0, "second sweep is idempotent");
         assert!(path.exists(), "fresh watch must survive both sweeps");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Issue #608: aggregate_conclusion_for_sha tests ──────────────────
+
+    fn make_run(id: u64, sha: &str, conclusion: Option<&str>) -> CiRun {
+        CiRun {
+            id,
+            head_sha: sha.to_string(),
+            conclusion: conclusion.map(String::from),
+            url: String::new(),
+        }
+    }
+
+    #[test]
+    fn aggregate_all_success_emits_pass() {
+        let runs = vec![
+            make_run(1, "abc123", Some("success")),
+            make_run(2, "abc123", Some("success")),
+        ];
+        assert_eq!(aggregate_conclusion_for_sha(&runs, "abc123"), Some("success"));
+    }
+
+    #[test]
+    fn aggregate_any_failure_emits_fail() {
+        let runs = vec![
+            make_run(1, "abc123", Some("success")),
+            make_run(2, "abc123", Some("failure")),
+        ];
+        assert_eq!(aggregate_conclusion_for_sha(&runs, "abc123"), Some("failure"));
+    }
+
+    #[test]
+    fn aggregate_in_progress_blocks_notification() {
+        let runs = vec![
+            make_run(1, "abc123", Some("success")),
+            make_run(2, "abc123", None),
+        ];
+        assert_eq!(aggregate_conclusion_for_sha(&runs, "abc123"), None);
+    }
+
+    #[test]
+    fn aggregate_empty_returns_none() {
+        let runs = vec![make_run(1, "other", Some("success"))];
+        assert_eq!(aggregate_conclusion_for_sha(&runs, "abc123"), None);
     }
 }
