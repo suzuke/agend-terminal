@@ -188,15 +188,6 @@ pub fn create(
         });
     }
 
-    // Sprint 57 Wave 4 (#546 Item 4): worktrees live external to
-    // source_repo, so the source repo's .gitignore no longer needs
-    // a `.worktrees` entry — but `ensure_gitignore` is kept as a
-    // best-effort idempotent backstop for repos that DID accumulate
-    // legacy worktrees pre-Wave-4. New creates land at
-    // `$AGEND_HOME/worktrees/...` which is outside the source tree
-    // entirely, so .gitignore there is moot for new path.
-    ensure_gitignore(repo_dir);
-
     // Worktree's parent dir must exist before `git worktree add`
     // runs against it. Branches with `/` (e.g. `feat/foo`) become
     // nested dirs naturally via create_dir_all.
@@ -438,33 +429,6 @@ pub fn list_legacy_residual(source_repo: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Ensure .worktrees is listed in .gitignore.
-fn ensure_gitignore(repo_dir: &Path) {
-    let gitignore = repo_dir.join(".gitignore");
-    let content = std::fs::read_to_string(&gitignore).unwrap_or_default();
-    if !content
-        .lines()
-        .any(|line| line.trim() == ".worktrees" || line.trim() == ".worktrees/")
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&gitignore)
-        {
-            let prefix = if content.is_empty() || content.ends_with('\n') {
-                ""
-            } else {
-                "\n"
-            };
-            if let Err(e) = writeln!(f, "{prefix}.worktrees") {
-                tracing::warn!(error = %e, "failed to update .gitignore");
-            }
-            tracing::info!("added .worktrees to .gitignore");
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -547,12 +511,6 @@ mod tests {
             info.path, expected,
             "worktree path must follow new external layout"
         );
-
-        // .gitignore is still touched as a back-compat backstop for
-        // legacy worktrees pre-Wave-4 — the entry exists even though
-        // new creates land outside the source repo.
-        let gitignore = std::fs::read_to_string(repo.join(".gitignore")).unwrap_or_default();
-        assert!(gitignore.contains(".worktrees"));
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
