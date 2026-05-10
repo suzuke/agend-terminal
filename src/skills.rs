@@ -759,4 +759,79 @@ mod tests {
         assert!(listed.is_empty());
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── Sprint 61 W1 PR-1 (#P0-1) — auto-install pre-spawn smoke ──────────
+    //
+    // The daemon's spawn_and_register_agent calls install_for_agent
+    // synchronously BEFORE agent::spawn_agent so SKILL.md files are in
+    // place at the agent's first read. These tests verify the contract
+    // properties that wiring depends on:
+    // - install_for_agent succeeds with an empty (no skills added) source,
+    //   so a fresh daemon launch with no `agend skills add` history
+    //   doesn't fail agent boot.
+    // - The wiring's best-effort Err handling is testable here because
+    //   install_for_agent's only Err return is `ensure_skills_root`
+    //   filesystem failure; on success it always returns `Ok(Vec)`.
+
+    #[test]
+    fn install_for_agent_succeeds_with_empty_source_root() {
+        // Empty source: install_for_agent ensures the source root exists
+        // (via ensure_skills_root) then iterates 5 backends; each install
+        // creates an empty symlink/copy target with the marker. The
+        // outcomes vec has one entry per backend, all in Symlink/Copy
+        // mode (no Skipped from missing source). This is the daemon's
+        // first-launch case: no skills configured → still safe to wire
+        // pre-spawn.
+        let home = tmp_home("install-empty-source");
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+        let outcomes = install_for_agent(&home, &working).unwrap();
+        assert_eq!(outcomes.len(), BACKEND_SKILL_DIRS.len());
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome.mode, InstallMode::Symlink | InstallMode::Copy),
+                "empty-source install must succeed for backend {}: {:?}",
+                outcome.backend,
+                outcome
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_for_agent_creates_working_dir_parents_when_needed() {
+        // Daemon's spawn_and_register_agent may pass a working_dir whose
+        // .claude/ etc. parents don't exist yet (fresh agent worktree).
+        // install_for_agent's per-backend create_dir_all(parent) handles
+        // this — verify by passing a working_dir with no .claude/ pre-
+        // existing and checking the backend dirs land cleanly.
+        let home = tmp_home("install-create-parents");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "anchor");
+        add(&home, stage.join("anchor").to_str().unwrap()).unwrap();
+        let working = home.join("fresh-wd");
+        std::fs::create_dir_all(&working).unwrap();
+        // Sanity: no backend parents yet.
+        assert!(!working.join(".claude").exists());
+        let outcomes = install_for_agent(&home, &working).unwrap();
+        // Every backend's parent dir must now exist + the install
+        // landed at the conventional path.
+        for (backend, rel) in BACKEND_SKILL_DIRS {
+            let target = working.join(rel);
+            let outcome = outcomes
+                .iter()
+                .find(|o| o.backend == *backend)
+                .expect("outcome present for backend");
+            assert!(
+                matches!(outcome.mode, InstallMode::Symlink | InstallMode::Copy),
+                "fresh-parent install must succeed for {backend}"
+            );
+            assert!(target.exists(), "target landed for {backend}");
+            assert!(
+                target.join("anchor").join("SKILL.md").exists(),
+                "skill visible at {target:?}"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

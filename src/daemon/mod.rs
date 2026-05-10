@@ -1372,6 +1372,29 @@ fn spawn_and_register_agent(
     // `SpawnMode::downgraded_for` for the why.
     let spawn_mode =
         crate::backend::SpawnMode::Resume.downgraded_for(command, working_dir.as_deref());
+
+    // Sprint 61 W1 PR-1 (#P0-1 Skills auto-install at agent launch):
+    // synchronous pre-spawn install per lead recommendation (a) — guarantees
+    // SKILL.md files are in place at the agent's first skill-discovery read.
+    // Best-effort: failures log + continue so a skills problem never blocks
+    // agent boot. Idempotent across restarts (install_for_agent skips
+    // pre-existing non-managed dirs + replaces managed ones per Sprint 60
+    // #581 contract).
+    if let Some(wd) = working_dir.as_deref() {
+        match crate::skills::install_for_agent(home, wd) {
+            Ok(outcomes) => {
+                let modes: Vec<(&str, crate::skills::InstallMode)> = outcomes
+                    .iter()
+                    .map(|o| (o.backend.as_str(), o.mode))
+                    .collect();
+                tracing::info!(agent = %name, ?modes, "skills auto-install complete");
+            }
+            Err(e) => {
+                tracing::warn!(agent = %name, error = %e, "skills auto-install failed, proceeding without skills");
+            }
+        }
+    }
+
     if let Err(e) = agent::spawn_agent(
         &agent::SpawnConfig {
             name,
