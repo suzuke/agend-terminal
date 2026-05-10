@@ -218,7 +218,7 @@ fn resolve_source_repo(
 /// Resolve source_repo from the agent's team configuration.
 pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathBuf> {
     let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok()?;
-    for (_name, cfg) in &fleet.teams {
+    for cfg in fleet.teams.values() {
         if cfg.members.contains(&agent.to_string()) {
             return cfg.source_repo.clone();
         }
