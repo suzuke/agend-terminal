@@ -301,15 +301,24 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     for (inst_name, entry) in &yaml_entries {
         let backend_name = entry.backend.as_deref().unwrap_or("claude");
         let work_dir = entry.working_directory.as_deref().unwrap_or(directory);
+        let mut params = serde_json::json!({
+            "name": inst_name,
+            "backend": backend_name,
+            "working_directory": work_dir,
+        });
+        if let Some(ref model) = entry.model {
+            params["model"] = serde_json::json!(model);
+        }
+        if let Some(ref args) = entry.args {
+            if !args.is_empty() {
+                params["args"] = serde_json::json!(args.join(" "));
+            }
+        }
         let _ = crate::api::call(
             home,
             &serde_json::json!({
                 "method": crate::api::method::SPAWN,
-                "params": {
-                    "name": inst_name,
-                    "backend": backend_name,
-                    "working_directory": work_dir,
-                }
+                "params": params,
             }),
         );
     }
