@@ -1557,7 +1557,7 @@ mod tests {
             ("claude", "\r"),
             ("kiro-cli", "\r"),
             ("codex", "\r"),
-            ("gemini", "\n\r"),
+            ("gemini", "\r"),
         ];
         for (cmd, expected) in cases {
             let key = Backend::from_command(cmd)
