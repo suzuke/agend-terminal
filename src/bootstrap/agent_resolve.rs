@@ -152,7 +152,7 @@ mod tests {
 
     fn init_git_repo(dir: &std::path::Path) {
         std::process::Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(dir)
             .output()
             .unwrap();

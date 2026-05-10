@@ -710,7 +710,7 @@ mod tests {
         std::fs::create_dir_all(&wd).ok();
         // Init a git repo so is_git_repo returns true
         let _ = std::process::Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&wd)
             .output();
         std::fs::write(

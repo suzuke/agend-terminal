@@ -781,7 +781,7 @@ mod tests {
     fn claude_creates_mcp_config() {
         let dir = tmp_dir("claude");
         std::process::Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&dir)
             .output()
             .ok();
