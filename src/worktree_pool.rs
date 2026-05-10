@@ -127,15 +127,17 @@ fn cleanup_merged_branch(source_repo: &Path, branch: &str, dry_run: bool) -> (bo
 
     // Check if remote tracking ref is gone (squash-merge detection).
     let is_gone = {
-        let has_remote = std::process::Command::new("git")
+        let remote_name = std::process::Command::new("git")
             .args(["config", &format!("branch.{branch}.remote")])
             .current_dir(source_repo)
             .env("AGEND_GIT_BYPASS", "1")
             .output()
-            .map(|o| o.status.success() && !o.stdout.is_empty())
-            .unwrap_or(false);
-        if has_remote {
-            let remote_ref = format!("refs/remotes/origin/{branch}");
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !remote_name.is_empty() {
+            let remote_ref = format!("refs/remotes/{remote_name}/{branch}");
             let exists = std::process::Command::new("git")
                 .args(["rev-parse", "--verify", &remote_ref])
                 .current_dir(source_repo)
@@ -198,6 +200,7 @@ fn cleanup_merged_branch(source_repo: &Path, branch: &str, dry_run: bool) -> (bo
 /// half-released state.
 pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     let mut out = ReleaseOutcome::default();
+    let mut managed_verified = false;
 
     let Some(binding) = crate::binding::read(home, agent) else {
         // Idempotent no-op on second call. Per spec: not fatal.
@@ -261,6 +264,7 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
             // git worktree remove --force, run from the OWNING repo's cwd
             // so the registry entry is cleaned up alongside the directory.
             // AGEND_GIT_BYPASS=1 bypasses the shim's worktree-deny matrix.
+            managed_verified = true;
             let mut cmd = std::process::Command::new("git");
             cmd.args([
                 "worktree",
@@ -346,9 +350,12 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
 
     // Issue #611: auto-cleanup merged local branch after release.
     // Read branch + source_repo from the binding we captured earlier.
+    // Only proceed if we verified the .agend-managed marker (Finding 2).
     let branch = binding["branch"].as_str().unwrap_or("");
     let sr_str = binding["source_repo"].as_str().unwrap_or("");
-    if !branch.is_empty() && !sr_str.is_empty() {
+    if !managed_verified {
+        out.branch_cleanup_skipped_reason = Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
+    } else if !branch.is_empty() && !sr_str.is_empty() {
         let (deleted, skip_reason) = cleanup_merged_branch(Path::new(sr_str), branch, dry_run);
         out.branch_deleted = deleted;
         out.branch_cleanup_skipped_reason = skip_reason;
