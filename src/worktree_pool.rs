@@ -110,7 +110,11 @@ pub struct ReleaseOutcome {
 /// Returns `(deleted, skip_reason)`:
 /// - `(true, None)` — branch was deleted
 /// - `(false, Some(reason))` — branch was NOT deleted, reason explains why
-fn cleanup_merged_branch(source_repo: &Path, branch: &str, dry_run: bool) -> (bool, Option<String>) {
+fn cleanup_merged_branch(
+    source_repo: &Path,
+    branch: &str,
+    dry_run: bool,
+) -> (bool, Option<String>) {
     // Never delete protected branches.
     if crate::agent_ops::is_protected_ref(branch) {
         return (false, Some(format!("branch '{branch}' is protected")));
@@ -156,7 +160,10 @@ fn cleanup_merged_branch(source_repo: &Path, branch: &str, dry_run: bool) -> (bo
     }
 
     if dry_run {
-        return (false, Some(format!("dry-run: would delete branch '{branch}'")));
+        return (
+            false,
+            Some(format!("dry-run: would delete branch '{branch}'")),
+        );
     }
 
     // Delete the local branch.
@@ -354,7 +361,8 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     let branch = binding["branch"].as_str().unwrap_or("");
     let sr_str = binding["source_repo"].as_str().unwrap_or("");
     if !managed_verified {
-        out.branch_cleanup_skipped_reason = Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
+        out.branch_cleanup_skipped_reason =
+            Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
     } else if !branch.is_empty() && !sr_str.is_empty() {
         let (deleted, skip_reason) = cleanup_merged_branch(Path::new(sr_str), branch, dry_run);
         out.branch_deleted = deleted;
@@ -1260,14 +1268,33 @@ mod tests {
         let l = lease(&home, &repo, "agent-611m", "feat/merged").expect("lease");
         // Add a commit on the feature branch via the worktree.
         std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "feat"])
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "feat",
+            ])
             .current_dir(&l.path)
             .env("AGEND_GIT_BYPASS", "1")
             .output()
             .unwrap();
         // Merge feat/merged into main from the source repo (without checking it out).
         std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=t@t", "merge", "feat/merged", "--no-ff", "-m", "merge"])
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "merge",
+                "feat/merged",
+                "--no-ff",
+                "-m",
+                "merge",
+            ])
             .current_dir(&repo)
             .env("AGEND_GIT_BYPASS", "1")
             .output()
@@ -1276,7 +1303,11 @@ mod tests {
         let outcome = release_full(&home, "agent-611m", false);
 
         assert!(outcome.released);
-        assert!(outcome.branch_deleted, "merged branch must be deleted: {:?}", outcome);
+        assert!(
+            outcome.branch_deleted,
+            "merged branch must be deleted: {:?}",
+            outcome
+        );
         assert!(outcome.branch_cleanup_skipped_reason.is_none());
         // Verify branch is actually gone from the repo.
         let branch_exists = std::process::Command::new("git")
@@ -1286,7 +1317,10 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
-        assert!(!branch_exists, "branch must not exist in repo after cleanup");
+        assert!(
+            !branch_exists,
+            "branch must not exist in repo after cleanup"
+        );
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
@@ -1300,7 +1334,16 @@ mod tests {
         let l = lease(&home, &repo, "agent-611u", "feat/unmerged").expect("lease");
         // Add a commit on the feature branch (not merged into main).
         std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "wip"])
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "wip",
+            ])
             .current_dir(&l.path)
             .env("AGEND_GIT_BYPASS", "1")
             .output()
@@ -1309,7 +1352,10 @@ mod tests {
         let outcome = release_full(&home, "agent-611u", false);
 
         assert!(outcome.released);
-        assert!(!outcome.branch_deleted, "unmerged branch must NOT be deleted");
+        assert!(
+            !outcome.branch_deleted,
+            "unmerged branch must NOT be deleted"
+        );
         assert_eq!(
             outcome.branch_cleanup_skipped_reason.as_deref(),
             Some("branch not merged into main")
@@ -1336,13 +1382,32 @@ mod tests {
         let l = lease(&home, &repo, "agent-611d", "feat/dryrun").expect("lease");
         // Add a commit and merge into main.
         std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "feat"])
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "feat",
+            ])
             .current_dir(&l.path)
             .env("AGEND_GIT_BYPASS", "1")
             .output()
             .unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.name=test", "-c", "user.email=t@t", "merge", "feat/dryrun", "--no-ff", "-m", "merge"])
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "merge",
+                "feat/dryrun",
+                "--no-ff",
+                "-m",
+                "merge",
+            ])
             .current_dir(&repo)
             .env("AGEND_GIT_BYPASS", "1")
             .output()
