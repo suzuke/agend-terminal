@@ -84,6 +84,7 @@ pub fn create(home: &Path, args: &Value) -> Value {
     };
     let orchestrator = args["orchestrator"].as_str().map(String::from);
     let description = args["description"].as_str().map(String::from);
+    let source_repo = args["source_repo"].as_str().map(std::path::PathBuf::from);
 
     // Validate orchestrator
     if let Some(ref orch) = orchestrator {
@@ -110,6 +111,7 @@ pub fn create(home: &Path, args: &Value) -> Value {
         orchestrator,
         description,
         created_at: Some(chrono::Utc::now().to_rfc3339()),
+        source_repo,
     };
     match crate::fleet::add_team_to_yaml(home, &name, &cfg) {
         Ok(true) => {
@@ -221,11 +223,17 @@ pub fn update(home: &Path, args: &Value) -> Value {
         current.orchestrator.clone()
     };
 
+    let new_source_repo = args["source_repo"]
+        .as_str()
+        .map(std::path::PathBuf::from)
+        .or_else(|| current.source_repo.clone());
+
     let cfg = crate::fleet::TeamConfig {
         members: new_members,
         orchestrator: resolved_orch,
         description: current.description.clone(),
         created_at: current.created_at.clone(),
+        source_repo: new_source_repo,
     };
     match crate::fleet::update_team_in_yaml(home, &name, &cfg) {
         Ok(true) => serde_json::json!({"status": "updated", "name": name}),
@@ -267,6 +275,7 @@ pub fn remove_member_from_all(home: &Path, instance_name: &str) {
             orchestrator: new_orch,
             description: cfg.description.clone(),
             created_at: cfg.created_at.clone(),
+            source_repo: cfg.source_repo.clone(),
         };
         let _ = crate::fleet::update_team_in_yaml(home, team_name, &new_cfg);
     }
@@ -318,6 +327,7 @@ pub fn get_members(home: &Path, team_name: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -560,6 +570,80 @@ mod tests {
         assert_eq!(members, vec!["alice", "bob"]);
         let listed = list(&home);
         assert_eq!(listed["teams"][0]["orchestrator"], "alice");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn team_create_with_source_repo() {
+        let home = tmp_home("create_src_repo");
+        let result = create(
+            &home,
+            &serde_json::json!({
+                "name": "dev",
+                "members": ["alice", "bob"],
+                "orchestrator": "alice",
+                "source_repo": "/tmp/my-repo"
+            }),
+        );
+        assert_eq!(result["status"], "created");
+        let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let team = fleet.teams.get("dev").unwrap();
+        assert_eq!(
+            team.source_repo.as_deref(),
+            Some(std::path::Path::new("/tmp/my-repo"))
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn team_update_source_repo() {
+        let home = tmp_home("update_src_repo");
+        create(
+            &home,
+            &serde_json::json!({
+                "name": "dev",
+                "members": ["alice"],
+                "orchestrator": "alice",
+                "source_repo": "/tmp/old-repo"
+            }),
+        );
+        let result = update(
+            &home,
+            &serde_json::json!({
+                "name": "dev",
+                "source_repo": "/tmp/new-repo"
+            }),
+        );
+        assert_eq!(result["status"], "updated");
+        let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let team = fleet.teams.get("dev").unwrap();
+        assert_eq!(
+            team.source_repo.as_deref(),
+            Some(std::path::Path::new("/tmp/new-repo"))
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resolve_source_repo_uses_team_tier() {
+        let home = tmp_home("team_tier");
+        create(
+            &home,
+            &serde_json::json!({
+                "name": "dev",
+                "members": ["agent-x"],
+                "orchestrator": "agent-x",
+                "source_repo": "/tmp/team-repo"
+            }),
+        );
+        let resolved =
+            crate::mcp::handlers::dispatch_hook::resolve_team_source_repo(&home, "agent-x");
+        assert_eq!(
+            resolved.as_deref(),
+            Some(std::path::Path::new("/tmp/team-repo"))
+        );
+        let none = crate::mcp::handlers::dispatch_hook::resolve_team_source_repo(&home, "other");
+        assert!(none.is_none());
         std::fs::remove_dir_all(&home).ok();
     }
 }
