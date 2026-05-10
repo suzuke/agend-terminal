@@ -5,7 +5,7 @@ fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
     let repo = home.join("workspace").join(agent);
     std::fs::create_dir_all(&repo).ok();
     std::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .current_dir(&repo)
         .env("AGEND_GIT_BYPASS", "1")
         .output()

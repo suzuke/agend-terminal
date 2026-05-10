@@ -449,7 +449,7 @@ mod tests {
         // git init
         std::process::Command::new("git")
             .env("AGEND_GIT_BYPASS", "1")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&dir)
             .output()
             .ok();
@@ -578,7 +578,7 @@ mod tests {
         std::fs::create_dir_all(&dir).ok();
         std::process::Command::new("git")
             .env("AGEND_GIT_BYPASS", "1")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&dir)
             .output()
             .ok();
@@ -604,7 +604,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::process::Command::new("git")
             .env("AGEND_GIT_BYPASS", "1")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&dir)
             .output()
             .unwrap();

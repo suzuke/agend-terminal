@@ -124,7 +124,7 @@ fn setup_git_repo_with_remote(home: &Path, agent: &str, origin_url: &str) -> std
     let repo = home.join("workspace").join(agent);
     std::fs::create_dir_all(&repo).ok();
     let _ = std::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .current_dir(&repo)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
@@ -368,7 +368,7 @@ fn ec6_dispatch_uses_fleet_source_repo_tier_when_present() {
     let src = home.join("src-tier2");
     std::fs::create_dir_all(&src).ok();
     let _ = std::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .current_dir(&src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
@@ -422,7 +422,7 @@ fn ec4_fleet_repo_override_wins_over_derive() {
     std::fs::create_dir_all(&src).ok();
     // git init but NO remote configured → derive returns None.
     let _ = std::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .current_dir(&src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
@@ -487,7 +487,7 @@ fn dispatch_with_source_repo_override_wins_over_fleet() {
     let real_src = home.join("override-src");
     std::fs::create_dir_all(&real_src).ok();
     let _ = std::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .current_dir(&real_src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
@@ -574,7 +574,7 @@ fn ci_watch_no_origin_remote_returns_non_github_error() {
     let src = home.join("workspace").join("alpha");
     std::fs::create_dir_all(&src).ok();
     let _ = std::process::Command::new("git")
-        .args(["init"])
+        .args(["init", "-b", "main"])
         .current_dir(&src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
