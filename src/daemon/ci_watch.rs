@@ -1648,10 +1648,7 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
 /// Returns Some("failure") if any run failed.
 /// Returns Some("success") only if all runs succeeded.
 /// Returns None if no runs match.
-pub(crate) fn aggregate_conclusion_for_sha<'a>(
-    runs: &'a [CiRun],
-    sha: &str,
-) -> Option<&'a str> {
+pub(crate) fn aggregate_conclusion_for_sha<'a>(runs: &'a [CiRun], sha: &str) -> Option<&'a str> {
     let matching: Vec<&CiRun> = runs.iter().filter(|r| r.head_sha == sha).collect();
     if matching.is_empty() {
         return None;
@@ -1659,10 +1656,16 @@ pub(crate) fn aggregate_conclusion_for_sha<'a>(
     if matching.iter().any(|r| r.conclusion.is_none()) {
         return None;
     }
-    if matching.iter().any(|r| r.conclusion.as_deref() == Some("failure")) {
+    if matching
+        .iter()
+        .any(|r| r.conclusion.as_deref() == Some("failure"))
+    {
         return Some("failure");
     }
-    if let Some(r) = matching.iter().find(|r| r.conclusion.as_deref() != Some("success")) {
+    if let Some(r) = matching
+        .iter()
+        .find(|r| r.conclusion.as_deref() != Some("success"))
+    {
         return r.conclusion.as_deref();
     }
     Some("success")
@@ -4678,7 +4681,10 @@ mod tests {
             make_run(1, "abc123", Some("success")),
             make_run(2, "abc123", Some("success")),
         ];
-        assert_eq!(aggregate_conclusion_for_sha(&runs, "abc123"), Some("success"));
+        assert_eq!(
+            aggregate_conclusion_for_sha(&runs, "abc123"),
+            Some("success")
+        );
     }
 
     #[test]
@@ -4687,7 +4693,10 @@ mod tests {
             make_run(1, "abc123", Some("success")),
             make_run(2, "abc123", Some("failure")),
         ];
-        assert_eq!(aggregate_conclusion_for_sha(&runs, "abc123"), Some("failure"));
+        assert_eq!(
+            aggregate_conclusion_for_sha(&runs, "abc123"),
+            Some("failure")
+        );
     }
 
     #[test]
