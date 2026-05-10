@@ -42,13 +42,30 @@ fn bootstrap_prepare_contains_all_shim_init_calls() {
 }
 
 /// Verify daemon::run does NOT duplicate the init calls (they're in bootstrap now).
+///
+/// Sprint 63 hotfix (Sprint 21+ bug, surfaced by Sprint 63 W1 cumulative
+/// run_core additions): the old `&rest[..rest.len().min(5000)]` slice
+/// panics when byte 5000 lands mid-UTF-8-character. The panic was latent
+/// because `run_core`'s leading 5000 bytes were all ASCII pre-Sprint-63;
+/// Sprint 63 W1 PR-1 #595 + PR-2 #596 + PR-3 #597 + PR-4 #598 cumulative
+/// additions (including comments containing Chinese / Unicode chars + new
+/// `#587` automation references) crossed the 5000-byte threshold at a
+/// non-char-boundary position, triggering the panic on every CI run from
+/// 16c30d5 onward.
+///
+/// Fix: use `rest.chars().take(5000).collect::<String>()` for char-aware
+/// truncation. This caps at 5000 *chars* not 5000 *bytes* — slightly
+/// looser than the original intent but the assertions only grep for ASCII
+/// substrings (`binding::reconcile_hooks(home)`, `binding::symlink_shim(home)`),
+/// so any prefix large enough to cover the original 5000 bytes' worth of
+/// content is sufficient.
 #[test]
 fn daemon_run_does_not_duplicate_init_calls() {
     let src = include_str!("../src/daemon/mod.rs");
     let fn_start = src.find("fn run_core(").expect("run_core must exist");
     let rest = &src[fn_start..];
-    // Check the first 200 lines of run_core for the old pattern.
-    let check_area = &rest[..rest.len().min(5000)];
+    // Char-aware truncation: avoids panic when byte 5000 lands mid-utf-8-char.
+    let check_area: String = rest.chars().take(5000).collect();
 
     // These should NOT be in daemon::run anymore (moved to bootstrap::prepare).
     assert!(
