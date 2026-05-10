@@ -161,9 +161,21 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
 
     let reg = agent::lock_registry(ctx.registry);
     let delivery_mode = if reg.contains_key(target) {
+        // Issue #603: Codex is one-shot — skip PTY inject for messages that
+        // don't require a reply (update/report), avoiding wasted turns.
+        let is_codex = reg
+            .get(target)
+            .map(|h| h.backend_command == "codex")
+            .unwrap_or(false);
+        let kind = params["kind"].as_str().unwrap_or("");
+        let skip_inject = is_codex && matches!(kind, "update" | "report");
         drop(reg);
-        crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
-        "pty"
+        if skip_inject {
+            "inbox_only"
+        } else {
+            crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
+            "pty"
+        }
     } else {
         drop(reg);
         "inbox_only"
