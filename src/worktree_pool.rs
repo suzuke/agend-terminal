@@ -647,7 +647,7 @@ mod tests {
     fn tmp_repo(tag: &str) -> PathBuf {
         let dir = tmp_home(tag);
         std::process::Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&dir)
             .output()
             .ok();
