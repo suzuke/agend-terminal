@@ -48,8 +48,11 @@ pub(crate) enum ShutdownReason {
     Unknown = 0,
     /// SIGINT / SIGTERM / SIGHUP via `bootstrap::signals::install`
     /// (the ctrlc handler bundles all three on Unix; this single
-    /// reason captures all of them — finer per-signal taxonomy is
-    /// a Sprint 58+ candidate).
+    /// reason captures all of them when the per-signal-aware
+    /// handlers below haven't fired). The daemon's ctrlc path still
+    /// records `Signal` because the ctrlc crate's callback signature
+    /// doesn't expose the originating signal — daemon-side
+    /// per-signal migration via sigaction is a Sprint 64+ candidate.
     Signal = 1,
     /// Operator invoked `agend-terminal stop` → API SHUTDOWN
     /// method tripped the flag.
@@ -67,6 +70,26 @@ pub(crate) enum ShutdownReason {
     /// `run_core` re-execs self after the shutdown sequence rather
     /// than returning to the bootstrap layer.
     OperatorRestart = 5,
+    /// Sprint 63 W1 PR-3 (Sprint 58 P2 #6): SIGINT specifically (vs
+    /// the bundled `Signal` when the handler can't distinguish).
+    /// Set by per-signal sigaction handlers; future Sprint 64+
+    /// daemon-side migration would record this from the daemon's
+    /// install path. Currently set by no production handler — the
+    /// app's `install_term_only` is SIGTERM-only, and daemon's
+    /// ctrlc-based `install` records `Signal`.
+    #[allow(dead_code)]
+    SignalSigint = 6,
+    /// Sprint 63 W1 PR-3 (Sprint 58 P2 #6): SIGTERM specifically.
+    /// Set by `bootstrap::signals::install_term_only` (the app's
+    /// SIGTERM-only sigaction handler); also set by future per-signal
+    /// daemon migration.
+    SignalSigterm = 7,
+    /// Sprint 63 W1 PR-3 (Sprint 58 P2 #6): SIGHUP specifically.
+    /// Set by future per-signal daemon migration. No current
+    /// production handler distinguishes SIGHUP from the bundled
+    /// `Signal` reason.
+    #[allow(dead_code)]
+    SignalSighup = 8,
 }
 
 impl ShutdownReason {
@@ -78,6 +101,9 @@ impl ShutdownReason {
             Self::Watchdog => "watchdog",
             Self::CleanExit => "clean_exit",
             Self::OperatorRestart => "operator_restart",
+            Self::SignalSigint => "signal_sigint",
+            Self::SignalSigterm => "signal_sigterm",
+            Self::SignalSighup => "signal_sighup",
         }
     }
 
@@ -88,6 +114,9 @@ impl ShutdownReason {
             3 => Self::Watchdog,
             4 => Self::CleanExit,
             5 => Self::OperatorRestart,
+            6 => Self::SignalSigint,
+            7 => Self::SignalSigterm,
+            8 => Self::SignalSighup,
             _ => Self::Unknown,
         }
     }
@@ -1733,11 +1762,28 @@ mod tests {
             ShutdownReason::ApiShutdown,
             ShutdownReason::Watchdog,
             ShutdownReason::CleanExit,
+            // Sprint 60 W1 PR-3 + Sprint 63 W1 PR-3 additions.
+            ShutdownReason::OperatorRestart,
+            ShutdownReason::SignalSigint,
+            ShutdownReason::SignalSigterm,
+            ShutdownReason::SignalSighup,
         ] {
             let raw = reason as u8;
             let recovered = ShutdownReason::from_u8(raw);
             assert_eq!(recovered, reason, "round-trip lost taxonomy for {reason:?}");
         }
+    }
+
+    #[test]
+    fn shutdown_reason_per_signal_taxonomy_strings_pinned() {
+        // Sprint 63 W1 PR-3 (Sprint 58 P2 #6): per-signal taxonomy
+        // string identifiers are pinned for downstream `daemon_stop`
+        // event consumers (greppers / parsers).
+        assert_eq!(ShutdownReason::SignalSigint.as_str(), "signal_sigint");
+        assert_eq!(ShutdownReason::SignalSigterm.as_str(), "signal_sigterm");
+        assert_eq!(ShutdownReason::SignalSighup.as_str(), "signal_sighup");
+        // Bundled `Signal` reason still pins to "signal" for backward compat.
+        assert_eq!(ShutdownReason::Signal.as_str(), "signal");
     }
 
     #[test]

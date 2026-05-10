@@ -91,6 +91,14 @@ pub fn install_term_only() {
 unsafe fn install_unix_sigterm() {
     extern "C" fn handler(_signum: libc::c_int) {
         // Signal-handler-safe: only atomic ops, no allocation, no tracing.
+        // Sprint 63 W1 PR-3 (Sprint 58 P2 #6): record SignalSigterm
+        // specifically rather than relying on the bundled `Signal`
+        // reason — `record_shutdown_reason` is signal-handler-safe
+        // (pure compare_exchange on AtomicU8). First-write-wins via
+        // compare_exchange in record_shutdown_reason: if a different
+        // shutdown reason has already been recorded (api / watchdog),
+        // this no-ops correctly.
+        crate::daemon::record_shutdown_reason(crate::daemon::ShutdownReason::SignalSigterm);
         TERM_REQUESTED.store(true, Ordering::Relaxed);
     }
     let mut action: libc::sigaction = std::mem::zeroed();
