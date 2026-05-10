@@ -302,10 +302,17 @@ pub fn install_for_agent(
 
 /// Stage a filtered copy of the unified source containing only the
 /// allowlisted skills. Stage path is `<home>/.skills-stage/<digest>/`
-/// where `digest` is a stable per-allowlist FNV-1a hash so multiple
+/// where `digest` is a stable per-allowlist SHA-256 prefix so multiple
 /// distinct filters coexist without overwrite. Rebuilt every call
 /// (idempotent + cheap — copies only of allowlisted names, not the
 /// full unified source).
+///
+/// Sprint 62 W1 PR-1 (#P0-1): replaces the Sprint 61 #586 FNV-1a
+/// digest with SHA-256-prefix per #586 reviewer minor caveat (FNV non-
+/// cryptographic). 16-hex-char prefix keeps directory names short
+/// while giving 64 bits of collision resistance. Pre-existing
+/// FNV-named stages become legacy on next daemon start; W1 PR-2
+/// skills-stage GC will sweep them.
 fn stage_filtered_source(home: &Path, source: &Path, allowlist: &[String]) -> Result<PathBuf> {
     let mut digest_input = String::new();
     let mut sorted: Vec<&String> = allowlist.iter().collect();
@@ -314,7 +321,7 @@ fn stage_filtered_source(home: &Path, source: &Path, allowlist: &[String]) -> Re
         digest_input.push_str(name);
         digest_input.push('\n');
     }
-    let digest = format!("{:016x}", fnv1a_64(digest_input.as_bytes()));
+    let digest = stage_digest(digest_input.as_bytes());
     let stage = home.join(".skills-stage").join(&digest);
     if stage.exists() {
         std::fs::remove_dir_all(&stage)
@@ -334,16 +341,17 @@ fn stage_filtered_source(home: &Path, source: &Path, allowlist: &[String]) -> Re
     Ok(stage)
 }
 
-/// FNV-1a 64-bit hash — small, dependency-free, stable across runs.
-/// Used for the filtered-source stage path so identical allowlists
-/// always resolve to the same stage dir.
-fn fnv1a_64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in data {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
+/// SHA-256 prefix digest used for the filtered-source stage path.
+/// 16 hex chars = first 8 bytes of SHA-256 output → 64 bits of
+/// collision resistance, sufficient at the daemon's scale (collision
+/// probability is birthday-bound at ~2^32 distinct allowlists; an
+/// AgEnD home holding billions of distinct skill filters is not a
+/// realistic scenario). Cryptographic in the underlying primitive,
+/// matching the Sprint 61 #586 reviewer caveat resolution.
+fn stage_digest(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let full = Sha256::digest(data);
+    hex::encode(&full[..8])
 }
 
 /// Per-backend install result.
@@ -981,6 +989,58 @@ mod tests {
             assert!(outcome.target.join("real").join("SKILL.md").exists());
             assert!(!outcome.target.join("ghost").exists());
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 62 W1 PR-1 (#P0-1) — SHA-256 digest determinism ─────────
+
+    #[test]
+    fn stage_digest_is_deterministic_across_calls() {
+        // Same input → same output — load-bearing for stage-dir
+        // reuse semantics. SHA-256 is byte-deterministic by spec;
+        // this test pins the contract against accidental refactor.
+        let a = stage_digest(b"alpha\nbeta\n");
+        let b = stage_digest(b"alpha\nbeta\n");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 16, "16 hex chars = 8 bytes prefix");
+        // Different input → different output.
+        let c = stage_digest(b"alpha\ngamma\n");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn stage_digest_pinned_value_for_known_input() {
+        // SHA-256 of "alpha\nbeta\n" is byte-deterministic across
+        // platforms. Pin the first-8-bytes-as-hex prefix so a future
+        // refactor that swapped digest length / encoding would
+        // surface here, not as a stage-dir cache miss in production.
+        // Reference: `printf 'alpha\nbeta\n' | shasum -a 256` first
+        // 16 hex chars.
+        let digest = stage_digest(b"alpha\nbeta\n");
+        assert_eq!(digest, "e49c81e2d2f84e25");
+    }
+
+    #[test]
+    fn stage_filtered_source_uses_sha256_digest_naming() {
+        // End-to-end: stage_filtered_source's directory name should
+        // be the SHA-256 prefix of the sorted-allowlist-newline-joined
+        // bytes. Verifies the wire-up between the helper and the
+        // digest function.
+        let home = tmp_home("digest-stage-naming");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "alpha");
+        seed_skill_source(&stage, "beta");
+        add(&home, stage.join("alpha").to_str().unwrap()).unwrap();
+        add(&home, stage.join("beta").to_str().unwrap()).unwrap();
+        let allowlist = vec!["alpha".to_string(), "beta".to_string()];
+        // Pre-compute expected dir name.
+        let expected = stage_digest(b"alpha\nbeta\n");
+        let stage_dir = stage_filtered_source(&home, &skills_root(&home), &allowlist).unwrap();
+        assert!(
+            stage_dir.ends_with(&expected),
+            "stage dir {:?} must end with SHA-256 prefix {expected}",
+            stage_dir
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
