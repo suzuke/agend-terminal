@@ -1,0 +1,51 @@
+name: LOC Overrun Check
+
+# Sprint 61 W1 PR-3 (#P0-3) — automation closure of Sprint 60 #582
+# Component 2. Parses the `<!-- LOC-EST: lower-upper -->` marker from
+# the PR description, computes actual diff LOC, and applies the
+# methodology's soft-warn / hard-fail thresholds (per #582 §5).
+#
+# Override: apply the `loc-overrun-accepted` label after a reviewer
+# cohesion-accept verdict. The script honors the label and exits 0
+# even when the hard-fail threshold is crossed.
+
+on:
+  pull_request:
+    types: [opened, synchronize, edited, labeled, unlabeled]
+    branches: [main]
+
+permissions:
+  pull-requests: read
+  contents: read
+
+concurrency:
+  group: loc-overrun-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: LOC overrun
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute actual diff LOC
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Count added lines via gh pr diff (excludes the +++ header).
+          added=$(gh pr diff "$PR_NUMBER" 2>/dev/null \
+            | grep -cE '^\+[^+]' || true)
+          echo "added=$added" >> "$GITHUB_OUTPUT"
+
+      - name: Run LOC overrun check
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_DIFF_LOC: ${{ steps.diff.outputs.added }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: ./scripts/check_loc_overrun.sh
