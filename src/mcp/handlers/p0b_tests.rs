@@ -176,7 +176,7 @@ fn ec7_release_full_unsubscribes_matching_branch() {
     let watch_path = write_ci_watch(&home, "o/r", "feat-ec7m", &["alpha", "bob"]);
     assert!(watch_path.exists());
 
-    crate::worktree_pool::release_full(&home, "alpha");
+    crate::worktree_pool::release_full(&home, "alpha", false);
 
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
@@ -206,7 +206,7 @@ fn release_full_unsubscribes_agent_from_cross_branch_watches_too() {
     // release; the new agent-keyed enumerator must clean it up.
     let other_path = write_ci_watch(&home, "o/r", "dev", &["alpha"]);
 
-    crate::worktree_pool::release_full(&home, "alpha");
+    crate::worktree_pool::release_full(&home, "alpha", false);
 
     // alpha was the sole subscriber → file deleted entirely.
     assert!(
@@ -240,7 +240,7 @@ fn release_full_unsubscribes_agent_from_cross_repo_watches_too() {
     // alpha's own repo-a watch so we can confirm both shrink.
     let own_path = write_ci_watch(&home, "o/repo-a", "feat-x", &["alpha", "bob"]);
 
-    crate::worktree_pool::release_full(&home, "alpha");
+    crate::worktree_pool::release_full(&home, "alpha", false);
 
     // BOTH watches shrink — agent-keyed unsubscribe doesn't care
     // about repo/branch matching the binding.
@@ -278,7 +278,7 @@ fn ec7_release_full_removes_watch_file_when_last_subscriber() {
     let watch_path = write_ci_watch(&home, "o/r", "feat-ec7l", &["alpha"]);
     assert!(watch_path.exists());
 
-    crate::worktree_pool::release_full(&home, "alpha");
+    crate::worktree_pool::release_full(&home, "alpha", false);
 
     assert!(
         !watch_path.exists(),
@@ -306,7 +306,7 @@ fn ec11_sequential_same_agent_same_home_succeeds_via_raii_release() {
         Some("o/r"),
     );
     assert!(r1.is_ok(), "first dispatch ok: {r1:?}");
-    crate::worktree_pool::release_full(&home, "alpha");
+    crate::worktree_pool::release_full(&home, "alpha", false);
     let r2 = super::dispatch_hook::dispatch_auto_bind_lease(
         &home,
         "alpha",
