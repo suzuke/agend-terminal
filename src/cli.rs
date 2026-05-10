@@ -732,7 +732,10 @@ pub fn run_skills_install(home: &Path, working_dir: &str) -> anyhow::Result<()> 
             wd.display()
         ));
     }
-    let outcomes = crate::skills::install_for_agent(home, &wd)?;
+    // CLI subcommand uses install-all default; per-instance filtering
+    // is the daemon's automatic launch-flow responsibility (Sprint 61
+    // W1 PR-2 #P0-2 fleet.yaml `instance.<name>.skills:` override).
+    let outcomes = crate::skills::install_for_agent(home, &wd, None)?;
     println!("installed skills into {}:", wd.display());
     for o in outcomes {
         match o.mode {

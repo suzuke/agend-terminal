@@ -207,6 +207,15 @@ pub struct InstanceConfig {
     /// operator's GitHub login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_login: Option<String>,
+    /// Sprint 61 W1 PR-2 (#P0-2): per-instance skills allowlist. When
+    /// `Some(vec)`, the daemon's auto-install hook installs only the
+    /// listed skill names from `<home>/skills/` into this agent's
+    /// per-backend skill paths. When `None`, every skill in the unified
+    /// source is installed (preserves the W1 PR-1 #585 default behavior).
+    /// `Some(vec![])` is meaningful — explicitly opts the agent OUT of
+    /// all skills (no per-backend dirs are populated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

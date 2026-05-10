@@ -273,15 +273,77 @@ pub fn update_all(home: &Path) -> Vec<(String, Result<Skill>)> {
 /// resolves to the unified source. Idempotent: pre-existing daemon-
 /// managed symlinks/copies are replaced; pre-existing non-managed
 /// directories are left alone with a tracing::warn.
-pub fn install_for_agent(home: &Path, working_dir: &Path) -> Result<Vec<InstallOutcome>> {
+///
+/// Sprint 61 W1 PR-2 (#P0-2): when `filter` is `Some(allowlist)`, only
+/// the named skills land in each backend's path — built by staging a
+/// scratch source dir under `<home>/.skills-stage/<digest>/` containing
+/// only the allowlisted entries from the unified source, then installing
+/// from the stage. `Some(vec![])` is meaningful and explicit — agent
+/// gets per-backend dirs that contain only the daemon-managed marker
+/// (no skills). `None` preserves the W1 PR-1 #585 install-all default.
+pub fn install_for_agent(
+    home: &Path,
+    working_dir: &Path,
+    filter: Option<&[String]>,
+) -> Result<Vec<InstallOutcome>> {
     let source = ensure_skills_root(home)?;
+    let staged_source = match filter {
+        None => source,
+        Some(allowlist) => stage_filtered_source(home, &source, allowlist)?,
+    };
     let mut outcomes = Vec::with_capacity(BACKEND_SKILL_DIRS.len());
     for (backend, rel) in BACKEND_SKILL_DIRS {
         let target = working_dir.join(rel);
-        let outcome = install_one(&source, &target, backend);
+        let outcome = install_one(&staged_source, &target, backend);
         outcomes.push(outcome);
     }
     Ok(outcomes)
+}
+
+/// Stage a filtered copy of the unified source containing only the
+/// allowlisted skills. Stage path is `<home>/.skills-stage/<digest>/`
+/// where `digest` is a stable per-allowlist FNV-1a hash so multiple
+/// distinct filters coexist without overwrite. Rebuilt every call
+/// (idempotent + cheap — copies only of allowlisted names, not the
+/// full unified source).
+fn stage_filtered_source(home: &Path, source: &Path, allowlist: &[String]) -> Result<PathBuf> {
+    let mut digest_input = String::new();
+    let mut sorted: Vec<&String> = allowlist.iter().collect();
+    sorted.sort();
+    for name in &sorted {
+        digest_input.push_str(name);
+        digest_input.push('\n');
+    }
+    let digest = format!("{:016x}", fnv1a_64(digest_input.as_bytes()));
+    let stage = home.join(".skills-stage").join(&digest);
+    if stage.exists() {
+        std::fs::remove_dir_all(&stage)
+            .with_context(|| format!("clean stage {}", stage.display()))?;
+    }
+    std::fs::create_dir_all(&stage).with_context(|| format!("create stage {}", stage.display()))?;
+    for name in allowlist {
+        let from = source.join(name);
+        if !from.exists() {
+            tracing::warn!(skill = %name, source = %source.display(),
+                "stage_filtered_source: allowlisted skill not present, skipping");
+            continue;
+        }
+        let to = stage.join(name);
+        copy_dir_recursive(&from, &to)?;
+    }
+    Ok(stage)
+}
+
+/// FNV-1a 64-bit hash — small, dependency-free, stable across runs.
+/// Used for the filtered-source stage path so identical allowlists
+/// always resolve to the same stage dir.
+fn fnv1a_64(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in data {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
 }
 
 /// Per-backend install result.
@@ -635,7 +697,7 @@ mod tests {
         let working = home.join("agent-wd");
         std::fs::create_dir_all(&working).unwrap();
 
-        let outcomes = install_for_agent(&home, &working).unwrap();
+        let outcomes = install_for_agent(&home, &working, None).unwrap();
         assert_eq!(outcomes.len(), BACKEND_SKILL_DIRS.len());
         for outcome in &outcomes {
             assert!(
@@ -673,7 +735,7 @@ mod tests {
         std::fs::create_dir_all(&claude).unwrap();
         std::fs::write(claude.join("operator-skill.md"), "hand-crafted\n").unwrap();
 
-        let outcomes = install_for_agent(&home, &working).unwrap();
+        let outcomes = install_for_agent(&home, &working, None).unwrap();
         let claude_outcome = outcomes.iter().find(|o| o.backend == "claude").unwrap();
         assert_eq!(
             claude_outcome.mode,
@@ -703,9 +765,9 @@ mod tests {
         std::fs::create_dir_all(&working).unwrap();
 
         // First install.
-        install_for_agent(&home, &working).unwrap();
+        install_for_agent(&home, &working, None).unwrap();
         // Second install must succeed (idempotent).
-        let outcomes = install_for_agent(&home, &working).unwrap();
+        let outcomes = install_for_agent(&home, &working, None).unwrap();
         for outcome in &outcomes {
             assert!(matches!(
                 outcome.mode,
@@ -785,7 +847,7 @@ mod tests {
         let home = tmp_home("install-empty-source");
         let working = home.join("agent-wd");
         std::fs::create_dir_all(&working).unwrap();
-        let outcomes = install_for_agent(&home, &working).unwrap();
+        let outcomes = install_for_agent(&home, &working, None).unwrap();
         assert_eq!(outcomes.len(), BACKEND_SKILL_DIRS.len());
         for outcome in &outcomes {
             assert!(
@@ -813,7 +875,7 @@ mod tests {
         std::fs::create_dir_all(&working).unwrap();
         // Sanity: no backend parents yet.
         assert!(!working.join(".claude").exists());
-        let outcomes = install_for_agent(&home, &working).unwrap();
+        let outcomes = install_for_agent(&home, &working, None).unwrap();
         // Every backend's parent dir must now exist + the install
         // landed at the conventional path.
         for (backend, rel) in BACKEND_SKILL_DIRS {
@@ -831,6 +893,93 @@ mod tests {
                 target.join("anchor").join("SKILL.md").exists(),
                 "skill visible at {target:?}"
             );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 61 W1 PR-2 (#P0-2) — fleet.yaml per-instance override ─────
+
+    #[test]
+    fn install_for_agent_with_filter_includes_only_allowlisted_skills() {
+        // Stage 3 skills in unified source; install only `alpha` + `gamma`
+        // for the agent. `beta` must NOT appear at any backend path.
+        let home = tmp_home("filter-allowlist");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "alpha");
+        seed_skill_source(&stage, "beta");
+        seed_skill_source(&stage, "gamma");
+        add(&home, stage.join("alpha").to_str().unwrap()).unwrap();
+        add(&home, stage.join("beta").to_str().unwrap()).unwrap();
+        add(&home, stage.join("gamma").to_str().unwrap()).unwrap();
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+        let allowlist = vec!["alpha".to_string(), "gamma".to_string()];
+
+        let outcomes = install_for_agent(&home, &working, Some(&allowlist)).unwrap();
+        for outcome in &outcomes {
+            assert!(matches!(
+                outcome.mode,
+                InstallMode::Symlink | InstallMode::Copy
+            ));
+            assert!(outcome.target.join("alpha").join("SKILL.md").exists());
+            assert!(outcome.target.join("gamma").join("SKILL.md").exists());
+            assert!(
+                !outcome.target.join("beta").exists(),
+                "beta must NOT appear under {} (filter excluded)",
+                outcome.target.display()
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_for_agent_with_empty_filter_opts_out_of_all_skills() {
+        // Some(empty) is meaningful — agent gets per-backend dirs but
+        // none of the skills from the unified source.
+        let home = tmp_home("filter-empty");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "anchor");
+        add(&home, stage.join("anchor").to_str().unwrap()).unwrap();
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+        let empty: Vec<String> = Vec::new();
+
+        let outcomes = install_for_agent(&home, &working, Some(&empty)).unwrap();
+        for outcome in &outcomes {
+            assert!(matches!(
+                outcome.mode,
+                InstallMode::Symlink | InstallMode::Copy
+            ));
+            assert!(
+                !outcome.target.join("anchor").exists(),
+                "anchor must NOT appear under {} (empty filter)",
+                outcome.target.display()
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn install_for_agent_with_filter_skips_unknown_skill_names() {
+        // Allowlist references a skill not in the unified source — the
+        // helper logs warn + skips silently rather than failing the
+        // whole install. Other allowlisted skills land normally.
+        let home = tmp_home("filter-unknown");
+        let stage = home.join("stage");
+        seed_skill_source(&stage, "real");
+        add(&home, stage.join("real").to_str().unwrap()).unwrap();
+        let working = home.join("agent-wd");
+        std::fs::create_dir_all(&working).unwrap();
+        let allowlist = vec!["real".to_string(), "ghost".to_string()];
+
+        let outcomes = install_for_agent(&home, &working, Some(&allowlist)).unwrap();
+        for outcome in &outcomes {
+            assert!(matches!(
+                outcome.mode,
+                InstallMode::Symlink | InstallMode::Copy
+            ));
+            assert!(outcome.target.join("real").join("SKILL.md").exists());
+            assert!(!outcome.target.join("ghost").exists());
         }
         std::fs::remove_dir_all(&home).ok();
     }
