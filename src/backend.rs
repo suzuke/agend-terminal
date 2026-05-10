@@ -227,9 +227,9 @@ impl Backend {
                 quit_command: "/quit",
                 instructions_path: ".kiro/steering/agend.md",
                 instructions_shared: false,
-                // Kiro CLI does not auto-load .kiro/steering/*.md (IDE-only feature).
-                // Inject the file contents as the first user message once ready.
-                inject_instructions_on_ready: true,
+                // Kiro CLI auto-loads .kiro/steering/*.md as context entries since
+                // its initial release (v1.20.0, 2025-11-17). No injection needed.
+                inject_instructions_on_ready: false,
                 ready_timeout_secs: 30,
                 dismiss_patterns: &[
                     // Trust-all-tools confirmation: cursor defaults to "No, exit"
