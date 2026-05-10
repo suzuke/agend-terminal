@@ -361,6 +361,18 @@ fn run_core(
         Err(e) => tracing::warn!(error = %e, "skills-stage GC: daemon-init sweep failed"),
     }
 
+    // Sprint 63 W1 PR-2 (Sprint 58 P2 #5): sweep stale `*.tmp` /
+    // `*.json.tmp` orphans under <home>/dedup-state/ left behind by
+    // crashed atomic_write cycles. 1-day retention threshold (much
+    // shorter than skills-stage 7-day because tmp files should never
+    // legitimately persist longer than a single syscall pair).
+    // Best-effort: failures log + continue (function returns
+    // DedupStateGcReport directly, no Err path).
+    const DEDUP_TMP_RETENTION_SECS: u64 = 24 * 60 * 60;
+    let dedup_report =
+        crate::daemon::dedup_state::cleanup_tmp_orphans(home, DEDUP_TMP_RETENTION_SECS);
+    tracing::info!(?dedup_report, "dedup-state GC: daemon-init sweep complete");
+
     // Sprint 24 P0 PR2 — bridge-phase legacy migration. Walks tasks.json
     // and emits canonical Created (+ status transition) events into
     // task_events.jsonl. Idempotent: re-run is a no-op via tail-scan

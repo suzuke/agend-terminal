@@ -431,6 +431,79 @@ fn quarantine_corrupt_file(path: &Path) -> String {
     }
 }
 
+/// Sprint 63 W1 PR-2 (Sprint 58 P2 #5): GC report — what
+/// `cleanup_tmp_orphans` found and acted on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DedupStateGcReport {
+    pub candidates: usize,
+    pub deleted: usize,
+    pub preserved_recent: usize,
+}
+
+/// Sprint 63 W1 PR-2 (Sprint 58 P2 #5): GC stale `*.tmp` / `*.json.tmp`
+/// orphans under `<home>/dedup-state/`. Closes the Sprint 57 Track C
+/// #553 Pass 2 reviewer note about startup tmp-file cleanup.
+///
+/// Background: `save` (line 260) uses `crate::store::atomic_write`
+/// (write-then-rename). When the daemon crashes between the write and
+/// the rename, a `*.json.tmp` file lingers in `dedup-state/` with no
+/// reader. These accumulate over crash cycles.
+///
+/// Mirrors the Sprint 62 #591 `cleanup_stale_stages` pattern: fail-
+/// open IO, retention threshold, report struct. No same-run exclusion
+/// needed — daemon-init is the only invocation site, and `save` only
+/// produces tmp files transiently between write+rename within a single
+/// syscall pair (any tmp older than the retention threshold is truly
+/// orphaned).
+///
+/// Returns counts so callers can log/test the GC outcome.
+pub fn cleanup_tmp_orphans(home: &std::path::Path, retention_secs: u64) -> DedupStateGcReport {
+    let dedup_root = home.join(DEDUP_STATE_DIR);
+    let mut report = DedupStateGcReport::default();
+    let entries = match std::fs::read_dir(&dedup_root) {
+        Ok(it) => it,
+        Err(_) => return report, // missing root → empty report (fresh home)
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Match `*.tmp` (catches both `<agent>.json.tmp` from atomic_write
+        // and any other *.tmp leftover that might land here).
+        if !name.ends_with(".tmp") {
+            continue;
+        }
+        report.candidates += 1;
+        let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+        let elapsed = mtime
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if elapsed < retention_secs {
+            report.preserved_recent += 1;
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.deleted += 1;
+                tracing::info!(file = %name, elapsed_secs = elapsed,
+                    "dedup-state GC: removed orphan tmp file");
+            }
+            Err(e) => {
+                tracing::warn!(file = %name, error = %e,
+                    "dedup-state GC: removal failed, skipping");
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1278,6 +1351,78 @@ mod tests {
                 .exists(),
             "healthy file remains at original path"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Sprint 63 W1 PR-2 (Sprint 58 P2 #5) — tmp orphan cleanup ─────
+
+    /// Helper: stage a back-dated tmp file using `touch -t` so retention
+    /// checks see it as old. POSIX-portable. Mirrors `seed_aged_stage`
+    /// from `src/skills.rs::tests::cleanup_stale_stages_*`.
+    fn seed_aged_tmp(home: &std::path::Path, name: &str, age_secs: u64) {
+        let dir = home.join(DEDUP_STATE_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, b"orphan tmp content").unwrap();
+        let now = std::time::SystemTime::now();
+        let back = now - std::time::Duration::from_secs(age_secs);
+        let secs = back
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let dt = chrono::DateTime::<chrono::Utc>::from(
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+        );
+        let arg = dt.format("%Y%m%d%H%M.%S").to_string();
+        let _ = std::process::Command::new("touch")
+            .args(["-t", &arg])
+            .arg(&path)
+            .status();
+    }
+
+    #[test]
+    fn cleanup_tmp_orphans_deletes_aged_tmp_files_above_threshold() {
+        let home = tmp_home("tmp-gc-aged");
+        // Two tmp files: one fresh (now), one aged 2 days.
+        std::fs::create_dir_all(home.join(DEDUP_STATE_DIR)).unwrap();
+        std::fs::write(home.join(DEDUP_STATE_DIR).join("fresh.json.tmp"), b"x").unwrap();
+        seed_aged_tmp(&home, "ancient.json.tmp", 2 * 24 * 60 * 60);
+
+        let report = cleanup_tmp_orphans(&home, 24 * 60 * 60);
+        assert_eq!(report.candidates, 2);
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.preserved_recent, 1);
+        assert!(home.join(DEDUP_STATE_DIR).join("fresh.json.tmp").exists());
+        assert!(!home.join(DEDUP_STATE_DIR).join("ancient.json.tmp").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_tmp_orphans_preserves_non_tmp_files() {
+        // *.json (production state files, not tmp) must NOT be touched
+        // even if aged. Only `*.tmp` is a candidate for cleanup.
+        let home = tmp_home("tmp-gc-preserve-json");
+        seed_aged_tmp(&home, "agent.json", 2 * 24 * 60 * 60);
+        seed_aged_tmp(&home, "agent.json.tmp", 2 * 24 * 60 * 60);
+
+        let report = cleanup_tmp_orphans(&home, 24 * 60 * 60);
+        assert_eq!(report.candidates, 1, "only .tmp counted as candidate");
+        assert_eq!(report.deleted, 1);
+        assert!(
+            home.join(DEDUP_STATE_DIR).join("agent.json").exists(),
+            "production .json file untouched"
+        );
+        assert!(!home.join(DEDUP_STATE_DIR).join("agent.json.tmp").exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cleanup_tmp_orphans_returns_empty_report_when_root_missing() {
+        // Daemon-init invocation on a fresh AgEnD home (no dedup-state
+        // dir created yet). Must return empty report, never error.
+        let home = tmp_home("tmp-gc-no-root");
+        let report = cleanup_tmp_orphans(&home, 24 * 60 * 60);
+        assert_eq!(report, DedupStateGcReport::default());
         std::fs::remove_dir_all(&home).ok();
     }
 }
