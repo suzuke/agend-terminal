@@ -1657,14 +1657,16 @@ pub(crate) fn aggregate_conclusion_for_sha<'a>(runs: &'a [CiRun], sha: &str) -> 
     if matching.is_empty() {
         return None;
     }
-    if matching.iter().any(|r| r.conclusion.is_none()) {
-        return None;
-    }
+    // Fail-fast: any failure → immediately report (don't wait for in-progress)
     if matching
         .iter()
         .any(|r| r.conclusion.as_deref() == Some("failure"))
     {
         return Some("failure");
+    }
+    // Still in-progress → wait for all to complete before reporting success
+    if matching.iter().any(|r| r.conclusion.is_none()) {
+        return None;
     }
     if let Some(r) = matching
         .iter()
@@ -4720,5 +4722,17 @@ mod tests {
     fn aggregate_empty_returns_none() {
         let runs = vec![make_run(1, "other", Some("success"))];
         assert_eq!(aggregate_conclusion_for_sha(&runs, "abc123"), None);
+    }
+
+    #[test]
+    fn aggregate_failure_with_in_progress_still_reports_failure() {
+        let runs = vec![
+            make_run(1, "abc123", Some("failure")),
+            make_run(2, "abc123", None),
+        ];
+        assert_eq!(
+            aggregate_conclusion_for_sha(&runs, "abc123"),
+            Some("failure")
+        );
     }
 }
