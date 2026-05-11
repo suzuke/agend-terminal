@@ -229,7 +229,10 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         return json!({"error": e});
     }
     let reason = args["reason"].as_str().unwrap_or("manual replacement");
-    let handover = crate::api::call(home, &json!({"method": crate::api::method::LIST}))
+
+    // Capture backend + working_directory before kill so we can respawn.
+    let list_resp = crate::api::call(home, &json!({"method": crate::api::method::LIST}));
+    let (backend, handover) = list_resp
         .ok()
         .and_then(|resp| {
             resp["result"]["agents"]
@@ -237,19 +240,31 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
                 .iter()
                 .find(|a| a["name"].as_str() == Some(name))
                 .map(|a| {
-                    format!(
+                    let backend = a["backend"].as_str().unwrap_or("claude").to_string();
+                    let handover = format!(
                         "Previous instance state: {}, health: {}. Replaced due to: {reason}",
                         a["agent_state"].as_str().unwrap_or("unknown"),
                         a["health_state"].as_str().unwrap_or("unknown")
-                    )
+                    );
+                    (backend, handover)
                 })
         })
-        .unwrap_or_else(|| format!("Replaced due to: {reason}"));
+        .unwrap_or_else(|| ("claude".to_string(), format!("Replaced due to: {reason}")));
 
+    // Resolve working_directory from fleet.yaml (survives kill).
+    let working_dir = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+        .ok()
+        .and_then(|f| f.resolve_instance(name))
+        .and_then(|r| r.working_directory)
+        .map(|p| p.display().to_string());
+
+    // Kill via DELETE (synchronous — waits for child exit + removes from registry).
     let _ = crate::api::call(
         home,
-        &json!({"method": crate::api::method::KILL, "params": {"name": name}}),
+        &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
     );
+
+    // Enqueue handover context for the new instance.
     let _ = crate::inbox::enqueue(
         home,
         name,
@@ -281,8 +296,24 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
             worktree_binding_required: None,
         },
     );
-    tracing::info!(%name, %reason, "replace_instance");
-    json!({"name": name, "reason": reason, "note": "Instance killed. Auto-respawn will create fresh instance with handover context."})
+
+    // Spawn fresh instance with same backend + working directory.
+    let mut spawn_params = json!({"name": name, "backend": backend});
+    if let Some(wd) = &working_dir {
+        spawn_params["working_directory"] = json!(wd);
+    }
+    let spawn_result = crate::api::call(
+        home,
+        &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
+    );
+
+    let spawned = spawn_result
+        .as_ref()
+        .map(|r| r["ok"].as_bool() == Some(true))
+        .unwrap_or(false);
+
+    tracing::info!(%name, %reason, %spawned, "replace_instance");
+    json!({"name": name, "reason": reason, "spawned": spawned})
 }
 
 pub(super) fn handle_set_display_name(home: &Path, args: &Value, instance_name: &str) -> Value {
