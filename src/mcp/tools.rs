@@ -169,6 +169,8 @@ fn task_tools() -> Vec<Value> {
             "pause": {"type": "boolean", "description": "Pause/resume the sweep tick"},
             "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"}
         }}}),
+        json!({"name": "restart_daemon", "description": "Request graceful daemon restart. Daemon exits with code 42 after shutdown; wrapper script restarts it. Idempotent.",
+            "inputSchema": {"type": "object", "properties": {}}}),
     ]
 }
 
@@ -455,8 +457,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            29,
-            "Sprint 61 tool slim: 32 - react - describe_instance - restart_daemon = 29. \
+            30,
+            "Sprint 61: 29 + restart_daemon(exit-42) = 30. \
              Current tools: {:?}",
             tools
                 .iter()

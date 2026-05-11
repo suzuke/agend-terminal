@@ -1033,56 +1033,14 @@ fn run_core(
     // topic registry, fleet.yaml) — operators re-attach PTY agents
     // post-restart per the MVP scope.
     if RESTART_PENDING.load(Ordering::Acquire) {
-        tracing::info!("operator-initiated restart: re-execing self");
-        exec_self_for_restart();
-        // exec_self_for_restart returns only on failure; fall through
-        // to normal exit so the operator gets a clean stop instead of
-        // a zombie process.
-        tracing::warn!("re-exec failed; falling back to normal exit");
+        let flag = home.join("restart-requested");
+        let _ = std::fs::remove_file(&flag);
+        tracing::info!("operator-initiated restart: exiting with code 42");
+        std::process::exit(42);
     }
 
     tracing::info!("exiting");
     Ok(())
-}
-
-/// Sprint 60 W1 PR-3 (#P0-3): re-exec the daemon with the same args
-/// after `RESTART_PENDING` was set. On Unix uses `execvp` via
-/// `CommandExt::exec` (atomic process-image replacement, preserves
-/// PID); on Windows spawns a fresh process and exits the current one
-/// (no `execvp` equivalent). Returns only on error — the success
-/// case never returns because the process image has been replaced
-/// (Unix) or `exit(0)` was called (Windows).
-fn exec_self_for_restart() {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "current_exe() failed during restart");
-            return;
-        }
-    };
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(&exe).args(&args).exec();
-        // exec only returns on error.
-        tracing::error!(error = %err, exe = %exe.display(), "execvp failed");
-    }
-
-    #[cfg(not(unix))]
-    {
-        match std::process::Command::new(&exe).args(&args).spawn() {
-            Ok(_child) => {
-                // New daemon has been spawned; exit current process so
-                // operators see a single clean transition.
-                std::process::exit(0);
-            }
-            Err(e) => {
-                tracing::error!(error = %e, exe = %exe.display(), "spawn-restart failed");
-            }
-        }
-    }
 }
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q6) shutdown summary record.

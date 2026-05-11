@@ -9,6 +9,7 @@ pub(crate) mod dispatch_hook;
 mod force_release;
 pub(crate) mod instance;
 pub(crate) mod instance_lifecycle;
+mod restart;
 mod schedule;
 pub(crate) mod sha_gate;
 mod task;
@@ -205,6 +206,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 
         // --- Phase 4 GC dry-run visibility (Sprint 53 P1-4) ---
         "gc_dry_run" => worktree::handle_gc_dry_run(&home, args, &sender),
+        "restart_daemon" => restart::handle_restart_daemon(&home),
 
         _ => json!({"error": format!("unknown tool: {tool}")}),
     }
