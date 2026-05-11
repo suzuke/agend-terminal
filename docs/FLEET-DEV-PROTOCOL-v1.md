@@ -124,6 +124,9 @@ When push claim references a function name, daemon verifies existence via syn-li
 ### 4.4 Reserved Name Warning (Sprint 46)
 Instance names with routing semantics (`general`, `lead`, `dev`, `reviewer`) emit warning on create. Not a hard reject.
 
+### 4.5 Cross-team ACK Absorption Exception (Sprint 61, #612)
+One-shot backends (Codex) skip PTY injection for `kind=update` and `kind=report` messages to avoid wasting turns. However, **cross-team messages are NEVER silently absorbed** — they always inject to PTY regardless of backend or message kind. Team membership is checked at delivery time; agents not in any team are treated as cross-team (safe default). Absorbed messages are audit-logged as `ack_absorbed` events.
+
 ## §5. Async Pipeline
 
 Impl pushes PR then immediately starts next task. Reviewer issues verdict then immediately takes next review. dev-lead maintains pending list; dual-VERIFIED + CI green (independently verified via `gh pr checks`) → self-merge.
