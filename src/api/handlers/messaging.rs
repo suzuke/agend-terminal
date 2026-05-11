@@ -265,6 +265,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
