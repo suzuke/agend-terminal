@@ -104,7 +104,6 @@ pub struct ReleaseOutcome {
     pub error: Option<String>,
 }
 
-/// Attempt to delete a local branch if it has been merged into main or its
 /// Delete the local branch ref after worktree release, IFF:
 /// - `managed_verified` is true (caller confirmed .agend-managed marker)
 /// - Branch is merged into main OR remote tracking ref is gone
