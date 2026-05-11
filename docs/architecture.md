@@ -921,15 +921,42 @@ rusqlite = "0.32"            # SQLite (schedules, logs)
 
 ## Source Layout (reference)
 
-The module design above is aspirational and largely file-agnostic; the table below is the current file-level mapping as of Task #9 Option C / Task #12 (2026-04). See `CONTRIBUTING.md` for the contribution-time style rules.
+The module design above is aspirational and largely file-agnostic; the table below is the current file-level mapping as of Sprint 61 (2026-05). See `CONTRIBUTING.md` for the contribution-time style rules.
 
 | Responsibility | File(s) |
 |---|---|
-| Shared helpers (messaging, fleet mutation, branch validation, cleanup) called from both the daemon API and the MCP handler path | `src/agent_ops.rs` |
-| Daemon JSON control API (wire protocol + per-method handlers) over TCP loopback | `src/api/mod.rs`, `src/api/handlers/*.rs` |
-| MCP surface for agents. `start_instance` is handled inline here — no separate `ops.rs` module (deleted in Task #12) | `src/mcp/handlers.rs`, `src/mcp/tools.rs` |
-| Domain logic | `src/agent.rs`, `src/fleet.rs`, `src/telegram.rs`, `src/health.rs`, `src/schedules.rs`, `src/decisions.rs`, … |
-| Supervisor (hot upgrade; Unix only) | `src/supervisor/`, `src/bin/agend-supervisor.rs` |
+| PTY session management, spawn, inject, ready detection | `src/agent.rs` |
+| Backend presets (Claude, Kiro, Codex, Gemini, OpenCode, Shell) | `src/backend.rs` |
+| Shared helpers (messaging, fleet mutation, branch validation) | `src/agent_ops.rs` |
+| Daemon JSON control API (wire protocol + handlers) over TCP loopback | `src/api/mod.rs`, `src/api/handlers/*.rs` |
+| MCP surface for agents (32 tools) | `src/mcp/handlers/`, `src/mcp/tools.rs` |
+| Dispatch hook (auto-bind, lease, worktree creation) | `src/mcp/handlers/dispatch_hook/` |
+| Fleet config (fleet.yaml parse, instances, teams) | `src/fleet.rs` |
+| Team management | `src/teams.rs` |
+| Task board | `src/tasks.rs` |
+| Decisions store | `src/decisions.rs` |
+| Schedules (cron + one-shot) | `src/schedules.rs` |
+| Deployments (template-based multi-agent spawn) | `src/deployments.rs` |
+| Worktree lifecycle (lease, release, GC) | `src/worktree_pool.rs`, `src/worktree.rs` |
+| Worktree auto-cleanup (sweep merged/gone branches) | `src/worktree_cleanup.rs` |
+| Binding state (agent ↔ branch ↔ worktree) | `src/binding.rs` |
+| Inbox (message queue, delivery, supersede) | `src/inbox.rs` |
+| Channel adapters (Telegram) | `src/channel/` |
+| Daemon tick loop (CI watch, health, supervisor) | `src/daemon/` |
+| CI watch (poll GitHub Actions, emit pass/fail) | `src/daemon/ci_watch.rs` |
+| Claim verifier (push-time semantic gate) | `src/claim_verifier.rs` |
+| TUI (multi-tab/pane terminal UI) | `src/tui.rs`, `src/render/`, `src/layout/` |
+| App mode (in-process TUI + daemon) | `src/app/` |
+| CLI argument parsing | `src/main.rs` (Commands enum) |
+| Instructions/steering injection | `src/instructions.rs` |
+| Admin (branch cleanup analysis) | `src/admin.rs` |
+| Event log (audit trail) | `src/event_log.rs` |
+| Health state | `src/health.rs` |
+| Service (systemd/launchd integration) | `src/service/` |
+| System tray | `src/tray/` |
+| Bootstrap (agent resolve, doctor, fleet normalize) | `src/bootstrap/` |
+| Git shim (worktree-deny matrix) | `src/bin/agend-git.rs` |
+| MCP bridge (per-agent MCP server) | `src/bin/agend-mcp-bridge.rs` |
 
 ### Drift enforcement
 
