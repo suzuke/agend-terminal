@@ -163,14 +163,29 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     let delivery_mode = if reg.contains_key(target) {
         // Issue #603: Codex is one-shot — skip PTY inject for messages that
         // don't require a reply (update/report), avoiding wasted turns.
+        // Issue #612: Cross-team messages are NEVER silently absorbed.
         let is_codex = reg
             .get(target)
             .map(|h| h.backend_command == "codex")
             .unwrap_or(false);
         let kind = params["kind"].as_str().unwrap_or("");
-        let skip_inject = is_codex && matches!(kind, "update" | "report");
         drop(reg);
+        let is_cross_team = {
+            let sender_team = crate::teams::find_team_for(ctx.home, from);
+            let target_team = crate::teams::find_team_for(ctx.home, target);
+            match (sender_team, target_team) {
+                (Some(s), Some(t)) => s.name != t.name,
+                _ => true, // no team = treat as cross-team (safe default)
+            }
+        };
+        let skip_inject = is_codex && matches!(kind, "update" | "report") && !is_cross_team;
         if skip_inject {
+            crate::event_log::log(
+                ctx.home,
+                "ack_absorbed",
+                target,
+                &format!("from={from} kind={kind}"),
+            );
             "inbox_only"
         } else {
             crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
