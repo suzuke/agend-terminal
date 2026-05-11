@@ -92,7 +92,7 @@ pub(super) fn handle_send_to_instance(
         home,
         &json!({
             "method": crate::api::method::SEND,
-            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str() }
+            "params": { "from": sender.as_str(), "target": target, "text": text, "kind": kind, "thread_id": thread_id, "parent_id": parent_id, "correlation_id": args["correlation_id"].as_str(), "sequencing": args["sequencing"].as_str(), "eta_minutes": args["eta_minutes"].as_u64(), "reporting_cadence": args["reporting_cadence"].as_str(), "worktree_binding_required": args["worktree_binding_required"].as_bool() }
         }),
     ) {
         Ok(resp) if resp["ok"].as_bool() == Some(true) => {
@@ -133,6 +133,10 @@ pub(super) fn handle_send_to_instance(
                 superseded_by: None,
                 from_id: None,
                 broadcast_context: None,
+                sequencing: None,
+                eta_minutes: None,
+                reporting_cadence: None,
+                worktree_binding_required: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
         }
@@ -343,6 +347,10 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
                 superseded_by: None,
                 from_id: None,
                 broadcast_context: None,
+                sequencing: None,
+                eta_minutes: None,
+                reporting_cadence: None,
+                worktree_binding_required: None,
             };
             crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
         }
@@ -476,6 +484,10 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     superseded_by: None,
                     from_id: None,
                     broadcast_context: None,
+                    sequencing: None,
+                    eta_minutes: None,
+                    reporting_cadence: None,
+                    worktree_binding_required: None,
                 };
                 crate::agent_ops::fallback_deliver(
                     home,

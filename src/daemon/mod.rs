@@ -1264,6 +1264,10 @@ pub fn run_task_maintenance(home: &Path) {
                 superseded_by: None,
                 from_id: None,
                 broadcast_context: None,
+                sequencing: None,
+                eta_minutes: None,
+                reporting_cadence: None,
+                worktree_binding_required: None,
             },
         );
     }
@@ -1333,6 +1337,10 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
                     superseded_by: None,
                     from_id: None,
                     broadcast_context: None,
+                    sequencing: None,
+                    eta_minutes: None,
+                    reporting_cadence: None,
+                    worktree_binding_required: None,
                 },
             );
         }

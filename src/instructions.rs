@@ -1106,6 +1106,10 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
             from_id: None,
         };
         let header = crate::inbox::format_header(&sample_msg);

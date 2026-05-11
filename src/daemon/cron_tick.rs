@@ -137,6 +137,10 @@ pub fn check_schedules(home: &Path, registry: &AgentRegistry) {
                     superseded_by: None,
                     from_id: None,
                     broadcast_context: None,
+                    sequencing: None,
+                    eta_minutes: None,
+                    reporting_cadence: None,
+                    worktree_binding_required: None,
                 },
             );
             "ok_inbox"

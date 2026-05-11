@@ -1002,6 +1002,10 @@ fn fan_out_health_event(
                 superseded_by: None,
                 from_id: None,
                 broadcast_context: None,
+                sequencing: None,
+                eta_minutes: None,
+                reporting_cadence: None,
+                worktree_binding_required: None,
             },
         );
     }
@@ -2003,6 +2007,10 @@ async fn ci_check_repo(
                         superseded_by: None,
                         from_id: None,
                         broadcast_context: None,
+                        sequencing: None,
+                        eta_minutes: None,
+                        reporting_cadence: None,
+                        worktree_binding_required: None,
                     },
                 );
             }

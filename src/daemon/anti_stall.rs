@@ -198,6 +198,10 @@ fn emit_stall(home: &Path, task: &Task, reason: &str) {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         if let Err(e) = crate::inbox::enqueue(home, &recipient, msg) {
             tracing::warn!(

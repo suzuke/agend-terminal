@@ -70,7 +70,11 @@ fn comm_tools() -> Vec<Value> {
                 "reviewed_head": {"type": "string", "description": "Git HEAD SHA at time of review"},
                 "artifacts": {"type": "string"},
                 "branch": {"type": "string"},
-                "working_directory": {"type": "string"}
+                "working_directory": {"type": "string"},
+                "sequencing": {"type": "string", "enum": ["parallel", "sequential", "sequential-merge-only"], "description": "Task execution order constraint"},
+                "eta_minutes": {"type": "integer", "description": "Expected completion time in minutes"},
+                "reporting_cadence": {"type": "string", "enum": ["per-pr", "wave-end", "both"], "description": "When implementer should report back"},
+                "worktree_binding_required": {"type": "boolean", "description": "Whether target must bind to a worktree before starting"}
             }, "required": ["message"]}}),
         json!({"name": "inbox", "description": "Check pending messages, OR look up a single message by ID, OR fetch a thread's messages. No params = drain pending. With message_id = describe message status (read/unread/expired/notfound). With thread_id = fetch all messages in thread ordered by timestamp.",
         "inputSchema": {"type": "object", "properties": {

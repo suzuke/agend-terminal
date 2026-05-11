@@ -145,6 +145,10 @@ pub fn hotspot_warn(home: &Path, agent: &str, file: &Path, last_toucher: &str, s
         superseded_by: None,
         from_id: None,
         broadcast_context: None,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
     };
     let _ = crate::inbox::enqueue(home, "lead", msg);
 }

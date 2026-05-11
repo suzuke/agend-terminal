@@ -968,6 +968,10 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         },
     );
 
@@ -1031,6 +1035,10 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         },
     );
 
@@ -1204,6 +1212,10 @@ fn test_describe_message_shows_delivery_mode() {
         superseded_by: None,
         from_id: None,
         broadcast_context: None,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
     };
     let inbox_dir = home.join("inbox");
     std::fs::create_dir_all(&inbox_dir).ok();

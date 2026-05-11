@@ -225,6 +225,15 @@ pub struct InboxMessage {
     /// surfaces the same context via `team=` / `broadcast=` fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broadcast_context: Option<BroadcastContext>,
+    /// Dispatch schema fields (Issue #649, Phase 1)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequencing: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporting_cadence: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_binding_required: Option<bool>,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).
@@ -898,6 +907,10 @@ pub fn deliver(
         superseded_by: None,
         from_id: None,
         broadcast_context,
+        sequencing: None,
+        eta_minutes: None,
+        reporting_cadence: None,
+        worktree_binding_required: None,
     };
     let _ = enqueue(home, agent_name, msg);
     notify_agent(home, agent_name, source, text);
@@ -1171,6 +1184,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         }
     }
 
@@ -1307,6 +1324,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -1416,6 +1437,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
@@ -1448,6 +1473,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         enqueue(&home, "agent1", msg).ok();
         let msgs = drain(&home, "agent1");
@@ -2043,6 +2072,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let json = serde_json::to_string(&msg).expect("ser");
         assert!(json.contains("thread_id"));
@@ -2096,6 +2129,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("[AGEND-MSG]"));
@@ -2132,6 +2169,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("from=from:agent"));
@@ -2173,6 +2214,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2205,6 +2250,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2251,6 +2300,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2371,6 +2424,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2426,6 +2483,10 @@ mod tests {
 
         let without_ctx = InboxMessage {
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
             ..with_ctx
         };
         let json2 = serde_json::to_string(&without_ctx).expect("ser");
@@ -2459,6 +2520,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let h = format_header(&msg);
         assert!(h.contains("reply_to_excerpt=[bob] original"), "{h}");
@@ -2558,6 +2623,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let h = format_header(&msg);
         assert!(!h.contains('\n'), "must be single line: {h}");
@@ -2588,6 +2657,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2626,6 +2699,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2669,6 +2746,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2715,6 +2796,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2878,6 +2963,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let back: InboxMessage = serde_json::from_str(&json).unwrap();
@@ -2935,6 +3024,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         enqueue(&home, agent, msg1).unwrap();
         mark_ci_watch_superseded(&home, agent, "owner/repo@main", "new-msg-id");
@@ -2972,6 +3065,10 @@ mod tests {
             superseded_by: None,
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let superseded = InboxMessage {
             schema_version: 0,
@@ -2995,6 +3092,10 @@ mod tests {
             superseded_by: Some("new-ci".into()),
             from_id: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         enqueue(&home, agent, normal).unwrap();
         enqueue(&home, agent, superseded).unwrap();
@@ -3028,6 +3129,10 @@ mod tests {
             in_reply_to_excerpt: None,
             superseded_by: None,
             broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: InboxMessage = serde_json::from_str(&json).expect("deserialize");
