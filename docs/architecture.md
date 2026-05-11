@@ -941,7 +941,7 @@ The module design above is aspirational and largely file-agnostic; the table bel
 | Worktree auto-cleanup (sweep merged/gone branches) | `src/worktree_cleanup.rs` |
 | Binding state (agent ↔ branch ↔ worktree) | `src/binding.rs` |
 | Inbox (message queue, delivery, supersede) | `src/inbox.rs` |
-| Channel adapters (Telegram) | `src/channel/` |
+| Channel adapters (Telegram, Discord) | `src/channel/` |
 | Daemon tick loop (CI watch, health, supervisor) | `src/daemon/` |
 | CI watch (poll GitHub Actions, emit pass/fail) | `src/daemon/ci_watch.rs` |
 | Claim verifier (push-time semantic gate) | `src/claim_verifier.rs` |
