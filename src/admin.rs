@@ -24,6 +24,7 @@ pub enum BranchAction {
 /// List local branches that are NOT checked out in any worktree.
 fn worktree_branches(repo: &Path) -> std::collections::HashSet<String> {
     let output = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(repo)
         .output();
@@ -42,6 +43,7 @@ fn worktree_branches(repo: &Path) -> std::collections::HashSet<String> {
 /// List all local branch names.
 fn local_branches(repo: &Path) -> Vec<String> {
     let output = std::process::Command::new("git")
+        .env("AGEND_GIT_BYPASS", "1")
         .args(["branch", "--format=%(refname:short)"])
         .current_dir(repo)
         .output();
@@ -113,6 +115,7 @@ pub fn execute_cleanup(repo: &Path, checks: &[BranchCheck], dry_run: bool) -> (u
                     log_lines.push(msg);
                 } else {
                     let result = std::process::Command::new("git")
+                        .env("AGEND_GIT_BYPASS", "1")
                         .args(["branch", "-d", &check.branch])
                         .current_dir(repo)
                         .output();
@@ -172,11 +175,13 @@ mod tests {
 
     fn init_repo(dir: &Path) {
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["init", "-b", "main"])
             .current_dir(dir)
             .output()
             .unwrap();
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args([
                 "-c",
                 "user.name=test",
@@ -208,12 +213,14 @@ mod tests {
         let dir = tmp_dir("wt-detect");
         init_repo(&dir);
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["branch", "feat-wt"])
             .current_dir(&dir)
             .output()
             .unwrap();
         let wt_path = dir.join("wt");
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["worktree", "add", wt_path.to_str().unwrap(), "feat-wt"])
             .current_dir(&dir)
             .output()
@@ -224,6 +231,7 @@ mod tests {
         assert_eq!(wt_check.action, BranchAction::SkipWorktree);
 
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["worktree", "remove", wt_path.to_str().unwrap()])
             .current_dir(&dir)
             .output()
@@ -236,6 +244,7 @@ mod tests {
         let dir = tmp_dir("unmerged");
         init_repo(&dir);
         std::process::Command::new("git")
+            .env("AGEND_GIT_BYPASS", "1")
             .args(["branch", "feat-unmerged"])
             .current_dir(&dir)
             .output()
