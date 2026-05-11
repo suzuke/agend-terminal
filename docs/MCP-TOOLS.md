@@ -50,7 +50,7 @@ Send a message to another instance or broadcast to multiple. Unified replacement
 - target_instance, targets, team, tags (routing)
 - request_kind: query / task / report / update
 - task_id (required for kind=task), success_criteria, branch, working_directory
-- correlation_id, parent_id, thread_id
+- context, requires_reply, task_summary, correlation_id, parent_id, thread_id
 - force, force_reason, second_reviewer, second_reviewer_reason
 - reviewed_head, artifacts
 
