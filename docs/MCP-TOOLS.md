@@ -1,278 +1,162 @@
-# MCP Tools Reference
+# AgEnD MCP Tools Reference (32 tools)
 
-Every agent spawned by `agend-terminal` gets an MCP stdio server wired in automatically (via `mcp_config.rs` writing each backend's config file). The server exposes 29 tools grouped into 11 categories. All tool definitions live in `src/mcp/tools.rs`; the canonical JSON schemas come from there (the unit test `tool_definitions_count_invariant_post_sprint_30` guards the count).
+## Action-based Tools
 
-> Legend: **bold** = required parameter. Types match JSON Schema (`string`, `number`, `integer`, `boolean`, `array<string>`).
+### `task`
+Manage task board. Actions: create, list, claim, done, update.
+- **action**: create / list / claim / done / update
+- title, description, id, assignee, priority, status, branch, depends_on, filter_status, filter_assignee, result, due_at, duration
 
-> **Note:** The per-category counts below reflect logical groupings; some entries pre-date Sprint 30 tool consolidation (e.g. `send_to_instance` / `delegate_task` / `report_result` / `request_information` / `broadcast` are now exposed via the unified `send` action). The authoritative tool count is enforced by the `tool_definitions_count_invariant_post_sprint_30` test in `src/mcp/tools.rs` — currently 29.
+### `decision`
+Manage decisions. Actions: post, list, update.
+- **action**: post / list / update
+- title, content, id, tags, scope, supersedes, archive, include_archived, ttl_days
 
-## Categories
+### `team`
+Manage teams. Actions: create, delete, list, update.
+- **action**: create / delete / list / update
+- name, members, orchestrator, description, source_repo, add, remove
 
-| # | Category | Count | Tools |
-|---|----------|-------|-------|
-| 1 | User comms (Telegram) | 4 | `reply`, `react`, `edit_message`, `download_attachment` |
-| 2 | Agent comms | 6 | `send_to_instance`, `delegate_task`, `report_result`, `request_information`, `broadcast`, `inbox` |
-| 3 | Instance lifecycle | 8 | `list_instances`, `create_instance`, `delete_instance`, `start_instance`, `describe_instance`, `replace_instance`, `set_display_name`, `set_description` |
-| 4 | Decisions | 3 | `post_decision`, `list_decisions`, `update_decision` |
-| 5 | Task board | 1 | `task` (actions: `create` / `list` / `claim` / `done` / `update`) |
-| 6 | Teams | 3 | `list_teams`, `update_team`, `delete_team` (teams are *created* via `create_instance` with `team` + `count`) |
-| 7 | Schedules | 4 | `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule` |
-| 8 | Deployments | 3 | `deploy_template`, `teardown_deployment`, `list_deployments` |
-| 9 | CI watchers | 2 | `watch_ci`, `unwatch_ci` |
-| 10 | Repo sharing | 2 | `checkout_repo`, `release_repo` |
-| 11 | Worktree binding | 3 | `bind_self`, `release_worktree`, `gc_dry_run` |
+### `schedule`
+Manage schedules. Actions: create, list, update, delete.
+- **action**: create / list / update / delete
+- id, label, target, message, cron, run_at, timezone, enabled
 
----
+### `deployment`
+Manage deployments. Actions: deploy, teardown, list.
+- **action**: deploy / teardown / list
+- name, template, branch, directory
 
-## 1. User Comms (Telegram)
+### `ci`
+Manage CI watching. Actions: watch, unwatch, status.
+- **action**: watch / unwatch / status
+- repo, branch, interval_secs
 
-Used when the agent's owning instance has a Telegram topic bound.
+### `repo`
+Manage repo worktrees. Actions: checkout, release.
+- **action**: checkout / release
+- source, branch, path
 
-### `reply`
-Reply to the user via Telegram.
-- **`text`** (string)
+### `health`
+Manage health state. Actions: report, clear.
+- **action**: report / clear
+- reason (rate_limit / quota_exceeded / awaiting_operator), retry_after_secs, instance, note
 
-### `react`
-React to the last user message with an emoji.
-- **`emoji`** (string)
+## Communication
 
-### `edit_message`
-Edit a previously sent message.
-- **`message_id`** (string), **`text`** (string)
-
-### `download_attachment`
-Download a file attachment. Returns the local path.
-- **`file_id`** (string)
-
----
-
-## 2. Agent Comms
-
-### `send_to_instance`
-Send a message to another instance.
-- **`instance_name`** (string), **`message`** (string)
-- `request_kind` (string enum: `query` | `task` | `report` | `update`)
-- `requires_reply` (boolean), `task_summary` (string), `correlation_id` (string)
-- `working_directory` (string), `branch` (string)
-
-### `delegate_task`
-Delegate work to another instance and expect a result report back.
-- **`target_instance`** (string), **`task`** (string)
-- `success_criteria` (string), `context` (string)
-
-### `report_result`
-Report results back to the instance that delegated to you.
-- **`target_instance`** (string), **`summary`** (string)
-- `correlation_id` (string), `artifacts` (string)
-
-### `request_information`
-Ask another instance a question, expect a reply.
-- **`target_instance`** (string), **`question`** (string), `context` (string)
-
-### `broadcast`
-Send a message to multiple instances. Resolution priority: `team` > `targets` > `tags` > all.
-- **`message`** (string)
-- `targets` (array<string>), `team` (string), `tags` (array<string>)
-- `request_kind` (string enum: `query` | `task` | `update`), `requires_reply` (boolean), `task_summary` (string)
+### `send`
+Send a message to another instance or broadcast to multiple. Unified replacement for send_to_instance/delegate_task/report_result/request_information/broadcast.
+- **message**: text content
+- target_instance, targets, team, tags (routing)
+- request_kind: query / task / report / update
+- task_id (required for kind=task), success_criteria, branch, working_directory
+- correlation_id, parent_id, thread_id
+- force, force_reason, second_reviewer, second_reviewer_reason
+- reviewed_head, artifacts
 
 ### `inbox`
-Check pending messages addressed to this instance. No parameters.
+Check pending messages, look up by ID, or fetch thread messages.
+- message_id, thread_id, instance
 
----
+### `reply`
+Reply to the user via the active channel (NOT for inter-agent use).
+- **text**: reply content
+- default_action, timeout_secs
 
-## 3. Instance Lifecycle
+### `react`
+React to a message with an emoji.
+- **emoji**: reaction emoji
+
+### `download_attachment`
+Download a file attachment (telegram multimedia). Returns local path.
+- **file_id**: attachment file ID
+
+## Instance Lifecycle
+
+### `create_instance`
+Create agent instance(s). Supports homogeneous teams (count + backend) and heterogeneous teams (backends list).
+- **name**: instance or team base name
+- backend, model, args, branch, working_directory, task
+- team, count, backends, layout, target_pane
+
+### `delete_instance`
+Stop and remove an instance.
+- **name**: instance to delete
+
+### `start_instance`
+Start a stopped instance.
+- **name**: instance to start
+
+### `describe_instance`
+Get detailed info about an instance.
+- **name**: instance to describe
+
+### `replace_instance`
+Replace an instance with a fresh one.
+- **name**: instance to replace
+- reason
 
 ### `list_instances`
 List all active agent instances. No parameters.
 
-### `create_instance`
-Create one or more agent instances.
-- **`name`** (string) — instance name for single spawn; becomes *base name* and is ignored when `team` is set.
-- `backend` (string) — `claude`, `gemini`, `kiro-cli`, `codex`, `opencode`.
-- `args` (string), `model` (string), `working_directory` (string)
-- `branch` (string) — if set, a git worktree is created.
-- `task` (string) — initial task injected after spawn.
-- `layout` (string enum: `tab` | `split-right` | `split-below`) — TUI placement. Relative to `target_pane` if set, otherwise relative to the caller's focused pane.
-- `target_pane` (string) — name of an existing instance. With `layout=split-right` or `split-below`, the new pane is attached next to that instance's pane in whichever tab currently hosts it. Precedence: `target_pane` → caller's tab → new tab (silent fallback when the target isn't displayed).
-- `team` (string) + one of:
-  - `count` (integer) — homogeneous team: spawn `<team>-1`..`<team>-N` all on `backend`.
-  - `backends` (array<string>) — heterogeneous team: member *i* uses `backends[i]` (e.g. `backends: ["codex", "kiro-cli", "gemini"]`). Length dictates member count; `count` is ignored when `backends` is set.
-- `command` (string) — **deprecated**, use `backend`.
-
-### `delete_instance`
-Stop and remove an instance. Cleans working dir, metadata, session entry, and Telegram topic.
-- **`name`** (string)
-
-### `start_instance`
-Start a stopped instance.
-- **`name`** (string)
-
-### `describe_instance`
-Detailed info about an instance (state, backend, working dir, health, etc.).
-- **`name`** (string)
-
-### `replace_instance`
-Replace an instance with a fresh one (fresh args, no resume).
-- **`name`** (string), `reason` (string)
-
 ### `set_display_name`
-Set your own display name.
-- **`name`** (string)
+Set your display name.
+- **name**: new display name
 
 ### `set_description`
 Set a description for this instance.
-- **`description`** (string)
+- **description**: instance description
 
----
+### `set_waiting_on`
+Declare what this instance is currently waiting for. Empty string to clear.
+- **condition**: what you're waiting for
 
-## 4. Decisions
+### `interrupt`
+Send ESC to target agent's PTY to interrupt current LLM turn.
+- **target**: instance name
+- reason
 
-### `post_decision`
-Record a decision. `scope: fleet` = visible to all instances; `scope: project` = same working directory only.
-- **`title`** (string), **`content`** (string)
-- `scope` (string enum: `project` | `fleet`), `tags` (array<string>)
-- `ttl_days` (number), `supersedes` (string)
+### `move_pane`
+Move an instance's pane into a different tab in the TUI.
+- **agent**: instance to move
+- **target_tab**: destination tab name
+- split_dir (horizontal / vertical)
 
-### `list_decisions`
-List active decisions.
-- `include_archived` (boolean), `tags` (array<string>)
+### `pane_snapshot`
+Read visible text from a target instance's PTY scrollback (ANSI stripped).
+- **target**: instance name
+- lines (default 100, max 10000)
 
-### `update_decision`
-Update or archive an existing decision.
-- **`id`** (string)
-- `content` (string), `tags` (array<string>), `ttl_days` (number), `archive` (boolean)
+## Worktree & Binding
 
----
+### `bind_self`
+Bind the calling agent to a fresh worktree on the named branch. Rejects main/master (E4.5) and cross-agent conflicts.
+- **branch**: branch to bind
+- source_repo, repo (deprecated), rebase_mode
 
-## 5. Task Board
+### `release_worktree`
+Release the daemon-managed worktree and clear binding. Only removes worktrees with `.agend-managed` marker.
+- **agent**: agent to release
+- dry_run
 
-### `task`
-Single tool covering the full board lifecycle.
-- **`action`** (string enum: `create` | `list` | `claim` | `done` | `update`)
-- `create` / `update`: `title`, `description`, `priority` (`low` | `normal` | `high` | `urgent`), `assignee`, `depends_on` (array<string>)
-- `claim` / `done` / `update`: `id`, `status` (`open` | `claimed` | `done` | `blocked` | `cancelled`), `result`
-- `list`: `filter_assignee`, `filter_status`
+### `force_release_worktree`
+Force-release a stale daemon-managed worktree directory. Emergency recovery tool.
+- **agent**: agent name
+- **branch**: branch name
 
----
+### `binding_state`
+Report structured daemon-side bind state for an agent. Non-destructive introspection.
+- **agent**: agent to inspect
 
-## 6. Teams
+### `gc_dry_run`
+List Phase 4 GC candidates without deleting. Non-destructive.
+- format (human / json)
 
-Teams are created via `create_instance` with `team` + `count`. Maintenance tools below.
+## Daemon Operations
 
-### `list_teams`
-No parameters.
+### `restart_daemon`
+Trigger programmatic daemon restart with state preservation. Idempotent. No parameters.
 
-### `update_team`
-Add or remove members. When running inside the TUI, added members migrate into the team tab (created on demand) and removed members are dropped from the team tab — panes in other tabs are left untouched.
-- **`name`** (string), `add` (array<string>), `remove` (array<string>)
-
-### `delete_team`
-- **`name`** (string)
-
----
-
-## 7. Schedules
-
-Schedules inject messages into a target instance either recurringly (cron)
-or at a single future instant (one-shot). One-shots auto-disable after
-firing or being detected as missed (daemon down through the instant).
-
-Each row carries a `trigger` object:
-- Cron: `{"kind": "cron", "expr": "0 9 * * *"}`
-- One-shot: `{"kind": "once", "at": "2026-04-21T15:30:00+08:00"}`
-
-Timezone detection is cross-platform (Linux, macOS, Windows) via the
-`iana-time-zone` crate; supply an explicit `timezone` to override.
-
-### `create_schedule`
-- **`message`** (string)
-- Exactly one of:
-  - **`cron`** (string) — 5- or 6-field cron expression.
-  - **`run_at`** (string) — ISO 8601 one-shot instant. Either with offset
-    (`2026-04-21T15:30:00+08:00`) or naive local (`2026-04-21T15:30:00`)
-    combined with `timezone`. Must resolve to the future.
-- `target` (string), `label` (string), `timezone` (string, IANA name).
-
-### `list_schedules`
-- `target` (string) — optional filter.
-
-### `update_schedule`
-- **`id`** (string)
-- Any of: `message`, `target`, `label`, `timezone`, `enabled` (boolean).
-- Trigger change: supply **either** `cron` **or** `run_at`
-  (mutually exclusive). Supplying either replaces the trigger kind.
-
-### `delete_schedule`
-- **`id`** (string)
-
----
-
-## 8. Deployments
-
-Templates from `fleet.yaml` spun up as a named deployment.
-
-### `deploy_template`
-- **`template`** (string), **`directory`** (string)
-- `name` (string, defaults to template name), `branch` (string — each instance gets its own worktree)
-
-### `teardown_deployment`
-- **`name`** (string)
-
-### `list_deployments`
-No parameters.
-
----
-
-## 9. CI Watchers
-
-Poll GitHub Actions; on failure, the log is auto-injected into this agent.
-
-### `watch_ci`
-- **`repo`** (string, `owner/repo`)
-- `branch` (string, default `main`), `interval_secs` (number, default 60)
-
-### `unwatch_ci`
-- **`repo`** (string)
-
----
-
-## 10. Repo Sharing
-
-### `checkout_repo`
-Mount another repo as a read-only worktree in your working directory.
-- **`source`** (string), `branch` (string)
-
-### `release_repo`
-- **`path`** (string)
-
----
-
-## 11. Worktree Binding
-
-Daemon-managed worktree lifecycle for multi-agent isolation. Each binding pairs an agent with one branch and one filesystem worktree, tracked via `binding.json` + `.agend-managed` marker. Production code path is dispatch-driven (`delegate_task` with `branch`); these tools cover the off-dispatch entries and exits.
-
-### `bind_self` (Sprint 54 P1-7)
-Bind the calling agent to a fresh worktree on the named branch. Reuses the dispatch-hook lifecycle so `binding.json` + worktree + `.agend-managed` marker + auto `watch_ci` registration all land via the same code path. Use when an agent needs a worktree but has nothing to delegate from (recovery, smoke, ad-hoc claim). Pair with `release_worktree` to unbind.
-- **`repo`** (string, `owner/name`), **`branch`** (string)
-- Rejects `main` / `master` (E4.5) and cross-agent branch claim conflicts.
-
-### `release_worktree` (Sprint 53 P0-X)
-Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone.
-- **`agent`** (string)
-
-### `gc_dry_run` (Sprint 53 P1-4)
-Surface Phase 4 GC findings to operators without removing anything. Returns the list of stale worktrees (no live binding, no `.agend-managed` marker, or marker older than the GC age threshold) plus their reason codes. Operator-driven cutover deferred — read-only by design.
-- `format` (string enum: `human` | `json`) — optional output shape; defaults to `human`.
-
----
-
-## How the Tools Are Wired
-
-1. `agend-terminal` daemon exposes a JSON control API on TCP loopback; the bound port is published to `~/.agend/run/{PID}/api.port` and authenticated by a 32-byte cookie at `~/.agend/run/{PID}/api.cookie` (0600 on Unix).
-2. For each backend, `src/mcp_config.rs` generates the backend's MCP config file pointing at `agend-mcp-bridge` (stdio transport). Sprint 56 Track I (#531) replaced the previous `agend-terminal mcp` invocation; the bridge proxies tool calls to the daemon's TCP API rather than running an inline local-mode server, which fixes the Windows "no active channel" failure mode for daemon-state-required tools (`reply` / `react` / `download_attachment`).
-3. `src/mcp/mod.rs` spawns a stdio server per agent, `src/mcp/tools.rs` serves schemas, `src/mcp/handlers.rs` proxies each call to the daemon API. Shared helpers (messaging, fleet mutation, branch validation) live in `src/agent_ops.rs` and are called from both sides; `tests/no_dual_track_drift.rs` enforces no drift between `agent_ops.rs` and `mcp/handlers.rs`.
-4. All tool calls flow: **agent → MCP stdio server → daemon loopback API → `src/api/handlers/*` → registry / inbox / fleet**. `start_instance` is handled inline by `src/mcp/handlers.rs` (no daemon round-trip) since Task #12.
-
-## Schemas in Code
-
-The authoritative source is `src/mcp/tools.rs`. If this doc drifts, regenerate by reading that file; the unit test `tool_count_at_least_35` guards against accidental removals.
+### `task_sweep_config`
+Configure GitHub-PR auto-close sweep daemon.
+- repo, dry_run, pause
