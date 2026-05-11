@@ -366,6 +366,13 @@ mod tests {
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        // Override backend_command to "codex" for ACK absorption check
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let configs: &'static crate::api::ConfigRegistry =
@@ -793,7 +800,7 @@ mod tests {
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
             name: "codex-agent",
-            backend_command: "codex",
+            backend_command: crate::default_shell(),
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,
             cols: 80,
@@ -806,6 +813,13 @@ mod tests {
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        // Override backend_command to "codex" for ACK absorption check
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let configs: &'static crate::api::ConfigRegistry =
@@ -862,7 +876,7 @@ mod tests {
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
             name: "codex-agent",
-            backend_command: "codex",
+            backend_command: crate::default_shell(),
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,
             cols: 80,
@@ -875,6 +889,13 @@ mod tests {
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        // Override backend_command to "codex" for ACK absorption check
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let configs: &'static crate::api::ConfigRegistry =
