@@ -94,9 +94,7 @@ pub(crate) fn scan_and_emit(
 }
 
 fn emit_stale_alert(home: &Path, agent: &str, condition: &str, elapsed_min: i64) {
-    let text = format!(
-        "[waiting_on_stale] {agent}: waiting on \"{condition}\" for {elapsed_min}m"
-    );
+    let text = format!("[waiting_on_stale] {agent}: waiting on \"{condition}\" for {elapsed_min}m");
     // Alert the agent itself
     emit_to(home, agent, "waiting_on_stale", &text, Some(agent));
     // Alert team orchestrator (if any)
@@ -140,7 +138,11 @@ fn emit_to(home: &Path, recipient: &str, kind: &str, text: &str, correlation_age
     if let Err(e) = crate::inbox::enqueue(home, recipient, msg) {
         tracing::warn!(error = %e, recipient, kind, "waiting_on_stale: enqueue failed");
     } else {
-        tracing::info!(recipient, agent = correlation_agent.unwrap_or(""), "waiting_on_stale: emitted alert");
+        tracing::info!(
+            recipient,
+            agent = correlation_agent.unwrap_or(""),
+            "waiting_on_stale: emitted alert"
+        );
     }
 }
 
@@ -223,7 +225,11 @@ mod tests {
         let first_count = count_lines();
 
         scan_and_emit(&home, &mut last_alerted);
-        assert_eq!(count_lines(), first_count, "dedup should suppress second alert");
+        assert_eq!(
+            count_lines(),
+            first_count,
+            "dedup should suppress second alert"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
