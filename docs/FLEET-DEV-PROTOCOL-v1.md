@@ -313,6 +313,14 @@ Impl/reviewer must use worktrees. `git worktree add -b <branch> <path> origin/ma
 ### 12.5 Spawn Site Rationale
 Every spawn must have `// fire-and-forget: <reason>` OR store JoinHandle. Test-only exempt.
 
+### 12.6 Multi-PR Wave Sequential Merge
+When multiple PRs ship in the same wave (same dispatch/task_id):
+1. Merge sequentially: A → rebase B on new main → re-verify CI → merge B → ...
+2. Never parallel merge — later PRs have stale base
+3. After each merge, remaining PRs must rebase and re-run CI before merge
+
+Daemon enforcement: `send(sequencing: "sequential-merge-only")` signals this constraint to downstream agents. Recipients MUST merge one at a time and verify CI between each merge.
+
 ## §13. `AGEND_GIT_BYPASS=1` Usage
 
 **TL;DR:** emergency override only. Default is bare `git`. Bypass when shim explicitly denies AND the operation is on the required-bypass list below.
