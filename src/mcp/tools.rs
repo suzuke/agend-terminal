@@ -229,7 +229,8 @@ fn ci_tools() -> Vec<Value> {
                 "action": {"type": "string", "enum": ["watch", "unwatch", "status"]},
                 "repo": {"type": "string", "description": "GitHub repo (owner/repo). Required for watch/unwatch; optional filter for status."},
                 "branch": {"type": "string", "description": "Branch to watch (default: main); optional filter for status."},
-                "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"}
+                "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
+                "next_after_ci": {"type": "string", "description": "Instance to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to this target."}
             }, "required": ["action"]}}),
     ]
 }

@@ -310,6 +310,10 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     watch["expires_at"] = json!((chrono::Utc::now()
         + chrono::Duration::hours(crate::daemon::ci_watch::WATCH_TTL_HOURS))
     .to_rfc3339());
+    // Issue #650: store next_after_ci for auto-routing on CI pass
+    if let Some(next) = args["next_after_ci"].as_str().filter(|s| !s.is_empty()) {
+        watch["next_after_ci"] = json!(next);
+    }
 
     let _ = crate::store::atomic_write(
         &watch_path,

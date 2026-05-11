@@ -2018,6 +2018,28 @@ async fn ci_check_repo(
         new_notified_sha = Some(sha.to_string());
     }
 
+    // Issue #650: auto-route [ci-ready-for-action] to next_after_ci target on pass
+    if new_notified_sha.is_some() {
+        if let Ok(content) = std::fs::read_to_string(watch_path) {
+            if let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(next) = watch["next_after_ci"].as_str().filter(|s| !s.is_empty()) {
+                    // Only route on success (not failure)
+                    let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
+                    if last_conclusion == Some("success") {
+                        let msg = format!(
+                            "[ci-ready-for-action] {repo}@{branch}: CI passed, your turn.\r"
+                        );
+                        let reg = agent::lock_registry(registry);
+                        if let Some(handle) = reg.get(next) {
+                            let _ = agent::inject_to_agent(handle, msg.as_bytes());
+                        }
+                        drop(reg);
+                    }
+                }
+            }
+        }
+    }
+
     update_watch_state_with_notify(
         watch_path,
         Some(max_notified_id),
