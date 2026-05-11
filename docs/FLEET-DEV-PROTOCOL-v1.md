@@ -253,6 +253,15 @@ Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/Aut
 - **Never** `git worktree add <path> main` — locks main, breaks operator builds. Always use `-b <new-branch>`. Recovery: `cd <worktree> && git switch -c <dedicated-branch>`
 - **Generic `bind_self` (Sprint 54 P1-7)**: any agent (lead, dev, reviewer, …) may proactively claim a worktree via `bind_self {repo, branch}` without going through the dispatch hook. Inherits every dispatch invariant — Phase 1 trailers, P0-1.5 cross-agent registry, P0-1.6 actual-HEAD verification, P0-X release_worktree as sole exit, source_repo persistence, auto watch_ci. Use case: lead orchestrator escalating to Path A IMPL on a hot branch. Pair with `release_worktree` to unbind. `main`/`master` rejected with E4.5; cross-agent branch conflicts return `code: cross_agent_conflict`.
 
+### release_worktree branch-cleanup scope
+
+`release_worktree` auto-cleanup ONLY operates on branches that satisfy ALL of:
+1. The worktree was daemon-managed (`.agend-managed` marker verified)
+2. The branch is confirmed merged into main OR remote tracking ref is gone (squash-merge)
+3. Protected refs (main/master) are NEVER touched
+
+User-checkout branches, operator-created worktrees without `.agend-managed` marker, and any branch where the marker cannot be verified are NEVER deleted.
+
 ## §11. Tool Quick Reference
 
 | Need | Use | NOT this |

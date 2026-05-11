@@ -105,7 +105,13 @@ pub struct ReleaseOutcome {
 }
 
 /// Attempt to delete a local branch if it has been merged into main or its
-/// remote tracking ref is gone (squash-merge detection).
+/// Delete the local branch ref after worktree release, IFF:
+/// - `managed_verified` is true (caller confirmed .agend-managed marker)
+/// - Branch is merged into main OR remote tracking ref is gone
+///
+/// SAFETY: This function ONLY receives the branch from the daemon's own
+/// binding record. User-checkout branches are never passed here because
+/// release_full gates on the .agend-managed marker.
 ///
 /// Returns `(deleted, skip_reason)`:
 /// - `(true, None)` — branch was deleted
@@ -1439,6 +1445,58 @@ mod tests {
             .unwrap_or(false);
         assert!(branch_exists, "branch must survive dry-run");
 
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn release_full_does_not_delete_unrelated_branch() {
+        let home = tmp_home("unrelated-branch");
+        let repo = tmp_repo("unrelated-branch-repo");
+        // Create an unrelated user branch with its own commit
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "user/my-feature"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "user work",
+            ])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "main"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        // Lease a different branch
+        let _l = lease(&home, &repo, "agent-x", "feat/daemon-task").expect("lease");
+        let outcome = release_full(&home, "agent-x", false);
+        assert!(outcome.released);
+        // Unrelated branch must still exist
+        let branch_exists = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "user/my-feature"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(
+            branch_exists,
+            "unrelated user branch must NOT be deleted by release_worktree"
+        );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
