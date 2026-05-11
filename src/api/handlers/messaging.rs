@@ -170,15 +170,21 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             .unwrap_or(false);
         let kind = params["kind"].as_str().unwrap_or("");
         drop(reg);
-        let is_cross_team = {
+        let (is_cross_team, is_orchestrator) = {
             let sender_team = crate::teams::find_team_for(ctx.home, from);
             let target_team = crate::teams::find_team_for(ctx.home, target);
-            match (sender_team, target_team) {
+            let orchestrator = target_team
+                .as_ref()
+                .map(|t| t.orchestrator.as_deref() == Some(target))
+                .unwrap_or(false);
+            let cross = match (sender_team, target_team) {
                 (Some(s), Some(t)) => s.name != t.name,
                 _ => true, // no team = treat as cross-team (safe default)
-            }
+            };
+            (cross, orchestrator)
         };
-        let skip_inject = is_codex && matches!(kind, "update" | "report") && !is_cross_team;
+        let skip_inject =
+            is_codex && matches!(kind, "update" | "report") && !is_cross_team && !is_orchestrator;
         if skip_inject {
             crate::event_log::log(
                 ctx.home,
