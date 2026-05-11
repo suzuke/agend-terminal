@@ -120,6 +120,14 @@ fn cleanup_merged_branch(
         return (false, Some(format!("branch '{branch}' is protected")));
     }
 
+    // Prune stale remote refs before remote-gone detection
+    // (GitHub deletes remote branch on merge but local ref may be stale)
+    let _ = std::process::Command::new("git")
+        .args(["fetch", "--prune", "origin"])
+        .current_dir(source_repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+
     // Check if branch is ancestor of main (fast-forward or true merge).
     let is_merged = std::process::Command::new("git")
         .args(["merge-base", "--is-ancestor", branch, "main"])
