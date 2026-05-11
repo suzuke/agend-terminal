@@ -150,17 +150,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     {
         format!("{} (use inbox tool)", crate::inbox::format_header(&msg))
     } else {
-        let display_text = if text.chars().count() > 200 {
-            format!(
-                "{}... (use inbox tool)",
-                text.chars().take(200).collect::<String>()
-            )
-        } else {
-            text.to_string()
-        };
-        format!(
-            "[from:{from}] {display_text} (Reply using send_to_instance MCP tool, NOT direct text)"
-        )
+        format!("[from:{from}] {text}")
     };
 
     let reg = agent::lock_registry(ctx.registry);

@@ -1245,18 +1245,38 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
         // H1: collect all bytes first, then write in short lock bursts.
         // Previous pattern held pty_writer lock for 2ms × N bytes (~20s for 10KB).
         let all_bytes: Vec<u8> = prefix.iter().chain(text_bytes.iter()).copied().collect();
-        for chunk in all_bytes.chunks(64) {
+
+        // Issue #658: system headers ([AGEND-MSG] / [from:) must be written
+        // atomically — chunking splits them across PTY reads, causing parse
+        // failures in the receiving agent. Write header line as single unit,
+        // then chunk only the body. Use `stripped` (ANSI-free) for detection
+        // since raw text may have color escapes before the bracket.
+        let is_system_header =
+            stripped.starts_with("[AGEND-MSG]") || stripped.starts_with("[from:");
+        let (atomic_part, chunk_part) = if is_system_header {
+            match all_bytes.iter().position(|&b| b == b'\n') {
+                Some(pos) => all_bytes.split_at(pos + 1),
+                None => (all_bytes.as_slice(), &[] as &[u8]),
+            }
+        } else {
+            (&[] as &[u8], all_bytes.as_slice())
+        };
+
+        if !atomic_part.is_empty() {
             let mut w = agent.pty_writer.lock();
-            // Sprint 54 F1: write chunk-at-a-time and flush once. Prevents
-            // the "ESC interpreted as keypress" race by keeping ANSI-free
-            // sequences contiguous.
+            w.write_all(atomic_part)?;
+            w.flush()?;
+            drop(w);
+            std::thread::sleep(std::time::Duration::from_millis(
+                2 * atomic_part.len() as u64,
+            ));
+        }
+
+        for chunk in chunk_part.chunks(64) {
+            let mut w = agent.pty_writer.lock();
             w.write_all(chunk)?;
             w.flush()?;
             drop(w);
-            // Inter-chunk pacing: 2ms per byte (=128ms for a full 64-byte chunk).
-            // This is byte-rate-limited backpressure, not a fixed inter-chunk
-            // delay — keeps lock-burst duration proportional to payload size so
-            // small messages still feel responsive.
             std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
         }
     } else {
@@ -2050,5 +2070,26 @@ Allow Trust All Tools mode?
             "expected NotFound, got: {result:?}"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Issue #658 regression: ANSI-colorized [AGEND-MSG] header must be
+    /// detected as system header for atomic write (uses stripped text).
+    #[test]
+    fn ansi_header_detected_as_system_header() {
+        // Simulate ANSI-wrapped header
+        let raw =
+            "\x1b[1;34m[AGEND-MSG]\x1b[0m from=lead kind=task size=500 (use inbox tool)\nBody here";
+        let stripped = strip_ansi(raw);
+        assert!(
+            stripped.starts_with("[AGEND-MSG]"),
+            "stripped should start with [AGEND-MSG], got: {stripped}"
+        );
+
+        let raw_from = "\x1b[32m[from:lead-kiro]\x1b[0m hello world";
+        let stripped_from = strip_ansi(raw_from);
+        assert!(
+            stripped_from.starts_with("[from:"),
+            "stripped should start with [from:, got: {stripped_from}"
+        );
     }
 }
