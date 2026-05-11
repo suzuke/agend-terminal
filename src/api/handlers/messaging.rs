@@ -172,7 +172,13 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
                 _ => true, // no team = treat as cross-team (safe default)
             }
         };
-        let skip_inject = is_codex && matches!(kind, "update" | "report") && !is_cross_team;
+        // Issue #656: orchestrators must always receive PTY inject so they
+        // can react to status updates from team members.
+        let is_orchestrator = crate::teams::find_team_for(ctx.home, target)
+            .and_then(|t| t.orchestrator)
+            .is_some_and(|orch| orch == target);
+        let skip_inject =
+            is_codex && matches!(kind, "update" | "report") && !is_cross_team && !is_orchestrator;
         if skip_inject {
             crate::event_log::log(
                 ctx.home,
@@ -917,6 +923,199 @@ mod tests {
             result["delivery_mode"].as_str(),
             Some("pty"),
             "cross-team message must NOT be absorbed: {result}"
+        );
+        let reg = agent::lock_registry(registry);
+        if let Some(h) = reg.get("codex-agent") {
+            let _ = h.child.lock().kill();
+        }
+        drop(reg);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn same_team_codex_update_orchestrator_not_skipped() {
+        let home = tmp_home("orch-not-skip");
+        // codex-agent is the orchestrator of team-a
+        let yaml = "instances:\n  sender:\n    backend: claude\n  codex-agent:\n    backend: codex\n\
+                    teams:\n  team-a:\n    members:\n      - sender\n      - codex-agent\n    orchestrator: codex-agent\n    created_at: \"2026-01-01T00:00:00Z\"\n";
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: "codex-agent",
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        let result = handle_send(
+            &json!({"from": "sender", "target": "codex-agent", "text": "status update", "kind": "update"}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("pty"),
+            "orchestrator must NOT be skipped even for same-team codex update: {result}"
+        );
+        let reg = agent::lock_registry(registry);
+        if let Some(h) = reg.get("codex-agent") {
+            let _ = h.child.lock().kill();
+        }
+        drop(reg);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn same_team_codex_update_non_orchestrator_skipped() {
+        let home = tmp_home("non-orch-skip");
+        // codex-agent is NOT the orchestrator (lead is)
+        let yaml = "instances:\n  sender:\n    backend: claude\n  codex-agent:\n    backend: codex\n  lead:\n    backend: claude\n\
+                    teams:\n  team-a:\n    members:\n      - sender\n      - codex-agent\n      - lead\n    orchestrator: lead\n    created_at: \"2026-01-01T00:00:00Z\"\n";
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: "codex-agent",
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        let result = handle_send(
+            &json!({"from": "sender", "target": "codex-agent", "text": "status update", "kind": "update"}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "non-orchestrator codex must be skipped for same-team update: {result}"
+        );
+        let reg = agent::lock_registry(registry);
+        if let Some(h) = reg.get("codex-agent") {
+            let _ = h.child.lock().kill();
+        }
+        drop(reg);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cross_team_codex_update_orchestrator_not_skipped() {
+        let home = tmp_home("cross-orch-no-skip");
+        // codex-agent is orchestrator, sender is "general" (cross-team bus)
+        let yaml = "instances:\n  general:\n    backend: claude\n  codex-agent:\n    backend: codex\n\
+                    teams:\n  team-a:\n    members:\n      - general\n    created_at: \"2026-01-01T00:00:00Z\"\n\
+                    \n  team-b:\n    members:\n      - codex-agent\n    orchestrator: codex-agent\n    created_at: \"2026-01-01T00:00:00Z\"\n";
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: "codex-agent",
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        let result = handle_send(
+            &json!({"from": "general", "target": "codex-agent", "text": "cross-team update", "kind": "update"}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("pty"),
+            "cross-team message must NOT be absorbed regardless of orchestrator: {result}"
         );
         let reg = agent::lock_registry(registry);
         if let Some(h) = reg.get("codex-agent") {
