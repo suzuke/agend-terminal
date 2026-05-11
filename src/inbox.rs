@@ -2346,6 +2346,10 @@ mod tests {
                 targets: vec!["kiro-cli-ea377a".into(), "kiro-cli-4e8a78".into()],
                 count: 2,
             }),
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(
@@ -2388,6 +2392,10 @@ mod tests {
                 targets: vec!["a".into(), "b".into(), "c".into()],
                 count: 3,
             }),
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let header = format_header(&msg);
         assert!(header.contains("broadcast=3"), "{header}");
@@ -2471,6 +2479,10 @@ mod tests {
                 targets: vec!["a".into(), "b".into()],
                 count: 2,
             }),
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
         };
         let json = serde_json::to_string(&with_ctx).expect("ser");
         assert!(json.contains("broadcast_context"));
