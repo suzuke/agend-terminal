@@ -222,6 +222,8 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // compiled-in registry. Closes the PR-5 → PR-4 chicken-and-egg loop.
     let mut mcp_registry_tracker =
         crate::daemon::mcp_registry_watcher::McpRegistryWatcherTracker::default();
+    let mut waiting_on_stale_tracker =
+        crate::daemon::waiting_on_stale::WaitingOnStaleTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -232,6 +234,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         decision_timeout_tracker.maybe_scan(&home);
         helper_staleness_tracker.maybe_scan(&home);
         mcp_registry_tracker.maybe_scan(&home);
+        waiting_on_stale_tracker.maybe_scan(&home);
     }
 }
 
