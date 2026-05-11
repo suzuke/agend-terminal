@@ -1,4 +1,4 @@
-# AgEnD MCP Tools Reference (32 tools)
+# AgEnD MCP Tools Reference (29 tools)
 
 ## Action-based Tools
 
@@ -63,10 +63,6 @@ Reply to the user via the active channel (NOT for inter-agent use).
 - **text**: reply content
 - default_action, timeout_secs
 
-### `react`
-React to a message with an emoji.
-- **emoji**: reaction emoji
-
 ### `download_attachment`
 Download a file attachment (telegram multimedia). Returns local path.
 - **file_id**: attachment file ID
@@ -86,10 +82,6 @@ Stop and remove an instance.
 ### `start_instance`
 Start a stopped instance.
 - **name**: instance to start
-
-### `describe_instance`
-Get detailed info about an instance.
-- **name**: instance to describe
 
 ### `replace_instance`
 Replace an instance with a fresh one.
@@ -153,9 +145,6 @@ List Phase 4 GC candidates without deleting. Non-destructive.
 - format (human / json)
 
 ## Daemon Operations
-
-### `restart_daemon`
-Trigger programmatic daemon restart with state preservation. Idempotent. No parameters.
 
 ### `task_sweep_config`
 Configure GitHub-PR auto-close sweep daemon.

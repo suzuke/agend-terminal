@@ -38,9 +38,6 @@ fn channel_tools() -> Vec<Value> {
                 "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."}
             }, "required": ["text"]},
             "requires_daemon_state": true}),
-        json!({"name": "react", "description": "React to a message with an emoji. Requires daemon API.",
-            "inputSchema": {"type": "object", "properties": {"emoji": {"type": "string"}}, "required": ["emoji"]},
-            "requires_daemon_state": true}),
         json!({"name": "download_attachment", "description": "Download a file attachment (telegram multimedia: images, audio, documents). Returns local path. Requires daemon API.",
             "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]},
             "requires_daemon_state": true}),
@@ -86,8 +83,8 @@ fn comm_tools() -> Vec<Value> {
 
 fn instance_tools() -> Vec<Value> {
     vec![
-        json!({"name": "list_instances", "description": "List all active agent instances.",
-            "inputSchema": {"type": "object", "properties": {}}}),
+        json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `name` for detailed info on a single instance.",
+            "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "description": "Optional: instance name for detailed info"}}}}),
         json!({"name": "create_instance", "description": "Create agent instance(s). Team modes: (a) homogeneous — count:3, backend:\"claude\", team:\"dev\" → dev-1..dev-3 all claude; (b) heterogeneous — backends:[\"codex\",\"kiro-cli\",\"gemini\"], team:\"mixed\" → mixed-1=codex, mixed-2=kiro-cli, mixed-3=gemini, all grouped in one tab.",
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Instance name (single instance) or base name (ignored when team is set — team name is used as prefix)"},
@@ -107,8 +104,6 @@ fn instance_tools() -> Vec<Value> {
         json!({"name": "delete_instance", "description": "Stop and remove an instance.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
         json!({"name": "start_instance", "description": "Start a stopped instance.",
-            "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
-        json!({"name": "describe_instance", "description": "Get detailed info about an instance.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}),
         json!({"name": "replace_instance", "description": "Replace an instance with a fresh one.",
             "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "reason": {"type": "string"}}, "required": ["name"]}}),
@@ -306,9 +301,6 @@ fn worktree_tools() -> Vec<Value> {
         // restart automatically since it's already on disk; PTY
         // agents are killed and operator re-attaches post-restart
         // (MVP scope).
-        json!({"name": "restart_daemon", "description": "Trigger a programmatic daemon restart with minimal-state-preservation semantics. Records OperatorRestart shutdown reason, drains the API loop, runs the standard shutdown sequence (terminates PTY agents), then re-execs self with the same args (Unix) or spawn-and-exit (Windows). On-disk state (binding metadata, topic registry, fleet.yaml) is preserved automatically; operators re-attach PTY agents post-restart. Idempotent (concurrent calls return code=already_pending). Sprint 60 W1 PR-3 closes the operator-restart-required SPOF that drove the Sprint 59 PR-4 (P3) abandon path.",
-            "inputSchema": {"type": "object", "properties": {}, "required": []},
-            "requires_daemon_state": true}),
         // Sprint 58 Wave 3 PR-2 (#8): daemon-side binding diagnostic.
         // Operator + agent introspection surface for lease-block recovery
         // debugging. Reports binding.json + on-disk worktree state +
@@ -463,12 +455,9 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            32,
-            "Sprint 60 W1 PR-3 tool count = 32 (restart_daemon added \
-             on top of Sprint 59 Wave 1 PR-5's 31). Operator restart \
-             MCP tool closes the operator-restart-required SPOF that \
-             drove the Sprint 59 PR-4 (P3) abandon path. Current \
-             tools: {:?}",
+            29,
+            "Sprint 61 tool slim: 32 - react - describe_instance - restart_daemon = 29. \
+             Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())

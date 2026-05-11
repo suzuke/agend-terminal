@@ -227,7 +227,6 @@ pub(crate) fn build_instructions_body(
     );
     content.push_str("  - Threading: `thread_id`, `parent_id`\n");
     content.push_str("- `inbox` — check pending OR query specific. No params = drain pending. With `message_id` = describe message status. With `thread_id` = fetch thread messages.\n");
-    content.push_str("- `react` — emoji reaction on a previously-observed message (lightweight ack, no inbox message on recipient)\n");
     content.push_str("- `reply` — reply to operator/user via the active channel (NOT for inter-agent — use `send`)\n");
     content.push_str("- `list_instances` — see all running agents\n");
     content.push_str("- `download_attachment` — download a telegram multimedia attachment (images / audio / documents) by `file_id`. Use when an inbox message contains `attachments=[...]` and you need the actual media bytes.\n\n");
@@ -253,9 +252,8 @@ pub(crate) fn build_instructions_body(
          - `query` — requires reply (other instance is waiting)\n\
          - `task` — may require reply after work (see Fleet Protocol §4 ack absorption)\n\
          - `report` / `update` — do NOT reply unless you have new information to add\n\n\
-         For acknowledgement without triggering a reply loop, use the `react` MCP tool \
-         (emoji reaction; no inbox message on recipient side). \
-         Pure ack messages (\"收到\", \"OK\", \"👍\") should use `react`, not `send`.\n\
+         For acknowledgement without triggering a reply loop, simply do not reply. \
+         Pure ack messages (\"收到\", \"OK\", \"👍\") do not need a response — ACK absorption (§4) handles this automatically.\n\
          When sending kind=report, include `parent_id` (the message you're replying to) \
          and `correlation_id` (the task board ID) for correlation tracking.\n\
          If you receive a `send` with kind=task while already working on an active review \
@@ -1156,8 +1154,8 @@ mod tests {
     fn react_tool_mentioned_in_prompt() {
         let body = build_instructions_body(None, None);
         assert!(
-            body.contains("react"),
-            "prompt must mention react tool for ack without reply loop"
+            body.contains("do not reply"),
+            "prompt must mention ack-without-reply guidance"
         );
     }
 

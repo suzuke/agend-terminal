@@ -7,7 +7,11 @@ use std::path::Path;
 
 use super::err_needs_identity;
 
-pub(super) fn handle_list_instances(home: &Path, instance_name: &str) -> Value {
+pub(super) fn handle_list_instances(home: &Path, args: &Value, instance_name: &str) -> Value {
+    // If `name` param is provided, return detailed info for that instance (replaces describe_instance)
+    if let Some(target) = args["name"].as_str().filter(|s| !s.is_empty()) {
+        return handle_describe_instance(home, &json!({"name": target}));
+    }
     match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
         Ok(resp) => {
             if let Some(agents) = resp["result"]["agents"].as_array() {

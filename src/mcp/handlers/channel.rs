@@ -105,24 +105,6 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     }
 }
 
-pub(super) fn handle_react(args: &Value, instance_name: &str) -> Value {
-    let emoji = args["emoji"].as_str().unwrap_or("").to_string();
-    let message_id = args["message_id"].as_str().map(String::from);
-    let Some(ch) = crate::channel::active_channel() else {
-        return json!({"error": "no active channel"});
-    };
-    match ch.send_from_agent(
-        instance_name,
-        crate::channel::AgentOutboundOp::React {
-            emoji: emoji.clone(),
-            message_id,
-        },
-    ) {
-        Ok(_) => json!({"emoji": emoji}),
-        Err(e) => json!({"error": format!("{e}")}),
-    }
-}
-
 pub(super) fn handle_download_attachment(home: &Path, args: &Value, instance_name: &str) -> Value {
     let file_id = match args["file_id"].as_str() {
         Some(f) => f,

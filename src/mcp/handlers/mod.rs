@@ -9,7 +9,6 @@ pub(crate) mod dispatch_hook;
 mod force_release;
 pub(crate) mod instance;
 pub(crate) mod instance_lifecycle;
-mod restart;
 mod schedule;
 pub(crate) mod sha_gate;
 mod task;
@@ -94,7 +93,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     match tool {
         // --- Channel ---
         "reply" => channel::handle_reply(&home, args, instance_name),
-        "react" => channel::handle_react(args, instance_name),
         "download_attachment" => channel::handle_download_attachment(&home, args, instance_name),
 
         // --- Cross-instance communication ---
@@ -110,11 +108,10 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
 
         // --- Instance management ---
-        "list_instances" => instance::handle_list_instances(&home, instance_name),
+        "list_instances" => instance::handle_list_instances(&home, args, instance_name),
         "create_instance" => instance::handle_create_instance(&home, args, instance_name),
         "delete_instance" => instance::handle_delete_instance(&home, args),
         "start_instance" => instance::handle_start_instance(&home, args),
-        "describe_instance" => instance::handle_describe_instance(&home, args),
         "replace_instance" => instance::handle_replace_instance(&home, args),
         "set_display_name" => instance::handle_set_display_name(&home, args, instance_name),
         "set_description" => instance::handle_set_description(&home, args, instance_name),
@@ -202,7 +199,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
 
         // --- Sprint 60 W1 PR-3 (#P0-3): operator restart MCP tool ---
-        "restart_daemon" => restart::handle_restart_daemon(&home, args, &sender),
 
         // --- Daemon binding-state diagnostic (Sprint 58 Wave 3 PR-2 #8) ---
         "binding_state" => binding_state::handle_binding_state(&home, args, &sender),

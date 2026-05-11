@@ -162,7 +162,7 @@ Use `send` for all inter-agent messaging:
 
 Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher relies on these as the loop closer; missing any forces them to poll, which is anti-pattern (see §7).
 
-- Pure ack → use `react` (emoji), not `send`
+- Pure ack → do not reply (ACK absorption §4 handles this automatically)
 - Response channel must match source channel
 - **Router-layer channel discipline (Sprint 52)**: daemon auto-mirrors agent direct text to the corresponding channel. Agent does not need to force `reply` tool — infrastructure handles routing.
 
@@ -281,7 +281,7 @@ User-checkout branches, operator-created worktrees without `.agend-managed` mark
 | Timeout | `replace_instance` | waiting forever |
 
 **Daemon-state error format (Sprint 54 #488 hotfix)**. Tools that
-depend on daemon-resident state — `reply`, `react`,
+depend on daemon-resident state — `reply`,
 `download_attachment` — never silently fall back to a local handler
 when the daemon is unreachable. They return a structured error of the
 form `tool '<NAME>' requires daemon API; not reachable: <CAUSE>`.
