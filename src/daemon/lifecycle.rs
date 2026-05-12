@@ -321,6 +321,7 @@ mod tests {
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),
             typed_inject: false,
+            spawned_at: std::time::Instant::now(),
         }
     }
 

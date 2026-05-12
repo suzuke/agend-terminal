@@ -278,6 +278,10 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
     );
 
+    // Brief pause after kill to let OS reclaim resources (ports, file locks)
+    // before spawning the replacement. Prevents startup race on fast exits.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     // Enqueue handover context for the new instance.
     let _ = crate::inbox::enqueue(
         home,

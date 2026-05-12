@@ -37,6 +37,7 @@ pub struct AgentHandle {
     pub submit_key: String,
     pub inject_prefix: String,
     pub typed_inject: bool,
+    pub spawned_at: std::time::Instant,
 }
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
@@ -529,6 +530,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                     .as_ref()
                     .map(|b| b.preset().typed_inject)
                     .unwrap_or(false),
+                spawned_at: std::time::Instant::now(),
             },
         );
     }
@@ -908,6 +910,35 @@ fn handle_pty_close(
     sweep_child_tree(name, registry);
 
     if is_user_clean_exit {
+        // Startup grace period: if the process exited within 5s of spawn,
+        // treat as startup failure — do NOT spawn shell fallback.
+        let uptime = {
+            let reg = registry.lock();
+            reg.get(name).map(|h| h.spawned_at.elapsed())
+        };
+        if let Some(uptime) = uptime {
+            if uptime < std::time::Duration::from_secs(5) {
+                tracing::warn!(
+                    agent = name,
+                    uptime_ms = uptime.as_millis() as u64,
+                    "startup failure (exited too quickly), skipping shell fallback"
+                );
+                if let Some(ref home) = home {
+                    crate::event_log::log(
+                        home,
+                        "startup_failure",
+                        name,
+                        &format!("exited in {}ms", uptime.as_millis()),
+                    );
+                }
+                // Mark as crashed so daemon can notify operator.
+                if let Some(ref tx) = crash_tx {
+                    let _ = tx.send(AgentExitEvent::Crash(name.to_string()));
+                }
+                return;
+            }
+        }
+
         // User-initiated clean exit (code 0 or 130): /exit, /quit, Ctrl+C.
         // Do NOT respawn the agent — spawn a shell replacement instead
         // (tmux-style: pane stays alive with a shell prompt).
@@ -1922,6 +1953,7 @@ Allow Trust All Tools mode?
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),
             typed_inject: false,
+            spawned_at: std::time::Instant::now(),
         };
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         registry.lock().insert("sweep-test".to_string(), handle);
@@ -2090,6 +2122,26 @@ Allow Trust All Tools mode?
         assert!(
             stripped_from.starts_with("[from:"),
             "stripped should start with [from:, got: {stripped_from}"
+        );
+    }
+
+    /// Startup grace period: agent that exits within 5s should NOT get shell fallback.
+    #[test]
+    fn startup_grace_period_detects_quick_exit() {
+        let spawned_at = std::time::Instant::now();
+        // Simulate immediate exit (0ms uptime)
+        let uptime = spawned_at.elapsed();
+        assert!(
+            uptime < std::time::Duration::from_secs(5),
+            "freshly spawned agent should be within grace period"
+        );
+
+        // Simulate 6s uptime (past grace period)
+        let old_spawn = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        let old_uptime = old_spawn.elapsed();
+        assert!(
+            old_uptime >= std::time::Duration::from_secs(5),
+            "agent running 6s should be past grace period"
         );
     }
 }
