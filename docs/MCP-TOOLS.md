@@ -1,4 +1,4 @@
-# AgEnD MCP Tools Reference (29 tools)
+# AgEnD MCP Tools Reference (30 tools)
 
 ## Action-based Tools
 
@@ -149,3 +149,11 @@ List Phase 4 GC candidates without deleting. Non-destructive.
 ### `task_sweep_config`
 Configure GitHub-PR auto-close sweep daemon.
 - repo, dry_run, pause
+
+### `restart_daemon`
+
+Request graceful daemon restart. Daemon exits with code 42; wrapper script restarts it. Idempotent.
+
+**Note**: All agent PTY sessions will be interrupted. Persistent state (tasks, bindings, ci_watch) survives; in-flight inbox messages may be lost.
+
+**Parameters**: None.

@@ -8,6 +8,13 @@ use std::path::{Path, PathBuf};
 /// Marker file placed in daemon-managed worktrees (R14 mitigation).
 const MANAGED_MARKER: &str = ".agend-managed";
 
+/// Root directory for daemon-managed worktrees in the new layout.
+/// `<home>/worktrees/` — contains `<agent>/<branch>/` subdirectories.
+/// Used by lease, gc_candidates, and reconcile_hooks.
+pub fn daemon_managed_worktree_root(home: &Path) -> PathBuf {
+    home.join("worktrees")
+}
+
 /// A lease on a worktree — returned by `lease()`, consumed by `release()`.
 #[derive(Debug, Clone)]
 pub struct WorktreeLease {
@@ -525,31 +532,54 @@ pub struct GcCandidate {
 /// Scan for GC candidates: daemon-tagged, past grace TTL, not pinned, no active binding.
 pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
     let mut candidates = Vec::new();
-    let workspace = home.join("workspace");
-    if !workspace.exists() {
-        return candidates;
-    }
 
-    // Scan all .worktrees subdirectories.
-    if let Ok(entries) = std::fs::read_dir(&workspace) {
-        for entry in entries.flatten() {
-            let wt_base = entry.path().join(".worktrees");
-            if !wt_base.is_dir() {
-                continue;
-            }
-            if let Ok(wts) = std::fs::read_dir(&wt_base) {
-                for wt in wts.flatten() {
-                    let wt_path = wt.path();
-                    if !wt_path.is_dir() {
-                        continue;
-                    }
-                    if let Some(candidate) = evaluate_candidate(home, &wt_path) {
-                        candidates.push(candidate);
+    // New layout: <home>/worktrees/<agent>/<branch>/
+    let new_root = daemon_managed_worktree_root(home);
+    if new_root.is_dir() {
+        if let Ok(agents) = std::fs::read_dir(&new_root) {
+            for agent_entry in agents.flatten() {
+                if !agent_entry.path().is_dir() {
+                    continue;
+                }
+                if let Ok(branches) = std::fs::read_dir(agent_entry.path()) {
+                    for branch_entry in branches.flatten() {
+                        let wt_path = branch_entry.path();
+                        if !wt_path.is_dir() {
+                            continue;
+                        }
+                        if let Some(candidate) = evaluate_candidate(home, &wt_path) {
+                            candidates.push(candidate);
+                        }
                     }
                 }
             }
         }
     }
+
+    // Legacy layout: <home>/workspace/*/.worktrees/*/
+    let workspace = home.join("workspace");
+    if workspace.exists() {
+        if let Ok(entries) = std::fs::read_dir(&workspace) {
+            for entry in entries.flatten() {
+                let wt_base = entry.path().join(".worktrees");
+                if !wt_base.is_dir() {
+                    continue;
+                }
+                if let Ok(wts) = std::fs::read_dir(&wt_base) {
+                    for wt in wts.flatten() {
+                        let wt_path = wt.path();
+                        if !wt_path.is_dir() {
+                            continue;
+                        }
+                        if let Some(candidate) = evaluate_candidate(home, &wt_path) {
+                            candidates.push(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     candidates
 }
 
@@ -562,16 +592,37 @@ fn evaluate_candidate(home: &Path, wt_path: &Path) -> Option<GcCandidate> {
     if is_pinned(wt_path) {
         return None;
     }
+    // Resolve agent name: read from .agend-managed marker (authoritative),
+    // fall back to parent dir name (new layout) or file_name (legacy).
+    let marker = wt_path.join(MANAGED_MARKER);
+    let marker_content = std::fs::read_to_string(&marker).unwrap_or_default();
+    let agent_name = marker_content
+        .lines()
+        .find(|l| l.starts_with("agent="))
+        .and_then(|l| l.strip_prefix("agent="))
+        .map(String::from)
+        .or_else(|| {
+            // New layout: <home>/worktrees/<agent>/<branch>/ → parent is agent
+            wt_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(String::from)
+        })
+        .unwrap_or_default();
+    if agent_name.is_empty() {
+        return None;
+    }
     // Must not have active binding.
-    let agent_name = wt_path.file_name()?.to_string_lossy().to_string();
     if crate::binding::read(home, &agent_name).is_some() {
         return None;
     }
     // Must be past grace TTL (check released_at in .agend-managed marker).
     // If no released_at, worktree is still active (not yet released) → not a candidate.
-    let marker = wt_path.join(MANAGED_MARKER);
-    let content = std::fs::read_to_string(&marker).unwrap_or_default();
-    if let Some(released_line) = content.lines().find(|l| l.starts_with("released_at=")) {
+    if let Some(released_line) = marker_content
+        .lines()
+        .find(|l| l.starts_with("released_at="))
+    {
         let ts = released_line.strip_prefix("released_at=").unwrap_or("");
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
             let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
@@ -1498,5 +1549,56 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn gc_new_layout_active_binding_not_candidate() {
+        let home = tmp_home("gc-new-active");
+        // Create new-layout worktree with active binding
+        let wt = home.join("worktrees").join("dev-1").join("feat-branch");
+        std::fs::create_dir_all(&wt).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::hours(100)).to_rfc3339();
+        std::fs::write(
+            wt.join(MANAGED_MARKER),
+            format!("agent=dev-1\nbranch=feat-branch\nleased_at={old}\nreleased_at={old}\n"),
+        )
+        .unwrap();
+        // Create active binding for dev-1
+        let rt = home.join("runtime").join("dev-1");
+        std::fs::create_dir_all(&rt).unwrap();
+        std::fs::write(
+            rt.join("binding.json"),
+            r#"{"worktree":"/tmp/x","branch":"feat-branch"}"#,
+        )
+        .unwrap();
+
+        let candidates = gc_candidates(&home);
+        assert!(
+            candidates.is_empty(),
+            "new-layout worktree with active binding must not be GC candidate"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn gc_new_layout_released_past_grace_is_candidate() {
+        let home = tmp_home("gc-new-released");
+        let wt = home.join("worktrees").join("dev-2").join("old-branch");
+        std::fs::create_dir_all(&wt).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::hours(100)).to_rfc3339();
+        std::fs::write(
+            wt.join(MANAGED_MARKER),
+            format!("agent=dev-2\nbranch=old-branch\nleased_at={old}\nreleased_at={old}\n"),
+        )
+        .unwrap();
+        // No binding for dev-2
+
+        let candidates = gc_candidates(&home);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "new-layout released worktree past grace should be GC candidate"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

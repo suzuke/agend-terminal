@@ -71,6 +71,8 @@ pub struct SweepConfig {
     /// - off: no compliance checks
     /// - warn: log violations, send telegram alert, but don't block
     /// - enforce: same as warn (future: block non-compliant merges)
+    // "enforce" is reserved for future pre-merge gate integration.
+    // Currently behaves identically to "warn" (post-merge alert only).
     #[serde(default = "default_compliance_mode")]
     pub compliance_mode: String,
     /// Cursor: last merged_at timestamp we've scanned for compliance.

@@ -143,11 +143,30 @@ pub fn install_hooks(home: &Path, worktree: &Path) {
 
 /// Install hooks on all existing worktrees (daemon startup reconcile).
 pub fn reconcile_hooks(home: &Path) {
+    // New layout: <home>/worktrees/<agent>/<branch>/
+    let new_root = crate::worktree_pool::daemon_managed_worktree_root(home);
+    if new_root.is_dir() {
+        if let Ok(agents) = std::fs::read_dir(&new_root) {
+            for agent_entry in agents.flatten() {
+                if !agent_entry.path().is_dir() {
+                    continue;
+                }
+                if let Ok(branches) = std::fs::read_dir(agent_entry.path()) {
+                    for branch_entry in branches.flatten() {
+                        if branch_entry.path().is_dir() {
+                            install_hooks(home, &branch_entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Legacy layout: <home>/workspace/*/.worktrees/*/
     let worktrees_base = home.join("workspace");
     if !worktrees_base.exists() {
         return;
     }
-    // Scan for .worktrees directories in workspace subdirs.
     if let Ok(entries) = std::fs::read_dir(&worktrees_base) {
         for entry in entries.flatten() {
             let wt_dir = entry.path().join(".worktrees");
