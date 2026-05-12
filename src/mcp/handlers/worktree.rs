@@ -75,6 +75,18 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     }
     let source_repo_path = source_repo_arg.map(std::path::PathBuf::from);
 
+    // Issue #689: reject path traversal in source_repo
+    if let Some(ref p) = source_repo_path {
+        if p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return json!({
+                "error": "source_repo must not contain '..' (path traversal rejected)",
+                "code": "path_traversal"
+            });
+        }
+    }
+
     if args["rebase_mode"].as_bool().unwrap_or(false) {
         if let Err(e) = crate::mcp::handlers::force_release::rebase_clean_self(home, agent, branch)
         {
@@ -701,6 +713,35 @@ mod tests {
             agents.contains(&"agent-prod"),
             "agent-prod must appear in candidates: {agents:?}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod path_traversal_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn source_repo_with_dotdot_rejected() {
+        let home = std::env::temp_dir().join("pt-test-1");
+        std::fs::create_dir_all(&home).ok();
+        let args = json!({"branch": "feat-x", "source_repo": "/tmp/../etc/passwd"});
+        let sender = Some(crate::identity::Sender::new("agent-1").unwrap());
+        let result = handle_bind_self(&home, &args, &sender);
+        assert_eq!(result["code"].as_str(), Some("path_traversal"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn nested_traversal_rejected() {
+        let home = std::env::temp_dir().join("pt-test-2");
+        std::fs::create_dir_all(&home).ok();
+        let args = json!({"branch": "feat-x", "source_repo": "/home/user/foo/../../etc"});
+        let sender = Some(crate::identity::Sender::new("agent-2").unwrap());
+        let result = handle_bind_self(&home, &args, &sender);
+        assert_eq!(result["code"].as_str(), Some("path_traversal"));
         std::fs::remove_dir_all(&home).ok();
     }
 }
