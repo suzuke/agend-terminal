@@ -79,10 +79,11 @@ pub fn read_cookie(run_dir: &Path) -> Result<Cookie> {
     Ok(bytes)
 }
 
-/// Compare 32-byte cookie. Sprint 29 over-engineering audit #6: localhost
-/// loopback jitter (~10-100µs) far exceeds the timing difference of a
-/// short-circuit 32-byte comparison (~ns), so timing-attack hardening is
-/// not applicable in this threat model. Plain `==` is sufficient.
+/// Verify the auth cookie using constant-time comparison.
+///
+/// Defense-in-depth: although the API is localhost-only and same-user,
+/// constant-time comparison prevents timing side-channels if the threat
+/// model ever expands (e.g. container-shared localhost).
 pub fn verify(expected: &Cookie, actual: &[u8]) -> bool {
     // H2: constant-time comparison to prevent timing side-channel
     if actual.len() != expected.len() {
