@@ -143,6 +143,32 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             worktree_binding_required: params["worktree_binding_required"].as_bool(),
         }
     };
+
+    // Issue #664 L4b: worktree marker check for high-risk ops.
+    // When kind=task + worktree_binding_required=true, verify target is in
+    // a daemon-managed worktree before dispatching.
+    if params["kind"].as_str() == Some("task")
+        && params["worktree_binding_required"].as_bool() == Some(true)
+    {
+        let mode =
+            std::env::var("AGEND_WORKTREE_ENFORCEMENT").unwrap_or_else(|_| "warn".to_string());
+        if mode != "off" && !crate::binding::is_agent_in_managed_worktree(ctx.home, target) {
+            if mode == "enforce" {
+                return json!({
+                    "ok": false,
+                    "error": "agent not bound in daemon-managed worktree",
+                    "hint": "call bind_self first",
+                    "code": "worktree_not_managed"
+                });
+            }
+            // warn mode: log but allow
+            tracing::warn!(
+                target,
+                "worktree marker check: agent not in managed worktree (warn mode, allowing)"
+            );
+        }
+    }
+
     let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
 
     let inject_msg = if crate::inbox::pointer_only_inject()
