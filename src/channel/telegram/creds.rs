@@ -13,7 +13,7 @@ pub(super) fn resolve_channel() -> anyhow::Result<(TelegramCreds, crate::fleet::
 pub(super) fn resolve_channel_from(
     home: &std::path::Path,
 ) -> anyhow::Result<(TelegramCreds, crate::fleet::FleetConfig)> {
-    let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))?;
+    let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))?;
     match &config.channel {
         Some(crate::fleet::ChannelConfig::Telegram {
             bot_token_env,

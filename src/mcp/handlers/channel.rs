@@ -40,7 +40,7 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
             crate::daemon::decision_timeout::mark_resolved_for_sender(home, instance_name);
     }
 
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
         return json!({"error": "No fleet.yaml — cannot send reply"});
     }

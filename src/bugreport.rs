@@ -45,7 +45,7 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     for (title, path, redact, fallback) in [
         (
             "Fleet Config (tokens redacted)",
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(home),
             true,
             "(not found)",
         ),

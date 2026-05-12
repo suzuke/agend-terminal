@@ -306,7 +306,7 @@ instances:
     command: /bin/true
     topic_id: 42
 ";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         std::fs::create_dir_all(home.join("channel")).ok();
         std::fs::write(home.join("channel").join("topics.json"), "{\"B\":42}")
             .expect("write topics.json");
@@ -320,7 +320,8 @@ instances:
             "inject_provenance should bubble the forced error"
         );
 
-        let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        let fleet_yaml =
+            std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read fleet.yaml");
         assert!(
             fleet_yaml.contains("B:"),
             "provenance failure mutated fleet.yaml (removed B): {fleet_yaml}"
@@ -353,7 +354,7 @@ instances:
     command: /bin/true
     topic_id: 42
 ";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         std::fs::create_dir_all(home.join("channel")).ok();
         std::fs::write(home.join("channel").join("topics.json"), "{\"B\":42}")
             .expect("write topics.json");
@@ -364,13 +365,14 @@ instances:
         let res = try_telegram_reply_from(&home, "B", "main-path send");
         assert!(res.is_err());
 
-        let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        let fleet_yaml =
+            std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read fleet.yaml");
         assert!(
             fleet_yaml.contains("B:"),
             "Sprint 23 P1: instance must survive topic invalidation; yaml was:\n{fleet_yaml}"
         );
-        let config =
-            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("load fleet.yaml");
+        let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("load fleet.yaml");
         let inst_b = config.instances.get("B").expect("B exists");
         assert_eq!(
             inst_b.topic_id, None,
@@ -402,7 +404,7 @@ instances:
     command: /bin/true
     topic_id: 42
 ";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         register_topic(&home, 42, "agent-x");
         std::env::set_var("SPRINT23_P1_FAKE_TOKEN", "fake");
 
@@ -417,7 +419,8 @@ instances:
             "stale topic 42 must be unregistered after retry; reg={reg:?}"
         );
 
-        let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        let fleet_yaml =
+            std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read fleet.yaml");
         assert!(
             fleet_yaml.contains("agent-x"),
             "instance must survive topic invalidation; yaml:\n{fleet_yaml}"
@@ -442,7 +445,7 @@ instances:
     command: /bin/true
     topic_id: 42
 ";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         register_topic(&home, 42, "agent-x");
         std::env::set_var("SPRINT23_P1_FAKE_TOKEN2", "fake");
 
@@ -465,7 +468,7 @@ instances:
     // ── Sprint 56 Track A — supergroup migration self-heal ───────────
 
     fn read_channel_group_id(home: &std::path::Path) -> Option<i64> {
-        let text = std::fs::read_to_string(home.join("fleet.yaml")).ok()?;
+        let text = std::fs::read_to_string(crate::fleet::fleet_yaml_path(home)).ok()?;
         let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
         doc.get("channel")
             .and_then(|c| c.get("group_id"))
@@ -489,7 +492,7 @@ instances:
     command: /bin/true
     topic_id: 42
 ";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         register_topic(&home, 42, "agent-x");
         std::env::set_var("SPRINT56_FAKE_TOKEN", "fake");
 
@@ -538,7 +541,7 @@ instances:
     command: /bin/true
     topic_id: 42
 ";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         register_topic(&home, 42, "agent-x");
         std::env::set_var("SPRINT56_FAKE_TOKEN_2", "fake");
 

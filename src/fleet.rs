@@ -4,6 +4,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Single source of truth for the fleet configuration filename.
+pub const FLEET_YAML_FILENAME: &str = "fleet.yaml";
+
+/// Canonical path to fleet.yaml given a home directory.
+pub fn fleet_yaml_path(home: &Path) -> PathBuf {
+    home.join(FLEET_YAML_FILENAME)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FleetConfig {
     #[serde(default)]
@@ -577,7 +585,7 @@ pub struct InstanceYamlEntry {
 /// Caller must hold the file lock.
 fn atomic_write_yaml(home: &Path, doc: &serde_yaml_ng::Value) -> Result<()> {
     let yaml = serde_yaml_ng::to_string(doc).context("Failed to serialize fleet.yaml")?;
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = fleet_yaml_path(home);
     // Use the shared helper so fsync-before-rename is uniform across the
     // codebase. The previous write→rename (no fsync) left a crash window
     // where the renamed-over fleet.yaml could be truncated on power loss.
@@ -603,7 +611,7 @@ fn mutate_fleet_yaml(
     default_content: &str,
     mutate: impl FnOnce(&mut serde_yaml_ng::Value) -> Result<()>,
 ) -> Result<()> {
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = fleet_yaml_path(home);
     if default_content.is_empty() && !fleet_path.exists() {
         return Ok(());
     }
@@ -1472,7 +1480,7 @@ instances:
     }
 
     fn read_channel_group_id(home: &Path) -> Option<i64> {
-        let text = std::fs::read_to_string(home.join("fleet.yaml")).ok()?;
+        let text = std::fs::read_to_string(fleet_yaml_path(home)).ok()?;
         let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
         doc.get("channel")
             .and_then(|c| c.get("group_id"))
@@ -2792,7 +2800,7 @@ instances:
     }
 
     fn read_yaml(home: &std::path::Path) -> serde_yaml_ng::Value {
-        let content = std::fs::read_to_string(home.join("fleet.yaml")).expect("read");
+        let content = std::fs::read_to_string(fleet_yaml_path(home)).expect("read");
         serde_yaml_ng::from_str(&content).expect("parse")
     }
 
@@ -2845,7 +2853,7 @@ instances:
         // OVERWRITE existing.
         let home = merge_tmp_home("rule-1-overwrite");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  dev:\n    backend: claude\n    source_repo: /old/path\n    role: \
              developer\n",
         )
@@ -2880,7 +2888,7 @@ instances:
         // know about must survive the merge unchanged.
         let home = merge_tmp_home("rule-2-deep-merge");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  dev:\n    backend: claude\n    role: developer\n    custom_operator_field: \
              my-special-value\n    display_name: Friendly Dev\n",
         )
@@ -2908,7 +2916,7 @@ instances:
         // both sides changed incompatibly → error with diff.
         let home = merge_tmp_home("rule-3-conflict");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  dev:\n    backend: claude\n    role: senior-dev\n",
         )
         .unwrap();
@@ -2946,7 +2954,7 @@ instances:
         // no error, no spurious churn.
         let home = merge_tmp_home("idempotent");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  dev:\n    backend: claude\n    role: developer\n    source_repo: /x\n",
         )
         .unwrap();
@@ -2973,7 +2981,7 @@ instances:
         // explicitly supplies.
         let home = merge_tmp_home("first-time-migration");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  reviewer:\n    backend: claude\n    role: code-reviewer\n    \
              instructions: ./reviewer-instructions.md\n",
         )
@@ -3003,7 +3011,7 @@ instances:
         // mapping created from the entry.
         let home = merge_tmp_home("new-instance");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  existing:\n    backend: claude\n",
         )
         .unwrap();
@@ -3031,7 +3039,7 @@ instances:
         // and the merge contract says daemon wins.
         let home = merge_tmp_home("daemon-managed-no-error");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  dev:\n    backend: claude\n    source_repo: /operator-edit\n",
         )
         .unwrap();
@@ -3062,7 +3070,7 @@ instances:
         // randomize order on every write.
         let home = merge_tmp_home("ordering");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  dev:\n    role: developer\n    backend: claude\n    \
              working_directory: /workspace/dev\n",
         )
@@ -3076,7 +3084,7 @@ instances:
         };
         add_instances_to_yaml(&home, &[("dev", &entry)]).unwrap();
 
-        let content = std::fs::read_to_string(home.join("fleet.yaml")).unwrap();
+        let content = std::fs::read_to_string(fleet_yaml_path(&home)).unwrap();
         // role should come before backend in the rewritten file.
         let role_pos = content.find("role:").expect("role present");
         let backend_pos = content.find("backend:").expect("backend present");
@@ -3095,7 +3103,7 @@ instances:
         // succeed). Pin the all-or-nothing semantic.
         let home = merge_tmp_home("multi-atomic");
         std::fs::write(
-            home.join("fleet.yaml"),
+            fleet_yaml_path(&home),
             "instances:\n  alpha:\n    role: senior-dev\n  beta:\n    role: junior-dev\n",
         )
         .unwrap();

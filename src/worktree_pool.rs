@@ -423,7 +423,7 @@ pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
 /// subscriber list. Best-effort: read/parse/write failures are
 /// logged but never abort release.
 fn unsubscribe_all_ci_watches_for_agent(home: &Path, agent: &str) {
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     let Ok(entries) = std::fs::read_dir(&ci_dir) else {
         return;
     };
@@ -1201,7 +1201,7 @@ mod tests {
         branch: &str,
         subscribers: &[&str],
     ) -> PathBuf {
-        let ci_dir = home.join("ci-watches");
+        let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
         std::fs::create_dir_all(&ci_dir).ok();
         let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
         let path = ci_dir.join(&filename);

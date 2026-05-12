@@ -350,7 +350,7 @@ mod tests {
             .output()
             .ok();
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(home),
             format!(
                 "instances:\n  {agent}:\n    backend: claude\n    working_directory: {}\n",
                 repo.display()

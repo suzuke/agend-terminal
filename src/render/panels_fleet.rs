@@ -150,10 +150,11 @@ pub(super) fn render_fleet_view(
     home: &std::path::Path,
 ) {
     let teams = crate::teams::list_all(home);
-    let all_instances: Vec<String> = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
-        .ok()
-        .map(|c| c.instance_names())
-        .unwrap_or_default();
+    let all_instances: Vec<String> =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .map(|c| c.instance_names())
+            .unwrap_or_default();
     let text_lines = build_fleet_view_lines(tasks, &teams, &all_instances);
 
     let lines: Vec<Line> = if text_lines.is_empty() {

@@ -366,13 +366,13 @@ instances:
     command: /bin/true
     topic_id: 99
 ";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         register_topic(&home, 42, "agent-x");
 
         let _ = invalidate_and_recreate_topic(&home, "agent-x", 42);
 
-        let config =
-            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("load fleet.yaml");
+        let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("load fleet.yaml");
         let agent_x = config.instances.get("agent-x").expect("agent-x exists");
         assert_eq!(
             agent_x.topic_id, None,
@@ -393,12 +393,13 @@ instances:
     topic_id: 42
     role: important
 ";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         register_topic(&home, 42, "agent-x");
 
         let _ = invalidate_and_recreate_topic(&home, "agent-x", 42);
 
-        let fleet_yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("read fleet.yaml");
+        let fleet_yaml =
+            std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("read fleet.yaml");
         assert!(
             fleet_yaml.contains("agent-x"),
             "instance must survive invalidation; yaml:\n{fleet_yaml}"
@@ -451,11 +452,11 @@ instances:
         let yaml = format!(
             "channel:\n  type: telegram\n  bot_token_env: AGEND_BOT_TOKEN\n  group_id: {group_id}\n  mode: {mode}\n  user_allowlist:\n  - 42\n"
         );
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).expect("write fleet.yaml");
     }
 
     fn channel_group_id_from_yaml(home: &std::path::Path) -> Option<i64> {
-        let text = std::fs::read_to_string(home.join("fleet.yaml")).ok()?;
+        let text = std::fs::read_to_string(crate::fleet::fleet_yaml_path(home)).ok()?;
         let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
         doc.get("channel")
             .and_then(|c| c.get("group_id"))

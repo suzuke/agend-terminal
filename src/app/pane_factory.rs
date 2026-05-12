@@ -260,7 +260,7 @@ pub(super) fn create_pane_from_resolved(
     spawn_mode: crate::backend::SpawnMode,
 ) -> Result<Pane> {
     // Build fleet peer list for agent instructions
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     let peers: Vec<(String, Option<String>)> = crate::fleet::FleetConfig::load(&fleet_path)
         .map(|f| {
             f.instances
@@ -417,7 +417,7 @@ pub(super) fn unique_fleet_name(home: &Path, base: &str) -> String {
 /// collision-skip path (a random `short_id()` lands in a pre-seeded collision
 /// bucket with probability ~10⁻⁷, so the tests would otherwise be vacuous).
 fn unique_fleet_name_with(home: &Path, base: &str, mut ids: impl Iterator<Item = u32>) -> String {
-    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     let taken = |name: &str| -> bool {
         if fleet
             .as_ref()

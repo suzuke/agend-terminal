@@ -126,7 +126,7 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
 /// formatted as `"<repo>:<branch>"` for terse human reading. Empty
 /// list when the watches dir doesn't exist or the agent isn't on any.
 fn enumerate_ci_watches_for_agent(home: &Path, agent: &str) -> Vec<String> {
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     let Ok(entries) = std::fs::read_dir(&ci_dir) else {
         return Vec::new();
     };
@@ -489,7 +489,7 @@ mod tests {
         // existing cleanup) — operators can verify pre/post-release
         // that watches were removed.
         let home = tmp_home("watches");
-        let ci_dir = home.join("ci-watches");
+        let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
         std::fs::create_dir_all(&ci_dir).unwrap();
         let watch = json!({
             "repo": "owner/repo",

@@ -31,7 +31,7 @@ impl Team {
 }
 
 fn load_fleet(home: &Path) -> crate::fleet::FleetConfig {
-    crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap_or_default()
+    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).unwrap_or_default()
 }
 
 /// Project a fleet.yaml `(name, TeamConfig)` pair into the public `Team`
@@ -565,7 +565,7 @@ mod tests {
     fn fleet_yaml_seed_team_visible_on_first_read() {
         let home = tmp_home("seed_visible");
         let yaml = "teams:\n  ops:\n    members: [alice, bob]\n    orchestrator: alice\n";
-        std::fs::write(home.join("fleet.yaml"), yaml).expect("write fleet.yaml");
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).expect("write fleet.yaml");
         let members = get_members(&home, "ops");
         assert_eq!(members, vec!["alice", "bob"]);
         let listed = list(&home);
@@ -586,7 +586,7 @@ mod tests {
             }),
         );
         assert_eq!(result["status"], "created");
-        let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let team = fleet.teams.get("dev").unwrap();
         assert_eq!(
             team.source_repo.as_deref(),
@@ -615,7 +615,7 @@ mod tests {
             }),
         );
         assert_eq!(result["status"], "updated");
-        let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let team = fleet.teams.get("dev").unwrap();
         assert_eq!(
             team.source_repo.as_deref(),

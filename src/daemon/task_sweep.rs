@@ -209,7 +209,7 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
     // mismatch — see `docs/RCA-issue-496-task-sweep-no-auto-close-2026-05-08.md`.
     // `Option<FleetConfig>` because a missing/malformed fleet.yaml must
     // not abort the sweep — fall back to direct compare for compat.
-    let fleet_cfg = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+    let fleet_cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
 
     // Snapshot of currently-open tasks. Read from tasks::list_all (the
     // PR2 bridge-phase legacy reader); PR3 cutover switches this to

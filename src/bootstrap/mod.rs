@@ -269,7 +269,7 @@ mod tests {
     }
 
     fn write_minimal_fleet(home: &Path) -> PathBuf {
-        let path = home.join("fleet.yaml");
+        let path = crate::fleet::fleet_yaml_path(home);
         std::fs::write(
             &path,
             "defaults:\n  backend: claude\ninstances:\n  worker:\n    backend: claude\n",
@@ -279,7 +279,7 @@ mod tests {
     }
 
     fn write_fleet_with_extra_instructions(home: &Path) -> PathBuf {
-        let path = home.join("fleet.yaml");
+        let path = crate::fleet::fleet_yaml_path(home);
         let instructions_dir = home.join("instructions");
         std::fs::create_dir_all(&instructions_dir).expect("mkdir instructions");
         std::fs::write(

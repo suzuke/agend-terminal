@@ -154,7 +154,7 @@ pub fn resolve_instance(
     home: &std::path::Path,
     name_or_id: &str,
 ) -> Result<(crate::types::InstanceId, String), ResolveError> {
-    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .unwrap_or_default();
 
@@ -1394,7 +1394,7 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
         // then chunk only the body. Use `stripped` (ANSI-free) for detection
         // since raw text may have color escapes before the bracket.
         let is_system_header =
-            stripped.starts_with("[AGEND-MSG]") || stripped.starts_with("[from:");
+            stripped.starts_with(crate::inbox::SYSTEM_MSG_PREFIX) || stripped.starts_with("[from:");
         let (atomic_part, chunk_part) = if is_system_header {
             match all_bytes.iter().position(|&b| b == b'\n') {
                 Some(pos) => all_bytes.split_at(pos + 1),
@@ -2182,7 +2182,7 @@ Allow Trust All Tools mode?
             "defaults:\n  backend: claude\ninstances:\n  dev:\n    id: \"{}\"\n    role: Test\n",
             id.full()
         );
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let (resolved_id, resolved_name) = resolve_instance(&home, "dev").unwrap();
         assert_eq!(resolved_id, id);
         assert_eq!(resolved_name, "dev");
@@ -2196,7 +2196,7 @@ Allow Trust All Tools mode?
         // Verify that a non-existent name returns NotFound.
         let home = resolve_test_home("notfound");
         let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n";
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let result = resolve_instance(&home, "nonexistent");
         assert!(
             matches!(result, Err(ResolveError::NotFound(_))),

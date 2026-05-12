@@ -104,7 +104,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
 ) -> Result<(), String> {
     let _guard = BindGuard::try_acquire(home, target)?;
 
-    let resolved = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|f| f.resolve_instance(target));
     let source_repo = resolve_source_repo(home, target, source_repo_override, resolved.as_ref());
@@ -221,7 +221,7 @@ fn resolve_source_repo(
 
 /// Resolve source_repo from the agent's team configuration.
 pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathBuf> {
-    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok()?;
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
     for cfg in fleet.teams.values() {
         if cfg.members.contains(&agent.to_string()) {
             return cfg.source_repo.clone();

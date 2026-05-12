@@ -33,7 +33,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
         "spawn" | "vsplit" | "hsplit" => {
             let base_name = parts.get(1).unwrap_or(&"agent");
             let backend_name = parts.get(2).unwrap_or(&"claude");
-            let fleet_path = ctx.home.join("fleet.yaml");
+            let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
             let pc = cols.saturating_sub(2);
             let pr = rows.saturating_sub(4);
@@ -195,7 +195,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
 
                     let pane_result = if let Some(ref fname) = fleet_name {
                         // Fleet agent — resolve from fleet.yaml (full config)
-                        let fleet_path = ctx.home.join("fleet.yaml");
+                        let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
                         let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
                         if let Some(resolved) =
                             fleet.as_ref().and_then(|f| f.resolve_instance(fname))

@@ -318,7 +318,7 @@ pub(crate) fn check_pane_input_not_submitted_for_agents(
 /// the agent's backend via fleet.yaml so per-instance overrides are
 /// honoured.
 fn pane_input_backend_supported(home: &std::path::Path, agent: &str) -> bool {
-    let Ok(fleet) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) else {
+    let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
         return false;
     };
     let Some(resolved) = fleet.resolve_instance(agent) else {
@@ -1748,7 +1748,7 @@ mod tests {
     fn fleet_with_backend(tag: &str, agent_name: &str, backend_cmd: &str) -> std::path::PathBuf {
         let home = tmp_home(tag);
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             format!(
                 "instances:\n  {agent_name}:\n    backend: {backend_cmd}\n    \
                  working_directory: \"/tmp\"\n"

@@ -77,7 +77,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
     }
 
     // Load fleet.yaml to find template definition
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
         return serde_json::json!({"error": "No fleet.yaml"});
     }
@@ -562,7 +562,7 @@ pub(crate) fn reconcile_orphan_deployments(home: &Path) -> Vec<String> {
     // Snapshot current fleet.yaml instance set. If fleet.yaml fails to load,
     // bail out with an empty result so a transient parse error doesn't wipe
     // the deployment store.
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     let live_instances: std::collections::HashSet<String> = match crate::fleet::FleetConfig::load(
         &fleet_path,
     ) {
@@ -724,7 +724,7 @@ templates:
         backend: kiro-cli
         role: implementer
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         let args = serde_json::json!({
             "template": "dev",
@@ -732,8 +732,8 @@ templates:
         });
         let _ = deploy(&home, "caller", &args);
 
-        let reloaded =
-            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("reload fleet.yaml");
+        let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("reload fleet.yaml");
         let lead = reloaded
             .instances
             .get("dev-lead")
@@ -766,12 +766,13 @@ templates:
         backend: claude
         description: orchestrator via alias
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
         let _ = deploy(&home, "caller", &args);
 
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         assert_eq!(
             reloaded
                 .instances
@@ -794,12 +795,13 @@ templates:
         backend: claude
         instructions: ./instructions/lead.md
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
         let _ = deploy(&home, "caller", &args);
 
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         assert_eq!(
             reloaded
                 .instances
@@ -826,13 +828,14 @@ templates:
           - --model
           - opus
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let inst = reloaded.instances.get("dev-worker").expect("dev-worker");
         assert_eq!(
             inst.args,
@@ -856,13 +859,14 @@ templates:
         backend: claude
         model: opus
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let inst = reloaded
             .instances
             .get("dev-specialist")
@@ -884,13 +888,14 @@ templates:
           MCP_SERVER_URL: https://example.com
           DEBUG: "1"
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let inst = reloaded.instances.get("dev-worker").expect("dev-worker");
         assert_eq!(
             inst.env.get("MCP_SERVER_URL").map(|s| s.as_str()),
@@ -911,13 +916,14 @@ templates:
         backend: claude
         ready_pattern: "ready for input"
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let inst = reloaded.instances.get("dev-worker").expect("dev-worker");
         assert_eq!(inst.ready_pattern.as_deref(), Some("ready for input"));
         std::fs::remove_dir_all(&home).ok();
@@ -939,13 +945,14 @@ templates:
       impl:
         backend: claude
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let reviewer = reloaded
             .instances
             .get("dev-reviewer")
@@ -975,13 +982,14 @@ templates:
         backend: claude
         command: ./scripts/my-runner.sh
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let inst = reloaded.instances.get("dev-script").expect("dev-script");
         assert_eq!(
             inst.command.as_deref(),
@@ -1008,13 +1016,14 @@ templates:
         backend: claude
         role: orchestrator
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let inst = reloaded.instances.get("dev-lead").expect("dev-lead");
         assert!(
             inst.args.is_empty(),
@@ -1063,13 +1072,14 @@ templates:
         command: my-runner
         worktree: false
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
             &serde_json::json!({"template": "full", "directory": home.display().to_string()}),
         );
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let inst = reloaded.instances.get("full-worker").expect("full-worker");
         assert_eq!(inst.args, vec!["--resume".to_string()]);
         assert_eq!(inst.model.as_deref(), Some("sonnet"));
@@ -1093,12 +1103,13 @@ templates:
       lead:
         backend: claude
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         let args = serde_json::json!({"template": "dev", "directory": home.display().to_string()});
         let _ = deploy(&home, "caller", &args);
 
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let lead = reloaded.instances.get("dev-lead").expect("dev-lead");
         assert!(
             lead.role.is_none(),
@@ -1128,7 +1139,7 @@ instances:
     backend: claude
     role: survivor
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         let _ = deploy(
             &home,
@@ -1136,15 +1147,15 @@ instances:
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
         // Sanity: deployed entries are there.
-        let after_deploy =
-            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("post-deploy");
+        let after_deploy = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("post-deploy");
         assert!(after_deploy.instances.contains_key("dev-lead"));
         assert!(after_deploy.instances.contains_key("dev-impl"));
 
         let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
 
-        let after_teardown =
-            crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("post-teardown");
+        let after_teardown = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("post-teardown");
         assert!(
             !after_teardown.instances.contains_key("dev-lead"),
             "deployed entry must be removed"
@@ -1179,7 +1190,7 @@ templates:
         backend: claude
         role: implementer
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         let _ = deploy(
             &home,
@@ -1213,7 +1224,7 @@ templates:
       impl:
         backend: claude
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         let _ = deploy(
             &home,
@@ -1257,7 +1268,7 @@ templates:
       impl-2:
         backend: kiro-cli
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         let _ = deploy(
             &home,
@@ -1265,7 +1276,8 @@ templates:
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
 
-        let reloaded = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let reloaded =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         let workdirs: std::collections::HashSet<String> = ["dev-lead", "dev-impl-1", "dev-impl-2"]
             .iter()
             .filter_map(|name| {
@@ -1312,7 +1324,7 @@ templates:
       good:
         backend: claude
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
 
         // Point the daemon-less API call at a non-running daemon: `api::call`
         // just returns an error, but `deploy` itself only tracks the names it
@@ -1354,7 +1366,7 @@ templates:
         backend: claude
 instances: {}
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
@@ -1386,7 +1398,7 @@ templates:
         backend: claude
 instances: {}
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
@@ -1418,7 +1430,7 @@ templates:
         backend: claude
 instances: {}
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
@@ -1426,7 +1438,8 @@ instances: {}
         );
         let _ = teardown(&home, &serde_json::json!({"name": "dev"}));
 
-        let config = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).expect("load fleet");
+        let config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("load fleet");
         assert!(
             !config.instances.contains_key("dev-impl"),
             "teardown must remove fleet entry to prevent respawn"
@@ -1460,7 +1473,7 @@ templates:
         backend: claude
 instances: {}
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
@@ -1520,7 +1533,7 @@ templates:
         backend: claude
 instances: {}
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
         let _ = deploy(
             &home,
             "caller",
@@ -1565,7 +1578,7 @@ instances: {}
         // — gets pruned on next `reconcile_orphans` call.
         let home = tmp_home("reconcile_orphans");
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "templates:\n  tpl:\n    instances:\n      worker:\n        backend: claude\ninstances: {}\n",
         )
         .unwrap();
@@ -1671,7 +1684,7 @@ instances: {}
         save(&home, &mut store).unwrap();
         // Empty fleet.yaml — simulates the "all instances closed" state
         // that triggers the prune branch in reconcile.
-        std::fs::write(home.join("fleet.yaml"), "instances: {}\n").unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
         (home, custom_root)
     }
 
@@ -1918,7 +1931,7 @@ instances: {}
         // Re-add one member back into fleet.yaml so reconcile sees it
         // as live and refuses to prune.
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "instances:\n  alive-team-a:\n    backend: claude\n",
         )
         .unwrap();

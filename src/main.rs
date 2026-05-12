@@ -522,7 +522,7 @@ fn main() -> anyhow::Result<()> {
 
             let fleet_path = fleet
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("fleet.yaml"));
+                .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));
             if !force_foreground {
                 // Sprint 57 Wave 3 PR-2 (#548 Q1) default branch: detach.
                 // Spawn self as a background process and exit. Child inherits

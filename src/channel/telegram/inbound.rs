@@ -57,7 +57,9 @@ pub(super) fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) ->
             return name;
         }
         // Unknown topic_id — reload from fleet.yaml
-        if let Ok(config) = crate::fleet::FleetConfig::load(&state.home.join("fleet.yaml")) {
+        if let Ok(config) =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&state.home))
+        {
             for (inst_name, inst) in &config.instances {
                 if inst.topic_id == Some(tid) {
                     state.topic_to_instance.insert(tid, inst_name.clone());

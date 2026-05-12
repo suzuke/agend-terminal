@@ -54,7 +54,7 @@ struct SessionPane {
 /// Sync fleet.yaml to match current pane state on detach.
 /// Removes fleet entries not present in any pane; adds panes with backend but missing from fleet.
 pub(super) fn sync_fleet_yaml(home: &Path, layout: &Layout) {
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     let fleet = fleet::FleetConfig::load(&fleet_path).ok();
 
     // Collect all fleet_instance_names currently in panes

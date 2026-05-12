@@ -27,7 +27,7 @@ fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
         .ok();
     // Write fleet.yaml so resolve_instance works.
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(home),
         format!(
             "instances:\n  {agent}:\n    backend: claude\n    working_directory: {}\n",
             repo.display()
@@ -87,7 +87,7 @@ fn lease_conflict_rejects_dispatch() {
     setup_test_repo(&home, "agent-a");
     setup_test_repo(&home, "agent-b");
     std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             format!("instances:\n  agent-a:\n    backend: claude\n    working_directory: {}\n  agent-b:\n    backend: claude\n    working_directory: {}\n",
                 home.join("workspace").join("agent-a").display(),
                 home.join("workspace").join("agent-b").display()),
@@ -259,7 +259,7 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
 
     let repo = home.join("workspace").join("agent-a");
     std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             // allow: shared-source_repo — this test exercises the central
             // lease registry's cross-agent collision rejection, which fires
             // precisely when two agents are bound to the same source repo
@@ -449,7 +449,7 @@ fn delegate_task_with_repo_creates_ci_watch() {
     assert!(result.is_ok(), "dispatch must succeed: {:?}", result.err());
 
     let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p02-with-repo");
-    let watch_path = home.join("ci-watches").join(&filename);
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
     assert!(
         watch_path.exists(),
         "watch file must exist at {}",
@@ -487,7 +487,7 @@ fn delegate_task_without_repo_no_ci_watch() {
     );
 
     // But ci-watches dir must be empty / non-existent (no auto-watch fired).
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
     let entries: Vec<_> = std::fs::read_dir(&ci_dir)
         .ok()
         .map(|rd| rd.flatten().collect())
@@ -520,7 +520,7 @@ fn delegate_task_idempotent_existing_watch() {
     assert!(r1.is_ok(), "first dispatch must succeed: {:?}", r1.err());
 
     let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p02-idem");
-    let watch_path = home.join("ci-watches").join(&filename);
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
     assert!(watch_path.exists(), "first dispatch must create watch");
 
     // Mutate watch state to simulate an in-flight poll, then re-dispatch.
@@ -540,7 +540,7 @@ fn delegate_task_idempotent_existing_watch() {
     assert!(r2.is_ok(), "re-dispatch must succeed: {:?}", r2.err());
 
     // ci-watches dir must still contain exactly one entry.
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
     let entry_count = std::fs::read_dir(&ci_dir)
         .expect("read ci-watches")
         .flatten()
@@ -599,7 +599,7 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
 
     // Production-smoke assertion: ci-watches entry must exist post-dispatch.
     let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p02-integration");
-    let watch_path = home.join("ci-watches").join(&filename);
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
     assert!(
         watch_path.exists(),
         "handle_delegate_task end-to-end must create ci-watches entry. \

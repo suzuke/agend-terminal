@@ -134,7 +134,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let home = crate::home_dir();
     let fleet_path = fleet_override
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| home.join("fleet.yaml"));
+        .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
@@ -796,7 +796,7 @@ fn pane_from_menu_item(
                 tracing::warn!(error = %e, "failed to write fleet.yaml");
             }
             // Resolve from fleet to get defaults merged
-            let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+            let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
             if let Some(resolved) = fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name)) {
                 pane_factory::create_pane_from_resolved(
                     &inst_name,

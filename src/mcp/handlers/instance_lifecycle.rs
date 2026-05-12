@@ -53,7 +53,7 @@ use std::path::Path;
 /// is a human-readable string listing the residual stores plus any
 /// per-step error captured during cleanup.
 pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
-    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     let (topic_id, working_dir) = fleet
         .as_ref()
         .and_then(|c| {
@@ -130,7 +130,7 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
 /// (disk-backed) where the silent-drop revival risk lives.
 pub(crate) fn name_residual_anywhere(home: &Path, name: &str) -> Vec<&'static str> {
     let mut sources: Vec<&'static str> = Vec::new();
-    if let Ok(cfg) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
+    if let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
         if cfg.instances.contains_key(name) {
             sources.push("fleet.yaml");
         }
@@ -206,7 +206,7 @@ mod tests {
     fn name_residual_anywhere_detects_fleet_yaml_instance_residual() {
         let home = tmp_home("fleet_yaml_inst");
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "instances:\n  zombie:\n    backend: claude\n",
         )
         .unwrap();
@@ -226,7 +226,7 @@ mod tests {
         // separately from the instances: stanza.
         let home = tmp_home("fleet_yaml_team");
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "teams:\n  ops:\n    members: [zombie, alice]\n    orchestrator: alice\n",
         )
         .unwrap();
@@ -288,7 +288,7 @@ mod tests {
         // as a missing entry in this list, not as a silent skip.
         let home = tmp_home("multi");
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "instances:\n  zombie:\n    backend: claude\n",
         )
         .unwrap();

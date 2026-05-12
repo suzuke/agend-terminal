@@ -90,7 +90,7 @@ instances:
   dev:
     role: "Developer"
 "#;
-    std::fs::write(home.join("fleet.yaml"), yaml).ok();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
     let key = get_submit_key(&home, "dev");
     // Claude Code preset submit_key is "\r" or similar
     assert!(!key.is_empty());
@@ -225,7 +225,7 @@ fn setup_recorder(tag: &str) -> (Arc<Recorder>, std::path::PathBuf) {
     // Minimal fleet so send_to's `get_submit_key` lookup resolves
     // (fallback path on unreachable daemon still needs submit_key).
     let yaml = "defaults:\n  backend: claude\ninstances:\n  target:\n    role: Test\n  sender:\n    role: Test\n";
-    std::fs::write(home.join("fleet.yaml"), yaml).ok();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
     let rec = Recorder::new();
     ux_sink_registry().clear_for_test();
     ux_sink_registry().register(rec.clone() as Arc<dyn UxEventSink>);
@@ -1121,7 +1121,7 @@ fn test_delegate_task_resolves_team_to_orchestrator_inbox() {
     // Sprint 54 fleet-yaml unification: instances + teams both live
     // in fleet.yaml. resolve_team_orchestrator now reads from there.
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  dev-lead:\n    backend: claude\n  dev-impl:\n    backend: claude\n\
          teams:\n  dev:\n    members: [dev-lead, dev-impl]\n    \
          orchestrator: dev-lead\n    created_at: \"2026-01-01T00:00:00Z\"\n",
@@ -1164,7 +1164,7 @@ fn test_send_to_inbox_fallback_mode() {
     let _g = fleet_test_guard();
     let home = tmp_home("delivery-fallback");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  receiver:\n    backend: claude\n",
     )
     .ok();
@@ -1246,7 +1246,7 @@ fn test_delegate_task_busy_returns_structured_response() {
     let _g = fleet_test_guard();
     let home = tmp_home("busy-gate");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -1285,7 +1285,7 @@ fn test_delegate_task_force_true_bypasses_busy_gate() {
     let _g = fleet_test_guard();
     let home = tmp_home("interrupt-bypass");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -1334,7 +1334,7 @@ fn test_delegate_task_force_true_without_reason_rejected() {
     let _g = fleet_test_guard();
     let home = tmp_home("interrupt-no-reason");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -1366,7 +1366,7 @@ fn test_delegate_task_idle_target_normal_delivery() {
     let _g = fleet_test_guard();
     let home = tmp_home("idle-target");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -1392,7 +1392,7 @@ fn test_delegate_task_second_reviewer_flag_requires_reason() {
     let _g = fleet_test_guard();
     let home = tmp_home("sr-no-reason");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -1418,7 +1418,7 @@ fn test_delegate_task_second_reviewer_with_reason_ok() {
     let _g = fleet_test_guard();
     let home = tmp_home("sr-with-reason");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -1450,7 +1450,7 @@ fn test_delegate_task_no_second_reviewer_flag_default_behavior() {
     let _g = fleet_test_guard();
     let home = tmp_home("sr-default");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -1534,7 +1534,7 @@ fn test_delegate_task_old_interrupt_true_still_works() {
     let _g = fleet_test_guard();
     let home = tmp_home("old-interrupt-compat");
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  target:\n    backend: claude\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -1594,7 +1594,7 @@ fn resolve_team_layout_auto_attaches_to_orchestrator() {
     let home = tmp_home("team_attach");
     // Sprint 54 fleet-yaml unification: teams in fleet.yaml.
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "teams:\n  dev:\n    members: [dev-lead, dev-impl-1]\n    \
          orchestrator: dev-lead\n    created_at: \"2026-01-01T00:00:00Z\"\n",
     )
@@ -1618,7 +1618,7 @@ fn resolve_team_layout_caller_override_preserved() {
     let home = tmp_home("override");
     // Sprint 54 fleet-yaml unification: teams in fleet.yaml.
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "teams:\n  dev:\n    members: [dev-lead, dev-impl-1]\n    \
          orchestrator: dev-lead\n    created_at: \"2026-01-01T00:00:00Z\"\n",
     )
@@ -1881,7 +1881,7 @@ fn reply_no_active_channel_returns_error() {
     let home = tmp_home("reply-no-ch");
     std::env::set_var("AGEND_HOME", &home);
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  sender:\n    backend: claude\n",
     )
     .ok();
@@ -2173,7 +2173,7 @@ fn broadcast_without_targets_sends_to_all() {
     let home = tmp_home("bcast-all");
     std::env::set_var("AGEND_HOME", &home);
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  sender:\n    backend: claude\n  target1:\n    backend: claude\n",
     )
     .ok();
@@ -2196,7 +2196,7 @@ fn broadcast_with_team_filter_targets_team_members() {
     std::env::set_var("AGEND_HOME", &home);
     // Sprint 54 fleet-yaml unification: instances + teams in fleet.yaml.
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  sender:\n    backend: claude\n  alice:\n    backend: claude\n  \
          bob:\n    backend: claude\nteams:\n  dev2:\n    members: [sender, alice]\n    \
          created_at: \"2026-01-01T00:00:00Z\"\n",
@@ -2431,7 +2431,7 @@ fn start_instance_response_shape_includes_structured_result() {
     std::env::set_var("AGEND_HOME", &home);
     // Set up fleet.yaml so start_instance can resolve the instance
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         "instances:\n  shape-agent:\n    backend: claude\n",
     )
     .ok();
@@ -2497,7 +2497,7 @@ fn delegate_task_instance_first_bypasses_team_orchestrator_collision() {
     let yaml = "defaults:\n  backend: claude\ninstances:\n  dev:\n    role: Test\n  \
                 lead:\n    role: Test\nteams:\n  dev:\n    members: [lead, dev]\n    \
                 orchestrator: lead\n    created_at: \"2026-04-30T00:00:00Z\"\n";
-    std::fs::write(home.join("fleet.yaml"), yaml).ok();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
 
     let result = handle_tool(
         "send",
@@ -2539,7 +2539,7 @@ fn m5_regression_via_id_routing() {
          orchestrator: lead\n    created_at: \"2026-04-30T00:00:00Z\"\n",
         id.full()
     );
-    std::fs::write(home.join("fleet.yaml"), &yaml).ok();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), &yaml).ok();
 
     let result = handle_tool(
         "send",
@@ -2568,7 +2568,7 @@ fn new_instance_writes_to_id_jsonl() {
         "defaults:\n  backend: claude\ninstances:\n  fresh:\n    id: \"{}\"\n    role: Test\n",
         id.full()
     );
-    std::fs::write(home.join("fleet.yaml"), &yaml).unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), &yaml).unwrap();
     let resolved = crate::inbox::inbox_path_resolved(&home, "fresh");
     assert!(
         resolved.to_string_lossy().contains(&id.full()),
@@ -2587,7 +2587,7 @@ fn legacy_instance_migration() {
         "defaults:\n  backend: claude\ninstances:\n  old:\n    id: \"{}\"\n    role: Test\n",
         id.full()
     );
-    std::fs::write(home.join("fleet.yaml"), &yaml).unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), &yaml).unwrap();
     // Create legacy name-based inbox file
     std::fs::create_dir_all(home.join("inbox")).unwrap();
     std::fs::write(home.join("inbox/old.jsonl"), "legacy data\n").unwrap();

@@ -136,7 +136,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| {
-            crate::fleet::FleetConfig::load(&ctx.home.join("fleet.yaml"))
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
                 .ok()
                 .and_then(|f| f.defaults.backend.map(|b| b.preset().command.to_string()))
                 .unwrap_or_else(|| "claude".to_string())
@@ -657,7 +657,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("agend-topic-persist-{}", std::process::id()));
         std::fs::create_dir_all(&home).ok();
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "instances:\n  agent1:\n    backend: claude\n",
         )
         .unwrap();
@@ -668,7 +668,7 @@ mod tests {
             serde_yaml_ng::Value::Number(serde_yaml_ng::Number::from(42)),
         )
         .unwrap();
-        let cfg = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).unwrap();
+        let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         assert_eq!(
             cfg.instances.get("agent1").and_then(|i| i.topic_id),
             Some(42),

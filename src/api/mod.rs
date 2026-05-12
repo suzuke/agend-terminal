@@ -940,7 +940,7 @@ mod tests {
         // First create a team via the teams store
         // Sprint 54 fleet-yaml unification: teams live in fleet.yaml.
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "teams:\n  t1:\n    members: [m1]\n    created_at: \"2026-01-01T00:00:00Z\"\n",
         )
         .unwrap();
@@ -1022,7 +1022,7 @@ mod tests {
         let (port, home, _notifier, shutdown) = start_test_server("send-char");
         // Target must exist in fleet.yaml for validation to pass.
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "instances:\n  receiver:\n    backend: claude\n",
         )
         .ok();
@@ -1329,7 +1329,7 @@ mod tests {
         // Pre-create team with members
         // Sprint 54 fleet-yaml unification: teams live in fleet.yaml.
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "teams:\n  t1:\n    members: [m1, m2]\n    created_at: \"2026-01-01T00:00:00Z\"\n",
         )
         .unwrap();
@@ -1362,7 +1362,7 @@ mod tests {
         // Pre-create team
         // Sprint 54 fleet-yaml unification: teams live in fleet.yaml.
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "teams:\n  t1:\n    members: [m1]\n    created_at: \"2026-01-01T00:00:00Z\"\n",
         )
         .unwrap();

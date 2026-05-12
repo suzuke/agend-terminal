@@ -127,7 +127,7 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
     if let Err(e) = crate::agent::validate_name(name) {
         return json!({"error": e});
     }
-    let fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml")).ok();
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     if let Some(ref config) = fleet {
         if config.channel.is_some()
             && config.instances.contains_key(name)
@@ -158,7 +158,7 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
     if let Err(e) = crate::agent::validate_name(name) {
         return json!({"error": e});
     }
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
         return json!({"error": "No fleet.yaml"});
     }
@@ -204,9 +204,10 @@ pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
                     merge_metadata(home, name, &mut info);
                     // Surface topic_id from fleet.yaml for debugging (#415).
                     if info.get("topic_id").is_none() {
-                        if let Some(tid) = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
-                            .ok()
-                            .and_then(|c| c.instances.get(name)?.topic_id)
+                        if let Some(tid) =
+                            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                                .ok()
+                                .and_then(|c| c.instances.get(name)?.topic_id)
                         {
                             info["topic_id"] = json!(tid);
                         }
@@ -233,7 +234,7 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
     // Capture backend + working_directory before kill so we can respawn.
     // Prefer fleet.yaml (short name like "claude") over LIST API (which may
     // store a resolved path). SPAWN expects the short preset name.
-    let fleet_resolved = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+    let fleet_resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|f| f.resolve_instance(name));
 
@@ -564,7 +565,7 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
         static DEDUP_SEQ: AtomicU64 = AtomicU64::new(0);
 
         let existing: std::collections::HashSet<String> =
-            crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .map(|c| c.instance_names().into_iter().collect())
                 .unwrap_or_default();
         if existing.contains(raw_name) {

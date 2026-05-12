@@ -46,7 +46,7 @@ fn write_binding(home: &Path, agent: &str, source_repo: &str, branch: &str) {
 }
 
 fn write_ci_watch(home: &Path, repo: &str, branch: &str, subs: &[&str]) -> std::path::PathBuf {
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     std::fs::create_dir_all(&ci_dir).ok();
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
     let path = ci_dir.join(&filename);
@@ -151,7 +151,7 @@ fn setup_git_repo_with_remote(home: &Path, agent: &str, origin_url: &str) -> std
         .env("AGEND_GIT_BYPASS", "1")
         .output();
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(home),
         format!(
             "instances:\n  {agent}:\n    backend: claude\n    working_directory: {}\n",
             repo.display()
@@ -387,7 +387,7 @@ fn ec6_dispatch_uses_fleet_source_repo_tier_when_present() {
         .env("AGEND_GIT_BYPASS", "1")
         .output();
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         format!(
             "instances:\n  alpha:\n    backend: claude\n    source_repo: {}\n",
             src.display()
@@ -441,7 +441,7 @@ fn ec4_fleet_repo_override_wins_over_derive() {
         .env("AGEND_GIT_BYPASS", "1")
         .output();
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         format!(
             "instances:\n  alpha:\n    backend: claude\n    source_repo: {}\n    repo: explicit/override\n",
             src.display()
@@ -453,7 +453,7 @@ fn ec4_fleet_repo_override_wins_over_derive() {
     let _ =
         super::dispatch_hook::dispatch_auto_bind_lease(&home, "alpha", "T-1", "feat-ec4o", None);
     let watch_filename = crate::daemon::ci_watch::watch_filename("explicit/override", "feat-ec4o");
-    let watch_path = home.join("ci-watches").join(&watch_filename);
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&watch_filename);
     assert!(
         watch_path.exists(),
         "ci-watch landed under fleet.yaml `repo:` override path: {}",
@@ -507,7 +507,7 @@ fn dispatch_with_source_repo_override_wins_over_fleet() {
         .output();
     // fleet.yaml points to a different (stub) source_repo
     std::fs::write(
-        home.join("fleet.yaml"),
+        crate::fleet::fleet_yaml_path(&home),
         format!(
             "instances:\n  alpha:\n    backend: claude\n    source_repo: {}\n",
             stub_src.display()

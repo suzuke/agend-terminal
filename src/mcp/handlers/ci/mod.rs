@@ -232,7 +232,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         return json!({"error": "Bitbucket Server not yet supported — track Sprint 41+ candidate. Use bitbucket_cloud for Bitbucket Cloud repos."});
     }
 
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     std::fs::create_dir_all(&ci_dir).ok();
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
     let watch_path = ci_dir.join(&filename);
@@ -386,7 +386,7 @@ pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
         .or_else(|| std::env::var("AGEND_INSTANCE_NAME").ok())
         .unwrap_or_default();
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
-    let path = home.join("ci-watches").join(&filename);
+    let path = crate::daemon::ci_watch::ci_watches_dir(home).join(&filename);
 
     let mut watch = match std::fs::read_to_string(&path)
         .ok()
@@ -460,7 +460,7 @@ pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
 pub(super) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
     let filter_repo = args["repo"].as_str();
     let filter_branch = args["branch"].as_str();
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     let entries = match std::fs::read_dir(&ci_dir) {
         Ok(e) => e,
         Err(_) => return json!({"watches": Vec::<Value>::new()}),

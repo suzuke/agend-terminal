@@ -54,7 +54,7 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
         .filter(|t| !t.is_empty());
 
     // Step 3: Check existing fleet.yaml for group_id
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     let existing_group_id = std::fs::read_to_string(&fleet_path)
         .ok()
         .and_then(|content| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&content).ok())
@@ -483,7 +483,7 @@ fn generate_fleet_yaml(
     group_id: Option<i64>,
     _token: Option<&str>,
 ) -> anyhow::Result<()> {
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
 
     if fleet_path.exists() {
         // Check compatibility with existing config
@@ -774,7 +774,7 @@ fn print_next_steps(home: &Path) {
     println!("       new id; quickstart now refuses regular groups upfront.\n");
     println!("  ── Next Steps ──\n");
     println!("  1. Edit fleet.yaml to add more instances:");
-    println!("     {}\n", home.join("fleet.yaml").display());
+    println!("     {}\n", crate::fleet::fleet_yaml_path(home).display());
     println!("  2. Start the fleet:");
     println!("     agend-terminal start\n");
     println!("  3. Check agent status:");
@@ -1331,7 +1331,7 @@ mod tests {
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
         generate_fleet_yaml(&home, &backend, Some(-1001234567890), None).expect("test");
-        let yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("test");
+        let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("test");
         assert!(
             yaml.contains("user_allowlist"),
             "emitted fleet.yaml must include user_allowlist for Sprint 21 fail-closed; got:\n{yaml}"
@@ -1400,7 +1400,7 @@ mod tests {
         std::fs::create_dir_all(&home).ok();
         let backend = Backend::all()[0].clone();
         generate_fleet_yaml(&home, &backend, None, None).expect("test");
-        let yaml = std::fs::read_to_string(home.join("fleet.yaml")).expect("test");
+        let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).expect("test");
         assert!(
             yaml.contains("user_allowlist"),
             "commented-out channel section must mention user_allowlist; got:\n{yaml}"

@@ -42,7 +42,7 @@ pub(crate) fn prepare_instructions(
     explicit_role: Option<&str>,
 ) {
     std::fs::create_dir_all(work_dir).ok();
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     // Look up team membership so agend.md can split collaborators (team
     // members) from the rest of the fleet. Owned here so we can hand out
     // borrowed TeamContexts into each match arm without moves.

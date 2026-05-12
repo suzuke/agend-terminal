@@ -291,7 +291,7 @@ instances:
     role: "General"
     topic_id: 1
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
         let mut state = TelegramState::new(
             "tok",
             -1,
@@ -316,7 +316,7 @@ instances:
   bob:
     topic_id: 500
 "#;
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
         let mut state = TelegramState::new(
             "tok",
             -1,
@@ -326,7 +326,7 @@ instances:
             None,
         );
         assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
-        std::fs::remove_file(home.join("fleet.yaml")).ok();
+        std::fs::remove_file(crate::fleet::fleet_yaml_path(&home)).ok();
         assert_eq!(resolve_topic(&mut state, Some(500)), "bob");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -357,10 +357,10 @@ instances:
     fn register_topic_writes_fleet_yaml() {
         let home = tmp_home("register_writes_yaml");
         let yaml = "defaults:\n  backend: claude\ninstances:\n  alice:\n    backend: claude\n";
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
         register_topic(&home, 42, "alice");
-        let content =
-            std::fs::read_to_string(home.join("fleet.yaml")).expect("fleet.yaml must exist");
+        let content = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home))
+            .expect("fleet.yaml must exist");
         assert!(
             content.contains("topic_id"),
             "fleet.yaml must contain topic_id after register_topic: {content}"

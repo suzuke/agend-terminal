@@ -310,7 +310,7 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
     // agend-git-shim init now in bootstrap::prepare (shared with app mode).
 
     // Check for previous snapshot if fleet.yaml doesn't exist
-    if !home.join("fleet.yaml").exists() {
+    if !crate::fleet::fleet_yaml_path(home).exists() {
         if let Some(snapshot) = crate::snapshot::load(home) {
             tracing::info!(
                 count = snapshot.agents.len(),
@@ -710,7 +710,7 @@ fn run_core(
                         .collect();
                     drop(cfgs);
                     let fleet_dirs: Vec<std::path::PathBuf> =
-                        crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+                        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                             .ok()
                             .map(|c| {
                                 c.instance_names()
@@ -1407,7 +1407,7 @@ fn spawn_and_register_agent(
         // → install only the named skills (Some(empty) opts the agent
         // out of skills entirely).
         let skills_filter: Option<Vec<String>> =
-            crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .and_then(|c| c.instances.get(name).and_then(|i| i.skills.clone()));
         match crate::skills::install_for_agent(home, wd, skills_filter.as_deref()) {

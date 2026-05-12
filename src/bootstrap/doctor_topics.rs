@@ -103,7 +103,7 @@ impl TopicReport {
 /// `can_manage_topics` permission probe done elsewhere.
 pub fn classify(home: &Path) -> TopicReport {
     let registry = load_topic_registry(home);
-    let fleet = FleetConfig::load(&home.join("fleet.yaml")).ok();
+    let fleet = FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
     let fleet_topic_ids: HashMap<String, i32> = fleet
         .as_ref()
         .map(|c| {
@@ -485,7 +485,7 @@ mod tests {
                 yaml.push_str(&format!("    topic_id: {t}\n"));
             }
         }
-        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
     }
 
     #[test]

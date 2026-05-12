@@ -64,7 +64,7 @@ fn store_path(home: &Path) -> std::path::PathBuf {
 /// Check if an instance name is known (in fleet.yaml).
 /// Returns true if fleet.yaml doesn't exist (no fleet = no restriction).
 fn instance_exists(home: &Path, name: &str) -> bool {
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     if !fleet_path.exists() {
         return true; // no fleet config = no restriction
     }
@@ -932,7 +932,7 @@ mod tests {
     /// validation paths so tests stay focused on `can_mutate_task` logic.
     fn write_dev_team_to_fleet(home: &std::path::Path) {
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(home),
             "teams:\n  dev:\n    members: [dev-lead, dev-impl-2]\n    \
              orchestrator: dev-lead\n    created_at: \"2026-04-27T00:00:00Z\"\n",
         )
@@ -1675,7 +1675,7 @@ mod tests {
             .map(|n| format!("  {n}:\n    backend: claude"))
             .collect();
         let yaml = format!("instances:\n{}", entries.join("\n"));
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).ok();
     }
 
     #[test]

@@ -104,7 +104,7 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     check("Home directory", home, " ✗ (not found)");
     check(".env file", &home.join(".env"), " - (optional)");
 
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     print!("  fleet.yaml: {}", fleet_path.display());
     if fleet_path.exists() {
         match fleet::FleetConfig::load(&fleet_path) {

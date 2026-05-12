@@ -135,7 +135,7 @@ pub fn init_from_config(
     }
 
     // Write back topic_ids + update registry
-    if home.join("fleet.yaml").exists() && !topic_map.is_empty() {
+    if crate::fleet::fleet_yaml_path(home).exists() && !topic_map.is_empty() {
         for (name, tid) in &topic_map {
             let _ = crate::fleet::update_instance_field(
                 home,

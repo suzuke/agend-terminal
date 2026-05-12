@@ -263,7 +263,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     // branch in the target's working directory (Sprint 31 task #52).
     let mut branch_checked_out: Option<&str> = None;
     if let Some(branch) = params["branch"].as_str().filter(|b| !b.is_empty()) {
-        let fleet_path = ctx.home.join("fleet.yaml");
+        let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
         if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {
             if let Some(resolved) = config.resolve_instance(target) {
                 if let Some(ref wd) = resolved.working_directory {
@@ -344,7 +344,7 @@ mod tests {
         let home = tmp_home("fleet-defined");
         // Define instance in fleet.yaml but don't start it
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "instances:\n  offline-agent:\n    backend: claude\n",
         )
         .ok();
@@ -370,7 +370,7 @@ mod tests {
     fn test_send_to_active_registry_target_returns_pty() {
         let home = tmp_home("active-pty");
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             "instances:\n  active-agent:\n    backend: claude\n  sender:\n    backend: claude\n",
         )
         .ok();
@@ -465,7 +465,7 @@ mod tests {
                 yaml.push_str("    created_at: \"2026-01-01T00:00:00Z\"\n");
             }
         }
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).ok();
     }
 
     fn audit_log_contains(home: &std::path::Path, kind: &str) -> bool {
@@ -736,7 +736,7 @@ mod tests {
         let home = tmp_home("branch-nongit");
         // Create fleet.yaml with working_directory pointing to a non-git dir
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             format!(
                 "instances:\n  sender:\n    backend: claude\n  target:\n    backend: claude\n    working_directory: {}\n",
                 home.join("workspace/target").display()
@@ -775,7 +775,7 @@ mod tests {
             .current_dir(&wd)
             .output();
         std::fs::write(
-            home.join("fleet.yaml"),
+            crate::fleet::fleet_yaml_path(&home),
             format!(
                 "instances:\n  sender:\n    backend: claude\n  target:\n    backend: claude\n    working_directory: {}\n",
                 wd.display()
@@ -815,12 +815,12 @@ mod tests {
             &[("dev", &["codex-agent", "sender"])],
         );
         // Override codex-agent backend to codex in fleet.yaml
-        let yaml = std::fs::read_to_string(home.join("fleet.yaml")).unwrap();
+        let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap();
         let yaml = yaml.replace(
             "  codex-agent:\n    backend: claude",
             "  codex-agent:\n    backend: codex",
         );
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
 
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
@@ -891,12 +891,12 @@ mod tests {
             &["codex-agent", "general"],
             &[("team-a", &["general"]), ("team-b", &["codex-agent"])],
         );
-        let yaml = std::fs::read_to_string(home.join("fleet.yaml")).unwrap();
+        let yaml = std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap();
         let yaml = yaml.replace(
             "  codex-agent:\n    backend: claude",
             "  codex-agent:\n    backend: codex",
         );
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
 
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
@@ -965,7 +965,7 @@ mod tests {
         let yaml = "instances:\n  sender:\n    backend: claude\n  codex-agent:\n    backend: codex\n\
                     teams:\n  team-a:\n    members:\n      - sender\n      - codex-agent\n    orchestrator: codex-agent\n    created_at: \"2026-01-01T00:00:00Z\"\n";
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
 
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
@@ -1029,7 +1029,7 @@ mod tests {
         let yaml = "instances:\n  sender:\n    backend: claude\n  codex-agent:\n    backend: codex\n  lead:\n    backend: claude\n\
                     teams:\n  team-a:\n    members:\n      - sender\n      - codex-agent\n      - lead\n    orchestrator: lead\n    created_at: \"2026-01-01T00:00:00Z\"\n";
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
 
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
@@ -1094,7 +1094,7 @@ mod tests {
                     teams:\n  team-a:\n    members:\n      - general\n    created_at: \"2026-01-01T00:00:00Z\"\n\
                     \n  team-b:\n    members:\n      - codex-agent\n    orchestrator: codex-agent\n    created_at: \"2026-01-01T00:00:00Z\"\n";
         std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
 
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));

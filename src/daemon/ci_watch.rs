@@ -1,6 +1,11 @@
 use crate::agent::{self, AgentRegistry};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Canonical path to the ci-watches directory.
+pub fn ci_watches_dir(home: &Path) -> PathBuf {
+    home.join("ci-watches")
+}
 
 // ---------------------------------------------------------------------------
 // H2: Shared tokio runtime for CI watch — avoids spawning a new thread +
@@ -1225,7 +1230,7 @@ pub fn detect_provider_from_remote(repo: &str) -> (&'static str, bool) {
 /// Returns the number of watches removed. Best-effort: read/parse
 /// failures skip the entry rather than aborting the sweep.
 pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = ci_watches_dir(home);
     let Ok(entries) = std::fs::read_dir(&ci_dir) else {
         return 0;
     };
@@ -1318,7 +1323,7 @@ pub fn startup_sweep(home: &Path) {
         tracing::info!(removed, "ci_watch startup sweep complete");
     }
     // Log surviving watches so operators can confirm persistence across restart.
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = ci_watches_dir(home);
     if let Ok(entries) = std::fs::read_dir(&ci_dir) {
         let active: Vec<String> = entries
             .flatten()
@@ -1420,7 +1425,7 @@ fn check_ci_watches_with_provider(
     registry: &AgentRegistry,
     make_provider: impl Fn(&serde_json::Value) -> Option<Box<dyn CiProvider>> + Send + Sync + 'static,
 ) {
-    let entries = match std::fs::read_dir(home.join("ci-watches")) {
+    let entries = match std::fs::read_dir(ci_watches_dir(home)) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -2114,6 +2119,15 @@ fn update_watch_state_with_notify(
 mod tests {
     use super::*;
     use crate::agent::AgentRegistry;
+
+    #[test]
+    fn ci_watches_dir_returns_expected_path() {
+        let home = std::path::Path::new("/tmp/test");
+        assert_eq!(
+            ci_watches_dir(home),
+            std::path::PathBuf::from("/tmp/test/ci-watches")
+        );
+    }
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -4226,7 +4240,7 @@ mod tests {
         branch: &str,
         watch: serde_json::Value,
     ) -> std::path::PathBuf {
-        let path = home.join("ci-watches").join(watch_filename(repo, branch));
+        let path = ci_watches_dir(home).join(watch_filename(repo, branch));
         std::fs::write(&path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
         path
     }
@@ -4560,7 +4574,7 @@ mod tests {
         branch: &str,
         watch: &serde_json::Value,
     ) -> std::path::PathBuf {
-        let ci_dir = home.join("ci-watches");
+        let ci_dir = ci_watches_dir(home);
         std::fs::create_dir_all(&ci_dir).ok();
         let filename = super::watch_filename(repo, branch);
         let path = ci_dir.join(&filename);
@@ -4786,7 +4800,7 @@ mod tests {
     #[test]
     fn startup_sweep_preserves_valid_watches() {
         let home = tmp_dir("restart-persist");
-        let ci_dir = home.join("ci-watches");
+        let ci_dir = ci_watches_dir(&home);
         std::fs::create_dir_all(&ci_dir).unwrap();
 
         // Create a valid (non-expired) watch

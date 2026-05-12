@@ -21,7 +21,7 @@ fn notify_telegram_inner(
     text: &str,
     disable_notification: bool,
 ) {
-    let config = match crate::fleet::FleetConfig::load(&home.join("fleet.yaml")) {
+    let config = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
         Ok(c) => c,
         Err(_) => return,
     };

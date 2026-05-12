@@ -29,7 +29,7 @@ pub fn fallback_deliver(
     msg: crate::inbox::InboxMessage,
     api_error: &anyhow::Error,
 ) -> Value {
-    let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+    let in_fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .map(|c| c.instances.contains_key(target))
         .unwrap_or(false);
@@ -84,7 +84,7 @@ pub fn send_to(
         Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
         Err(e) => {
             // Validate target exists in fleet.yaml before writing to inbox.
-            let in_fleet = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+            let in_fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
                 .ok()
                 .map(|c| c.instances.contains_key(target))
                 .unwrap_or(false);
@@ -118,7 +118,7 @@ pub fn metadata_path(home: &Path, name: &str) -> PathBuf {
 /// Sprint 46 P2: resolve metadata path by InstanceId when available.
 /// Migrates legacy name-based files to id-based on first access.
 pub fn metadata_path_resolved(home: &Path, name: &str) -> PathBuf {
-    let id = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+    let id = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|c| {
             c.instances
@@ -206,7 +206,7 @@ pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, V
 
 /// Look up submit_key for a target instance from fleet config.
 pub fn get_submit_key(home: &Path, target: &str) -> String {
-    let fleet_path = home.join("fleet.yaml");
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
     if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {
         if let Some(resolved) = config.resolve_instance(target) {
             return resolved.submit_key;

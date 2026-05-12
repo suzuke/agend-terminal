@@ -288,7 +288,7 @@ pub(crate) fn inbox_path(home: &Path, name: &str) -> PathBuf {
 pub(crate) fn inbox_path_resolved(home: &Path, name: &str) -> PathBuf {
     // Only use id-based path when the instance has a real ID in fleet.yaml
     // (backfilled by P1). Instances without an ID use name-based paths.
-    let id = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
+    let id = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|c| {
             c.instances
@@ -613,6 +613,10 @@ pub fn pointer_only_inject() -> bool {
 
 /// ANSI-colored header prefix for visual distinction in terminal.
 pub const HEADER_PREFIX: &str = "\x1b[44;97m[AGEND-MSG]\x1b[0m";
+
+/// Plain-text system message prefix (without ANSI colors).
+/// Used for detection/matching in agent PTY output parsing.
+pub const SYSTEM_MSG_PREFIX: &str = "[AGEND-MSG]";
 
 /// Sanitize a value for header inclusion: replace control chars with space.
 fn sanitize_header_value(s: &str) -> String {

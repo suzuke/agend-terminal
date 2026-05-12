@@ -66,7 +66,7 @@ fn dispatch_with_branch_and_repo_auto_invokes_watch_ci() {
     let args = serde_json::json!({"repo": "owner/repo", "branch": "feat/test"});
     handle_watch_ci(&home, &args, "test-agent");
     let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/test");
-    let watch_path = home.join("ci-watches").join(&filename);
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
     assert!(watch_path.exists(), "watch file must be created");
     std::fs::remove_dir_all(&home).ok();
 }
@@ -79,7 +79,7 @@ fn dispatch_idempotent_double_watch_safe() {
     handle_watch_ci(&home, &args, "agent-1");
     handle_watch_ci(&home, &args, "agent-1"); // second call — idempotent
     let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/idem");
-    let watch_path = home.join("ci-watches").join(&filename);
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
     assert!(watch_path.exists());
     std::fs::remove_dir_all(&home).ok();
 }
@@ -89,10 +89,10 @@ fn dispatch_without_repo_no_auto_watch() {
     // If no repo field, auto-watch should not fire.
     // This tests the comms.rs logic: args["repo"].as_str() returns None.
     let home = std::env::temp_dir().join(format!("agend-no-watch-{}", std::process::id()));
-    std::fs::create_dir_all(home.join("ci-watches")).ok();
+    std::fs::create_dir_all(crate::daemon::ci_watch::ci_watches_dir(&home)).ok();
     // No watch file should exist for a branch without repo.
     let filename = crate::daemon::ci_watch::watch_filename("", "feat/no-repo");
-    let watch_path = home.join("ci-watches").join(&filename);
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
     assert!(!watch_path.exists(), "no watch without repo");
     std::fs::remove_dir_all(&home).ok();
 }
@@ -108,7 +108,7 @@ fn dispatch_without_repo_no_auto_watch() {
 
 fn watch_path_for(home: &Path, repo: &str, branch: &str) -> std::path::PathBuf {
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
-    home.join("ci-watches").join(filename)
+    crate::daemon::ci_watch::ci_watches_dir(home).join(filename)
 }
 
 fn read_watch(path: &Path) -> serde_json::Value {
@@ -205,7 +205,7 @@ fn ci_watch_legacy_instance_field_migrates_on_resubscribe() {
     // legacy field is preserved as a deprecated alias so a rollback
     // to a pre-r0 daemon binary can still read SOMEONE.
     let home = std::env::temp_dir().join(format!("agend-watch-migrate-{}", std::process::id()));
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
     std::fs::create_dir_all(&ci_dir).ok();
     let path = watch_path_for(&home, "owner/repo", "feat-test");
 
@@ -539,7 +539,7 @@ fn handle_watch_ci_rejects_protected_refs() {
 
         // No side-effect on rejection: ci-watches dir must not gain
         // a new file for the protected branch.
-        let ci_dir = home.join("ci-watches");
+        let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
         if let Ok(rd) = std::fs::read_dir(&ci_dir) {
             let n: usize = rd.count();
             assert_eq!(
@@ -571,7 +571,7 @@ fn handle_watch_ci_default_branch_does_not_silently_set_main() {
         "default-branch path must hit the E4.5 gate, got {resp}"
     );
 
-    let ci_dir = home.join("ci-watches");
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
     if let Ok(rd) = std::fs::read_dir(&ci_dir) {
         assert_eq!(rd.count(), 0, "no watch file must be created on rejection");
     }
