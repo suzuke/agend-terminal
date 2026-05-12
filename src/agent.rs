@@ -39,6 +39,8 @@ pub struct AgentHandle {
     pub typed_inject: bool,
     pub spawned_at: std::time::Instant,
     pub spawned_at_epoch_ms: u64,
+    /// Set by DELETE handler to prevent reaper from spawning shell fallback.
+    pub deleted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
@@ -536,6 +538,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64,
+                deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
     }
@@ -558,6 +561,12 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         })
         .unwrap_or_default();
     let shutdown_for_reaper = shutdown.clone();
+    let deleted_for_reaper = {
+        let reg = registry.lock();
+        reg.get(*name)
+            .map(|h| Arc::clone(&h.deleted))
+            .unwrap_or_default()
+    };
     let n = name.to_string();
     let ctx = PtyReadContext {
         name: n.clone(),
@@ -568,6 +577,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         crash_tx: crash_tx_for_reaper,
         dismiss_patterns: dismiss,
         shutdown: shutdown_for_reaper,
+        deleted: deleted_for_reaper,
     };
     // fire-and-forget: pty_read_loop terminates on PTY EOF, which fires when
     // the child process is killed during shutdown / delete. JoinHandle is
@@ -727,6 +737,7 @@ struct PtyReadContext {
     crash_tx: Option<CrashChannel>,
     dismiss_patterns: Vec<(String, Vec<u8>)>,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
+    deleted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// PTY read loop: feeds VTerm, broadcasts output, auto-dismisses dialogs, handles exit.
@@ -740,6 +751,7 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
         crash_tx,
         dismiss_patterns,
         shutdown,
+        deleted,
     } = ctx;
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
@@ -755,7 +767,7 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
                         "[pty_read {name}] EOF after {read_count} reads, {total_bytes} bytes"
                     );
                 }
-                handle_pty_close(name, registry, home, crash_tx, shutdown);
+                handle_pty_close(name, registry, home, crash_tx, shutdown, deleted);
                 break;
             }
             Ok(n_bytes) => {
@@ -837,6 +849,7 @@ fn handle_pty_close(
     home: &Option<std::path::PathBuf>,
     crash_tx: &Option<CrashChannel>,
     shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
+    deleted: &Arc<std::sync::atomic::AtomicBool>,
 ) {
     // Check if daemon is shutting down — if so, this is not a crash
     let is_shutdown = shutdown
@@ -913,6 +926,15 @@ fn handle_pty_close(
     // try_wait succeeded (graceful or crash exit may still leave grandchildren
     // orphaned to PID 1) and the 2s timeout (leader still alive).
     sweep_child_tree(name, registry);
+
+    // Check if agent was explicitly deleted (e.g. replace_instance DELETE).
+    // Reaper may still fire after DELETE removes the registry entry — the
+    // deleted flag survives because the reaper thread captured Arc<AtomicBool>
+    // at spawn time (via PtyReadContext). Skip shell fallback entirely.
+    if deleted.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::info!(agent = name, "agent deleted, skipping shell fallback");
+        return;
+    }
 
     if is_user_clean_exit {
         // Startup grace period: if the process exited within 5s of spawn
@@ -1968,6 +1990,7 @@ Allow Trust All Tools mode?
             typed_inject: false,
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         registry.lock().insert("sweep-test".to_string(), handle);
@@ -2164,5 +2187,57 @@ Allow Trust All Tools mode?
             had_user_input_since_spawn,
             "input after spawn should count as user input → not startup failure"
         );
+    }
+
+    /// Deleted agent: reaper should not spawn shell fallback when deleted flag is set.
+    /// Behavioral test: spawn a short-lived process, set deleted=true, verify
+    /// no shell replacement appears in registry after exit.
+    #[test]
+    fn deleted_agent_reaper_no_shell_fallback() {
+        use std::sync::atomic::Ordering;
+
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let spawn_cfg = SpawnConfig {
+            name: "del-test",
+            backend_command: "true", // exits immediately with code 0
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        spawn_agent(&spawn_cfg, &registry).expect("spawn");
+
+        // Set deleted flag (simulates DELETE handler)
+        {
+            let reg = registry.lock();
+            let handle = reg.get("del-test").expect("agent must exist");
+            handle.deleted.store(true, Ordering::SeqCst);
+        }
+
+        // Wait for reaper to detect exit + process the deleted check
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+
+        // After reaper runs, agent should NOT be re-spawned as shell.
+        // With deleted=true, reaper returns early → registry entry removed
+        // (by sweep_child_tree or naturally) but no new shell spawned.
+        let reg = registry.lock();
+        match reg.get("del-test") {
+            None => {} // removed from registry — correct (no shell fallback)
+            Some(h) => {
+                // If still present, backend_command must NOT be a shell
+                assert_ne!(
+                    h.backend_command,
+                    crate::default_shell(),
+                    "deleted agent must NOT get shell fallback, but got: {}",
+                    h.backend_command
+                );
+            }
+        }
     }
 }

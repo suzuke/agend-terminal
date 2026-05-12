@@ -81,8 +81,13 @@ pub fn delete_transaction(
     // Step 1: snapshot the child handle while still holding registry entry,
     // then release the registry lock before issuing the kill so concurrent
     // listings aren't blocked while we wait for exit.
+    // Also set the `deleted` flag so the reaper thread (which may still be
+    // alive) knows not to spawn a shell fallback.
     let child_arc = {
         let reg = registry.lock();
+        if let Some(h) = reg.get(name) {
+            h.deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         reg.get(name).map(|h| Arc::clone(&h.child))
     };
 
@@ -323,6 +328,7 @@ mod tests {
             typed_inject: false,
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
