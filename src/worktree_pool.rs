@@ -134,8 +134,9 @@ fn cleanup_merged_branch(
 
     // Prune stale remote refs before remote-gone detection
     // (GitHub deletes remote branch on merge but local ref may be stale)
+    let remote = crate::git_helpers::primary_remote(source_repo);
     let _ = std::process::Command::new("git")
-        .args(["fetch", "--prune", "origin"])
+        .args(["fetch", "--prune", &remote])
         .current_dir(source_repo)
         .env("AGEND_GIT_BYPASS", "1")
         .output();

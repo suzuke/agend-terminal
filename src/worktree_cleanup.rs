@@ -58,10 +58,11 @@ fn list_worktrees(repo_root: &Path) -> Vec<WorktreeEntry> {
     entries
 }
 
-/// Check if a branch is merged into main (local check, no API needed).
+/// Check if a branch is merged into the default branch (local check, no API needed).
 fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
+    let default = crate::git_helpers::default_branch(repo_root);
     Command::new("git")
-        .args(["merge-base", "--is-ancestor", branch, "main"])
+        .args(["merge-base", "--is-ancestor", branch, &default])
         .current_dir(repo_root)
         .output()
         .map(|o| o.status.success())
@@ -73,21 +74,22 @@ fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
 /// case where `is_branch_merged` returns false because GitHub squash-merge
 /// rewrites the commit hash.
 fn is_remote_gone(repo_root: &Path, branch: &str) -> bool {
-    // Read upstream tracking ref: "refs/remotes/origin/<branch>" or empty
+    // Read upstream tracking remote name
     let output = Command::new("git")
         .args(["config", &format!("branch.{branch}.remote")])
         .current_dir(repo_root)
         .output();
-    let has_remote = output
+    let remote = output
         .as_ref()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false);
-    if !has_remote {
+        .ok()
+        .filter(|o| o.status.success() && !o.stdout.is_empty())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let Some(remote) = remote else {
         // No remote configured — not a remote-tracking branch, don't treat as "gone"
         return false;
-    }
+    };
     // Check if the remote ref still exists
-    let remote_ref = format!("refs/remotes/origin/{branch}");
+    let remote_ref = format!("refs/remotes/{remote}/{branch}");
     let exists = Command::new("git")
         .args(["rev-parse", "--verify", &remote_ref])
         .current_dir(repo_root)
