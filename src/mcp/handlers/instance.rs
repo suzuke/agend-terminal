@@ -231,10 +231,16 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
     let reason = args["reason"].as_str().unwrap_or("manual replacement");
 
     // Capture backend + working_directory before kill so we can respawn.
-    let list_resp = crate::api::call(home, &json!({"method": crate::api::method::LIST}));
-    let (backend, handover) = list_resp
+    // Prefer fleet.yaml (short name like "claude") over LIST API (which may
+    // store a resolved path). SPAWN expects the short preset name.
+    let fleet_resolved = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
         .ok()
-        .and_then(|resp| {
+        .and_then(|f| f.resolve_instance(name));
+
+    let list_resp = crate::api::call(home, &json!({"method": crate::api::method::LIST}));
+    let (backend, handover) = {
+        let fleet_backend = fleet_resolved.as_ref().map(|r| r.backend_command.clone());
+        let list_info = list_resp.ok().and_then(|resp| {
             resp["result"]["agents"]
                 .as_array()?
                 .iter()
@@ -248,13 +254,21 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
                     );
                     (backend, handover)
                 })
-        })
-        .unwrap_or_else(|| ("claude".to_string(), format!("Replaced due to: {reason}")));
+        });
+        let backend = fleet_backend.unwrap_or_else(|| {
+            list_info
+                .as_ref()
+                .map(|(b, _)| b.clone())
+                .unwrap_or_else(|| "claude".to_string())
+        });
+        let handover = list_info
+            .map(|(_, h)| h)
+            .unwrap_or_else(|| format!("Replaced due to: {reason}"));
+        (backend, handover)
+    };
 
     // Resolve working_directory from fleet.yaml (survives kill).
-    let working_dir = crate::fleet::FleetConfig::load(&home.join("fleet.yaml"))
-        .ok()
-        .and_then(|f| f.resolve_instance(name))
+    let working_dir = fleet_resolved
         .and_then(|r| r.working_directory)
         .map(|p| p.display().to_string());
 
