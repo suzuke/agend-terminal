@@ -1270,22 +1270,98 @@ pub fn try_dismiss_dialog(
 }
 
 /// Write data to an agent's PTY (atomic write — for attach path).
+/// PTY write timeout. Prevents indefinite blocking when backend stops
+/// reading stdin (buffer full). Spawns a short-lived thread for the write;
+/// if it doesn't complete within the timeout, returns TimedOut error.
+/// Uses an AtomicBool guard to prevent thread accumulation: if a previous
+/// write is still stuck, returns TimedOut immediately without spawning.
+const PTY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-writer in-progress guard. Keyed by Arc identity (pointer address).
+static WRITE_IN_PROGRESS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::OnceLock::new();
+
+fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::HashSet<usize>> {
+    WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
+    let key = Arc::as_ptr(writer) as usize;
+
+    // If a previous write is still stuck, fail fast.
+    {
+        let set = write_in_progress_set();
+        let mut guard = set.lock();
+        if guard.contains(&key) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "PTY write already in progress (previous write stuck)",
+            ));
+        }
+        guard.insert(key);
+    }
+
+    let data = data.to_vec();
+    let writer = Arc::clone(writer);
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let spawn_result = std::thread::Builder::new()
+        .name("pty_write_timeout".into())
+        .spawn(move || {
+            let result = (|| {
+                let mut w = writer.lock();
+                w.write_all(&data)?;
+                w.flush()
+            })();
+            let _ = tx.send(result);
+        });
+    if let Err(e) = spawn_result {
+        write_in_progress_set().lock().remove(&key);
+        return Err(std::io::Error::other(format!(
+            "PTY write thread spawn failed: {e}"
+        )));
+    }
+    let result = match rx.recv_timeout(PTY_WRITE_TIMEOUT) {
+        Ok(Ok(())) => {
+            // Success: clear guard
+            write_in_progress_set().lock().remove(&key);
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            // Fast failure (BrokenPipe etc): clear guard, allow retry
+            write_in_progress_set().lock().remove(&key);
+            Err(e)
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            // Thread truly stuck: keep guard set to prevent spawning more
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "PTY write timed out (5s) — backend may be stuck",
+            ))
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            // Thread panicked or dropped: clear guard
+            write_in_progress_set().lock().remove(&key);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "PTY write thread disconnected",
+            ))
+        }
+    };
+
+    result
+}
+
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    let mut w = agent.pty_writer.lock();
-    w.write_all(data)
-        .map_err(crate::error::AgendError::PtyWrite)?;
-    w.flush().map_err(crate::error::AgendError::PtyWrite)?;
+    write_with_timeout(&agent.pty_writer, data).map_err(crate::error::AgendError::PtyWrite)?;
     Ok(())
 }
 
 /// Write data to an agent's PTY byte-by-byte with small delays.
 #[allow(dead_code)]
 pub fn write_to_agent_typed(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
-    let mut w = agent.pty_writer.lock();
     for byte in data {
-        w.write_all(&[*byte])
-            .map_err(crate::error::AgendError::PtyWrite)?;
-        w.flush().map_err(crate::error::AgendError::PtyWrite)?;
+        write_with_timeout(&agent.pty_writer, &[*byte])?;
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     Ok(())
@@ -1329,31 +1405,21 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
         };
 
         if !atomic_part.is_empty() {
-            let mut w = agent.pty_writer.lock();
-            w.write_all(atomic_part)?;
-            w.flush()?;
-            drop(w);
+            write_with_timeout(&agent.pty_writer, atomic_part)?;
             std::thread::sleep(std::time::Duration::from_millis(
                 2 * atomic_part.len() as u64,
             ));
         }
 
         for chunk in chunk_part.chunks(64) {
-            let mut w = agent.pty_writer.lock();
-            w.write_all(chunk)?;
-            w.flush()?;
-            drop(w);
+            write_with_timeout(&agent.pty_writer, chunk)?;
             std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
         }
     } else {
-        let mut w = agent.pty_writer.lock();
-        if !prefix.is_empty() {
-            w.write_all(prefix)?;
-            w.flush()?;
-        }
-        w.write_all(text_bytes)?;
-        w.flush()?;
-        drop(w);
+        let mut combined = Vec::with_capacity(prefix.len() + text_bytes.len());
+        combined.extend_from_slice(prefix);
+        combined.extend_from_slice(text_bytes);
+        write_with_timeout(&agent.pty_writer, &combined)?;
     }
 
     // Pre-submit delay (separate from the per-chunk pacing above). 50ms gives
@@ -1363,9 +1429,7 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Write submit key
-    let mut w = agent.pty_writer.lock();
-    w.write_all(submit)?;
-    w.flush()?;
+    write_with_timeout(&agent.pty_writer, submit)?;
     Ok(())
 }
 
@@ -2238,6 +2302,128 @@ Allow Trust All Tools mode?
                     h.backend_command
                 );
             }
+        }
+    }
+
+    /// PTY write timeout: write_with_timeout returns within bounded time.
+    #[test]
+    fn write_timeout_does_not_hang() {
+        let buf: PtyWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let data = vec![0u8; 1024];
+        let start = std::time::Instant::now();
+        let result = write_with_timeout(&buf, &data);
+        let elapsed = start.elapsed();
+        assert!(result.is_ok(), "normal write should succeed");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "normal write should be fast, got {elapsed:?}"
+        );
+    }
+
+    /// Stuck write: second write attempt returns TimedOut immediately
+    /// (write_in_progress guard prevents thread accumulation).
+    #[test]
+    fn write_in_progress_guard_prevents_thread_leak() {
+        // Simulate a stuck writer by inserting the key into the in-progress set
+        let buf: PtyWriter = Arc::new(Mutex::new(Box::new(std::io::sink())));
+        let key = Arc::as_ptr(&buf) as usize;
+        {
+            let mut guard = write_in_progress_set().lock();
+            guard.insert(key);
+        }
+        // Second write should fail immediately
+        let result = write_with_timeout(&buf, b"hello");
+        assert!(result.is_err());
+        match &result {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Ok(_) => panic!("expected error"),
+        }
+        // Cleanup
+        {
+            let mut guard = write_in_progress_set().lock();
+            guard.remove(&key);
+        }
+    }
+
+    /// Error (non-timeout) clears guard, allowing retry.
+    #[test]
+    #[cfg(unix)]
+    fn error_clears_guard_allows_retry() {
+        // Use a closed writer that returns BrokenPipe
+        let (rd, wr) = std::os::unix::net::UnixStream::pair().expect("pair");
+        drop(rd); // close read end → writes will fail with BrokenPipe
+        let buf: PtyWriter = Arc::new(Mutex::new(Box::new(wr)));
+
+        // First write: should fail with BrokenPipe but clear guard
+        let r1 = write_with_timeout(&buf, b"hello");
+        assert!(r1.is_err());
+
+        // Second write: should also fail (not blocked by guard)
+        let r2 = write_with_timeout(&buf, b"world");
+        assert!(r2.is_err());
+        // Key: it didn't return "already in progress" — it actually tried
+        let err_msg = r2.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+        assert_ne!(
+            err_msg,
+            "PTY write already in progress (previous write stuck)"
+        );
+    }
+
+    /// write_to_agent_typed also uses timeout (not direct lock+write).
+    #[test]
+    fn write_to_agent_typed_uses_timeout() {
+        // Verify typed path calls write_with_timeout by checking it
+        // respects the in-progress guard
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let writer: PtyWriter =
+            Arc::new(Mutex::new(pair.master.take_writer().expect("take_writer")));
+        // Insert in-progress guard
+        let key = Arc::as_ptr(&writer) as usize;
+        {
+            let mut guard = write_in_progress_set().lock();
+            guard.insert(key);
+        }
+        let handle = AgentHandle {
+            id: crate::types::InstanceId::default(),
+            name: "typed-test".to_string(),
+            backend_command: "test".to_string(),
+            pty_writer: writer,
+            pty_master: Arc::new(Mutex::new(pair.master)),
+            core: Arc::new(Mutex::new(AgentCore {
+                vterm: VTerm::new(80, 24),
+                subscribers: Vec::new(),
+                state: StateTracker::new(None),
+                health: HealthTracker::new(),
+            })),
+            child: Arc::new(Mutex::new(
+                pair.slave
+                    .spawn_command(portable_pty::CommandBuilder::new("true"))
+                    .expect("spawn"),
+            )),
+            submit_key: "\r".to_string(),
+            inject_prefix: String::new(),
+            typed_inject: true,
+            spawned_at: std::time::Instant::now(),
+            spawned_at_epoch_ms: 0,
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let result = write_to_agent_typed(&handle, b"x");
+        assert!(
+            result.is_err(),
+            "typed write should fail when in-progress guard is set"
+        );
+        // Cleanup
+        {
+            let key = Arc::as_ptr(&handle.pty_writer) as usize;
+            let mut guard = write_in_progress_set().lock();
+            guard.remove(&key);
         }
     }
 }
