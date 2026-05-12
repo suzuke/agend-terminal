@@ -102,6 +102,16 @@ pub fn read(home: &Path, agent: &str) -> Option<serde_json::Value> {
         .and_then(|c| serde_json::from_str(&c).ok())
 }
 
+/// Check if an agent is bound in a daemon-managed worktree.
+/// Returns true if the agent has a binding with a worktree path that
+/// contains the `.agend-managed` marker file.
+pub fn is_agent_in_managed_worktree(home: &Path, agent: &str) -> bool {
+    read(home, agent)
+        .and_then(|v| v["worktree"].as_str().map(std::path::PathBuf::from))
+        .map(|wt| wt.join(".agend-managed").exists())
+        .unwrap_or(false)
+}
+
 /// Install the prepare-commit-msg hook into a worktree via core.hooksPath.
 /// Points to `$AGEND_HOME/hooks/` unified directory.
 /// Installs bash hook on Unix, PowerShell hook on Windows.
@@ -222,6 +232,7 @@ pub fn reconcile_orphans(home: &Path) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -266,6 +277,46 @@ mod tests {
     fn read_missing_returns_none() {
         let home = tmp_home("read-miss");
         assert!(read(&home, "ghost").is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn marker_check_passes_for_managed_worktree() {
+        let home = tmp_home("marker-pass");
+        let wt = home.join("worktrees").join("agent-1").join("feat-branch");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".agend-managed"), "").unwrap();
+        // Write binding pointing to this worktree
+        let rt = home.join("runtime").join("agent-1");
+        std::fs::create_dir_all(&rt).unwrap();
+        let binding =
+            serde_json::json!({"worktree": wt.to_str().unwrap(), "branch": "feat-branch"});
+        std::fs::write(rt.join("binding.json"), binding.to_string()).unwrap();
+
+        assert!(is_agent_in_managed_worktree(&home, "agent-1"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn marker_check_fails_for_unmanaged() {
+        let home = tmp_home("marker-fail");
+        let wt = home.join("worktrees").join("agent-2").join("feat-branch");
+        std::fs::create_dir_all(&wt).unwrap();
+        // No .agend-managed marker
+        let rt = home.join("runtime").join("agent-2");
+        std::fs::create_dir_all(&rt).unwrap();
+        let binding =
+            serde_json::json!({"worktree": wt.to_str().unwrap(), "branch": "feat-branch"});
+        std::fs::write(rt.join("binding.json"), binding.to_string()).unwrap();
+
+        assert!(!is_agent_in_managed_worktree(&home, "agent-2"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn marker_check_fails_for_no_binding() {
+        let home = tmp_home("marker-no-bind");
+        assert!(!is_agent_in_managed_worktree(&home, "nobody"));
         std::fs::remove_dir_all(&home).ok();
     }
 }
