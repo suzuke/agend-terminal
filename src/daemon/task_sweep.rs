@@ -67,10 +67,27 @@ pub struct SweepConfig {
     /// `true` = log decisions but do not emit events.
     #[serde(default)]
     pub dry_run: bool,
+    /// Compliance scanner mode: "off" | "warn" | "enforce". Default: "warn".
+    /// - off: no compliance checks
+    /// - warn: log violations, send telegram alert, but don't block
+    /// - enforce: same as warn (future: block non-compliant merges)
+    #[serde(default = "default_compliance_mode")]
+    pub compliance_mode: String,
+    /// Cursor: last merged_at timestamp we've scanned for compliance.
+    /// Prevents re-scanning old PRs on restart.
+    #[serde(default)]
+    pub last_seen_merged_at: Option<String>,
+    /// PRs already alerted — prevents duplicate telegram notifications.
+    #[serde(default)]
+    pub alerted_prs: Vec<u64>,
 }
 
 fn config_path(home: &Path) -> PathBuf {
     home.join("task_sweep.json")
+}
+
+fn default_compliance_mode() -> String {
+    "warn".to_string()
 }
 
 fn load_config(home: &Path) -> SweepConfig {
@@ -327,6 +344,12 @@ fn sweep_tick(home: &Path) -> anyhow::Result<()> {
             );
         }
     }
+
+    // Issue #664: run compliance checks on merged PRs
+    if cfg.compliance_mode != "off" {
+        let _ = compliance_sweep(home, &repo);
+    }
+
     Ok(())
 }
 
@@ -360,6 +383,7 @@ fn extract_closes_markers(body: &str) -> Vec<String> {
 /// JSON parsing in [`parse_pr_meta`] flags schema mismatches.
 struct PrMeta {
     number: u64,
+    title: String,
     state: String,
     merged: bool,
     merge_commit_sha: Option<String>,
@@ -414,6 +438,11 @@ fn list_recently_merged_prs(repo: &str) -> anyhow::Result<Vec<PrMeta>> {
 
 fn parse_pr_meta(v: &serde_json::Value, api_response_hash: String) -> Option<PrMeta> {
     let number = v.get("number")?.as_u64()?;
+    let title = v
+        .get("title")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let state = v.get("state")?.as_str()?.to_string();
     let merged = v.get("merged_at").map(|x| !x.is_null()).unwrap_or(false);
     let merge_commit_sha = v
@@ -439,6 +468,7 @@ fn parse_pr_meta(v: &serde_json::Value, api_response_hash: String) -> Option<PrM
         .to_string();
     Some(PrMeta {
         number,
+        title,
         state,
         merged,
         merge_commit_sha,
@@ -480,7 +510,237 @@ pub fn handle_task_sweep_config(home: &Path, args: &serde_json::Value) -> serde_
         "repo": cfg.repo,
         "paused": cfg.paused,
         "dry_run": cfg.dry_run,
+        "compliance_mode": cfg.compliance_mode,
+        "last_seen_merged_at": cfg.last_seen_merged_at,
     })
+}
+
+// ─── Issue #664: Post-merge compliance scanner ───────────────────────────────
+
+/// Result of a single compliance check.
+#[derive(Debug, Clone)]
+pub(crate) struct ComplianceViolation {
+    pub pr_number: u64,
+    pub check_name: &'static str,
+    pub detail: String,
+}
+
+/// Run compliance checks on a merged PR.
+/// Returns a list of violations (empty = compliant).
+fn check_pr_compliance(pr: &PrMeta, _home: &Path, repo: &str) -> Vec<ComplianceViolation> {
+    let mut violations = Vec::new();
+
+    // docs-only exception: skip compliance for PRs that only touch docs
+    let files = get_pr_changed_files(pr.number, repo);
+    if is_docs_only_pr(&files) {
+        tracing::info!(pr = pr.number, "compliance: docs-only PR, skipping checks");
+        return violations;
+    }
+
+    // Check 1: Review verdict (VERIFIED in PR body or comments)
+    if !has_review_verdict(pr) {
+        violations.push(ComplianceViolation {
+            pr_number: pr.number,
+            check_name: "review_verdict",
+            detail: "No VERIFIED verdict found in PR body".to_string(),
+        });
+    }
+
+    // Check 2: CI green confirmation
+    if let Some(v) = check_ci_green(pr, repo) {
+        violations.push(v);
+    }
+
+    // Check 3: Scope decision linkage (task board id or Closes #N)
+    if !has_scope_linkage(pr) {
+        violations.push(ComplianceViolation {
+            pr_number: pr.number,
+            check_name: "scope_linkage",
+            detail: "PR body missing task board id (t-...) or Closes #N".to_string(),
+        });
+    }
+
+    violations
+}
+
+/// Check if PR only touches docs (docs/**, *.md, no src/ changes).
+fn is_docs_only_pr(files: &[String]) -> bool {
+    !files.is_empty()
+        && files
+            .iter()
+            .all(|f| f.starts_with("docs/") || f.ends_with(".md"))
+}
+
+/// Get changed files for a PR via GitHub API.
+fn get_pr_changed_files(pr_number: u64, repo: &str) -> Vec<String> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "files",
+            "--jq",
+            ".files[].path",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Check 1: PR body contains "VERIFIED" verdict.
+fn has_review_verdict(pr: &PrMeta) -> bool {
+    let body_upper = pr.body.to_uppercase();
+    body_upper.contains("VERIFIED")
+}
+
+/// Check 2: All CI checks passed (queries gh pr checks).
+fn check_ci_green(pr: &PrMeta, repo: &str) -> Option<ComplianceViolation> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "checks",
+            &pr.number.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "state",
+            "--jq",
+            "[.[] | select(.state != \"SUCCESS\" and .state != \"SKIPPED\")] | length",
+        ])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let count: u32 = String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(1);
+            if count > 0 {
+                Some(ComplianceViolation {
+                    pr_number: pr.number,
+                    check_name: "ci_green",
+                    detail: format!("{count} check(s) not SUCCESS/SKIPPED"),
+                })
+            } else {
+                None
+            }
+        }
+        _ => {
+            // Can't verify CI — treat as violation in enforce mode
+            Some(ComplianceViolation {
+                pr_number: pr.number,
+                check_name: "ci_green",
+                detail: "Unable to query CI status".to_string(),
+            })
+        }
+    }
+}
+
+/// Check 3: PR body has task board id (t-...) or Closes #N.
+fn has_scope_linkage(pr: &PrMeta) -> bool {
+    let body = &pr.body;
+    // Task board id pattern
+    let has_task_id = body.contains("t-") && {
+        let re = regex::Regex::new(r"t-[0-9]+-[0-9]+").expect("static regex");
+        re.is_match(body)
+    };
+    // Closes #N pattern
+    let has_closes = {
+        let re = regex::Regex::new(r"(?i)closes?\s+#\d+").expect("static regex");
+        re.is_match(body)
+    };
+    has_task_id || has_closes
+}
+
+/// Run compliance sweep on recently merged PRs.
+/// Called from sweep_tick when compliance_mode != "off".
+fn compliance_sweep(home: &Path, repo: &str) -> Vec<ComplianceViolation> {
+    let mut cfg = load_config(home);
+    if cfg.compliance_mode == "off" {
+        return Vec::new();
+    }
+
+    let prs = match list_recently_merged_prs(repo) {
+        Ok(prs) => prs,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut all_violations = Vec::new();
+    let mut max_merged_at: Option<String> = None;
+
+    for pr in &prs {
+        if !pr.merged {
+            continue;
+        }
+        // Skip PRs we've already scanned (cursor)
+        if let Some(ref cursor) = cfg.last_seen_merged_at {
+            if let Some(ref merged_at) = pr.merged_at {
+                if merged_at <= cursor {
+                    continue;
+                }
+            }
+        }
+        // Track max merged_at for cursor update
+        if let Some(ref merged_at) = pr.merged_at {
+            if max_merged_at
+                .as_ref()
+                .map(|m| merged_at > m)
+                .unwrap_or(true)
+            {
+                max_merged_at = Some(merged_at.clone());
+            }
+        }
+
+        let violations = check_pr_compliance(pr, home, repo);
+        if !violations.is_empty() {
+            for v in &violations {
+                tracing::warn!(
+                    pr = pr.number,
+                    check = v.check_name,
+                    detail = %v.detail,
+                    "compliance violation"
+                );
+            }
+            // Telegram alert (dedup: skip if already alerted)
+            if !cfg.alerted_prs.contains(&pr.number) {
+                crate::channel::telegram::notify::notify_telegram(
+                    home,
+                    SWEEP_EMITTER,
+                    &format!(
+                        "⚠️ Compliance violation PR #{}: {}",
+                        pr.number,
+                        violations
+                            .iter()
+                            .map(|v| v.check_name)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+                cfg.alerted_prs.push(pr.number);
+            }
+        }
+        all_violations.extend(violations);
+    }
+
+    // Single cursor + alerted_prs persistence at end
+    if let Some(merged_at) = max_merged_at {
+        cfg.last_seen_merged_at = Some(merged_at);
+    }
+    // Cap alerted_prs to last 100 to prevent unbounded growth
+    if cfg.alerted_prs.len() > 100 {
+        let drain = cfg.alerted_prs.len() - 100;
+        cfg.alerted_prs.drain(..drain);
+    }
+    let _ = save_config(home, &cfg);
+
+    all_violations
 }
 
 #[cfg(test)]
@@ -838,5 +1098,110 @@ mod tests {
             markers.len(),
             text.len()
         );
+    }
+
+    // ─── Issue #664 compliance scanner tests ─────────────────────────
+
+    fn make_pr_meta(number: u64, title: &str, body: &str) -> PrMeta {
+        PrMeta {
+            number,
+            title: title.to_string(),
+            state: "closed".to_string(),
+            merged: true,
+            merge_commit_sha: Some("abc123".to_string()),
+            merged_at: Some("2026-05-12T00:00:00Z".to_string()),
+            body: body.to_string(),
+            author_login: "test-user".to_string(),
+            api_response_hash: "deadbeef".to_string(),
+        }
+    }
+
+    #[test]
+    fn compliance_review_verdict_detected() {
+        let pr = make_pr_meta(1, "fix: something", "Review VERIFIED by reviewer-codex");
+        assert!(has_review_verdict(&pr));
+    }
+
+    #[test]
+    fn compliance_review_verdict_missing() {
+        let pr = make_pr_meta(2, "fix: something", "No review info here");
+        assert!(!has_review_verdict(&pr));
+    }
+
+    #[test]
+    fn compliance_scope_linkage_task_id() {
+        let pr = make_pr_meta(3, "fix: something", "Implements t-20260511-12");
+        assert!(has_scope_linkage(&pr));
+    }
+
+    #[test]
+    fn compliance_scope_linkage_closes_issue() {
+        let pr = make_pr_meta(4, "fix: something", "Closes #664");
+        assert!(has_scope_linkage(&pr));
+    }
+
+    #[test]
+    fn compliance_scope_linkage_missing() {
+        let pr = make_pr_meta(5, "fix: something", "Just a fix without linkage");
+        assert!(!has_scope_linkage(&pr));
+    }
+
+    #[test]
+    fn compliance_docs_only_exception() {
+        let files = vec!["docs/SKILLS.md".to_string(), "README.md".to_string()];
+        assert!(is_docs_only_pr(&files));
+    }
+
+    #[test]
+    fn compliance_non_docs_pr() {
+        let files = vec!["src/agent.rs".to_string(), "docs/README.md".to_string()];
+        assert!(!is_docs_only_pr(&files));
+    }
+
+    #[test]
+    fn compliance_feature_flag_off() {
+        let home = tmp_home("compliance-off");
+        fs::create_dir_all(&home).unwrap();
+        let cfg = SweepConfig {
+            repo: Some("test/repo".to_string()),
+            paused: false,
+            dry_run: false,
+            compliance_mode: "off".to_string(),
+            last_seen_merged_at: None,
+            alerted_prs: Vec::new(),
+        };
+        save_config(&home, &cfg).unwrap();
+        let violations = compliance_sweep(&home, "test/repo");
+        assert!(
+            violations.is_empty(),
+            "off mode should produce no violations"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn compliance_cursor_persisted() {
+        let home = tmp_home("compliance-cursor");
+        fs::create_dir_all(&home).unwrap();
+        let mut cfg = SweepConfig {
+            repo: Some("test/repo".to_string()),
+            paused: false,
+            dry_run: false,
+            compliance_mode: "warn".to_string(),
+            last_seen_merged_at: None,
+            alerted_prs: Vec::new(),
+        };
+        // Simulate cursor update (done by compliance_sweep at end)
+        cfg.last_seen_merged_at = Some("2026-05-12T00:00:00Z".to_string());
+        cfg.alerted_prs.push(10);
+        save_config(&home, &cfg).unwrap();
+
+        let updated = load_config(&home);
+        assert_eq!(
+            updated.last_seen_merged_at.as_deref(),
+            Some("2026-05-12T00:00:00Z")
+        );
+        assert!(updated.alerted_prs.contains(&10));
+        fs::remove_dir_all(&home).ok();
     }
 }
