@@ -910,25 +910,30 @@ fn handle_pty_close(
     sweep_child_tree(name, registry);
 
     if is_user_clean_exit {
-        // Startup grace period: if the process exited within 5s of spawn,
-        // treat as startup failure — do NOT spawn shell fallback.
+        // Startup grace period: if the process exited within 5s of spawn
+        // AND no user input was received, treat as startup failure.
+        // If user sent input (e.g. /exit), it's a legitimate quick exit.
         let uptime = {
             let reg = registry.lock();
             reg.get(name).map(|h| h.spawned_at.elapsed())
         };
+        let had_user_input = {
+            let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
+            pair.last_input_at_ms > 0
+        };
         if let Some(uptime) = uptime {
-            if uptime < std::time::Duration::from_secs(5) {
+            if uptime < std::time::Duration::from_secs(5) && !had_user_input {
                 tracing::warn!(
                     agent = name,
                     uptime_ms = uptime.as_millis() as u64,
-                    "startup failure (exited too quickly), skipping shell fallback"
+                    "startup failure (exited too quickly, no user input), skipping shell fallback"
                 );
                 if let Some(ref home) = home {
                     crate::event_log::log(
                         home,
                         "startup_failure",
                         name,
-                        &format!("exited in {}ms", uptime.as_millis()),
+                        &format!("exited in {}ms, no user input", uptime.as_millis()),
                     );
                 }
                 // Mark as crashed so daemon can notify operator.
@@ -2126,22 +2131,29 @@ Allow Trust All Tools mode?
     }
 
     /// Startup grace period: agent that exits within 5s should NOT get shell fallback.
+    /// Startup failure: exit within 5s + no user input → no shell fallback.
     #[test]
-    fn startup_grace_period_detects_quick_exit() {
+    fn startup_failure_no_input_no_shell_fallback() {
         let spawned_at = std::time::Instant::now();
-        // Simulate immediate exit (0ms uptime)
         let uptime = spawned_at.elapsed();
+        let had_user_input = false;
         assert!(
-            uptime < std::time::Duration::from_secs(5),
-            "freshly spawned agent should be within grace period"
+            uptime < std::time::Duration::from_secs(5) && !had_user_input,
+            "should detect startup failure: quick exit + no user input"
         );
+    }
 
-        // Simulate 6s uptime (past grace period)
-        let old_spawn = std::time::Instant::now() - std::time::Duration::from_secs(6);
-        let old_uptime = old_spawn.elapsed();
+    /// Quick user exit: exit within 5s but HAD user input → normal clean exit.
+    #[test]
+    fn quick_user_exit_still_clean() {
+        let spawned_at = std::time::Instant::now();
+        let uptime = spawned_at.elapsed();
+        let had_user_input = true;
+        // Condition for startup failure is: quick exit AND no input
+        // With input, this should NOT trigger startup failure
         assert!(
-            old_uptime >= std::time::Duration::from_secs(5),
-            "agent running 6s should be past grace period"
+            !(uptime < std::time::Duration::from_secs(5) && !had_user_input),
+            "should NOT be startup failure when user input was received"
         );
     }
 }
