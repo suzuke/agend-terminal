@@ -977,12 +977,14 @@ fn agent_picked_up_emitted_on_inbox_drain() {
 
     let _ = handle_tool("inbox", &json!({}), "sender");
 
+    // Brief pause to let async event emission complete (fixes macOS race)
+    std::thread::sleep(std::time::Duration::from_millis(100));
     let events = rec.snapshot();
     let pickups: Vec<_> = events
         .iter()
         .filter(|e| matches!(e, UxEvent::AgentPickedUp { .. }))
         .collect();
-    assert_eq!(pickups.len(), 1, "expected 1 AgentPickedUp: {events:?}");
+    assert_eq!(pickups.len(), 1, "expected 1 AgentPickedUp: {pickups:?}");
     if let UxEvent::AgentPickedUp { origin_msg, agent } = &pickups[0] {
         assert_eq!(origin_msg.id, "99");
         assert_eq!(agent, "sender");
@@ -1044,6 +1046,8 @@ fn agent_picked_up_fires_for_all_pending_messages() {
 
     let _ = handle_tool("inbox", &json!({}), "sender");
 
+    // Brief pause to let async event emission complete (fixes macOS race)
+    std::thread::sleep(std::time::Duration::from_millis(100));
     let events = rec.snapshot();
     let pickups: Vec<_> = events
         .iter()
