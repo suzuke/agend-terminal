@@ -158,9 +158,20 @@ impl StatePatterns {
                 // Sprint 31+ #4: word-boundary `429` to avoid false-positive
                 // on substrings like "build #4290" / "request id: 4291...".
                 // Server-side throttle (distinct from user usage limit) — auto-retry safe.
+                // Issue #668: extend to cover generic 5xx server faults
+                // ("API Error: 500/502/503/504") and the explicit
+                // "server-side issue ... temporary" phrasing seen on
+                // newer Claude Code SDK releases. All four are the same
+                // class of transient upstream fault as the existing
+                // "Server is temporarily limiting requests" message, so
+                // they share the SERVER_RATE_LIMIT_MAX_RETRIES auto-retry
+                // budget (cap is per-agent, not per-pattern — see
+                // daemon::supervisor::process_server_rate_limit_retries).
+                // `\b` after the 3-digit code rejects false positives
+                // like "API Error: 5000123" (timestamp / request id).
                 (
                     AgentState::ServerRateLimit,
-                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage",
+                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary",
                 ),
                 (AgentState::RateLimit, r"overloaded|rate.?limit|\b429\b"),
                 // [docs] Auto-compaction on context limit
@@ -2677,6 +2688,102 @@ mod tests {
             patterns.detect(screen),
             Some(AgentState::RateLimit),
             "generic overloaded must be RateLimit, not ServerRateLimit"
+        );
+    }
+
+    // ── Issue #668: generic 5xx classifier extension ─────────────────
+    //
+    // Operator observed agents stuck on `API Error: 500/502/503/504` and
+    // `server-side issue, usually temporary` strings — semantically the
+    // same transient server fault as the existing "Server is temporarily
+    // limiting requests" message, but unclassified, so the supervisor
+    // never re-injected the last input and the agent sat idle. These
+    // tests pin the expectation that all four common Anthropic 5xx
+    // status strings and the generic "server-side issue ... temporary"
+    // phrase route into ServerRateLimit so the supervisor's auto-retry
+    // path (3-attempt cap at SERVER_RATE_LIMIT_MAX_RETRIES) covers them.
+
+    #[test]
+    fn api_error_500_classified_as_server_rate_limit() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let screen = "API Error: 500 Internal server error";
+        assert_eq!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "API Error: 500 must classify as ServerRateLimit (#668)"
+        );
+    }
+
+    #[test]
+    fn api_error_502_classified_as_server_rate_limit() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let screen = "API Error: 502 Bad Gateway";
+        assert_eq!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "API Error: 502 must classify as ServerRateLimit (#668)"
+        );
+    }
+
+    #[test]
+    fn api_error_503_classified_as_server_rate_limit() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let screen = "API Error: 503 Service Unavailable";
+        assert_eq!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "API Error: 503 must classify as ServerRateLimit (#668)"
+        );
+    }
+
+    #[test]
+    fn api_error_504_classified_as_server_rate_limit() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let screen = "API Error: 504 Gateway Timeout";
+        assert_eq!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "API Error: 504 must classify as ServerRateLimit (#668)"
+        );
+    }
+
+    #[test]
+    fn server_side_issue_temporary_classified_as_server_rate_limit() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        let screen = "Encountered a server-side issue, usually temporary";
+        assert_eq!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "server-side issue + temporary must classify as ServerRateLimit (#668)"
+        );
+    }
+
+    #[test]
+    fn api_error_4xx_not_classified_as_server_rate_limit() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        // 4xx is a client error — must NOT trigger 5xx auto-retry path.
+        // 401 is also caught by the AuthError pattern, so use 404 here to
+        // isolate the 5xx-vs-non-5xx classifier behaviour.
+        let screen = "API Error: 404 Not Found";
+        assert_ne!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "4xx must NOT trigger ServerRateLimit (#668)"
+        );
+    }
+
+    #[test]
+    fn api_error_long_digit_run_not_classified_as_server_rate_limit() {
+        let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
+        // \b word boundary after the 3-digit status code rejects strings
+        // where the "5xx" is actually a prefix of a longer integer
+        // (e.g. timestamp or request id) — guards against false positives
+        // like "API Error: 5000123 something else happened".
+        let screen = "API Error: 5000123 some other failure";
+        assert_ne!(
+            patterns.detect(screen),
+            Some(AgentState::ServerRateLimit),
+            "5-followed-by-many-digits must NOT trigger ServerRateLimit (#668)"
         );
     }
 }
