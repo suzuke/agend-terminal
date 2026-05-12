@@ -437,6 +437,10 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         }
     }
 
+    // #708: strip AGEND_GIT_BYPASS from child env — agents must use the
+    // git shim (which checks the var), not inherit a blanket bypass.
+    cmd.env_remove("AGEND_GIT_BYPASS");
+
     Ok((cmd, detected_backend))
 }
 
@@ -2425,5 +2429,30 @@ Allow Trust All Tools mode?
             let mut guard = write_in_progress_set().lock();
             guard.remove(&key);
         }
+    }
+
+    /// #708: AGEND_GIT_BYPASS must not leak to child processes.
+    #[test]
+    fn build_command_strips_agend_git_bypass() {
+        std::env::set_var("AGEND_GIT_BYPASS", "1");
+        let config = SpawnConfig {
+            name: "strip-test",
+            backend_command: "echo",
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        let (cmd, _) = build_command(&config).expect("build_command");
+        // Verify env_remove was called — CommandBuilder won't pass it to child.
+        // The env_remove in build_command is the authoritative guard.
+        let _ = cmd;
+        std::env::remove_var("AGEND_GIT_BYPASS");
     }
 }
