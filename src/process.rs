@@ -30,6 +30,10 @@ pub fn is_pid_alive(pid: u32) -> bool {
 
 /// Send SIGTERM to a process (Unix) or terminate it (Windows).
 pub fn terminate(pid: u32) {
+    if pid == 0 {
+        tracing::warn!("terminate called with pid=0, skipping");
+        return;
+    }
     #[cfg(unix)]
     {
         unsafe {
@@ -58,6 +62,10 @@ pub fn terminate(pid: u32) {
 /// in the group), then waits briefly and escalates to SIGKILL if still alive.
 /// On Windows, falls back to TerminateProcess on the leader.
 pub fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        tracing::warn!("kill_process_tree called with pid=0, skipping (would kill daemon)");
+        return;
+    }
     #[cfg(unix)]
     {
         // M2: query actual PGID instead of assuming PID==PGID
@@ -132,5 +140,11 @@ mod tests {
             "sleep child must also be dead after kill_process_tree (group kill)"
         );
         let _ = std::fs::remove_file(&pid_file);
+    }
+
+    #[test]
+    fn kill_process_tree_with_pid_zero_is_noop() {
+        // Should not panic or kill anything
+        kill_process_tree(0);
     }
 }
