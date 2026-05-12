@@ -385,8 +385,12 @@ impl FleetConfig {
         let submit_key = preset.submit_key.to_string();
 
         let working_directory = Some(if let Some(d) = inst.working_directory.as_ref() {
-            // M2: reject path traversal
-            if d.contains("..") {
+            // M2: reject path traversal (component-level check)
+            let wd_path = std::path::Path::new(d);
+            if wd_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
                 tracing::warn!(
                     name,
                     dir = d,
