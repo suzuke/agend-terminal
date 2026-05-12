@@ -146,3 +146,12 @@ jobs:
           name: agend-terminal-${{ runner.os }}-${{ runner.arch }}
           path: target/release/agend-terminal.exe
           retention-days: 14
+
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
