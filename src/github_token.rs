@@ -117,7 +117,30 @@ fn instance() -> &'static TokenCache {
 /// Returns an owned `String` so callers can move it into auth closures
 /// without holding a borrow across `await` boundaries.
 pub fn cached_token() -> Option<String> {
-    instance().token().map(String::from)
+    let token = instance().token().map(String::from)?;
+    if let Err(msg) = validate_token_format(&token) {
+        tracing::warn!("GitHub token format invalid: {msg}");
+        return None;
+    }
+    Some(token)
+}
+
+/// Validate GitHub token format.
+/// Accepts: `ghp_` (PAT), `gho_` (OAuth), `ghs_` (app), `github_pat_` (fine-grained).
+/// Minimum length: 20 chars.
+pub fn validate_token_format(token: &str) -> Result<(), &'static str> {
+    let valid_prefix = token.starts_with("ghp_")
+        || token.starts_with("gho_")
+        || token.starts_with("ghs_")
+        || token.starts_with("ghu_")
+        || token.starts_with("github_pat_");
+    if !valid_prefix {
+        return Err("token must start with ghp_, gho_, ghs_, ghu_, or github_pat_");
+    }
+    if token.len() < 20 {
+        return Err("token too short (minimum 20 characters)");
+    }
+    Ok(())
 }
 
 /// Convenience accessor for the cached `setup_warning` text. Returns
@@ -328,5 +351,21 @@ mod tests {
         let cache = TokenCache::discover_with(&BlankEnv, &StubGh(None));
         assert_eq!(cache.source(), TokenSource::None);
         assert!(cache.setup_warning().is_some());
+    }
+
+    #[test]
+    fn validate_token_format_accepts_valid() {
+        assert!(validate_token_format("ghp_abcdefghijklmnopqrstuvwxyz1234").is_ok());
+        assert!(validate_token_format("gho_abcdefghijklmnopqrstuvwxyz1234").is_ok());
+        assert!(validate_token_format("ghs_abcdefghijklmnopqrstuvwxyz1234").is_ok());
+        assert!(validate_token_format("ghu_abcdefghijklmnopqrstuvwxyz1234").is_ok());
+        assert!(validate_token_format("github_pat_abcdefghijklmnopqrstuvwxyz").is_ok());
+    }
+
+    #[test]
+    fn validate_token_format_rejects_invalid() {
+        assert!(validate_token_format("invalid_token_no_prefix").is_err());
+        assert!(validate_token_format("ghp_short").is_err()); // too short
+        assert!(validate_token_format("").is_err());
     }
 }
