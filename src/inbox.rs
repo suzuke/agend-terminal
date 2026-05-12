@@ -2611,6 +2611,24 @@ mod tests {
         );
     }
 
+    // Issue #672: inline-notification truncation hint must point at the
+    // `inbox` MCP tool, not at the (non-existent) `agend-terminal agent
+    // inbox` CLI subcommand. The CLI subcommand was never implemented;
+    // a user following the old hint hits `unrecognized subcommand`.
+    #[test]
+    fn test_inline_long_text_hint_points_at_mcp_tool_not_cli() {
+        let long: String = "x".repeat(250);
+        let out = format_notification_for_inject(false, &NotifySource::Agent("peer"), &long, &[]);
+        assert!(
+            out.contains("inbox MCP tool"),
+            "hint must direct caller to the MCP tool: {out}"
+        );
+        assert!(
+            !out.contains("agend-terminal agent"),
+            "hint must not reference the non-existent `agent` CLI subcommand: {out}"
+        );
+    }
+
     #[test]
     fn test_reply_excerpt_newline_escaped() {
         let msg = InboxMessage {
