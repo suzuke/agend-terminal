@@ -158,9 +158,20 @@ impl StatePatterns {
                 // Sprint 31+ #4: word-boundary `429` to avoid false-positive
                 // on substrings like "build #4290" / "request id: 4291...".
                 // Server-side throttle (distinct from user usage limit) — auto-retry safe.
+                // Issue #668: extend to cover generic 5xx server faults
+                // ("API Error: 500/502/503/504") and the explicit
+                // "server-side issue ... temporary" phrasing seen on
+                // newer Claude Code SDK releases. All four are the same
+                // class of transient upstream fault as the existing
+                // "Server is temporarily limiting requests" message, so
+                // they share the SERVER_RATE_LIMIT_MAX_RETRIES auto-retry
+                // budget (cap is per-agent, not per-pattern — see
+                // daemon::supervisor::process_server_rate_limit_retries).
+                // `\b` after the 3-digit code rejects false positives
+                // like "API Error: 5000123" (timestamp / request id).
                 (
                     AgentState::ServerRateLimit,
-                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage",
+                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary",
                 ),
                 (AgentState::RateLimit, r"overloaded|rate.?limit|\b429\b"),
                 // [docs] Auto-compaction on context limit
