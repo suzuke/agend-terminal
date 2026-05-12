@@ -322,6 +322,7 @@ mod tests {
             inject_prefix: String::new(),
             typed_inject: false,
             spawned_at: std::time::Instant::now(),
+            spawned_at_epoch_ms: 0,
         }
     }
 

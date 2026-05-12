@@ -38,6 +38,7 @@ pub struct AgentHandle {
     pub inject_prefix: String,
     pub typed_inject: bool,
     pub spawned_at: std::time::Instant,
+    pub spawned_at_epoch_ms: u64,
 }
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
@@ -531,6 +532,10 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                     .map(|b| b.preset().typed_inject)
                     .unwrap_or(false),
                 spawned_at: std::time::Instant::now(),
+                spawned_at_epoch_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
             },
         );
     }
@@ -915,14 +920,17 @@ fn handle_pty_close(
         // If user sent input (e.g. /exit), it's a legitimate quick exit.
         let uptime = {
             let reg = registry.lock();
-            reg.get(name).map(|h| h.spawned_at.elapsed())
+            reg.get(name)
+                .map(|h| (h.spawned_at.elapsed(), h.spawned_at_epoch_ms))
         };
-        let had_user_input = {
+        let had_user_input_since_spawn = {
             let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
-            pair.last_input_at_ms > 0
+            uptime
+                .map(|(_, epoch_ms)| pair.last_input_at_ms >= epoch_ms)
+                .unwrap_or(false)
         };
-        if let Some(uptime) = uptime {
-            if uptime < std::time::Duration::from_secs(5) && !had_user_input {
+        if let Some((uptime, _)) = uptime {
+            if uptime < std::time::Duration::from_secs(5) && !had_user_input_since_spawn {
                 tracing::warn!(
                     agent = name,
                     uptime_ms = uptime.as_millis() as u64,
@@ -1959,6 +1967,7 @@ Allow Trust All Tools mode?
             inject_prefix: String::new(),
             typed_inject: false,
             spawned_at: std::time::Instant::now(),
+            spawned_at_epoch_ms: 0,
         };
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         registry.lock().insert("sweep-test".to_string(), handle);
@@ -2131,29 +2140,29 @@ Allow Trust All Tools mode?
     }
 
     /// Startup grace period: agent that exits within 5s should NOT get shell fallback.
-    /// Startup failure: exit within 5s + no user input → no shell fallback.
+    /// Startup failure: exit within 5s + no user input since spawn → no shell fallback.
     #[test]
     fn startup_failure_no_input_no_shell_fallback() {
-        let spawned_at = std::time::Instant::now();
-        let uptime = spawned_at.elapsed();
-        let had_user_input = false;
+        // spawned_at_epoch_ms = 1000, last_input_at_ms = 500 → input before spawn
+        let spawned_at_epoch_ms: u64 = 1000;
+        let last_input_at_ms: u64 = 500;
+        let had_user_input_since_spawn = last_input_at_ms >= spawned_at_epoch_ms;
         assert!(
-            uptime < std::time::Duration::from_secs(5) && !had_user_input,
-            "should detect startup failure: quick exit + no user input"
+            !had_user_input_since_spawn,
+            "input before spawn should not count as user input"
         );
     }
 
-    /// Quick user exit: exit within 5s but HAD user input → normal clean exit.
+    /// Quick user exit: input AFTER spawn → normal clean exit, not startup failure.
     #[test]
     fn quick_user_exit_still_clean() {
-        let spawned_at = std::time::Instant::now();
-        let uptime = spawned_at.elapsed();
-        let had_user_input = true;
-        // Condition for startup failure is: quick exit AND no input
-        // With input, this should NOT trigger startup failure
+        // spawned_at_epoch_ms = 1000, last_input_at_ms = 1500 → input after spawn
+        let spawned_at_epoch_ms: u64 = 1000;
+        let last_input_at_ms: u64 = 1500;
+        let had_user_input_since_spawn = last_input_at_ms >= spawned_at_epoch_ms;
         assert!(
-            !(uptime < std::time::Duration::from_secs(5) && !had_user_input),
-            "should NOT be startup failure when user input was received"
+            had_user_input_since_spawn,
+            "input after spawn should count as user input → not startup failure"
         );
     }
 }
