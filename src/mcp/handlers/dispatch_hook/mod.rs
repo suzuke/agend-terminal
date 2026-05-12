@@ -143,6 +143,10 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
     // Lease errors REJECT the dispatch (Q2 + §3.3).
     let lease = crate::worktree_pool::lease(home, &source_repo, target, branch)?;
 
+    // Clean empty "init" commits left by kiro-cli session checkpoints.
+    // Best-effort: failure here is non-fatal (worktree is still usable).
+    clean_empty_init_commits(&lease.path);
+
     // Bind with worktree + source-repo paths. Bind file write error stays graceful (Q1).
     // source_repo persistence (P0-X r1): release_full uses it to run
     // `git worktree remove` from the owning repo's cwd.
@@ -284,3 +288,103 @@ fn derive_repo_from_remote(source_repo: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
+
+/// Remove empty commits with message "init" between origin/main and HEAD.
+/// These are left by kiro-cli session checkpoints and pollute PRs.
+/// Best-effort: logs warnings on failure but never panics.
+fn clean_empty_init_commits(worktree: &Path) {
+    let output = std::process::Command::new("git")
+        .args(["log", "origin/main..HEAD", "--format=%H %s"])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let log = String::from_utf8_lossy(&output.stdout);
+    if log.trim().is_empty() {
+        return;
+    }
+
+    // Identify empty "init" commits.
+    let mut empty_inits: Vec<&str> = Vec::new();
+    for line in log.lines() {
+        let (hash, msg) = match line.split_once(' ') {
+            Some(pair) => pair,
+            None => continue,
+        };
+        if msg != "init" {
+            continue;
+        }
+        // Check if commit has no file changes.
+        let diff = std::process::Command::new("git")
+            .args(["diff-tree", "--no-commit-id", "--name-only", "-r", hash])
+            .current_dir(worktree)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+        if let Ok(d) = diff {
+            if d.status.success() && d.stdout.trim_ascii().is_empty() {
+                empty_inits.push(hash);
+            }
+        }
+    }
+
+    if empty_inits.is_empty() {
+        return;
+    }
+
+    // All commits between origin/main..HEAD are empty inits → soft reset.
+    let total_commits = log.lines().count();
+    if empty_inits.len() == total_commits {
+        let status = std::process::Command::new("git")
+            .args(["reset", "--soft", "origin/main"])
+            .current_dir(worktree)
+            .env("AGEND_GIT_BYPASS", "1")
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                tracing::info!(
+                    count = total_commits,
+                    "cleaned all empty init commits via soft reset"
+                );
+            }
+            _ => {
+                tracing::warn!("failed to soft-reset empty init commits");
+            }
+        }
+        return;
+    }
+
+    // Mixed: use interactive rebase to drop empty inits.
+    // Build a sed script that changes "pick <hash>" to "drop <hash>" for each empty init.
+    // Use `sed -i.bak` for cross-platform compat (macOS requires suffix, Linux accepts it).
+    let sed_parts: Vec<String> = empty_inits
+        .iter()
+        .map(|h| format!("s/^pick {short} /drop {short} /", short = &h[..7]))
+        .collect();
+    let sed_script = sed_parts.join(";");
+    let status = std::process::Command::new("git")
+        .args(["-c", "core.abbrev=7", "rebase", "-i", "origin/main"])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_SEQUENCE_EDITOR", format!("sed -i.bak '{sed_script}'"))
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            tracing::info!(
+                count = empty_inits.len(),
+                "cleaned empty init commits via rebase"
+            );
+        }
+        _ => {
+            // Abort failed rebase to leave worktree in clean state.
+            let _ = std::process::Command::new("git")
+                .args(["rebase", "--abort"])
+                .current_dir(worktree)
+                .env("AGEND_GIT_BYPASS", "1")
+                .status();
+            tracing::warn!("failed to rebase-drop empty init commits");
+        }
+    }
+}
