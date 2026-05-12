@@ -1010,7 +1010,7 @@ pub fn format_notification_for_inject(
             attachment_body_placeholder(attachments)
         } else if text.chars().count() > 200 {
             let truncated: String = text.chars().take(200).collect();
-            format!("{truncated}... (run: agend-terminal agent inbox)")
+            format!("{truncated}... (use the inbox MCP tool to read full message)")
         } else {
             text.to_string()
         };

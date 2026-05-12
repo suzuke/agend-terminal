@@ -20,27 +20,15 @@ pub fn tool_definitions() -> Value {
 }
 
 fn channel_tools() -> Vec<Value> {
-    // Sprint 54 #488 hotfix: these handlers depend on daemon-resident
-    // state (ACTIVE_CHANNEL, telegram bot session) and cannot run
-    // outside the daemon process. Tagged `requires_daemon_state: true`
-    // so the `agend-mcp-bridge` proxy surfaces a structured error to
-    // callers when the daemon is unreachable, rather than degrading
-    // to a local fallback that would silently produce misleading
-    // errors like `no active channel`. Sprint 56 Track I-Phase2c
-    // (#531) hard-removed the local-fallback path that this comment
-    // originally described — flag stays valid as a daemon-side
-    // dispatch hint and as the contract the bridge consumes.
     vec![
         json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API. Sprint 59 Wave 1 PR-4 ((B) decision default with timeout): when both `default_action` and `timeout_secs` are set, the daemon records a pending operator decision sidecar and auto-fires the default after the timeout window. Subsequent reply calls without `default_action` resolve the pending decision (operator override / explicit answer arrived).",
             "inputSchema": {"type": "object", "properties": {
                 "text": {"type": "string"},
                 "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
                 "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."}
-            }, "required": ["text"]},
-            "requires_daemon_state": true}),
+            }, "required": ["text"]}}),
         json!({"name": "download_attachment", "description": "Download a file attachment (telegram multimedia: images, audio, documents). Returns local path. Requires daemon API.",
-            "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]},
-            "requires_daemon_state": true}),
+            "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}}),
     ]
 }
 
