@@ -142,16 +142,15 @@ pub fn run(
     let child_id = child.id();
     let deregister_name = name.to_string();
     let deregister_home = home.to_path_buf();
-    static SIGNAL_RECEIVED: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static SIGNAL_RECEIVED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ctrlc::set_handler(move || {
-        SIGNAL_RECEIVED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = SIGNAL_RECEIVED.set(());
     })
     .ok();
 
     // 11. Wait for child to exit, checking signal flag
     loop {
-        if SIGNAL_RECEIVED.load(std::sync::atomic::Ordering::Relaxed) {
+        if SIGNAL_RECEIVED.get().is_some() {
             crate::process::terminate(child_id);
             let _ = crate::api::call(
                 &deregister_home,

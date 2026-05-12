@@ -239,10 +239,24 @@ pub fn reconcile_orphans(home: &Path) {
                                 let age = chrono::Utc::now()
                                     .signed_duration_since(dt.with_timezone(&chrono::Utc));
                                 if age > chrono::Duration::hours(24) {
+                                    // #693: check heartbeat — if agent is still active, don't delete
+                                    let entry_path = entry.path();
+                                    let agent_name = entry_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("");
+                                    let hb =
+                                        crate::daemon::heartbeat_pair::snapshot_for(agent_name);
+                                    let hb_age_ms = crate::daemon::heartbeat_pair::now_ms()
+                                        .saturating_sub(hb.heartbeat_at_ms);
+                                    if hb_age_ms < 3_600_000 {
+                                        // Heartbeat within 1h — agent still active, skip
+                                        continue;
+                                    }
                                     let _ = std::fs::remove_file(&binding_path);
                                     tracing::info!(
                                         path = %binding_path.display(),
-                                        "removed orphan binding (>24h old)"
+                                        "removed orphan binding (>24h old, heartbeat stale)"
                                     );
                                 }
                             }
