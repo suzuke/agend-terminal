@@ -35,7 +35,7 @@ pub fn bind_full(
     worktree: &std::path::Path,
     source_repo: &std::path::Path,
 ) {
-    let dir = home.join("runtime").join(agent);
+    let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).ok();
     let path = dir.join("binding.json");
     let lock_path = dir.join(".binding.json.lock");
@@ -61,7 +61,9 @@ pub fn bind_full(
 
 /// Clear a binding for an agent (task completed/released).
 pub fn unbind(home: &Path, agent: &str) {
-    let path = home.join("runtime").join(agent).join("binding.json");
+    let path = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
     let _ = std::fs::remove_file(path);
 }
 
@@ -72,7 +74,7 @@ pub fn scan_existing_branch_binding(
     branch: &str,
     exclude_agent: &str,
 ) -> Option<String> {
-    let runtime_dir = home.join("runtime");
+    let runtime_dir = crate::paths::runtime_dir(home);
     let entries = std::fs::read_dir(&runtime_dir).ok()?;
     for entry in entries.flatten() {
         let agent = entry.file_name().to_string_lossy().to_string();
@@ -96,7 +98,9 @@ pub fn scan_existing_branch_binding(
 /// Read the current binding for an agent (for internal use/tests).
 #[allow(dead_code)] // Used by tests + Phase 2
 pub fn read(home: &Path, agent: &str) -> Option<serde_json::Value> {
-    let path = home.join("runtime").join(agent).join("binding.json");
+    let path = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
     std::fs::read_to_string(path)
         .ok()
         .and_then(|c| serde_json::from_str(&c).ok())
@@ -163,7 +167,7 @@ pub fn reconcile_hooks(home: &Path) {
     }
 
     // Legacy layout: <home>/workspace/*/.worktrees/*/
-    let worktrees_base = home.join("workspace");
+    let worktrees_base = crate::paths::workspace_dir(home);
     if !worktrees_base.exists() {
         return;
     }
@@ -219,7 +223,7 @@ pub fn symlink_shim(home: &Path) {
 /// Clear orphan bindings (agents no longer in registry).
 /// Called at daemon startup.
 pub fn reconcile_orphans(home: &Path) {
-    let runtime_dir = home.join("runtime");
+    let runtime_dir = crate::paths::runtime_dir(home);
     if !runtime_dir.exists() {
         return;
     }
@@ -306,7 +310,7 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join(".agend-managed"), "").unwrap();
         // Write binding pointing to this worktree
-        let rt = home.join("runtime").join("agent-1");
+        let rt = crate::paths::runtime_dir(&home).join("agent-1");
         std::fs::create_dir_all(&rt).unwrap();
         let binding =
             serde_json::json!({"worktree": wt.to_str().unwrap(), "branch": "feat-branch"});
@@ -322,7 +326,7 @@ mod tests {
         let wt = home.join("worktrees").join("agent-2").join("feat-branch");
         std::fs::create_dir_all(&wt).unwrap();
         // No .agend-managed marker
-        let rt = home.join("runtime").join("agent-2");
+        let rt = crate::paths::runtime_dir(&home).join("agent-2");
         std::fs::create_dir_all(&rt).unwrap();
         let binding =
             serde_json::json!({"worktree": wt.to_str().unwrap(), "branch": "feat-branch"});

@@ -102,7 +102,7 @@ instances:
 #[test]
 fn cleanup_agend_workspace_removes_entire_dir() {
     let home = tmp_home("cleanup_ws");
-    let ws = home.join("workspace").join("test-agent");
+    let ws = crate::paths::workspace_dir(&home).join("test-agent");
     std::fs::create_dir_all(&ws).ok();
     std::fs::write(ws.join("somefile.txt"), "data").ok();
     std::fs::write(ws.join("opencode.json"), "{}").ok();
@@ -140,7 +140,7 @@ fn cleanup_user_dir_only_removes_agend_files() {
 #[test]
 fn cleanup_removes_metadata() {
     let home = tmp_home("cleanup_meta");
-    let ws = home.join("workspace").join("agent1");
+    let ws = crate::paths::workspace_dir(&home).join("agent1");
     std::fs::create_dir_all(&ws).ok();
 
     std::fs::create_dir_all(home.join("metadata")).ok();
@@ -1748,11 +1748,11 @@ fn consolidated_deployment_unknown_action_errors() {
 fn create_instance_default_working_directory_path() {
     let home = tmp_home("create-default-wd");
     let name = "test-agent";
-    let expected = home.join("workspace").join(name);
+    let expected = crate::paths::workspace_dir(&home).join(name);
     // Verify PathBuf construction matches (cross-platform safe)
     assert_eq!(
         expected,
-        home.join("workspace").join(name),
+        crate::paths::workspace_dir(&home).join(name),
         "default working_directory must be $AGEND_HOME/workspace/<name>"
     );
     // Verify the path ends with the expected components

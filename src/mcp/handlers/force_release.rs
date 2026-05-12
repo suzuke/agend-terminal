@@ -510,7 +510,7 @@ mod tests {
         let home = tmp_home("bind-rebase-cleanup");
         let dir = seed_daemon_worktree(&home, "dev", "feat/rebase-bind");
         // Seed a binding too so we can verify it's released.
-        let runtime = home.join("runtime").join("dev");
+        let runtime = crate::paths::runtime_dir(&home).join("dev");
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::write(
             runtime.join("binding.json"),

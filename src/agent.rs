@@ -1393,8 +1393,8 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
         // failures in the receiving agent. Write header line as single unit,
         // then chunk only the body. Use `stripped` (ANSI-free) for detection
         // since raw text may have color escapes before the bracket.
-        let is_system_header =
-            stripped.starts_with(crate::inbox::SYSTEM_MSG_PREFIX) || stripped.starts_with("[from:");
+        let is_system_header = stripped.starts_with(crate::inbox::SYSTEM_MSG_PREFIX)
+            || stripped.starts_with(crate::inbox::AGENT_MSG_PREFIX);
         let (atomic_part, chunk_part) = if is_system_header {
             match all_bytes.iter().position(|&b| b == b'\n') {
                 Some(pos) => all_bytes.split_at(pos + 1),

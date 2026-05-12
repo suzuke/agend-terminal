@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 
 /// Marker file placed in daemon-managed worktrees (R14 mitigation).
-const MANAGED_MARKER: &str = ".agend-managed";
+pub(crate) const MANAGED_MARKER: &str = ".agend-managed";
 
 /// Root directory for daemon-managed worktrees in the new layout.
 /// `<home>/worktrees/` — contains `<agent>/<branch>/` subdirectories.
@@ -489,7 +489,7 @@ pub fn is_pinned(worktree_path: &Path) -> bool {
 
 /// Reconcile orphan leases at daemon startup (log only, no delete in Phase 3).
 pub fn reconcile_orphan_leases(home: &Path) {
-    let runtime_dir = home.join("runtime");
+    let runtime_dir = crate::paths::runtime_dir(home);
     if !runtime_dir.exists() {
         return;
     }
@@ -557,7 +557,7 @@ pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
     }
 
     // Legacy layout: <home>/workspace/*/.worktrees/*/
-    let workspace = home.join("workspace");
+    let workspace = crate::paths::workspace_dir(home);
     if workspace.exists() {
         if let Ok(entries) = std::fs::read_dir(&workspace) {
             for entry in entries.flatten() {
@@ -890,7 +890,7 @@ mod tests {
         let home = tmp_home("p0x-unmanaged");
         let unmanaged_wt = tmp_home("p0x-unmanaged-wt-target");
         // Hand-craft a binding pointing at an unmanaged path.
-        std::fs::create_dir_all(home.join("runtime").join("agent-u")).ok();
+        std::fs::create_dir_all(crate::paths::runtime_dir(&home).join("agent-u")).ok();
         let binding = serde_json::json!({
             "version": 1,
             "agent": "agent-u",
@@ -900,7 +900,9 @@ mod tests {
             "worktree": unmanaged_wt.display().to_string(),
         });
         std::fs::write(
-            home.join("runtime").join("agent-u").join("binding.json"),
+            crate::paths::runtime_dir(&home)
+                .join("agent-u")
+                .join("binding.json"),
             serde_json::to_string_pretty(&binding).unwrap(),
         )
         .unwrap();
@@ -1564,7 +1566,7 @@ mod tests {
         )
         .unwrap();
         // Create active binding for dev-1
-        let rt = home.join("runtime").join("dev-1");
+        let rt = crate::paths::runtime_dir(&home).join("dev-1");
         std::fs::create_dir_all(&rt).unwrap();
         std::fs::write(
             rt.join("binding.json"),

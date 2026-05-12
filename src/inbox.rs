@@ -618,6 +618,9 @@ pub const HEADER_PREFIX: &str = "\x1b[44;97m[AGEND-MSG]\x1b[0m";
 /// Used for detection/matching in agent PTY output parsing.
 pub const SYSTEM_MSG_PREFIX: &str = "[AGEND-MSG]";
 
+/// Agent-to-agent message prefix.
+pub const AGENT_MSG_PREFIX: &str = "[from:";
+
 /// Sanitize a value for header inclusion: replace control chars with space.
 fn sanitize_header_value(s: &str) -> String {
     s.chars()

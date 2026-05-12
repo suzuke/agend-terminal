@@ -613,7 +613,12 @@ fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Valu
         .get("working_directory")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .unwrap_or_else(|| home.join("workspace").join(name).display().to_string());
+        .unwrap_or_else(|| {
+            crate::paths::workspace_dir(home)
+                .join(name)
+                .display()
+                .to_string()
+        });
 
     if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
         if !validate_branch(branch) {

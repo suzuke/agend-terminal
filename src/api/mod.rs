@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn validate_work_dir_allows_normal_path() {
         let home = tmp_home("validate_normal");
-        let ok = home.join("workspace").join("agent");
+        let ok = crate::paths::workspace_dir(&home).join("agent");
         let resolved = validate_working_directory(&ok, &home).expect("normal path must validate");
         assert_eq!(resolved, ok);
         std::fs::remove_dir_all(&home).ok();

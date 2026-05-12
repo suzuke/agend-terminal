@@ -520,7 +520,7 @@ channel:
         "\n# channel:\n#   type: telegram\n#   bot_token_env: AGEND_BOT_TOKEN\n#   group_id: YOUR_GROUP_ID\n#   user_allowlist: [YOUR_USER_ID]\n".to_string()
     };
 
-    let workspace_dir = home.join("workspace").join("general");
+    let workspace_dir = crate::paths::workspace_dir(home).join("general");
     std::fs::create_dir_all(&workspace_dir)?;
     let working_dir = format!("    working_directory: {}", workspace_dir.display());
 

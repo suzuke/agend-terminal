@@ -85,7 +85,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             failed.push(format!("{inst_name}: agent already exists"));
             continue;
         }
-        let work_dir = ctx.home.join("workspace").join(&inst_name);
+        let work_dir = crate::paths::workspace_dir(ctx.home).join(&inst_name);
         planned.push((inst_name, backend.clone(), work_dir));
     }
 

@@ -190,7 +190,7 @@ pub(crate) fn touch_progress_for_branch(home: &Path, branch: &str) -> Option<Str
     if branch.is_empty() {
         return None;
     }
-    let runtime_dir = home.join("runtime");
+    let runtime_dir = crate::paths::runtime_dir(home);
     let entries = std::fs::read_dir(&runtime_dir).ok()?;
     for entry in entries.flatten() {
         let binding_path = entry.path().join("binding.json");
@@ -389,7 +389,7 @@ mod tests {
         // sidecar with source=ci_push.
         let home = tmp_home("hook-pr-push");
         // Seed a binding with task_id + branch.
-        let runtime_dir = home.join("runtime").join("dev");
+        let runtime_dir = crate::paths::runtime_dir(&home).join("dev");
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let binding = serde_json::json!({
             "version": 1,
@@ -451,7 +451,7 @@ mod tests {
         // touch_progress_for_branch must skip these — they have no
         // task board entry to track progress against.
         let home = tmp_home("hook-self-binding");
-        let runtime_dir = home.join("runtime").join("dev");
+        let runtime_dir = crate::paths::runtime_dir(&home).join("dev");
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let binding = serde_json::json!({
             "version": 1,

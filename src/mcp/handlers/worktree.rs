@@ -97,7 +97,9 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             // Successful bind: read back the worktree path from the binding
             // file we just wrote so the response reflects authoritative
             // state, not a recomputation.
-            let binding_path = home.join("runtime").join(agent).join("binding.json");
+            let binding_path = crate::paths::runtime_dir(home)
+                .join(agent)
+                .join("binding.json");
             let worktree_path = std::fs::read_to_string(&binding_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -326,7 +328,7 @@ mod tests {
     // signature.
 
     fn p17_setup_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
-        let repo = home.join("workspace").join(agent);
+        let repo = crate::paths::workspace_dir(home).join(agent);
         std::fs::create_dir_all(&repo).ok();
         std::process::Command::new("git")
             .args(["init", "-b", "main"])
@@ -392,7 +394,9 @@ mod tests {
             .expect("worktree_path in success response");
         assert!(!worktree_path.is_empty(), "worktree_path must be populated");
 
-        let binding_path = home.join("runtime").join("agent-self").join("binding.json");
+        let binding_path = crate::paths::runtime_dir(&home)
+            .join("agent-self")
+            .join("binding.json");
         assert!(
             binding_path.exists(),
             "binding.json must exist after bind_self"
@@ -471,7 +475,9 @@ mod tests {
         );
 
         // No side-effects on rejection.
-        let binding = home.join("runtime").join("agent-e45").join("binding.json");
+        let binding = crate::paths::runtime_dir(&home)
+            .join("agent-e45")
+            .join("binding.json");
         assert!(
             !binding.exists(),
             "rejected bind_self must not write binding.json"

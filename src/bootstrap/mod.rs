@@ -287,7 +287,7 @@ mod tests {
             "# Extra Instructions\nAlways include rollout checklist.",
         )
         .expect("write instructions file");
-        let work_dir = home.join("workspace").join("worker");
+        let work_dir = crate::paths::workspace_dir(home).join("worker");
         let yaml = format!(
             "defaults:\n  backend: claude\ninstances:\n  worker:\n    backend: claude\n    working_directory: {}\n    instructions: ./instructions/dev.md\n",
             work_dir.display()

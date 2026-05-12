@@ -34,7 +34,7 @@ fn tmp_home(tag: &str) -> std::path::PathBuf {
 }
 
 fn write_binding(home: &Path, agent: &str, source_repo: &str, branch: &str) {
-    let dir = home.join("runtime").join(agent);
+    let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).ok();
     let v = json!({
         "version": 1,
@@ -92,7 +92,7 @@ fn ec15_ci_watch_source_repo_path_deleted_returns_error() {
 #[test]
 fn ci_watch_binding_corrupt_returns_error() {
     let home = tmp_home("corrupt");
-    let dir = home.join("runtime").join("alpha");
+    let dir = crate::paths::runtime_dir(&home).join("alpha");
     std::fs::create_dir_all(&dir).ok();
     std::fs::write(dir.join("binding.json"), "this is not json").ok();
     let result = super::ci::handle_watch_ci(&home, &json!({}), "alpha");
@@ -121,7 +121,7 @@ fn setup_git_repo(home: &Path, agent: &str) -> std::path::PathBuf {
 }
 
 fn setup_git_repo_with_remote(home: &Path, agent: &str, origin_url: &str) -> std::path::PathBuf {
-    let repo = home.join("workspace").join(agent);
+    let repo = crate::paths::workspace_dir(home).join(agent);
     std::fs::create_dir_all(&repo).ok();
     let _ = std::process::Command::new("git")
         .args(["init", "-b", "main"])
@@ -402,7 +402,9 @@ fn ec6_dispatch_uses_fleet_source_repo_tier_when_present() {
         Some("o/r"),
     );
     assert!(r.is_ok(), "dispatch via fleet source_repo tier ok: {r:?}");
-    let binding_path = home.join("runtime").join("alpha").join("binding.json");
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("alpha")
+        .join("binding.json");
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&binding_path).unwrap()).unwrap();
     assert_eq!(
@@ -483,7 +485,7 @@ fn bind_self_with_source_repo_arg_succeeds() {
 #[test]
 fn dispatch_with_source_repo_override_wins_over_fleet() {
     let home = tmp_home("override-wins");
-    let stub_src = home.join("workspace").join("alpha");
+    let stub_src = crate::paths::workspace_dir(&home).join("alpha");
     let real_src = home.join("override-src");
     std::fs::create_dir_all(&real_src).ok();
     let _ = std::process::Command::new("git")
@@ -523,7 +525,9 @@ fn dispatch_with_source_repo_override_wins_over_fleet() {
         Some(&real_src), // override wins over fleet stub
     );
     assert!(r.is_ok(), "override dispatch ok: {r:?}");
-    let binding_path = home.join("runtime").join("alpha").join("binding.json");
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("alpha")
+        .join("binding.json");
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&binding_path).unwrap()).unwrap();
     assert_eq!(
@@ -571,7 +575,7 @@ fn ci_watch_no_origin_remote_returns_non_github_error() {
     // Distinct from EC1 (no binding at all): here a binding exists but
     // its source_repo has no origin remote → derive returns None.
     let home = tmp_home("ci-no-origin");
-    let src = home.join("workspace").join("alpha");
+    let src = crate::paths::workspace_dir(&home).join("alpha");
     std::fs::create_dir_all(&src).ok();
     let _ = std::process::Command::new("git")
         .args(["init", "-b", "main"])

@@ -256,7 +256,7 @@ pub fn is_protected_ref(branch: &str) -> bool {
 /// is missing the 5 Kiro paths: `.kiro/agents/{agend.json,agend-prompt.md,
 /// default.json}`, `.kiro/prompts/agend.md`, `.kiro/settings.json`.
 pub fn cleanup_working_dir(home: &Path, name: &str, working_dir: &Path) {
-    let workspaces = home.join("workspace");
+    let workspaces = crate::paths::workspace_dir(home);
 
     // If under $AGEND_HOME/workspace/, remove the whole directory
     if working_dir.starts_with(&workspaces) {

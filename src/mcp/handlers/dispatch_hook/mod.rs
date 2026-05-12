@@ -210,7 +210,7 @@ fn resolve_source_repo(
             "source_repo resolved via fleet.yaml working_directory (tier 3, deprecation candidate)");
         return p;
     }
-    let stub = home.join("workspace").join(target);
+    let stub = crate::paths::workspace_dir(home).join(target);
     tracing::warn!(%target, tier = "stub", path = %stub.display(),
         "source_repo using home/workspace stub (tier 4) — fleet.yaml has no source_repo OR working_directory; binding may target wrong git history");
     if std::env::var("AGEND_BIND_STRICT_MODE").as_deref() == Ok("1") {

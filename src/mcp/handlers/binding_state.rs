@@ -161,7 +161,7 @@ fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> V
     if branch.is_empty() {
         return Vec::new();
     }
-    let runtime_dir = home.join("runtime");
+    let runtime_dir = crate::paths::runtime_dir(home);
     let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
         return Vec::new();
     };
@@ -203,7 +203,7 @@ mod tests {
     }
 
     fn write_binding(home: &std::path::Path, agent: &str, branch: &str, worktree: &str) {
-        let dir = home.join("runtime").join(agent);
+        let dir = crate::paths::runtime_dir(home).join(agent);
         std::fs::create_dir_all(&dir).unwrap();
         let payload = json!({
             "version": 1,

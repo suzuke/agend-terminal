@@ -2,7 +2,7 @@
 // These call the PRODUCTION function directly (§1.4 compliance).
 
 fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
-    let repo = home.join("workspace").join(agent);
+    let repo = crate::paths::workspace_dir(home).join(agent);
     std::fs::create_dir_all(&repo).ok();
     std::process::Command::new("git")
         .args(["init", "-b", "main"])
@@ -47,7 +47,9 @@ fn dispatch_with_branch_creates_binding_and_worktree() {
     let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-100", "feat/test", None);
     assert!(result.is_ok(), "dispatch must succeed: {:?}", result.err());
 
-    let binding_path = home.join("runtime").join("test-agent").join("binding.json");
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("test-agent")
+        .join("binding.json");
     assert!(binding_path.exists(), "binding.json must exist");
     let content = std::fs::read_to_string(&binding_path).expect("read");
     let v: serde_json::Value = serde_json::from_str(&content).expect("parse");
@@ -70,7 +72,9 @@ fn main_branch_rejects_dispatch() {
     assert!(err.contains("E4.5"), "error must mention E4.5: {err}");
 
     // No binding should exist.
-    let binding_path = home.join("runtime").join("test-agent").join("binding.json");
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("test-agent")
+        .join("binding.json");
     assert!(
         !binding_path.exists(),
         "rejected dispatch must not create binding"
@@ -89,8 +93,8 @@ fn lease_conflict_rejects_dispatch() {
     std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
             format!("instances:\n  agent-a:\n    backend: claude\n    working_directory: {}\n  agent-b:\n    backend: claude\n    working_directory: {}\n",
-                home.join("workspace").join("agent-a").display(),
-                home.join("workspace").join("agent-b").display()),
+                crate::paths::workspace_dir(&home).join("agent-a").display(),
+                crate::paths::workspace_dir(&home).join("agent-b").display()),
         ).ok();
 
     // First dispatch succeeds in agent-a's clone.
@@ -111,7 +115,9 @@ fn lease_conflict_rejects_dispatch() {
     );
 
     // Agent-b binding must NOT exist (Q2: REJECT = no side effects).
-    let binding_b = home.join("runtime").join("agent-b").join("binding.json");
+    let binding_b = crate::paths::runtime_dir(&home)
+        .join("agent-b")
+        .join("binding.json");
     assert!(
         !binding_b.exists(),
         "rejected dispatch must not create binding"
@@ -139,7 +145,9 @@ fn same_agent_re_dispatch_idempotent() {
     );
 
     // Binding should exist with new task_id.
-    let binding = home.join("runtime").join("agent-x").join("binding.json");
+    let binding = crate::paths::runtime_dir(&home)
+        .join("agent-x")
+        .join("binding.json");
     let content = std::fs::read_to_string(&binding).expect("read");
     let v: serde_json::Value = serde_json::from_str(&content).expect("parse");
     assert_eq!(v["task_id"], "T-2", "task_id must update on re-dispatch");
@@ -156,7 +164,7 @@ fn bind_file_error_stays_graceful() {
     setup_test_repo(&home, "test-agent");
 
     // Block bind_full by creating runtime/test-agent as a file (not dir).
-    let runtime_parent = home.join("runtime");
+    let runtime_parent = crate::paths::runtime_dir(&home);
     std::fs::create_dir_all(&runtime_parent).ok();
     let runtime_agent = runtime_parent.join("test-agent");
     std::fs::write(&runtime_agent, "blocking file").ok();
@@ -257,7 +265,7 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
     std::fs::create_dir_all(&home).ok();
     setup_test_repo(&home, "agent-a");
 
-    let repo = home.join("workspace").join("agent-a");
+    let repo = crate::paths::workspace_dir(&home).join("agent-a");
     std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
             // allow: shared-source_repo — this test exercises the central
@@ -359,7 +367,9 @@ fn same_agent_different_branch_rejects() {
 
     // Binding still reflects feat/A (T-1) — the rejected dispatch must
     // not have overwritten it.
-    let binding = home.join("runtime").join("agent-x").join("binding.json");
+    let binding = crate::paths::runtime_dir(&home)
+        .join("agent-x")
+        .join("binding.json");
     let content = std::fs::read_to_string(&binding).expect("read binding");
     let v: serde_json::Value = serde_json::from_str(&content).expect("parse binding");
     assert_eq!(
@@ -480,7 +490,9 @@ fn delegate_task_without_repo_no_ci_watch() {
     assert!(result.is_ok(), "dispatch must succeed: {:?}", result.err());
 
     // Bind/lease still happened (load-bearing).
-    let binding_path = home.join("runtime").join("test-agent").join("binding.json");
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("test-agent")
+        .join("binding.json");
     assert!(
         binding_path.exists(),
         "binding.json must exist (lease succeeded)"
@@ -671,7 +683,9 @@ fn dispatch_auto_bind_lease_rejects_same_agent_different_branch_post_wave_4() {
 
     // Binding still reflects feat/A — the rejected dispatch must
     // NOT have overwritten it.
-    let binding = home.join("runtime").join("agent-y").join("binding.json");
+    let binding = crate::paths::runtime_dir(&home)
+        .join("agent-y")
+        .join("binding.json");
     let content = std::fs::read_to_string(&binding).expect("read binding");
     let v: serde_json::Value = serde_json::from_str(&content).expect("parse binding");
     assert_eq!(

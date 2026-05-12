@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn name_residual_anywhere_detects_runtime_binding_residual() {
         let home = tmp_home("binding");
-        let dir = home.join("runtime").join("zombie");
+        let dir = crate::paths::runtime_dir(&home).join("zombie");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("binding.json"), "{}").unwrap();
         let sources = name_residual_anywhere(&home, "zombie");

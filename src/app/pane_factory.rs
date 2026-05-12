@@ -91,7 +91,7 @@ pub(super) fn create_pane(
     // Resolve working directory
     let work_dir = working_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| home.join("workspace").join(&name));
+        .unwrap_or_else(|| crate::paths::workspace_dir(home).join(&name));
 
     // Generate MCP config for agent backends
     if Backend::from_command(command).is_some() {
@@ -425,7 +425,7 @@ fn unique_fleet_name_with(home: &Path, base: &str, mut ids: impl Iterator<Item =
         {
             return true;
         }
-        if home.join("workspace").join(name).exists() {
+        if crate::paths::workspace_dir(home).join(name).exists() {
             return true;
         }
         if crate::inbox::inbox_path_resolved(home, name).exists() {
@@ -490,7 +490,7 @@ mod tests {
         let home = tmp_home("diff");
         let a = unique_fleet_name(&home, "codex");
         // Realize `a` as a workspace so the next call must not collide with it.
-        std::fs::create_dir_all(home.join("workspace").join(&a)).expect("create a");
+        std::fs::create_dir_all(crate::paths::workspace_dir(&home).join(&a)).expect("create a");
         let b = unique_fleet_name(&home, "codex");
         assert_ne!(a, b);
         std::fs::remove_dir_all(&home).ok();
@@ -523,8 +523,10 @@ mod tests {
         let home = tmp_home("fallback");
         // Seed the exact 100 suffixes the iterator will produce
         for n in 1..=100u32 {
-            std::fs::create_dir_all(home.join("workspace").join(format!("codex-{n:06x}")))
-                .expect("seed");
+            std::fs::create_dir_all(
+                crate::paths::workspace_dir(&home).join(format!("codex-{n:06x}")),
+            )
+            .expect("seed");
         }
         let name =
             unique_fleet_name_with(&home, "codex", (1u32..=100).collect::<Vec<_>>().into_iter());

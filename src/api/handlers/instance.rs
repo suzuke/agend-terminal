@@ -149,7 +149,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     let requested_work_dir = params["working_directory"]
         .as_str()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| ctx.home.join("workspace").join(name));
+        .unwrap_or_else(|| crate::paths::workspace_dir(ctx.home).join(name));
     let work_dir = match crate::api::validate_working_directory(&requested_work_dir, ctx.home) {
         Ok(p) => p,
         Err(e) => return json!({"ok": false, "error": format!("{e}")}),
@@ -624,7 +624,7 @@ mod tests {
 
         // Call spawn_one directly (team-spawn path bypasses handle_spawn)
         let size = (80u16, 24u16);
-        let work_dir = home.join("workspace").join("team-meta");
+        let work_dir = crate::paths::workspace_dir(&home).join("team-meta");
         std::fs::create_dir_all(&work_dir).ok();
         let result = crate::api::spawn_one(
             ctx.home,

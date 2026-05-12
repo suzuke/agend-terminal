@@ -492,7 +492,7 @@ fn cleanup_deployment_dirs(home: &Path, deployment: &Deployment) {
         // to `home/workspace/<deploy_name>` (subdir lands at
         // `home/workspace/<deploy_name>/<inst>`) AND covers historical
         // teardown semantics that cleaned `home/workspace/<inst>` directly.
-        let default_subdir = home.join("workspace").join(inst);
+        let default_subdir = crate::paths::workspace_dir(home).join(inst);
         if default_subdir.exists() {
             crate::agent_ops::cleanup_working_dir(home, inst, &default_subdir);
         }
@@ -1373,7 +1373,7 @@ instances: {}
             &serde_json::json!({"template": "dev", "directory": home.display().to_string()}),
         );
         // Create workspace dir (simulates what daemon would create).
-        let workspace = home.join("workspace").join("dev-worker");
+        let workspace = crate::paths::workspace_dir(&home).join("dev-worker");
         std::fs::create_dir_all(&workspace).ok();
         std::fs::write(workspace.join("test.txt"), "data").ok();
         assert!(workspace.exists());
@@ -1412,7 +1412,7 @@ instances: {}
 
         // Binding should be cleared by cleanup_working_dir or DELETE.
         // Workspace dir should not exist.
-        let workspace = home.join("workspace").join("dev-agent");
+        let workspace = crate::paths::workspace_dir(&home).join("dev-agent");
         assert!(!workspace.exists(), "workspace must be cleaned");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1743,7 +1743,7 @@ instances: {}
         // Hand-create the workspace subdir (production's spawn path
         // would have created it; deploy_single_instance_for_test stops
         // short of spawning).
-        let wd = home.join("workspace").join("tpl-worker");
+        let wd = crate::paths::workspace_dir(&home).join("tpl-worker");
         std::fs::create_dir_all(&wd).unwrap();
         std::fs::write(wd.join("agent_data.txt"), "data").unwrap();
         assert!(wd.exists(), "test setup: workspace dir must exist");
