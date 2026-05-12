@@ -1317,6 +1317,31 @@ pub fn startup_sweep(home: &Path) {
     if removed > 0 {
         tracing::info!(removed, "ci_watch startup sweep complete");
     }
+    // Log surviving watches so operators can confirm persistence across restart.
+    let ci_dir = home.join("ci-watches");
+    if let Ok(entries) = std::fs::read_dir(&ci_dir) {
+        let active: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                    return None;
+                }
+                let content = std::fs::read_to_string(&path).ok()?;
+                let watch: serde_json::Value = serde_json::from_str(&content).ok()?;
+                let repo = watch["repo"].as_str()?;
+                let branch = watch["branch"].as_str().unwrap_or("main");
+                Some(format!("{repo}@{branch}"))
+            })
+            .collect();
+        if !active.is_empty() {
+            tracing::info!(
+                count = active.len(),
+                watches = %active.join(", "),
+                "ci_watch: restored watches from disk after restart"
+            );
+        }
+    }
 }
 
 pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
@@ -4756,5 +4781,35 @@ mod tests {
             aggregate_conclusion_for_sha(&runs, "abc123"),
             Some("failure")
         );
+    }
+
+    #[test]
+    fn startup_sweep_preserves_valid_watches() {
+        let home = tmp_dir("restart-persist");
+        let ci_dir = home.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).unwrap();
+
+        // Create a valid (non-expired) watch
+        let watch = serde_json::json!({
+            "repo": "test/repo",
+            "branch": "feat-branch",
+            "subscribers": ["dev-1"],
+            "interval_secs": 60,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "last_polled_at": chrono::Utc::now().timestamp_millis() - 120_000,
+        });
+        let filename = watch_filename("test/repo", "feat-branch");
+        std::fs::write(ci_dir.join(&filename), watch.to_string()).unwrap();
+
+        // Simulate restart: run startup_sweep
+        startup_sweep(&home);
+
+        // Watch must survive (not expired, not protected branch)
+        let surviving = std::fs::read_to_string(ci_dir.join(&filename));
+        assert!(
+            surviving.is_ok(),
+            "valid watch must survive startup_sweep (restart persistence)"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
