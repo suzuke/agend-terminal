@@ -4,7 +4,19 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Poll a predicate until it returns true or timeout expires.
+fn wait_until<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if pred() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
 
 /// Shell binary used as the dummy long-running process for each agent.
 /// Both `/bin/bash` (Unix) and `cmd.exe` (Windows) sit in the default PATH
@@ -337,8 +349,20 @@ fn test_crash_respawn_health() {
         );
     }
 
-    // Wait for respawn (backoff 5s + spawn time)
-    std::thread::sleep(Duration::from_secs(8));
+    // Wait for respawn (poll instead of hard 8s sleep)
+    assert!(
+        wait_until(
+            || {
+                let r = daemon.api_call(&serde_json::json!({"method": "list"}));
+                r["result"]["agents"]
+                    .as_array()
+                    .map(|a| a.len() == 1 && a[0]["health_state"] == "healthy")
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(12)
+        ),
+        "agent did not respawn within 12s"
+    );
 
     // Agent should be back
     let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
@@ -408,11 +432,12 @@ fn test_shutdown_no_crash_log() {
 #[test]
 fn test_event_log_written() {
     let mut daemon = TestDaemon::start("event_log");
-    std::thread::sleep(Duration::from_secs(1));
-
-    // Check event log has daemon_start
+    // Poll for event log to appear
     let log_path = daemon.home.join("event-log.jsonl");
-    assert!(log_path.exists(), "event-log.jsonl should exist");
+    assert!(
+        wait_until(|| log_path.exists(), Duration::from_secs(3)),
+        "event-log.jsonl should exist"
+    );
 
     let content = std::fs::read_to_string(&log_path).expect("read log");
     assert!(
@@ -448,8 +473,20 @@ fn test_fleet_multi_agent_lifecycle() {
         daemon.api_call(&serde_json::json!({"method": "kill", "params": {"name": "shell1"}}));
     assert_eq!(resp["ok"], true);
 
-    // Wait for respawn (5s backoff + spawn time)
-    std::thread::sleep(Duration::from_secs(8));
+    // Wait for respawn (poll instead of hard 8s sleep)
+    assert!(
+        wait_until(
+            || {
+                let r = daemon.api_call(&serde_json::json!({"method": "list"}));
+                r["result"]["agents"]
+                    .as_array()
+                    .map(|a| a.len() == 2)
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(12)
+        ),
+        "agents did not respawn within 12s"
+    );
 
     let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
     let agents = resp["result"]["agents"].as_array().expect("agents");
