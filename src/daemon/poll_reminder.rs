@@ -168,6 +168,7 @@ mod tests {
             typed_inject: false,
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         reg.lock().insert(name.to_string(), handle);
