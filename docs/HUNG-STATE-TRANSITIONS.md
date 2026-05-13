@@ -359,7 +359,7 @@ validation (`#685` sub-task 5). Not recommendations.**
 |---|---|---|
 | (a) Cursor-anchored / viewport-only | Match patterns only against last N rows or visible viewport; exclude scrollback rows entirely | Count Scenario C bounces before/after on corpus; **feasibility check**: portable-pty / vterm cursor-position API surface on macOS / Linux / Windows ConPTY (Open question §F39.5) |
 | (b) Recent-output-bytes gate | Match against bytes received in last K `feed()` calls (slice accumulated buffer) instead of full rendered screen | Measure output rate distribution per backend; choose K such that legitimate Thinking matches stay above threshold |
-| (c) Co-required negative pattern | `Thinking` valid only if `esc to cancel` present AND prompt indicator (e.g. `❯`) absent | Count Thinking→Idle transitions with spinner visible on corpus |
+| (c) Co-required negative pattern¹ | `Thinking` valid only if `esc to cancel` present AND prompt indicator (e.g. `❯`) absent | Count Thinking→Idle transitions with spinner visible on corpus |
 | (d) Oscillation-detection min-hold extension | Counter detects ≥2 transitions touching the same state within N seconds → extend `min_hold` to N × K seconds before allowing further transitions | Measure oscillation frequency on corpus |
 | (e) Pattern-source-line tracking | `detect()` returns match row index; scrollback rows (above viewport top) yield "stale" verdict and skip `transition()` | Measure scrollback-vs-viewport match rate per pattern |
 | (f) Per-pattern / dynamic `LATCHED_STATE_EXPIRY` | Per-pattern expiry value (shorter for `Thinking`), or dynamic shrink when current state held > 2× typical duration | Measure typical Thinking duration per backend; identify outliers |
@@ -368,6 +368,12 @@ validation (`#685` sub-task 5). Not recommendations.**
 transition gate at `rg "min_hold" src/state.rs`) to make oscillation
 harder; (f) shortens `LATCHED_STATE_EXPIRY` so the latched state
 expires sooner. Both are independently composable.
+
+¹ Hypothesis (c) variant — narrowing Gemini Thinking pattern from
+`r"esc to cancel"` to `r"\(esc to cancel,"` — speculatively applied in
+PR #763 (decision `d-20260513231713506833-1`). Reduces FPs from stale
+`esc to cancel` text in scrollback without requiring co-pattern gating.
+Re-evaluate the full (c) hypothesis when fixture corpus data is available.
 
 **Rejected**: tick force-recheck on screen-hash change — `tick()` already
 calls `maybe_expire_latched_state` periodically (`rg "fn tick" src/state.rs`),

@@ -423,7 +423,7 @@ impl StatePatterns {
                 // Braille spinner) is a speculative quick-win for a separate
                 // follow-up PR, not committed here.
                 // See docs/HUNG-STATE-TRANSITIONS.md §F39.1
-                (AgentState::Thinking, r"esc to cancel"),
+                (AgentState::Thinking, r"\(esc to cancel,"),
                 // [measured] Input prompt text
                 (AgentState::Idle, r"Type your message"),
                 // [measured] Full ready prompt + YOLO mode
@@ -2114,6 +2114,39 @@ mod tests {
             AgentState::Idle,
             "stale 'Thinking' word in chat history must not latch"
         );
+    }
+
+    #[test]
+    fn gemini_thinking_pattern_matches_spinner_with_timer() {
+        // F39 contract (decision d-20260513231713506833-1): active Gemini
+        // spinner line with timer-paren prefix `(esc to cancel, Ns)` must
+        // trigger Thinking transition.
+        let mut vt = VTerm::new(120, 24);
+        let mut st = StateTracker::new(Some(&Backend::Gemini));
+        drive(
+            &mut vt,
+            &mut st,
+            b"\xe2\xa0\xa6 Thinking... (esc to cancel, 5s)\r\n",
+        );
+        assert_eq!(st.get_state(), AgentState::Thinking);
+    }
+
+    #[test]
+    fn gemini_thinking_pattern_does_not_match_bare_scrollback_text() {
+        // F39 contract (decision d-20260513231713506833-1): prose containing
+        // literal "esc to cancel" without the timer-paren prefix (chat
+        // history, docs, help text) must NOT trigger Thinking. Locks the
+        // narrowing: r"esc to cancel" → r"\(esc to cancel,". Test asserts
+        // semantic outcome, not regex literal — future further-narrowing
+        // that preserves this contract is free to refactor.
+        let mut vt = VTerm::new(120, 24);
+        let mut st = StateTracker::new(Some(&Backend::Gemini));
+        drive(
+            &mut vt,
+            &mut st,
+            b"Press Ctrl-C or esc to cancel the operation.\r\n",
+        );
+        assert_ne!(st.get_state(), AgentState::Thinking);
     }
 
     #[test]
