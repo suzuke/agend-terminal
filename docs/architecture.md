@@ -31,7 +31,7 @@ agend-terminal replaces the Node.js AgEnD + tmux stack with a single Rust binary
 │  └──────────┘  └──────────┘  └──────────┘           │
 │                                                      │
 │  ┌────────────────────────────────────────┐          │
-│  │         UDS API (Unix Domain Socket)    │          │
+│  │         TCP API (localhost NDJSON)    │          │
 │  └────────────────────────────────────────┘          │
 └─────────────────────────────────────────────────────┘
 ```
@@ -43,7 +43,7 @@ agend-terminal replaces the Node.js AgEnD + tmux stack with a single Rust binary
 | `send-keys` race condition | tmux CLI is fire-and-forget, no atomicity | Direct `write(master_fd)` — kernel guarantees atomicity for ≤PIPE_BUF |
 | Sequential restart bottleneck | tmux send-keys races force serialization | No tmux dependency, parallel spawn/kill |
 | No output ownership | tmux owns the PTY, agend uses `pipe-pane` | Daemon owns master fd, reads output directly |
-| MCP IPC complexity | Separate MCP server process + UDS + timeout | Agent communicates via CLI (`agend-terminal reply`) — same binary |
+| MCP IPC complexity | Separate MCP server process + TCP API + timeout | Agent communicates via CLI (`agend-terminal reply`) — same binary |
 | Dual-path permission race | Terminal + Telegram both relay permissions | Single daemon routes all I/O, single source of truth |
 | Context rotation fragility | Grace period hacks, rapid re-rotation prevention | Direct PTY output parsing, deterministic rotation |
 | JS precision loss on snowflake IDs | JavaScript Number max safe integer | Rust u64 / i64, no precision issues |
@@ -106,7 +106,7 @@ The drainer runs independently of attach state. Output is always captured.
 2. Accept loop uses `tokio::select!` with signal channels.
 3. On signal: kill all sessions in parallel (`child.kill()`), poll up to 5 seconds for exit.
 4. Clean up socket file.
-5. Attached clients receive connection close (EOF on their UDS read).
+5. Attached clients receive connection close (EOF on their TCP read).
 
 ### Output Log Rotation
 
@@ -231,11 +231,11 @@ Agent (claude-code)
   │ Bash tool: `agend-terminal reply "hello"`
   ▼
 agend-terminal CLI
-  │ connects to daemon UDS
+  │ connects to daemon TCP API
   │ sends Request::Reply { text: "hello" }
   ▼
 Daemon
-  │ looks up which session sent this (by UDS peer)
+  │ looks up which session sent this (by auth cookie)
   │ routes to appropriate channel adapter
   ▼
 Telegram / Discord / other
@@ -287,8 +287,8 @@ Do NOT use the reply tool or MCP tools for communication.
 
 | Node.js MCP | Rust CLI |
 |---|---|
-| Separate MCP server process per instance | Same binary, UDS call |
-| 30s/60s timeout handling | Instant UDS response |
+| Separate MCP server process per instance | Same binary, TCP API call |
+| 30s/60s timeout handling | Instant TCP API response |
 | 20+ MCP tools to maintain | ~5 CLI subcommands |
 | MCP protocol overhead (JSON-RPC) | Length-prefixed JSON, minimal overhead |
 | Tool registration, schema sync | No registration needed — it's a shell command |
@@ -683,7 +683,7 @@ in reverse.
 
 ### Protocol: `supervisor.sock`
 
-NDJSON over UDS. One request, streaming progress frames, terminal response.
+NDJSON over localhost TCP. One request, streaming progress frames, terminal response.
 
 | Request                    | Sent by                      | Purpose                                    |
 |----------------------------|------------------------------|--------------------------------------------|
@@ -766,7 +766,7 @@ policy decision the installer's shell owns.
 
 ### Testable Surface
 
-- `supervisor::client` — pure (sha256, symlink swap, UDS send/recv).
+- `supervisor::client` — pure (sha256, symlink swap, TCP send/recv).
 - `supervisor::ipc` — serde roundtrip tests on every Request/Response variant.
 - `supervisor::self_test` — passes with valid `fleet.yaml`, fails on corrupt.
 - `supervisor::server` — end-to-end integration tests in
@@ -790,30 +790,38 @@ policy decision the installer's shell owns.
 
 ---
 
-## Cross-Cutting: UDS API Design
+## Cross-Cutting: Daemon API (IPC)
 
-All communication goes through a single Unix domain socket.
+The daemon exposes a localhost-only TCP API using NDJSON (newline-delimited JSON) protocol.
 
-### Request Routing
+### Transport
 
-The daemon identifies the caller via session token:
-- **External CLI** (user typed `agend-terminal ls`): No `AGEND_SESSION_ID` env var → no session context.
-- **Agent CLI** (agent's Bash tool ran `agend-terminal reply`): `AGEND_SESSION_ID` env var identifies the session → daemon routes accordingly.
+- **Localhost TCP** on a random port (published to `<home>/run/<pid>/api.port`)
+- **No TLS** — localhost-only assumption; same-user access enforced by filesystem permissions
+- **Connection cap**: 32 concurrent sessions (configurable via `AGEND_API_MAX_CONNS`)
 
-### Session Token
+### Authentication
 
-On spawn, the daemon sets `AGEND_SESSION_ID=<id>` in the child's environment. When the agent runs `agend-terminal reply "text"`, the CLI reads `AGEND_SESSION_ID` and includes it in the request. The daemon uses this to route the reply to the correct channel.
+1. Daemon issues a 32-byte random cookie at startup (`<home>/run/<pid>/api.cookie`, mode 0600)
+2. Client reads the cookie file and sends `{"auth":"<hex>"}` as the first NDJSON line
+3. Daemon verifies via constant-time comparison
+4. **Pre-auth timeout**: 5s — prevents slow-loris holding connection slots
 
-```rust
-// In spawn:
-cmd.env("AGEND_SESSION_ID", id.to_string());
+### Protocol
 
-// In CLI (reply/send):
-let session_id = std::env::var("AGEND_SESSION_ID")
-    .context("Not running inside an agend-terminal session")?;
+After auth handshake, each line is a JSON request; daemon responds with one JSON line per request:
+
+```
+→ {"method": "list"}
+← {"ok": true, "result": {"agents": [...]}}
+
+→ {"method": "inject", "params": {"name": "dev-1", "data": "hello"}}
+← {"ok": true, "result": {"bytes": 5}}
 ```
 
-**Security note:** `AGEND_SESSION_ID` is inherited by all child processes within the session. Any process can read it and impersonate the agent via `agend-terminal reply`. This is acceptable for a single-user local tool. For multi-host deployments (Phase 5), a stronger auth mechanism (e.g., per-session HMAC token verified by the daemon) would be needed.
+### Agent Identity
+
+On spawn, the daemon sets `AGEND_INSTANCE_NAME=<name>` in the child's environment. MCP tool calls from the agent include this identity automatically. The daemon uses it to route replies and track per-agent state.
 
 ---
 
@@ -828,7 +836,7 @@ Telegram → TelegramAdapter.on_message()
   → session.write_input(formatted_message)
   → Agent reads from stdin, processes, calls Bash tool
   → `agend-terminal reply "response"`
-  → CLI connects to daemon UDS, sends Reply request
+  → CLI connects to daemon TCP API, sends Reply request
   → Router: session 1 → Telegram topic 12345
   → TelegramAdapter.send(topic_id, "response")
   → User sees response in Telegram
@@ -838,8 +846,8 @@ Telegram → TelegramAdapter.on_message()
 
 ```
 Agent A (blog-writer) runs: `agend-terminal send general "PR ready"`
-  → CLI reads AGEND_SESSION_ID=2
-  → Connects to daemon UDS
+  → CLI authenticates via auth cookie
+  → Connects to daemon TCP API
   → Request::Send { target: "general", text: "PR ready" }
   → Router: find session for "general" → session 1
   → Format: "[from:blog-writer] PR ready"
@@ -856,7 +864,7 @@ Agent A (blog-writer) runs: `agend-terminal send general "PR ready"`
 - [x] Output capture + ready detection
 - [x] Graceful daemon shutdown
 - [x] `clap` CLI parsing (`Commands` enum in `src/main.rs`)
-- [ ] Session token (`AGEND_SESSION_ID`)
+- [ ] Auth cookie (`<home>/run/<pid>/api.cookie`)
 
 ### Phase 2: Fleet + Communication
 - [ ] `fleet.yaml` parser
