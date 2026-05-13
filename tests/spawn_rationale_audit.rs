@@ -203,7 +203,9 @@ fn dispatch_scoped_sweep_sites_have_rationale() {
         ("instance_monitor.rs", "std::thread::Builder::new()"),
         ("agent.rs", "std::thread::Builder::new()"),
         ("daemon/mod.rs", "std::thread::Builder::new()"),
-        ("daemon/ci_watch.rs", "std::thread::Builder::new()"),
+        // #701 split: ci_watch.rs → ci_watch/{mod,registry,provider,sweep,poller,watcher}.rs
+        // The shared_ci_runtime spawn site lives in poller.rs.
+        ("daemon/ci_watch/poller.rs", "shared_ci_runtime().spawn"),
         ("daemon/tui_bridge.rs", "std::thread::Builder::new()"),
         ("channel/telegram/inbound.rs", "std::thread::Builder::new()"),
         ("app/telegram_hooks.rs", "std::thread::spawn"),

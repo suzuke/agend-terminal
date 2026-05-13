@@ -1,11 +1,30 @@
 use crate::agent::{self, AgentRegistry};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-/// Canonical path to the ci-watches directory.
-pub fn ci_watches_dir(home: &Path) -> PathBuf {
-    home.join("ci-watches")
-}
+use super::provider::{CiPollResult, CiProvider, CiRun, PrState};
+use super::registry::{
+    ci_watches_dir, parse_subscribers, remove_watch, update_watch_state,
+    update_watch_state_with_notify,
+};
+use super::sweep::{bump_consecutive_skips_and_maybe_notify, clear_stall_and_maybe_notify_resumed};
+use super::WATCH_TTL_HOURS;
+
+// Test-only re-exports so the existing test module (moved verbatim from
+// the pre-#701 single-file ci_watch.rs) can keep referencing siblings
+// via `super::X` paths — `super` here resolves to `poller`, so these
+// aliases preserve the original `super::ci_watch::X` semantics.
+#[cfg(test)]
+use super::provider::{
+    BitbucketCiProvider, GitHubCiProvider, GitLabCiProvider, detect_provider_from_remote,
+    github_token_warning,
+};
+#[cfg(test)]
+use super::registry::watch_filename;
+#[cfg(test)]
+use super::sweep::{gc_stale_watches, startup_sweep, STALL_THRESHOLD};
+#[cfg(test)]
+use super::watcher::check_ci_watches;
 
 // ---------------------------------------------------------------------------
 // H2: Shared tokio runtime for CI watch — avoids spawning a new thread +
@@ -22,1068 +41,6 @@ fn shared_ci_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("ci-watch runtime")
     })
-}
-
-// ---------------------------------------------------------------------------
-// Shared HTTP client for CI providers (Sprint 39 follow-up extraction)
-// ---------------------------------------------------------------------------
-
-/// Auth scheme for CI provider HTTP requests.
-pub(crate) enum CiAuth {
-    /// `Authorization: Bearer <token>` (GitHub)
-    Bearer(String),
-    /// Custom header name + value (GitLab: `PRIVATE-TOKEN: <token>`)
-    Header(String, String),
-    /// HTTP Basic auth `user:password` (Bitbucket)
-    Basic(String, String),
-}
-
-/// Shared HTTP client wrapping reqwest + auth + base URL.
-/// Each CiProvider stores one and delegates request construction.
-pub(crate) struct CiHttpClient {
-    client: reqwest::Client,
-    base_url: String,
-    /// Path prefix inserted between base_url and the caller's path
-    /// (e.g., "/api/v4" for GitLab, "/2.0" for Bitbucket, "" for GitHub).
-    path_prefix: String,
-    /// Auth resolver called per-request (token may change at runtime).
-    auth_fn: Box<dyn Fn() -> Option<CiAuth> + Send + Sync>,
-    /// Per-provider Accept header (e.g., GitHub's `application/vnd.github+json`).
-    default_accept: Option<String>,
-}
-
-impl CiHttpClient {
-    pub(crate) fn new(
-        base_url: String,
-        path_prefix: &str,
-        auth_fn: impl Fn() -> Option<CiAuth> + Send + Sync + 'static,
-    ) -> anyhow::Result<Self> {
-        Self::with_accept(base_url, path_prefix, None, auth_fn)
-    }
-
-    pub(crate) fn with_accept(
-        base_url: String,
-        path_prefix: &str,
-        default_accept: Option<String>,
-        auth_fn: impl Fn() -> Option<CiAuth> + Send + Sync + 'static,
-    ) -> anyhow::Result<Self> {
-        Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()?,
-            base_url,
-            path_prefix: path_prefix.to_string(),
-            auth_fn: Box::new(auth_fn),
-            default_accept,
-        })
-    }
-
-    /// Build a GET request with auth + User-Agent applied.
-    pub(crate) fn get(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = if self.path_prefix.is_empty() {
-            format!("{}/{path}", self.base_url)
-        } else {
-            format!("{}/{}/{path}", self.base_url, self.path_prefix)
-        };
-        let mut req = self.client.get(&url).header("User-Agent", "agend-terminal");
-        if let Some(ref accept) = self.default_accept {
-            req = req.header("Accept", accept.as_str());
-        }
-        if let Some(auth) = (self.auth_fn)() {
-            req = match auth {
-                CiAuth::Bearer(token) => req.bearer_auth(token),
-                CiAuth::Header(name, value) => req.header(name, value),
-                CiAuth::Basic(user, pass) => req.basic_auth(user, Some(pass)),
-            };
-        }
-        req
-    }
-
-    /// Parse rate-limit reset timestamp from response headers.
-    /// Checks both GitHub (`x-ratelimit-reset`) and GitLab (`ratelimit-reset`) header names.
-    #[allow(dead_code)] // available for providers to use; wired per-provider as needed
-    pub(crate) fn parse_rate_limit_reset(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-        headers
-            .get("x-ratelimit-reset")
-            .or_else(|| headers.get("ratelimit-reset"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CiProvider trait — abstracts CI-server-specific HTTP calls so ci_watch
-// state-machine logic can be tested with a mock and future providers
-// (GitLab, Buildkite, …) can be added without touching the orchestration.
-// ---------------------------------------------------------------------------
-
-/// A single CI pipeline/workflow run, provider-neutral.
-#[derive(Debug, Clone)]
-pub struct CiRun {
-    pub id: u64,
-    /// `None` means in-progress / not yet concluded.
-    pub conclusion: Option<String>,
-    pub head_sha: String,
-    pub url: String,
-}
-
-/// Result of polling CI runs for a branch.
-///
-/// Sprint 54 P0-2: the success variant carries the
-/// `X-RateLimit-Remaining` / `X-RateLimit-Limit` quota counters when
-/// the provider exposes them. The tick-loop feeds these into
-/// [`adaptive_interval`] to widen the next poll's effective interval
-/// before the limit is exhausted (preempt vs. recover).
-#[derive(Debug)]
-pub enum CiPollResult {
-    /// Runs retrieved successfully (may be empty). Rate-limit fields
-    /// are `None` for providers that don't expose the quota headers
-    /// (currently only GitHub does); callers fall back to the
-    /// configured interval in that case.
-    Runs {
-        runs: Vec<CiRun>,
-        /// Last seen `X-RateLimit-Remaining`. None if header absent.
-        rate_limit_remaining: Option<u64>,
-        /// Last seen `X-RateLimit-Limit`. None if header absent.
-        rate_limit_limit: Option<u64>,
-    },
-    /// API-level error (rate limit, auth failure, server error).
-    ApiError {
-        #[allow(dead_code)]
-        status: u16,
-        message: String,
-        /// If rate-limited, epoch seconds when quota resets.
-        rate_limit_reset: Option<u64>,
-    },
-}
-
-/// PR terminal-state check result.
-#[derive(Debug)]
-pub enum PrState {
-    /// PR reached terminal state (closed or merged).
-    Terminal { merged: bool },
-    /// PR is still open.
-    Open,
-    /// Check failed or no PR found — leave watcher alone.
-    Unknown,
-}
-
-/// Abstraction over a CI server's REST API.
-/// Each method corresponds to one provider-specific HTTP call.
-/// Return types are provider-neutral — all schema parsing happens
-/// inside the impl, not in the ci_watch state machine.
-#[async_trait::async_trait]
-pub trait CiProvider: Send + Sync {
-    /// Poll workflow/pipeline runs for `repo@branch`.
-    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult>;
-
-    /// Check whether the PR/MR for `branch` has reached a terminal state.
-    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState;
-
-    /// Fetch a human-readable summary of the first failed job/step.
-    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String;
-
-    /// Optional token/auth warning shown in the `watch_ci` MCP response.
-    /// Currently called via `github_token_warning_from_env()` in the handler;
-    /// future providers will use this method directly.
-    #[allow(dead_code)]
-    fn token_warning(&self) -> Option<&'static str>;
-}
-
-/// GitHub Actions implementation of [`CiProvider`].
-pub struct GitHubCiProvider {
-    http: CiHttpClient,
-}
-
-impl GitHubCiProvider {
-    #[allow(dead_code)] // used by tests + future direct callers
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_base_url("https://api.github.com".to_string())
-    }
-
-    #[allow(dead_code)] // used by auto-detect for GHE; wired in this PR
-    pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
-        Ok(Self {
-            http: CiHttpClient::with_accept(
-                base_url,
-                "",
-                Some("application/vnd.github+json".to_string()),
-                // Sprint 54 P0-4: token resolution now goes through the
-                // centralized cache (env → gh CLI → None). The cache
-                // discovers once per process and never writes back to env,
-                // so child PTYs don't silently inherit a token.
-                || crate::github_token::cached_token().map(CiAuth::Bearer),
-            )?,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl CiProvider for GitHubCiProvider {
-    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
-        let resp = self
-            .http
-            .get(&format!(
-                "repos/{repo}/actions/runs?branch={branch}&per_page=5"
-            ))
-            .send()
-            .await?;
-        let status = resp.status().as_u16();
-        let rate_limit_reset = resp
-            .headers()
-            .get("x-ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        // Sprint 54 P0-2: capture remaining/limit on every response,
-        // not just rate-limited ones. The watch loop feeds these into
-        // `adaptive_interval` so we widen the next poll BEFORE hitting
-        // the cap, instead of recovering from it.
-        let parse_u64_header = |name: &str| {
-            resp.headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-        };
-        let rate_limit_remaining = parse_u64_header("x-ratelimit-remaining");
-        let rate_limit_limit = parse_u64_header("x-ratelimit-limit");
-        let body: serde_json::Value = resp.json().await?;
-
-        // Surface API errors (rate-limit, auth, server) instead of
-        // silently treating them as "no runs".
-        if !(200..300).contains(&status) {
-            let message = body["message"]
-                .as_str()
-                .unwrap_or("(no message)")
-                .to_string();
-            // Sprint 54 P0-4: hint via the unified token cache. Anything
-            // the cache treats as "no token available" (env unset AND gh
-            // not authed) gets the actionable hint. Reading the cache —
-            // not env — keeps behavior consistent with what auth_fn
-            // actually saw on the wire.
-            let hint = if status == 403
-                && crate::github_token::cached_token().is_none()
-                && message.to_lowercase().contains("rate limit")
-            {
-                " — set GITHUB_TOKEN or run `gh auth login` to raise the unauthenticated 60/hr cap"
-            } else {
-                ""
-            };
-            return Ok(CiPollResult::ApiError {
-                status,
-                message: format!("GH API {status}: {message}{hint}"),
-                rate_limit_reset,
-            });
-        }
-
-        // Parse GitHub-specific `workflow_runs` array into neutral CiRun structs.
-        let runs = body["workflow_runs"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| {
-                        Some(CiRun {
-                            id: r["id"].as_u64()?,
-                            conclusion: r["conclusion"].as_str().map(String::from),
-                            head_sha: r["head_sha"].as_str()?.to_string(),
-                            url: r["html_url"].as_str().unwrap_or("").to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(CiPollResult::Runs {
-            runs,
-            rate_limit_remaining,
-            rate_limit_limit,
-        })
-    }
-
-    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
-        // Sprint 54 Hotfix F gap fix: GitHub's `head=` query parameter
-        // requires `user:ref-name` format. Sending bare `head=feat/foo`
-        // makes the API silently drop the filter and return the most
-        // recently created PR in the repo regardless of branch — that
-        // behavior masked Hotfix F's freshness check (the misrouted PR
-        // was usually fresh enough to pass the 1-hour window) and
-        // produced false `Terminal{merged}` for any branch that had
-        // never had a PR opened. Per GitHub docs:
-        // https://docs.github.com/en/rest/pulls/pulls#list-pull-requests
-        let owner = repo.split('/').next().unwrap_or("");
-        let resp: serde_json::Value = match self
-            .http
-            .get(&format!(
-                "repos/{repo}/pulls?head={owner}:{branch}&state=all&per_page=1"
-            ))
-            .send()
-            .await
-        {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(_) => return PrState::Unknown,
-            },
-            Err(_) => return PrState::Unknown,
-        };
-        match resp.as_array().and_then(|a| a.first()) {
-            Some(pr) => {
-                // Sprint 54 Hotfix F gap fix (defensive): even with the
-                // correct query format, GitHub may return a PR whose
-                // `head.ref` doesn't match what we asked for (cross-fork
-                // edge cases, schema drift, future API quirks). Treat
-                // mismatch as Unknown rather than trusting the response
-                // — the cost of an extra polling tick is far smaller
-                // than a false auto-clear.
-                if pr["head"]["ref"].as_str() != Some(branch) {
-                    tracing::debug!(
-                        repo,
-                        branch,
-                        returned_ref = ?pr["head"]["ref"].as_str(),
-                        "check_pr_terminal: response head.ref mismatch — returning Unknown"
-                    );
-                    return PrState::Unknown;
-                }
-                match pr["state"].as_str() {
-                    Some("closed") => {
-                        // Verify this PR was updated recently (not a stale PR from
-                        // a previous use of the same branch name). If closed_at is
-                        // older than 1 hour, treat as stale → Unknown (pending).
-                        if let Some(closed_at) = pr["closed_at"].as_str() {
-                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(closed_at) {
-                                let age = chrono::Utc::now()
-                                    .signed_duration_since(dt.with_timezone(&chrono::Utc));
-                                if age > chrono::Duration::hours(1) {
-                                    // Stale PR from previous branch use — not terminal.
-                                    return PrState::Unknown;
-                                }
-                            }
-                        }
-                        PrState::Terminal {
-                            merged: pr["merged_at"].as_str().is_some(),
-                        }
-                    }
-                    Some(_) => PrState::Open,
-                    None => PrState::Unknown,
-                }
-            }
-            None => PrState::Unknown,
-        }
-    }
-
-    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
-        let jobs_resp: serde_json::Value = match self
-            .http
-            .get(&format!("repos/{repo}/actions/runs/{run_id}/jobs"))
-            .send()
-            .await
-        {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(_) => return "unknown step".to_string(),
-            },
-            Err(_) => return "unknown step".to_string(),
-        };
-        jobs_resp["jobs"]
-            .as_array()
-            .and_then(|jobs| {
-                jobs.iter().find_map(|job| {
-                    job["steps"].as_array().and_then(|steps| {
-                        steps.iter().find_map(|step| {
-                            (step["conclusion"].as_str() == Some("failure")).then(|| {
-                                format!(
-                                    "{} / {}",
-                                    job["name"].as_str().unwrap_or("?"),
-                                    step["name"].as_str().unwrap_or("?")
-                                )
-                            })
-                        })
-                    })
-                })
-            })
-            .unwrap_or_else(|| "unknown step".to_string())
-    }
-
-    fn token_warning(&self) -> Option<&'static str> {
-        github_token_warning(std::env::var("GITHUB_TOKEN").ok().as_deref())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GitLab CI provider
-// ---------------------------------------------------------------------------
-
-/// GitLab Pipelines implementation of [`CiProvider`].
-pub struct GitLabCiProvider {
-    http: CiHttpClient,
-}
-
-impl GitLabCiProvider {
-    #[allow(dead_code)] // wired in Sprint 39 PR-3 (fleet.yaml ci_provider config)
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_base_url("https://gitlab.com".to_string())
-    }
-
-    #[allow(dead_code)]
-    pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
-        Ok(Self {
-            http: CiHttpClient::new(base_url, "api/v4", || {
-                Self::resolve_token().map(|t| CiAuth::Header("PRIVATE-TOKEN".into(), t))
-            })?,
-        })
-    }
-
-    /// Resolve GitLab auth token via fallback chain:
-    /// 1. GITLAB_TOKEN env var
-    /// 2. glab CLI config (~/.config/glab-cli/config.yml)
-    fn resolve_token() -> Option<String> {
-        if let Ok(token) = std::env::var("GITLAB_TOKEN") {
-            return Some(token);
-        }
-        // Fallback: glab CLI config file at $HOME/.config/glab-cli/config.yml.
-        let home = std::env::var("HOME").ok()?;
-        let config_path = std::path::PathBuf::from(home)
-            .join(".config")
-            .join("glab-cli")
-            .join("config.yml");
-        let content = std::fs::read_to_string(config_path).ok()?;
-        // glab config stores token as `token: <value>` under hosts.
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if let Some(token) = trimmed.strip_prefix("token:") {
-                let token = token.trim().to_string();
-                if !token.is_empty() {
-                    return Some(token);
-                }
-            }
-        }
-        None
-    }
-
-    /// URL-encode a `owner/repo` path for GitLab project ID.
-    fn encode_project(repo: &str) -> String {
-        repo.replace('/', "%2F")
-    }
-}
-
-#[async_trait::async_trait]
-impl CiProvider for GitLabCiProvider {
-    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
-        let project = Self::encode_project(repo);
-        let resp = self
-            .http
-            .get(&format!(
-                "projects/{project}/pipelines?ref={branch}&per_page=5"
-            ))
-            .send()
-            .await?;
-        let status = resp.status().as_u16();
-        let rate_limit_reset = resp
-            .headers()
-            .get("ratelimit-reset")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok());
-        let body: serde_json::Value = resp.json().await?;
-
-        if !(200..300).contains(&status) {
-            let message = body["message"]
-                .as_str()
-                .or_else(|| body["error"].as_str())
-                .unwrap_or("(no message)")
-                .to_string();
-            return Ok(CiPollResult::ApiError {
-                status,
-                message: format!("GitLab API {status}: {message}"),
-                rate_limit_reset,
-            });
-        }
-
-        let runs = body
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| {
-                        let gl_status = r["status"].as_str()?;
-                        let conclusion = match gl_status {
-                            "success" => Some("success".to_string()),
-                            "failed" => Some("failure".to_string()),
-                            "canceled" => Some("cancelled".to_string()),
-                            _ => None, // running/pending/etc → in-progress
-                        };
-                        Some(CiRun {
-                            id: r["id"].as_u64()?,
-                            conclusion,
-                            head_sha: r["sha"].as_str()?.to_string(),
-                            url: r["web_url"].as_str().unwrap_or("").to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Sprint 54 P0-2: GitLab uses different rate-limit headers
-        // (`ratelimit-*` per CiHttpClient::parse_rate_limit_reset). Until
-        // we add per-provider quota mapping, treat headers as absent
-        // here — the throttle path falls through to the configured
-        // baseline.
-        Ok(CiPollResult::Runs {
-            runs,
-            rate_limit_remaining: None,
-            rate_limit_limit: None,
-        })
-    }
-
-    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
-        let project = Self::encode_project(repo);
-        let resp: serde_json::Value = match self
-            .http
-            .get(&format!(
-                "projects/{project}/merge_requests?source_branch={branch}&state=all&per_page=1"
-            ))
-            .send()
-            .await
-        {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(_) => return PrState::Unknown,
-            },
-            Err(_) => return PrState::Unknown,
-        };
-        match resp.as_array().and_then(|a| a.first()) {
-            Some(mr) => match mr["state"].as_str() {
-                Some("merged") => PrState::Terminal { merged: true },
-                Some("closed") => PrState::Terminal { merged: false },
-                Some("opened") => PrState::Open,
-                _ => PrState::Unknown,
-            },
-            None => PrState::Unknown,
-        }
-    }
-
-    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
-        let project = Self::encode_project(repo);
-        let jobs_resp: serde_json::Value = match self
-            .http
-            .get(&format!(
-                "projects/{project}/pipelines/{run_id}/jobs?per_page=20"
-            ))
-            .send()
-            .await
-        {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(_) => return "unknown job".to_string(),
-            },
-            Err(_) => return "unknown job".to_string(),
-        };
-        let failed_job = jobs_resp.as_array().and_then(|jobs| {
-            jobs.iter()
-                .find(|job| job["status"].as_str() == Some("failed"))
-        });
-        let Some(job) = failed_job else {
-            return "unknown job".to_string();
-        };
-        let stage = job["stage"].as_str().unwrap_or("?");
-        let name = job["name"].as_str().unwrap_or("?");
-        let header = format!("{stage} / {name}");
-
-        // Chain: fetch job trace (log tail ~50 lines) for richer summary.
-        let job_id = match job["id"].as_u64() {
-            Some(id) => id,
-            None => return header,
-        };
-        let trace = match self
-            .http
-            .get(&format!("projects/{project}/jobs/{job_id}/trace"))
-            .send()
-            .await
-        {
-            Ok(r) => r.text().await.unwrap_or_default(),
-            Err(_) => return header,
-        };
-        let tail: String = trace
-            .lines()
-            .rev()
-            .take(50)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        if tail.is_empty() {
-            header
-        } else {
-            format!("{header}\n---\n{tail}")
-        }
-    }
-
-    fn token_warning(&self) -> Option<&'static str> {
-        if Self::resolve_token().is_some() {
-            None
-        } else {
-            Some("GITLAB_TOKEN not set and glab CLI config not found — API calls may be rate-limited or fail for private repos")
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bitbucket Cloud CI provider
-// ---------------------------------------------------------------------------
-
-/// Bitbucket Cloud Pipelines implementation of [`CiProvider`].
-/// Cloud-only MVP per Sprint 39 §11 #1; Bitbucket Server deferred to Sprint 41+.
-pub struct BitbucketCiProvider {
-    http: CiHttpClient,
-}
-
-#[allow(dead_code)] // Constructors wired in Sprint 39 PR-3
-impl BitbucketCiProvider {
-    pub fn new() -> anyhow::Result<Self> {
-        Self::with_base_url("https://api.bitbucket.org".to_string())
-    }
-
-    pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
-        Ok(Self {
-            http: CiHttpClient::new(base_url, "2.0", || {
-                Self::resolve_token().map(|t| {
-                    let parts: Vec<&str> = t.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        CiAuth::Basic(parts[0].to_string(), parts[1].to_string())
-                    } else {
-                        CiAuth::Bearer(t)
-                    }
-                })
-            })?,
-        })
-    }
-
-    /// Resolve Bitbucket auth via fallback chain:
-    /// 1. BITBUCKET_TOKEN env (format: "user:app_password")
-    /// 2. ~/.config/bb/config (Bitbucket CLI config)
-    fn resolve_token() -> Option<String> {
-        if let Ok(token) = std::env::var("BITBUCKET_TOKEN") {
-            return Some(token);
-        }
-        let home = std::env::var("HOME").ok()?;
-        let config_path = std::path::PathBuf::from(home)
-            .join(".config")
-            .join("bb")
-            .join("config");
-        let content = std::fs::read_to_string(config_path).ok()?;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if let Some(token) = trimmed.strip_prefix("token:") {
-                let token = token.trim().to_string();
-                if !token.is_empty() {
-                    return Some(token);
-                }
-            }
-        }
-        None
-    }
-}
-
-#[async_trait::async_trait]
-impl CiProvider for BitbucketCiProvider {
-    async fn poll_runs(&self, repo: &str, branch: &str) -> anyhow::Result<CiPollResult> {
-        let resp = self
-            .http
-            .get(&format!(
-                "repositories/{repo}/pipelines/?target.branch={branch}&pagelen=5&sort=-created_on"
-            ))
-            .send()
-            .await?;
-        let status = resp.status().as_u16();
-        let body: serde_json::Value = resp.json().await?;
-
-        if !(200..300).contains(&status) {
-            let message = body["error"]["message"]
-                .as_str()
-                .unwrap_or("(no message)")
-                .to_string();
-            return Ok(CiPollResult::ApiError {
-                status,
-                message: format!("Bitbucket API {status}: {message}"),
-                rate_limit_reset: None,
-            });
-        }
-
-        let runs = body["values"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| {
-                        let state = r["state"]["name"].as_str()?;
-                        let conclusion = match state {
-                            "COMPLETED" => {
-                                let result = r["state"]["result"]["name"].as_str()?;
-                                Some(match result {
-                                    "SUCCESSFUL" => "success".to_string(),
-                                    "FAILED" => "failure".to_string(),
-                                    "STOPPED" => "cancelled".to_string(),
-                                    other => other.to_lowercase(),
-                                })
-                            }
-                            _ => None, // RUNNING/PENDING → in-progress
-                        };
-                        Some(CiRun {
-                            id: r["build_number"].as_u64()?,
-                            conclusion,
-                            head_sha: r["target"]["commit"]["hash"].as_str()?.to_string(),
-                            url: r["links"]["html"]["href"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Sprint 54 P0-2: Bitbucket Cloud doesn't expose GitHub-style
-        // quota headers. Treat as absent — adaptive_interval falls
-        // through to the configured baseline for non-GitHub providers.
-        Ok(CiPollResult::Runs {
-            runs,
-            rate_limit_remaining: None,
-            rate_limit_limit: None,
-        })
-    }
-
-    async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {
-        let resp: serde_json::Value = match self
-            .http
-            .get(&format!(
-                "repositories/{repo}/pullrequests?q=source.branch.name=\"{branch}\"&pagelen=1"
-            ))
-            .send()
-            .await
-        {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(_) => return PrState::Unknown,
-            },
-            Err(_) => return PrState::Unknown,
-        };
-        match resp["values"].as_array().and_then(|a| a.first()) {
-            Some(pr) => match pr["state"].as_str() {
-                Some("MERGED") => PrState::Terminal { merged: true },
-                Some("DECLINED") | Some("SUPERSEDED") => PrState::Terminal { merged: false },
-                Some("OPEN") => PrState::Open,
-                _ => PrState::Unknown,
-            },
-            None => PrState::Unknown,
-        }
-    }
-
-    async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String {
-        // Bitbucket uses pipeline UUID for steps, but we store build_number.
-        // Steps endpoint: GET /repositories/{repo}/pipelines/{pipeline_uuid}/steps/
-        // Since we have build_number, use it as pipeline selector.
-        let steps_resp: serde_json::Value = match self
-            .http
-            .get(&format!(
-                "repositories/{repo}/pipelines/{run_id}/steps/?pagelen=20"
-            ))
-            .send()
-            .await
-        {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(_) => return "unknown step".to_string(),
-            },
-            Err(_) => return "unknown step".to_string(),
-        };
-        let failed_step = steps_resp["values"].as_array().and_then(|steps| {
-            steps
-                .iter()
-                .find(|step| step["state"]["result"]["name"].as_str() == Some("FAILED"))
-        });
-        let Some(step) = failed_step else {
-            return "unknown step".to_string();
-        };
-        let name = step["name"].as_str().unwrap_or("?").to_string();
-        // Chain: fetch step log tail (~50 lines).
-        let step_uuid = match step["uuid"].as_str() {
-            Some(u) => u,
-            None => return name,
-        };
-        let log = match self
-            .http
-            .get(&format!(
-                "repositories/{repo}/pipelines/{run_id}/steps/{step_uuid}/log"
-            ))
-            .send()
-            .await
-        {
-            Ok(r) => r.text().await.unwrap_or_default(),
-            Err(_) => return name,
-        };
-        let tail: String = log
-            .lines()
-            .rev()
-            .take(50)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        if tail.is_empty() {
-            name
-        } else {
-            format!("{name}\n---\n{tail}")
-        }
-    }
-
-    fn token_warning(&self) -> Option<&'static str> {
-        if Self::resolve_token().is_some() {
-            None
-        } else {
-            Some("BITBUCKET_TOKEN not set and bb CLI config not found — API calls may fail for private repos")
-        }
-    }
-}
-
-/// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
-pub const WATCH_TTL_HOURS: i64 = 72;
-
-/// Sprint 54 P0-5 (sub-scope B): consecutive rate-limited skips before a
-/// `[ci-watch-stalled]` notification fires. Picked low (3) so a watch
-/// stuck behind a multi-minute reset window surfaces quickly without
-/// over-paging on a one-tick blip.
-pub(crate) const STALL_THRESHOLD: u64 = 3;
-
-/// Sprint 54 P0-5 helper: read existing `consecutive_skips`, increment,
-/// persist, and (if we just crossed `STALL_THRESHOLD` and haven't yet
-/// notified for this window) fan out a `[ci-watch-stalled]` inbox event
-/// to every subscriber. The notify step reuses the P0-1 fan-out
-/// contract — one inbox enqueue per subscriber.
-///
-/// Atomicity: the increment + `stalled_notified` flag move in a single
-/// atomic_write so the next tick can't observe a "skips ≥ threshold,
-/// flag still false" intermediate state and fire a duplicate event.
-fn bump_consecutive_skips_and_maybe_notify(
-    home: &Path,
-    watch_path: &Path,
-    repo: &str,
-    branch: &str,
-    subscribers: &[String],
-    reset_epoch: u64,
-) {
-    let mut watch: serde_json::Value = match std::fs::read_to_string(watch_path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-    {
-        Some(v) => v,
-        None => return,
-    };
-    let prev_skips = watch["consecutive_skips"].as_u64().unwrap_or(0);
-    let next_skips = prev_skips.saturating_add(1);
-    watch["consecutive_skips"] = serde_json::json!(next_skips);
-
-    let already_notified = watch["stalled_notified"].as_bool().unwrap_or(false);
-    let should_notify = next_skips >= STALL_THRESHOLD && !already_notified;
-    if should_notify {
-        watch["stalled_notified"] = serde_json::json!(true);
-        // Stamp `stalled_since_ms` only on the first stall write — gives
-        // operators a stable anchor in the inbox payload.
-        if watch["stalled_since_ms"].as_i64().is_none() {
-            watch["stalled_since_ms"] = serde_json::json!(chrono::Utc::now().timestamp_millis());
-        }
-    }
-    let _ = crate::store::atomic_write(
-        watch_path,
-        serde_json::to_string_pretty(&watch)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-
-    if should_notify {
-        let stalled_since_ms = watch["stalled_since_ms"].as_i64();
-        // next_poll_eta = reset_epoch_ms (skip lifts at reset, then
-        // adaptive backoff applies — but reset is the user-visible
-        // "stalled until" moment).
-        let next_poll_eta = (reset_epoch as i64).saturating_mul(1000);
-        let setup_warning = crate::github_token::cached_setup_warning();
-        let body = build_stalled_body(repo, branch, stalled_since_ms, next_poll_eta, setup_warning);
-        fan_out_health_event(home, repo, branch, subscribers, "ci-watch-stalled", body);
-    }
-}
-
-/// Sprint 54 P0-5 helper: clear the stall state on the first successful
-/// poll after a stall window. Fans out `[ci-watch-resumed]` exactly
-/// once per resume — symmetry with the stalled path.
-fn clear_stall_and_maybe_notify_resumed(
-    home: &Path,
-    watch_path: &Path,
-    repo: &str,
-    branch: &str,
-    subscribers: &[String],
-) {
-    let mut watch: serde_json::Value = match std::fs::read_to_string(watch_path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-    {
-        Some(v) => v,
-        None => return,
-    };
-    let was_stalled = watch["stalled_notified"].as_bool().unwrap_or(false);
-    let had_skips = watch["consecutive_skips"].as_u64().unwrap_or(0) > 0;
-    if !was_stalled && !had_skips {
-        return; // common case — no stall in flight, nothing to write.
-    }
-    watch["consecutive_skips"] = serde_json::json!(0);
-    watch["stalled_notified"] = serde_json::json!(false);
-    watch["stalled_since_ms"] = serde_json::Value::Null;
-    let _ = crate::store::atomic_write(
-        watch_path,
-        serde_json::to_string_pretty(&watch)
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    if was_stalled {
-        let body =
-            format!("[ci-watch-resumed] {repo}@{branch}: poll resumed after rate-limit backoff");
-        fan_out_health_event(home, repo, branch, subscribers, "ci-watch-resumed", body);
-    }
-}
-
-fn build_stalled_body(
-    repo: &str,
-    branch: &str,
-    stalled_since_ms: Option<i64>,
-    next_poll_eta_ms: i64,
-    setup_warning: Option<&'static str>,
-) -> String {
-    let mut s = format!("[ci-watch-stalled] {repo}@{branch}: rate-limit backoff in effect");
-    if let Some(ts) = stalled_since_ms {
-        if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts) {
-            s.push_str(&format!("\nStalled since: {}", dt.to_rfc3339()));
-        }
-    }
-    if let Some(eta) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(next_poll_eta_ms) {
-        s.push_str(&format!("\nNext poll ETA: {}", eta.to_rfc3339()));
-    }
-    if let Some(w) = setup_warning {
-        s.push_str(&format!("\nSetup hint: {w}"));
-    }
-    s
-}
-
-/// Sprint 54 P0-5: fan out a CI health event to every subscriber.
-/// Mirrors the P0-1 terminal-notify loop — one inbox enqueue per
-/// subscriber so multi-caller watches don't get last-write-wins.
-fn fan_out_health_event(
-    home: &Path,
-    repo: &str,
-    branch: &str,
-    subscribers: &[String],
-    kind: &str,
-    body: String,
-) {
-    let repo_branch_key = format!("{repo}@{branch}");
-    let supersede_token = format!("{kind}-{}", chrono::Utc::now().timestamp_millis());
-    for sub in subscribers {
-        crate::inbox::mark_ci_watch_superseded(home, sub, &repo_branch_key, &supersede_token);
-        let _ = crate::inbox::enqueue(
-            home,
-            sub,
-            crate::inbox::InboxMessage {
-                schema_version: 0,
-                id: None,
-                read_at: None,
-                thread_id: None,
-                parent_id: None,
-                task_id: None,
-                force_meta: None,
-                correlation_id: None,
-                reviewed_head: None,
-                from: "system:ci".to_string(),
-                text: body.clone(),
-                kind: Some(kind.to_string()),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                channel: None,
-                delivery_mode: None,
-                attachments: vec![],
-                in_reply_to_msg_id: None,
-                in_reply_to_excerpt: None,
-                superseded_by: None,
-                from_id: None,
-                broadcast_context: None,
-                sequencing: None,
-                eta_minutes: None,
-                reporting_cadence: None,
-                worktree_binding_required: None,
-            },
-        );
-    }
-}
-
-/// Read the list of subscribed instances from a watch JSON value.
-///
-/// Schema migration (Sprint 54 P0-1): the canonical source is the
-/// `subscribers` array (`[{instance, subscribed_at}, …]`). Pre-Sprint-54
-/// files carry only a single `instance: "X"` field; this helper returns
-/// `[X]` for them so the daemon's poll loop, notify path, and unwatch
-/// logic all see one uniform `Vec<String>` regardless of file vintage.
-///
-/// The legacy `instance` field is preserved on writes for one release
-/// cycle (read-only by writers post-r0) and slated for removal in
-/// Sprint 55 once daemons in the wild have written-back the new
-/// schema at least once.
-pub(crate) fn parse_subscribers(watch: &serde_json::Value) -> Vec<String> {
-    if let Some(arr) = watch.get("subscribers").and_then(|v| v.as_array()) {
-        let mut out: Vec<String> = arr
-            .iter()
-            .filter_map(|s| s.get("instance").and_then(|v| v.as_str()))
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
-        out.dedup();
-        if !out.is_empty() {
-            return out;
-        }
-    }
-    // Legacy: pre-r0 watch files carry only `instance: "X"`. Treat as a
-    // singleton list so the rest of the pipeline doesn't have to fork.
-    if let Some(legacy) = watch.get("instance").and_then(|v| v.as_str()) {
-        if !legacy.is_empty() {
-            return vec![legacy.to_string()];
-        }
-    }
-    Vec::new()
-}
-
-/// Remove a watch file and log the removal event.
-///
-/// `instance_label` is a free-form audit string — the caller passes
-/// either a single subscriber (legacy callers) or comma-joined
-/// subscribers (post-r0 multi-caller). The event log mirrors the
-/// label verbatim for human-readable traceability.
-pub fn remove_watch(
-    home: &Path,
-    watch_path: &Path,
-    instance_label: &str,
-    repo: &str,
-    branch: &str,
-    reason: &str,
-) {
-    let _ = std::fs::remove_file(watch_path);
-    crate::event_log::log(
-        home,
-        "ci_watch_removed",
-        instance_label,
-        &format!("repo={repo} branch={branch} reason={reason}"),
-    );
-}
-
-/// Deterministic, collision-free filename for a CI watch entry.
-/// Uses SHA-256 of `"{repo}:{branch}"` to avoid path traversal and
-/// collisions when repo names contain `/` (e.g. `owner/repo` vs
-/// `owner_repo`).
-pub fn watch_filename(repo: &str, branch: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    format!("{repo}:{branch}").hash(&mut h);
-    format!("{:016x}.json", h.finish())
 }
 
 /// Sprint 54 P0-2: adaptive backoff curve based on remaining quota.
@@ -1161,266 +118,8 @@ fn watch_is_due(last_polled_at: Option<i64>, interval_secs: u64, now_ms: i64) ->
     }
 }
 
-/// Preventive warning shown in the `watch_ci` MCP response when no
-/// GitHub token is available from any source.
-///
-/// Sprint 54 P0-4: this helper now delegates to
-/// `crate::github_token::cached_setup_warning()` so the wording is in
-/// one place. The argument is unused in production (kept for backward
-/// API compatibility with existing unit tests that drive this with
-/// synthetic input), but the global cache's verdict is what
-/// `handle_watch_ci` actually surfaces. When env is set OR `gh` is
-/// authed, no warning fires.
-pub fn github_token_warning(token: Option<&str>) -> Option<&'static str> {
-    // Pure form retained for the existing in-file unit tests:
-    // "Some(non-blank) ⇒ None, None ⇒ Some(SETUP_WARNING)".
-    match token.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(_) => None,
-        None => Some(crate::github_token::SETUP_WARNING),
-    }
-}
-
-/// Production warning surface — reads through the unified token cache.
-/// Used by `handle_watch_ci` to attach `setup_warning` to the MCP
-/// response when no token is reachable. Same source-of-truth as the
-/// auth path in [`GitHubCiProvider::with_base_url`], so the warning
-/// fires iff the next HTTP request would actually go unauthenticated.
-pub fn github_token_warning_from_env() -> Option<&'static str> {
-    crate::github_token::cached_setup_warning()
-}
-
-/// Check CI watch configs and inject failure logs to agents when CI fails.
-/// Auto-detect CI provider from a `repo` string (typically from git remote URL).
-/// Returns `(provider_kind, custom_host)`. `custom_host=true` means the domain
-/// doesn't exactly match the canonical host — caller should warn.
-pub fn detect_provider_from_remote(repo: &str) -> (&'static str, bool) {
-    if repo.contains("gitlab.com") {
-        ("gitlab", false)
-    } else if repo.contains("gitlab") {
-        ("gitlab", true) // self-hosted GitLab
-    } else if repo.contains("bitbucket.org") {
-        ("bitbucket_cloud", false)
-    } else if repo.contains("bitbucket") {
-        ("bitbucket_cloud", true) // custom Bitbucket domain
-    } else if repo.contains("github.com") {
-        ("github", false) // canonical github.com
-    } else {
-        // GitHub Enterprise custom domain OR fully unknown → default github + warn
-        ("github", true)
-    }
-}
-
-/// Sprint 57 Wave 2 Track B (#546 Item 1 + Item 3 migration) —
-/// scan ci-watches dir, remove any watch that:
-///   1. has `expires_at < now` (absolute TTL elapsed),
-///   2. has `last_terminal_seen_at` older than `WATCH_TTL_HOURS`
-///      (inactivity TTL elapsed), or
-///   3. targets a protected ref per `agent_ops::is_protected_ref`
-///      (E4.5 migration — closes the ci_watch-on-main bypass that
-///      Sprint 56's `handle_watch_ci` left open until Wave 2 Track B
-///      gated it).
-///
-/// The poll loop (`check_ci_watches_with_provider`) already enforces
-/// (1) and (2) lazily on every per-watch tick, but only for watches
-/// it actively polls — a watch can persist on disk indefinitely if
-/// the upstream branch is gone or no agent is currently polling it.
-/// This eager helper closes that gap by walking the entire dir
-/// without entering the poll path.
-///
-/// Returns the number of watches removed. Best-effort: read/parse
-/// failures skip the entry rather than aborting the sweep.
-pub fn gc_stale_watches(home: &Path, sweep_origin: &str) -> usize {
-    let ci_dir = ci_watches_dir(home);
-    let Ok(entries) = std::fs::read_dir(&ci_dir) else {
-        return 0;
-    };
-    let now_utc = chrono::Utc::now();
-    let mut removed = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        let repo = watch["repo"].as_str().unwrap_or("?");
-        let branch = watch["branch"].as_str().unwrap_or("?");
-        let audit_label = parse_subscribers(&watch).join(",");
-
-        // (3) E4.5 protected-ref migration — applied first because a
-        // protected-ref watch is invalid regardless of TTL state.
-        if crate::agent_ops::is_protected_ref(branch) {
-            remove_watch(
-                home,
-                &path,
-                &audit_label,
-                repo,
-                branch,
-                &format!("{sweep_origin}_protected_branch_migration"),
-            );
-            tracing::info!(repo = %repo, branch = %branch, sweep = %sweep_origin,
-                "ci_watch removed (E4.5 protected-branch migration)");
-            removed += 1;
-            continue;
-        }
-
-        // (1) absolute TTL.
-        if let Some(expires_at) = watch["expires_at"].as_str() {
-            if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
-                if now_utc > exp.with_timezone(&chrono::Utc) {
-                    remove_watch(
-                        home,
-                        &path,
-                        &audit_label,
-                        repo,
-                        branch,
-                        &format!("{sweep_origin}_expired"),
-                    );
-                    tracing::info!(repo = %repo, branch = %branch, sweep = %sweep_origin,
-                        "ci_watch removed (absolute TTL elapsed)");
-                    removed += 1;
-                    continue;
-                }
-            }
-        }
-
-        // (2) inactivity TTL.
-        if let Some(last_seen) = watch["last_terminal_seen_at"].as_str() {
-            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last_seen) {
-                let elapsed = now_utc.signed_duration_since(ts.with_timezone(&chrono::Utc));
-                if elapsed > chrono::Duration::hours(WATCH_TTL_HOURS) {
-                    remove_watch(
-                        home,
-                        &path,
-                        &audit_label,
-                        repo,
-                        branch,
-                        &format!("{sweep_origin}_inactivity_ttl"),
-                    );
-                    tracing::info!(repo = %repo, branch = %branch, hours = WATCH_TTL_HOURS,
-                        sweep = %sweep_origin,
-                        "ci_watch removed (inactivity TTL elapsed)");
-                    removed += 1;
-                    continue;
-                }
-            }
-        }
-    }
-    removed
-}
-
-/// Sprint 57 Wave 2 Track B (#546 Item 1) — daemon-startup eager
-/// sweep. Runs once before the tick loop begins so stale entries
-/// from a prior daemon process don't outlive the restart. Idempotent;
-/// re-runs are no-ops once the dir is clean.
-pub fn startup_sweep(home: &Path) {
-    let removed = gc_stale_watches(home, "startup_sweep");
-    if removed > 0 {
-        tracing::info!(removed, "ci_watch startup sweep complete");
-    }
-    // Log surviving watches so operators can confirm persistence across restart.
-    let ci_dir = ci_watches_dir(home);
-    if let Ok(entries) = std::fs::read_dir(&ci_dir) {
-        let active: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let path = e.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    return None;
-                }
-                let content = std::fs::read_to_string(&path).ok()?;
-                let watch: serde_json::Value = serde_json::from_str(&content).ok()?;
-                let repo = watch["repo"].as_str()?;
-                let branch = watch["branch"].as_str().unwrap_or("main");
-                Some(format!("{repo}@{branch}"))
-            })
-            .collect();
-        if !active.is_empty() {
-            tracing::info!(
-                count = active.len(),
-                watches = %active.join(", "),
-                "ci_watch: restored watches from disk after restart"
-            );
-        }
-    }
-}
-
-pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
-    // Sprint 57 Wave 2 Track B (#546 Item 1) — eager per-tick GC pass
-    // BEFORE the poll loop. The lazy expiry inside the poll body still
-    // runs (Sprint 53/54 era), but it can only see watches actively
-    // being polled. This pass closes the "stale on disk after upstream
-    // branch deletion" gap.
-    let _ = gc_stale_watches(home, "eager_gc");
-    check_ci_watches_with_provider(home, registry, |watch| {
-        let ci_url = watch
-            .get("ci_provider_url")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let repo = watch.get("repo").and_then(|v| v.as_str()).unwrap_or("");
-        // Explicit ci_provider wins; absent → auto-detect from repo URL.
-        let (ci_type, default_url) = match watch.get("ci_provider").and_then(|v| v.as_str()) {
-            Some(explicit) => (explicit, String::new()),
-            None => {
-                let (kind, is_custom) = detect_provider_from_remote(repo);
-                if is_custom {
-                    tracing::warn!(
-                        repo,
-                        kind,
-                        "ci_watch: custom CI host pattern detected — suggest setting fleet.yaml ci_provider: explicitly"
-                    );
-                }
-                let default = match kind {
-                    "gitlab" => "https://gitlab.com",
-                    "bitbucket_cloud" => "https://api.bitbucket.org",
-                    _ => "https://api.github.com",
-                };
-                (kind, default.to_string())
-            }
-        };
-        let url = ci_url.unwrap_or(default_url);
-        match ci_type {
-            "gitlab" => {
-                let url = if url.is_empty() {
-                    "https://gitlab.com".to_string()
-                } else {
-                    url
-                };
-                Some(Box::new(GitLabCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
-            }
-            "bitbucket_cloud" => {
-                let url = if url.is_empty() {
-                    "https://api.bitbucket.org".to_string()
-                } else {
-                    url
-                };
-                Some(Box::new(BitbucketCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
-            }
-            "bitbucket_server" => {
-                tracing::error!(
-                    "Bitbucket Server not yet supported — track Sprint 41+ candidate. \
-                     Use bitbucket_cloud for Bitbucket Cloud repos."
-                );
-                None
-            }
-            _ => {
-                let url = if url.is_empty() {
-                    "https://api.github.com".to_string()
-                } else {
-                    url
-                };
-                Some(Box::new(GitHubCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
-            }
-        }
-    });
-}
-
 /// Inner implementation that accepts a provider factory for testability.
-fn check_ci_watches_with_provider(
+pub(super) fn check_ci_watches_with_provider(
     home: &Path,
     registry: &AgentRegistry,
     make_provider: impl Fn(&serde_json::Value) -> Option<Box<dyn CiProvider>> + Send + Sync + 'static,
@@ -1590,7 +289,7 @@ fn check_ci_watches_with_provider(
 ///
 /// Production code now uses [`CiPollResult`] via the [`CiProvider`] trait;
 /// this enum is retained for unit-testing the classification logic that
-/// lives inside [`GitHubCiProvider::poll_runs`].
+/// lives inside [`super::provider::GitHubCiProvider::poll_runs`].
 #[cfg(test)]
 enum RunsResponse<'a> {
     Run(&'a serde_json::Value),
@@ -1602,7 +301,7 @@ enum RunsResponse<'a> {
 /// why the rate-limit / NoRuns distinction matters.
 ///
 /// Retained under `#[cfg(test)]` — production classification now happens
-/// inside [`GitHubCiProvider::poll_runs`].
+/// inside [`super::provider::GitHubCiProvider::poll_runs`].
 #[cfg(test)]
 fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse<'_> {
     if !(200..300).contains(&status) {
@@ -1785,7 +484,7 @@ async fn ci_check_repo(
                 if let Some(expires_at) = watch["expires_at"].as_str() {
                     if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at) {
                         let watch_age = exp.with_timezone(&chrono::Utc)
-                            - chrono::Duration::hours(crate::daemon::ci_watch::WATCH_TTL_HOURS);
+                            - chrono::Duration::hours(WATCH_TTL_HOURS);
                         let since_creation = chrono::Utc::now().signed_duration_since(watch_age);
                         if since_creation < chrono::Duration::seconds(60) {
                             tracing::info!(
@@ -2131,48 +830,6 @@ async fn ci_check_repo(
         new_notified_sha.as_deref(),
     );
     Ok(())
-}
-
-/// Persist updated tracking state (last_run_id + head_sha) to the watch file.
-fn update_watch_state(watch_path: &Path, run_id: Option<u64>, head_sha: &str) {
-    update_watch_state_with_notify(watch_path, run_id, head_sha, None);
-}
-
-/// Persist tracking state including last_notified_head_sha.
-fn update_watch_state_with_notify(
-    watch_path: &Path,
-    run_id: Option<u64>,
-    head_sha: &str,
-    notified_sha: Option<&str>,
-) {
-    // #692: flock protects RMW against concurrent unsubscribe
-    let lock_path = watch_path.with_extension("lock");
-    let _lock = match crate::store::acquire_file_lock(&lock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(path = %lock_path.display(), error = %e, "failed to acquire ci-watch lock, skipping update");
-            return;
-        }
-    };
-    if let Ok(content) = std::fs::read_to_string(watch_path) {
-        if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
-            watch["last_run_id"] = serde_json::json!(run_id);
-            if !head_sha.is_empty() {
-                watch["head_sha"] = serde_json::json!(head_sha);
-            }
-            if let Some(sha) = notified_sha {
-                watch["last_notified_head_sha"] = serde_json::json!(sha);
-            }
-            watch["last_terminal_seen_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
-            // M1: atomic write to prevent partial-file on crash
-            let _ = crate::store::atomic_write(
-                watch_path,
-                serde_json::to_string_pretty(&watch)
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3476,7 +2133,7 @@ mod tests {
     /// against mock server with spec-quoted fixture.
     #[test]
     fn gitlab_poll_runs_parses_pipelines() {
-        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let fixture = include_str!("../../../tests/fixtures/gitlab-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
 
         let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
@@ -3508,7 +2165,7 @@ mod tests {
     /// §3.5.10: GitLabCiProvider::check_pr_terminal parses MR state.
     #[test]
     fn gitlab_check_pr_terminal_merged() {
-        let fixture = include_str!("../../tests/fixtures/gitlab-merge-requests-response.json");
+        let fixture = include_str!("../../../tests/fixtures/gitlab-merge-requests-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
 
         let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
@@ -3533,7 +2190,7 @@ mod tests {
     /// §3.5.10: GitLabCiProvider::fetch_failure_summary finds failed job.
     #[test]
     fn gitlab_fetch_failure_summary_finds_failed_job() {
-        let fixture = include_str!("../../tests/fixtures/gitlab-jobs-response.json");
+        let fixture = include_str!("../../../tests/fixtures/gitlab-jobs-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
 
         let provider = super::GitLabCiProvider::with_base_url(format!("http://127.0.0.1:{port}"))
@@ -3588,7 +2245,7 @@ mod tests {
     /// B4: Auth state 1 — GITLAB_TOKEN env present → PRIVATE-TOKEN header sent.
     #[test]
     fn gitlab_auth_env_token_sends_private_token_header() {
-        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let fixture = include_str!("../../../tests/fixtures/gitlab-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
 
         let _guard = GitlabTokenGuard::set("test-token-123");
@@ -3613,7 +2270,7 @@ mod tests {
     /// B4 state 2: env absent + glab CLI config present → token from config.
     #[test]
     fn gitlab_auth_glab_config_fallback_sends_private_token_header() {
-        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let fixture = include_str!("../../../tests/fixtures/gitlab-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
 
         // Guard serializes + saves/restores GITLAB_TOKEN + HOME.
@@ -3700,7 +2357,7 @@ mod tests {
     /// §3.5.10: poll_runs parses Bitbucket pipelines response.
     #[test]
     fn bitbucket_poll_runs_parses_pipelines() {
-        let fixture = include_str!("../../tests/fixtures/bitbucket-pipelines-response.json");
+        let fixture = include_str!("../../../tests/fixtures/bitbucket-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
         let _guard = BitbucketTokenGuard::set("user:pass");
         let provider =
@@ -3734,7 +2391,7 @@ mod tests {
     /// §3.5.10: check_pr_terminal parses Bitbucket PR state.
     #[test]
     fn bitbucket_check_pr_terminal_merged() {
-        let fixture = include_str!("../../tests/fixtures/bitbucket-pullrequests-response.json");
+        let fixture = include_str!("../../../tests/fixtures/bitbucket-pullrequests-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
         let _guard = BitbucketTokenGuard::set("user:pass");
         let provider =
@@ -3771,7 +2428,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
         let cap = captured_reqs.clone();
         let steps_body =
-            include_str!("../../tests/fixtures/bitbucket-steps-response.json").to_string();
+            include_str!("../../../tests/fixtures/bitbucket-steps-response.json").to_string();
         // fire-and-forget: test mock server thread
         let handle = std::thread::spawn(move || {
             for i in 0..2 {
@@ -3842,7 +2499,7 @@ mod tests {
     /// Auth state 1: BITBUCKET_TOKEN env → Basic auth header.
     #[test]
     fn bitbucket_auth_env_token_sends_basic_header() {
-        let fixture = include_str!("../../tests/fixtures/bitbucket-pipelines-response.json");
+        let fixture = include_str!("../../../tests/fixtures/bitbucket-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
         let _guard = BitbucketTokenGuard::set("user:app_pass");
         let provider =
@@ -3874,7 +2531,7 @@ mod tests {
     /// Auth state 2: env absent + bb CLI config → Basic auth from config.
     #[test]
     fn bitbucket_auth_bb_config_fallback_sends_basic_header() {
-        let fixture = include_str!("../../tests/fixtures/bitbucket-pipelines-response.json");
+        let fixture = include_str!("../../../tests/fixtures/bitbucket-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
         let mut guard = BitbucketTokenGuard::clear();
         // Setup temp HOME with bb config.
@@ -3989,7 +2646,7 @@ mod tests {
     fn explicit_ci_provider_overrides_auto_detect() {
         // Watch with ci_provider: gitlab but repo URL pointing to github.com.
         // Factory should construct GitLab provider, not GitHub.
-        let fixture = include_str!("../../tests/fixtures/gitlab-pipelines-response.json");
+        let fixture = include_str!("../../../tests/fixtures/gitlab-pipelines-response.json");
         let (port, handle, captured) = gitlab_mock_server(fixture);
 
         // Construct GitLab provider via the same factory logic as production:
@@ -4279,7 +2936,8 @@ mod tests {
         // Tested via the GitHub provider's closed_at check.
         // The mock provider bypasses this (returns Terminal directly), so this
         // test verifies the design contract via source inspection.
-        let src = include_str!("ci_watch.rs");
+        // #701 split: provider impls (incl. check_pr_terminal) moved to provider.rs.
+        let src = include_str!("provider.rs");
         assert!(
             src.contains("closed_at") && src.contains("Duration::hours(1)"),
             "check_pr_terminal must verify closed_at freshness (stale PR filter)"
