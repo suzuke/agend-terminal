@@ -523,13 +523,16 @@ fn run_core(
     // tick fires. Idempotent.
     crate::daemon::ci_watch::startup_sweep(home);
 
-    // Per-tick handlers (#694 BLOCK 1 first cut — see daemon::per_tick).
-    // Owned across the daemon's lifetime so their interior state (snapshot
-    // dedup string, poll-reminder counter) persists across ticks. Called at
-    // their pre-extraction sites in the main loop below.
+    // Per-tick handlers (#694 BLOCK 1 — see daemon::per_tick). Owned
+    // across the daemon's lifetime so their interior state (snapshot
+    // dedup string, poll-reminder + inbox-maintenance counters) persists
+    // across ticks. Called at their pre-extraction sites in the main
+    // loop below.
     use per_tick::PerTickHandler as _;
     let snapshot_handler = per_tick::SnapshotRotationHandler::new();
     let poll_reminder_handler = per_tick::PollReminderHandler::new(30);
+    let inbox_maintenance_handler = per_tick::InboxMaintenanceHandler::new(60);
+    let external_liveness_handler = per_tick::ExternalLivenessHandler::new();
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -576,10 +579,12 @@ fn run_core(
 
         // Per-tick context shared by handlers extracted under #694 BLOCK 1.
         // Borrows are valid for the rest of this iteration; coexists with
-        // other immutable uses of `&registry` / `&configs` below.
+        // other immutable uses of `&registry` / `&externals` / `&configs`
+        // below.
         let tick_ctx = per_tick::TickContext {
             home,
             registry: &registry,
+            externals: &externals,
             configs: &configs,
         };
 
@@ -644,18 +649,9 @@ fn run_core(
             }
         }
 
-        // Liveness check for external agents
-        {
-            let mut ext = crate::agent::lock_external(&externals);
-            ext.retain(|name, handle| {
-                let alive = crate::process::is_pid_alive(handle.pid);
-                if !alive {
-                    tracing::info!(agent = %name, pid = handle.pid, "external agent gone, deregistering");
-                    crate::event_log::log(home, "disconnect", name, "external agent PID gone");
-                }
-                alive
-            });
-        }
+        // Liveness check for external agents.
+        // #694 BLOCK 1 — extracted into daemon::per_tick::ExternalLivenessHandler.
+        external_liveness_handler.run(&tick_ctx);
 
         // Periodic snapshot: save fleet state (only if changed).
         // #694 BLOCK 1 — extracted into daemon::per_tick::SnapshotRotationHandler.
@@ -664,68 +660,9 @@ fn run_core(
         check_schedules(home, &registry);
         check_ci_watches(home, &registry);
 
-        // Periodic inbox maintenance — every 60 ticks (≈10 min at 10s/tick)
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SWEEP_COUNTER: AtomicU64 = AtomicU64::new(0);
-            if SWEEP_COUNTER
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(60)
-            {
-                crate::inbox::sweep_expired(home);
-                crate::inbox::check_disk_space(home);
-                run_task_maintenance(home);
-                // Worktree auto-cleanup (runtime registry based)
-                {
-                    let cfgs = configs.lock();
-                    let config_data: std::collections::HashMap<
-                        String,
-                        (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
-                    > = cfgs
-                        .iter()
-                        .map(|(name, cfg)| {
-                            (
-                                name.clone(),
-                                (cfg.working_dir.clone(), cfg.worktree_source.clone()),
-                            )
-                        })
-                        .collect();
-                    drop(cfgs);
-                    let fleet_dirs: Vec<std::path::PathBuf> =
-                        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                            .ok()
-                            .map(|c| {
-                                c.instance_names()
-                                    .iter()
-                                    .filter_map(|n| {
-                                        c.resolve_instance(n).and_then(|r| r.working_directory)
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                    let cleaned =
-                        crate::worktree_cleanup::sweep_from_registry(&config_data, &fleet_dirs);
-                    for (branch, path) in &cleaned {
-                        crate::event_log::log(
-                            home,
-                            "worktree_auto_removed",
-                            branch,
-                            &format!("path={path}, branch merged into main"),
-                        );
-                        tracing::info!(branch, path, "worktree auto-removed (branch merged)");
-                    }
-                }
-                // Phase 4 git-shim: worktree GC (hourly with sweep).
-                // Default: dry-run only. Cutover when AGEND_WORKTREE_GC=1.
-                if std::env::var("AGEND_WORKTREE_GC").as_deref() == Ok("1") {
-                    crate::worktree_pool::gc_cutover(home);
-                } else {
-                    crate::worktree_pool::gc_dry_run(home);
-                }
-                // Phase 5: hotspot scan — check recent commits for multi-agent file conflicts.
-                hotspot_scan(home, &configs);
-            }
-        }
+        // Periodic inbox maintenance — every 60 ticks (≈10 min at 10s/tick).
+        // #694 BLOCK 1 — extracted into daemon::per_tick::InboxMaintenanceHandler.
+        inbox_maintenance_handler.run(&tick_ctx);
 
         // Poll-reminder: nudge idle agents with unread inbox (every 30 ticks).
         // #694 BLOCK 1 — extracted into daemon::per_tick::PollReminderHandler.

@@ -1,0 +1,155 @@
+//! Inbox-maintenance composite: every-60-tick batch of 6 sub-ops gated
+//! on a single cadence counter. Extracted verbatim from
+//! `src/daemon/mod.rs:667-728` (pre-T-B3) — sub-ops preserved in the
+//! same order, same call signatures, same gating. The pre-extraction
+//! `static AtomicU64` counter moves onto the struct.
+
+use super::{PerTickHandler, TickContext};
+use crate::api::ConfigRegistry;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub(crate) struct InboxMaintenanceHandler {
+    every_n_ticks: u64,
+    counter: AtomicU64,
+}
+
+impl InboxMaintenanceHandler {
+    pub(crate) fn new(every_n_ticks: u64) -> Self {
+        Self {
+            every_n_ticks,
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Matches the pre-extraction `static AtomicU64` cadence: `fetch_add`
+    /// returns prev value, so first tick (counter=0) fires.
+    fn should_fire(&self) -> bool {
+        self.counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(self.every_n_ticks)
+    }
+}
+
+impl PerTickHandler for InboxMaintenanceHandler {
+    fn name(&self) -> &'static str {
+        "inbox_maintenance"
+    }
+
+    fn run(&self, ctx: &TickContext<'_>) {
+        if !self.should_fire() {
+            return;
+        }
+        // Sub-op order matches the pre-extraction inline composite verbatim.
+        crate::inbox::sweep_expired(ctx.home);
+        crate::inbox::check_disk_space(ctx.home);
+        crate::daemon::run_task_maintenance(ctx.home);
+        worktree_auto_cleanup(ctx.home, ctx.configs);
+        worktree_gc(ctx.home);
+        crate::daemon::hotspot_scan(ctx.home, ctx.configs);
+    }
+}
+
+/// Worktree auto-cleanup (runtime registry based): drop branches whose
+/// PRs have merged into main. Logged via `event_log` + tracing on every
+/// removal so operators can audit. Verbatim from the pre-extraction
+/// block at mod.rs:678-717.
+fn worktree_auto_cleanup(home: &Path, configs: &ConfigRegistry) {
+    let cfgs = configs.lock();
+    let config_data: std::collections::HashMap<
+        String,
+        (Option<std::path::PathBuf>, Option<std::path::PathBuf>),
+    > = cfgs
+        .iter()
+        .map(|(name, cfg)| {
+            (
+                name.clone(),
+                (cfg.working_dir.clone(), cfg.worktree_source.clone()),
+            )
+        })
+        .collect();
+    drop(cfgs);
+    let fleet_dirs: Vec<std::path::PathBuf> =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .map(|c| {
+                c.instance_names()
+                    .iter()
+                    .filter_map(|n| c.resolve_instance(n).and_then(|r| r.working_directory))
+                    .collect()
+            })
+            .unwrap_or_default();
+    let cleaned = crate::worktree_cleanup::sweep_from_registry(&config_data, &fleet_dirs);
+    for (branch, path) in &cleaned {
+        crate::event_log::log(
+            home,
+            "worktree_auto_removed",
+            branch,
+            &format!("path={path}, branch merged into main"),
+        );
+        tracing::info!(branch, path, "worktree auto-removed (branch merged)");
+    }
+}
+
+/// Phase 4 git-shim: worktree GC (hourly with sweep). Default dry-run;
+/// cutover when AGEND_WORKTREE_GC=1. Verbatim from the pre-extraction
+/// block at mod.rs:718-724.
+fn worktree_gc(home: &Path) {
+    if std::env::var("AGEND_WORKTREE_GC").as_deref() == Ok("1") {
+        crate::worktree_pool::gc_cutover(home);
+    } else {
+        crate::worktree_pool::gc_dry_run(home);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Cadence predicate test (same pattern as PollReminderHandler).
+    /// N=60 is the production value; pin a small N for compact assertion.
+    #[test]
+    fn fires_on_first_tick_then_every_n() {
+        let h = InboxMaintenanceHandler::new(4);
+        let fires: Vec<bool> = (0..9).map(|_| h.should_fire()).collect();
+        assert_eq!(
+            fires,
+            vec![true, false, false, false, true, false, false, false, true]
+        );
+    }
+
+    /// Smoke test: `run()` against an empty registry + temp home must
+    /// complete without panic. Every sub-op tolerates missing state
+    /// (empty inbox dir, no tasks.json, empty configs, no fleet.yaml),
+    /// so this exercises the composite end-to-end.
+    #[test]
+    fn run_is_no_op_on_empty_fixtures() {
+        use crate::agent::{AgentRegistry, ExternalRegistry};
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let tag = std::process::id();
+        let home = std::env::temp_dir().join(format!("agend-inbox-maint-handler-{tag}"));
+        std::fs::create_dir_all(&home).unwrap();
+
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+
+        // N=1 forces every call to fire (every sub-op runs).
+        let h = InboxMaintenanceHandler::new(1);
+        h.run(&ctx);
+        h.run(&ctx);
+
+        // Cleanup
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
