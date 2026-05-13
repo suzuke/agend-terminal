@@ -268,8 +268,12 @@ impl VTerm {
     }
 
     /// Returns true if the terminal application has enabled mouse reporting.
+    /// Uses `intersects` because alacritty_terminal stores the three mouse-mode
+    /// bits (1000/1002/1003) as mutually-exclusive (each `[?1xxxh]` removes the
+    /// whole MOUSE_MODE set first, then inserts one bit). `contains` would
+    /// require all three bits and therefore never fire.
     pub fn wants_mouse(&self) -> bool {
-        self.term.mode().contains(term::TermMode::MOUSE_MODE)
+        self.term.mode().intersects(term::TermMode::MOUSE_MODE)
     }
 
     /// Returns true if SGR mouse encoding is active (CSI < format).
@@ -1101,5 +1105,46 @@ mod tests {
         let vt = VTerm::new(80, 24);
         let text = vt.read_scrollback(100);
         assert!(text.is_empty(), "empty PTY must return empty string");
+    }
+
+    // #700 regression guard: alacritty_terminal stores mouse-mode bits
+    // (1000/1002/1003) as mutually-exclusive. `contains(MOUSE_MODE)` requires
+    // all three bits and therefore never fires for real backends, which is
+    // exactly the bug that let mouse forwarding silently skip every event.
+    #[test]
+    fn wants_mouse_detects_single_mouse_mode_bit() {
+        for seq in [
+            b"\x1b[?1000h".as_slice(), // click reporting
+            b"\x1b[?1002h",            // button-event tracking
+            b"\x1b[?1003h",            // any-motion tracking
+        ] {
+            let mut vt = VTerm::new(80, 24);
+            vt.process(seq);
+            assert!(
+                vt.wants_mouse(),
+                "wants_mouse must be true after {:?}",
+                String::from_utf8_lossy(seq)
+            );
+        }
+    }
+
+    #[test]
+    fn wants_mouse_matches_opencode_startup_sequence() {
+        // Exact sequence from tests/fixtures/state-replay/opencode-thinking.raw
+        let mut vt = VTerm::new(80, 24);
+        vt.process(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+        assert!(
+            vt.wants_mouse(),
+            "wants_mouse must be true after opencode startup"
+        );
+        assert!(vt.mouse_sgr(), "mouse_sgr must be true after 1006h");
+    }
+
+    #[test]
+    fn wants_mouse_false_without_mouse_mode() {
+        let mut vt = VTerm::new(80, 24);
+        vt.process(b"plain text \x1b[31mred\x1b[0m");
+        assert!(!vt.wants_mouse());
+        assert!(!vt.mouse_sgr());
     }
 }
