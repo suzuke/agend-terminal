@@ -124,15 +124,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
 
         // --- Instance management ---
-        // NOTE: `list_instances` and `interrupt` migrated to dispatch table (#694 BLOCK 2 T-B7).
-        "create_instance" => instance::handle_create_instance(&home, args, instance_name),
-        "delete_instance" => instance::handle_delete_instance(&home, args),
-        "start_instance" => instance::handle_start_instance(&home, args),
-        "replace_instance" => instance::handle_replace_instance(&home, args),
+        // NOTE: 8 instance-lifecycle arms migrated to dispatch table
+        // (#694 BLOCK 2 T-B7): list_instances, create_instance,
+        // delete_instance, start_instance, replace_instance,
+        // set_description, interrupt, move_pane. See dispatch.rs.
+        // Action-based + `&sender`-style arms stay inline for T-B8+.
         "set_display_name" => instance::handle_set_display_name(&home, args, instance_name),
-        "set_description" => instance::handle_set_description(&home, args, instance_name),
         "set_waiting_on" => instance::handle_set_waiting_on(&home, args, instance_name, &sender),
-        "move_pane" => instance::handle_move_pane(&home, args),
         "pane_snapshot" => instance::handle_pane_snapshot(&home, args),
         // Consolidated: health action=report/clear
         "health" => match args["action"].as_str().unwrap_or("") {

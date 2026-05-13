@@ -72,12 +72,40 @@ pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
 // underlying handler needs out of `HandlerCtx` and forwards the call.
 // ---------------------------------------------------------------------
 
+// Shape 1 — takes `instance_name`.
+
 fn dispatch_list_instances(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_list_instances(ctx.home, ctx.args, ctx.instance_name)
 }
 
+fn dispatch_create_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_create_instance(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_set_description(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_set_description(ctx.home, ctx.args, ctx.instance_name)
+}
+
+// Shape 2 — ignores `instance_name`.
+
 fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_interrupt(ctx.home, ctx.args)
+}
+
+fn dispatch_delete_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_delete_instance(ctx.home, ctx.args)
+}
+
+fn dispatch_start_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_start_instance(ctx.home, ctx.args)
+}
+
+fn dispatch_replace_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_replace_instance(ctx.home, ctx.args)
+}
+
+fn dispatch_move_pane(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_move_pane(ctx.home, ctx.args)
 }
 
 /// Registered tool dispatchers. **Adding a tool**: write its adapter
@@ -86,13 +114,39 @@ fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
 /// `name`), but keeping similar tools clustered helps grep.
 pub(super) fn registered_handlers() -> &'static [HandlerEntry] {
     &[
+        // Instance lifecycle — shape 1
         HandlerEntry {
             name: "list_instances",
             handler: dispatch_list_instances,
         },
         HandlerEntry {
+            name: "create_instance",
+            handler: dispatch_create_instance,
+        },
+        HandlerEntry {
+            name: "set_description",
+            handler: dispatch_set_description,
+        },
+        // Instance lifecycle — shape 2
+        HandlerEntry {
             name: "interrupt",
             handler: dispatch_interrupt,
+        },
+        HandlerEntry {
+            name: "delete_instance",
+            handler: dispatch_delete_instance,
+        },
+        HandlerEntry {
+            name: "start_instance",
+            handler: dispatch_start_instance,
+        },
+        HandlerEntry {
+            name: "replace_instance",
+            handler: dispatch_replace_instance,
+        },
+        HandlerEntry {
+            name: "move_pane",
+            handler: dispatch_move_pane,
         },
     ]
 }
@@ -138,11 +192,74 @@ mod tests {
     }
 
     /// Regression guard: pin the expected set of registered tool names
-    /// for this PR's first cut. Future PRs that migrate more arms will
-    /// update this list; an accidental rename / removal trips the test.
+    /// for T-B7. Future PRs that migrate more arms will update this
+    /// list; an accidental rename / removal trips the test.
     #[test]
     fn registered_handler_names_pin() {
         let names: Vec<&'static str> = registered_handlers().iter().map(|e| e.name).collect();
-        assert_eq!(names, vec!["list_instances", "interrupt"]);
+        assert_eq!(
+            names,
+            vec![
+                "list_instances",
+                "create_instance",
+                "set_description",
+                "interrupt",
+                "delete_instance",
+                "start_instance",
+                "replace_instance",
+                "move_pane",
+            ]
+        );
+        assert_eq!(registered_handlers().len(), 8);
+    }
+
+    /// Coverage test: every tool name advertised by
+    /// [`crate::mcp::tools::tool_definitions`] must be routed somewhere
+    /// — either by the dispatch table (`dispatch.rs`) or by the
+    /// fallback inline `match` (`mod.rs`). Catches the bug class
+    /// "tool added to the catalogue but routing forgotten".
+    ///
+    /// Implemented as a **static source-grep** rather than calling
+    /// `handle_tool` per name: a handler call would invoke real
+    /// side-effectful code paths (filesystem, channel, daemon API)
+    /// against the dev's environment. The source-grep is fast,
+    /// deterministic, and has no side effects. False-positive risk
+    /// (a tool name appearing in a doc comment but no real routing)
+    /// is low because match arms and `HandlerEntry { name: "..." }`
+    /// are the only places where a quoted bare tool name typically
+    /// appears in these files.
+    #[test]
+    fn every_advertised_tool_is_routed_somewhere() {
+        let defs = crate::mcp::tools::tool_definitions();
+        // `tool_definitions()` returns `{"tools": [...]}`.
+        let arr = defs
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .expect("tool_definitions() should return {tools: [...]}");
+        let names: Vec<&str> = arr
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .collect();
+        let mod_rs = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/mcp/handlers/mod.rs"
+        ))
+        .expect("read mod.rs");
+        let dispatch_rs = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/mcp/handlers/dispatch.rs"
+        ))
+        .expect("read dispatch.rs");
+        let mut missing: Vec<&str> = Vec::new();
+        for name in &names {
+            let quoted = format!("\"{name}\"");
+            if !mod_rs.contains(&quoted) && !dispatch_rs.contains(&quoted) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "tools advertised by tool_definitions() but not routed in mod.rs or dispatch.rs: {missing:?}"
+        );
     }
 }
