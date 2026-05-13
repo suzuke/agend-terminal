@@ -1971,9 +1971,27 @@ async fn ci_check_repo(
             // Some runs for this sha are still in-progress — skip, don't update tracking.
             continue;
         }
-        // Only advance max_notified_id for runs we actually emit.
+        // Comment intentionally retained: advancing happens BEFORE the
+        // staleness gate so even dropped (stale) runs bump trackers and
+        // can't re-trigger on the next poll. The fan-out is what's gated.
         if *run_id > max_notified_id {
             max_notified_id = *run_id;
+        }
+
+        // Issue #745: drop notifications for SHAs that are no longer the
+        // branch's current head. A newer commit was pushed since this run
+        // was triggered, so its pass/fail is no longer actionable. The
+        // tracker still advances (above and below) so we don't re-process.
+        if *sha != current_sha {
+            tracing::info!(
+                repo,
+                branch,
+                stale_sha = %sha,
+                current_sha,
+                "dropping stale CI notification (newer commit on branch)"
+            );
+            new_notified_sha = Some(sha.to_string());
+            continue;
         }
 
         if let Some(headline) = ci_notification_message(repo, branch, conclusion, None, Some(sha)) {
@@ -3049,6 +3067,89 @@ mod tests {
                 .map(|d| d.count() > 0)
                 .unwrap_or(false);
         assert!(has_inbox, "success run should enqueue inbox notification");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #745 regression guard: when an older run's SHA no longer
+    /// matches the branch head (a newer commit has been pushed since the
+    /// run was triggered), the notification must be dropped — but the
+    /// tracker must still advance so the same stale run isn't re-tried
+    /// on the next poll.
+    #[test]
+    fn mock_stale_sha_drops_notification_but_advances_tracker() {
+        let dir = tmp_dir("mock-stale-sha");
+        // Two runs: NEW_HEAD is the current head (in-progress); OLD_HEAD
+        // was just superseded by a push. OLD_HEAD's run completed first
+        // (success). Without the staleness filter we would notify users
+        // about OLD_HEAD passing — that pass is no longer relevant; the
+        // user is waiting on NEW_HEAD.
+        let provider = MockCiProvider::with_runs(vec![
+            CiRun {
+                id: 301, // NEW_HEAD's run (latest, in-progress)
+                conclusion: None,
+                head_sha: "newhead".into(),
+                url: "https://example.com/301".into(),
+            },
+            CiRun {
+                id: 300, // OLD_HEAD's run (terminal but stale)
+                conclusion: Some("success".into()),
+                head_sha: "oldhead".into(),
+                url: "https://example.com/300".into(),
+            },
+        ]);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+        // Watch state: tracker advances past the stale run so it won't
+        // be re-emitted on the next poll. head_sha is the NEW_HEAD.
+        let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(
+            updated["head_sha"].as_str(),
+            Some("newhead"),
+            "head_sha must track newest run's sha"
+        );
+        assert_eq!(
+            updated["last_notified_head_sha"].as_str(),
+            Some("oldhead"),
+            "stale sha must still mark notified so it isn't re-emitted"
+        );
+
+        // Inbox: must NOT contain a `[ci-pass]` for the stale sha.
+        // The OLD_HEAD success was dropped silently (info-level log only).
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        if inbox_path.exists() {
+            let content = std::fs::read_to_string(&inbox_path).unwrap();
+            assert!(
+                !content.contains("[ci-pass]"),
+                "stale CI pass must not be delivered: {content}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Negative case: when only one run exists and its sha is the current
+    /// head, the existing happy path must still notify.
+    #[test]
+    fn mock_single_run_current_head_still_notifies() {
+        let dir = tmp_dir("mock-single-current");
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 400,
+            conclusion: Some("success".into()),
+            head_sha: "onlyhead".into(),
+            url: "https://example.com/400".into(),
+        }]);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+        let inbox_dir = dir.join("inbox");
+        let has_inbox = inbox_dir.exists()
+            && std::fs::read_dir(&inbox_dir)
+                .map(|d| d.count() > 0)
+                .unwrap_or(false);
+        assert!(
+            has_inbox,
+            "single-run case must preserve existing notify behavior"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
