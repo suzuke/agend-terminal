@@ -2922,3 +2922,104 @@ fn task_id_required_error_uses_stable_code_for_machine_consumption() {
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ─── Issue #699: Top 5 MCP tools smoke tests ─────────────────────────────
+
+#[test]
+fn smoke_send_happy_path() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("smoke_send");
+    std::env::set_var("AGEND_HOME", &home);
+    // Setup fleet.yaml with sender + peer in same team
+    let yaml = "instances:\n  sender:\n    backend: claude\n  peer:\n    backend: claude\nteams:\n  dev:\n    members:\n      - sender\n      - peer\n    created_at: \"2026-01-01T00:00:00Z\"\n";
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
+    let result = handle_tool(
+        "send",
+        &json!({"message": "hello", "target_instance": "peer"}),
+        "sender",
+    );
+    assert!(result.is_object(), "send must return JSON object: {result}");
+    assert!(
+        result.get("target").is_some(),
+        "send should return target field: {result}"
+    );
+    assert!(
+        result.get("error").is_none(),
+        "send should not error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn smoke_inbox_happy_path() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("smoke_inbox");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("inbox", &json!({}), "agent1");
+    assert!(
+        result.is_object(),
+        "inbox must return JSON object: {result}"
+    );
+    assert!(
+        result["messages"].is_array(),
+        "inbox must return messages array: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn smoke_task_list_happy_path() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("smoke_task");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("task", &json!({"action": "list"}), "agent1");
+    assert!(
+        result.is_object(),
+        "task list must return JSON object: {result}"
+    );
+    let tasks = result
+        .get("tasks")
+        .expect("task list should have tasks key");
+    assert!(tasks.is_array(), "tasks should be array");
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn smoke_ci_status_happy_path() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("smoke_ci");
+    std::env::set_var("AGEND_HOME", &home);
+    std::fs::create_dir_all(home.join("ci-watches")).ok();
+    let result = handle_tool("ci", &json!({"action": "status"}), "agent1");
+    assert!(
+        result.is_object(),
+        "ci status must return JSON object: {result}"
+    );
+    assert!(
+        result.get("watches").is_some(),
+        "ci status must have watches key: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn smoke_create_instance_missing_name_errors() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("smoke_create");
+    std::env::set_var("AGEND_HOME", &home);
+    let result = handle_tool("create_instance", &json!({}), "agent1");
+    assert!(
+        result.is_object(),
+        "create_instance must return JSON object: {result}"
+    );
+    assert!(
+        result.get("error").is_some(),
+        "create_instance without name must error: {result}"
+    );
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
