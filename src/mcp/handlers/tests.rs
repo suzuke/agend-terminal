@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use serial_test::serial;
 
 fn tmp_home(name: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -930,6 +931,8 @@ fn metadata_persisted_on_pending_pickup() {
 }
 
 #[test]
+// TODO(#701): DI refactor 後可移除 #[serial]
+#[serial]
 fn agent_picked_up_emitted_on_inbox_drain() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("pickup_emit");
@@ -977,8 +980,6 @@ fn agent_picked_up_emitted_on_inbox_drain() {
 
     let _ = handle_tool("inbox", &json!({}), "sender");
 
-    // Brief pause to let async event emission complete (fixes macOS race)
-    std::thread::sleep(std::time::Duration::from_millis(100));
     let events = rec.snapshot();
     let pickups: Vec<_> = events
         .iter()
@@ -995,6 +996,8 @@ fn agent_picked_up_emitted_on_inbox_drain() {
 }
 
 #[test]
+// TODO(#701): DI refactor 後可移除 #[serial]
+#[serial]
 fn agent_picked_up_fires_for_all_pending_messages() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("pickup_multi");
@@ -1046,8 +1049,6 @@ fn agent_picked_up_fires_for_all_pending_messages() {
 
     let _ = handle_tool("inbox", &json!({}), "sender");
 
-    // Brief pause to let async event emission complete (fixes macOS race)
-    std::thread::sleep(std::time::Duration::from_millis(100));
     let events = rec.snapshot();
     let pickups: Vec<_> = events
         .iter()
@@ -1188,6 +1189,8 @@ fn test_send_to_inbox_fallback_mode() {
 }
 
 #[test]
+// TODO(#701): DI refactor 後可移除 #[serial]
+#[serial]
 fn test_describe_message_shows_delivery_mode() {
     // Verify describe_message returns delivery_mode when stored on the message.
     let _g = fleet_test_guard();
