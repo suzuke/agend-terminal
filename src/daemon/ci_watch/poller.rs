@@ -16,8 +16,8 @@ use super::WATCH_TTL_HOURS;
 // aliases preserve the original `super::ci_watch::X` semantics.
 #[cfg(test)]
 use super::provider::{
-    BitbucketCiProvider, GitHubCiProvider, GitLabCiProvider, detect_provider_from_remote,
-    github_token_warning,
+    detect_provider_from_remote, github_token_warning, BitbucketCiProvider, GitHubCiProvider,
+    GitLabCiProvider,
 };
 #[cfg(test)]
 use super::registry::watch_filename;

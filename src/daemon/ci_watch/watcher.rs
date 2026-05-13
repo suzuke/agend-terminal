@@ -3,7 +3,8 @@ use std::path::Path;
 
 use super::poller::check_ci_watches_with_provider;
 use super::provider::{
-    BitbucketCiProvider, CiProvider, GitHubCiProvider, GitLabCiProvider, detect_provider_from_remote,
+    detect_provider_from_remote, BitbucketCiProvider, CiProvider, GitHubCiProvider,
+    GitLabCiProvider,
 };
 use super::sweep::gc_stale_watches;
 

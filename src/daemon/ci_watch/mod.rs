@@ -24,8 +24,9 @@ pub const WATCH_TTL_HOURS: i64 = 72;
 // some items is via the trait object inside `watcher::check_ci_watches`.
 #[allow(unused_imports)]
 pub use provider::{
+    detect_provider_from_remote, github_token_warning, github_token_warning_from_env,
     BitbucketCiProvider, CiPollResult, CiProvider, CiRun, GitHubCiProvider, GitLabCiProvider,
-    PrState, detect_provider_from_remote, github_token_warning, github_token_warning_from_env,
+    PrState,
 };
 #[allow(unused_imports)]
 pub use registry::{ci_watches_dir, remove_watch, watch_filename};
