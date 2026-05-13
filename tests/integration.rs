@@ -360,33 +360,82 @@ fn test_crash_respawn_health() {
         );
     }
 
-    // Wait for respawn (poll instead of hard 8s sleep)
-    assert!(
-        wait_until(
-            || {
-                let r = daemon.api_call(&serde_json::json!({"method": "list"}));
-                r["result"]["agents"]
-                    .as_array()
-                    .map(|a| a.len() == 1 && a[0]["health_state"] == "healthy")
-                    .unwrap_or(false)
-            },
-            Duration::from_secs(30)
-        ),
-        "agent did not respawn within 30s"
-    );
+    // Lifecycle: kill → restarting → (process up + registry handle insert) → Ready
+    //            → (respawn_ok lock window, sub-ms in-memory flip) → Healthy.
+    // Note: Shell backend initial state = Ready (src/state.rs:625-628) — managed
+    // backends go Starting→Ready, so Phase 1 budget may need recalibration if
+    // pattern reused there. Single-kill test: no monotonic Recovering↔Healthy
+    // flicker possible; multi-kill extension must re-evaluate Phase 2 budget.
+    const SPAWN_TIMEOUT: Duration = Duration::from_secs(28);
+    const HEALTH_FLIP_TIMEOUT: Duration = Duration::from_secs(2);
 
-    // Agent should be back
+    let phase_start = Instant::now();
+
+    // Phase 1: process up + new registry handle inserted → agent_state == "ready"
+    if !wait_until(
+        || {
+            let r = daemon.api_call(&serde_json::json!({"method": "list"}));
+            r["result"]["agents"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|a| a["agent_state"].as_str())
+                .map(|s| s == "ready")
+                .unwrap_or(false)
+        },
+        SPAWN_TIMEOUT,
+    ) {
+        let r = daemon.api_call(&serde_json::json!({"method": "list"}));
+        let agents = r["result"]["agents"].as_array();
+        let first = agents.and_then(|a| a.first());
+        panic!(
+            "phase 1 (agent_state == 'ready') not satisfied within 28s. \
+             last: count={}, agent_state={:?}, health_state={:?}",
+            agents.map(|a| a.len()).unwrap_or(0),
+            first.and_then(|a| a["agent_state"].as_str()).unwrap_or("?"),
+            first
+                .and_then(|a| a["health_state"].as_str())
+                .unwrap_or("?"),
+        );
+    }
+    let phase1_elapsed = phase_start.elapsed();
+
+    // Phase 2: respawn_ok flips Recovering → Healthy. Guard against transient
+    // ready+recovering window between spawn_agent insert and respawn_ok lock
+    // reacquire (src/daemon/mod.rs:889-902).
+    if !wait_until(
+        || {
+            let r = daemon.api_call(&serde_json::json!({"method": "list"}));
+            r["result"]["agents"]
+                .as_array()
+                .and_then(|a| a.first())
+                .map(|a| {
+                    a["agent_state"].as_str() == Some("ready")
+                        && a["health_state"].as_str() == Some("healthy")
+                })
+                .unwrap_or(false)
+        },
+        HEALTH_FLIP_TIMEOUT,
+    ) {
+        let r = daemon.api_call(&serde_json::json!({"method": "list"}));
+        let agents = r["result"]["agents"].as_array();
+        let first = agents.and_then(|a| a.first());
+        panic!(
+            "phase 2 (ready + healthy) not satisfied within 2s. \
+             phase1_elapsed={:?}, last: count={}, agent_state={:?}, health_state={:?}",
+            phase1_elapsed,
+            agents.map(|a| a.len()).unwrap_or(0),
+            first.and_then(|a| a["agent_state"].as_str()).unwrap_or("?"),
+            first
+                .and_then(|a| a["health_state"].as_str())
+                .unwrap_or("?"),
+        );
+    }
+
+    // Identity check — second api_call is necessary (wait_until returns bool).
     let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
     let agents = resp["result"]["agents"].as_array().expect("a");
-    assert_eq!(agents.len(), 1, "agent should have respawned");
-    assert_eq!(agents[0]["name"], "shell");
-
-    // Health state should be healthy (respawn_ok called)
-    let health = agents[0]["health_state"].as_str().unwrap_or("");
-    assert_eq!(
-        health, "healthy",
-        "health should be healthy after respawn_ok"
-    );
+    let first = agents.first().expect("agent should have respawned");
+    assert_eq!(first["name"], "shell");
 
     daemon.stop();
 }
