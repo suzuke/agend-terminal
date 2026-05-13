@@ -34,6 +34,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) mod check_schedules;
+pub(crate) mod ci_watch_poll;
 pub(crate) mod external_liveness;
 pub(crate) mod hang_detection;
 pub(crate) mod inbox_maintenance;
@@ -42,6 +43,7 @@ pub(crate) mod snapshot;
 pub(crate) mod watchdog;
 
 pub(crate) use check_schedules::CheckSchedulesHandler;
+pub(crate) use ci_watch_poll::CiWatchPollHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
 pub(crate) use hang_detection::HangDetectionHandler;
 pub(crate) use inbox_maintenance::InboxMaintenanceHandler;
