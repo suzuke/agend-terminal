@@ -7,15 +7,21 @@
 //! the main loop in the same position it occupied before. The trait is
 //! deliberately minimal — pattern relocation, not abstraction.
 //!
-//! This first cut extracts two low-risk subsystems:
+//! Cumulative extraction state (handlers grow per PR):
 //!
-//! - [`SnapshotRotationHandler`] (was `mod.rs:644-680`) — owns the
-//!   `last_snapshot_json` dedup string that used to live as a loop-local
-//!   in `run_core`.
-//! - [`PollReminderHandler`] (was `mod.rs:748-758`) — owns the every-N
-//!   tick counter that used to live as a function-local `static`.
+//! - [`SnapshotRotationHandler`] (T-B2, was `mod.rs:644-680`) — owns the
+//!   `last_snapshot_json` dedup string that used to live as a loop-local.
+//! - [`PollReminderHandler`] (T-B2, was `mod.rs:748-758`) — owns the
+//!   every-N tick counter that used to live as a function-local `static`.
+//! - [`InboxMaintenanceHandler`] (T-B3, was `mod.rs:667-728`) — the
+//!   every-60-tick composite of 6 sub-ops; counter moves from
+//!   function-local `static AtomicU64` onto the struct.
+//! - [`ExternalLivenessHandler`] (T-B3, was `mod.rs:647-658`) — picked
+//!   over the watchdog block for blast-radius reasons documented in the
+//!   T-B3 PR body. Stateless wrapper around the `externals.retain`
+//!   liveness sweep.
 //!
-//! Follow-up PRs (T-B3+) will move further subsystems behind the same
+//! Follow-up PRs (T-B4+) will move further subsystems behind the same
 //! trait. Until then, the daemon loop holds the handlers as named locals
 //! and calls them at their original sites — a single `Vec<Box<dyn …>>`
 //! iteration would reorder execution and is deferred until enough
@@ -27,15 +33,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub(crate) mod inbox_maintenance;
 pub(crate) mod poll_reminder;
 pub(crate) mod snapshot;
 
+pub(crate) use inbox_maintenance::InboxMaintenanceHandler;
 pub(crate) use poll_reminder::PollReminderHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
 
 /// Shared per-tick context. Field types match what the daemon main loop
-/// holds verbatim — the trait is pure relocation, not abstraction. Future
-/// handlers add fields as their extraction lands.
+/// holds verbatim — the trait is pure relocation, not abstraction. New
+/// fields are added as a handler's extraction lands; existing handlers
+/// are unaffected because all fields are borrowed references.
 pub(crate) struct TickContext<'a> {
     pub home: &'a Path,
     pub registry: &'a AgentRegistry,
