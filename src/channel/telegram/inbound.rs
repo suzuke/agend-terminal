@@ -10,38 +10,48 @@ use super::state::{lock_state, TelegramState};
 use super::topic_registry::load_topic_registry;
 
 /// Start Telegram polling in a dedicated thread with its own tokio runtime.
+/// Supervisor loop: auto-restarts on error/panic with 5s backoff.
 pub fn start_polling(state: Arc<Mutex<TelegramState>>) {
-    // fire-and-forget: telegram polling thread runs the teloxide dispatcher
-    // for the daemon's lifetime. Stops when the bot's update stream errors
-    // (network drop / shutdown). No JoinHandle / shutdown signal needed —
-    // process exit reaps the thread.
+    // fire-and-forget: telegram supervisor thread runs for the daemon's lifetime.
     if let Err(e) = std::thread::Builder::new()
         .name("telegram".into())
         .spawn(move || {
             let _census = crate::thread_census::register("telegram_poll");
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                tracing::error!("failed to build tokio runtime");
-                return;
-            };
-            rt.block_on(async {
-                let bot = lock_state(&state)
-                    .bot
-                    .clone()
-                    .expect("telegram bot not initialized (polling thread)");
-                let state2 = Arc::clone(&state);
-                let handler = Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
-                    let state = Arc::clone(&state2);
-                    async move {
-                        handle_message(&state, &msg).await;
-                        respond(())
-                    }
-                });
-                tracing::info!("polling started");
-                Dispatcher::builder(bot, handler).build().dispatch().await;
-            });
+            loop {
+                tracing::info!("telegram dispatcher starting");
+                let state_clone = Arc::clone(&state);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        tracing::error!("failed to build tokio runtime");
+                        return;
+                    };
+                    rt.block_on(async {
+                        let bot = lock_state(&state_clone)
+                            .bot
+                            .clone()
+                            .expect("telegram bot not initialized (polling thread)");
+                        let state2 = Arc::clone(&state_clone);
+                        let handler =
+                            Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
+                                let state = Arc::clone(&state2);
+                                async move {
+                                    handle_message(&state, &msg).await;
+                                    respond(())
+                                }
+                            });
+                        tracing::info!("polling started");
+                        Dispatcher::builder(bot, handler).build().dispatch().await;
+                    });
+                }));
+                match result {
+                    Ok(()) => tracing::warn!("telegram dispatcher exited, restarting in 5s"),
+                    Err(_) => tracing::error!("telegram dispatcher panicked, restarting in 5s"),
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
         })
     {
         tracing::error!(error = %e, "failed to spawn polling thread");
