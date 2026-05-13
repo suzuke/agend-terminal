@@ -264,7 +264,6 @@ fn finalize_results(
     Ok(())
 }
 
-#[allow(clippy::unwrap_used)]
 fn test_attach(_home: &Path) -> TestResult {
     let registry = Arc::new(Mutex::new(HashMap::new()));
     if let Err(e) = agent::spawn_agent(&test_spawn_config("verify-attach", None), &registry) {
@@ -273,19 +272,28 @@ fn test_attach(_home: &Path) -> TestResult {
     std::thread::sleep(std::time::Duration::from_secs(1));
     {
         let reg = registry.lock();
-        let _ = agent::write_to_agent(reg.get("verify-attach").unwrap(), b"echo VERIFY_OK\r");
+        let Some(agent) = reg.get("verify-attach") else {
+            return TestResult::fail("attach", "agent not found after spawn");
+        };
+        let _ = agent::write_to_agent(agent, b"echo VERIFY_OK\r");
     }
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     let output = {
         let reg = registry.lock();
-        let core = reg.get("verify-attach").unwrap().core.lock();
+        let Some(agent) = reg.get("verify-attach") else {
+            return TestResult::fail("attach", "agent not found before output read");
+        };
+        let core = agent.core.lock();
         String::from_utf8_lossy(&core.vterm.dump_screen()).to_string()
     };
     let ok = output.contains("VERIFY_OK");
 
     let reg = registry.lock();
-    let _ = reg.get("verify-attach").unwrap().child.lock().kill();
+    let Some(agent) = reg.get("verify-attach") else {
+        return TestResult::fail("attach", "agent not found during cleanup");
+    };
+    let _ = agent.child.lock().kill();
 
     TestResult::from_bool(
         "attach",
@@ -466,7 +474,6 @@ fn test_telegram() -> TestResult {
 }
 
 /// Per-backend verification: spawn, ready, instructions, MCP config, inject, quit.
-#[allow(clippy::unwrap_used)]
 fn test_backend(backend: &backend::Backend, home: &Path) -> Vec<TestResult> {
     let name = backend.name();
     let preset = backend.preset();
