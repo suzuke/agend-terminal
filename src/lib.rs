@@ -1,4 +1,5 @@
 //! agend-terminal library surface.
+pub mod capture;
 pub mod sync_audit;
 
 /// Re-export for integration tests. The actual implementation lives in the

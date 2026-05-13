@@ -583,6 +583,13 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
         shutdown: shutdown_for_reaper,
         deleted: deleted_for_reaper,
     };
+    let capture = {
+        let backend_str = detected_backend
+            .as_ref()
+            .map(|b| b.name())
+            .unwrap_or(backend_command);
+        crate::capture::make_capture_writer(home.as_deref(), name, backend_str)
+    };
     // fire-and-forget: pty_read_loop terminates on PTY EOF, which fires when
     // the child process is killed during shutdown / delete. JoinHandle is
     // discarded because the loop's exit is signalled via the OS-side PTY
@@ -590,7 +597,7 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
     std::thread::Builder::new()
         .name(format!("{n}_pty_read"))
         .spawn(move || {
-            pty_read_loop(&mut pty_reader, &ctx);
+            pty_read_loop(&mut pty_reader, &ctx, capture);
         })?;
 
     // Backends whose CLI does not auto-load the instructions file (e.g. Kiro)
@@ -745,7 +752,11 @@ struct PtyReadContext {
 }
 
 /// PTY read loop: feeds VTerm, broadcasts output, auto-dismisses dialogs, handles exit.
-fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
+fn pty_read_loop(
+    pty_reader: &mut dyn Read,
+    ctx: &PtyReadContext,
+    mut capture: Box<dyn crate::capture::CaptureWriter + Send>,
+) {
     let PtyReadContext {
         name,
         core,
@@ -793,6 +804,8 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
                     );
                 }
                 let data = &buf[..n_bytes];
+
+                capture.write(data);
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic),
                 // then scan the rendered screen for dismiss patterns. Scanning
