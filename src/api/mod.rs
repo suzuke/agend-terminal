@@ -108,16 +108,52 @@ pub trait ApiNotifier: Send + Sync {
 /// over-engineering audit (daemon runs as user, full filesystem access).
 pub fn validate_working_directory(
     path: &std::path::Path,
-    _home: &std::path::Path,
+    home: &std::path::Path,
 ) -> anyhow::Result<std::path::PathBuf> {
     use std::path::Component;
-    // Sprint 29: simplified to bare `..` rejection per over-engineering audit
-    // (audit #4). Daemon runs as user — full filesystem access already.
-    // Canonicalize + ancestor walk + allowed roots removed.
+    // Reject path traversal at component level
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         anyhow::bail!("working_directory must not contain '..'");
     }
-    Ok(path.to_path_buf())
+    // Canonicalize to resolve symlinks
+    let canonical = if path.exists() {
+        std::fs::canonicalize(path)
+            .map_err(|e| anyhow::anyhow!("working_directory canonicalize failed: {e}"))?
+    } else {
+        // Path doesn't exist yet (will be created) — use parent for validation
+        path.to_path_buf()
+    };
+    // Allowed-roots check
+    if !is_under_allowed_root(&canonical, home) {
+        anyhow::bail!("working_directory outside allowed roots");
+    }
+    Ok(canonical)
+}
+
+/// Compute allowed root directories for working_directory validation.
+fn allowed_roots(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![home.to_path_buf(), crate::paths::workspace_dir(home)];
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+    if let Ok(extra) = std::env::var("AGEND_ALLOWED_ROOTS") {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for r in extra.split(sep) {
+            if !r.is_empty() {
+                roots.push(std::path::PathBuf::from(r));
+            }
+        }
+    }
+    roots
+}
+
+fn is_under_allowed_root(path: &std::path::Path, home: &std::path::Path) -> bool {
+    let roots = allowed_roots(home);
+    roots.iter().any(|root| {
+        // Canonicalize root too (home might be a symlink)
+        let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        path.starts_with(&canonical_root)
+    })
 }
 
 // Sprint 29: strip_verbatim_prefix removed — canonicalize no longer called.
@@ -546,9 +582,43 @@ mod tests {
     fn validate_work_dir_allows_normal_path() {
         let home = tmp_home("validate_normal");
         let ok = crate::paths::workspace_dir(&home).join("agent");
+        std::fs::create_dir_all(&ok).expect("create dir");
         let resolved = validate_working_directory(&ok, &home).expect("normal path must validate");
-        assert_eq!(resolved, ok);
+        assert!(resolved.ends_with("agent"));
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn validate_work_dir_rejects_outside_roots() {
+        let home = tmp_home("validate_outside");
+        // /tmp exists but is not under home or workspace
+        let outside = std::path::PathBuf::from("/tmp");
+        let err = validate_working_directory(&outside, &home).unwrap_err();
+        assert!(
+            format!("{err}").contains("outside allowed roots"),
+            "expected roots rejection, got: {err}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn validate_work_dir_env_override_accepted() {
+        let home = tmp_home("validate_env");
+        // Use a sibling dir of home (not under home) as custom root
+        let custom = home.parent().unwrap().join("agend-custom-root-707");
+        std::fs::create_dir_all(&custom).expect("create custom");
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let canonical_custom = std::fs::canonicalize(&custom).unwrap_or_else(|_| custom.clone());
+        std::env::set_var(
+            "AGEND_ALLOWED_ROOTS",
+            canonical_custom.to_str().unwrap_or(""),
+        );
+        let result = validate_working_directory(&custom, &home);
+        std::env::remove_var("AGEND_ALLOWED_ROOTS");
+        assert!(result.is_ok(), "env override should allow: {result:?}");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&custom).ok();
+        let _ = sep; // suppress unused warning
     }
 
     #[test]
