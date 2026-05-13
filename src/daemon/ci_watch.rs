@@ -2093,6 +2093,15 @@ fn update_watch_state_with_notify(
     head_sha: &str,
     notified_sha: Option<&str>,
 ) {
+    // #692: flock protects RMW against concurrent unsubscribe
+    let lock_path = watch_path.with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(path = %lock_path.display(), error = %e, "failed to acquire ci-watch lock, skipping update");
+            return;
+        }
+    };
     if let Ok(content) = std::fs::read_to_string(watch_path) {
         if let Ok(mut watch) = serde_json::from_str::<serde_json::Value>(&content) {
             watch["last_run_id"] = serde_json::json!(run_id);

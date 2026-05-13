@@ -433,6 +433,12 @@ fn unsubscribe_all_ci_watches_for_agent(home: &Path, agent: &str) {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
+        // #692: flock protects read-modify-write against concurrent ci_watch tick
+        let lock_path = path.with_extension("lock");
+        let _lock = match crate::store::acquire_file_lock(&lock_path) {
+            Ok(l) => l,
+            Err(_) => continue, // skip if can't lock
+        };
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
