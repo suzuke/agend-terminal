@@ -526,19 +526,24 @@ fn run_core(
     // dedup string, poll-reminder + inbox-maintenance counters) persists
     // across ticks. Called at their pre-extraction sites in the main
     // loop below.
-    use per_tick::PerTickHandler as _;
     // Watchdog dry-run mode: log classifications without mutating health
     // state. Read ONCE at daemon startup (matches pre-extraction
     // semantics; env changes mid-runtime are not observed).
     let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
-    let snapshot_handler = per_tick::SnapshotRotationHandler::new();
-    let poll_reminder_handler = per_tick::PollReminderHandler::new(30);
-    let inbox_maintenance_handler = per_tick::InboxMaintenanceHandler::new(60);
-    let external_liveness_handler = per_tick::ExternalLivenessHandler::new();
-    let hang_detection_handler = per_tick::HangDetectionHandler::new();
-    let watchdog_handler = per_tick::WatchdogHandler::new(watchdog_dry_run);
-    let check_schedules_handler = per_tick::CheckSchedulesHandler::new();
-    let ci_watch_poll_handler = per_tick::CiWatchPollHandler::new();
+    // #694 BLOCK 1 closeout — eight handlers collapsed from named bindings
+    // + per-handler call sites into a single Vec dispatched by a uniform
+    // for-loop below. Vec order MUST match the pre-collapse call order;
+    // that ordering is the zero-behavior-change guarantee.
+    let handlers: Vec<Box<dyn per_tick::PerTickHandler>> = vec![
+        Box::new(per_tick::HangDetectionHandler::new()),
+        Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
+        Box::new(per_tick::ExternalLivenessHandler::new()),
+        Box::new(per_tick::SnapshotRotationHandler::new()),
+        Box::new(per_tick::CheckSchedulesHandler::new()),
+        Box::new(per_tick::CiWatchPollHandler::new()),
+        Box::new(per_tick::InboxMaintenanceHandler::new(60)),
+        Box::new(per_tick::PollReminderHandler::new(30)),
+    ];
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -596,32 +601,13 @@ fn run_core(
         // (spawned earlier) so app mode gets the same behavior as daemon mode.
         // Hang detection and health decay stay here — they're daemon-only
         // concerns (hang notifications tie into crash respawn accounting).
-        // #694 BLOCK 1 cohort — extracted into daemon::per_tick. Hang and
-        // Watchdog are adjacent so the same-tick `core.health` read-after-
-        // write sequence stays visibly contiguous in the select! lambda.
-        hang_detection_handler.run(&tick_ctx);
-        watchdog_handler.run(&tick_ctx);
-
-        // Liveness check for external agents.
-        // #694 BLOCK 1 — extracted into daemon::per_tick::ExternalLivenessHandler.
-        external_liveness_handler.run(&tick_ctx);
-
-        // Periodic snapshot: save fleet state (only if changed).
-        // #694 BLOCK 1 — extracted into daemon::per_tick::SnapshotRotationHandler.
-        snapshot_handler.run(&tick_ctx);
-
-        // #694 BLOCK 1 — extracted into daemon::per_tick::CheckSchedulesHandler.
-        check_schedules_handler.run(&tick_ctx);
-        // #694 BLOCK 1 — extracted into daemon::per_tick::CiWatchPollHandler.
-        ci_watch_poll_handler.run(&tick_ctx);
-
-        // Periodic inbox maintenance — every 60 ticks (≈10 min at 10s/tick).
-        // #694 BLOCK 1 — extracted into daemon::per_tick::InboxMaintenanceHandler.
-        inbox_maintenance_handler.run(&tick_ctx);
-
-        // Poll-reminder: nudge idle agents with unread inbox (every 30 ticks).
-        // #694 BLOCK 1 — extracted into daemon::per_tick::PollReminderHandler.
-        poll_reminder_handler.run(&tick_ctx);
+        // #694 BLOCK 1 closeout — handler dispatch is Vec-driven (see
+        // `let handlers = …` above). The pre-collapse call order is
+        // preserved verbatim by the Vec literal's element order; this
+        // loop is the only call site.
+        for handler in &handlers {
+            handler.run(&tick_ctx);
+        }
 
         // Handle exit event (if any)
         let exit_event = match exit_event {
