@@ -86,6 +86,7 @@ Additional: wire-format invariant tests (pin shape); production-path-coupled (no
 
 ### 3.10 Test-first
 Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
+- Every fix PR MUST include an empirical reproduction test case. Reviewers MUST verify the presence and validity of this test.
 - Reviewer verifies: `git checkout <test-sha>` fails → `HEAD` passes
 - Exemptions: docs-only, pure refactor, test-only, dep bump, EMERGENCY, pure deletion, empirical-revert
 
