@@ -209,6 +209,11 @@ impl HealthTracker {
     /// (the escalation-worthy state). [`HealthState::IdleLong`] transitions
     /// return `false` so cron escalation consumers (interrupt
     /// / replace) keep their existing semantics — they only act on `Hung`.
+    ///
+    /// Mutator monopoly: [`Self::maybe_decay`] does NOT touch
+    /// [`HealthState::Hung`]; all Hung mutations are inside this function
+    /// (entries below, exit at the silence-drops branch). See
+    /// `docs/HUNG-STATE-TRANSITIONS.md §Invariants`.
     pub fn check_hang(
         &mut self,
         agent_state: AgentState,
@@ -237,7 +242,13 @@ impl HealthTracker {
         };
 
         if !silence_exceeds_threshold {
-            // Recovering from a previous Hung/IdleLong → back to Healthy.
+            // Hung Exit (X1) / IdleLong Exit (X1): silence dropped below threshold
+            // PRE: state in {Hung, IdleLong}, !silence_exceeds_threshold
+            // POST: state = Healthy, check_hang returns false
+            // FP vector: F10 — any 1 byte of output (spinner tick, log line) flips
+            //   Hung → Healthy without productive-work evidence.
+            // FN vector: indirect via FP (stale "Healthy" hides genuine stuck agent).
+            // See docs/HUNG-STATE-TRANSITIONS.md §Exit.X1
             if matches!(self.state, HealthState::Hung | HealthState::IdleLong) {
                 self.state = HealthState::Healthy;
             }
@@ -269,6 +280,16 @@ impl HealthTracker {
                 agent_state = ?agent_state,
                 "agent classified Hung — input pending {delta_ms}ms past last heartbeat (escalation-worthy)"
             );
+            // Hung Entry (E1): input pending past heartbeat_deadline
+            // PRE: !blocked-reason race mutex, silence > threshold,
+            //   last_input_at_ms > last_heartbeat_at_ms + 5s grace,
+            //   state != Hung
+            // POST: state = Hung, check_hang returns true (first detection only)
+            // FP vector: operator typed input but agent is genuinely producing
+            //   keystrokes draining through MCP; bounded by heartbeat refresh.
+            // FN vector: F9 grey failure — 1-byte spinner output resets silent
+            //   timer in StateTracker; never crosses threshold.
+            // See docs/HUNG-STATE-TRANSITIONS.md §Entry.E1
             if self.state != HealthState::Hung {
                 self.state = HealthState::Hung;
                 return true; // First hang detection — caller escalates
@@ -297,6 +318,16 @@ impl HealthTracker {
                 agent_state = ?agent_state,
                 "agent classified Hung — heartbeat fresh but PTY silent (F1 cross-check)"
             );
+            // Hung Entry (E2): heartbeat fresh but PTY silent (F1 cross-check)
+            // PRE: !blocked-reason race mutex, silence > threshold,
+            //   !input_pending_past_response (E1 did not fire),
+            //   last_heartbeat_at_ms > 0 AND heartbeat_age_ms < silent.as_millis(),
+            //   state != Hung
+            // POST: state = Hung, check_hang returns true (first detection only)
+            // FP vector: F39 — stale AgentState::Thinking pattern in vterm scrollback;
+            //   bounded by LATCHED_STATE_EXPIRY (30s) but not perfectly.
+            // FN vector: F9 grey failure — same shape as §Entry.E1.
+            // See docs/HUNG-STATE-TRANSITIONS.md §Entry.E2
             if self.state != HealthState::Hung {
                 self.state = HealthState::Hung;
                 return true;
@@ -304,6 +335,15 @@ impl HealthTracker {
             return false;
         }
 
+        // IdleLong Entry (E1): silent past threshold, no input pending
+        // PRE: !blocked-reason race mutex, silence > threshold,
+        //   !input_pending_past_response, !heartbeat_fresh, state != IdleLong
+        // POST: state = IdleLong, check_hang returns false (escalation
+        //   consumers act only on Hung per rustdoc contract above)
+        // FP vector: genuinely idle agent waiting for next operator prompt
+        //   (04:00 UTC false-alarm pattern that motivated splitting Hung/IdleLong)
+        // FN vector: F9 grey failure — same shape as §Entry.E1.
+        // See docs/HUNG-STATE-TRANSITIONS.md §IdleLong.Entry.E1
         if self.state != HealthState::IdleLong {
             tracing::debug!(
                 last_input_at_ms,
