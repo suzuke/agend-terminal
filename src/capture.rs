@@ -6,11 +6,31 @@
 //!
 //! `promote_capture` copies a chosen .cap into `tests/fixtures/<backend>/`.
 
-use std::io::Write;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Cumulative .cap budget per agent; oldest files deleted when exceeded.
 const CAPTURE_ROTATION_BUDGET_BYTES: u64 = 50 * 1024 * 1024;
+
+// ── Trait ──────────────────────────────────────────────────────────────────
+
+/// Abstraction over the PTY byte sink so `pty_read_loop` can call `.write()`
+/// unconditionally without an `Option` branch.
+pub trait CaptureWriter: Send {
+    fn write(&mut self, data: &[u8]);
+}
+
+/// Zero-sized no-op: produced when `AGEND_CAPTURE_FIXTURES` is unset.
+/// `Box<NoOpCapture>` does not allocate (ZST optimisation).
+pub struct NoOpCapture;
+
+impl CaptureWriter for NoOpCapture {
+    #[inline(always)]
+    fn write(&mut self, _data: &[u8]) {}
+}
+
+// ── Real sink ──────────────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CaptureMeta {
@@ -32,17 +52,15 @@ pub struct CaptureSink {
 }
 
 impl CaptureSink {
-    /// Create capture dir, rotate if needed, open a new .cap file.
-    /// Returns `None` if the env flag is off or directory/file creation fails.
-    pub fn new_if_enabled(home: &Path, agent_name: &str, backend: &str) -> Option<Self> {
+    fn new_if_enabled(home: &Path, agent_name: &str, backend: &str) -> Option<Self> {
         if std::env::var("AGEND_CAPTURE_FIXTURES").as_deref() != Ok("1") {
             return None;
         }
         let dir = home.join("captures").join(agent_name);
         std::fs::create_dir_all(&dir).ok()?;
         rotate_captures(&dir);
-        let epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let epoch_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let cap_path = dir.join(format!("{epoch_ms}.cap"));
@@ -61,8 +79,10 @@ impl CaptureSink {
             byte_count: 0,
         })
     }
+}
 
-    pub fn write(&mut self, data: &[u8]) {
+impl CaptureWriter for CaptureSink {
+    fn write(&mut self, data: &[u8]) {
         if self.file.write_all(data).is_ok() {
             self.byte_count += data.len() as u64;
         }
@@ -79,33 +99,65 @@ impl Drop for CaptureSink {
             byte_count: self.byte_count,
         };
         if let Ok(json) = serde_json::to_string_pretty(&meta) {
+            // IO errors on drop are silently discarded — never propagate.
             let _ = std::fs::write(&self.meta_path, json);
         }
     }
 }
 
-/// Delete oldest .cap files (and their sidecars) until total is below limit.
+// ── Factory ────────────────────────────────────────────────────────────────
+
+/// Return a `FsCapture` when `AGEND_CAPTURE_FIXTURES=1`, else a `NoOpCapture`.
+/// The caller unconditionally calls `.write()` — no branch on the hot path.
+pub fn make_capture_writer(
+    home: Option<&Path>,
+    agent_name: &str,
+    backend: &str,
+) -> Box<dyn CaptureWriter + Send> {
+    home.and_then(|h| CaptureSink::new_if_enabled(h, agent_name, backend))
+        .map(|s| Box::new(s) as Box<dyn CaptureWriter + Send>)
+        .unwrap_or_else(|| Box::new(NoOpCapture))
+}
+
+// ── Rotation ───────────────────────────────────────────────────────────────
+
 fn rotate_captures(dir: &Path) {
-    let mut files: Vec<(PathBuf, u64)> = std::fs::read_dir(dir)
+    rotate_captures_with_budget(dir, CAPTURE_ROTATION_BUDGET_BYTES);
+}
+
+/// Delete oldest (by mtime) `.cap` files until total is below `budget`.
+/// Always keeps at least one file so an in-progress capture is never deleted.
+fn rotate_captures_with_budget(dir: &Path, budget: u64) {
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            (p.extension().and_then(|x| x.to_str()) == Some("cap")).then(|| {
-                let size = p.metadata().map(|m| m.len()).unwrap_or(0);
-                (p, size)
-            })
+            if p.extension().and_then(|x| x.to_str()) != Some("cap") {
+                return None;
+            }
+            let meta = p.metadata().ok()?;
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((p, meta.len(), mtime))
         })
         .collect();
-    let total: u64 = files.iter().map(|(_, s)| s).sum();
-    if total < CAPTURE_ROTATION_BUDGET_BYTES {
+
+    if files.len() <= 1 {
         return;
     }
-    files.sort_by(|(a, _), (b, _)| a.cmp(b)); // oldest-first via epoch prefix
+
+    let total: u64 = files.iter().map(|(_, s, _)| s).sum();
+    if total < budget {
+        return;
+    }
+
+    files.sort_by_key(|(_, _, mtime)| *mtime); // oldest-first
+
     let mut remaining = total;
-    for (path, size) in files {
-        if remaining < CAPTURE_ROTATION_BUDGET_BYTES {
+    let mut files_left = files.len();
+    for (path, size, _) in &files {
+        if remaining < budget || files_left <= 1 {
             break;
         }
         let sidecar = {
@@ -113,11 +165,14 @@ fn rotate_captures(dir: &Path) {
             s.push(".meta.json");
             PathBuf::from(s)
         };
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(&sidecar);
-        remaining = remaining.saturating_sub(size);
+        remaining = remaining.saturating_sub(*size);
+        files_left -= 1;
     }
 }
+
+// ── Promote ────────────────────────────────────────────────────────────────
 
 /// Copy `capture_path` to `tests/fixtures/<backend>/<scenario_name>.cap`.
 ///
@@ -148,18 +203,22 @@ pub fn promote_capture(capture_path: &Path, scenario_name: &str) -> anyhow::Resu
     Ok(())
 }
 
+// ── Tests ──────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+    fn tmp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("agend-capture-unit-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
     #[test]
+    #[serial(capture_env)]
     fn sink_none_when_env_unset() {
         std::env::remove_var("AGEND_CAPTURE_FIXTURES");
         let dir = tmp_dir("none");
@@ -168,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(capture_env)]
     fn sink_creates_cap_and_meta_on_drop() {
         let dir = tmp_dir("create");
         std::env::set_var("AGEND_CAPTURE_FIXTURES", "1");
@@ -203,29 +263,42 @@ mod tests {
     }
 
     #[test]
-    fn rotate_removes_oldest_when_over_limit() {
-        let dir = tmp_dir("rotate");
-        std::fs::create_dir_all(&dir).unwrap();
-        // Write 3 fake .cap files totalling > CAPTURE_ROTATION_BUDGET_BYTES
-        let big = vec![0u8; (CAPTURE_ROTATION_BUDGET_BYTES / 2 + 1) as usize];
-        for epoch in [1000u64, 2000, 3000] {
-            std::fs::write(dir.join(format!("{epoch}.cap")), &big).unwrap();
-        }
-        rotate_captures(&dir);
-        let remaining: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("cap"))
-            .collect();
-        // After rotation, total must be < CAPTURE_ROTATION_BUDGET_BYTES
-        let total: u64 = remaining
-            .iter()
-            .map(|e| e.path().metadata().map(|m| m.len()).unwrap_or(0))
-            .sum();
+    fn rotate_keeps_single_file_even_over_budget() {
+        let dir = tmp_dir("rotate-single");
+        std::fs::write(dir.join("1000.cap"), b"big").unwrap();
+        rotate_captures_with_budget(&dir, 1); // budget=1 byte, file is 3 bytes
         assert!(
-            total < CAPTURE_ROTATION_BUDGET_BYTES,
-            "total={total} must be < limit"
+            dir.join("1000.cap").exists(),
+            "must not delete last remaining file"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rotate_deletes_oldest_by_mtime_not_name() {
+        let dir = tmp_dir("rotate-mtime");
+        // "9000.cap" created first (older mtime), "1000.cap" created second (newer).
+        // Alphabetically "1000" < "9000", so old sort-by-name would delete the
+        // wrong file. Mtime sort must delete "9000.cap".
+        std::fs::write(dir.join("9000.cap"), b"aaa").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("1000.cap"), b"bbb").unwrap();
+        // budget = 5 bytes, total = 6 bytes → need to delete one
+        rotate_captures_with_budget(&dir, 5);
+        assert!(
+            !dir.join("9000.cap").exists(),
+            "oldest by mtime must be deleted"
+        );
+        assert!(
+            dir.join("1000.cap").exists(),
+            "newest by mtime must survive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn noop_capture_writer_is_zero_cost() {
+        let mut noop = NoOpCapture;
+        noop.write(b"ignored");
     }
 }

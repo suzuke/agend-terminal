@@ -1,33 +1,31 @@
 //! Integration test for AGEND_CAPTURE_FIXTURES passive tee (issue #704).
 #![allow(clippy::unwrap_used)]
-//!
-//! Tests CaptureSink behaviour directly without requiring a running daemon.
-//! Gate the full spawn variant behind AGEND_LIVE_BACKEND_TEST=1.
 
+use agend_terminal::capture::make_capture_writer;
+use serial_test::serial;
 use std::path::PathBuf;
 
 fn tmp_home(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("agend-capture-test-{tag}"));
+    let _ = std::fs::remove_dir_all(&dir); // clear any leftovers from previous run
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
 #[test]
-fn capture_sink_writes_cap_and_meta_when_env_set() {
-    let home = tmp_home("sink");
+#[serial(capture_env)]
+fn capture_writer_writes_cap_and_meta_when_env_set() {
+    let home = tmp_home("writer");
     let agent = "test-capture-agent";
     let backend = "shell";
 
     std::env::set_var("AGEND_CAPTURE_FIXTURES", "1");
-    let mut sink = agend_terminal::capture::CaptureSink::new_if_enabled(&home, agent, backend)
-        .expect("sink must be created when AGEND_CAPTURE_FIXTURES=1");
+    let mut writer = make_capture_writer(Some(&home), agent, backend);
 
     let payload = b"hello capture world\r\n";
-    sink.write(payload);
-    assert_eq!(sink.byte_count, payload.len() as u64);
+    writer.write(payload);
 
-    // Drop triggers meta sidecar flush.
-    drop(sink);
+    drop(writer);
     std::env::remove_var("AGEND_CAPTURE_FIXTURES");
 
     let cap_dir = home.join("captures").join(agent);
@@ -58,10 +56,16 @@ fn capture_sink_writes_cap_and_meta_when_env_set() {
 }
 
 #[test]
-fn capture_sink_is_none_when_env_unset() {
+#[serial(capture_env)]
+fn capture_writer_is_noop_when_env_unset() {
     std::env::remove_var("AGEND_CAPTURE_FIXTURES");
-    let home = tmp_home("no-sink");
-    let result = agend_terminal::capture::CaptureSink::new_if_enabled(&home, "agent", "shell");
-    assert!(result.is_none(), "sink must be None when env var is unset");
+    let home = tmp_home("noop");
+    let mut writer = make_capture_writer(Some(&home), "agent", "shell");
+    writer.write(b"should be ignored");
+    drop(writer);
+    assert!(
+        !home.join("captures").exists(),
+        "no captures dir when env unset"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
