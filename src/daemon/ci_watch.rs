@@ -1739,9 +1739,9 @@ fn ci_notification_message(
         .map(|s| format!(" ({})", &s[..s.len().min(7)]))
         .unwrap_or_default();
     let msg = match conclusion {
-        "failure" => format!("[ci-fail] {repo}@{branch}{sha_short}: failure\r"),
-        "success" => format!("[ci-pass] {repo}@{branch}{sha_short}: passed ✓\r"),
-        other => format!("[ci-ended] {repo}@{branch}{sha_short}: {other}\r"),
+        "failure" => format!("[ci-fail] {repo}@{branch}{sha_short}: failure"),
+        "success" => format!("[ci-pass] {repo}@{branch}{sha_short}: passed ✓"),
+        other => format!("[ci-ended] {repo}@{branch}{sha_short}: {other}"),
     };
     Some(msg)
 }
@@ -2058,9 +2058,8 @@ async fn ci_check_repo(
                     // Only route on success (not failure)
                     let last_conclusion = aggregate_conclusion_for_sha(&runs, current_sha);
                     if last_conclusion == Some("success") {
-                        let msg = format!(
-                            "[ci-ready-for-action] {repo}@{branch}: CI passed, your turn.\r"
-                        );
+                        let msg =
+                            format!("[ci-ready-for-action] {repo}@{branch}: CI passed, your turn.");
                         let reg = agent::lock_registry(registry);
                         if let Some(handle) = reg.get(next) {
                             let _ = agent::inject_to_agent(handle, msg.as_bytes());
@@ -2264,10 +2263,7 @@ mod tests {
     #[test]
     fn ci_watch_success_notifies() {
         let msg = ci_notification_message("owner/repo", "main", Some("success"), None, None);
-        assert_eq!(
-            msg.as_deref(),
-            Some("[ci-pass] owner/repo@main: passed ✓\r")
-        );
+        assert_eq!(msg.as_deref(), Some("[ci-pass] owner/repo@main: passed ✓"));
     }
 
     #[test]
@@ -2280,13 +2276,13 @@ mod tests {
             Some("Build / Test"),
             None,
         );
-        assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure\r"));
+        assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure"));
     }
 
     #[test]
     fn ci_watch_failure_without_detail_same_headline() {
         let msg = ci_notification_message("owner/repo", "main", Some("failure"), None, None);
-        assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure\r"));
+        assert_eq!(msg.as_deref(), Some("[ci-fail] owner/repo@main: failure"));
     }
 
     #[test]
@@ -2303,7 +2299,7 @@ mod tests {
         let msg = ci_notification_message("owner/repo", "feat", Some("cancelled"), None, None);
         assert_eq!(
             msg.as_deref(),
-            Some("[ci-ended] owner/repo@feat: cancelled\r")
+            Some("[ci-ended] owner/repo@feat: cancelled")
         );
     }
 
@@ -2312,7 +2308,7 @@ mod tests {
         let msg = ci_notification_message("owner/repo", "main", Some("timed_out"), None, None);
         assert_eq!(
             msg.as_deref(),
-            Some("[ci-ended] owner/repo@main: timed_out\r")
+            Some("[ci-ended] owner/repo@main: timed_out")
         );
     }
 
@@ -2661,7 +2657,7 @@ mod tests {
     #[test]
     fn test_inbox_body_failure_has_detail_and_url() {
         let body = build_inbox_body(
-            "[ci-fail] o/r@main: failure\r",
+            "[ci-fail] o/r@main: failure",
             "failure",
             Some("Check / Clippy"),
             "https://github.com/o/r/actions/runs/123",
@@ -2676,7 +2672,7 @@ mod tests {
     #[test]
     fn test_inbox_body_success_has_url_no_detail() {
         let body = build_inbox_body(
-            "[ci-pass] o/r@main: passed ✓\r",
+            "[ci-pass] o/r@main: passed ✓",
             "success",
             None,
             "https://github.com/o/r/actions/runs/456",
