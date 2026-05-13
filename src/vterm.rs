@@ -1123,7 +1123,7 @@ mod tests {
             assert!(
                 vt.wants_mouse(),
                 "wants_mouse must be true after {:?}",
-                std::str::from_utf8(seq).unwrap()
+                String::from_utf8_lossy(seq)
             );
         }
     }
