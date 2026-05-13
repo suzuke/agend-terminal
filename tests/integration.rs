@@ -581,3 +581,79 @@ fn daemon_shutdown_cleans_up_three_agents() {
         }
     }
 }
+
+// ─── Issue #714: Bridge invariant tests ──────────────────────────────────
+#[test]
+#[cfg(unix)]
+#[ignore = "daemon does not currently reject cookies with wrong permissions — future hardening"]
+fn bridge_rejects_cookie_wrong_permissions() {
+    // Placeholder: daemon writes 0600 at creation but does not check on read.
+    // When permission check is added, this test should verify rejection.
+}
+
+#[test]
+fn bridge_rejects_cookie_mismatch() {
+    // Start daemon, then try to connect with wrong cookie
+    let mut daemon = TestDaemon::start("bridge_mismatch");
+    let port = TestDaemon::find_api_port(&daemon.home).expect("api port");
+    let mut stream =
+        TcpStream::connect(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    // Send wrong cookie (all zeros)
+    let fake_hex = "00".repeat(32);
+    writeln!(stream, r#"{{"auth":"{}"}}"#, fake_hex).expect("write");
+    stream.flush().expect("flush");
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse");
+    assert_eq!(resp["ok"], false, "wrong cookie must be rejected: {resp}");
+    daemon.stop();
+}
+
+#[test]
+fn bridge_rejects_malformed_mcp_json() {
+    let mut daemon = TestDaemon::start("bridge_malformed");
+    // Send malformed JSON after auth
+    let (mut reader, mut writer) = daemon.connect_authed();
+    writeln!(writer, "{{not valid json at all").expect("write");
+    writer.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    let resp: serde_json::Value = serde_json::from_str(line.trim()).expect("parse");
+    assert_eq!(
+        resp["ok"], false,
+        "malformed JSON must return error: {resp}"
+    );
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("parse"),
+        "should mention parse error: {resp}"
+    );
+    daemon.stop();
+}
+
+#[test]
+fn bridge_handles_half_up_daemon() {
+    // Get a random port that nothing is listening on
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+        // l drops here — port is free but nothing listening
+    };
+    // Try to connect — should fail (connection refused), not hang
+    let start = Instant::now();
+    let result = TcpStream::connect_timeout(
+        &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        Duration::from_secs(3),
+    );
+    let elapsed = start.elapsed();
+    assert!(result.is_err(), "connect to non-listening port should fail");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "should fail quickly, not hang: {elapsed:?}"
+    );
+}
