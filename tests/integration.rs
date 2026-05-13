@@ -7,7 +7,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 /// Poll a predicate until it returns true or timeout expires.
-fn wait_until<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
+fn wait_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if pred() {
@@ -531,4 +531,53 @@ fn test_fleet_multi_agent_lifecycle() {
     );
 
     daemon.stop();
+}
+
+#[test]
+fn daemon_shutdown_cleans_up_three_agents() {
+    let a1 = format!("agent1:{SHELL_BIN}");
+    let a2 = format!("agent2:{SHELL_BIN}");
+    let a3 = format!("agent3:{SHELL_BIN}");
+    let mut daemon =
+        TestDaemon::start_with_agents("shutdown3", vec![a1.as_str(), a2.as_str(), a3.as_str()]);
+
+    // Verify all 3 agents are running
+    let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
+    assert_eq!(resp["ok"], true);
+    let agents = resp["result"]["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 3, "should have 3 agents before shutdown");
+
+    // Trigger shutdown
+    let start = Instant::now();
+    daemon.api_call(&serde_json::json!({"method": "shutdown"}));
+
+    // Wait for daemon process to exit (should be < 30s)
+    let exited = wait_until(
+        || daemon.child.try_wait().ok().flatten().is_some(),
+        Duration::from_secs(30),
+    );
+    let elapsed = start.elapsed();
+    assert!(exited, "daemon must exit within 30s of shutdown");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "shutdown took too long: {elapsed:?}"
+    );
+
+    // Verify no orphan processes by checking the run dir is cleaned
+    let run_dir = daemon.home.join("run");
+    if run_dir.exists() {
+        let entries: Vec<_> = std::fs::read_dir(&run_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        // Run dir may have the PID subdir but api.port should be gone
+        for entry in &entries {
+            let port_file = entry.path().join("api.port");
+            assert!(
+                !port_file.exists(),
+                "api.port should be cleaned on shutdown"
+            );
+        }
+    }
 }
