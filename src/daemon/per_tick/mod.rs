@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub(crate) mod check_schedules;
 pub(crate) mod external_liveness;
 pub(crate) mod hang_detection;
 pub(crate) mod inbox_maintenance;
@@ -40,6 +41,7 @@ pub(crate) mod poll_reminder;
 pub(crate) mod snapshot;
 pub(crate) mod watchdog;
 
+pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
 pub(crate) use hang_detection::HangDetectionHandler;
 pub(crate) use inbox_maintenance::InboxMaintenanceHandler;
