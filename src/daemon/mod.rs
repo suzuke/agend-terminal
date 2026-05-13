@@ -12,6 +12,7 @@ pub(crate) mod idle_watchdog;
 pub(crate) mod legacy_backfill;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
+pub(crate) mod per_tick;
 pub(crate) mod poll_reminder;
 pub(crate) mod router;
 pub(crate) mod supervisor;
@@ -522,7 +523,13 @@ fn run_core(
     // tick fires. Idempotent.
     crate::daemon::ci_watch::startup_sweep(home);
 
-    let mut last_snapshot_json = String::new();
+    // Per-tick handlers (#694 BLOCK 1 first cut — see daemon::per_tick).
+    // Owned across the daemon's lifetime so their interior state (snapshot
+    // dedup string, poll-reminder counter) persists across ticks. Called at
+    // their pre-extraction sites in the main loop below.
+    use per_tick::PerTickHandler as _;
+    let snapshot_handler = per_tick::SnapshotRotationHandler::new();
+    let poll_reminder_handler = per_tick::PollReminderHandler::new(30);
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -566,6 +573,15 @@ fn run_core(
                 continue;
             }
         }
+
+        // Per-tick context shared by handlers extracted under #694 BLOCK 1.
+        // Borrows are valid for the rest of this iteration; coexists with
+        // other immutable uses of `&registry` / `&configs` below.
+        let tick_ctx = per_tick::TickContext {
+            home,
+            registry: &registry,
+            configs: &configs,
+        };
 
         // Periodic maintenance (runs on every wake, whether crash or tick).
         // AwaitingOperator detection lives in the dedicated supervisor thread
@@ -641,43 +657,9 @@ fn run_core(
             });
         }
 
-        // Periodic snapshot: save fleet state (only if changed)
-        {
-            let reg = agent::lock_registry(&registry);
-            let cfgs = configs.lock();
-            let snapshots: Vec<_> = reg
-                .iter()
-                .map(|(name, handle)| {
-                    let (agent_state, health_state) = {
-                        let c = handle.core.lock();
-                        (
-                            c.state.get_state().display_name().to_string(),
-                            c.health.state.display_name().to_string(),
-                        )
-                    };
-                    let cfg = cfgs.get(name);
-                    crate::snapshot::AgentSnapshot {
-                        name: name.clone(),
-                        backend_command: handle.backend_command.clone(),
-                        args: cfg.map(|c| c.args.clone()).unwrap_or_default(),
-                        working_dir: cfg
-                            .and_then(|c| c.working_dir.as_ref())
-                            .map(|p| p.display().to_string()),
-                        submit_key: handle.submit_key.clone(),
-                        health_state,
-                        agent_state,
-                    }
-                })
-                .collect();
-            drop(cfgs);
-            drop(reg);
-            // Only write if snapshot content changed
-            let new_json = serde_json::to_string(&snapshots).unwrap_or_default();
-            if last_snapshot_json != new_json {
-                crate::snapshot::save(home, &snapshots);
-                last_snapshot_json = new_json;
-            }
-        }
+        // Periodic snapshot: save fleet state (only if changed).
+        // #694 BLOCK 1 — extracted into daemon::per_tick::SnapshotRotationHandler.
+        snapshot_handler.run(&tick_ctx);
 
         check_schedules(home, &registry);
         check_ci_watches(home, &registry);
@@ -745,17 +727,9 @@ fn run_core(
             }
         }
 
-        // Poll-reminder: nudge idle agents with unread inbox (every 30 ticks)
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static POLL_COUNTER: AtomicU64 = AtomicU64::new(0);
-            if POLL_COUNTER
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(30)
-            {
-                poll_reminder::poll_reminder_pass(home, &registry);
-            }
-        }
+        // Poll-reminder: nudge idle agents with unread inbox (every 30 ticks).
+        // #694 BLOCK 1 — extracted into daemon::per_tick::PollReminderHandler.
+        poll_reminder_handler.run(&tick_ctx);
 
         // Handle exit event (if any)
         let exit_event = match exit_event {
