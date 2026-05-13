@@ -1990,6 +1990,41 @@ async fn ci_check_repo(
                 current_sha,
                 "dropping stale CI notification (newer commit on branch)"
             );
+            for sub in subscribers {
+                let _ = crate::inbox::enqueue(
+                    home,
+                    sub,
+                    crate::inbox::InboxMessage {
+                        schema_version: 0,
+                        id: None,
+                        read_at: None,
+                        thread_id: None,
+                        parent_id: None,
+                        task_id: None,
+                        force_meta: None,
+                        correlation_id: None,
+                        reviewed_head: None,
+                        from: "system:ci".to_string(),
+                        text: format!(
+                            "[ci-stale] {repo}@{branch} ({sha}): superseded by {current_sha}"
+                        ),
+                        kind: Some("ci-stale".to_string()),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        channel: None,
+                        delivery_mode: None,
+                        attachments: vec![],
+                        in_reply_to_msg_id: None,
+                        in_reply_to_excerpt: None,
+                        superseded_by: None,
+                        from_id: None,
+                        broadcast_context: None,
+                        sequencing: None,
+                        eta_minutes: None,
+                        reporting_cadence: None,
+                        worktree_binding_required: None,
+                    },
+                );
+            }
             new_notified_sha = Some(sha.to_string());
             continue;
         }
@@ -3125,6 +3160,44 @@ mod tests {
                 "stale CI pass must not be delivered: {content}"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #745 follow-up: stale drops must produce an observable `[ci-stale]`
+    /// inbox message so operators can audit which runs were superseded.
+    #[test]
+    fn mock_stale_sha_emits_ci_stale_inbox_message() {
+        let dir = tmp_dir("mock-stale-sha-inbox");
+        let provider = MockCiProvider::with_runs(vec![
+            CiRun {
+                id: 301,
+                conclusion: None,
+                head_sha: "newhead".into(),
+                url: "https://example.com/301".into(),
+            },
+            CiRun {
+                id: 300,
+                conclusion: Some("success".into()),
+                head_sha: "oldhead".into(),
+                url: "https://example.com/300".into(),
+            },
+        ]);
+        run_ci_check(&dir, &base_watch(), &provider).unwrap();
+
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        assert!(
+            inbox_path.exists(),
+            "inbox file must exist after stale drop"
+        );
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("[ci-stale]"),
+            "inbox must contain [ci-stale] kind: {content}"
+        );
+        assert!(
+            content.contains("oldhead"),
+            "ci-stale message must reference the stale sha: {content}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
