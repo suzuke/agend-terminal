@@ -9,8 +9,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Maximum cumulative .cap size per agent before oldest files are rotated out.
-const MAX_BYTES_PER_AGENT: u64 = 50 * 1024 * 1024;
+/// Cumulative .cap budget per agent; oldest files deleted when exceeded.
+const CAPTURE_ROTATION_BUDGET_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CaptureMeta {
@@ -99,13 +99,13 @@ fn rotate_captures(dir: &Path) {
         })
         .collect();
     let total: u64 = files.iter().map(|(_, s)| s).sum();
-    if total < MAX_BYTES_PER_AGENT {
+    if total < CAPTURE_ROTATION_BUDGET_BYTES {
         return;
     }
     files.sort_by(|(a, _), (b, _)| a.cmp(b)); // oldest-first via epoch prefix
     let mut remaining = total;
     for (path, size) in files {
-        if remaining < MAX_BYTES_PER_AGENT {
+        if remaining < CAPTURE_ROTATION_BUDGET_BYTES {
             break;
         }
         let sidecar = {
@@ -206,8 +206,8 @@ mod tests {
     fn rotate_removes_oldest_when_over_limit() {
         let dir = tmp_dir("rotate");
         std::fs::create_dir_all(&dir).unwrap();
-        // Write 3 fake .cap files totalling > MAX_BYTES_PER_AGENT
-        let big = vec![0u8; (MAX_BYTES_PER_AGENT / 2 + 1) as usize];
+        // Write 3 fake .cap files totalling > CAPTURE_ROTATION_BUDGET_BYTES
+        let big = vec![0u8; (CAPTURE_ROTATION_BUDGET_BYTES / 2 + 1) as usize];
         for epoch in [1000u64, 2000, 3000] {
             std::fs::write(dir.join(format!("{epoch}.cap")), &big).unwrap();
         }
@@ -217,12 +217,15 @@ mod tests {
             .flatten()
             .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("cap"))
             .collect();
-        // After rotation, total must be < MAX_BYTES_PER_AGENT
+        // After rotation, total must be < CAPTURE_ROTATION_BUDGET_BYTES
         let total: u64 = remaining
             .iter()
             .map(|e| e.path().metadata().map(|m| m.len()).unwrap_or(0))
             .sum();
-        assert!(total < MAX_BYTES_PER_AGENT, "total={total} must be < limit");
+        assert!(
+            total < CAPTURE_ROTATION_BUDGET_BYTES,
+            "total={total} must be < limit"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
