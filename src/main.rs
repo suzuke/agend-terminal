@@ -11,6 +11,7 @@ mod binding;
 mod bootstrap;
 mod bridge_client;
 mod bugreport;
+mod capture;
 mod channel;
 mod claim_verifier;
 mod cli;
@@ -266,14 +267,10 @@ enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
-    /// Capture backend output for debugging
+    /// Capture backend output or promote captures to fixtures
     Capture {
-        /// Backend name (claude, kiro-cli, codex, opencode, gemini)
-        #[arg(long)]
-        backend: String,
-        /// Capture duration in seconds
-        #[arg(long, default_value = "15")]
-        seconds: u64,
+        #[command(subcommand)]
+        action: CaptureAction,
     },
     /// E2E verification (use `--quick` for the lightweight subset)
     Verify {
@@ -354,6 +351,27 @@ enum AdminCommands {
         /// Actually delete branches (default is dry-run preview).
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// Issue #704: passive capture subcommands.
+#[derive(Subcommand)]
+enum CaptureAction {
+    /// Capture backend output for debugging (existing behaviour)
+    Backend {
+        /// Backend name (claude, kiro-cli, codex, opencode, gemini)
+        #[arg(long)]
+        backend: String,
+        /// Capture duration in seconds
+        #[arg(long, default_value = "15")]
+        seconds: u64,
+    },
+    /// Promote a passive capture to tests/fixtures/<backend>/<scenario>.cap
+    Promote {
+        /// Path to a .cap file (produced by AGEND_CAPTURE_FIXTURES=1)
+        capture_path: String,
+        /// Scenario name (becomes the file stem in tests/fixtures/)
+        scenario_name: String,
     },
 }
 
@@ -714,18 +732,26 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Some(Commands::Capture { backend, seconds }) => {
-            let b: backend::Backend = serde_json::from_str(&format!("\"{backend}\""))
-                .unwrap_or_else(|_| {
-                    eprintln!("Unknown backend: {backend}");
+        Some(Commands::Capture { action }) => match action {
+            CaptureAction::Backend { backend, seconds } => {
+                let b: backend::Backend = serde_json::from_str(&format!("\"{backend}\""))
+                    .unwrap_or_else(|_| {
+                        eprintln!("Unknown backend: {backend}");
+                        std::process::exit(1);
+                    });
+                if !b.is_installed() {
+                    eprintln!("{} ({}) not found in PATH", backend, b.preset().command);
                     std::process::exit(1);
-                });
-            if !b.is_installed() {
-                eprintln!("{} ({}) not found in PATH", backend, b.preset().command);
-                std::process::exit(1);
+                }
+                cli::capture_backend(&b, seconds)?;
             }
-            cli::capture_backend(&b, seconds)?;
-        }
+            CaptureAction::Promote {
+                capture_path,
+                scenario_name,
+            } => {
+                capture::promote_capture(std::path::Path::new(&capture_path), &scenario_name)?;
+            }
+        },
         Some(Commands::Verify {
             json,
             backend,
