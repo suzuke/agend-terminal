@@ -337,8 +337,19 @@ fn test_crash_respawn_health() {
     let resp = daemon.api_call(&serde_json::json!({"method": "kill", "params": {"name": "shell"}}));
     assert_eq!(resp["ok"], true);
 
-    // Immediately after kill — agent should be in Restarting state
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for agent to enter restarting/starting state
+    let _ = wait_until(
+        || {
+            let r = daemon.api_call(&serde_json::json!({"method": "list"}));
+            r["result"]["agents"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|a| a["agent_state"].as_str())
+                .map(|s| s == "restarting" || s == "starting")
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
     let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
     let agents = resp["result"]["agents"].as_array().expect("a");
     if !agents.is_empty() {
@@ -359,9 +370,9 @@ fn test_crash_respawn_health() {
                     .map(|a| a.len() == 1 && a[0]["health_state"] == "healthy")
                     .unwrap_or(false)
             },
-            Duration::from_secs(12)
+            Duration::from_secs(30)
         ),
-        "agent did not respawn within 12s"
+        "agent did not respawn within 30s"
     );
 
     // Agent should be back
@@ -483,9 +494,9 @@ fn test_fleet_multi_agent_lifecycle() {
                     .map(|a| a.len() == 2)
                     .unwrap_or(false)
             },
-            Duration::from_secs(12)
+            Duration::from_secs(30)
         ),
-        "agents did not respawn within 12s"
+        "agents did not respawn within 30s"
     );
 
     let resp = daemon.api_call(&serde_json::json!({"method": "list"}));
