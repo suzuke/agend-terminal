@@ -1133,7 +1133,10 @@ mod tests {
         // Exact sequence from tests/fixtures/state-replay/opencode-thinking.raw
         let mut vt = VTerm::new(80, 24);
         vt.process(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
-        assert!(vt.wants_mouse(), "wants_mouse must be true after opencode startup");
+        assert!(
+            vt.wants_mouse(),
+            "wants_mouse must be true after opencode startup"
+        );
         assert!(vt.mouse_sgr(), "mouse_sgr must be true after 1006h");
     }
 
