@@ -209,26 +209,6 @@ pub fn strip_ansi_pub(s: &str) -> String {
     strip_ansi(s)
 }
 
-/// Strip mouse mode enable/disable sequences from PTY output.
-/// Prevents backends (opencode, etc.) from stealing mouse events from the TUI.
-/// Strips: \x1b[?{1000,1002,1003,1006,1015}{h,l}
-///
-/// NOTE: chunk-boundary splits of mouse sequences are not handled;
-/// probability is negligible (8-byte sequence vs 4KB+ read chunks).
-fn strip_mouse_mode_sequences(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    // Fast path: no ESC byte → no mouse sequence possible
-    if !data.contains(&0x1b) {
-        return std::borrow::Cow::Borrowed(data);
-    }
-    use regex::bytes::Regex;
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"\x1b\[\?(1000|1002|1003|1006|1015)[hl]").expect("mouse mode regex")
-    });
-    re.replace_all(data, &b""[..])
-}
-
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -821,10 +801,6 @@ fn pty_read_loop(pty_reader: &mut dyn Read, ctx: &PtyReadContext) {
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
                 let screen = {
                     let mut c = core.lock();
-                    // #700: strip mouse mode enable sequences from PTY output
-                    // so backends can't steal mouse events from the TUI.
-                    let filtered = strip_mouse_mode_sequences(data);
-                    let data = &*filtered;
                     c.vterm.process(data);
                     let rows = c.vterm.rows() as usize;
                     let screen = c.vterm.tail_lines(rows);
@@ -2478,33 +2454,5 @@ Allow Trust All Tools mode?
         // The env_remove in build_command is the authoritative guard.
         let _ = cmd;
         std::env::remove_var("AGEND_GIT_BYPASS");
-    }
-
-    #[test]
-    fn strip_mouse_mode_all_modes_enable_disable() {
-        for mode in &["1000", "1002", "1003", "1006", "1015"] {
-            let enable = format!("\x1b[?{mode}h");
-            let disable = format!("\x1b[?{mode}l");
-            let input_h = format!("A{enable}B");
-            let input_l = format!("X{disable}Y");
-            let r1 = strip_mouse_mode_sequences(input_h.as_bytes());
-            assert_eq!(&*r1, b"AB", "failed for {mode}h");
-            let r2 = strip_mouse_mode_sequences(input_l.as_bytes());
-            assert_eq!(&*r2, b"XY", "failed for {mode}l");
-        }
-    }
-
-    #[test]
-    fn strip_mouse_mode_preserves_normal_ansi() {
-        let input = b"\x1b[31mRed\x1b[0m Normal \x1b[?25h";
-        let result = strip_mouse_mode_sequences(input);
-        assert_eq!(&*result, &input[..]);
-    }
-
-    #[test]
-    fn strip_mouse_mode_fast_path_no_esc() {
-        let input = b"plain text without escape";
-        let result = strip_mouse_mode_sequences(input);
-        assert_eq!(&*result, &input[..]);
     }
 }

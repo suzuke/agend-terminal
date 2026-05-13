@@ -267,6 +267,16 @@ impl VTerm {
         }
     }
 
+    /// Returns true if the terminal application has enabled mouse reporting.
+    pub fn wants_mouse(&self) -> bool {
+        self.term.mode().contains(term::TermMode::MOUSE_MODE)
+    }
+
+    /// Returns true if SGR mouse encoding is active (CSI < format).
+    pub fn mouse_sgr(&self) -> bool {
+        self.term.mode().contains(term::TermMode::SGR_MOUSE)
+    }
+
     /// Maximum scroll offset (history size).
     pub fn max_scroll(&self) -> usize {
         use alacritty_terminal::grid::Dimensions;

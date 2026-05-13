@@ -49,6 +49,46 @@ pub(super) fn handle(
     registry: &AgentRegistry,
 ) -> MouseOutcome {
     let mut out = MouseOutcome::default();
+
+    // #700: If focused pane's terminal wants mouse events AND shift is not held,
+    // forward the event as SGR mouse report to the PTY instead of local handling.
+    if !mouse
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::SHIFT)
+    {
+        if let Some(tab) = layout.active_tab() {
+            if let Some(pane) = tab.focused_pane() {
+                if pane.vterm.wants_mouse() && pane.vterm.mouse_sgr() {
+                    let pane_id = tab.focus_id;
+                    if let Some(&(px, py, pw, ph)) = tab.pane_rects.get(&pane_id) {
+                        let inner_x = px + 1;
+                        let inner_y = py + 1;
+                        let inner_w = pw.saturating_sub(2);
+                        let inner_h = ph.saturating_sub(2);
+                        // Only forward if cursor is inside pane content area
+                        if mouse.column >= inner_x
+                            && mouse.column < inner_x + inner_w
+                            && mouse.row >= inner_y
+                            && mouse.row < inner_y + inner_h
+                        {
+                            if let Some(encoded) =
+                                crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y)
+                            {
+                                super::write_to_focused(
+                                    &crate::home_dir(),
+                                    layout,
+                                    registry,
+                                    &encoded,
+                                );
+                                return out;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     match mouse.kind {
         MouseEventKind::ScrollUp => super::scroll_focused(layout, 3),
         MouseEventKind::ScrollDown => super::scroll_focused(layout, -3),

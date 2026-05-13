@@ -38,6 +38,7 @@ mod keybinds;
 mod layout;
 mod mcp;
 mod mcp_config;
+mod mouse_forward;
 mod notification_queue;
 mod paths;
 mod process;
