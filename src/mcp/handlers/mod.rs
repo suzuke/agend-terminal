@@ -5,6 +5,7 @@ mod binding_state;
 mod channel;
 pub(crate) mod ci;
 mod comms;
+mod dispatch;
 pub(crate) mod dispatch_hook;
 mod force_release;
 pub(crate) mod instance;
@@ -91,6 +92,20 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         );
     }
 
+    // #694 BLOCK 2 — dispatch table lookup. Returns `Some` for migrated
+    // tools; falls through to the inline match below for un-migrated
+    // arms. See `dispatch.rs` for the registered handler list and the
+    // signature-bundling rationale.
+    let dispatch_ctx = dispatch::HandlerCtx {
+        home: &home,
+        args,
+        instance_name,
+        sender: &sender,
+    };
+    if let Some(value) = dispatch::try_dispatch(tool, &dispatch_ctx) {
+        return value;
+    }
+
     match tool {
         // --- Channel ---
         "reply" => channel::handle_reply(&home, args, instance_name),
@@ -109,14 +124,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         }
 
         // --- Instance management ---
-        "list_instances" => instance::handle_list_instances(&home, args, instance_name),
+        // NOTE: `list_instances` and `interrupt` migrated to dispatch table (#694 BLOCK 2 T-B7).
         "create_instance" => instance::handle_create_instance(&home, args, instance_name),
         "delete_instance" => instance::handle_delete_instance(&home, args),
         "start_instance" => instance::handle_start_instance(&home, args),
         "replace_instance" => instance::handle_replace_instance(&home, args),
         "set_display_name" => instance::handle_set_display_name(&home, args, instance_name),
         "set_description" => instance::handle_set_description(&home, args, instance_name),
-        "interrupt" => instance::handle_interrupt(&home, args),
         "set_waiting_on" => instance::handle_set_waiting_on(&home, args, instance_name, &sender),
         "move_pane" => instance::handle_move_pane(&home, args),
         "pane_snapshot" => instance::handle_pane_snapshot(&home, args),
