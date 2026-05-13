@@ -263,6 +263,12 @@ impl StatePatterns {
                 // [measured] Kiro shows "Kiro is working" + "esc to cancel"
                 // during generation. Earlier "Thinking" pattern no longer
                 // matches current kiro-cli versions.
+                // F39 risk: pattern text persisting in scrollback can re-detect
+                // when screen scrolls. Mitigated by transition() same-state
+                // early-return + feed() hash-dedup for Scenarios A/B; Scenario C
+                // (priority oscillation under conflicting patterns) is the
+                // unaddressed bug surface.
+                // See docs/HUNG-STATE-TRANSITIONS.md §F39.1
                 (AgentState::Thinking, r"Kiro is working|esc to cancel"),
                 // [measured] Idle prompt
                 (
@@ -410,6 +416,13 @@ impl StatePatterns {
                 // the bare word "Thinking" previously latched the state and
                 // never released — chat history kept the token visible on
                 // screen and detect() kept returning Thinking forever.
+                // F39 risk: prior bare `r"Thinking"` already narrowed to
+                // `esc to cancel` (history note above). Same scrollback
+                // stickiness surface as Kiro pattern; same Scenario A/B/C
+                // taxonomy applies. Further narrow (e.g. require leading
+                // Braille spinner) is a speculative quick-win for a separate
+                // follow-up PR, not committed here.
+                // See docs/HUNG-STATE-TRANSITIONS.md §F39.1
                 (AgentState::Thinking, r"esc to cancel"),
                 // [measured] Input prompt text
                 (AgentState::Idle, r"Type your message"),
@@ -592,6 +605,10 @@ impl StateTracker {
     /// Max time a self-expiring active state (Thinking / ToolUse) may stay
     /// latched when the screen keeps updating but no pattern matches on it.
     /// See `maybe_expire_latched_state` for rationale.
+    ///
+    /// F39: expiry effectiveness depends on `since` actually elapsing —
+    /// Scenario C oscillation can keep `since` recent. See
+    /// `docs/HUNG-STATE-TRANSITIONS.md §F39.2`.
     const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);
 
     /// Max time `InteractivePrompt` / `PermissionPrompt` may stay latched
@@ -799,6 +816,11 @@ impl StateTracker {
     /// Starting / AwaitingOperator / Hang are driven by their own
     /// supervisors (see `daemon::supervisor`).
     fn maybe_expire_latched_state(&mut self) {
+        // F39: scrollback re-detection (Scenarios A/B) preserved by
+        // transition() same-state early-return + feed() hash-dedup; Scenario C
+        // priority oscillation between Thinking and other states resets `since`
+        // per bounce and is the unaddressed bug surface. See
+        // docs/HUNG-STATE-TRANSITIONS.md §F39.3.
         // Active states (Thinking / ToolUse) expire on the short window —
         // their trigger patterns (spinners, tool-call banners) commonly
         // stop rendering mid-operation even when the agent is still

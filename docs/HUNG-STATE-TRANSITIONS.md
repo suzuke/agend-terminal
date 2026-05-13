@@ -217,23 +217,200 @@ it anything" from "agent silent because it stopped responding to input"
   `check_hang` returns `false`)
 - **FP / FN**: same as §Exit.X1
 
-## F39 cross-reference
+## §F39 — AgentState Thinking Pattern Stickiness (cross-audit: AgentState, not HealthState)
 
-F39 evidence in `src/state.rs` shapes the false-positive vector of
-§Entry.E2 (via `AgentState::Thinking` pattern stickiness). The
-following references exist at HEAD `2f24376` and are surfaced here
-rather than mirrored as inline comments in `src/state.rs` (per Trap-A
-B-route in decision `d-20260513154400110972-2`):
+This section is a **cross-audit boundary**: §F39 documents `AgentState::Thinking`
+pattern semantics in `src/state.rs`, which feed `check_hang` as an input
+signal but are not themselves `HealthState` mutators. F39 is included in
+this Hung-state audit because the `AgentState::Thinking` pattern feeds the
+§Entry.E2 precondition path (heartbeat-fresh + PTY-silent classification),
+so stale-pattern false positives propagate into Hung detection.
 
-| Reference | Find in source | Relevance |
+Scope: pattern stickiness audit, possible mitigations as **hypotheses
+only** (no FP-rate data available — fixture-corpus validation pending
+sub-task `#685` deliverable 5). Implementation of any mitigation is
+strictly out of scope.
+
+Sibling decision: `d-20260513161542381785-0` (sub-task 2 of N).
+
+### §F39.1 — Patterns per backend
+
+`AgentState::Thinking` is matched per-backend via regex pattern catalogs in
+`src/state.rs`. Patterns are scoped to a single backend (state pattern
+lookup keyed on `Backend` enum variant during `StateTracker::new`), so
+cross-backend contamination requires the prior step (backend detection)
+to be wrong — see §F39.5 cross-backend overlap.
+
+| Backend | Pattern | Find in source | Source evidence | History |
+|---|---|---|---|---|
+| Kiro (kiro-cli) | `r"Kiro is working\|esc to cancel"` | `rg "Kiro is working" src/state.rs` | `[measured]` comment above pattern line | Sprint 34 PR-1 (`Kiro is working` shown during generation) |
+| Gemini (gemini-cli) | `r"esc to cancel"` | `rg "esc to cancel" src/state.rs` | `[measured]` comment near pattern | Originally bare `r"Thinking"` — already narrowed to `esc to cancel` to reduce stale matches. Further narrow (e.g. require leading Braille spinner `⠦`) is a candidate quick-win to-be-evaluated in a separate follow-up PR, NOT in this audit. |
+
+Cross-backend overlap: the literal `"esc to cancel"` substring appears in
+both Kiro and Gemini patterns. Because pattern catalogs are scoped
+per-backend, this is benign **as long as backend detection is correct**.
+If `Backend::from_command` mis-routes (e.g. unfamiliar binary name), the
+catalog used is `None` (Shell/Raw fallback) which has **no Thinking
+pattern**, so cross-contamination requires an active mis-route to a
+different managed backend. Out of scope for this audit — see §F39.5.
+
+### §F39.2 — LATCHED_STATE_EXPIRY semantics
+
+```rust
+const LATCHED_STATE_EXPIRY: Duration = Duration::from_secs(30);  // src/state.rs
+```
+
+The expiry interacts with active-state hysteresis via
+`maybe_expire_latched_state` (`rg "fn maybe_expire_latched_state" src/state.rs`):
+when `current` is a self-expiring active state (`Thinking | ToolUse`) and
+`since.elapsed() >= LATCHED_STATE_EXPIRY`, the tracker transitions to
+`Ready`. The fallback fires from two call-sites:
+
+1. `feed()` non-match branch (`rg "maybe_expire_latched_state" src/state.rs` —
+   first call-site, line near 759) — when screen changed but no pattern
+   matched, the fallback drops stale latched state.
+2. `tick()` periodic supervisor call (`rg "fn tick" src/state.rs` — second
+   call-site, line near 843) — runs even when no PTY output (covers the
+   "screen frozen at dismissed prompt" case from prior incident
+   `dev-reviewer 卡在互動 prompt`).
+
+Both call-sites depend on `since` having actually elapsed past
+LATCHED_STATE_EXPIRY. The Scenario C bug (§F39.3) is that `since` keeps
+getting reset by priority oscillation before the threshold can be reached.
+
+### §F39.3 — Scenario taxonomy A/B/C (centerpiece)
+
+The intuitive "scrollback pattern re-matches → `since` resets → expiry
+never fires" framing is **wrong**. Two existing guards prevent the naive
+re-match path from breaking expiry:
+
+- `feed()` hash-dedup (`rg "last_screen_hash" src/state.rs`) — if the
+  rendered screen hash is unchanged, `feed()` short-circuits before
+  reaching `detect()`. Same hash ⇒ same patterns visible ⇒ no spurious
+  re-detect.
+- `transition(same_state)` early return (`rg "if new_state == self.current" src/state.rs`) —
+  if `detect()` returns the same state we're already in, `transition()`
+  short-circuits without touching `since`.
+
+These two guards correctly handle scenarios A and B. Scenario C is the
+actual bug surface.
+
+**Scenario A — pattern in scrollback, screen static (WORKING)**
+
+The agent is `Thinking`. The active spinner stops rendering but `esc to
+cancel` text remains visible on a frozen screen. The screen hash is
+unchanged across ticks, so `feed()` short-circuits at the hash-dedup
+gate. `detect()` is not called; `since` stays at the original
+transition timestamp. After `LATCHED_STATE_EXPIRY` elapses, `tick()`
+fires `maybe_expire_latched_state` → transition to `Ready`. **No bug.**
+
+Footnote — screen resize: a terminal resize forces vterm buffer realloc,
+which changes the screen hash even without semantic change. This
+re-triggers `detect()`, but if the pattern still matches (same
+text content, different layout), the result is Scenario B — also handled
+correctly. A resize without pattern-text change is Scenario A unchanged.
+
+**Scenario B — screen changes, state pattern unchanged (WORKING)**
+
+The agent is `Thinking`. New content scrolls in but `esc to cancel`
+remains visible. Hash changes, `detect()` runs and returns `Thinking`,
+but `transition(Thinking)` early-returns because `new_state == self.current`.
+`since` is unchanged. `tick()` eventually fires expiry. **No bug.**
+
+**Scenario C — priority oscillation under conflicting patterns (BROKEN)**
+
+Sequence (numbers are illustrative; behaviour holds for any oscillating
+priority pair):
+
+```
+t=0s   agent enters Thinking (priority 6); since=0
+t=10s  spinner clears, shell prompt `❯` becomes visible
+       detect() returns Idle (priority 4)
+       transition(Idle): priority-down + held >= 2s active min_hold
+         → state=Idle; since=10s
+t=15s  screen scrolls; `esc to cancel` re-enters viewport
+       detect() returns Thinking (priority 6)
+       transition(Thinking): higher priority always wins, instant
+         → state=Thinking; since=15s   ← `since` reset by bounce
+t=25s  agent action clears spinner; `❯` again
+       transition(Idle) → state=Idle; since=25s
+t=40s  scroll triggers `esc to cancel` re-detection
+       transition(Thinking) → state=Thinking; since=40s
+...
+```
+
+Each different-state transition resets `since`. The 30s
+`LATCHED_STATE_EXPIRY` predicate `since.elapsed() >= 30s` never holds
+long enough to fire because successive bounces keep `since` recent. The
+agent appears Thinking indefinitely to upstream consumers (including
+`check_hang`'s §Entry.E2 path).
+
+**Precise mechanic**: priority oscillation resets `since` per bounce.
+(Note: the doc deliberately does not use "afterglow" language — that
+implies a decaying signal, but the actual bug is `since=now` reset, not
+decay.)
+
+### §F39.4 — Possible mitigations to-be-validated
+
+**No FP-rate data available. These are hypotheses for fixture corpus
+validation (`#685` sub-task 5). Not recommendations.**
+
+| Hypothesis | Description | Measurement required |
 |---|---|---|
-| `LATCHED_STATE_EXPIRY` constant | `rg "LATCHED_STATE_EXPIRY" src/state.rs` | Bounds how long a stale Thinking pattern can suppress an agent flipping to other states. |
-| Kiro Thinking pattern | `rg "Kiro is working" src/state.rs` | Regex anchor for kiro-cli's Thinking detection; can match stale scrollback. |
-| Gemini Thinking pattern | `rg "esc to cancel" src/state.rs` | Regex anchor for gemini-cli's Thinking detection; same caveat. |
+| (a) Cursor-anchored / viewport-only | Match patterns only against last N rows or visible viewport; exclude scrollback rows entirely | Count Scenario C bounces before/after on corpus; **feasibility check**: portable-pty / vterm cursor-position API surface on macOS / Linux / Windows ConPTY (Open question §F39.5) |
+| (b) Recent-output-bytes gate | Match against bytes received in last K `feed()` calls (slice accumulated buffer) instead of full rendered screen | Measure output rate distribution per backend; choose K such that legitimate Thinking matches stay above threshold |
+| (c) Co-required negative pattern | `Thinking` valid only if `esc to cancel` present AND prompt indicator (e.g. `❯`) absent | Count Thinking→Idle transitions with spinner visible on corpus |
+| (d) Oscillation-detection min-hold extension | Counter detects ≥2 transitions touching the same state within N seconds → extend `min_hold` to N × K seconds before allowing further transitions | Measure oscillation frequency on corpus |
+| (e) Pattern-source-line tracking | `detect()` returns match row index; scrollback rows (above viewport top) yield "stale" verdict and skip `transition()` | Measure scrollback-vs-viewport match rate per pattern |
+| (f) Per-pattern / dynamic `LATCHED_STATE_EXPIRY` | Per-pattern expiry value (shorter for `Thinking`), or dynamic shrink when current state held > 2× typical duration | Measure typical Thinking duration per backend; identify outliers |
 
-F39 sub-task (separate PR) will audit which patterns are stickier than
-they should be and propose mitigations. This audit only records the
-cross-reference.
+**Distinct levers — (d) vs (f)**: (d) extends `min_hold` (the priority
+transition gate at `rg "min_hold" src/state.rs`) to make oscillation
+harder; (f) shortens `LATCHED_STATE_EXPIRY` so the latched state
+expires sooner. Both are independently composable.
+
+**Rejected**: tick force-recheck on screen-hash change — `tick()` already
+calls `maybe_expire_latched_state` periodically (`rg "fn tick" src/state.rs`),
+and the underlying `since.elapsed() >= LATCHED_STATE_EXPIRY` check is
+identical regardless of caller. Does not address Scenario C's `since`
+reset mechanic.
+
+### §F39.5 — Open questions
+
+- **F9 / F39 interaction warning**: F9 productive-output signal
+  (separate sub-task) will inherit Scenario A/B/C surface if it uses
+  PTY pattern matching as evidence. F9 sub-task design must consider
+  scrollback-staleness from day-1; the same A/B/C taxonomy applies.
+
+- **Fixture corpus Scenario C capture acceptance criteria**: the
+  fixture corpus sub-task (`#685` deliverable 5) must include traces
+  where `AgentState` alternates between `Thinking` and a non-`Thinking`
+  state (`Idle`, `Ready`, etc.) **≥3 times within a 30-second window**,
+  with `esc to cancel` (or other Thinking-pattern substring) visible in
+  scrollback throughout. Without Scenario-C-specific capture, FP-rate
+  measurement of hypotheses (a)–(f) cannot differentiate fixes that
+  address the bug from fixes that only mask Scenarios A and B.
+
+- **Cross-backend pattern overlap**: Kiro `r"Kiro is working|esc to cancel"`
+  and Gemini `r"esc to cancel"` share the literal `"esc to cancel"`. State
+  patterns are per-backend (`StateTracker::new(Some(&backend))` → backend-
+  specific catalog), so this is benign as long as `Backend::from_command`
+  routing is correct. If a backend mis-detect routes the wrong catalog,
+  silent latching to the wrong state can occur. Out-of-scope verification —
+  worth noting for F9 / mitigation design.
+
+- **Missing unit test for Scenario C**: `rg "oscillation|bounce" src/state.rs`
+  → 0 hits in tests. Existing tests cover happy-path
+  `LATCHED_STATE_EXPIRY` (`rg "fn feed_fallback_expires_thinking" src/state.rs`),
+  but not priority oscillation. Add Scenario-C-specific unit test when
+  any mitigation sub-task lands.
+
+- **Cursor-anchored feasibility check**: hypothesis (a) depends on
+  cursor-position API surface in `portable-pty` and the `VTerm`
+  abstraction on each supported platform (macOS, Linux, Windows
+  ConPTY). Verify availability before any implementation PR — if
+  cursor position is not reliably exposed on Windows ConPTY,
+  hypothesis (a) is infeasible cross-platform.
 
 ## F9 / F10 follow-up scope cross-reference
 
