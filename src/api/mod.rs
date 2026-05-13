@@ -184,8 +184,30 @@ pub fn serve(
     };
     tracing::info!(port, "API listening");
 
+    // #680: connection counter — limits concurrent API sessions.
+    let max_conns: usize = std::env::var("AGEND_API_MAX_CONNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     for stream in listener.incoming().flatten() {
         let _ = stream.set_nodelay(true);
+        // #680: atomic reserve-then-check (no race between check and increment)
+        let prev = active_conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if prev >= max_conns {
+            active_conns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            tracing::warn!("API connection rejected — at capacity");
+            drop(stream);
+            continue;
+        }
+        if prev >= max_conns * 3 / 4 {
+            tracing::warn!(
+                active = prev + 1,
+                max = max_conns,
+                "API connection pool nearing capacity"
+            );
+        }
         // Sprint 29: TCP read/write timeouts removed per operator directive
         // (m-41 #6 + m-102). Localhost-only daemon relies on PID watcher
         // (Sprint 25 P3 PR #263) + TCP EOF for dead-peer detection.
@@ -198,7 +220,9 @@ pub fn serve(
         // Cookie is `[u8; 32]` (Copy), each session gets its own copy so the
         // spawned closure satisfies `'static`.
         let session_cookie = cookie;
-        std::thread::Builder::new()
+        let conn_counter = Arc::clone(&active_conns);
+        let spawn_counter = Arc::clone(&active_conns);
+        if std::thread::Builder::new()
             .name("api_handler".into())
             .spawn(move || {
                 let _census = crate::thread_census::register("api_handler");
@@ -211,9 +235,14 @@ pub fn serve(
                     &ext,
                     ntf.as_deref(),
                     session_cookie,
-                )
+                );
+                conn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             })
-            .ok();
+            .is_err()
+        {
+            spawn_counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            tracing::warn!("failed to spawn API handler thread");
+        }
     }
 }
 
@@ -241,6 +270,8 @@ fn handle_session(
     // P1-10 gate: first NDJSON line must be `{"auth":"<hex>"}`. Read deadline
     // on the stream (set in `serve`) ensures a silent peer closes out in 30s
     // rather than pinning this worker thread.
+    // #680: 5s pre-auth timeout — prevents slow-loris holding a semaphore slot.
+    let _ = writer.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     // Sprint 25 P1 F1: extract optional peer PID for telemetry.
     let peer_pid =
         match crate::auth_cookie::server_handshake_ndjson(&mut reader, &mut writer, &cookie) {
@@ -250,6 +281,8 @@ fn handle_session(
                 return;
             }
         };
+    // Restore no-timeout for authenticated sessions
+    let _ = writer.set_read_timeout(None);
     // Telemetry only — see MCP-DAEMON-PROXY-CONTRACT §peer-PID-telemetry.
     if let Some(pid) = peer_pid {
         tracing::debug!(peer_pid = pid, "API session peer PID");

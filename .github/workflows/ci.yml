@@ -63,6 +63,8 @@ jobs:
       # which triggered 2 extra recompilations from feature-flag switching.
       - name: Tests (unit + integration + tray)
         timeout-minutes: 30
+        env:
+          AGEND_LOCK_AUDIT: "1"
         run: cargo test --tests --features tray
 
       - name: CLI smoke (Phase C.5)
