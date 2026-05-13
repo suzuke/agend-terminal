@@ -339,13 +339,13 @@ fn parent_process_name() -> Option<String> {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
-        ProcessRefreshKind::new(),
+        ProcessRefreshKind::nothing(),
     );
     let parent_pid = sys.process(pid)?.parent()?;
     sys.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[parent_pid]),
         true,
-        ProcessRefreshKind::new(),
+        ProcessRefreshKind::nothing(),
     );
     sys.process(parent_pid)
         .map(|p| p.name().to_string_lossy().to_string())
