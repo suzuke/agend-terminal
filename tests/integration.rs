@@ -325,6 +325,10 @@ fn test_api_rejects_connection_with_wrong_cookie() {
     daemon.stop();
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "tracking #749: daemon respawn loop on cmd.exe + ConPTY"
+)]
 #[test]
 fn test_crash_respawn_health() {
     let mut daemon = TestDaemon::start("crash");
@@ -366,6 +370,10 @@ fn test_crash_respawn_health() {
     // backends go Starting→Ready, so Phase 1 budget may need recalibration if
     // pattern reused there. Single-kill test: no monotonic Recovering↔Healthy
     // flicker possible; multi-kill extension must re-evaluate Phase 2 budget.
+    //
+    // Windows note: cmd.exe + ConPTY EOF triggers a 5-20s respawn cycle.
+    // SPAWN_TIMEOUT must exceed max backoff to produce a stable diagnostic
+    // panic should this test be re-enabled on Windows. Tracked in #749.
     const SPAWN_TIMEOUT: Duration = Duration::from_secs(28);
     const HEALTH_FLIP_TIMEOUT: Duration = Duration::from_secs(2);
 
