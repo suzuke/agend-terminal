@@ -125,7 +125,7 @@ mod tests {
     /// so this exercises the composite end-to-end.
     #[test]
     fn run_is_no_op_on_empty_fixtures() {
-        use crate::agent::AgentRegistry;
+        use crate::agent::{AgentRegistry, ExternalRegistry};
         use parking_lot::Mutex;
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -135,10 +135,12 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
 
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
         let configs = Arc::new(Mutex::new(HashMap::new()));
         let ctx = TickContext {
             home: &home,
             registry: &registry,
+            externals: &externals,
             configs: &configs,
         };
 

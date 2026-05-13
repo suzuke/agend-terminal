@@ -532,6 +532,7 @@ fn run_core(
     let snapshot_handler = per_tick::SnapshotRotationHandler::new();
     let poll_reminder_handler = per_tick::PollReminderHandler::new(30);
     let inbox_maintenance_handler = per_tick::InboxMaintenanceHandler::new(60);
+    let external_liveness_handler = per_tick::ExternalLivenessHandler::new();
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -578,10 +579,12 @@ fn run_core(
 
         // Per-tick context shared by handlers extracted under #694 BLOCK 1.
         // Borrows are valid for the rest of this iteration; coexists with
-        // other immutable uses of `&registry` / `&configs` below.
+        // other immutable uses of `&registry` / `&externals` / `&configs`
+        // below.
         let tick_ctx = per_tick::TickContext {
             home,
             registry: &registry,
+            externals: &externals,
             configs: &configs,
         };
 
@@ -646,18 +649,9 @@ fn run_core(
             }
         }
 
-        // Liveness check for external agents
-        {
-            let mut ext = crate::agent::lock_external(&externals);
-            ext.retain(|name, handle| {
-                let alive = crate::process::is_pid_alive(handle.pid);
-                if !alive {
-                    tracing::info!(agent = %name, pid = handle.pid, "external agent gone, deregistering");
-                    crate::event_log::log(home, "disconnect", name, "external agent PID gone");
-                }
-                alive
-            });
-        }
+        // Liveness check for external agents.
+        // #694 BLOCK 1 — extracted into daemon::per_tick::ExternalLivenessHandler.
+        external_liveness_handler.run(&tick_ctx);
 
         // Periodic snapshot: save fleet state (only if changed).
         // #694 BLOCK 1 — extracted into daemon::per_tick::SnapshotRotationHandler.

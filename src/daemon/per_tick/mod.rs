@@ -27,16 +27,18 @@
 //! iteration would reorder execution and is deferred until enough
 //! handlers exist for the uniform iteration to be the natural shape.
 
-use crate::agent::AgentRegistry;
+use crate::agent::{AgentRegistry, ExternalRegistry};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub(crate) mod external_liveness;
 pub(crate) mod inbox_maintenance;
 pub(crate) mod poll_reminder;
 pub(crate) mod snapshot;
 
+pub(crate) use external_liveness::ExternalLivenessHandler;
 pub(crate) use inbox_maintenance::InboxMaintenanceHandler;
 pub(crate) use poll_reminder::PollReminderHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
@@ -48,6 +50,7 @@ pub(crate) use snapshot::SnapshotRotationHandler;
 pub(crate) struct TickContext<'a> {
     pub home: &'a Path,
     pub registry: &'a AgentRegistry,
+    pub externals: &'a ExternalRegistry,
     pub configs: &'a Arc<Mutex<HashMap<String, super::AgentConfig>>>,
 }
 
