@@ -29,30 +29,48 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # #772: force toolchain bootstrap AFTER rust-cache restore.
-      # Symptom: `cargo fmt` on macos-latest resolves to `rustup-init`
-      # (signature: `error: unexpected argument 'fmt' found / Usage:
-      # rustup-init[EXE] [OPTIONS]`).
-      # Root cause: `Swatinem/rust-cache@v2` caches `~/.cargo/bin/`. A
-      # prior failed bootstrap can leave a stale rustup-init binary
-      # there; cache restore on a subsequent run **overwrites** the
-      # freshly-installed rustup proxy with that stale binary. r0 of
-      # this fix placed the bootstrap step BEFORE rust-cache and got
-      # immediately undone by the cache restore (#796 r1).
-      # Mitigation: run bootstrap AFTER cache restore so any stale
-      # binaries get overwritten by the freshly-bootstrapped ones.
-      # `rustup show` triggers install; `rustc --version` +
-      # `cargo --version` hard-assert the proxy is verifiably-backed
-      # end-to-end before any cargo invocation runs. Cheap on
-      # ubuntu/windows; pays ~30-60s on cold macOS bootstrap where
-      # the bug fires. Single insertion covers all 3 matrix platforms.
-      # DO NOT remove or move before rust-cache without addressing
-      # #772 root cause (cache-overwrite of toolchain binaries).
-      - name: Force toolchain bootstrap (mitigates macOS rustup-init transient #772)
+      # #772 v2 (replaces v1 from PR #796): content-validating proxy check
+      # with auto-invalidation. v1 bootstrap step (`rustup show && rustc
+      # --version && cargo --version`) relied on EXIT CODES — but the
+      # stale `rustup-init` binary in `~/.cargo/bin/cargo` responds to
+      # `--version` with `rustup-init 1.29.0` exit-0, defeating the
+      # check. PR #799's macos saga (3 reruns over ~3hr) confirmed the
+      # detection gap.
+      #
+      # v2 validates output CONTENT (must start with the tool's own name)
+      # for ALL 4 proxies the workflow invokes (cargo + rustc + rustfmt +
+      # clippy-driver) and auto-invalidates stale cache binaries when
+      # mismatch detected. `LC_ALL=C` reduces locale-format risk.
+      # `shell: bash` required — for-loop syntax is bash-only and
+      # windows-latest defaults to PowerShell.
+      #
+      # On recovery: surgical 6-binary `rm` preserves `rustup` itself
+      # (so we can re-install). After `rustup default stable` + component
+      # add, `rustup show` forces proxy refresh. Final invariant loop
+      # hard-fails if any proxy is still broken.
+      #
+      # DO NOT remove or move before rust-cache without addressing #772
+      # root cause (cache-overwrite of toolchain binaries).
+      - name: Force toolchain bootstrap (mitigates macOS rustup-init transient #772 v2)
+        shell: bash
         run: |
-          rustup show
-          rustc --version
-          cargo --version
+          needs_recovery=0
+          for tool in cargo rustc rustfmt clippy-driver; do
+            if ! LC_ALL=C "$tool" --version 2>&1 | grep -qE "^${tool} [0-9]"; then
+              echo "::warning::Stale binary at ~/.cargo/bin/$tool ($(LC_ALL=C "$tool" --version 2>&1 | head -1)); will invalidate"
+              needs_recovery=1
+            fi
+          done
+          if [ "$needs_recovery" = "1" ]; then
+            rm -rf ~/.cargo/bin/cargo ~/.cargo/bin/rustc ~/.cargo/bin/rustfmt ~/.cargo/bin/clippy-driver ~/.cargo/bin/cargo-fmt ~/.cargo/bin/cargo-clippy
+            rustup default stable
+            rustup component add rustfmt clippy
+            rustup show
+          fi
+          for tool in cargo rustc rustfmt clippy-driver; do
+            LC_ALL=C "$tool" --version 2>&1 | grep -qE "^${tool} [0-9]" \
+              || { echo "::error::$tool proxy still broken after recovery: $(LC_ALL=C "$tool" --version 2>&1 | head -1)"; exit 1; }
+          done
 
       # tray-icon / tao on Linux link against GTK3 + the ayatana app-
       # indicator — these come from `libgtk-3-dev` (provides glib-2.0.pc,
