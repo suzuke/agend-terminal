@@ -116,6 +116,20 @@ pub fn create(home: &Path, args: &Value) -> Value {
         }
     }
 
+    // #781 Piece 4 (Bug A2 UX): operator can silently create a team
+    // without `source_repo`, then watch every `dispatch_auto_bind_lease`
+    // fall through to the Tier 4 workspace stub at run time. Surface
+    // the omission as a warning at create time so the operator can
+    // amend before the gap is observed at dispatch.
+    if source_repo.is_none() {
+        warnings.push(format!(
+            "team '{name}' created without `source_repo` — \
+             dispatch_auto_bind_lease will fall through Tier 2.5 and \
+             land on the workspace stub at Tier 4. Set via \
+             `team(action=update, name={name}, source_repo=...)` to \
+             bind agents on the canonical repo."
+        ));
+    }
     let cfg = crate::fleet::TeamConfig {
         members,
         orchestrator,
@@ -654,6 +668,85 @@ mod tests {
         );
         let none = crate::mcp::handlers::dispatch_hook::resolve_team_source_repo(&home, "other");
         assert!(none.is_none());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn team_list_response_surfaces_source_repo_field() {
+        // #781 Piece 3 (Bug A1): `team list` response must expose
+        // `source_repo` so operators can audit which teams need a
+        // remediation update (Bug A0 legacy-migration cases render
+        // `null`).
+        let home = std::env::temp_dir().join(format!("agend-p781-list-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        super::create(
+            &home,
+            &serde_json::json!({
+                "name": "with-repo",
+                "members": ["agent-w"],
+                "orchestrator": "agent-w",
+                "source_repo": "/tmp/p781-test-canonical",
+            }),
+        );
+        super::create(
+            &home,
+            &serde_json::json!({
+                "name": "without-repo",
+                "members": ["agent-n"],
+                "orchestrator": "agent-n",
+            }),
+        );
+        let list = super::list(&home);
+        let teams = list["teams"].as_array().expect("teams array");
+        let with = teams
+            .iter()
+            .find(|t| t["name"] == "with-repo")
+            .expect("with-repo present");
+        let without = teams
+            .iter()
+            .find(|t| t["name"] == "without-repo")
+            .expect("without-repo present");
+        assert_eq!(
+            with["source_repo"].as_str(),
+            Some("/tmp/p781-test-canonical"),
+            "list response must surface source_repo: {with}"
+        );
+        assert!(
+            without.get("source_repo").is_some(),
+            "list response must include source_repo field even when null: {without}"
+        );
+        assert!(
+            without["source_repo"].is_null(),
+            "missing source_repo must render as null, not absent: {without}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn create_warns_when_source_repo_absent() {
+        // #781 Piece 4 (Bug A2 UX): `team(action=create)` accepts missing
+        // `source_repo` but must surface a warning so the operator can
+        // amend before the gap is observed at dispatch.
+        let home = std::env::temp_dir().join(format!("agend-p781-warn-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let resp = super::create(
+            &home,
+            &serde_json::json!({
+                "name": "no-repo",
+                "members": ["agent-z"],
+                "orchestrator": "agent-z",
+            }),
+        );
+        assert_eq!(resp["status"], "created");
+        let warnings = resp["warnings"]
+            .as_array()
+            .expect("warnings array when source_repo omitted");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("source_repo"))),
+            "warning text must reference source_repo: {warnings:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
