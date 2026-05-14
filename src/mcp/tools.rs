@@ -242,7 +242,8 @@ fn repo_tools() -> Vec<Value> {
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["checkout", "release"]},
                 "source": {"type": "string"}, "branch": {"type": "string"},
-                "path": {"type": "string"}
+                "path": {"type": "string"},
+                "bind": {"type": "boolean", "description": "#778 Option 1: when true on checkout, atomically bind the caller to the just-provisioned worktree (writes binding.json + .agend-managed marker + arms ci_watches) and lands HEAD on the named branch instead of a detached commit. Default false preserves back-compat for inspection-only callers (review pool, operator triage)."}
             }, "required": ["action"]}}),
     ]
 }

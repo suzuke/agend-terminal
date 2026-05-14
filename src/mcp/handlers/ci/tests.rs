@@ -601,3 +601,252 @@ fn handle_watch_ci_accepts_non_protected_branch() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ----------------------------------------------------------------------
+// #778 Option 1: `repo action=checkout bind:true` — atomic provision +
+// bind. Closes the chicken-and-egg surfaced by validation canary
+// 2026-05-14 (dossier /tmp/val-workflow-2026-05-14.md). Empirical
+// anchor: comment out the `bind` block in handle_checkout_repo →
+// `checkout_bind_true_writes_binding_marker_and_arms_watch` fails
+// because binding.json never gets written.
+// ----------------------------------------------------------------------
+
+fn p778_tmp_home(suffix: &str) -> std::path::PathBuf {
+    let h = std::env::temp_dir().join(format!(
+        "agend-p778-bind-{}-{}-{}",
+        std::process::id(),
+        suffix,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&h).ok();
+    h
+}
+
+/// Fixture: a real git source repo with `origin` remote pointing at a
+/// GitHub-style URL so `derive_repo_from_remote_pub` resolves to
+/// `owner/repo` and the test exercises the auto-watch_ci arm. One
+/// initial commit on `main`, plus a feature branch named `branch`
+/// pre-created so `git worktree add <path> <branch>` succeeds.
+fn p778_setup_source_repo(parent: &Path, branch: &str) -> std::path::PathBuf {
+    let repo = parent.join("source-repo");
+    std::fs::create_dir_all(&repo).ok();
+    let bypass = ("AGEND_GIT_BYPASS", "1");
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", branch, "main"])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    repo
+}
+
+#[test]
+fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
+    // Empirical regression-proof anchor for #778 Option 1.
+    let home = p778_tmp_home("ok");
+    let parent = p778_tmp_home("ok-src-parent");
+    let source = p778_setup_source_repo(&parent, "feat/p778");
+    let agent = "p778-agent-ok";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p778",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+    assert_eq!(
+        resp["bound"].as_bool(),
+        Some(true),
+        "bind=true must surface bound flag: {resp}"
+    );
+
+    let wt_path = std::path::PathBuf::from(resp["path"].as_str().expect("path"));
+    assert!(wt_path.exists(), "worktree dir must exist: {resp}");
+    assert!(
+        wt_path.join(crate::worktree_pool::MANAGED_MARKER).exists(),
+        ".agend-managed marker must be written"
+    );
+
+    let binding = crate::paths::runtime_dir(&home)
+        .join(agent)
+        .join("binding.json");
+    assert!(binding.exists(), "binding.json must be written");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding).unwrap()).unwrap();
+    assert_eq!(v["branch"].as_str(), Some("feat/p778"));
+    assert_eq!(
+        v["task_id"].as_str(),
+        Some("self"),
+        "atomic bind must record task_id=self"
+    );
+
+    // Auto-watch_ci must have been armed via derive_repo_from_remote_pub.
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p778"),
+    );
+    assert!(
+        watch_path.exists(),
+        "watch_ci must be armed for derived repo on bind:true"
+    );
+
+    // HEAD must be on the named branch (NOT detached). Verifies the
+    // `--detach` omission for bind:true so subsequent commits land
+    // on the right ref.
+    let head_ref = std::fs::read_to_string(wt_path.join(".git"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
+                .map(std::path::PathBuf::from)
+        })
+        .and_then(|d| std::fs::read_to_string(d.join("HEAD")).ok())
+        .unwrap_or_default();
+    assert!(
+        head_ref.starts_with("ref: refs/heads/feat/p778"),
+        "HEAD must point at refs/heads/feat/p778 (no --detach), got: {head_ref:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+fn checkout_bind_false_default_preserves_detached_no_binding() {
+    // Back-compat: existing callers (review pool, operator triage) pass
+    // no `bind` arg → behavior identical to pre-#778 — detached HEAD,
+    // no binding.json, no marker, no auto-watch.
+    let home = p778_tmp_home("bc");
+    let parent = p778_tmp_home("bc-src-parent");
+    let source = p778_setup_source_repo(&parent, "feat/p778-bc");
+    let agent = "p778-agent-bc";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p778-bc",
+        }),
+        agent,
+    );
+
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+    assert!(
+        resp.get("bound").is_none(),
+        "default checkout must NOT surface bound: {resp}"
+    );
+
+    let wt_path = std::path::PathBuf::from(resp["path"].as_str().expect("path"));
+    assert!(
+        !wt_path.join(crate::worktree_pool::MANAGED_MARKER).exists(),
+        ".agend-managed marker must NOT be written without bind:true"
+    );
+
+    let binding = crate::paths::runtime_dir(&home)
+        .join(agent)
+        .join("binding.json");
+    assert!(
+        !binding.exists(),
+        "binding.json must NOT be written without bind:true"
+    );
+
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p778-bc"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "watch_ci must NOT be armed without bind:true"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+fn checkout_bind_true_rejects_protected_branch_e45() {
+    // E4.5 invariant: bind:true must reject `main`/`master` since it
+    // grants write authority. Mirrors bind_self's protected-ref gate.
+    let home = p778_tmp_home("e45");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": "/tmp",  // never reached — E4.5 fires first
+            "branch": "main",
+            "bind": true,
+        }),
+        "p778-agent-e45",
+    );
+
+    assert!(resp.get("error").is_some(), "main must be rejected: {resp}");
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("e4_5_protected_branch"),
+        "code must mark E4.5 class: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn checkout_bind_true_rejects_anonymous_caller() {
+    // bind:true is a write-side operation that must be attributed to a
+    // named agent. Anonymous (empty instance_name) callers cannot
+    // claim a worktree — surface as `needs_identity` so the caller
+    // knows to set AGEND_INSTANCE_NAME.
+    let home = p778_tmp_home("anon");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": "/tmp",
+            "branch": "feat/p778",
+            "bind": true,
+        }),
+        "",
+    );
+
+    assert!(resp.get("error").is_some(), "anon must be rejected: {resp}");
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("needs_identity"),
+        "code must demand identity: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}

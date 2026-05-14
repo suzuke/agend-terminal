@@ -42,7 +42,12 @@ fn main() {
     // fence. See `invocation_is_gh_post_merge` for the rationale.
     let parent_is_gh = invocation_is_gh_post_merge();
 
-    match classify(subcommand, &args, &binding, parent_is_gh) {
+    // #778 Option 3: resolve cwd-is-canonical-worktree once, pass into
+    // classify as a pure bool so the leniency rule is unit-testable
+    // without a real filesystem fixture.
+    let canonical_cwd = cwd_is_canonical_worktree();
+
+    match classify(subcommand, &args, &binding, parent_is_gh, canonical_cwd) {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) => exec_real_git(&args, Some(&worktree)),
         Action::SilentExempt {
@@ -172,7 +177,59 @@ fn is_protected_ref(branch: &str) -> bool {
     matches!(branch, "main" | "master")
 }
 
-fn classify(subcmd: &str, args: &[String], binding: &Binding, parent_is_gh: bool) -> Action {
+/// #778 Option 3: detect that cwd is inside a worktree whose `.git`
+/// pointer resolves to a source repo carrying `[remote "origin"]`.
+/// The `origin` remote is what distinguishes a canonical worktree
+/// (daemon-provisioned off a real upstream repo) from an orphan
+/// workspace-placeholder repo (daemon startup creates these before
+/// fleet config resolves; they have no remote and no project files).
+/// Returns `true` only for canonical worktrees — the criterion the
+/// shim uses to grant unbound checkout/switch leniency.
+fn cwd_is_canonical_worktree() -> bool {
+    let cwd = match env::current_dir() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let dot_git = cwd.join(".git");
+    let meta = match std::fs::metadata(&dot_git) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let content = match std::fs::read_to_string(&dot_git) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let gitdir_str = match content
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
+    {
+        Some(s) => s,
+        None => return false,
+    };
+    let gitdir = PathBuf::from(gitdir_str);
+    // gitdir layout: <source>/.git/worktrees/<entry>. Grandparent is
+    // <source>/.git which carries the source repo's config.
+    let source_git_dir = match gitdir.parent().and_then(|p| p.parent()) {
+        Some(p) => p.to_path_buf(),
+        None => return false,
+    };
+    let config = match std::fs::read_to_string(source_git_dir.join("config")) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    config.contains("[remote \"origin\"]")
+}
+
+fn classify(
+    subcmd: &str,
+    args: &[String],
+    binding: &Binding,
+    parent_is_gh: bool,
+    canonical_cwd: bool,
+) -> Action {
     let bound = is_bound(binding);
 
     match subcmd {
@@ -202,11 +259,30 @@ fn classify(subcmd: &str, args: &[String], binding: &Binding, parent_is_gh: bool
         }
         // Checkout/switch: deny unbound, deny cross-branch.
         "checkout" | "switch" => {
+            let target_branch = args.get(1).map(|s| s.as_str()).unwrap_or("");
             if !bound {
+                // #778 Option 3: shim leniency for canonical-rooted
+                // unbound worktrees. When cwd is inside a worktree whose
+                // `.git` pointer resolves to a source repo carrying a
+                // `[remote "origin"]` config entry (i.e. a canonical
+                // repo, not the orphan workspace-placeholder daemon
+                // startup leaves), allow `git checkout`/`git switch
+                // <branch>` as a Passthrough. Closes the chicken-and-egg
+                // surfaced by validation canary 2026-05-14:
+                // `repo action=checkout` provisions the worktree in
+                // detached-HEAD but doesn't bind, so the natural
+                // follow-up `git switch <branch>` would otherwise need
+                // a BYPASS. Narrow by design — `target_branch` must be
+                // a positional argument (not a flag) and the worktree
+                // must be daemon-provisioned canonical-rooted, so the
+                // surface is limited to navigation within an already-
+                // materialized worktree.
+                if !target_branch.is_empty() && !target_branch.starts_with('-') && canonical_cwd {
+                    return Action::Passthrough;
+                }
                 return Action::Deny("unbound — no active task assignment".into());
             }
             // Check for cross-branch attempt.
-            let target_branch = args.get(1).map(|s| s.as_str()).unwrap_or("");
             if let Some(ref assigned) = binding.branch {
                 if !target_branch.is_empty()
                     && target_branch != assigned
@@ -517,6 +593,7 @@ mod tests {
             &["checkout".into(), "main".into()],
             &binding,
             true, // parent_is_gh = true
+            false,
         );
         match action {
             Action::SilentExempt {
@@ -544,6 +621,7 @@ mod tests {
             &["checkout".into(), "master".into()],
             &binding,
             true,
+            false,
         );
         assert!(
             matches!(action, Action::SilentExempt { .. }),
@@ -563,6 +641,7 @@ mod tests {
             &["checkout".into(), "main".into()],
             &binding,
             false, // parent_is_gh = false (interactive shell)
+            false,
         );
         match action {
             Action::Deny(reason) => {
@@ -586,11 +665,22 @@ mod tests {
         // exemption + the normal block both work via either spelling.
         let binding = bound_binding("sprint57-track-q", "/tmp/.worktrees/dev");
         // gh path → exempt
-        let action_gh = classify("switch", &["switch".into(), "main".into()], &binding, true);
+        let action_gh = classify(
+            "switch",
+            &["switch".into(), "main".into()],
+            &binding,
+            true,
+            false,
+        );
         assert!(matches!(action_gh, Action::SilentExempt { .. }));
         // interactive path → deny
-        let action_interactive =
-            classify("switch", &["switch".into(), "main".into()], &binding, false);
+        let action_interactive = classify(
+            "switch",
+            &["switch".into(), "main".into()],
+            &binding,
+            false,
+            false,
+        );
         match action_interactive {
             Action::Deny(_) => {}
             other => panic!("interactive `switch main` must deny, got {other:?}"),
@@ -611,6 +701,7 @@ mod tests {
             &["checkout".into(), "feat-other".into()],
             &binding,
             true, // parent_is_gh — but target isn't protected.
+            false,
         );
         match action {
             Action::Deny(reason) => {
@@ -743,5 +834,128 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ----- #778 Option 3 — canonical-worktree leniency for unbound -----
+
+    #[test]
+    fn p778_unbound_canonical_worktree_checkout_branch_passes_through() {
+        // Empirical regression-proof anchor for #778 Option 3:
+        // commenting out the `if !target_branch.is_empty() && ...
+        // canonical_cwd { Action::Passthrough }` block makes this
+        // FAIL with Action::Deny.
+        let action = classify(
+            "checkout",
+            &["checkout".into(), "feat/p778".into()],
+            &Binding::default(), // unbound
+            false,               // parent_is_gh = no
+            true,                // canonical_cwd = yes
+        );
+        assert!(
+            matches!(action, Action::Passthrough),
+            "unbound + canonical worktree + positional branch must Passthrough, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn p778_unbound_canonical_switch_subcommand_also_passes() {
+        // `git switch` is the modern equivalent and must benefit from
+        // the same leniency — otherwise the rule is partial and the
+        // validation-canary workflow stays broken on the recommended
+        // `switch` path.
+        let action = classify(
+            "switch",
+            &["switch".into(), "feat/p778".into()],
+            &Binding::default(),
+            false,
+            true,
+        );
+        assert!(
+            matches!(action, Action::Passthrough),
+            "switch must also benefit from the leniency, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn p778_unbound_non_canonical_worktree_still_denied() {
+        // Negative: when cwd is not a canonical worktree (placeholder
+        // repo with no origin, or no worktree at all), the original
+        // unbound deny must still fire — this is the security
+        // guarantee that keeps the leniency narrow.
+        let action = classify(
+            "checkout",
+            &["checkout".into(), "feat/p778".into()],
+            &Binding::default(),
+            false,
+            false, // canonical_cwd = no
+        );
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("unbound"),
+                "non-canonical cwd must keep the unbound deny: {reason}"
+            ),
+            other => panic!("non-canonical unbound must deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p778_unbound_canonical_flag_arg_still_denied() {
+        // Heuristic safety: when the next arg is a flag (`-b
+        // newbranch`, `-B foo`, `--orphan`) the leniency must NOT
+        // fire — those create branches or detach in ways that aren't
+        // "just navigation". Keep the deny for the unbound case so
+        // we don't accidentally widen the surface.
+        let action = classify(
+            "checkout",
+            &["checkout".into(), "-b".into(), "evil".into()],
+            &Binding::default(),
+            false,
+            true, // canonical_cwd = yes, but arg is a flag
+        );
+        match action {
+            Action::Deny(reason) => assert!(
+                reason.contains("unbound"),
+                "flag arg in unbound canonical must deny: {reason}"
+            ),
+            other => panic!("flag arg leniency leak: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p778_unbound_canonical_no_branch_arg_still_denied() {
+        // `git checkout` with no positional branch (just to inspect
+        // status) shouldn't even hit the leniency block — keep the
+        // existing unbound deny for the no-target case.
+        let action = classify(
+            "checkout",
+            &["checkout".into()],
+            &Binding::default(),
+            false,
+            true,
+        );
+        match action {
+            Action::Deny(reason) => assert!(reason.contains("unbound"), "got {reason}"),
+            other => panic!("no-arg unbound must deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p778_bound_path_unchanged_when_canonical_cwd_true() {
+        // Regression-proof of the bound path: canonical_cwd must NOT
+        // alter behavior when the agent is bound. The existing
+        // cross-branch check + ChdirPass dispatch are the source of
+        // truth; the leniency only opens when bound=false.
+        let binding = bound_binding("feat/p778", "/tmp/.worktrees/dev");
+        let action = classify(
+            "checkout",
+            &["checkout".into(), "feat/p778".into()],
+            &binding,
+            false,
+            true, // canonical_cwd — should NOT route through leniency
+        );
+        match action {
+            Action::ChdirPass(ref wt) => assert_eq!(wt, "/tmp/.worktrees/dev"),
+            other => panic!("bound same-branch must ChdirPass, got {other:?}"),
+        }
     }
 }
