@@ -778,3 +778,167 @@ fn release_worktree_then_rebind_different_branch_succeeds_post_wave_4() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ----------------------------------------------------------------------
+// #781 dispatch_auto_bind_lease structural tests. Pins Piece 2 (Bug B,
+// worktree::create exit-code-128 gate too strict) + Piece 6 (source_repo
+// tier observability) + Piece 7 (structured DispatchOutcome).
+//
+// Source of truth: decision d-20260514124732379010-0 (amended) +
+// d-20260514130311646510-1 (Piece 1 micro-amend).
+//
+// Empirical anchor (§3.10 red→green): comment out the Bug B fix in
+// worktree.rs:228-230 OR revert the SourceRepoTier wiring in C4 →
+// `dispatch_auto_bind_lease_with_pre_existing_branch_in_team_source_repo_succeeds_via_fallback`
+// fails (at C3 HEAD both regressions still active: lease fails with exit
+// 255 unmatched + source_repo_tier placeholder mismatches TeamSourceRepo).
+//
+// Cross-platform: all happy-path tests `#[cfg(unix)]` per §3.7 — Windows
+// runner git-subprocess concurrency observed unstable, see #780/#778
+// fixture history. Backlog D tracks Windows CI smoke test.
+// ----------------------------------------------------------------------
+
+/// Fixture: canonical repo + fleet.yaml team source_repo + simulated
+/// `refs/remotes/origin/main`. Branch parameter pre-created on canonical
+/// so `worktree::create`'s `-b` path hits the duplicate-branch fallback
+/// (this is the Bug B trigger).
+#[cfg(unix)]
+fn p781_canonical_with_team_source_repo(
+    parent: &std::path::Path,
+    branch: &str,
+    pre_create_branch: bool,
+    team: &str,
+    members: &[&str],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let home = parent.join(format!(
+        "home-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    let canonical = parent.join(format!(
+        "canonical-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&canonical).ok();
+    let bypass = ("AGEND_GIT_BYPASS", "1");
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&canonical)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(&canonical)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    // Simulate fetched origin/main so #780 auto-create on bind:true
+    // (if invoked) doesn't need network I/O.
+    let main_sha = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(&canonical)
+            .env(bypass.0, bypass.1)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+        .current_dir(&canonical)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    if pre_create_branch {
+        std::process::Command::new("git")
+            .args(["branch", branch, "main"])
+            .current_dir(&canonical)
+            .env(bypass.0, bypass.1)
+            .output()
+            .unwrap();
+    }
+    let members_yaml = members
+        .iter()
+        .map(|m| format!("      - {m}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let yaml = format!(
+        "instances: {{}}\nteams:\n  {team}:\n    members:\n{members_yaml}\n    source_repo: {}\n",
+        canonical.display()
+    );
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    (home, canonical)
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_with_pre_existing_branch_in_team_source_repo_succeeds_via_fallback() {
+    // ANCHOR (§3.10 red→green). Pre-C4 HEAD this FAILs on:
+    //   (a) `worktree::create` -b path returns exit 255 with stderr
+    //       "already exists"; current exit-code-128 gate misses
+    //       fallback → lease returns Err → dispatch surfaces
+    //       Err(DispatchError { stage: WorktreeLeaseConflict }).
+    //   (b) Even if lease succeeded, C2's placeholder
+    //       `SourceRepoTier::Stub` mismatches the asserted
+    //       `TeamSourceRepo` until C4 wires `resolve_source_repo`.
+    // C4 fixes both: Bug B (stderr-substring fallback) + Piece 6
+    // (tier wiring) → test PASSes.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-anchor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/p781-anchor",
+        true, // pre-create branch on canonical → triggers Bug B fallback path
+        "val",
+        &["val-dev"],
+    );
+
+    let result = super::dispatch_auto_bind_lease(&home, "val-dev", "T-1", "feat/p781-anchor", None);
+
+    let outcome = result.expect("dispatch must succeed via stderr-substring fallback");
+    assert_eq!(
+        outcome.source_repo_tier,
+        super::SourceRepoTier::TeamSourceRepo,
+        "source_repo_tier must observe Tier 2.5 (team source_repo): {outcome:?}"
+    );
+
+    // Binding written with canonical source_repo (Tier 2.5 resolution
+    // actually wins downstream — no Tier 4 stub).
+    let binding = home.join("runtime").join("val-dev").join("binding.json");
+    assert!(binding.exists(), "binding.json must be written");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding).unwrap()).unwrap();
+    let observed = std::path::PathBuf::from(v["source_repo"].as_str().unwrap());
+    assert_eq!(
+        observed.canonicalize().unwrap_or(observed.clone()),
+        canonical.canonicalize().unwrap_or(canonical.clone()),
+        "binding.source_repo must be canonical (Tier 2.5), not workspace stub"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
