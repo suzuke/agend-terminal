@@ -153,6 +153,11 @@ pub(super) fn check_ci_watches_with_provider(
         let last_run_id = watch["last_run_id"].as_u64();
         let head_sha = watch["head_sha"].as_str().map(String::from);
         let last_notified_sha = watch["last_notified_head_sha"].as_str().map(String::from);
+        // #786: load conclusion of the prior notification to feed the
+        // rerun-aware dedup. Absent on pre-#786 watches → None → first
+        // poll post-upgrade fires once on any terminal run (bounded
+        // migration spam, documented in PR body).
+        let last_notified_conclusion = watch["last_notified_conclusion"].as_str().map(String::from);
 
         // Audit label for remove_watch: comma-joined subscribers so the
         // event log stays human-readable when multiple agents share a watch.
@@ -265,6 +270,7 @@ pub(super) fn check_ci_watches_with_provider(
                 last_run_id,
                 head_sha.as_deref(),
                 last_notified_sha.as_deref(),
+                last_notified_conclusion.as_deref(),
                 &registry,
                 provider.as_ref(),
             )
@@ -323,20 +329,42 @@ fn classify_runs_response(status: u16, body: &serde_json::Value) -> RunsResponse
 }
 
 /// Select runs from a CI poll result that should trigger notifications.
-/// Returns indices into `runs` of terminal runs with `id > last_run_id`, ordered
-/// oldest-first so notifications arrive chronologically.
-/// In-progress runs (conclusion=None) are skipped.
-pub(crate) fn select_runs_to_notify(runs: &[CiRun], last_run_id: Option<u64>) -> Vec<usize> {
+/// Returns indices into `runs` of terminal runs ordered oldest-first
+/// so notifications arrive chronologically. In-progress runs
+/// (conclusion=None) are skipped.
+///
+/// #786 — rerun on same run_id (`gh run rerun --failed` re-executes
+/// the same workflow attempt; run_id unchanged, conclusion transitions
+/// failure→success). Pre-#786 logic dropped these because the filter
+/// was strictly `run.id > last_run_id`. With this fix a run is also
+/// included when `run.id == last_run_id` AND its conclusion differs
+/// from `last_notified_conclusion` — bounded by conclusion change so a
+/// stable terminal state doesn't re-spam subscribers.
+pub(crate) fn select_runs_to_notify(
+    runs: &[CiRun],
+    last_run_id: Option<u64>,
+    last_notified_conclusion: Option<&str>,
+) -> Vec<usize> {
     let threshold = last_run_id.unwrap_or(0);
     let mut selected: Vec<(usize, u64)> = runs
         .iter()
         .enumerate()
         .filter_map(|(i, run)| {
-            if run.id <= threshold {
+            // Skip non-terminal (in-progress) runs first — conclusion
+            // is the precondition for either inclusion path below.
+            run.conclusion.as_ref()?;
+            if run.id < threshold {
+                // Strictly older than last seen — ignore.
                 return None;
             }
-            // Skip non-terminal (in-progress) runs
-            run.conclusion.as_ref()?;
+            if run.id == threshold {
+                // Same run_id as last notified. #786: include only when
+                // conclusion changed (rerun changed outcome). Equal
+                // conclusion → suppress (stable terminal state).
+                if run.conclusion.as_deref() == last_notified_conclusion {
+                    return None;
+                }
+            }
             Some((i, run.id))
         })
         .collect();
@@ -347,12 +375,24 @@ pub(crate) fn select_runs_to_notify(runs: &[CiRun], last_run_id: Option<u64>) ->
 
 /// Pure function: deduplicate terminal runs by head_sha.
 /// Returns `(run_index, run_id, head_sha)` tuples, one per unique sha,
-/// keeping the latest run_id per sha. Skips shas matching `last_notified`.
-/// Sorted by run_id (oldest first) for chronological notification order.
+/// keeping the latest run_id per sha. Sorted by run_id (oldest first)
+/// for chronological notification order.
+///
+/// #786 — precedence with `select_runs_to_notify`: that filter runs
+/// FIRST and already enforces the `(run_id, conclusion)` change
+/// invariant. This filter is the SECOND gate, keyed on `head_sha`. A
+/// run with `head_sha == last_notified_sha` was previously dropped
+/// unconditionally — that path swallowed rerun outcomes when a new
+/// `run_id` re-executed the SAME commit (different attempt path, same
+/// sha). The `last_notified_conclusion` arg makes this site
+/// conclusion-aware in parallel with site 1: same sha is allowed
+/// through only when at least one of the candidate runs has a
+/// conclusion that differs from the last notified conclusion.
 pub(crate) fn dedupe_notifications_by_head_sha<'a>(
     runs: &'a [CiRun],
     to_notify: &[usize],
-    last_notified: Option<&str>,
+    last_notified_sha: Option<&str>,
+    last_notified_conclusion: Option<&str>,
 ) -> Vec<(usize, u64, &'a str)> {
     let mut best: std::collections::HashMap<&str, (usize, u64)> = std::collections::HashMap::new();
     for &idx in to_notify {
@@ -369,7 +409,14 @@ pub(crate) fn dedupe_notifications_by_head_sha<'a>(
     }
     let mut result: Vec<_> = best
         .into_iter()
-        .filter(|(sha, _)| last_notified != Some(*sha))
+        .filter(|(sha, (idx, _))| {
+            if last_notified_sha != Some(*sha) {
+                return true; // different sha → always pass
+            }
+            // Same sha as last notified — #786: allow through only
+            // when conclusion changed (rerun / re-scheduled run).
+            runs[*idx].conclusion.as_deref() != last_notified_conclusion
+        })
         .map(|(sha, (idx, id))| (idx, id, sha))
         .collect();
     result.sort_by_key(|&(_, id, _)| id);
@@ -469,6 +516,7 @@ async fn ci_check_repo(
     last_run_id: Option<u64>,
     prev_head_sha: Option<&str>,
     last_notified_sha: Option<&str>,
+    last_notified_conclusion: Option<&str>,
     registry: &AgentRegistry,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<()> {
@@ -647,9 +695,17 @@ async fn ci_check_repo(
         last_run_id
     };
 
-    let to_notify = select_runs_to_notify(&runs, effective_last_run_id);
+    // #786: same `last_notified_conclusion` arg is consulted at both
+    // Sites 1 + 2 below. Site 1 drops runs at the run_id-equality
+    // boundary; Site 2 drops them at the head_sha-equality boundary.
+    // Both must be conclusion-aware so a rerun on the same run_id OR a
+    // re-scheduled run on the same commit fires the notification.
+    let to_notify = select_runs_to_notify(&runs, effective_last_run_id, last_notified_conclusion);
     if to_notify.is_empty() {
         // No new terminal runs — update head_sha but keep last_run_id.
+        // #786: avoid state churn (reviewer constraint 1) — no
+        // `last_notified_conclusion` write here because no notification
+        // fired.
         if let Some(id) = effective_last_run_id {
             update_watch_state(watch_path, Some(id), current_sha);
         }
@@ -658,8 +714,19 @@ async fn ci_check_repo(
 
     let mut max_notified_id = effective_last_run_id.unwrap_or(0);
 
-    let deduped = dedupe_notifications_by_head_sha(&runs, &to_notify, last_notified_sha);
+    let deduped = dedupe_notifications_by_head_sha(
+        &runs,
+        &to_notify,
+        last_notified_sha,
+        last_notified_conclusion,
+    );
     let mut new_notified_sha = last_notified_sha.map(String::from);
+    // #786: track the conclusion of the most-recent notification so the
+    // next poll cycle can detect rerun-on-same-id outcome transitions.
+    // Initialized to the prior persisted value; overwritten as
+    // notifications fire below. Persisted at the end alongside
+    // `new_notified_sha` in a single atomic write.
+    let mut new_notified_conclusion = last_notified_conclusion.map(String::from);
 
     for (idx, run_id, sha) in &deduped {
         let run = &runs[*idx];
@@ -725,6 +792,10 @@ async fn ci_check_repo(
                 );
             }
             new_notified_sha = Some(sha.to_string());
+            // #786: stale-drop also updates conclusion tracker so a
+            // future same-id rerun on a then-current sha doesn't get
+            // confused by stale "last conclusion" state.
+            new_notified_conclusion = conclusion.map(String::from);
             continue;
         }
 
@@ -800,6 +871,10 @@ async fn ci_check_repo(
             }
         }
         new_notified_sha = Some(sha.to_string());
+        // #786: persist the conclusion that fired the notification so
+        // the next poll can detect a rerun outcome transition (same
+        // run_id OR same head_sha with different conclusion).
+        new_notified_conclusion = conclusion.map(String::from);
     }
 
     // Issue #650: auto-route [ci-ready-for-action] to next_after_ci target on pass
@@ -828,6 +903,7 @@ async fn ci_check_repo(
         Some(max_notified_id),
         current_sha,
         new_notified_sha.as_deref(),
+        new_notified_conclusion.as_deref(),
     );
     Ok(())
 }
@@ -1224,7 +1300,7 @@ mod tests {
                 url: String::new(),
             },
         ];
-        let selected = select_runs_to_notify(&runs, Some(99));
+        let selected = select_runs_to_notify(&runs, Some(99), None);
         assert_eq!(
             selected,
             vec![0, 1],
@@ -1240,7 +1316,7 @@ mod tests {
             head_sha: "aaa".into(),
             url: String::new(),
         }];
-        let selected = select_runs_to_notify(&runs, None);
+        let selected = select_runs_to_notify(&runs, None, None);
         assert!(selected.is_empty(), "in-progress run must not be selected");
     }
 
@@ -1266,7 +1342,7 @@ mod tests {
                 url: String::new(),
             },
         ];
-        let selected = select_runs_to_notify(&runs, Some(299));
+        let selected = select_runs_to_notify(&runs, Some(299), None);
         assert_eq!(
             selected,
             vec![0, 1, 2],
@@ -1290,11 +1366,17 @@ mod tests {
                 url: String::new(),
             },
         ];
-        let selected = select_runs_to_notify(&runs, Some(400));
+        // #786: "already notified" semantic now requires BOTH the
+        // run_id boundary AND a matching prior conclusion — without
+        // the conclusion arg, a same-id rerun with a different outcome
+        // would legitimately fire (which is the bug fix). Passing
+        // Some("success") here preserves the original pre-#786 intent
+        // of this test (suppress stable terminal state).
+        let selected = select_runs_to_notify(&runs, Some(400), Some("success"));
         assert_eq!(
             selected,
             vec![1],
-            "run 400 already notified, only 401 selected"
+            "run 400 already notified with same conclusion, only 401 selected"
         );
     }
 
@@ -1314,8 +1396,8 @@ mod tests {
                 url: String::new(),
             },
         ];
-        let selected = select_runs_to_notify(&runs, Some(499));
-        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None);
+        let selected = select_runs_to_notify(&runs, Some(499), None);
+        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None, None);
         assert_eq!(deduped.len(), 1, "same sha → 1 notification");
         assert_eq!(deduped[0].1, 501, "latest run_id wins");
         assert_eq!(deduped[0].2, "abc");
@@ -1337,9 +1419,18 @@ mod tests {
                 url: String::new(),
             },
         ];
-        let selected = select_runs_to_notify(&runs, Some(599));
-        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, Some("aaa"));
-        assert_eq!(deduped.len(), 1, "aaa already notified → only bbb");
+        // #786: "already notified" for dedup means BOTH the sha AND
+        // the conclusion match. Passing Some("success") here preserves
+        // the pre-#786 intent — a future PR could add a same-sha
+        // different-conclusion test (handled by anchor test 5).
+        let selected = select_runs_to_notify(&runs, Some(599), None);
+        let deduped =
+            dedupe_notifications_by_head_sha(&runs, &selected, Some("aaa"), Some("success"));
+        assert_eq!(
+            deduped.len(),
+            1,
+            "aaa already notified with same conclusion → only bbb"
+        );
         assert_eq!(deduped[0].2, "bbb");
     }
 
@@ -1359,8 +1450,8 @@ mod tests {
                 url: String::new(),
             },
         ];
-        let selected = select_runs_to_notify(&runs, Some(599));
-        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None);
+        let selected = select_runs_to_notify(&runs, Some(599), None);
+        let deduped = dedupe_notifications_by_head_sha(&runs, &selected, None, None);
         assert_eq!(deduped.len(), 2, "different shas → 2 notifications");
     }
 
@@ -1721,6 +1812,7 @@ mod tests {
             watch_json["last_run_id"].as_u64(),
             watch_json["head_sha"].as_str(),
             watch_json["last_notified_head_sha"].as_str(),
+            watch_json["last_notified_conclusion"].as_str(),
             &registry,
             provider,
         ))
@@ -1946,6 +2038,7 @@ mod tests {
             "o/r",
             "feat",
             &["agent1".to_string()],
+            None,
             None,
             None,
             None,
@@ -2739,6 +2832,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -2783,6 +2877,7 @@ mod tests {
             "o/r",
             "feat-old",
             &["agent1".to_string()],
+            None,
             None,
             None,
             None,
@@ -2831,6 +2926,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &registry,
             &provider,
         ))
@@ -2866,6 +2962,7 @@ mod tests {
             "o/r",
             "feat",
             &["agent1".to_string()],
+            None,
             None,
             None,
             None,
@@ -2913,6 +3010,7 @@ mod tests {
             "o/r",
             "feat-merged",
             &["agent1".to_string()],
+            None,
             None,
             None,
             None,
@@ -3003,6 +3101,7 @@ mod tests {
             "o/r",
             "feat",
             &["lead".to_string(), "dev".to_string()],
+            None,
             None,
             None,
             None,
@@ -3662,5 +3761,247 @@ mod tests {
             "valid watch must survive startup_sweep (restart persistence)"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ----------------------------------------------------------------------
+    // #786 conclusion-change dedup anchor tests.
+    //
+    // Both tests fail at C1 HEAD (pre-impl) because:
+    //   Site 1 (`select_runs_to_notify`) drops runs where `run.id <=
+    //     last_run_id` regardless of conclusion change.
+    //   Site 2 (`dedupe_notifications_by_head_sha`) drops runs whose
+    //     head_sha matches `last_notified_head_sha` regardless of
+    //     conclusion change.
+    //
+    // The fixture sets up a watch already in the "notified" state
+    // (last_run_id + last_notified_head_sha both populated) and feeds a
+    // poll that should re-fire because the conclusion changed (the
+    // gh-rerun-on-same-attempt scenario). Pre-impl drops the run on
+    // either Site 1 or Site 2; post-impl includes it because both sites
+    // become conclusion-aware.
+    //
+    // Source of truth: decision d-20260514163605327829-3.
+    // Cross-platform: no `#[cfg(unix)]` gate (pure async logic, no
+    // git subprocess) per reviewer C6 / #785 precedent.
+    // ----------------------------------------------------------------------
+
+    fn p786_watch_already_notified(
+        last_run_id: u64,
+        conclusion: &str,
+        head_sha: &str,
+    ) -> serde_json::Value {
+        // Watch state where a prior poll cycle already notified for
+        // `(last_run_id, head_sha)` with `conclusion`. Subsequent polls
+        // must respect `last_notified_conclusion` (post-#786 field).
+        serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "interval_secs": 60,
+            "instance": "agent1",
+            "last_run_id": last_run_id,
+            "head_sha": head_sha,
+            "last_polled_at": null,
+            "last_notified_head_sha": head_sha,
+            "last_notified_conclusion": conclusion,
+        })
+    }
+
+    #[test]
+    fn rerun_changes_conclusion_fires_notification() {
+        // ANCHOR test 1 (§3.10 red→green).
+        //
+        // Scenario: `gh run rerun --failed` on the same workflow run
+        // produces a new attempt with the same run_id but new
+        // conclusion ("failure" → "success"). The watch must re-fire
+        // because the conclusion changed.
+        //
+        // Pre-impl: Site 1 filters run.id <= last_run_id → no notify
+        //   → inbox has zero ci-pass messages → assertion fails.
+        // Post-impl: Site 1 conclusion-aware → run included → Site 2
+        //   conclusion-aware → run included → notification fires.
+        let dir = tmp_dir("p786-rerun-changes-conclusion");
+        let watch = p786_watch_already_notified(100, "failure", "abc");
+        // Same run_id, same head_sha, NEW conclusion.
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 100,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/100".into(),
+        }]);
+
+        run_ci_check(&dir, &watch, &provider).unwrap();
+
+        // Inbox must contain the rerun's success notification.
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        assert!(
+            inbox_path.exists(),
+            "rerun changing conclusion must enqueue inbox notification"
+        );
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("ci-pass") || content.contains("[ci-pass]"),
+            "rerun success must fire ci-pass notification: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dedupe_by_head_sha_does_not_block_conclusion_change() {
+        // ANCHOR test 5 (§3.10 red→green) — Site 2 isolation.
+        //
+        // Scenario: a NEW workflow run (different run_id) re-runs on the
+        // SAME commit (same head_sha) and produces a new conclusion.
+        // This bypasses Site 1's run_id filter but pre-impl Site 2 still
+        // drops it because head_sha matches last_notified_head_sha.
+        // Pinning Site 2 independently prevents a future PR from
+        // reverting only Site 2 (which Site-1-only tests can't catch).
+        //
+        // Pre-impl: Site 1 passes (101 > 100), Site 2 filters (sha
+        //   matches last_notified) → no notify → test fails.
+        // Post-impl: Site 2 conclusion-aware → fires.
+        let dir = tmp_dir("p786-site2-isolation");
+        // Prior state: notified for run 100 / sha=abc / "failure".
+        let watch = p786_watch_already_notified(100, "failure", "abc");
+        // New scheduled run on same commit: run_id=101 (passes Site 1),
+        // same sha (would be dropped by Site 2 pre-impl), new conclusion.
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 101,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/101".into(),
+        }]);
+
+        run_ci_check(&dir, &watch, &provider).unwrap();
+
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        assert!(
+            inbox_path.exists(),
+            "new run on same sha with new conclusion must enqueue notification"
+        );
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("ci-pass") || content.contains("[ci-pass]"),
+            "Site 2 must allow conclusion-change through despite matching head_sha: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_run_id_same_conclusion_does_not_re_fire() {
+        // Test 2 (back-compat invariant + reviewer constraint 1):
+        // same run_id + same conclusion as last notified → no
+        // notification, no state churn (no rewrite of last_notified_*
+        // fields).
+        let dir = tmp_dir("p786-no-churn");
+        let watch = p786_watch_already_notified(100, "failure", "abc");
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 100,
+            conclusion: Some("failure".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/100".into(),
+        }]);
+        let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+
+        run_ci_check(&dir, &watch, &provider).unwrap();
+
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        if inbox_path.exists() {
+            let content = std::fs::read_to_string(&inbox_path).unwrap();
+            assert!(
+                !content.contains("ci-pass") && !content.contains("ci-fail"),
+                "stable terminal state must NOT re-fire: {content}"
+            );
+        }
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(
+            updated["last_notified_conclusion"].as_str(),
+            Some("failure"),
+            "no churn: last_notified_conclusion must remain 'failure': {updated}"
+        );
+        assert_eq!(
+            updated["last_notified_head_sha"].as_str(),
+            Some("abc"),
+            "no churn: last_notified_head_sha must remain 'abc': {updated}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_run_id_fires_regardless_of_prior_conclusion() {
+        // Test 3 (existing-behavior preservation): new run_id + new
+        // commit fires regardless of prior conclusion. Dedup only
+        // affects same-run_id / same-sha paths.
+        let dir = tmp_dir("p786-new-run");
+        let watch = p786_watch_already_notified(100, "success", "abc");
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 200,
+            conclusion: Some("success".into()),
+            head_sha: "def".into(),
+            url: "https://example.com/200".into(),
+        }]);
+
+        run_ci_check(&dir, &watch, &provider).unwrap();
+
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        assert!(
+            inbox_path.exists(),
+            "new run_id + new commit must fire regardless of prior conclusion"
+        );
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("ci-pass") || content.contains("[ci-pass]"),
+            "new run must fire ci-pass: {content}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_last_notified_conclusion_field_handles_first_poll_gracefully() {
+        // Test 4 (migration invariant): pre-#786 watches lack the
+        // `last_notified_conclusion` field. First post-upgrade poll
+        // on a terminal run fires once (None != Some("success")) —
+        // bounded migration spam — then persists the new field so
+        // subsequent stable polls don't re-fire.
+        let dir = tmp_dir("p786-migration");
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "interval_secs": 60,
+            "instance": "agent1",
+            "last_run_id": 100,
+            "head_sha": "abc",
+            "last_polled_at": null,
+            "last_notified_head_sha": "abc",
+            // last_notified_conclusion intentionally absent (pre-#786 shape).
+        });
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 100,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/100".into(),
+        }]);
+
+        run_ci_check(&dir, &watch, &provider).unwrap();
+
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        assert!(
+            inbox_path.exists(),
+            "missing last_notified_conclusion must fire on first post-upgrade poll"
+        );
+
+        let watch_path = dir.join("ci-watches").join(watch_filename("o/r", "feat"));
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(
+            updated["last_notified_conclusion"].as_str(),
+            Some("success"),
+            "migration: post-fire watch must persist last_notified_conclusion: {updated}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
