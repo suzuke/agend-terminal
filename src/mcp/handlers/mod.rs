@@ -112,7 +112,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         "download_attachment" => channel::handle_download_attachment(&home, args, instance_name),
 
         // --- Cross-instance communication ---
-        "send" => comms::handle_unified_send(&home, args, &sender),
+        // NOTE: `send` migrated to dispatch table (#694 BLOCK 2 T-B8).
         "inbox" => {
             if args.get("message_id").and_then(|v| v.as_str()).is_some() {
                 comms::handle_describe_message(&home, args, instance_name)
@@ -127,10 +127,10 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // NOTE: 8 instance-lifecycle arms migrated to dispatch table
         // (#694 BLOCK 2 T-B7): list_instances, create_instance,
         // delete_instance, start_instance, replace_instance,
-        // set_description, interrupt, move_pane. See dispatch.rs.
-        // Action-based + `&sender`-style arms stay inline for T-B8+.
+        // set_description, interrupt, move_pane. T-B8 adds
+        // `set_waiting_on`. See dispatch.rs. Remaining action-based +
+        // channel-heavy arms stay inline for T-B9+.
         "set_display_name" => instance::handle_set_display_name(&home, args, instance_name),
-        "set_waiting_on" => instance::handle_set_waiting_on(&home, args, instance_name, &sender),
         "pane_snapshot" => instance::handle_pane_snapshot(&home, args),
         // Consolidated: health action=report/clear
         "health" => match args["action"].as_str().unwrap_or("") {
@@ -148,7 +148,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         },
 
         // --- Task board ---
-        "task" => task::handle_task(&home, args, instance_name),
+        // NOTE: `task` migrated to dispatch table (#694 BLOCK 2 T-B8),
+        // including a sub-routing table for the `action` parameter.
+        // T-B8 wires `action=list` to a sub-handler; the other four
+        // actions (create/claim/update/done) fall through to the base
+        // handler `dispatch_task` which forwards to `task::handle_task`,
+        // preserving pre-migration behavior. T-B9+ wires the rest.
 
         // --- Task sweep config ---
         "task_sweep_config" => task::handle_task_sweep_config(&home, args),
@@ -195,29 +200,11 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             other => json!({"error": format!("unknown ci action: {other}")}),
         },
 
-        // --- Generic self-bind (Sprint 54 P1-7) — agents can claim a
-        // worktree without going through the dispatch hook. Reuses the
-        // same lifecycle helper so every Sprint 53/54 invariant applies.
-        "bind_self" => worktree::handle_bind_self(&home, args, &sender),
-
-        // --- Daemon-managed worktree release (Sprint 53 P0-X) ---
-        "release_worktree" => worktree::handle_release_worktree(&home, args, &sender),
-
-        // --- Force-release stale worktree dir (Sprint 59 Wave 1 PR-5
-        //     emergency cherry-pick — closes BYPASS escape hatch by
-        //     making the bind_self lease_failed recovery path daemon-
-        //     managed).
-        "force_release_worktree" => {
-            force_release::handle_force_release_worktree(&home, args, &sender)
-        }
+        // NOTE: bind_self / release_worktree / force_release_worktree /
+        // binding_state / gc_dry_run migrated to dispatch table (#694
+        // BLOCK 2 T-B8). See dispatch.rs `dispatch_<name>` adapters.
 
         // --- Sprint 60 W1 PR-3 (#P0-3): operator restart MCP tool ---
-
-        // --- Daemon binding-state diagnostic (Sprint 58 Wave 3 PR-2 #8) ---
-        "binding_state" => binding_state::handle_binding_state(&home, args, &sender),
-
-        // --- Phase 4 GC dry-run visibility (Sprint 53 P1-4) ---
-        "gc_dry_run" => worktree::handle_gc_dry_run(&home, args, &sender),
         "restart_daemon" => restart::handle_restart_daemon(&home),
 
         _ => json!({"error": format!("unknown tool: {tool}")}),
