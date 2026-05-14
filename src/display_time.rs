@@ -71,4 +71,47 @@ mod tests {
         assert_eq!(format_local_short("not-a-date", None), "not-a-date");
         assert_eq!(format_local_short("short", None), "short");
     }
+
+    // ─── #790 anchor tests (§3.10 RED) ─────────────────────────────────
+
+    /// Explicit `Asia/Taipei` IANA tz converts UTC → UTC+8 — May 7
+    /// 22:00 UTC is May 8 06:00 Taipei. Pinned exact output so the
+    /// helper's chrono-tz path is verifiably-correct, not just
+    /// shape-conforming. RED until the GREEN commit wires `chrono_tz::Tz`.
+    #[test]
+    fn format_local_short_with_asia_taipei_renders_utc_plus_8() {
+        let out = format_local_short("2026-05-07T22:00:00Z", Some("Asia/Taipei"));
+        assert_eq!(out, "05-08 06:00", "Asia/Taipei should yield UTC+8 render");
+    }
+
+    /// Invalid IANA name falls back to `chrono::Local` so the helper
+    /// never panics on hand-edited fleet.yaml typos. The output shape
+    /// is `MM-DD HH:MM` (11 chars) — same shape as the `None` path so
+    /// the operator gets a render, just with the wrong tz, plus a
+    /// (one-shot) warn log to surface the misconfiguration.
+    #[test]
+    fn format_local_short_with_invalid_iana_falls_back_to_chrono_local() {
+        let out = format_local_short("2026-05-07T22:00:00Z", Some("Not/A_Real_TZ"));
+        let local_out = format_local_short("2026-05-07T22:00:00Z", None);
+        assert_eq!(
+            out, local_out,
+            "invalid IANA must fall back to chrono::Local, identical to None"
+        );
+    }
+
+    /// `tz = None` preserves Sprint 54 P2-6 behaviour exactly:
+    /// chrono::Local render. Backward-compat anchor — if this regresses,
+    /// every existing fleet.yaml without `display_timezone:` would
+    /// silently change output format.
+    #[test]
+    fn format_local_short_with_none_tz_matches_chrono_local() {
+        let out_none = format_local_short("2026-05-07T22:00:00Z", None);
+        // Re-derive what chrono::Local should produce directly.
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-05-07T22:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string();
+        assert_eq!(out_none, expected, "None tz must match chrono::Local");
+    }
 }

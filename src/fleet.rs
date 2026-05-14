@@ -3170,4 +3170,38 @@ instances:
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #790: `display_timezone` survives a load → save round-trip.
+    /// Operator-set value persists across daemon restarts; absent
+    /// stays absent (`skip_serializing_if = Option::is_none` keeps
+    /// existing fleet.yaml clean).
+    #[test]
+    fn fleet_config_load_save_roundtrip_preserves_display_timezone() {
+        let dir = std::env::temp_dir().join(format!("agend-tz-rt-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            "display_timezone: Asia/Taipei\ninstances:\n  shell:\n    command: /bin/bash\n",
+        );
+        let loaded = FleetConfig::load(&path).expect("load");
+        assert_eq!(loaded.display_timezone.as_deref(), Some("Asia/Taipei"));
+
+        let yaml = serde_yaml_ng::to_string(&loaded).expect("serialize");
+        let reloaded: FleetConfig = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        assert_eq!(reloaded.display_timezone.as_deref(), Some("Asia/Taipei"));
+
+        // Absent → stays absent on serialize (skip_serializing_if).
+        let bare_path = write_fleet(
+            &dir.join("bare"),
+            "instances:\n  shell:\n    command: /bin/bash\n",
+        );
+        let bare = FleetConfig::load(&bare_path).expect("load bare");
+        assert!(bare.display_timezone.is_none());
+        let bare_yaml = serde_yaml_ng::to_string(&bare).expect("serialize bare");
+        assert!(
+            !bare_yaml.contains("display_timezone"),
+            "absent field must not be serialized, got:\n{bare_yaml}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
