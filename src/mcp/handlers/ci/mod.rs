@@ -2,6 +2,18 @@ use crate::agent_ops::validate_branch;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Daemon-internal git subprocess wrapper that always sets
+/// `AGEND_GIT_BYPASS=1`. Centralizes the bypass-env contract so adding
+/// a new git call to this module cannot silently trip the fleet-managed
+/// `git worktree`/`git branch` shim deny.
+fn git_bypass(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+}
+
 pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let source = match args["source"].as_str() {
         Some(s) => s,
@@ -70,6 +82,160 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
     {
         return json!({"error": "source path rejected: system directory"});
     }
+    // #780: auto-create branch from `from_ref` when bind:true + branch
+    // missing locally. Closes the single-step bypass-free workflow gap
+    // surfaced post-#779 (`git worktree add <path> <branch>` without
+    // `-b` rejects missing refs). `bind:false` preserves current
+    // back-compat (no auto-create) per decision
+    // `d-20260514102305998399-0` scope.
+    let mut auto_created_branch = false;
+    let mut fetch_attempted = false;
+    if bind {
+        let from_ref = args["from_ref"].as_str().unwrap_or("origin/main");
+        // Defense in depth: same charset rules as `branch`. Rejects
+        // option-injection (e.g. `--upload-pack=...`) via the leading-`-`
+        // and ".." guards in `validate_branch`.
+        if !validate_branch(from_ref) {
+            return json!({
+                "error": format!("invalid from_ref '{from_ref}'"),
+                "code": "invalid_from_ref",
+                "stage": "validate_from_ref",
+                "fetch_attempted": false,
+            });
+        }
+        let src = Path::new(&source_path);
+        let branch_ref = format!("refs/heads/{branch}");
+        let branch_exists = git_bypass(src, &["rev-parse", "--verify", &branch_ref])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !branch_exists {
+            // Step 2: try create from `from_ref` (no fetch yet — zero
+            // network on the fast path where origin/main is already
+            // a valid local ref).
+            match git_bypass(src, &["branch", branch, from_ref]) {
+                Ok(o) if o.status.success() => {
+                    auto_created_branch = true;
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                    if stderr.contains("already exists") {
+                        // Race: concurrent caller authored the branch
+                        // between rev-parse and branch. Idempotent
+                        // fall-through — auto_created_branch stays false
+                        // so callers can distinguish "I created it" vs
+                        // "I observed it pre-existing".
+                    } else if stderr.contains("not a valid object name")
+                        || stderr.contains("not a valid ref")
+                    {
+                        tracing::warn!(
+                            target: "ci_handler",
+                            branch = %branch,
+                            from_ref = %from_ref,
+                            "auto-create fallback: from_ref unresolved locally — fetching origin"
+                        );
+                        let fetch_start = std::time::Instant::now();
+                        let fetch_out = git_bypass(src, &["fetch", "origin", "--quiet"]);
+                        fetch_attempted = true;
+                        let fetch_ms = fetch_start.elapsed().as_millis();
+                        crate::event_log::log(
+                            home,
+                            "checkout_auto_create_fetch",
+                            instance_name,
+                            &format!("branch={branch} from_ref={from_ref} duration_ms={fetch_ms}"),
+                        );
+                        match fetch_out {
+                            Ok(fo) if fo.status.success() => {
+                                match git_bypass(src, &["branch", branch, from_ref]) {
+                                    Ok(ro) if ro.status.success() => {
+                                        auto_created_branch = true;
+                                    }
+                                    Ok(ro) => {
+                                        let rstderr =
+                                            String::from_utf8_lossy(&ro.stderr).to_string();
+                                        if rstderr.contains("already exists") {
+                                            // Race after fetch — leave
+                                            // auto_created_branch=false.
+                                        } else {
+                                            tracing::warn!(
+                                                target: "ci_handler",
+                                                branch = %branch,
+                                                from_ref = %from_ref,
+                                                stderr = %rstderr,
+                                                "auto-create retry failed after fetch"
+                                            );
+                                            return json!({
+                                                "error": format!(
+                                                    "from_ref '{from_ref}' invalid (branch creation failed after fetch)"
+                                                ),
+                                                "code": "invalid_from_ref",
+                                                "stage": "retry_create",
+                                                "fetch_attempted": true,
+                                                "raw": rstderr,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        return json!({
+                                            "error": format!("git branch retry spawn failed: {e}"),
+                                            "code": "branch_create_failed",
+                                            "stage": "retry_create",
+                                            "fetch_attempted": true,
+                                            "raw": e.to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(fo) => {
+                                let fstderr = String::from_utf8_lossy(&fo.stderr).to_string();
+                                tracing::warn!(
+                                    target: "ci_handler",
+                                    branch = %branch,
+                                    from_ref = %from_ref,
+                                    stderr = %fstderr,
+                                    "auto-create fetch failed"
+                                );
+                                return json!({
+                                    "error": format!(
+                                        "git fetch origin failed (from_ref '{from_ref}' cannot be resolved)"
+                                    ),
+                                    "code": "fetch_failed",
+                                    "stage": "fetch",
+                                    "fetch_attempted": true,
+                                    "raw": fstderr,
+                                });
+                            }
+                            Err(e) => {
+                                return json!({
+                                    "error": format!("git fetch spawn failed: {e}"),
+                                    "code": "fetch_failed",
+                                    "stage": "fetch",
+                                    "fetch_attempted": true,
+                                    "raw": e.to_string(),
+                                });
+                            }
+                        }
+                    } else {
+                        return json!({
+                            "error": format!("git branch failed: {}", stderr.trim()),
+                            "code": "branch_create_failed",
+                            "stage": "create_branch",
+                            "fetch_attempted": false,
+                            "raw": stderr,
+                        });
+                    }
+                }
+                Err(e) => {
+                    return json!({
+                        "error": format!("git branch spawn failed: {e}"),
+                        "code": "branch_create_failed",
+                        "stage": "create_branch",
+                        "fetch_attempted": false,
+                        "raw": e.to_string(),
+                    });
+                }
+            }
+        }
+    }
     // When `bind:true`, omit `--detach` so HEAD lands on the named
     // branch — subsequent commits write to the right ref without the
     // extra `git switch` that triggered the #778 chicken-and-egg.
@@ -79,18 +245,7 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
     } else {
         vec!["worktree", "add", "--detach", &worktree_path_str, branch]
     };
-    match std::process::Command::new("git")
-        .args(&git_args)
-        .current_dir(&source_path)
-        // Daemon-internal git spawn — bypass the shim so a test or agent
-        // invocation of `repo action=checkout` from inside an instance
-        // process (where AGEND_INSTANCE_NAME is set) doesn't trip the
-        // `git worktree` fleet-managed deny. Matches the convention used
-        // by `dispatch_hook::derive_repo_from_remote` and other
-        // daemon-side git callers.
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-    {
+    match git_bypass(Path::new(&source_path), &git_args) {
         Ok(o) if o.status.success() => {
             let mut resp =
                 json!({"path": worktree_path_str, "source": source_path, "branch": branch});
@@ -121,11 +276,38 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
                     );
                 }
                 resp["bound"] = json!(true);
+                resp["auto_created_branch"] = json!(auto_created_branch);
+                resp["fetch_attempted"] = json!(fetch_attempted);
             }
             resp
         }
-        Ok(o) => json!({"error": String::from_utf8_lossy(&o.stderr).to_string()}),
-        Err(e) => json!({"error": format!("{e}")}),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            let mut err = json!({
+                "error": format!("git worktree add failed: {}", stderr.trim()),
+                "code": "worktree_add_failed",
+                "stage": "worktree_add",
+                "raw": stderr,
+            });
+            if bind {
+                err["fetch_attempted"] = json!(fetch_attempted);
+                err["auto_created_branch"] = json!(auto_created_branch);
+            }
+            err
+        }
+        Err(e) => {
+            let mut err = json!({
+                "error": format!("git worktree add spawn failed: {e}"),
+                "code": "worktree_add_failed",
+                "stage": "worktree_add",
+                "raw": e.to_string(),
+            });
+            if bind {
+                err["fetch_attempted"] = json!(fetch_attempted);
+                err["auto_created_branch"] = json!(auto_created_branch);
+            }
+            err
+        }
     }
 }
 

@@ -1009,3 +1009,376 @@ fn checkout_bind_true_auto_creates_branch_from_origin_main_when_missing() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&parent).ok();
 }
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_existing_branch_ignores_from_ref() {
+    // Back-compat pin: when the branch already exists in the source
+    // repo, the auto-create path is skipped entirely. `from_ref` is
+    // irrelevant — the caller's value (here a typo `origin/maine`) MUST
+    // NOT cause a fetch or any error. `auto_created_branch=false`
+    // distinguishes "branch existed" from "we authored it" so callers
+    // can audit which branches the handler newly created.
+    let home = p778_tmp_home("780-existing");
+    let parent = p778_tmp_home("780-existing-src");
+    // Use #778's fixture which DOES pre-create the feature branch.
+    let source = p778_setup_source_repo(&parent, "feat/p780-existing");
+    let agent = "p780-agent-existing";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p780-existing",
+            "bind": true,
+            // intentional typo — must not be consulted when branch exists.
+            "from_ref": "origin/maine",
+        }),
+        agent,
+    );
+
+    assert!(
+        resp.get("error").is_none(),
+        "existing branch must succeed regardless of from_ref: {resp}"
+    );
+    assert_eq!(
+        resp["auto_created_branch"].as_bool(),
+        Some(false),
+        "auto_created_branch must be false for pre-existing branch: {resp}"
+    );
+    assert_eq!(
+        resp["fetch_attempted"].as_bool(),
+        Some(false),
+        "fetch must NOT fire when branch exists: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// Fixture: source repo whose origin remote points at a file:// URL that
+/// does not exist on disk so `git fetch origin` fails fast (no network
+/// round-trip, no DNS, no hang). Used by tests that exercise the
+/// fetch-failure error surface.
+#[cfg(unix)]
+fn p780_setup_source_broken_origin(parent: &Path) -> std::path::PathBuf {
+    let repo = parent.join("source-repo-broken");
+    std::fs::create_dir_all(&repo).ok();
+    let bypass = ("AGEND_GIT_BYPASS", "1");
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    // file:// URL pointing at a non-existent path — `git fetch origin`
+    // exits non-zero immediately with `fatal: '/...' does not appear to
+    // be a git repository`.
+    let broken_url = format!("file:///tmp/agend-p780-nonexistent-{}", std::process::id());
+    let _ = std::process::Command::new("git")
+        .args(["remote", "add", "origin", &broken_url])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    repo
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_invalid_from_ref_returns_structured_error_with_stage() {
+    // Error surface pin: when `from_ref` is unresolvable BOTH locally
+    // and after a fetch, the response must carry the canonical code
+    // enum + stage + fetch_attempted + raw fields per decision
+    // d-20260514102305998399-0. The fixture's broken origin URL
+    // guarantees `git fetch origin` fails fast so the test doesn't hit
+    // the network.
+    let home = p778_tmp_home("780-bad-ref");
+    let parent = p778_tmp_home("780-bad-ref-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "p780-agent-bad-ref";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p780-bad",
+            "bind": true,
+            // Unresolvable: this remote ref does not exist locally and
+            // the broken origin URL prevents fetch from populating it.
+            "from_ref": "origin/totally-bogus-ref-name",
+        }),
+        agent,
+    );
+
+    assert!(
+        resp.get("error").is_some(),
+        "unresolvable from_ref must error: {resp}"
+    );
+    // Stage must be one of the auto-create pipeline stages — either
+    // `fetch` (fetch itself failed) or `retry_create` (fetch succeeded
+    // but ref still missing). Both are valid endpoints; the broken
+    // origin URL deterministically lands on `fetch` for this fixture.
+    let stage = resp["stage"].as_str().unwrap_or_default();
+    assert!(
+        stage == "fetch" || stage == "retry_create",
+        "stage must be fetch or retry_create, got: {resp}"
+    );
+    let code = resp["code"].as_str().unwrap_or_default();
+    assert!(
+        code == "fetch_failed" || code == "invalid_from_ref",
+        "code must be fetch_failed or invalid_from_ref, got: {resp}"
+    );
+    assert_eq!(
+        resp["fetch_attempted"].as_bool(),
+        Some(true),
+        "fetch_attempted must be true after fallback path entered: {resp}"
+    );
+    assert!(
+        resp["raw"].as_str().is_some() && !resp["raw"].as_str().unwrap().is_empty(),
+        "raw stderr must be surfaced for debug: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_concurrent_branch_create_race_idempotent() {
+    // Race semantic pin: two concurrent callers on the SAME source repo
+    // + SAME branch must not both error out at the `git branch` stage.
+    // The winner sees `auto_created_branch=true`. The loser hits the
+    // `already exists` stderr and falls through idempotently to the
+    // worktree-add stage — where it will fail with
+    // `code=worktree_add_failed` (different `instance_name` → different
+    // worktree path, but same branch ref → git refuses second
+    // checkout). The fall-through invariant we pin: NEITHER caller
+    // returns `code=branch_create_failed`. Barrier(2) makes the race
+    // deterministic without timing-dependent sleeps.
+    let home = p778_tmp_home("780-race");
+    let parent = p778_tmp_home("780-race-src");
+    let source = p780_setup_source_no_feature_branch(&parent);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for i in 0..2 {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let home_c = home.clone();
+        let source_c = source.clone();
+        // fire-and-forget: test-only race harness; JoinHandle stored
+        // in `handles` and explicitly joined below — not a long-lived
+        // spawn site requiring supervisor wiring.
+        handles.push(std::thread::spawn(move || {
+            let agent = format!("p780-agent-race-{i}");
+            barrier.wait();
+            super::handle_checkout_repo(
+                &home_c,
+                &serde_json::json!({
+                    "source": source_c.display().to_string(),
+                    "branch": "feat/p780-race",
+                    "bind": true,
+                }),
+                &agent,
+            )
+        }));
+    }
+    let results: Vec<serde_json::Value> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // Neither caller may surface `branch_create_failed` — the race must
+    // be absorbed by the idempotent `already exists` fall-through.
+    for r in &results {
+        let code = r["code"].as_str().unwrap_or_default();
+        assert_ne!(
+            code, "branch_create_failed",
+            "race must fall through, never error at branch create: {r}"
+        );
+    }
+    // Exactly one winner observed auto_created_branch=true. The other
+    // either fell through to a successful worktree add (rare — same
+    // branch on same repo blocks second worktree) or failed at
+    // worktree_add stage with auto_created_branch absent (error path).
+    let winners = results
+        .iter()
+        .filter(|r| r["auto_created_branch"].as_bool() == Some(true))
+        .count();
+    assert_eq!(
+        winners, 1,
+        "exactly one caller must author the branch: {results:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_stress_50_iter_branch_create_no_flaky_parse() {
+    // Stress pin: 50 sequential fresh-repo iterations exercising the
+    // auto-create path. Catches:
+    //   1. Flaky stderr-matching from git version / locale variation
+    //      (we match on substring "not a valid object name" /
+    //      "already exists" — if a future git rewords these the test
+    //      surfaces the parse drift here, not in production).
+    //   2. Resource / fd leaks from repeated subprocess spawns.
+    //   3. Timing-dependent ordering issues in
+    //      rev-parse → branch → worktree-add.
+    // Each iter rebuilds the source repo from scratch, so the auto-
+    // create path is deterministically exercised. Runtime expectation:
+    // ~50ms × 50 ≈ 2.5s on a typical dev machine.
+    let parent = p778_tmp_home("780-stress-src");
+    for i in 0..50 {
+        let home = p778_tmp_home(&format!("780-stress-{i}"));
+        let source = p780_setup_source_no_feature_branch(&parent.join(format!("iter-{i}")));
+        let agent = format!("p780-agent-stress-{i}");
+
+        let resp = super::handle_checkout_repo(
+            &home,
+            &serde_json::json!({
+                "source": source.display().to_string(),
+                "branch": format!("feat/p780-stress-{i}"),
+                "bind": true,
+            }),
+            &agent,
+        );
+
+        assert!(
+            resp.get("error").is_none(),
+            "iter {i}: auto-create must succeed every time, got: {resp}"
+        );
+        assert_eq!(
+            resp["auto_created_branch"].as_bool(),
+            Some(true),
+            "iter {i}: every iter creates a fresh branch: {resp}"
+        );
+        assert_eq!(
+            resp["fetch_attempted"].as_bool(),
+            Some(false),
+            "iter {i}: fixture has origin/main locally — no fetch should fire: {resp}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_auto_create_path_preserves_779_tail_ops() {
+    // Regression guard: when the auto-create path entered, ALL of
+    // #779's tail-ops (marker write, binding.json, ci_watches arming)
+    // must still fire. This is the property
+    // `checkout_bind_true_writes_binding_marker_and_arms_watch` pinned
+    // for the pre-existing-branch case; #780 introduces a new code path
+    // that easily regresses tail-ops if the auto-create logic
+    // accidentally short-circuits the post-worktree-add block.
+    let home = p778_tmp_home("780-tail");
+    let parent = p778_tmp_home("780-tail-src");
+    let source = p780_setup_source_no_feature_branch(&parent);
+    let agent = "p780-agent-tail";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p780-tail",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert!(resp.get("error").is_none(), "checkout must succeed: {resp}");
+    assert_eq!(resp["auto_created_branch"].as_bool(), Some(true));
+
+    let wt_path = std::path::PathBuf::from(resp["path"].as_str().expect("path"));
+    assert!(
+        wt_path.join(crate::worktree_pool::MANAGED_MARKER).exists(),
+        ".agend-managed marker must be written on auto-create path"
+    );
+
+    let binding = crate::paths::runtime_dir(&home)
+        .join(agent)
+        .join("binding.json");
+    assert!(
+        binding.exists(),
+        "binding.json must be written on auto-create path"
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding).unwrap()).unwrap();
+    assert_eq!(v["branch"].as_str(), Some("feat/p780-tail"));
+    assert_eq!(v["task_id"].as_str(), Some("self"));
+
+    // ci_watch arming uses derive_repo_from_remote_pub on origin URL —
+    // the fixture's `https://github.com/owner/repo.git` resolves to
+    // `owner/repo`.
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p780-tail"),
+    );
+    assert!(
+        watch_path.exists(),
+        "watch_ci must be armed on auto-create path"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_false_does_not_auto_create() {
+    // Scope invariant pin: #780 auto-create is gated on `bind:true`.
+    // The `bind:false` review-pool / operator-triage path must NOT
+    // auto-create a missing branch — preserves the existing
+    // fail-loud-on-missing-ref semantics for inspection-only callers.
+    let home = p778_tmp_home("780-bind-false");
+    let parent = p778_tmp_home("780-bind-false-src");
+    let source = p780_setup_source_no_feature_branch(&parent);
+    let agent = "p780-agent-bind-false";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p780-bind-false",
+            // bind defaulting to false — explicit for test clarity.
+            "bind": false,
+        }),
+        agent,
+    );
+
+    assert!(
+        resp.get("error").is_some(),
+        "bind:false missing branch must surface error (no auto-create): {resp}"
+    );
+    // No auto-create response fields on the bind:false path.
+    assert!(
+        resp.get("auto_created_branch").is_none(),
+        "bind:false must NOT expose auto_created_branch: {resp}"
+    );
+    // Confirm the branch was NOT actually created in the source repo.
+    let probe = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "refs/heads/feat/p780-bind-false"])
+        .current_dir(&source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git rev-parse");
+    assert!(
+        !probe.status.success(),
+        "bind:false must not write any ref into source repo"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
