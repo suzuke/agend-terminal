@@ -5,6 +5,127 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+/// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
+/// response shape for `repo action=checkout bind:true` so callers across
+/// the fleet observe a single canonical schema regardless of whether the
+/// worktree was provisioned via the `repo` MCP tool or via the
+/// auto-bind hook fired from `send kind=task`.
+///
+/// Introduced in C1 as a types-only commit; first call site materializes
+/// in C2 (signature migration). `allow(dead_code)` until C2 wires it up.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchOutcome {
+    /// Which tier of [`resolve_source_repo`] fired — exposes the
+    /// silent-miss class of Bug A0 (operator sees `Stub` and knows team
+    /// `source_repo` is unset).
+    pub source_repo_tier: SourceRepoTier,
+    /// `true` when this dispatch authored the branch on `source_repo`.
+    /// `false` when the branch pre-existed (back-compat / race
+    /// fall-through). Mirrors `auto_created_branch` from #784.
+    pub auto_created_branch: bool,
+    /// `true` when the lazy `git fetch origin` was invoked because
+    /// `from_ref` did not resolve locally. Surfaces network I/O so
+    /// callers can correlate slow dispatches with fetch fallback.
+    pub fetch_attempted: bool,
+}
+
+/// #781 Piece 7: structured error. The string-only `Result<_, String>`
+/// it supersedes (pre-#781) lost the `code` / `stage` / `raw` triple
+/// callers need to dispatch error handling programmatically.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchError {
+    /// Human-readable summary. Safe to log verbatim.
+    pub message: String,
+    /// Canonical reason class — see [`ErrorCode`]. Stable enum, not
+    /// stderr fragments.
+    pub code: ErrorCode,
+    /// Pipeline locator — which step of `dispatch_auto_bind_lease`
+    /// raised. See [`Stage`].
+    pub stage: Stage,
+    /// `true` when the fetch fallback fired before the failure (lets
+    /// callers distinguish "config / option-injection invalid" from
+    /// "fetch happened but couldn't resolve from_ref").
+    pub fetch_attempted: bool,
+    /// Raw git stderr if any — for debug / post-mortem. `None` when
+    /// the failure didn't involve a git subprocess.
+    pub raw: Option<String>,
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
+/// Which tier of [`resolve_source_repo`] fired. Observable via
+/// [`DispatchOutcome::source_repo_tier`] so callers can audit
+/// configuration completeness without parsing logs.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRepoTier {
+    /// Tier 1 — explicit `source_repo_override` from
+    /// `bind_self(source_repo=...)` etc.
+    Override,
+    /// Tier 2 — per-instance `source_repo:` in fleet.yaml.
+    FleetSourceRepo,
+    /// Tier 2.5 — team `source_repo:` in fleet.yaml.
+    TeamSourceRepo,
+    /// Tier 3 — per-instance `working_directory:` fallback (deprecation
+    /// candidate).
+    WorkingDirectory,
+    /// Tier 4 — `$AGEND_HOME/workspace/<agent>` stub (last resort).
+    /// Surfacing this signals operator config gap.
+    Stub,
+}
+
+/// Pipeline stage that produced a [`DispatchError`]. Coarse enough to
+/// remain stable across refactors, fine enough to debug.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    /// `from_ref` rejected by `validate_branch` charset / option-injection guard.
+    ValidateFromRef,
+    /// First `git branch <name> <from_ref>` attempt failed for a reason
+    /// other than "already exists" / "not a valid ref".
+    CreateBranch,
+    /// `git fetch origin` after the missing-ref fallback failed.
+    Fetch,
+    /// Retry `git branch <name> <from_ref>` after fetch still failed.
+    RetryCreate,
+    /// `worktree_pool::lease` returned error (worktree creation failed,
+    /// cross-agent lease conflict, same-agent different-branch conflict).
+    WorktreeLeaseConflict,
+}
+
+/// Canonical `code` enum — stable across releases. Callers MUST match
+/// on this rather than parsing `message` substrings.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// `from_ref` arg rejected by `validate_branch` charset rules.
+    InvalidFromRef,
+    /// `git branch` failed at a stage we can't recover from (not
+    /// already-exists, not invalid-ref).
+    BranchCreateFailed,
+    /// `git fetch origin` exit non-zero / spawn error.
+    FetchFailed,
+    /// `worktree_pool::lease` rejected — cross-agent branch lease,
+    /// same-agent different-branch, worktree::create None, etc.
+    LeaseConflict,
+    /// E4.5 protected ref guard (`main` / `master`).
+    ProtectedBranch,
+    /// `bind_in_flight_set` already contains `(home, agent)` — concurrent
+    /// dispatch blocked.
+    BindInFlight,
+}
+
 /// Sprint 55 P0-B EC11: per-agent in-flight guard scoped to the daemon's
 /// `home` directory. Prevents concurrent `dispatch_auto_bind_lease` calls
 /// for the same agent from interleaving `binding.json` writes / lease
