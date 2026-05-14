@@ -76,13 +76,25 @@ Carried inside `HealthTracker` so the dispatcher reads both
               └─────────────────┘
 ```
 
-Phase 1 (this PR) implements:
+Sub-task 7a (Stage 1) implemented:
 - `None → Stage1Pending` (alive-stuck branch)
 - `None → Stage2Eligible` (dead-likely branch OR cooldown skip)
 - `Stage1Pending → Stage2Eligible` (Stage 1 timeout expired)
 - `* → None` (spontaneous recovery on `Healthy`)
 
-Phase 2 follow-ups (7b/7c) add Stage 2/3 dispatch arms.
+**Sub-task 7b (Stage 2) implemented** (this PR):
+- `None → Stage3Eligible` (cumulative restart cap reached — direct
+  escalation, bypass Stages 1/2)
+- `Stage2Eligible → Stage2Pending` (Stage 2 fire — emits
+  `AgentExitEvent::Stage2Restart` via `try_send`; counter increment
+  lives in respawn worker `selective-restore` arm)
+- `Stage2Pending → Stage3Eligible` (Stage 2 timeout expired without
+  recovery)
+- `Stage2Eligible → Stage2Eligible` (channel-full retry — `try_send`
+  failed, state stays for next-tick retry without counter increment)
+
+Sub-task 7c (Stage 3) follow-up adds `Stage3Eligible → Stage3Pending +
+HealthState::Paused` transition.
 
 ## §RS.3 — Tick order & dispatcher placement
 
@@ -213,9 +225,8 @@ sub-task 7c's Stage 3 dispatcher arm.
 - `src/agent.rs::AgentExitEvent::Stage2Restart` — variant definition
   for sub-task 7b emission.
 
-### Out of scope (this sub-task)
+### Out of scope (sub-task 7a baseline)
 
-- Stage 2 auto-restart dispatcher arm — sub-task 7b.
 - Stage 3 pause + escalate dispatcher arm — sub-task 7c.
 - Operator unpause command (CLI or MCP tool) — separate sub-task,
   required before Stage 3 ships in production.
@@ -227,3 +238,150 @@ sub-task 7c's Stage 3 dispatcher arm.
 - F39 mitigation selection / F9 promotion — fixture-corpus-N-gated.
 - Multi-stage timeout per-backend overrides beyond uniform defaults +
   env-var overrides.
+
+## §RS.9 — Stage 2 specifics (sub-task 7b)
+
+Sub-task 7b (decision `d-20260514034230950032-2`) implements Stage 2 on
+top of the 7a infrastructure. Stage 2 is **controlled auto-restart**:
+when an agent fails to recover from Stage 1 ESC (or is dead-likely from
+the start), the dispatcher emits an `AgentExitEvent::Stage2Restart`
+event to `crash_tx`; the respawn worker's Stage 2 arm in
+`src/daemon/mod.rs::handle_stage2_restart` runs `spawn_agent` with
+selective field preservation.
+
+### 9.1 Cumulative restart cap
+
+`HealthTracker.recovery_restart_count: u32` mirrors `total_crashes`
+discipline. Each successful Stage 2 fire increments the counter (in the
+respawn worker, NOT the dispatcher — avoids double-counting if the
+channel send succeeds but the spawn fails). Default cap
+`STAGE2_MAX_RESTARTS_DEFAULT = 3` (per decision §Q1/Q2 — issue body
+"fails N times → Stage 3"). Operator override via env var
+`AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS`.
+
+When `recovery_restart_count >= cap`, the dispatcher's Stage 1 entry
+arm short-circuits the cycle and escalates **directly** to
+`Stage3Eligible` — operator intervention required rather than further
+automated thrashing.
+
+### 9.2 Selective field preservation across spawn
+
+Decision §1 critical wrinkle (dev round 1): `spawn_agent` at
+`rg "reg.insert" src/agent.rs` creates a **fresh `AgentCore` with
+default `HealthTracker`**. Existing Crash path preserves all health
+via `saved_health.clone()` at `daemon/mod.rs` Stage 2 needs different
+semantics:
+
+| Field | Stage 2 behaviour |
+|---|---|
+| `state` | Reset to fresh `Healthy` — recovery success seed |
+| `recovery_stage_state` | Reset to fresh `None` — linear escalation reset |
+| `last_stage1_fired_at` | Reset to fresh `None` (Stage 2 implies Stage 1 either fired or skipped, but next cycle starts clean) |
+| `crash_times` | **PRESERVE** — don't lose crash history due to recovery restart |
+| `total_crashes` | **PRESERVE** — same reason |
+| `last_notification` | **PRESERVE** — notify cooldown discipline |
+| `recovery_restart_count` | **PRESERVE + INCREMENT by 1** — counter must survive the restart it drove |
+| `last_stage2_fired_at` | Set to `Some(now)` — drives decay clock |
+
+`record_crash` is **NOT** called (Stage 2 ≠ crash). `respawn_ok` is
+**NOT** called (state is already fresh `Healthy`).
+
+### 9.3 1-second backoff
+
+Decision §1.4 Delta 2: 1s default backoff before `spawn_agent` runs in
+the Stage 2 arm. Defensive padding against tight-loop on transient
+spawn errors (filesystem / network / PTY allocation). Crash path uses
+exponential 5s+ backoff; Stage 2's controlled action permits shorter
+delay. Operator override via env var
+`AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS`.
+
+### 9.4 Stage 2 fail criteria (3 modes)
+
+The dispatcher's `Stage2Pending` monitor escalates to `Stage3Eligible`
+on any of:
+
+1. **`spawn_agent` returns `Err`** — Stage 2 cannot complete; agent
+   removed from registry, dispatcher next-tick sees nothing to do.
+   Operator already received telegram pre-emit. Phase 1 limitation:
+   manual respawn or future operator-unpause command required.
+2. **30s timeout window expired** without recovery (`state != Healthy`
+   when `entered_at.elapsed() >= STAGE2_TIMEOUT_DEFAULT_MS`). Operator
+   override via `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS`.
+3. **Agent re-Hungs within Stage 2 window** — `Stage2Pending` and
+   state == Hung implies brief Healthy then back to Hung; more
+   aggressive escalation. (Phase 1 implementation: timeout check
+   covers this; re-Hung is just a specific instance of "still not
+   Healthy after timeout".)
+
+### 9.5 Channel-full safety (try_send)
+
+`crash_tx` is `bounded::<>(64)` at `daemon/mod.rs:438`. Under extreme
+load (e.g. many agents crashing simultaneously), the send may fail
+with `TrySendError::Full`. Dispatcher uses `try_send`:
+
+- **`Ok`**: state transitions to `Stage2Pending`,
+  `last_stage2_fired_at` stamped. Counter increment lives on the
+  respawn worker side so a successful event delivery without spawn
+  completion does not falsely increment.
+- **`Err`**: state stays `Stage2Eligible`, counter NOT incremented.
+  Next dispatcher tick retries.
+
+This is the **race coverage** mentioned in decision §extras: a crash
+arriving on the same channel during Stage 2 spawn does NOT cause
+double-counting because the dispatcher's `try_send` operates on a
+different (`Stage2Restart`) variant; the crash flows through its own
+path independently.
+
+### 9.6 Spawn failure Phase 1 limitation
+
+If `spawn_agent` in `handle_stage2_restart` returns `Err`, the agent is
+**removed** from the registry. Dispatcher next-tick won't find it and
+the recovery sequence ends. Operator visibility is preserved via the
+Stage 2 telegram emitted **pre-emit** (before the spawn attempt).
+
+Full lifecycle (operator-driven re-spawn or unpause) ships in sub-task
+7c + a separate operator-unpause command sub-task. Phase 1 acceptable:
+spawn-failure is edge case; operator can manually re-spawn via the
+existing `start` CLI or MCP `agent spawn` tool.
+
+### 9.7 Telegram notify content
+
+```
+[recovery] {agent_name}: Stage 2 auto-restart triggered.
+Hung silence: {silent_ms}ms (productive silence: {prod_ms}ms)
+Recovery restart count: {count}
+Next: monitoring 30s for recovery; Stage 3 (pause + operator action)
+on continued failure.
+```
+
+Operator-actionable: surfaces what triggered (silence vs productive
+silence — distinguishes alive-stuck from dead-likely), current
+restart-count progression toward cap, and expected next-step
+escalation timeline.
+
+### 9.8 Activation gate (mirrors §RS.5 Stage 1 pattern)
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `AGEND_AUTO_RECOVERY_STAGE2` | unset (shadow) | `"1"` activates: dispatcher emits `Stage2Restart` event. Unset: same telemetry, no emission. |
+| `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS` | 30000 | Stage 2 monitoring window. |
+| `AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS` | 1000 | Backoff before respawn worker spawn attempt. |
+| `AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS` | 3 | Cumulative cap → direct `Stage3Eligible` escalation. |
+
+Same shadow-mode promotion workflow as Stage 1: operator runs in
+shadow for ≥2 weeks, classifies would-have-fires via
+`recovery_shadow` tracing target, flips to active when confidence is
+high. Anti-dead-infra clause: 6 weeks without measurement → Stage 2
+removal candidate.
+
+### Out of scope (sub-task 7b)
+
+- Stage 3 dispatcher arm + `HealthState::Paused` activation —
+  sub-task 7c.
+- Operator unpause command — separate sub-task (required before
+  Stage 3 ships in production).
+- Per-backend Stage 2 timeout / backoff tuning — needs corpus
+  measurement, follow-up.
+- Full PTY-backed integration test for the variant-split spawn —
+  unit tests cover the state machine + counter discipline; full
+  integration deferred unless shadow telemetry surfaces edge cases.
