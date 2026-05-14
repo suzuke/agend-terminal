@@ -77,15 +77,20 @@ pub fn watch_filename(repo: &str, branch: &str) -> String {
 
 /// Persist updated tracking state (last_run_id + head_sha) to the watch file.
 pub(super) fn update_watch_state(watch_path: &Path, run_id: Option<u64>, head_sha: &str) {
-    update_watch_state_with_notify(watch_path, run_id, head_sha, None);
+    update_watch_state_with_notify(watch_path, run_id, head_sha, None, None);
 }
 
-/// Persist tracking state including last_notified_head_sha.
+/// Persist tracking state including last_notified_head_sha and
+/// last_notified_conclusion (#786). Both notify fields are written
+/// only when caller supplies them — preserves the
+/// "no state churn when no notification fires" invariant tested in
+/// `same_run_id_same_conclusion_does_not_re_fire`.
 pub(super) fn update_watch_state_with_notify(
     watch_path: &Path,
     run_id: Option<u64>,
     head_sha: &str,
     notified_sha: Option<&str>,
+    notified_conclusion: Option<&str>,
 ) {
     // #692: flock protects RMW against concurrent unsubscribe
     let lock_path = watch_path.with_extension("lock");
@@ -104,6 +109,9 @@ pub(super) fn update_watch_state_with_notify(
             }
             if let Some(sha) = notified_sha {
                 watch["last_notified_head_sha"] = serde_json::json!(sha);
+            }
+            if let Some(c) = notified_conclusion {
+                watch["last_notified_conclusion"] = serde_json::json!(c);
             }
             watch["last_terminal_seen_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
             // M1: atomic write to prevent partial-file on crash
