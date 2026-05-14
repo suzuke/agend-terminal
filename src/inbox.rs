@@ -632,9 +632,14 @@ fn sanitize_header_value(s: &str) -> String {
 /// Fields: from / id / kind / thread / parent / size.
 /// Optional fields (thread/parent) omitted when None.
 pub fn format_header(msg: &InboxMessage) -> String {
+    // #761: strip the redundant `from:` prefix that `Source::Agent`'s
+    // Display impl (inbox.rs:144) adds. `strip_prefix` returns `Some`
+    // for agent sources and `None` otherwise, so `system:` / `user:`
+    // namespaces survive untouched via the `unwrap_or` fallback.
+    let from_value = msg.from.strip_prefix("from:").unwrap_or(&msg.from);
     let mut parts = vec![
         HEADER_PREFIX.to_string(),
-        format!("from={}", sanitize_header_value(&msg.from)),
+        format!("from={}", sanitize_header_value(from_value)),
     ];
     if let Some(ref id) = msg.id {
         parts.push(format!("id={}", sanitize_header_value(id)));
