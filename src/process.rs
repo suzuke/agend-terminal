@@ -113,18 +113,32 @@ mod tests {
                 .expect("spawn sh + sleep")
         };
         let shell_pid = child.id();
-        // Wait for sleep to start and write its PID
-        for _ in 0..20 {
-            if pid_file.exists() {
-                break;
+        // #773: poll until the PID file BOTH exists AND parses as a u32.
+        // `pid_file.exists()` flips true the moment the shell opens the
+        // file for writing — before `echo $! > file` flushes its content
+        // — so the previous `for _ in 0..20 { if pid_file.exists() }`
+        // loop could exit early and the subsequent `parse()` panic with
+        // `ParseIntError { kind: Empty }` on an empty / partial read.
+        // The combined budget (5s = 100 × 50ms) covers both spawn
+        // latency AND write-flush race on a contended CI runner.
+        let sleep_pid: u32 = {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = content.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    let last = std::fs::read_to_string(&pid_file).unwrap_or_default();
+                    panic!(
+                        "PID file never materialized with parseable content after 5s; \
+                         last read: {last:?}"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let sleep_pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap_or_default()
-            .trim()
-            .parse()
-            .expect("parse sleep PID");
+        };
         assert!(is_pid_alive(shell_pid), "shell must be alive before kill");
         assert!(
             is_pid_alive(sleep_pid),
