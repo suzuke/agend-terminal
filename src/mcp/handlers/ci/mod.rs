@@ -122,39 +122,58 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
             let mut resp =
                 json!({"path": worktree_path_str, "source": source_path, "branch": branch});
             if bind {
+                // #779 P2 Option B: collect tail-op partial failures
+                // into a `warnings` array. `bound: true` remains
+                // load-bearing (lease succeeded — the main op went
+                // through); `warnings` flags degraded daemon-side
+                // state so callers can diagnose without grepping logs.
+                // Vec ordering preserves tail-op execution order
+                // (marker → bind_full → watch_ci) for positional
+                // semantics. Prefix convention: `<step>: <message>`
+                // — machine-greppable by callers.
+                let mut warnings: Vec<String> = Vec::new();
                 let marker_path = worktree_dir.join(crate::worktree_pool::MANAGED_MARKER);
-                let _ = std::fs::write(
+                if let Err(e) = std::fs::write(
                     &marker_path,
                     format!(
                         "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
                         chrono::Utc::now().to_rfc3339()
                     ),
-                );
-                // #779 P2 C1 mechanical: bind_full now returns Result;
-                // preserve pre-#779-P2 silent semantic here so the call
-                // site compiles. C3 substantive commit replaces with
-                // warning collection.
-                let _ = crate::binding::bind_full(
+                ) {
+                    warnings.push(format!("marker: {e}"));
+                }
+                if let Err(e) = crate::binding::bind_full(
                     home,
                     instance_name,
                     "self",
                     branch,
                     &worktree_dir,
                     &source_canonical,
-                )
-                .ok();
+                ) {
+                    warnings.push(format!("bind_full: {e}"));
+                }
                 if let Some(r) = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
                     &source_canonical,
                 ) {
-                    let _ = handle_watch_ci(
+                    let watch_resp = handle_watch_ci(
                         home,
                         &json!({"repo": &r, "branch": branch}),
                         instance_name,
                     );
+                    if let Some(err_msg) = watch_resp.get("error").and_then(|v| v.as_str()) {
+                        let code = watch_resp
+                            .get("code")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        warnings.push(format!("watch_ci: {err_msg} (code={code})"));
+                    }
                 }
                 resp["bound"] = json!(true);
                 resp["auto_created_branch"] = json!(auto_created_branch);
                 resp["fetch_attempted"] = json!(fetch_attempted);
+                if !warnings.is_empty() {
+                    resp["warnings"] = json!(warnings);
+                }
             }
             resp
         }
@@ -356,7 +375,18 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     }
 
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
-    std::fs::create_dir_all(&ci_dir).ok();
+    // #779 P2 Piece 3 site A: pre-#779-P2 swallowed dir-create errors
+    // silently and continued, returning happy-path Value even when the
+    // subsequent atomic_write was destined to fail. Now surface as
+    // structured error matching the existing `{error, code}` shape so
+    // handle_checkout_repo (and direct callers of `ci action=watch`)
+    // observe the partial-failure class.
+    if let Err(e) = std::fs::create_dir_all(&ci_dir) {
+        return json!({
+            "error": format!("ci-watches dir create failed: {e}"),
+            "code": "ci_watches_dir_create_failed",
+        });
+    }
     let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
     let watch_path = ci_dir.join(&filename);
 
@@ -438,12 +468,26 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["next_after_ci"] = json!(next);
     }
 
-    let _ = crate::store::atomic_write(
+    // #779 P2 Piece 3 site B: atomic_write failure (disk full,
+    // permission, etc.) previously surfaced as `let _ = ...` silent
+    // discard, returning happy-path Value with `watching: true` even
+    // when the watch file was never written. Now surface as structured
+    // error so callers don't act on phantom state. NOTE: site C
+    // (line ~362 `read_to_string(&watch_path).ok()`) is intentionally
+    // NOT hardened — its None case is the load-bearing fresh-watch
+    // init path; hardening there would block legitimate first
+    // subscribes.
+    if let Err(e) = crate::store::atomic_write(
         &watch_path,
         serde_json::to_string_pretty(&watch)
             .unwrap_or_default()
             .as_bytes(),
-    );
+    ) {
+        return json!({
+            "error": format!("watch file write failed: {e}"),
+            "code": "watch_write_failed",
+        });
+    }
     // Sprint 54 P0-5 (sub-scope A): response enrichment — agents see
     // CI health without polling the watch file. Read state freshly
     // from `watch` JSON we just composed; populate diagnostic fields

@@ -1492,3 +1492,90 @@ fn handle_watch_ci_atomic_write_failure_returns_error_field() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_watch_ci_failure_surfaces_warning() {
+    // Test 2 (depends on Piece 3 hardening landed in C3): pre-create
+    // ci-watches as a regular file. handle_watch_ci's site-A hardening
+    // returns `{error, code: ci_watches_dir_create_failed}`. handle_
+    // checkout_repo captures it into `warnings: ["watch_ci: ... (code=ci_watches_dir_create_failed)"]`.
+    // `bound: true` MUST still hold (lease succeeded).
+    let home = p778_tmp_home("779p2-watch-warn");
+    let parent = p778_tmp_home("779p2-watch-warn-src");
+    let source = p778_setup_source_repo(&parent, "feat/p779p2-watch");
+    let agent = "p779p2-agent-watch-warn";
+
+    // Block ci-watches dir create by pre-creating the path as a file.
+    let ci_watches = crate::daemon::ci_watch::ci_watches_dir(&home);
+    if let Some(p) = ci_watches.parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    std::fs::write(&ci_watches, "blocking file (not a dir)").unwrap();
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p779p2-watch",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(
+        resp["bound"].as_bool(),
+        Some(true),
+        "lease success → bound=true must hold despite watch_ci failure: {resp}"
+    );
+    let warnings = resp["warnings"]
+        .as_array()
+        .expect("warnings array must be present when watch_ci failed");
+    let watch_warning = warnings
+        .iter()
+        .find_map(|w| w.as_str().filter(|s| s.starts_with("watch_ci:")))
+        .expect("warnings must contain a `watch_ci:` prefix entry");
+    assert!(
+        watch_warning.contains("code=ci_watches_dir_create_failed"),
+        "watch_ci warning must surface the canonical code: {watch_warning}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_no_failures_no_warnings_field() {
+    // Test 4 (back-compat invariant): clean fixture, no injection.
+    // All tail-ops succeed → `warnings` field MUST be absent (omitted)
+    // from the response. Pre-#779-P2 callers checking only `bound`/
+    // `error` keys see no payload change.
+    let home = p778_tmp_home("779p2-clean");
+    let parent = p778_tmp_home("779p2-clean-src");
+    let source = p778_setup_source_repo(&parent, "feat/p779p2-clean");
+    let agent = "p779p2-agent-clean";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p779p2-clean",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert!(
+        resp.get("error").is_none(),
+        "clean path must not error: {resp}"
+    );
+    assert_eq!(resp["bound"].as_bool(), Some(true));
+    assert!(
+        resp.get("warnings").is_none(),
+        "no failures → no `warnings` field (back-compat invariant): {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
