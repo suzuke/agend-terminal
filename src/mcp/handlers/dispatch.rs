@@ -37,7 +37,9 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{binding_state, channel, ci, comms, force_release, instance, schedule, task, worktree};
+use super::{
+    binding_state, channel, ci, comms, force_release, instance, restart, schedule, task, worktree,
+};
 
 /// Shared per-call context — every common parameter `handle_tool`
 /// would otherwise pass into the match arms, bundled together so each
@@ -489,6 +491,33 @@ fn dispatch_reply(ctx: &HandlerCtx<'_>) -> Value {
     channel::handle_reply(ctx.home, ctx.args, ctx.instance_name)
 }
 
+// Final-cut flat tools (T-B11) — closing out #694 BLOCK 2 at 30/30+
+// arms. All four are stateless: no `args["action"]` sub-routing, no
+// per-tool counters, no env flags. Each adapter is a 1-line forward
+// to the existing per-tool fn.
+
+fn dispatch_set_display_name(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_set_display_name(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_pane_snapshot(ctx.home, ctx.args)
+}
+
+fn dispatch_task_sweep_config(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_task_sweep_config(ctx.home, ctx.args)
+}
+
+// `restart_daemon` is high-sensitivity (Sprint 60 W1 PR-3): the
+// daemon re-execs itself when this handler runs. ZERO behavior
+// change requires byte-identical forwarding to the existing
+// `restart::handle_restart_daemon`; the adapter is a verbatim 1-line
+// forward — no added logic, no extra logging, no field reads beyond
+// `ctx.home`.
+fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
+    restart::handle_restart_daemon(ctx.home)
+}
+
 /// Registered tool dispatchers. **Adding a tool**: write its adapter
 /// above, append a [`HandlerEntry`] here. **Removing**: delete both
 /// halves. Order doesn't affect correctness (linear-scan match by
@@ -649,6 +678,27 @@ static REGISTERED: &[HandlerEntry] = &[
         handler: dispatch_reply,
         actions: None,
     },
+    // Final-cut flat tools (T-B11) — closing out BLOCK 2 at 30/30+.
+    HandlerEntry {
+        name: "set_display_name",
+        handler: dispatch_set_display_name,
+        actions: None,
+    },
+    HandlerEntry {
+        name: "pane_snapshot",
+        handler: dispatch_pane_snapshot,
+        actions: None,
+    },
+    HandlerEntry {
+        name: "task_sweep_config",
+        handler: dispatch_task_sweep_config,
+        actions: None,
+    },
+    HandlerEntry {
+        name: "restart_daemon",
+        handler: dispatch_restart_daemon,
+        actions: None,
+    },
 ];
 
 pub(super) fn registered_handlers() -> &'static [HandlerEntry] {
@@ -727,9 +777,13 @@ mod tests {
                 "download_attachment",
                 "inbox",
                 "reply",
+                "set_display_name",
+                "pane_snapshot",
+                "task_sweep_config",
+                "restart_daemon",
             ]
         );
-        assert_eq!(registered_handlers().len(), 26);
+        assert_eq!(registered_handlers().len(), 30);
     }
 
     /// Coverage test: every tool name advertised by

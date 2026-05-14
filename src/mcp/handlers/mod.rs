@@ -106,58 +106,13 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         return value;
     }
 
-    match tool {
-        // --- Channel ---
-        // NOTE: `reply` / `download_attachment` migrated to dispatch table
-        // (#694 BLOCK 2 T-B10). See `dispatch::dispatch_reply` /
-        // `dispatch::dispatch_download_attachment`.
-
-        // --- Cross-instance communication ---
-        // NOTE: `send` migrated to dispatch table (#694 BLOCK 2 T-B8).
-        // NOTE: `inbox` migrated to dispatch table (#694 BLOCK 2 T-B10).
-        // The three-way branch on `message_id` / `thread_id` / drain
-        // moved verbatim into `dispatch::dispatch_inbox`.
-
-        // --- Instance management ---
-        // NOTE: 8 instance-lifecycle arms migrated to dispatch table
-        // (#694 BLOCK 2 T-B7): list_instances, create_instance,
-        // delete_instance, start_instance, replace_instance,
-        // set_description, interrupt, move_pane. T-B8 adds
-        // `set_waiting_on`. See dispatch.rs. Remaining action-based +
-        // channel-heavy arms stay inline for T-B9+.
-        "set_display_name" => instance::handle_set_display_name(&home, args, instance_name),
-        "pane_snapshot" => instance::handle_pane_snapshot(&home, args),
-        // NOTE: `health` migrated to dispatch table (#694 BLOCK 2 T-B9).
-
-        // NOTE: `decision` migrated to dispatch table (#694 BLOCK 2 T-B9).
-
-        // --- Task board ---
-        // NOTE: `task` migrated to dispatch table (#694 BLOCK 2 T-B8),
-        // including a sub-routing table for the `action` parameter.
-        // T-B8 wires `action=list` to a sub-handler; the other four
-        // actions (create/claim/update/done) fall through to the base
-        // handler `dispatch_task` which forwards to `task::handle_task`,
-        // preserving pre-migration behavior. T-B9+ wires the rest.
-
-        // --- Task sweep config ---
-        "task_sweep_config" => task::handle_task_sweep_config(&home, args),
-
-        // NOTE: `team` / `schedule` / `deployment` / `repo` migrated to
-        // dispatch table (#694 BLOCK 2 T-B9).
-
-        // NOTE: `ci` migrated to dispatch table (#694 BLOCK 2 T-B9),
-        // including the Sprint 54 P0-5 `status` action for aggregate
-        // health snapshot.
-
-        // NOTE: bind_self / release_worktree / force_release_worktree /
-        // binding_state / gc_dry_run migrated to dispatch table (#694
-        // BLOCK 2 T-B8). See dispatch.rs `dispatch_<name>` adapters.
-
-        // --- Sprint 60 W1 PR-3 (#P0-3): operator restart MCP tool ---
-        "restart_daemon" => restart::handle_restart_daemon(&home),
-
-        _ => json!({"error": format!("unknown tool: {tool}")}),
-    }
+    // #694 BLOCK 2 fully migrated — all 30 advertised MCP tools flow
+    // through `dispatch::try_dispatch` above. The inline match is gone;
+    // a reached-this-line tool name must be unregistered. (Defensive
+    // catch-all — `every_advertised_tool_is_routed_somewhere` in
+    // dispatch.rs::tests pins that every tool in `tool_definitions()`
+    // is routed by `dispatch.rs`.)
+    json!({"error": format!("unknown tool: {tool}")})
 }
 
 #[cfg(test)]
