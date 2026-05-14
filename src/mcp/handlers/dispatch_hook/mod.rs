@@ -325,7 +325,11 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
 
     // Clean empty "init" commits left by kiro-cli session checkpoints.
     // Best-effort: failure here is non-fatal (worktree is still usable).
-    clean_empty_init_commits(&lease.path);
+    // #789: existing call site preserves pre-#789 silent semantic via
+    // `.ok()` so dispatch path has zero observable behavior change.
+    // The Result is consumed by `bind_self` / `task action=done` /
+    // `release_worktree` / `repo action=cleanup_init_commits` callers.
+    let _ = clean_empty_init_commits(&lease.path).ok();
 
     // Bind with worktree + source-repo paths. Bind file write error stays graceful (Q1).
     // source_repo persistence (P0-X r1): release_full uses it to run
@@ -680,9 +684,23 @@ fn derive_repo_from_remote(source_repo: &std::path::Path) -> Option<String> {
 mod tests;
 
 /// Remove empty commits with message "init" between origin/main and HEAD.
-/// These are left by kiro-cli session checkpoints and pollute PRs.
-/// Best-effort: logs warnings on failure but never panics.
-fn clean_empty_init_commits(worktree: &Path) {
+/// These come from BACKEND session checkpoints (claude-code / kiro-cli)
+/// that fire heartbeats every ~90s; not from agend-terminal production
+/// code (worktree.rs uses message "init (agend-terminal)" which the
+/// strict `subject == "init"` filter correctly skips).
+///
+/// #789 — returned `Result<usize, String>`:
+/// - `Ok(count)` — number of empty init commits removed (0 = noop)
+/// - `Err(msg)` — git subprocess failure with human-readable error
+///
+/// Caller chooses semantics:
+/// - Existing `dispatch_auto_bind_lease` site preserves the pre-#789
+///   silent semantic via `let _ = ...ok();` (zero observable change to
+///   dispatch path, per #779 P2 convention).
+/// - `bind_self` / `task action=done` / `release_worktree` / new MCP
+///   `repo action=cleanup_init_commits` consume the Result so operator-
+///   facing surfaces can report the cleaned count + surface failures.
+pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String> {
     let output = std::process::Command::new("git")
         .args(["log", "origin/main..HEAD", "--format=%H %s"])
         .current_dir(worktree)
@@ -690,11 +708,17 @@ fn clean_empty_init_commits(worktree: &Path) {
         .output();
     let output = match output {
         Ok(o) if o.status.success() => o,
-        _ => return,
+        Ok(o) => {
+            return Err(format!(
+                "git log origin/main..HEAD failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
+        Err(e) => return Err(format!("git log spawn failed: {e}")),
     };
     let log = String::from_utf8_lossy(&output.stdout);
     if log.trim().is_empty() {
-        return;
+        return Ok(0);
     }
 
     // Identify empty "init" commits.
@@ -721,7 +745,7 @@ fn clean_empty_init_commits(worktree: &Path) {
     }
 
     if empty_inits.is_empty() {
-        return;
+        return Ok(0);
     }
 
     // All commits between origin/main..HEAD are empty inits → soft reset.
@@ -738,12 +762,19 @@ fn clean_empty_init_commits(worktree: &Path) {
                     count = total_commits,
                     "cleaned all empty init commits via soft reset"
                 );
+                return Ok(total_commits);
             }
-            _ => {
+            Ok(s) => {
                 tracing::warn!("failed to soft-reset empty init commits");
+                return Err(format!(
+                    "git reset --soft origin/main exited with status {s:?}"
+                ));
+            }
+            Err(e) => {
+                tracing::warn!("failed to soft-reset empty init commits");
+                return Err(format!("git reset spawn failed: {e}"));
             }
         }
-        return;
     }
 
     // Mixed: use interactive rebase to drop empty inits.
@@ -754,6 +785,7 @@ fn clean_empty_init_commits(worktree: &Path) {
         .map(|h| format!("s/^pick {short} /drop {short} /", short = &h[..7]))
         .collect();
     let sed_script = sed_parts.join(";");
+    let cleaned = empty_inits.len();
     let status = std::process::Command::new("git")
         .args(["-c", "core.abbrev=7", "rebase", "-i", "origin/main"])
         .current_dir(worktree)
@@ -762,12 +794,10 @@ fn clean_empty_init_commits(worktree: &Path) {
         .status();
     match status {
         Ok(s) if s.success() => {
-            tracing::info!(
-                count = empty_inits.len(),
-                "cleaned empty init commits via rebase"
-            );
+            tracing::info!(count = cleaned, "cleaned empty init commits via rebase");
+            Ok(cleaned)
         }
-        _ => {
+        Ok(_) | Err(_) => {
             // Abort failed rebase to leave worktree in clean state.
             let _ = std::process::Command::new("git")
                 .args(["rebase", "--abort"])
@@ -775,6 +805,10 @@ fn clean_empty_init_commits(worktree: &Path) {
                 .env("AGEND_GIT_BYPASS", "1")
                 .status();
             tracing::warn!("failed to rebase-drop empty init commits");
+            Err(match status {
+                Ok(s) => format!("git rebase -i exited with status {s:?}"),
+                Err(e) => format!("git rebase spawn failed: {e}"),
+            })
         }
     }
 }
