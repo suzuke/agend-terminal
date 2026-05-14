@@ -1,22 +1,33 @@
-//! MCP handlers for daemon-managed worktree lifecycle:
-//! - `release_worktree` (Sprint 53 P0-X) — hard release of an agent's
-//!   worktree + binding via `worktree_pool::release_full`.
-//! - `gc_dry_run` (Sprint 53 P1-4) — operator-callable visibility into
-//!   Phase 4 GC candidates without grepping app.log. Wraps the existing
-//!   `worktree_pool::gc_dry_run`; non-destructive.
-//!
-//! Both tools are operator-callable + agent-callable.
+//! MCP handlers for daemon-managed worktree lifecycle. Operator- and
+//! agent-callable: `bind_self` (Sprint 54 P1-7), `release_worktree`
+//! (Sprint 53 P0-X), `gc_dry_run` (Sprint 53 P1-4 Phase 4 visibility,
+//! non-destructive — wraps `worktree_pool::gc_dry_run`).
 
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
 /// MCP tool: `bind_self` (Sprint 54 P1-7). Lets any instance proactively
-/// bind itself to a worktree without going through the dispatch hook.
+/// bind itself to a worktree on the named branch via the daemon's
+/// standard lease lifecycle.
+///
+/// **When to use vs `repo action=checkout bind:true`** (#779 Option 1):
+/// - **`bind:true`** — preferred for fresh-task dispatches where the
+///   caller already knows the source repo (passes explicit `source`
+///   arg). Single-step atomic provision + bind.
+/// - **`bind_self`** — preferred for mid-lifecycle scenarios:
+///   (a) re-binding a recovered worktree via `rebase_mode=true`,
+///   (b) binding via fleet.yaml-resolved source_repo (caller has no
+///   explicit source arg available),
+///   (c) post-`release_worktree` re-claim of the same branch.
+///
+/// Both paths share `dispatch_auto_bind_lease` so binding.json +
+/// .agend-managed marker + auto watch_ci all land. Bug fixes in the
+/// dispatch path inherit automatically.
+///
 /// Required args: `repo` / `source_repo` (one of), `branch`. Returns
 /// `{bound, worktree_path, branch}` on success or `{error, code}` on
-/// failure. Thin shim over `dispatch_auto_bind_lease` — bug fixes in
-/// the dispatch path inherit automatically.
+/// failure.
 pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
     let agent = match sender.as_ref().map(Sender::as_str) {
         Some(a) if !a.is_empty() => a,
@@ -125,19 +136,11 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     }
 }
 
-/// MCP tool: `release_worktree`.
-///
-/// Required arg: `agent` (string).
-///
-/// Returns:
-/// - `released`: `true` when the binding was cleared (worktree may still
-///   exist if removal was skipped or partially failed — see `error`).
-/// - `worktree_removed`: `true` when the worktree directory was actually
-///   removed via `git worktree remove --force` (or fallback).
-/// - `binding_removed`: `true` when `runtime/<agent>/binding.json` was
-///   deleted.
-/// - `error`: optional human-readable error. Idempotent second call returns
-///   `released: false, error: "no binding for agent X"` per spec.
+/// MCP tool: `release_worktree`. Required arg: `agent`. Returns
+/// `{released, worktree_removed, binding_removed, error}` —
+/// `released:true` clears binding; worktree removal via
+/// `git worktree remove --force` (or fallback). Idempotent — second
+/// call returns `released:false, error:"no binding for agent X"`.
 pub(crate) fn handle_release_worktree(
     home: &Path,
     args: &Value,
@@ -155,20 +158,11 @@ pub(crate) fn handle_release_worktree(
     serde_json::to_value(&outcome).unwrap_or_else(|_| json!({"error": "serialize failed"}))
 }
 
-/// MCP tool: `gc_dry_run` (Sprint 53 P1-4).
-///
-/// Operator-callable surface for Phase 4 GC visibility. Wraps the existing
-/// `worktree_pool::gc_dry_run` (which the daemon also runs hourly), enriches
-/// each candidate with `branch` / `leased_at` / `released_at` parsed out of
-/// its `.agend-managed` marker, and formats the result as either a
-/// human-readable string list (default) or a JSON object.
-///
-/// Non-destructive: dry-run only. Phase 4 cutover (actual `git worktree remove`
-/// of candidates) stays behind the separate `AGEND_WORKTREE_GC=1` switch.
-///
-/// Optional arg:
-/// - `format`: `"human"` (default) or `"json"`. Anything else → graceful
-///   error so a typo doesn't silently produce one of the formats.
+/// MCP tool: `gc_dry_run` (Sprint 53 P1-4) — Phase 4 GC visibility wrapper
+/// over `worktree_pool::gc_dry_run`. Enriches candidates with marker
+/// metadata (branch / leased_at / released_at), formats as `"human"`
+/// (default) or `"json"`. Non-destructive — actual removal stays behind
+/// `AGEND_WORKTREE_GC=1`. Unknown `format` → graceful error.
 pub(crate) fn handle_gc_dry_run(home: &Path, args: &Value, _sender: &Option<Sender>) -> Value {
     let format = args["format"].as_str().unwrap_or("human");
     if format != "human" && format != "json" {

@@ -211,6 +211,12 @@ pub(crate) fn dispatch_auto_bind_lease(
 /// existing callers go through [`dispatch_auto_bind_lease`] which passes
 /// `None` to preserve pre-Sprint-55 behavior.
 ///
+/// **Callers**: `handle_bind_self` (post-`release_worktree` re-claim,
+/// rebase recovery) + `handle_checkout_repo` with `bind:true` (#779
+/// Option 1 atomic fresh provision). Both share this dispatch path —
+/// caller chooses entry based on whether the caller already knows the
+/// source repo (bind:true) or relies on fleet.yaml resolution (bind_self).
+///
 /// #781 Piece 7: returns structured [`DispatchOutcome`] / [`DispatchError`].
 /// C2 commit performs the signature migration mechanically — `source_repo_tier`,
 /// `auto_created_branch`, `fetch_attempted` populated with placeholders here

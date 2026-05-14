@@ -250,17 +250,19 @@ fn repo_tools() -> Vec<Value> {
 
 fn worktree_tools() -> Vec<Value> {
     vec![
-        // Sprint 54 P1-7: generic self-bind — any instance can claim a
-        // worktree without going through the dispatch hook. Reuses
-        // `dispatch_auto_bind_lease` so every Sprint 53/54 invariant
-        // (Phase 1 trailers, P0-1.5 cross-agent registry check, P0-1.6
-        // actual-HEAD verification, P0-X release_worktree as sole exit
-        // point, source_repo persistence, auto watch_ci) applies.
+        // Sprint 54 P1-7: generic self-bind. Same `dispatch_auto_bind_lease`
+        // lifecycle as `repo action=checkout bind:true` (#779 Option 1);
+        // difference is caller context (fleet.yaml-resolved source_repo vs
+        // explicit `source` arg), not the underlying mechanism. Every
+        // Sprint 53/54 invariant (Phase 1 trailers, P0-1.5 cross-agent
+        // registry check, P0-1.6 actual-HEAD verification, P0-X
+        // release_worktree as sole exit point, source_repo persistence,
+        // auto watch_ci) applies uniformly.
         // Sprint 55 P0-B: dual-arg shape (handler at worktree.rs:24-27) —
         // schema exposes both `source_repo` (preferred) and legacy `repo`
         // with `required` relaxed to `branch` only. Handler enforces
         // mutual exclusivity at runtime via `ambiguous_args` code.
-        json!({"name": "bind_self", "description": "Bind the calling agent to a fresh worktree on the named branch. Reuses the dispatch-hook lifecycle so binding.json + worktree + .agend-managed marker + auto watch_ci all land. Rejects 'main'/'master' (E4.5) and cross-agent branch conflicts. Pair with `release_worktree` to unbind.",
+        json!({"name": "bind_self", "description": "Bind the calling agent to a worktree on the named branch. For fresh-task workflows that know the source repo, prefer `repo action=checkout bind:true` (#779 Option 1) — single-step atomic provision + bind. Use `bind_self` when the caller is mid-lifecycle: (a) re-binding a recovered worktree via `rebase_mode=true`, (b) binding via fleet.yaml-resolved source_repo (no explicit source arg), or (c) post-`release_worktree` re-claim of the same branch. Both paths share `dispatch_auto_bind_lease` so binding.json + .agend-managed marker + auto watch_ci all land. Rejects 'main'/'master' (E4.5) and cross-agent branch conflicts. Pair with `release_worktree` to unbind.",
             "inputSchema": {"type": "object", "properties": {
                 "source_repo": {"type": "string", "description": "Local path to source repository. Daemon resolves GitHub owner/repo via `git remote get-url origin`. Sprint 55 P0-B preferred form. Mutually exclusive with `repo` (handler rejects both via `ambiguous_args` code)."},
                 "repo": {"type": "string", "description": "GitHub repo (owner/name). Legacy form retained for one-Sprint deprecation window — emits warn-log; removal Sprint 57. Mutually exclusive with `source_repo`."},
