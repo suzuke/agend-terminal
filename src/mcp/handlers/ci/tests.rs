@@ -609,8 +609,18 @@ fn handle_watch_ci_accepts_non_protected_branch() {
 // anchor: comment out the `bind` block in handle_checkout_repo →
 // `checkout_bind_true_writes_binding_marker_and_arms_watch` fails
 // because binding.json never gets written.
+//
+// Happy-path tests spawn real git subprocesses (init/commit/remote/
+// branch/worktree-add) and are `#[cfg(unix)]` — Windows CI runner's
+// git-subprocess concurrency was observed to cause unrelated
+// `worktree_pool::tests::*` regressions when these tests ran in
+// parallel. The daemon code itself is cross-platform (Windows path
+// mangling now collapses `\` and `:` alongside `/`); only the
+// integration-style happy-path tests are unix-gated. The E4.5 +
+// anonymous-caller error-path tests below stay cross-platform.
 // ----------------------------------------------------------------------
 
+#[cfg(unix)]
 fn p778_tmp_home(suffix: &str) -> std::path::PathBuf {
     let h = std::env::temp_dir().join(format!(
         "agend-p778-bind-{}-{}-{}",
@@ -630,6 +640,7 @@ fn p778_tmp_home(suffix: &str) -> std::path::PathBuf {
 /// `owner/repo` and the test exercises the auto-watch_ci arm. One
 /// initial commit on `main`, plus a feature branch named `branch`
 /// pre-created so `git worktree add <path> <branch>` succeeds.
+#[cfg(unix)]
 fn p778_setup_source_repo(parent: &Path, branch: &str) -> std::path::PathBuf {
     let repo = parent.join("source-repo");
     std::fs::create_dir_all(&repo).ok();
@@ -672,6 +683,7 @@ fn p778_setup_source_repo(parent: &Path, branch: &str) -> std::path::PathBuf {
 }
 
 #[test]
+#[cfg(unix)]
 fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
     // Empirical regression-proof anchor for #778 Option 1.
     let home = p778_tmp_home("ok");
@@ -747,6 +759,7 @@ fn checkout_bind_true_writes_binding_marker_and_arms_watch() {
 }
 
 #[test]
+#[cfg(unix)]
 fn checkout_bind_false_default_preserves_detached_no_binding() {
     // Back-compat: existing callers (review pool, operator triage) pass
     // no `bind` arg → behavior identical to pre-#778 — detached HEAD,
