@@ -128,6 +128,14 @@ pub(super) fn check_ci_watches_with_provider(
         Ok(e) => e,
         Err(_) => return,
     };
+    // #790: one fleet.yaml read per tick to extract the operator's
+    // configured display tz for notification body rendering. Failures
+    // (missing/unreadable fleet.yaml) silently fall through to `None`
+    // → chrono::Local — same behaviour as pre-#790.
+    let display_timezone: Option<String> =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .and_then(|c| c.display_timezone);
     for entry in entries.flatten() {
         let path = entry.path();
         let watch: serde_json::Value = match std::fs::read_to_string(&path)
@@ -201,6 +209,7 @@ pub(super) fn check_ci_watches_with_provider(
                     &branch,
                     &subscribers,
                     reset_epoch,
+                    display_timezone.as_deref(),
                 );
                 continue;
             }
@@ -3211,6 +3220,7 @@ mod tests {
             "feat",
             &subscribers,
             future_reset,
+            None,
         );
         bump_consecutive_skips_and_maybe_notify(
             &home,
@@ -3219,6 +3229,7 @@ mod tests {
             "feat",
             &subscribers,
             future_reset,
+            None,
         );
         let watch: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -3254,6 +3265,7 @@ mod tests {
                 "feat",
                 &subscribers,
                 future_reset,
+                None,
             );
         }
 
@@ -3330,6 +3342,7 @@ mod tests {
                 "feat",
                 &subscribers,
                 future_reset,
+                None,
             );
         }
         for sub in ["lead", "dev"] {
@@ -3348,6 +3361,70 @@ mod tests {
                 "{sub} must receive resumed event"
             );
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #790 wiring test: notification BODY renders Stalled-since and
+    /// Next-poll-ETA in the operator's configured display tz, while
+    /// the InboxMessage storage `timestamp` field stays UTC (storage
+    /// invariant pin guard, per dispatch spec).
+    ///
+    /// Stalled-since is anchored at `2026-05-07T22:00:00Z` (epoch
+    /// 1746655200000ms). With `display_timezone=Some("Asia/Taipei")`
+    /// the body should contain `"05-08 06:00"` (UTC+8). The inbox
+    /// message timestamp field is set inside `fan_out_health_event`
+    /// from `chrono::Utc::now().to_rfc3339()` — must end with `Z` or
+    /// `+00:00` regardless of display_timezone.
+    #[test]
+    fn stalled_event_body_uses_display_tz_storage_stays_utc() {
+        let home = p05_temp_home("p790_tz_body");
+        // Pre-stamp stalled_since_ms so the body interpolation is
+        // deterministic (no race on chrono::Utc::now()).
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-07T00:00:00Z"}],
+            "consecutive_skips": 0,
+            "stalled_since_ms": 1746655200000_i64, // 2026-05-07T22:00:00Z
+        });
+        let path = p05_write_watch(&home, "o/r", "feat", watch);
+        let subscribers = vec!["lead".to_string()];
+        let future_reset = (chrono::Utc::now().timestamp() as u64) + 3600;
+
+        for _ in 0..STALL_THRESHOLD {
+            bump_consecutive_skips_and_maybe_notify(
+                &home,
+                &path,
+                "o/r",
+                "feat",
+                &subscribers,
+                future_reset,
+                Some("Asia/Taipei"),
+            );
+        }
+
+        let lines = p05_read_inbox_lines(&home, "lead");
+        let stalled_line = lines
+            .iter()
+            .find(|l| l.contains("ci-watch-stalled"))
+            .expect("stalled event must enqueue");
+        let msg: serde_json::Value =
+            serde_json::from_str(stalled_line).expect("inbox line is JSON");
+
+        // Wiring: body text must contain Taipei-rendered Stalled-since.
+        let text = msg["text"].as_str().expect("inbox text field");
+        assert!(
+            text.contains("Stalled since: 05-08 06:00"),
+            "body must render Taipei tz (UTC+8) for 2026-05-07T22:00:00Z, got:\n{text}"
+        );
+
+        // Storage invariant: inbox timestamp field stays UTC ISO 8601.
+        let ts = msg["timestamp"].as_str().expect("timestamp field");
+        assert!(
+            ts.ends_with('Z') || ts.ends_with("+00:00"),
+            "inbox storage timestamp must be UTC ISO 8601, got {ts:?}"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 
