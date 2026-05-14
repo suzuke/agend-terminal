@@ -3663,4 +3663,127 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ----------------------------------------------------------------------
+    // #786 conclusion-change dedup anchor tests.
+    //
+    // Both tests fail at C1 HEAD (pre-impl) because:
+    //   Site 1 (`select_runs_to_notify`) drops runs where `run.id <=
+    //     last_run_id` regardless of conclusion change.
+    //   Site 2 (`dedupe_notifications_by_head_sha`) drops runs whose
+    //     head_sha matches `last_notified_head_sha` regardless of
+    //     conclusion change.
+    //
+    // The fixture sets up a watch already in the "notified" state
+    // (last_run_id + last_notified_head_sha both populated) and feeds a
+    // poll that should re-fire because the conclusion changed (the
+    // gh-rerun-on-same-attempt scenario). Pre-impl drops the run on
+    // either Site 1 or Site 2; post-impl includes it because both sites
+    // become conclusion-aware.
+    //
+    // Source of truth: decision d-20260514163605327829-3.
+    // Cross-platform: no `#[cfg(unix)]` gate (pure async logic, no
+    // git subprocess) per reviewer C6 / #785 precedent.
+    // ----------------------------------------------------------------------
+
+    fn p786_watch_already_notified(
+        last_run_id: u64,
+        conclusion: &str,
+        head_sha: &str,
+    ) -> serde_json::Value {
+        // Watch state where a prior poll cycle already notified for
+        // `(last_run_id, head_sha)` with `conclusion`. Subsequent polls
+        // must respect `last_notified_conclusion` (post-#786 field).
+        serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "interval_secs": 60,
+            "instance": "agent1",
+            "last_run_id": last_run_id,
+            "head_sha": head_sha,
+            "last_polled_at": null,
+            "last_notified_head_sha": head_sha,
+            "last_notified_conclusion": conclusion,
+        })
+    }
+
+    #[test]
+    fn rerun_changes_conclusion_fires_notification() {
+        // ANCHOR test 1 (§3.10 red→green).
+        //
+        // Scenario: `gh run rerun --failed` on the same workflow run
+        // produces a new attempt with the same run_id but new
+        // conclusion ("failure" → "success"). The watch must re-fire
+        // because the conclusion changed.
+        //
+        // Pre-impl: Site 1 filters run.id <= last_run_id → no notify
+        //   → inbox has zero ci-pass messages → assertion fails.
+        // Post-impl: Site 1 conclusion-aware → run included → Site 2
+        //   conclusion-aware → run included → notification fires.
+        let dir = tmp_dir("p786-rerun-changes-conclusion");
+        let watch = p786_watch_already_notified(100, "failure", "abc");
+        // Same run_id, same head_sha, NEW conclusion.
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 100,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/100".into(),
+        }]);
+
+        run_ci_check(&dir, &watch, &provider).unwrap();
+
+        // Inbox must contain the rerun's success notification.
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        assert!(
+            inbox_path.exists(),
+            "rerun changing conclusion must enqueue inbox notification"
+        );
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("ci-pass") || content.contains("[ci-pass]"),
+            "rerun success must fire ci-pass notification: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dedupe_by_head_sha_does_not_block_conclusion_change() {
+        // ANCHOR test 5 (§3.10 red→green) — Site 2 isolation.
+        //
+        // Scenario: a NEW workflow run (different run_id) re-runs on the
+        // SAME commit (same head_sha) and produces a new conclusion.
+        // This bypasses Site 1's run_id filter but pre-impl Site 2 still
+        // drops it because head_sha matches last_notified_head_sha.
+        // Pinning Site 2 independently prevents a future PR from
+        // reverting only Site 2 (which Site-1-only tests can't catch).
+        //
+        // Pre-impl: Site 1 passes (101 > 100), Site 2 filters (sha
+        //   matches last_notified) → no notify → test fails.
+        // Post-impl: Site 2 conclusion-aware → fires.
+        let dir = tmp_dir("p786-site2-isolation");
+        // Prior state: notified for run 100 / sha=abc / "failure".
+        let watch = p786_watch_already_notified(100, "failure", "abc");
+        // New scheduled run on same commit: run_id=101 (passes Site 1),
+        // same sha (would be dropped by Site 2 pre-impl), new conclusion.
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 101,
+            conclusion: Some("success".into()),
+            head_sha: "abc".into(),
+            url: "https://example.com/101".into(),
+        }]);
+
+        run_ci_check(&dir, &watch, &provider).unwrap();
+
+        let inbox_path = dir.join("inbox").join("agent1.jsonl");
+        assert!(
+            inbox_path.exists(),
+            "new run on same sha with new conclusion must enqueue notification"
+        );
+        let content = std::fs::read_to_string(&inbox_path).unwrap();
+        assert!(
+            content.contains("ci-pass") || content.contains("[ci-pass]"),
+            "Site 2 must allow conclusion-change through despite matching head_sha: {content}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
