@@ -250,12 +250,14 @@ fn repo_tools() -> Vec<Value> {
 
 fn worktree_tools() -> Vec<Value> {
     vec![
-        // Sprint 54 P1-7: generic self-bind — any instance can claim a
-        // worktree without going through the dispatch hook. Reuses
-        // `dispatch_auto_bind_lease` so every Sprint 53/54 invariant
-        // (Phase 1 trailers, P0-1.5 cross-agent registry check, P0-1.6
-        // actual-HEAD verification, P0-X release_worktree as sole exit
-        // point, source_repo persistence, auto watch_ci) applies.
+        // Sprint 54 P1-7: generic self-bind. Same `dispatch_auto_bind_lease`
+        // lifecycle as `repo action=checkout bind:true` (#779 Option 1);
+        // difference is caller context (fleet.yaml-resolved source_repo vs
+        // explicit `source` arg), not the underlying mechanism. Every
+        // Sprint 53/54 invariant (Phase 1 trailers, P0-1.5 cross-agent
+        // registry check, P0-1.6 actual-HEAD verification, P0-X
+        // release_worktree as sole exit point, source_repo persistence,
+        // auto watch_ci) applies uniformly.
         // Sprint 55 P0-B: dual-arg shape (handler at worktree.rs:24-27) —
         // schema exposes both `source_repo` (preferred) and legacy `repo`
         // with `required` relaxed to `branch` only. Handler enforces
