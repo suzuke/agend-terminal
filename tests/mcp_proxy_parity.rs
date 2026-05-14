@@ -47,9 +47,17 @@ fn bridge_unwraps_daemon_response_for_tools_call() {
 
 /// Verify the 5 representative tools are all handled by handle_tool.
 /// This ensures the proxy path covers the same tools as direct invocation.
+///
+/// `handle_tool` routes via two sources since #694 BLOCK 2 first cut:
+/// the dispatch table (`dispatch.rs`) plus the fallback inline `match`
+/// (`mod.rs`). Both files participate in the route, so a tool name
+/// satisfies the "is routed" invariant if it appears as a quoted
+/// literal in either one.
 #[test]
 fn five_tool_sample_all_routed_through_handle_tool() {
-    let src = std::fs::read_to_string("src/mcp/handlers/mod.rs").expect("read handlers mod.rs");
+    let mod_src = std::fs::read_to_string("src/mcp/handlers/mod.rs").expect("read handlers mod.rs");
+    let dispatch_src =
+        std::fs::read_to_string("src/mcp/handlers/dispatch.rs").expect("read dispatch.rs");
     let tools = [
         "list_instances",
         "reply",
@@ -58,9 +66,10 @@ fn five_tool_sample_all_routed_through_handle_tool() {
         "inbox",
     ];
     for tool in &tools {
+        let quoted = format!(r#""{tool}""#);
         assert!(
-            src.contains(&format!(r#""{tool}""#)),
-            "handle_tool must route '{tool}'"
+            mod_src.contains(&quoted) || dispatch_src.contains(&quoted),
+            "handle_tool must route '{tool}' (checked mod.rs + dispatch.rs)"
         );
     }
 }
