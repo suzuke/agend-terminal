@@ -139,6 +139,29 @@ pub const STAGE1_TIMEOUT_DEFAULT_MS: u64 = 10_000;
 /// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE1_COOLDOWN_MS`.
 pub const STAGE1_COOLDOWN_DEFAULT_MS: u64 = 60_000;
 
+/// Stage 2 default backoff — sleep before `spawn_agent` re-runs in the
+/// respawn worker's Stage 2 arm. Decision §1.4 Delta 2: 1s default
+/// (defensive padding against tight-loop on transient spawn errors —
+/// transient filesystem / network / PTY allocation failures), with env
+/// var override for operators who observe unnecessary latency.
+/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS`.
+pub const STAGE2_BACKOFF_DEFAULT_MS: u64 = 1_000;
+
+/// Stage 2 default monitoring window — how long the dispatcher waits in
+/// `Stage2Pending` for the agent to settle on `Healthy` before
+/// classifying Stage 2 as failed and escalating to `Stage3Eligible`.
+/// Mirrors the 30s window already documented in `docs/RECOVERY-STAGES.md`.
+/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS`.
+pub const STAGE2_TIMEOUT_DEFAULT_MS: u64 = 30_000;
+
+/// Stage 2 cumulative retry cap — when `recovery_restart_count` reaches
+/// this number across Hung cycles, the dispatcher skips Stages 1/2 on
+/// the next Hung and escalates directly to `Stage3Eligible`. Decision
+/// §Q1/Q2: N=3 default mirrors the issue body's "fails N times → Stage 3"
+/// language with a conservative restart budget before operator intervention.
+/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS`.
+pub const STAGE2_MAX_RESTARTS_DEFAULT: u32 = 3;
+
 /// Returns `true` when `silent_productive` (silence since last productive
 /// output) exceeds the per-`AgentState` threshold. Mirrors the
 /// `silence_exceeds_threshold` pattern at the top of `check_hang`.
@@ -175,10 +198,10 @@ pub enum BlockedReason {
 #[allow(dead_code)] // error_events, last_output, record_error, reset: reserved for daemon health monitoring
 pub struct HealthTracker {
     pub state: HealthState,
-    crash_times: VecDeque<Instant>,
-    total_crashes: u32,
+    pub crash_times: VecDeque<Instant>,
+    pub total_crashes: u32,
     max_retries: u32,
-    last_notification: Option<Instant>,
+    pub last_notification: Option<Instant>,
     error_events: VecDeque<(Instant, AgentState)>,
     pub last_output: Instant,
     pub current_reason: Option<BlockedReason>,
@@ -194,6 +217,32 @@ pub struct HealthTracker {
     /// `Stage2Eligible`. `None` means Stage 1 has never fired for this
     /// agent in the current daemon run.
     pub last_stage1_fired_at: Option<Instant>,
+    /// `#685` sub-task 7b: cumulative Stage 2 auto-restart count across
+    /// Hung cycles. Increments on each Stage 2 fire that the respawn
+    /// worker successfully consumes (channel `try_send` `Ok`). When
+    /// count reaches `STAGE2_MAX_RESTARTS_DEFAULT`, the dispatcher
+    /// skips Stages 1/2 on the next Hung cycle and escalates directly
+    /// to `Stage3Eligible` — operator must intervene rather than the
+    /// daemon repeatedly thrashing the agent.
+    ///
+    /// Decays via `maybe_decay`: 1 unit per `STABILITY_WINDOW` (30 min)
+    /// of last-crash stability. Mirrors `total_crashes` decay
+    /// discipline so an agent that recovers and stays stable does not
+    /// carry recovery-restart attribution forever.
+    ///
+    /// Preserved selectively across the Stage 2 respawn boundary in
+    /// `daemon/mod.rs` Stage 2 variant arm — fresh `HealthTracker` on
+    /// spawn re-applies this counter (plus crash_times + total_crashes,
+    /// plus last_notification) so the cap survives the restart that
+    /// the counter itself drove.
+    pub recovery_restart_count: u32,
+    /// `#685` sub-task 7b: timestamp of last Stage 2 auto-restart fire.
+    /// Used to drive `recovery_restart_count` decay alongside
+    /// `crash_times` — `maybe_decay` checks the most recent of the two
+    /// when deciding whether the agent has been stable long enough to
+    /// decrement the recovery counter. `None` means Stage 2 has never
+    /// fired for this agent in the current daemon run.
+    pub last_stage2_fired_at: Option<Instant>,
 }
 
 impl HealthTracker {
@@ -209,6 +258,8 @@ impl HealthTracker {
             current_reason: None,
             recovery_stage_state: RecoveryStageState::None,
             last_stage1_fired_at: None,
+            recovery_restart_count: 0,
+            last_stage2_fired_at: None,
         }
     }
 
@@ -571,8 +622,43 @@ impl HealthTracker {
     /// `Paused` is reachable only via Stage 3 dispatcher, never via
     /// crash counter or decay paths.
     pub fn maybe_decay(&mut self) {
+        self.maybe_decay_at(Instant::now());
+    }
+
+    /// Test-injection variant of [`Self::maybe_decay`] — accepts a
+    /// caller-supplied `now` so tests can simulate elapsed time without
+    /// constructing backdated `Instant` values via subtraction.
+    ///
+    /// **Why this exists**: Windows `Instant::now()` is anchored to system
+    /// uptime via `QueryPerformanceCounter`. On a fresh CI VM with low
+    /// uptime, `Instant::now() - Duration::from_secs(30 * 60)` underflows
+    /// and panics. Tests instead use `base + offset` (cross-platform safe;
+    /// `Instant::add` saturates to `Instant::MAX` on all platforms) and
+    /// pass the resulting future-Instant as the `now` argument. Internal
+    /// elapsed checks use `now.saturating_duration_since(t)` defensively
+    /// against clock skew.
+    ///
+    /// Production callers should always use [`Self::maybe_decay`] which
+    /// passes `Instant::now()` — zero behaviour change. Sub-task 7b PR
+    /// #775 v2 hot-fix.
+    pub(crate) fn maybe_decay_at(&mut self, now: Instant) {
         if self.state == HealthState::Paused {
             return;
+        }
+        // `#685` sub-task 7b: decay recovery_restart_count via the same
+        // STABILITY_WINDOW discipline as crash decay. Independent of
+        // crash counter — if agent went through Stage 2 restart without
+        // crashing, last_stage2_fired_at drives the decay clock alone.
+        // Mirrors decision §Delta 3: long-stability decay (NOT
+        // reset-on-Healthy, which oscillates too aggressively).
+        if self.recovery_restart_count > 0 {
+            let last_stage2_idle = self
+                .last_stage2_fired_at
+                .map(|t| now.saturating_duration_since(t) >= STABILITY_WINDOW)
+                .unwrap_or(false);
+            if last_stage2_idle {
+                self.recovery_restart_count = self.recovery_restart_count.saturating_sub(1);
+            }
         }
         if self.total_crashes == 0 {
             return;
@@ -581,7 +667,7 @@ impl HealthTracker {
             Some(t) => *t,
             None => return,
         };
-        if last_crash.elapsed() >= STABILITY_WINDOW {
+        if now.saturating_duration_since(last_crash) >= STABILITY_WINDOW {
             self.total_crashes = self.total_crashes.saturating_sub(1);
             if self.total_crashes == 0 {
                 self.crash_times.clear();

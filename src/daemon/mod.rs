@@ -536,14 +536,19 @@ fn run_core(
     // that ordering is the zero-behavior-change guarantee.
     let handlers: Vec<Box<dyn per_tick::PerTickHandler>> = vec![
         Box::new(per_tick::HangDetectionHandler::new()),
-        // `#685` sub-task 7a Stage 1: recovery dispatcher MUST run after
-        // `HangDetectionHandler` in the same tick so it reads the
-        // freshly-updated `HealthState` (sub-task 1 §Invariants 5b means
-        // `check_hang` returns true only on transition-into-Hung;
-        // dispatcher reads state directly to handle the "still Hung"
-        // case). Shadow-mode by default — gated on
-        // `AGEND_AUTO_RECOVERY_STAGE1=1`. See `docs/RECOVERY-STAGES.md`.
-        Box::new(per_tick::RecoveryDispatcherHandler::new()),
+        // `#685` sub-task 7a Stage 1 / 7b Stage 2: recovery dispatcher
+        // MUST run after `HangDetectionHandler` in the same tick so it
+        // reads the freshly-updated `HealthState` (sub-task 1 §Invariants 5b
+        // means `check_hang` returns true only on transition-into-Hung;
+        // dispatcher reads state directly to handle the "still Hung" case).
+        // Shadow-mode by default — gated on `AGEND_AUTO_RECOVERY_STAGE1=1`
+        // / `STAGE2=1`. Constructor takes `crash_tx` so the Stage 2
+        // arm can `try_send` the `AgentExitEvent::Stage2Restart` variant
+        // that the respawn worker (`daemon/mod.rs:642` Stage 2 arm)
+        // splits on. See `docs/RECOVERY-STAGES.md` §RS.9.
+        Box::new(per_tick::RecoveryDispatcherHandler::new(
+            std::sync::Arc::new(crash_tx.clone()),
+        )),
         Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
         Box::new(per_tick::ExternalLivenessHandler::new()),
         Box::new(per_tick::SnapshotRotationHandler::new()),
@@ -634,6 +639,23 @@ fn run_core(
                 reg.remove(name.as_str());
             }
             configs.lock().remove(name.as_str());
+            continue;
+        }
+
+        // `#685` sub-task 7b: Stage 2 auto-restart path. Emitted by the
+        // recovery dispatcher (`per_tick/recovery_dispatcher.rs`) when an
+        // agent re-Hung after Stage 1 ESC fail OR the agent was
+        // dead-likely from the start. Distinct from crash because Stage 2
+        // is controlled, not detected — skip `record_crash`, use shorter
+        // backoff, selectively preserve crash counters + recovery counter
+        // across the spawn boundary (decision §1 critical wrinkle: fresh
+        // `HealthTracker` on spawn). See `docs/RECOVERY-STAGES.md` §RS.9.
+        if let crate::agent::AgentExitEvent::Stage2Restart(name) = exit_event {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                tracing::info!(agent = %name, "ignoring stage2 restart during shutdown");
+                break;
+            }
+            handle_stage2_restart(home, &name, &registry, &configs, &crash_tx, &shutdown);
             continue;
         }
 
@@ -1333,6 +1355,157 @@ fn spawn_and_register_agent(
         return Err(e.into());
     }
     Ok(())
+}
+
+/// `#685` sub-task 7b: Stage 2 auto-restart handler. Distinct from
+/// the Crash path (which calls `record_crash` + uses exponential
+/// backoff): Stage 2 is a *controlled* restart initiated by the
+/// recovery dispatcher when the agent failed to recover from Stage 1
+/// ESC. Selectively preserves crash counters + recovery counter
+/// across the spawn boundary so the cap (`STAGE2_MAX_RESTARTS_DEFAULT`)
+/// survives the restart it drove.
+///
+/// Decision §1 selective restore (4 fields): `crash_times`,
+/// `total_crashes`, `last_notification`, `recovery_restart_count` (+1).
+/// All other `HealthTracker` fields reset to fresh defaults — including
+/// `state: Healthy` (Stage 2 success seed) and `recovery_stage_state:
+/// None` (linear escalation rule restarts).
+///
+/// `spawn_agent` failure: agent removed from registry, dispatcher
+/// next-tick won't find it. Operator already received Stage 2 telegram
+/// pre-emit so visibility is preserved. Phase 1 limitation acknowledged
+/// in `docs/RECOVERY-STAGES.md §RS.9` — full operator unpause +
+/// re-spawn flow ships in sub-task 7c.
+fn handle_stage2_restart(
+    home: &Path,
+    name: &str,
+    registry: &AgentRegistry,
+    configs: &Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>,
+    crash_tx: &crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+    shutdown: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::time::{Duration, Instant};
+    tracing::warn!(
+        target: "recovery_shadow",
+        agent = %name,
+        "stage2 restart initiated"
+    );
+    crate::event_log::log(home, "stage2_restart", name, "stage 2 auto-restart");
+
+    // Snapshot the 4 fields we'll preserve across spawn. Reads then
+    // drops the lock before backoff sleep + spawn.
+    let saved = {
+        let reg = agent::lock_registry(registry);
+        reg.get(name).map(|h| {
+            let core = h.core.lock();
+            (
+                core.health.crash_times.clone(),
+                core.health.total_crashes,
+                core.health.last_notification,
+                core.health.recovery_restart_count,
+            )
+        })
+    };
+    let saved = match saved {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                target: "recovery_shadow",
+                agent = %name,
+                "stage2 restart: agent not in registry, skipping"
+            );
+            return;
+        }
+    };
+
+    let config = match configs.lock().get(name).cloned() {
+        Some(c) => c,
+        None => {
+            tracing::warn!(
+                target: "recovery_shadow",
+                agent = %name,
+                "stage2 restart: no config for respawn (likely deleted)"
+            );
+            return;
+        }
+    };
+
+    let backoff_ms = std::env::var("AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(crate::health::STAGE2_BACKOFF_DEFAULT_MS);
+    let backoff = Duration::from_millis(backoff_ms);
+
+    std::thread::sleep(backoff);
+    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            target: "recovery_shadow",
+            agent = %name,
+            "shutdown during stage2 backoff, aborting"
+        );
+        return;
+    }
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    let spawn_result = agent::spawn_agent(
+        &agent::SpawnConfig {
+            name,
+            backend_command: &config.backend_command,
+            args: &config.args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols,
+            rows,
+            env: config.env.as_ref(),
+            working_dir: config.working_dir.as_deref(),
+            submit_key: &config.submit_key,
+            home: Some(home),
+            crash_tx: Some(crash_tx.clone()),
+            shutdown: Some(Arc::clone(shutdown)),
+        },
+        registry,
+    );
+
+    match spawn_result {
+        Ok(()) => {
+            tracing::info!(
+                target: "recovery_shadow",
+                agent = %name,
+                "stage2 spawn ok"
+            );
+            crate::event_log::log(home, "stage2_spawn_ok", name, "stage 2 spawn succeeded");
+
+            // Selective restore — fresh tracker starts with default
+            // values; we overwrite only the 4 preserved fields and
+            // increment recovery_restart_count by 1 (this Stage 2 fire
+            // contributes to the cap). All other fields stay at
+            // default — state stays Healthy (recovery success seed),
+            // recovery_stage_state stays None (linear escalation reset
+            // already encoded by spontaneous-recovery reset in
+            // dispatcher).
+            let reg = agent::lock_registry(registry);
+            if let Some(handle) = reg.get(name) {
+                let mut core = handle.core.lock();
+                let (crash_times, total_crashes, last_notification, prev_count) = saved;
+                core.health.crash_times = crash_times;
+                core.health.total_crashes = total_crashes;
+                core.health.last_notification = last_notification;
+                core.health.recovery_restart_count = prev_count.saturating_add(1);
+                core.health.last_stage2_fired_at = Some(Instant::now());
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "recovery_shadow",
+                agent = %name,
+                error = %e,
+                "stage2 spawn failed — agent removed, operator notified via telegram"
+            );
+            crate::event_log::log(home, "stage2_spawn_failed", name, &format!("error: {e}"));
+            // Agent left removed; operator handles via manual re-spawn
+            // OR future operator-unpause / re-spawn sub-task. Phase 1
+            // limitation documented in §RS.9.
+        }
+    }
 }
 
 #[cfg(test)]
