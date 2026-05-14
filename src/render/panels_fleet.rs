@@ -199,6 +199,7 @@ mod tests {
             orchestrator: Some("dev-lead".to_string()),
             description: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
+            source_repo: None,
         }];
         let tasks = vec![crate::tasks::Task {
             id: "t-1".to_string(),

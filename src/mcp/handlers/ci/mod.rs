@@ -1,18 +1,7 @@
 use crate::agent_ops::validate_branch;
+use crate::git_helpers::git_bypass;
 use serde_json::{json, Value};
 use std::path::Path;
-
-/// Daemon-internal git subprocess wrapper that always sets
-/// `AGEND_GIT_BYPASS=1`. Centralizes the bypass-env contract so adding
-/// a new git call to this module cannot silently trip the fleet-managed
-/// `git worktree`/`git branch` shim deny.
-fn git_bypass(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-}
 
 pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let source = match args["source"].as_str() {
@@ -83,156 +72,39 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
         return json!({"error": "source path rejected: system directory"});
     }
     // #780: auto-create branch from `from_ref` when bind:true + branch
-    // missing locally. Closes the single-step bypass-free workflow gap
-    // surfaced post-#779 (`git worktree add <path> <branch>` without
-    // `-b` rejects missing refs). `bind:false` preserves current
-    // back-compat (no auto-create) per decision
+    // missing locally. #781 Piece 6 extracts the decision tree into
+    // `dispatch_hook::ensure_branch_exists` so the same logic services
+    // both this MCP-tool entry and the `send kind=task` dispatch hook
+    // (single source of truth, no #780-vs-#781 logic drift). `bind:false`
+    // preserves current back-compat (no auto-create) per decision
     // `d-20260514102305998399-0` scope.
     let mut auto_created_branch = false;
     let mut fetch_attempted = false;
     if bind {
         let from_ref = args["from_ref"].as_str().unwrap_or("origin/main");
-        // Defense in depth: same charset rules as `branch`. Rejects
-        // option-injection (e.g. `--upload-pack=...`) via the leading-`-`
-        // and ".." guards in `validate_branch`.
-        if !validate_branch(from_ref) {
-            return json!({
-                "error": format!("invalid from_ref '{from_ref}'"),
-                "code": "invalid_from_ref",
-                "stage": "validate_from_ref",
-                "fetch_attempted": false,
-            });
-        }
         let src = Path::new(&source_path);
-        let branch_ref = format!("refs/heads/{branch}");
-        let branch_exists = git_bypass(src, &["rev-parse", "--verify", &branch_ref])
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !branch_exists {
-            // Step 2: try create from `from_ref` (no fetch yet — zero
-            // network on the fast path where origin/main is already
-            // a valid local ref).
-            match git_bypass(src, &["branch", branch, from_ref]) {
-                Ok(o) if o.status.success() => {
-                    auto_created_branch = true;
+        match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
+            home,
+            src,
+            branch,
+            from_ref,
+            instance_name,
+        ) {
+            Ok((created, fetched)) => {
+                auto_created_branch = created;
+                fetch_attempted = fetched;
+            }
+            Err(err) => {
+                let mut e = json!({
+                    "error": err.message,
+                    "code": serde_json::to_value(err.code).unwrap_or(json!("unknown")),
+                    "stage": serde_json::to_value(err.stage).unwrap_or(json!("unknown")),
+                    "fetch_attempted": err.fetch_attempted,
+                });
+                if let Some(raw) = err.raw {
+                    e["raw"] = json!(raw);
                 }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                    if stderr.contains("already exists") {
-                        // Race: concurrent caller authored the branch
-                        // between rev-parse and branch. Idempotent
-                        // fall-through — auto_created_branch stays false
-                        // so callers can distinguish "I created it" vs
-                        // "I observed it pre-existing".
-                    } else if stderr.contains("not a valid object name")
-                        || stderr.contains("not a valid ref")
-                    {
-                        tracing::warn!(
-                            target: "ci_handler",
-                            branch = %branch,
-                            from_ref = %from_ref,
-                            "auto-create fallback: from_ref unresolved locally — fetching origin"
-                        );
-                        let fetch_start = std::time::Instant::now();
-                        let fetch_out = git_bypass(src, &["fetch", "origin", "--quiet"]);
-                        fetch_attempted = true;
-                        let fetch_ms = fetch_start.elapsed().as_millis();
-                        crate::event_log::log(
-                            home,
-                            "checkout_auto_create_fetch",
-                            instance_name,
-                            &format!("branch={branch} from_ref={from_ref} duration_ms={fetch_ms}"),
-                        );
-                        match fetch_out {
-                            Ok(fo) if fo.status.success() => {
-                                match git_bypass(src, &["branch", branch, from_ref]) {
-                                    Ok(ro) if ro.status.success() => {
-                                        auto_created_branch = true;
-                                    }
-                                    Ok(ro) => {
-                                        let rstderr =
-                                            String::from_utf8_lossy(&ro.stderr).to_string();
-                                        if rstderr.contains("already exists") {
-                                            // Race after fetch — leave
-                                            // auto_created_branch=false.
-                                        } else {
-                                            tracing::warn!(
-                                                target: "ci_handler",
-                                                branch = %branch,
-                                                from_ref = %from_ref,
-                                                stderr = %rstderr,
-                                                "auto-create retry failed after fetch"
-                                            );
-                                            return json!({
-                                                "error": format!(
-                                                    "from_ref '{from_ref}' invalid (branch creation failed after fetch)"
-                                                ),
-                                                "code": "invalid_from_ref",
-                                                "stage": "retry_create",
-                                                "fetch_attempted": true,
-                                                "raw": rstderr,
-                                            });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        return json!({
-                                            "error": format!("git branch retry spawn failed: {e}"),
-                                            "code": "branch_create_failed",
-                                            "stage": "retry_create",
-                                            "fetch_attempted": true,
-                                            "raw": e.to_string(),
-                                        });
-                                    }
-                                }
-                            }
-                            Ok(fo) => {
-                                let fstderr = String::from_utf8_lossy(&fo.stderr).to_string();
-                                tracing::warn!(
-                                    target: "ci_handler",
-                                    branch = %branch,
-                                    from_ref = %from_ref,
-                                    stderr = %fstderr,
-                                    "auto-create fetch failed"
-                                );
-                                return json!({
-                                    "error": format!(
-                                        "git fetch origin failed (from_ref '{from_ref}' cannot be resolved)"
-                                    ),
-                                    "code": "fetch_failed",
-                                    "stage": "fetch",
-                                    "fetch_attempted": true,
-                                    "raw": fstderr,
-                                });
-                            }
-                            Err(e) => {
-                                return json!({
-                                    "error": format!("git fetch spawn failed: {e}"),
-                                    "code": "fetch_failed",
-                                    "stage": "fetch",
-                                    "fetch_attempted": true,
-                                    "raw": e.to_string(),
-                                });
-                            }
-                        }
-                    } else {
-                        return json!({
-                            "error": format!("git branch failed: {}", stderr.trim()),
-                            "code": "branch_create_failed",
-                            "stage": "create_branch",
-                            "fetch_attempted": false,
-                            "raw": stderr,
-                        });
-                    }
-                }
-                Err(e) => {
-                    return json!({
-                        "error": format!("git branch spawn failed: {e}"),
-                        "code": "branch_create_failed",
-                        "stage": "create_branch",
-                        "fetch_attempted": false,
-                        "raw": e.to_string(),
-                    });
-                }
+                return e;
             }
         }
     }

@@ -22,6 +22,15 @@ pub struct Team {
     pub orchestrator: Option<String>,
     pub description: Option<String>,
     pub created_at: String,
+    /// #781 Piece 3 (Bug A1): operator-visible source_repo. Pre-#781
+    /// the projection silently dropped this field, masking the
+    /// migration-time `source_repo=None` (Bug A0) from `team list`
+    /// callers. Persist as `Option` so legacy-migrated teams render
+    /// `null` rather than disappearing from the projection — operator
+    /// can `jq '.teams[] | select(.source_repo == null)'` to enumerate
+    /// teams needing remediation.
+    #[serde(default)]
+    pub source_repo: Option<std::path::PathBuf>,
 }
 
 impl Team {
@@ -45,6 +54,7 @@ fn project_team(name: &str, cfg: &crate::fleet::TeamConfig) -> Team {
         orchestrator: cfg.orchestrator.clone(),
         description: cfg.description.clone(),
         created_at: cfg.created_at.clone().unwrap_or_default(),
+        source_repo: cfg.source_repo.clone(),
     }
 }
 

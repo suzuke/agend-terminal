@@ -224,10 +224,25 @@ pub fn create(
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            // Branch or worktree already exists — try without -b (exit code 128 = git error)
-            if o.status.code() == Some(128)
-                && (stderr.contains("already exists") || stderr.contains("is already checked out"))
-            {
+            // #781 Piece 2 (Bug B): the prior `o.status.code() == Some(128)`
+            // gate was too strict. `git worktree add -b <existing-branch>`
+            // can exit with code 255 (not 128) when the failure happens
+            // after the "Preparing worktree (new branch …)" progress line
+            // has already been emitted to stderr — observed in macOS git
+            // 2.42+ in the #781 spike (raw capture: exit 255, stderr
+            // "fatal: a branch named '…' already exists"). Exit codes
+            // from `git worktree add` are not contracted in any released
+            // git manpage we could find; the stderr substring is the
+            // load-bearing semantic signal. Rely on it alone.
+            //
+            // Reasoning: across git versions / locales the stderr
+            // wording stays stable (English) for the duplicate-branch
+            // case ("already exists") and the cross-worktree-checkout
+            // case ("is already checked out"); the exit code drift is
+            // version-specific. Adding more codes to the allow-list
+            // would just chase the next git release — the substring
+            // check is what we actually want.
+            if stderr.contains("already exists") || stderr.contains("is already checked out") {
                 let output2 = std::process::Command::new("git")
                     .env("AGEND_GIT_BYPASS", "1")
                     .args(["worktree", "add", &wt_dir.display().to_string(), &branch])

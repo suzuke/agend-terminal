@@ -2,6 +2,23 @@
 
 use std::path::Path;
 
+/// #781 Piece 6 — daemon-internal `git` subprocess wrapper that always
+/// sets `AGEND_GIT_BYPASS=1`. Centralizes the bypass-env contract so
+/// adding a new git call cannot silently trip the fleet-managed
+/// `git worktree` / `git branch` shim deny.
+///
+/// Originated in #780 as a private `fn` inside `mcp::handlers::ci::mod`.
+/// Promoted to `pub(crate)` in `git_helpers` for #781 so both
+/// `handle_checkout_repo` and `dispatch_auto_bind_lease`'s
+/// `ensure_branch_exists` extraction share a single bypass-env helper.
+pub(crate) fn git_bypass(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+}
+
 /// Detect the default branch of a repository.
 /// Reads `refs/remotes/origin/HEAD` → extracts branch name.
 /// Falls back to "main" if detection fails.

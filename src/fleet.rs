@@ -1215,12 +1215,43 @@ pub fn migrate_teams_json_to_yaml(home: &Path) -> Result<()> {
             orchestrator: team.orchestrator.clone(),
             description: team.description.clone(),
             created_at: team.created_at.clone(),
+            // Legacy `teams.json` schema (pre-Sprint-54) has no
+            // `source_repo` field — migration physically cannot carry
+            // over what doesn't exist. Hard-coded None is the only
+            // option; downstream operator UX (#781 Piece 1a-i / 1a-ii
+            // warn below + Bug A1 Team projection surfacing the field)
+            // makes the resulting `None` state visible so the operator
+            // knows to run `team update source_repo=...` instead of
+            // silently falling to Tier 4 stub at dispatch time.
             source_repo: None,
         };
         // add_team_to_yaml is no-op when team already in fleet.yaml —
         // operator hand-edits win, runtime store loses on conflict.
         match add_team_to_yaml(home, &team.name, &cfg) {
-            Ok(true) => tracing::info!(name = %team.name, "migrated team to fleet.yaml"),
+            Ok(true) => {
+                tracing::info!(name = %team.name, "migrated team to fleet.yaml");
+                // #781 Piece 1a-i — operator-facing warn so the
+                // legacy-migration source_repo=None state surfaces in
+                // daemon logs at startup time, not at first failed
+                // dispatch.
+                tracing::warn!(
+                    name = %team.name,
+                    "migrated team from legacy teams.json without source_repo — \
+                     set via `team(action=update, name={}, source_repo=...)` or \
+                     daemon will fall to working_directory/stub Tier 3/4 in dispatch_auto_bind_lease",
+                    team.name
+                );
+                // #781 Piece 1a-ii — event_log persists the warning
+                // for post-mortem visibility; tracing logs rotate /
+                // tail-only by default and operators may miss them.
+                crate::event_log::log(
+                    home,
+                    "team_migration_missing_source_repo",
+                    &team.name,
+                    "legacy teams.json schema had no source_repo; \
+                     set via team(action=update) to avoid Tier 4 stub fallback",
+                );
+            }
             Ok(false) => tracing::info!(name = %team.name,
                 "team already in fleet.yaml, skipping migration entry"),
             Err(e) => {

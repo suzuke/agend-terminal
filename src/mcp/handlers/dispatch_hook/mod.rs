@@ -62,12 +62,6 @@ impl std::error::Error for DispatchError {}
 /// Which tier of [`resolve_source_repo`] fired. Observable via
 /// [`DispatchOutcome::source_repo_tier`] so callers can audit
 /// configuration completeness without parsing logs.
-///
-/// Variants `Override`/`FleetSourceRepo`/`TeamSourceRepo`/`WorkingDirectory`
-/// are wired in C4 once `resolve_source_repo` reports tier. C2 only
-/// constructs `Stub` (placeholder); `allow(dead_code)` on unused variants
-/// until C4 removes the attribute.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceRepoTier {
@@ -88,11 +82,6 @@ pub enum SourceRepoTier {
 
 /// Pipeline stage that produced a [`DispatchError`]. Coarse enough to
 /// remain stable across refactors, fine enough to debug.
-///
-/// Variants `ValidateFromRef`/`CreateBranch`/`Fetch`/`RetryCreate` are
-/// constructed in C4 once `ensure_branch_exists` runs at the dispatch
-/// layer. `allow(dead_code)` on unused variants until C4.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -112,11 +101,6 @@ pub enum Stage {
 
 /// Canonical `code` enum — stable across releases. Callers MUST match
 /// on this rather than parsing `message` substrings.
-///
-/// Variants `InvalidFromRef`/`BranchCreateFailed`/`FetchFailed` are
-/// constructed in C4 once `ensure_branch_exists` runs. `allow(dead_code)`
-/// on unused variants until C4.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -250,7 +234,8 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
     let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|f| f.resolve_instance(target));
-    let source_repo = resolve_source_repo(home, target, source_repo_override, resolved.as_ref());
+    let (source_repo, source_repo_tier) =
+        resolve_source_repo(home, target, source_repo_override, resolved.as_ref());
 
     // P0-1.5: central lease registry check — reject if another agent holds this branch.
     if let Some(other) = crate::binding::scan_existing_branch_binding(home, branch, target) {
@@ -294,6 +279,47 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         }
     }
 
+    // #781 Piece 6: ensure branch exists in `source_repo` BEFORE the
+    // lease attempt. Centralizing branch provisioning at the dispatch
+    // layer surfaces auto-create observability (DispatchOutcome's
+    // auto_created_branch / fetch_attempted) and shares one decision
+    // tree with `repo action=checkout bind:true` (the #784 entry).
+    //
+    // `from_ref` is hard-coded to `"origin/main"` (mirror #784 default).
+    //
+    // Fail-soft contract: errors from `ensure_branch_exists` fall through
+    // to `worktree_pool::lease` → `worktree::create -b` (which creates
+    // the branch from current HEAD). This preserves pre-#781 behavior
+    // for legacy callers / test fixtures where `source_repo` is a local
+    // repo with no `origin` remote (so the `git branch X origin/main` +
+    // fetch fallback paths both fail). Production canonicals have
+    // `origin/main` populated and hit the fast path. Validate-side
+    // failures (`InvalidFromRef`, e.g. option injection) DO surface as
+    // hard errors so a malicious caller can't slip past the boundary
+    // by triggering soft-fallback.
+    let (auto_created_branch, fetch_attempted) =
+        match ensure_branch_exists(home, &source_repo, branch, "origin/main", target) {
+            Ok(tup) => tup,
+            Err(err)
+                if err.code == ErrorCode::InvalidFromRef && err.stage == Stage::ValidateFromRef =>
+            {
+                return Err(err);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "dispatch_hook",
+                    %target,
+                    %branch,
+                    code = ?err.code,
+                    stage = ?err.stage,
+                    message = %err.message,
+                    "ensure_branch_exists soft-fallback: legacy / origin-less source_repo \
+                     — falling through to worktree::create -b path"
+                );
+                (false, err.fetch_attempted)
+            }
+        };
+
     // Attempt lease (creates worktree + tags as daemon-managed).
     // Lease errors REJECT the dispatch (Q2 + §3.3).
     let lease = crate::worktree_pool::lease(home, &source_repo, target, branch).map_err(|msg| {
@@ -306,7 +332,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
             message: msg.clone(),
             code,
             stage: Stage::WorktreeLeaseConflict,
-            fetch_attempted: false,
+            fetch_attempted,
             raw: Some(msg),
         }
     })?;
@@ -344,15 +370,10 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         tracing::info!(%target, repo = %r, %branch, "dispatch auto-watch_ci");
     }
 
-    // C2 placeholder: `source_repo_tier` / `auto_created_branch` /
-    // `fetch_attempted` are wired to real observability sources in C4 once
-    // `resolve_source_repo` reports tier + `ensure_branch_exists` reports
-    // create/fetch outcomes. Placeholder values are safe defaults — no
-    // existing caller inspects these fields pre-C4.
     Ok(DispatchOutcome {
-        source_repo_tier: SourceRepoTier::Stub,
-        auto_created_branch: false,
-        fetch_attempted: false,
+        source_repo_tier,
+        auto_created_branch,
+        fetch_attempted,
     })
 }
 
@@ -361,32 +382,37 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
 /// `working_directory` → `home/workspace/<agent>` stub. INFO logs which
 /// tier was hit; WARN when the stub fallback (tier 4) fires; optional
 /// `AGEND_BIND_STRICT_MODE=1` env flag rejects tier 4 in production.
+///
+/// #781 Piece 6: returns the resolved path AND the [`SourceRepoTier`]
+/// that fired so callers (`dispatch_auto_bind_lease_with_source`) can
+/// surface tier via [`DispatchOutcome::source_repo_tier`] — operator
+/// audits configuration completeness without parsing logs.
 fn resolve_source_repo(
     home: &Path,
     target: &str,
     override_path: Option<&Path>,
     resolved: Option<&crate::fleet::ResolvedInstance>,
-) -> PathBuf {
+) -> (PathBuf, SourceRepoTier) {
     if let Some(p) = override_path {
         tracing::info!(%target, tier = "override", path = %p.display(),
             "source_repo resolved via explicit caller override (tier 1)");
-        return p.to_path_buf();
+        return (p.to_path_buf(), SourceRepoTier::Override);
     }
     if let Some(p) = resolved.and_then(|r| r.source_repo.clone()) {
         tracing::info!(%target, tier = "fleet_source_repo", path = %p.display(),
             "source_repo resolved via fleet.yaml source_repo (tier 2)");
-        return p;
+        return (p, SourceRepoTier::FleetSourceRepo);
     }
     // Tier 2.5: team source_repo
     if let Some(p) = resolve_team_source_repo(home, target) {
         tracing::info!(%target, tier = "team_source_repo", path = %p.display(),
             "source_repo resolved via team source_repo (tier 2.5)");
-        return p;
+        return (p, SourceRepoTier::TeamSourceRepo);
     }
     if let Some(p) = resolved.and_then(|r| r.working_directory.clone()) {
         tracing::info!(%target, tier = "working_directory", path = %p.display(),
             "source_repo resolved via fleet.yaml working_directory (tier 3, deprecation candidate)");
-        return p;
+        return (p, SourceRepoTier::WorkingDirectory);
     }
     let stub = crate::paths::workspace_dir(home).join(target);
     tracing::warn!(%target, tier = "stub", path = %stub.display(),
@@ -394,17 +420,214 @@ fn resolve_source_repo(
     if std::env::var("AGEND_BIND_STRICT_MODE").as_deref() == Ok("1") {
         tracing::error!(%target, "AGEND_BIND_STRICT_MODE=1: stub fallback rejected");
     }
-    stub
+    (stub, SourceRepoTier::Stub)
+}
+
+/// #781 Piece 6: shared auto-create-branch helper. Encapsulates the
+/// decision tree previously inlined in
+/// `mcp::handlers::ci::handle_checkout_repo` (introduced in #780). Both
+/// the `repo action=checkout bind:true` MCP tool entry and
+/// `dispatch_auto_bind_lease` now route through this single helper so
+/// the fast path (zero network on missing-branch-with-local-origin/main)
+/// and the lazy fetch fallback live in one place.
+///
+/// Behavior (mirror #784 / decision d-20260514102305998399-0):
+/// 1. `rev-parse --verify refs/heads/<branch>` — if exists, return
+///    `(auto_created=false, fetch_attempted=false)`.
+/// 2. Else `git branch <branch> <from_ref>`:
+///    - success → `(true, false)`
+///    - stderr `"already exists"` (concurrent race) → `(false, false)`
+///    - stderr `"not a valid object name"` / `"not a valid ref"` →
+///      `git fetch origin --quiet` then retry; success → `(true, true)`;
+///      retry race "already exists" → `(false, true)`; otherwise
+///      structured error.
+///
+/// `from_ref` runs through `validate_branch` (defense in depth) to
+/// reject option-injection (`--upload-pack=...`) at the daemon API
+/// boundary — same rule applied to the user-supplied `branch` arg.
+///
+/// `actor` is the agent / instance name used as `event_log` identifier
+/// for the fetch-duration breadcrumb (helps post-mortem who triggered
+/// the network I/O).
+pub(crate) fn ensure_branch_exists(
+    home: &Path,
+    source: &Path,
+    branch: &str,
+    from_ref: &str,
+    actor: &str,
+) -> Result<(bool, bool), DispatchError> {
+    if !crate::agent_ops::validate_branch(from_ref) {
+        return Err(DispatchError {
+            message: format!("invalid from_ref '{from_ref}'"),
+            code: ErrorCode::InvalidFromRef,
+            stage: Stage::ValidateFromRef,
+            fetch_attempted: false,
+            raw: None,
+        });
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_exists =
+        crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", &branch_ref])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    if branch_exists {
+        return Ok((false, false));
+    }
+    // Step 2: try create from `from_ref` (no fetch yet — zero network
+    // on the fast path where origin/main is already a valid local ref).
+    match crate::git_helpers::git_bypass(source, &["branch", branch, from_ref]) {
+        Ok(o) if o.status.success() => Ok((true, false)),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            if stderr.contains("already exists") {
+                // Race: concurrent caller authored the branch between
+                // rev-parse and branch. Idempotent fall-through —
+                // auto_created stays false so callers can distinguish
+                // "I created it" vs "I observed it pre-existing".
+                Ok((false, false))
+            } else if stderr.contains("not a valid object name")
+                || stderr.contains("not a valid ref")
+            {
+                tracing::warn!(
+                    target: "dispatch_hook",
+                    %branch,
+                    %from_ref,
+                    "ensure_branch_exists fallback: from_ref unresolved locally — fetching origin"
+                );
+                let fetch_start = std::time::Instant::now();
+                let fetch_out =
+                    crate::git_helpers::git_bypass(source, &["fetch", "origin", "--quiet"]);
+                let fetch_ms = fetch_start.elapsed().as_millis();
+                crate::event_log::log(
+                    home,
+                    "ensure_branch_fetch",
+                    actor,
+                    &format!("branch={branch} from_ref={from_ref} duration_ms={fetch_ms}"),
+                );
+                match fetch_out {
+                    Ok(fo) if fo.status.success() => {
+                        match crate::git_helpers::git_bypass(source, &["branch", branch, from_ref])
+                        {
+                            Ok(ro) if ro.status.success() => Ok((true, true)),
+                            Ok(ro) => {
+                                let rstderr = String::from_utf8_lossy(&ro.stderr).to_string();
+                                if rstderr.contains("already exists") {
+                                    Ok((false, true))
+                                } else {
+                                    tracing::warn!(
+                                        target: "dispatch_hook",
+                                        %branch, %from_ref, stderr = %rstderr,
+                                        "ensure_branch_exists retry failed after fetch"
+                                    );
+                                    Err(DispatchError {
+                                        message: format!(
+                                            "from_ref '{from_ref}' invalid (branch creation failed after fetch)"
+                                        ),
+                                        code: ErrorCode::InvalidFromRef,
+                                        stage: Stage::RetryCreate,
+                                        fetch_attempted: true,
+                                        raw: Some(rstderr),
+                                    })
+                                }
+                            }
+                            Err(e) => Err(DispatchError {
+                                message: format!("git branch retry spawn failed: {e}"),
+                                code: ErrorCode::BranchCreateFailed,
+                                stage: Stage::RetryCreate,
+                                fetch_attempted: true,
+                                raw: Some(e.to_string()),
+                            }),
+                        }
+                    }
+                    Ok(fo) => {
+                        let fstderr = String::from_utf8_lossy(&fo.stderr).to_string();
+                        tracing::warn!(
+                            target: "dispatch_hook",
+                            %branch, %from_ref, stderr = %fstderr,
+                            "ensure_branch_exists fetch failed"
+                        );
+                        Err(DispatchError {
+                            message: format!(
+                                "git fetch origin failed (from_ref '{from_ref}' cannot be resolved)"
+                            ),
+                            code: ErrorCode::FetchFailed,
+                            stage: Stage::Fetch,
+                            fetch_attempted: true,
+                            raw: Some(fstderr),
+                        })
+                    }
+                    Err(e) => Err(DispatchError {
+                        message: format!("git fetch spawn failed: {e}"),
+                        code: ErrorCode::FetchFailed,
+                        stage: Stage::Fetch,
+                        fetch_attempted: true,
+                        raw: Some(e.to_string()),
+                    }),
+                }
+            } else {
+                Err(DispatchError {
+                    message: format!("git branch failed: {}", stderr.trim()),
+                    code: ErrorCode::BranchCreateFailed,
+                    stage: Stage::CreateBranch,
+                    fetch_attempted: false,
+                    raw: Some(stderr),
+                })
+            }
+        }
+        Err(e) => Err(DispatchError {
+            message: format!("git branch spawn failed: {e}"),
+            code: ErrorCode::BranchCreateFailed,
+            stage: Stage::CreateBranch,
+            fetch_attempted: false,
+            raw: Some(e.to_string()),
+        }),
+    }
 }
 
 /// Resolve source_repo from the agent's team configuration.
+///
+/// #781 Piece 5 (defensive logging): the prior `.ok()?` swallowed
+/// FleetConfig::load errors silently — a malformed fleet.yaml or
+/// transient I/O fault dropped Tier 2.5 to None with zero diagnostics,
+/// making post-mortem investigation harder. The defensive branches
+/// below surface the actual error class (load failure vs no team
+/// match vs team match without `source_repo`) so operators can
+/// distinguish "Bug A0 legacy-migration case" (team matched but
+/// source_repo None) from "team membership setup gap".
 pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathBuf> {
-    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
+    let fleet = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                %agent,
+                home = %home.display(),
+                error = %e,
+                "Tier 2.5 resolution skipped: fleet.yaml load failed — \
+                 dispatch will fall through to tier 3 (working_directory) or \
+                 tier 4 (workspace stub)"
+            );
+            return None;
+        }
+    };
     for cfg in fleet.teams.values() {
         if cfg.members.contains(&agent.to_string()) {
+            if cfg.source_repo.is_none() {
+                tracing::warn!(
+                    %agent,
+                    "Tier 2.5 team match but `source_repo` is None — \
+                     likely legacy migration from teams.json (Bug A0, see #781). \
+                     Operator must run `team update name=<team> source_repo=<canonical>` \
+                     to escape the workspace stub fallback at tier 4"
+                );
+            }
             return cfg.source_repo.clone();
         }
     }
+    tracing::debug!(
+        %agent,
+        teams_searched = fleet.teams.len(),
+        "Tier 2.5: no team membership found for agent — falling through to tier 3/4"
+    );
     None
 }
 
