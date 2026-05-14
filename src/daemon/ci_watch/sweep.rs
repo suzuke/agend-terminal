@@ -25,6 +25,7 @@ pub(super) fn bump_consecutive_skips_and_maybe_notify(
     branch: &str,
     subscribers: &[String],
     reset_epoch: u64,
+    display_timezone: Option<&str>,
 ) {
     let mut watch: serde_json::Value = match std::fs::read_to_string(watch_path)
         .ok()
@@ -61,7 +62,14 @@ pub(super) fn bump_consecutive_skips_and_maybe_notify(
         // "stalled until" moment).
         let next_poll_eta = (reset_epoch as i64).saturating_mul(1000);
         let setup_warning = crate::github_token::cached_setup_warning();
-        let body = build_stalled_body(repo, branch, stalled_since_ms, next_poll_eta, setup_warning);
+        let body = build_stalled_body(
+            repo,
+            branch,
+            stalled_since_ms,
+            next_poll_eta,
+            setup_warning,
+            display_timezone,
+        );
         fan_out_health_event(home, repo, branch, subscribers, "ci-watch-stalled", body);
     }
 }
@@ -110,15 +118,24 @@ fn build_stalled_body(
     stalled_since_ms: Option<i64>,
     next_poll_eta_ms: i64,
     setup_warning: Option<&'static str>,
+    display_timezone: Option<&str>,
 ) -> String {
     let mut s = format!("[ci-watch-stalled] {repo}@{branch}: rate-limit backoff in effect");
     if let Some(ts) = stalled_since_ms {
         if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts) {
-            s.push_str(&format!("\nStalled since: {}", dt.to_rfc3339()));
+            // #790: render notification body in operator-configured tz;
+            // storage (`stalled_since_ms` json field) stays UTC.
+            s.push_str(&format!(
+                "\nStalled since: {}",
+                crate::display_time::format_local_short(&dt.to_rfc3339(), display_timezone)
+            ));
         }
     }
     if let Some(eta) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(next_poll_eta_ms) {
-        s.push_str(&format!("\nNext poll ETA: {}", eta.to_rfc3339()));
+        s.push_str(&format!(
+            "\nNext poll ETA: {}",
+            crate::display_time::format_local_short(&eta.to_rfc3339(), display_timezone)
+        ));
     }
     if let Some(w) = setup_warning {
         s.push_str(&format!("\nSetup hint: {w}"));

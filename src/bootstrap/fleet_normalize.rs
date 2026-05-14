@@ -140,6 +140,7 @@ mod tests {
             }),
             channels: None,
             templates: None,
+            display_timezone: None,
         };
         c.instances.insert(
             "worker".to_string(),
