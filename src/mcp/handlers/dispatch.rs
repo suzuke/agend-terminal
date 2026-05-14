@@ -34,10 +34,10 @@
 //! names.
 
 use crate::identity::Sender;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{binding_state, comms, force_release, instance, task, worktree};
+use super::{binding_state, ci, comms, force_release, instance, schedule, task, worktree};
 
 /// Shared per-call context — every common parameter `handle_tool`
 /// would otherwise pass into the match arms, bundled together so each
@@ -224,6 +224,232 @@ static TASK_ACTIONS: &[(&str, HandlerFn)] = &[
     ("done", dispatch_task_done),
 ];
 
+// ---------------------------------------------------------------------
+// Cohort migration (T-B9) — 7 action-based tools with N sub-handlers
+// each. Pattern (per T-B8 spot-check ACK + T-B9 dispatch):
+//
+//   - `dispatch_<tool>` base handler relocates the inline `match` from
+//     `mod.rs`. Recognized arms point to the same per-action fns the
+//     inline match used; the `other` arm produces the same error JSON.
+//   - Per-action sub-handlers (`dispatch_<tool>_<action>`) forward
+//     directly to the per-action fns. The dispatch table catches
+//     recognized actions and routes through these.
+//   - `<TOOL>_ACTIONS` static lists the (action_name, sub_handler)
+//     pairs.
+//
+// Runtime path: recognized action → dispatch table actions[…] hit →
+// sub-handler → per-action fn. Unknown / missing action → fall through
+// to `dispatch_<tool>` base → its `match` → `other` arm → unknown-
+// action error JSON. The base handler's recognized-action arms are
+// unreachable at runtime (dispatch table catches them first); they're
+// retained because they mirror the pre-migration inline match exactly,
+// which is the double-match safety net the dispatch contract requires.
+
+// `ci` — actions: watch / unwatch / status.
+
+fn dispatch_ci(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "watch" => ci::handle_watch_ci(ctx.home, ctx.args, ctx.instance_name),
+        "unwatch" => ci::handle_unwatch_ci(ctx.home, ctx.args),
+        "status" => ci::handle_status_ci(ctx.home, ctx.args, ctx.instance_name),
+        other => json!({"error": format!("unknown ci action: {other}")}),
+    }
+}
+
+fn dispatch_ci_watch(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_watch_ci(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_ci_unwatch(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_unwatch_ci(ctx.home, ctx.args)
+}
+
+fn dispatch_ci_status(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_status_ci(ctx.home, ctx.args, ctx.instance_name)
+}
+
+static CI_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("watch", dispatch_ci_watch),
+    ("unwatch", dispatch_ci_unwatch),
+    ("status", dispatch_ci_status),
+];
+
+// `decision` — actions: post / list / update.
+
+fn dispatch_decision(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "post" => task::handle_post_decision(ctx.home, ctx.args, ctx.instance_name, ctx.sender),
+        "list" => task::handle_list_decisions(ctx.home, ctx.args),
+        "update" => task::handle_update_decision(ctx.home, ctx.args, ctx.instance_name),
+        other => json!({"error": format!("unknown decision action: {other}")}),
+    }
+}
+
+fn dispatch_decision_post(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_post_decision(ctx.home, ctx.args, ctx.instance_name, ctx.sender)
+}
+
+fn dispatch_decision_list(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_list_decisions(ctx.home, ctx.args)
+}
+
+fn dispatch_decision_update(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_update_decision(ctx.home, ctx.args, ctx.instance_name)
+}
+
+static DECISION_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("post", dispatch_decision_post),
+    ("list", dispatch_decision_list),
+    ("update", dispatch_decision_update),
+];
+
+// `deployment` — actions: deploy / teardown / list.
+
+fn dispatch_deployment(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "deploy" => schedule::handle_deploy_template(ctx.home, ctx.args, ctx.instance_name),
+        "teardown" => schedule::handle_teardown_deployment(ctx.home, ctx.args),
+        "list" => schedule::handle_list_deployments(ctx.home),
+        other => json!({"error": format!("unknown deployment action: {other}")}),
+    }
+}
+
+fn dispatch_deployment_deploy(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_deploy_template(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_deployment_teardown(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_teardown_deployment(ctx.home, ctx.args)
+}
+
+fn dispatch_deployment_list(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_list_deployments(ctx.home)
+}
+
+static DEPLOYMENT_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("deploy", dispatch_deployment_deploy),
+    ("teardown", dispatch_deployment_teardown),
+    ("list", dispatch_deployment_list),
+];
+
+// `health` — actions: report / clear.
+
+fn dispatch_health(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "report" => {
+            instance::handle_report_health(ctx.home, ctx.args, ctx.instance_name, ctx.sender)
+        }
+        "clear" => instance::handle_clear_blocked_reason(ctx.home, ctx.args),
+        other => json!({"error": format!("unknown health action: {other}")}),
+    }
+}
+
+fn dispatch_health_report(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_report_health(ctx.home, ctx.args, ctx.instance_name, ctx.sender)
+}
+
+fn dispatch_health_clear(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_clear_blocked_reason(ctx.home, ctx.args)
+}
+
+static HEALTH_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("report", dispatch_health_report),
+    ("clear", dispatch_health_clear),
+];
+
+// `repo` — actions: checkout / release.
+
+fn dispatch_repo(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "checkout" => ci::handle_checkout_repo(ctx.home, ctx.args, ctx.instance_name),
+        "release" => ci::handle_release_repo(ctx.args),
+        other => json!({"error": format!("unknown repo action: {other}")}),
+    }
+}
+
+fn dispatch_repo_checkout(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_checkout_repo(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_repo_release(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_release_repo(ctx.args)
+}
+
+static REPO_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("checkout", dispatch_repo_checkout),
+    ("release", dispatch_repo_release),
+];
+
+// `schedule` — actions: create / list / update / delete.
+
+fn dispatch_schedule(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "create" => schedule::handle_create_schedule(ctx.home, ctx.args, ctx.instance_name),
+        "list" => schedule::handle_list_schedules(ctx.home, ctx.args),
+        "update" => schedule::handle_update_schedule(ctx.home, ctx.args),
+        "delete" => schedule::handle_delete_schedule(ctx.home, ctx.args),
+        other => json!({"error": format!("unknown schedule action: {other}")}),
+    }
+}
+
+fn dispatch_schedule_create(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_create_schedule(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_schedule_list(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_list_schedules(ctx.home, ctx.args)
+}
+
+fn dispatch_schedule_update(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_update_schedule(ctx.home, ctx.args)
+}
+
+fn dispatch_schedule_delete(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_delete_schedule(ctx.home, ctx.args)
+}
+
+static SCHEDULE_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("create", dispatch_schedule_create),
+    ("list", dispatch_schedule_list),
+    ("update", dispatch_schedule_update),
+    ("delete", dispatch_schedule_delete),
+];
+
+// `team` — actions: create / delete / list / update.
+
+fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "create" => task::handle_create_team(ctx.home, ctx.args),
+        "delete" => task::handle_delete_team(ctx.home, ctx.args),
+        "list" => task::handle_list_teams(ctx.home),
+        "update" => task::handle_update_team(ctx.home, ctx.args),
+        other => json!({"error": format!("unknown team action: {other}")}),
+    }
+}
+
+fn dispatch_team_create(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_create_team(ctx.home, ctx.args)
+}
+
+fn dispatch_team_delete(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_delete_team(ctx.home, ctx.args)
+}
+
+fn dispatch_team_list(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_list_teams(ctx.home)
+}
+
+fn dispatch_team_update(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_update_team(ctx.home, ctx.args)
+}
+
+static TEAM_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("create", dispatch_team_create),
+    ("delete", dispatch_team_delete),
+    ("list", dispatch_team_list),
+    ("update", dispatch_team_update),
+];
+
 /// Registered tool dispatchers. **Adding a tool**: write its adapter
 /// above, append a [`HandlerEntry`] here. **Removing**: delete both
 /// halves. Order doesn't affect correctness (linear-scan match by
@@ -321,12 +547,49 @@ static REGISTERED: &[HandlerEntry] = &[
         handler: dispatch_gc_dry_run,
         actions: None,
     },
-    // Action sub-routing validation case (T-B8) — only "list"
-    // wired for early-report spot-check. T-B9 wires the rest.
+    // Action sub-routing (T-B8) — all 5 actions wired (`task`).
     HandlerEntry {
         name: "task",
         handler: dispatch_task,
         actions: Some(TASK_ACTIONS),
+    },
+    // Action-based cohort (T-B9): ci / decision / deployment / health
+    // / repo / schedule / team. Alphabetical per dispatch contract's
+    // suggested decomposition.
+    HandlerEntry {
+        name: "ci",
+        handler: dispatch_ci,
+        actions: Some(CI_ACTIONS),
+    },
+    HandlerEntry {
+        name: "decision",
+        handler: dispatch_decision,
+        actions: Some(DECISION_ACTIONS),
+    },
+    HandlerEntry {
+        name: "deployment",
+        handler: dispatch_deployment,
+        actions: Some(DEPLOYMENT_ACTIONS),
+    },
+    HandlerEntry {
+        name: "health",
+        handler: dispatch_health,
+        actions: Some(HEALTH_ACTIONS),
+    },
+    HandlerEntry {
+        name: "repo",
+        handler: dispatch_repo,
+        actions: Some(REPO_ACTIONS),
+    },
+    HandlerEntry {
+        name: "schedule",
+        handler: dispatch_schedule,
+        actions: Some(SCHEDULE_ACTIONS),
+    },
+    HandlerEntry {
+        name: "team",
+        handler: dispatch_team,
+        actions: Some(TEAM_ACTIONS),
     },
 ];
 
@@ -396,9 +659,16 @@ mod tests {
                 "force_release_worktree",
                 "gc_dry_run",
                 "task",
+                "ci",
+                "decision",
+                "deployment",
+                "health",
+                "repo",
+                "schedule",
+                "team",
             ]
         );
-        assert_eq!(registered_handlers().len(), 16);
+        assert_eq!(registered_handlers().len(), 23);
     }
 
     /// Coverage test: every tool name advertised by
@@ -440,21 +710,61 @@ mod tests {
         );
     }
 
-    /// Action sub-routing — each of the 5 recognized `task` actions
-    /// routes through its sub-handler. All 5 sub-handlers currently
-    /// forward to the same base, so the assertion is that the call
-    /// returns `Some` (proves the sub-routing path executed without
-    /// panic for every wired action). Parameterized to avoid 5 near-
-    /// identical test fns.
+    /// Action sub-routing — every recognized action across every
+    /// action-based tool routes through its sub-handler. Parameterized
+    /// on (tool, action) pairs to avoid 8+ near-identical test fns.
+    /// The list mirrors the `actions` fields declared in `REGISTERED`
+    /// and the inline-match arms removed from `mod.rs`; if a new
+    /// action gets added to a tool, add it here so the routing is
+    /// pinned.
     #[test]
     fn try_dispatch_routes_known_action_through_sub_handler() {
         let home = std::env::temp_dir();
-        for action in ["create", "list", "claim", "update", "done"] {
-            let args = json!({"action": action});
-            let ctx = ctx_for(&home, &args, "");
+        let cases: &[(&str, &[&str])] = &[
+            ("task", &["create", "list", "claim", "update", "done"]),
+            ("ci", &["watch", "unwatch", "status"]),
+            ("decision", &["post", "list", "update"]),
+            ("deployment", &["deploy", "teardown", "list"]),
+            ("health", &["report", "clear"]),
+            ("repo", &["checkout", "release"]),
+            ("schedule", &["create", "list", "update", "delete"]),
+            ("team", &["create", "delete", "list", "update"]),
+        ];
+        for (tool, actions) in cases {
+            for action in actions.iter() {
+                let args = json!({ "action": action });
+                let ctx = ctx_for(&home, &args, "");
+                assert!(
+                    try_dispatch(tool, &ctx).is_some(),
+                    "tool='{tool}' action='{action}' did not route through dispatch table"
+                );
+            }
+        }
+    }
+
+    /// Cohort invariant — every action-based tool has `actions:
+    /// Some(...)` populated (not `None`). Pins the "we wired the
+    /// sub-routing infrastructure for every cohort member" property.
+    #[test]
+    fn action_based_tools_have_actions_populated() {
+        let action_tools = [
+            "task",
+            "ci",
+            "decision",
+            "deployment",
+            "health",
+            "repo",
+            "schedule",
+            "team",
+        ];
+        for tool in action_tools {
+            let entry = registered_handlers()
+                .iter()
+                .find(|e| e.name == tool)
+                .unwrap_or_else(|| panic!("tool '{tool}' should be in dispatch table"));
             assert!(
-                try_dispatch("task", &ctx).is_some(),
-                "action='{action}' did not route through dispatch table"
+                entry.actions.is_some(),
+                "tool '{tool}' should have action sub-routing populated"
             );
         }
     }

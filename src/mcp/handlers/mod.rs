@@ -132,20 +132,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // channel-heavy arms stay inline for T-B9+.
         "set_display_name" => instance::handle_set_display_name(&home, args, instance_name),
         "pane_snapshot" => instance::handle_pane_snapshot(&home, args),
-        // Consolidated: health action=report/clear
-        "health" => match args["action"].as_str().unwrap_or("") {
-            "report" => instance::handle_report_health(&home, args, instance_name, &sender),
-            "clear" => instance::handle_clear_blocked_reason(&home, args),
-            other => json!({"error": format!("unknown health action: {other}")}),
-        },
+        // NOTE: `health` migrated to dispatch table (#694 BLOCK 2 T-B9).
 
-        // --- Decisions (consolidated: decision action=post/list/update) ---
-        "decision" => match args["action"].as_str().unwrap_or("") {
-            "post" => task::handle_post_decision(&home, args, instance_name, &sender),
-            "list" => task::handle_list_decisions(&home, args),
-            "update" => task::handle_update_decision(&home, args, instance_name),
-            other => json!({"error": format!("unknown decision action: {other}")}),
-        },
+        // NOTE: `decision` migrated to dispatch table (#694 BLOCK 2 T-B9).
 
         // --- Task board ---
         // NOTE: `task` migrated to dispatch table (#694 BLOCK 2 T-B8),
@@ -158,47 +147,12 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // --- Task sweep config ---
         "task_sweep_config" => task::handle_task_sweep_config(&home, args),
 
-        // --- Teams (consolidated: team action=create/delete/list/update) ---
-        "team" => match args["action"].as_str().unwrap_or("") {
-            "create" => task::handle_create_team(&home, args),
-            "delete" => task::handle_delete_team(&home, args),
-            "list" => task::handle_list_teams(&home),
-            "update" => task::handle_update_team(&home, args),
-            other => json!({"error": format!("unknown team action: {other}")}),
-        },
+        // NOTE: `team` / `schedule` / `deployment` / `repo` migrated to
+        // dispatch table (#694 BLOCK 2 T-B9).
 
-        // --- Scheduling (consolidated: schedule action=create/list/update/delete) ---
-        "schedule" => match args["action"].as_str().unwrap_or("") {
-            "create" => schedule::handle_create_schedule(&home, args, instance_name),
-            "list" => schedule::handle_list_schedules(&home, args),
-            "update" => schedule::handle_update_schedule(&home, args),
-            "delete" => schedule::handle_delete_schedule(&home, args),
-            other => json!({"error": format!("unknown schedule action: {other}")}),
-        },
-
-        // --- Deployments (consolidated: deployment action=deploy/teardown/list) ---
-        "deployment" => match args["action"].as_str().unwrap_or("") {
-            "deploy" => schedule::handle_deploy_template(&home, args, instance_name),
-            "teardown" => schedule::handle_teardown_deployment(&home, args),
-            "list" => schedule::handle_list_deployments(&home),
-            other => json!({"error": format!("unknown deployment action: {other}")}),
-        },
-
-        // --- Repo access (consolidated: repo action=checkout/release) ---
-        "repo" => match args["action"].as_str().unwrap_or("") {
-            "checkout" => ci::handle_checkout_repo(&home, args, instance_name),
-            "release" => ci::handle_release_repo(args),
-            other => json!({"error": format!("unknown repo action: {other}")}),
-        },
-
-        // --- CI watch (consolidated: ci action=watch/unwatch) ---
-        "ci" => match args["action"].as_str().unwrap_or("") {
-            "watch" => ci::handle_watch_ci(&home, args, instance_name),
-            "unwatch" => ci::handle_unwatch_ci(&home, args),
-            // Sprint 54 P0-5 (sub-scope C): aggregate health snapshot.
-            "status" => ci::handle_status_ci(&home, args, instance_name),
-            other => json!({"error": format!("unknown ci action: {other}")}),
-        },
+        // NOTE: `ci` migrated to dispatch table (#694 BLOCK 2 T-B9),
+        // including the Sprint 54 P0-5 `status` action for aggregate
+        // health snapshot.
 
         // NOTE: bind_self / release_worktree / force_release_worktree /
         // binding_state / gc_dry_run migrated to dispatch table (#694
