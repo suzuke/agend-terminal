@@ -132,12 +132,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // channel-heavy arms stay inline for T-B9+.
         "set_display_name" => instance::handle_set_display_name(&home, args, instance_name),
         "pane_snapshot" => instance::handle_pane_snapshot(&home, args),
-        // Consolidated: health action=report/clear
-        "health" => match args["action"].as_str().unwrap_or("") {
-            "report" => instance::handle_report_health(&home, args, instance_name, &sender),
-            "clear" => instance::handle_clear_blocked_reason(&home, args),
-            other => json!({"error": format!("unknown health action: {other}")}),
-        },
+        // NOTE: `health` migrated to dispatch table (#694 BLOCK 2 T-B9).
 
         // NOTE: `decision` migrated to dispatch table (#694 BLOCK 2 T-B9).
 
@@ -152,32 +147,8 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // --- Task sweep config ---
         "task_sweep_config" => task::handle_task_sweep_config(&home, args),
 
-        // --- Teams (consolidated: team action=create/delete/list/update) ---
-        "team" => match args["action"].as_str().unwrap_or("") {
-            "create" => task::handle_create_team(&home, args),
-            "delete" => task::handle_delete_team(&home, args),
-            "list" => task::handle_list_teams(&home),
-            "update" => task::handle_update_team(&home, args),
-            other => json!({"error": format!("unknown team action: {other}")}),
-        },
-
-        // --- Scheduling (consolidated: schedule action=create/list/update/delete) ---
-        "schedule" => match args["action"].as_str().unwrap_or("") {
-            "create" => schedule::handle_create_schedule(&home, args, instance_name),
-            "list" => schedule::handle_list_schedules(&home, args),
-            "update" => schedule::handle_update_schedule(&home, args),
-            "delete" => schedule::handle_delete_schedule(&home, args),
-            other => json!({"error": format!("unknown schedule action: {other}")}),
-        },
-
-        // NOTE: `deployment` migrated to dispatch table (#694 BLOCK 2 T-B9).
-
-        // --- Repo access (consolidated: repo action=checkout/release) ---
-        "repo" => match args["action"].as_str().unwrap_or("") {
-            "checkout" => ci::handle_checkout_repo(&home, args, instance_name),
-            "release" => ci::handle_release_repo(args),
-            other => json!({"error": format!("unknown repo action: {other}")}),
-        },
+        // NOTE: `team` / `schedule` / `deployment` / `repo` migrated to
+        // dispatch table (#694 BLOCK 2 T-B9).
 
         // NOTE: `ci` migrated to dispatch table (#694 BLOCK 2 T-B9),
         // including the Sprint 54 P0-5 `status` action for aggregate
