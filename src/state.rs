@@ -2402,6 +2402,44 @@ mod tests {
         expected_transitions: Vec<String>,
         expected_final_state: String,
         expected_final_detect: Option<String>,
+        // F685 sub-task 5 fixture corpus extension (decision
+        // d-20260514015214320625-1 §1.A). All fields optional with serde
+        // defaults — existing 13 fixtures (schema_version 1, implicit)
+        // remain valid without manifest edits. Schema_version is a
+        // future-compat metadata marker; no runtime enforcement Phase 1.
+        // See docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.2.
+        #[serde(default)]
+        #[allow(dead_code)]
+        scenario_kind: Option<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        expected_hung_classification: Option<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        expected_oscillation_count: Option<u32>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        productive_marker_expectations: Vec<ProductiveMarkerExpectation>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        capture_kind: Option<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        provenance: Option<String>,
+        #[serde(default = "default_schema_version")]
+        #[allow(dead_code)]
+        schema_version: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct ProductiveMarkerExpectation {
+        time_ms: u64,
+        source: String,
+    }
+
+    fn default_schema_version() -> u32 {
+        1
     }
 
     fn parse_state(name: &str) -> AgentState {
@@ -2503,6 +2541,125 @@ mod tests {
                 detect_result, expected_detect
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // F685 sub-task 5 corpus measurement (decision d-20260514015214320625-1)
+    // -----------------------------------------------------------------
+    //
+    // The integration-test side (`tests/fixture_corpus_measurement.rs`)
+    // validates manifest schema + byte-existence. THIS unit-test side
+    // exercises the actual `infer_productivity` measurement path against
+    // labelled fixtures, since the function lives in the binary crate
+    // and is not exposed via `src/lib.rs`. The harness here is a smoke
+    // test for the measurement plumbing, NOT a pass/fail gate on the
+    // FP < 1% / FN < 10% acceptance criteria — those gate on corpus
+    // growth (N ≥ 300 / N ≥ 30) over weeks per decision §1 reframe.
+
+    #[test]
+    fn corpus_measurement_smoke_f9_marker_signals() {
+        // Run F9 productive-signal inference against the three schema-v2
+        // fixtures and assert the signal classification matches the
+        // labelled scenario_kind. This is the F9 measurement loop in
+        // miniature: harness reports rates, gates on growth.
+        let fixtures_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-replay");
+        let manifest_path = fixtures_dir.join("MANIFEST.yaml");
+        let raw = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+        let manifest: ReplayManifest =
+            serde_yaml_ng::from_str(&raw).unwrap_or_else(|e| panic!("parse: {e}"));
+
+        let v2: Vec<&ReplayFixture> = manifest
+            .fixtures
+            .iter()
+            .filter(|f| f.schema_version >= 2)
+            .collect();
+        assert!(
+            v2.len() >= 3,
+            "smoke test requires ≥3 schema-v2 fixtures, got {}",
+            v2.len()
+        );
+
+        let mut productive_marker_fire_observations = 0usize;
+        let mut productive_silence_observations = 0usize;
+
+        for f in &v2 {
+            let backend = parse_backend(&f.backend);
+            let pconfig = crate::behavioral::config_for_productivity(&backend);
+            let bytes = std::fs::read(fixtures_dir.join(&f.file))
+                .unwrap_or_else(|e| panic!("read {}: {e}", f.file));
+
+            // Render through vterm to get the screen the StateTracker
+            // would feed against. Mirrors `replay_manifest_regression`
+            // loop body.
+            let mut vt = VTerm::new(120, 40);
+            for chunk in bytes.chunks(512) {
+                vt.process(chunk);
+            }
+            let rows = vt.rows() as usize;
+            let screen = vt.tail_lines(rows);
+
+            // Heartbeat_age = MAX simulates "no MCP integration / stale";
+            // forces evaluation through the marker path only. This is the
+            // common-case for synthetic byte-only fixtures.
+            let signal = crate::behavioral::infer_productivity(
+                &pconfig,
+                &screen,
+                std::time::Duration::from_secs(u32::MAX as u64),
+            );
+
+            match f.scenario_kind.as_deref() {
+                Some("productive_marker_fire") => {
+                    assert!(
+                        matches!(
+                            signal,
+                            crate::behavioral::ProductivitySignal::Productive { .. }
+                        ),
+                        "fixture {} labelled productive_marker_fire but signal = {:?}",
+                        f.file,
+                        signal
+                    );
+                    productive_marker_fire_observations += 1;
+                }
+                Some("productive_silence") => {
+                    assert_eq!(
+                        signal,
+                        crate::behavioral::ProductivitySignal::NoSignal,
+                        "fixture {} labelled productive_silence but signal = {:?}",
+                        f.file,
+                        signal
+                    );
+                    productive_silence_observations += 1;
+                }
+                Some("silent_stuck") => {
+                    // silent_stuck = no productive evidence; signal must
+                    // be NoSignal (heartbeat MAX + no marker).
+                    assert_eq!(
+                        signal,
+                        crate::behavioral::ProductivitySignal::NoSignal,
+                        "fixture {} labelled silent_stuck but signal = {:?}",
+                        f.file,
+                        signal
+                    );
+                }
+                Some("priority_oscillation") | Some(_) | None => {
+                    // priority_oscillation and other kinds need
+                    // time-injection harness extension — deferred per
+                    // §F685-CORPUS.6 open questions. Skip silently in
+                    // Phase 1 smoke test.
+                }
+            }
+        }
+
+        assert!(
+            productive_marker_fire_observations >= 1,
+            "initial corpus must include at least one productive_marker_fire fixture"
+        );
+        assert!(
+            productive_silence_observations >= 1,
+            "initial corpus must include at least one productive_silence fixture"
+        );
     }
 
     // -----------------------------------------------------------------

@@ -407,6 +407,13 @@ reset mechanic.
   measurement of hypotheses (a)–(f) cannot differentiate fixes that
   address the bug from fixes that only mask Scenarios A and B.
 
+  **Update (sub-task 5 ship)**: corpus infrastructure landed in PR
+  containing `rg "F685-FIXTURE-CORPUS" docs/`. The Scenario C measurement
+  itself remains deferred — replay test runs in microseconds so
+  `min_hold` thresholds (wall-clock based) never cross during byte-only
+  replay. Time-injection harness extension required; see
+  `docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.6` open questions.
+
 - **Cross-backend pattern overlap**: Kiro `r"Kiro is working|esc to cancel"`
   and Gemini `r"esc to cancel"` share the literal `"esc to cancel"`. State
   patterns are per-backend (`StateTracker::new(Some(&backend))` → backend-

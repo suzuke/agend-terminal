@@ -231,3 +231,87 @@ fixtures:
     expected_transitions: [starting, idle, thinking]
     expected_final_state: thinking
     expected_final_detect: null
+
+  # ---------------------------------------------------------------------
+  # F685 sub-task 5 fixture corpus (decision d-20260514015214320625-1)
+  # ---------------------------------------------------------------------
+  # The entries below extend the manifest with F9/F39 measurement labels
+  # via the optional schema-v2 fields (scenario_kind,
+  # expected_hung_classification, productive_marker_expectations,
+  # capture_kind, provenance, schema_version). The existing 13 entries
+  # above remain on implicit schema_version 1 and are unaffected.
+  #
+  # See docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.2 for field semantics
+  # and §F685-CORPUS.3 for the initial corpus rationale.
+
+  - file: f685-f9-positive-savedfile.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-14"
+    scenario: |
+      Synthetic Claude session: tool call success followed by a file-save
+      banner that matches the F9 generic productive marker
+      `^Saved to \S+`. Used to lock the F9 positive-marker-fires path in
+      shadow-mode measurement.
+    # Replay observation: Claude `Ready` pattern matches the bypass-permissions
+    # banner; the `✓ ReadFile` token does NOT trigger ToolUse because the
+    # Claude ToolUse regex requires `✓ Read\b` (word boundary after `Read`)
+    # and `ReadFile` lacks that boundary. The fixture's F9 measurement
+    # focus is the `Saved to <path>` marker firing — observed via
+    # `infer_productivity` independent of AgentState transitions.
+    expected_transitions: [starting, ready]
+    expected_final_state: ready
+    expected_final_detect: ready
+    scenario_kind: productive_marker_fire
+    expected_hung_classification: not_hung
+    capture_kind: synthetic
+    provenance: "f685 sub-task 5 synthetic — F9 positive marker fixture"
+    schema_version: 2
+    productive_marker_expectations:
+      - time_ms: 0
+        source: "marker(^Saved to \\S+)"
+
+  - file: f685-f9-negative-saved-prose.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-14"
+    scenario: |
+      Synthetic Claude session: assistant prose contains the substring
+      `I have saved your time` and the literal `esc to cancel`, but
+      NEITHER appears at a line start nor with the structural anchor
+      `^Saved to \S+`. Locks the F9 anti-FP contract: bare keywords
+      must not classify as productive.
+    expected_transitions: [starting, ready]
+    expected_final_state: ready
+    expected_final_detect: ready
+    scenario_kind: productive_silence
+    expected_hung_classification: not_hung
+    capture_kind: synthetic
+    provenance: "f685 sub-task 5 synthetic — F9 anti-FP fixture (bare 'saved' in prose)"
+    schema_version: 2
+
+  - file: f685-silent-stuck-stub.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-14"
+    scenario: |
+      Synthetic Gemini session: agent enters Thinking via `⠦ Thinking...
+      (esc to cancel, Ns)` spinner cycle. No productive markers fire.
+      Models the #659 silent-stuck pattern as best-effort byte-only
+      stub: in production this would manifest as continued spinner
+      updates without underlying progress. Replay does not exercise
+      wall-clock silence thresholds; harness uses scenario_kind label
+      to short-circuit time-injection where deferred (see §F685-CORPUS.6).
+    # Replay observation: the `Type your message` idle prompt at fixture
+    # start drives Starting→Thinking directly (Idle pattern is offset by
+    # the `> please analyze` user-input line breaking the Idle match
+    # surface before the spinner appears). Observed [Starting, Thinking];
+    # the Idle hop is not produced under byte-level replay.
+    expected_transitions: [starting, thinking]
+    expected_final_state: thinking
+    expected_final_detect: thinking
+    scenario_kind: silent_stuck
+    expected_hung_classification: hung
+    capture_kind: synthetic_from_real_template
+    provenance: "f685 sub-task 5 synthetic — #659 silent-stuck template; real capture pending"
+    schema_version: 2

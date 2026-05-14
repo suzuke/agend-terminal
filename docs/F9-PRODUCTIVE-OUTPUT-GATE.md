@@ -148,7 +148,10 @@ shipped in shadow mode and never promoted. This PR's commit message
 encodes explicit promotion criteria to avoid the same outcome:
 
 1. **Fixture corpus measures FP rate < 1% on 3+ confirmed cases**
-   (`#685` issue acceptance criterion).
+   (`#685` issue acceptance criterion). Measurement methodology and
+   corpus growth protocol live in
+   `docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.4` (per-transition unit,
+   source-separated reporting, statistical minimums delegate-to-growth).
 2. **2-week shadow-mode telemetry shows behavioral divergence stable**
    (Sprint 27 PR-A divergence dashboard pattern reused via
    `rg "behavioral_shadow" src/behavioral.rs`).

@@ -1066,6 +1066,15 @@ mod tests {
     // env. Use a single Once-style mutex to avoid flake.
     // -----------------------------------------------------------------------
 
+    /// Run `f` with `AGEND_PRODUCTIVE_GATE` env var set per `active`,
+    /// restoring the prior value on return.
+    ///
+    /// **Mirror copy** of `tests/common/env_gate.rs::with_f9_gate`. Unit
+    /// tests cannot directly import from `tests/common/`; the helper is
+    /// duplicated to enable both unit and integration test reuse. Sub-task
+    /// 5 decision `d-20260514015214320625-1` §1.D accepted the ~15 LOC
+    /// duplication over exposing `pub mod test_util` in production code.
+    /// Keep in lock-step with the integration-test copy.
     fn with_f9_gate<R>(active: bool, f: impl FnOnce() -> R) -> R {
         // Tests touch a shared process-wide env var — serialise via a
         // function-scoped mutex so parallel test threads don't race.
