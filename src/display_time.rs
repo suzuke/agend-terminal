@@ -11,22 +11,57 @@
 //! which preserves the pre-#790 behaviour from Sprint 54 P2-6.
 //! Invalid IANA strings warn once and fall back to `chrono::Local`.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 /// Convert an RFC 3339 UTC timestamp into a short display string of
 /// the form `MM-DD HH:MM` in the configured display timezone.
 ///
 /// - `rfc3339`: UTC ISO 8601 string (e.g. from storage)
 /// - `tz`: IANA timezone name (e.g. `Asia/Taipei`); `None` → system tz
 ///
-/// Falls back to the first-10-char slice on parse error so legacy /
-/// mid-migration fixtures render the same as before.
-pub fn format_local_short(rfc3339: &str, _tz: Option<&str>) -> String {
-    chrono::DateTime::parse_from_rfc3339(rfc3339)
-        .map(|d| {
-            d.with_timezone(&chrono::Local)
-                .format("%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|_| rfc3339.chars().take(10).collect())
+/// Falls back to the first-10-char slice on parse-error of the input
+/// timestamp so legacy / mid-migration fixtures render the same as
+/// before. Invalid IANA tz strings warn once per process per name and
+/// fall back to `chrono::Local` so a typoed `display_timezone` in
+/// fleet.yaml degrades to the system tz rather than panicking.
+pub fn format_local_short(rfc3339: &str, tz: Option<&str>) -> String {
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(rfc3339) else {
+        return rfc3339.chars().take(10).collect();
+    };
+    match tz {
+        Some(iana) => match iana.parse::<chrono_tz::Tz>() {
+            Ok(tz) => parsed.with_timezone(&tz).format("%m-%d %H:%M").to_string(),
+            Err(_) => {
+                warn_invalid_iana_once(iana);
+                parsed
+                    .with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            }
+        },
+        None => parsed
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string(),
+    }
+}
+
+/// One-shot warn per invalid IANA name to surface fleet.yaml typos
+/// without spamming logs on every render frame.
+fn warn_invalid_iana_once(iana: &str) {
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut guard = match SEEN.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let set = guard.get_or_insert_with(HashSet::new);
+    if set.insert(iana.to_string()) {
+        tracing::warn!(
+            iana = %iana,
+            "display_timezone: invalid IANA name, falling back to system tz"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -108,7 +143,7 @@ mod tests {
         let out_none = format_local_short("2026-05-07T22:00:00Z", None);
         // Re-derive what chrono::Local should produce directly.
         let expected = chrono::DateTime::parse_from_rfc3339("2026-05-07T22:00:00Z")
-            .unwrap()
+            .expect("known-good RFC 3339 fixture")
             .with_timezone(&chrono::Local)
             .format("%m-%d %H:%M")
             .to_string();
