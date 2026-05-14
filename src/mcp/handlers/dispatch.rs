@@ -165,30 +165,35 @@ fn dispatch_gc_dry_run(ctx: &HandlerCtx<'_>) -> Value {
     worktree::handle_gc_dry_run(ctx.home, ctx.args, ctx.sender)
 }
 
-// `task` — action sub-routing validation case (T-B8 first action).
+// `task` — action sub-routing validation case (T-B8).
 //
-// Both `dispatch_task` (base) and `dispatch_task_list` (sub-handler for
-// action="list") forward to `task::handle_task`. The forwarding is
-// identical at runtime — the actions table is purely structural here,
-// adding a routing-table layer without changing what gets called.
+// All 5 sub-handlers (`dispatch_task_create` / `..._list` / `..._claim`
+// / `..._update` / `..._done`) AND the base `dispatch_task` all forward
+// to `task::handle_task`. The forwarding is identical at runtime — the
+// actions table is purely structural here, adding a routing-table layer
+// without changing what gets called.
 //
 // `task::handle_task` is itself a 1-line forward to `crate::tasks::handle`,
 // which has its own internal match on `args["action"]`. So:
 //
-// * action="list" → dispatch table actions["list"] hit → dispatch_task_list
-//   → task::handle_task → tasks::handle → "list" arm of internal match
-// * action="create" → dispatch table actions["create"] miss → fall-through
-//   to dispatch_task (base) → task::handle_task → tasks::handle → "create"
+// * recognized action (e.g. "list") → dispatch table actions[…] hit →
+//   matching sub-handler → task::handle_task → tasks::handle → matching
 //   arm of internal match
-// * action="frobnicate" → dispatch table actions miss → fall-through to
-//   dispatch_task (base) → task::handle_task → tasks::handle → "unknown
-//   action" error from internal match
+// * unrecognized action (e.g. "frobnicate") → dispatch table actions miss
+//   → fall-through to base `dispatch_task` → task::handle_task →
+//   tasks::handle → "unknown action" error from internal match
 //
-// T-B8 only migrates `list` to demonstrate the action-routing
-// infrastructure. T-B9+ migrates the other 4 actions (create / claim /
-// update / done) once the lead spot-checks this shape.
+// The "double match" (action-routing in dispatch.rs AND internal match
+// in `tasks::handle`) is redundant work but preserves ZERO behavior
+// change. Refactoring `tasks::handle` to expose per-action `pub fn`s
+// is left as a future optimization once the dispatch table is stable
+// across all action-based tools.
 
 fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_task_create(ctx: &HandlerCtx<'_>) -> Value {
     task::handle_task(ctx.home, ctx.args, ctx.instance_name)
 }
 
@@ -196,19 +201,46 @@ fn dispatch_task_list(ctx: &HandlerCtx<'_>) -> Value {
     task::handle_task(ctx.home, ctx.args, ctx.instance_name)
 }
 
+fn dispatch_task_claim(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_task_update(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_task_done(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+}
+
 /// Static sub-handler table for `task` action routing. Lifted out of
 /// the entry literal so the table address can be `'static`-borrowed.
-static TASK_ACTIONS: &[(&str, HandlerFn)] = &[("list", dispatch_task_list)];
+/// Action set matches `tasks::handle`'s internal `match` arms.
+static TASK_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("create", dispatch_task_create),
+    ("list", dispatch_task_list),
+    ("claim", dispatch_task_claim),
+    ("update", dispatch_task_update),
+    ("done", dispatch_task_done),
+];
 
 /// Registered tool dispatchers. **Adding a tool**: write its adapter
 /// above, append a [`HandlerEntry`] here. **Removing**: delete both
 /// halves. Order doesn't affect correctness (linear-scan match by
 /// `name`), but keeping similar tools clustered helps grep.
 ///
-/// Declared as a `static` (rather than returned from the fn via an
-/// inline `&[...]`) so the slice address is unambiguously `'static`;
-/// const-promotion of the array literal is fragile once entries carry
-/// `Option<&'static [...]>` fields.
+/// **Why `static` instead of inline `&[...]` return**: Rust's
+/// const-promotion turns an `&[T {...}]` array literal in fn-return
+/// position into a `'static` slice automatically — but only if every
+/// field of `T` is itself const-promotable in that context. Once
+/// `HandlerEntry` gained `actions: Option<&'static [(&str, HandlerFn)]>`
+/// in T-B8, the inner static-slice field defeats promotion of the
+/// outer array and rustc raises E0515 ("returns a reference to data
+/// owned by the current function"). Lifting the array to a top-level
+/// `static` gives the slice an unambiguous `'static` origin and side-
+/// steps the gotcha. Symptom for future readers: if you add a field
+/// to `HandlerEntry` and the array literal stops compiling, this
+/// `static` is why.
 static REGISTERED: &[HandlerEntry] = &[
     // Instance lifecycle — shape 1 (T-B7)
     HandlerEntry {
@@ -408,17 +440,23 @@ mod tests {
         );
     }
 
-    /// Action sub-routing — recognized action in the table fires the
-    /// sub-handler (here: `task` action=`list` → `dispatch_task_list`).
-    /// Currently `dispatch_task_list` is a thin forward to the base
-    /// handler, so the assertion is that the call returns `Some`
-    /// (proves the sub-routing path executed without panic).
+    /// Action sub-routing — each of the 5 recognized `task` actions
+    /// routes through its sub-handler. All 5 sub-handlers currently
+    /// forward to the same base, so the assertion is that the call
+    /// returns `Some` (proves the sub-routing path executed without
+    /// panic for every wired action). Parameterized to avoid 5 near-
+    /// identical test fns.
     #[test]
     fn try_dispatch_routes_known_action_through_sub_handler() {
         let home = std::env::temp_dir();
-        let args = json!({"action": "list"});
-        let ctx = ctx_for(&home, &args, "");
-        assert!(try_dispatch("task", &ctx).is_some());
+        for action in ["create", "list", "claim", "update", "done"] {
+            let args = json!({"action": action});
+            let ctx = ctx_for(&home, &args, "");
+            assert!(
+                try_dispatch("task", &ctx).is_some(),
+                "action='{action}' did not route through dispatch table"
+            );
+        }
     }
 
     /// Action sub-routing — unknown action falls through to the base
