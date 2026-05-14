@@ -30,10 +30,15 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
             "code": "needs_identity"
         });
     }
+    // Windows-safe path mangling: also collapse `\` (path separator) and
+    // `:` (drive letter) so a source like `C:\Users\runner\...` doesn't
+    // produce a worktree path with mid-name colons (rejected by NTFS).
+    // Pre-existing tests didn't exercise Windows-built happy-path until
+    // #778's new bind:true coverage.
     let worktree_dir = home.join("worktrees").join(format!(
         "{}-{}",
         instance_name,
-        source.replace('/', "_").replace('~', "")
+        source.replace(['/', '\\', ':'], "_").replace('~', "")
     ));
     std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
     let source_path = if source.starts_with('/') || source.starts_with('~') {
