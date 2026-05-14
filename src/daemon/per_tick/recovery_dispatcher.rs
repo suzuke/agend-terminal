@@ -94,6 +94,14 @@ const STAGE2_BACKOFF_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS";
 const STAGE2_TIMEOUT_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2_TIMEOUT_MS";
 const STAGE2_MAX_RESTARTS_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE2_MAX_RESTARTS";
 
+/// `#685` sub-task 7c: env var controlling Stage 3 escalation activation.
+/// When set to `"1"`, the dispatcher writes `HealthState::Paused` via
+/// `HealthTracker::enter_paused` (active mode). Default unset = shadow
+/// mode: telegram + tracing only, no state write — operator can observe
+/// the decision pattern before flipping. Mirrors STAGE1 / STAGE2 env
+/// gate pattern.
+const STAGE3_ENV_VAR: &str = "AGEND_AUTO_RECOVERY_STAGE3";
+
 pub(crate) struct RecoveryDispatcherHandler {
     /// `#685` sub-task 7b: handle to the daemon's `crash_tx` channel.
     /// Stage 1 path (already shipped in 7a) holds but never sends —
@@ -130,6 +138,12 @@ fn stage2_max_restarts() -> u32 {
         },
         Err(_) => crate::health::STAGE2_MAX_RESTARTS_DEFAULT,
     }
+}
+
+fn stage3_gate_active() -> bool {
+    std::env::var(STAGE3_ENV_VAR)
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Read an env var as milliseconds with a typed default. Logged at
@@ -205,6 +219,7 @@ impl PerTickHandler for RecoveryDispatcherHandler {
             crate::health::STAGE2_TIMEOUT_DEFAULT_MS,
         );
         let stage2_max = stage2_max_restarts();
+        let stage3_active = stage3_gate_active();
 
         for (name, handle) in reg.iter() {
             // Single per-agent lock acquisition reads all dispatcher
@@ -294,11 +309,23 @@ impl PerTickHandler for RecoveryDispatcherHandler {
                         core.health.recovery_stage_state = RecoveryStageState::Stage3Eligible;
                     }
                 }
-                RecoveryStageState::Stage3Eligible | RecoveryStageState::Stage3Pending => {
-                    // Stage 3 arm ships in sub-task 7c. Dispatcher
-                    // currently no-op for these states; once 7c lands,
-                    // Stage3Eligible → transition HealthState to Paused
-                    // and emit Stage 3 telegram.
+                RecoveryStageState::Stage3Eligible => {
+                    self.handle_stage3_escalate(name, handle, &snapshot, stage3_active);
+                }
+                RecoveryStageState::Stage3Pending { entered_at } => {
+                    // Stage 3 is terminal — no further auto-recovery,
+                    // no timeout escalation, no telegram re-fire. The
+                    // explicit no-op arm exists so the match is
+                    // compile-time exhaustive and so audit traces show
+                    // the dispatcher saw the agent but deliberately
+                    // declined to act. Operator unpause command (future
+                    // sub-task) is the only path out of Paused.
+                    tracing::debug!(
+                        target: TARGET,
+                        agent = %name,
+                        paused_for_ms = entered_at.elapsed().as_millis() as u64,
+                        "stage3_pending: awaiting operator unpause"
+                    );
                 }
             }
         }
@@ -464,6 +491,64 @@ impl RecoveryDispatcherHandler {
             }
         }
     }
+
+    /// Stage 3 escalate arm. Stage 3 is the terminal stage of the
+    /// recovery state machine — after Stage 1 ESC failed and Stage 2
+    /// auto-restart was attempted up to the cumulative cap, the agent
+    /// is escalated to `HealthState::Paused` and the operator is
+    /// notified that manual intervention is required.
+    ///
+    /// Order of operations (atomicity-relevant):
+    /// 1. Pre-emit telegram via `notify_stage3_escalate` — fires in
+    ///    BOTH shadow and active modes so operators have visibility
+    ///    into the decision pattern before flipping the gate to `=1`.
+    /// 2. If `gate_active`: acquire the per-agent lock once and call
+    ///    `core.health.enter_paused(now)` — atomically writes
+    ///    `state = Paused`, `recovery_stage_state = Stage3Pending`,
+    ///    `last_stage3_fired_at = Some(now)`. Next-tick dispatcher
+    ///    lands on the `Stage3Pending` no-op arm and on the top-level
+    ///    `Paused` `continue` guard, so the telegram never re-fires.
+    /// 3. Else (shadow): emit `tracing::info!` with would-have-paused
+    ///    details; no state mutation.
+    ///
+    /// `recovery_restart_count` is NOT reset on entry — per decision
+    /// `enter_paused` documentation, the count is preserved so a
+    /// future operator-unpause that doesn't address the root cause
+    /// immediately re-escalates rather than burning further auto-
+    /// restart budget.
+    fn handle_stage3_escalate(
+        &self,
+        name: &str,
+        handle: &agent::AgentHandle,
+        snapshot: &DispatchSnapshot,
+        gate_active: bool,
+    ) {
+        // Pre-emit telegram in BOTH modes — operator visibility on
+        // shadow promotions matters as much as on active escalations.
+        notify_stage3_escalate(name, snapshot);
+
+        if gate_active {
+            let now = Instant::now();
+            let mut core = handle.core.lock();
+            core.health.enter_paused(now);
+            tracing::info!(
+                target: TARGET,
+                agent = %name,
+                recovery_restart_count = snapshot.recovery_restart_count,
+                gate_active = true,
+                "stage3 fired: HealthState transitioned to Paused via enter_paused"
+            );
+        } else {
+            tracing::info!(
+                target: TARGET,
+                agent = %name,
+                recovery_restart_count = snapshot.recovery_restart_count,
+                silent_ms = snapshot.silent.as_millis() as u64,
+                gate_active = false,
+                "stage3 would-have-fired (shadow mode): Paused write NOT applied"
+            );
+        }
+    }
 }
 
 /// Read-only snapshot of per-agent state captured under a single lock
@@ -507,6 +592,45 @@ fn notify_stage2_fire(name: &str, _handle: &agent::AgentHandle, snapshot: &Dispa
             target: TARGET,
             agent = %name,
             "stage2 telegram skipped: no active channel"
+        );
+    }
+}
+
+/// Build the Stage 3 escalation telegram body. Extracted so unit
+/// tests can pin the operator-facing wording (decision §3 "dev's
+/// revised 4-line content") independent of the `gated_notify` plumbing.
+fn format_stage3_body(name: &str, recovery_restart_count: u32) -> String {
+    format!(
+        "[recovery ESCALATION] {name}: PAUSED — manual intervention required.\n  \
+         Stage 2 auto-restart fired {count} time(s), all exhausted.\n  \
+         Final state: Paused (no further auto-recovery).\n  \
+         Action: investigate root cause + manual unpause (CLI command pending sub-task).",
+        count = recovery_restart_count,
+    )
+}
+
+/// Stage 3 escalation telegram. Operator-action-required severity =
+/// `NotifySeverity::Error` (per decision §3 dev-grep evidence: enum has
+/// only Info/Warn/Error; Stage 2 = Warn, crash = Error; Stage 3 ≥ crash
+/// since auto-recovery is exhausted and only operator action can
+/// resume). `silent=false` so the operator's channel surfaces it
+/// alongside crash notifications. Uses `gated_notify` so the
+/// info-leak gate prevents leakage when channel is unauthorised.
+fn notify_stage3_escalate(name: &str, snapshot: &DispatchSnapshot) {
+    let body = format_stage3_body(name, snapshot.recovery_restart_count);
+    if let Some(channel) = crate::channel::active_channel() {
+        let _ = crate::channel::gated_notify(
+            channel.as_ref(),
+            name,
+            crate::channel::NotifySeverity::Error,
+            &body,
+            false,
+        );
+    } else {
+        tracing::debug!(
+            target: TARGET,
+            agent = %name,
+            "stage3 telegram skipped: no active channel"
         );
     }
 }
@@ -966,5 +1090,134 @@ mod tests {
         let recent = base;
         let now_recent = base + Duration::from_secs(5);
         assert!(now_recent.saturating_duration_since(recent) < timeout);
+    }
+
+    // -------------------------------------------------------------------
+    // `#685` sub-task 7c Stage 3 tests. Cover the new dispatcher arm
+    // surface: env gate round-trip, enter_paused atomic invariants,
+    // recovery_restart_count NOT reset on Paused entry (operator-must-
+    // fix-root-cause signal), Stage3Pending idempotent no-op semantics,
+    // and operator-facing telegram content. Decision §7.
+    // -------------------------------------------------------------------
+
+    fn with_stage3_gate<R>(active: bool, f: impl FnOnce() -> R) -> R {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        let lock = LOCK.get_or_init(|| std::sync::Mutex::new(()));
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var(STAGE3_ENV_VAR).ok();
+        unsafe {
+            if active {
+                std::env::set_var(STAGE3_ENV_VAR, "1");
+            } else {
+                std::env::remove_var(STAGE3_ENV_VAR);
+            }
+        }
+        let result = f();
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var(STAGE3_ENV_VAR, v),
+                None => std::env::remove_var(STAGE3_ENV_VAR),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn stage3_gate_env_var_round_trip() {
+        // Operator can flip `AGEND_AUTO_RECOVERY_STAGE3=1` without
+        // restarting the daemon — same shape as Stage 1 / Stage 2 gate
+        // env tests. Decision §4 shadow-mode default + env var promotion
+        // workflow.
+        with_stage3_gate(true, || {
+            assert!(stage3_gate_active());
+        });
+        with_stage3_gate(false, || {
+            assert!(!stage3_gate_active());
+        });
+    }
+
+    #[test]
+    fn enter_paused_sets_state_recovery_stage_and_timestamp_atomically() {
+        // Decision §1: `enter_paused(now)` writes 3 invariants in one
+        // logical step:
+        //   1. state = Paused
+        //   2. recovery_stage_state = Stage3Pending { entered_at: now }
+        //   3. last_stage3_fired_at = Some(now)
+        // Single grep target enforces 7a §F39.5 "Paused entered ONLY
+        // via Stage 3 dispatcher".
+        let mut tracker = crate::health::HealthTracker::new();
+        let now = Instant::now();
+        tracker.enter_paused(now);
+        assert_eq!(tracker.state, HealthState::Paused);
+        match tracker.recovery_stage_state {
+            RecoveryStageState::Stage3Pending { entered_at } => {
+                assert_eq!(entered_at, now);
+            }
+            other => panic!("expected Stage3Pending, got {other:?}"),
+        }
+        assert_eq!(tracker.last_stage3_fired_at, Some(now));
+    }
+
+    #[test]
+    fn enter_paused_does_not_reset_recovery_restart_count() {
+        // Decision §1 critical invariant: `recovery_restart_count` is
+        // preserved across `enter_paused` to keep the operator-must-fix
+        // signal. If a future operator unpauses the agent without
+        // addressing the root cause and it Hungs again, the dispatcher
+        // cap check immediately escalates to Stage3Eligible rather than
+        // burning further auto-restart budget.
+        let mut tracker = crate::health::HealthTracker::new();
+        tracker.recovery_restart_count = 3;
+        let now = Instant::now();
+        tracker.enter_paused(now);
+        assert_eq!(tracker.recovery_restart_count, 3);
+        assert_eq!(tracker.state, HealthState::Paused);
+    }
+
+    #[test]
+    fn stage3_pending_state_no_op_under_maybe_decay() {
+        // Stage 3 is terminal: dispatcher's `Stage3Pending` arm is
+        // explicit no-op, and `maybe_decay_at` honours the
+        // `HealthState::Paused` short-circuit. Together these ensure
+        // that ticking the dispatcher / decay loop while an agent is
+        // Paused does NOT silently mutate state away from Paused or
+        // re-fire Stage 3. Pinned at the decay boundary because that's
+        // the only health-side mutation that runs on every tick;
+        // dispatcher-tick Stage3Pending no-op is verified by reading
+        // the source (no AgentHandle harness exists for the run() arm).
+        let mut tracker = crate::health::HealthTracker::new();
+        let entered = Instant::now();
+        tracker.enter_paused(entered);
+        // Simulate a very long stable window — decay must still not
+        // exit Paused or touch the preserved counter.
+        tracker.recovery_restart_count = 2;
+        tracker.last_stage2_fired_at = Some(entered);
+        tracker.maybe_decay_at(entered + Duration::from_secs(31 * 60));
+        assert_eq!(tracker.state, HealthState::Paused);
+        assert_eq!(tracker.recovery_restart_count, 2);
+        match tracker.recovery_stage_state {
+            RecoveryStageState::Stage3Pending { entered_at } => {
+                assert_eq!(entered_at, entered);
+            }
+            other => panic!("expected Stage3Pending preserved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_stage3_body_includes_recovery_restart_count_and_action() {
+        // Decision §3 telegram content (dev-revised after grep evidence
+        // cut Backend + N1): operator-facing wording must surface the
+        // exhausted Stage 2 count + manual-unpause action hint. Cuts
+        // Backend (DispatchSnapshot lacks the field) and Stage 1 N1
+        // (HealthTracker doesn't track the count).
+        let body = format_stage3_body("orchestrator", 3);
+        assert!(body.contains("ESCALATION"));
+        assert!(body.contains("orchestrator"));
+        assert!(body.contains("PAUSED"));
+        assert!(body.contains("Stage 2 auto-restart fired 3 time(s)"));
+        assert!(body.contains("manual unpause"));
+        // Negative: must NOT include the cut fields per decision §3.
+        assert!(!body.contains("Backend:"));
+        assert!(!body.contains("Stage 1 ESC"));
     }
 }

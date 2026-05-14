@@ -68,12 +68,13 @@ Carried inside `HealthTracker` so the dispatcher reads both
               └────────┬────────┘
                        ▼
               ┌─────────────────┐
-              │ Stage3Eligible  │── (7c) Stage 3 fires
-              └────────┬────────┘
-                       ▼
-              ┌─────────────────┐    HealthState transitions to Paused;
-              │ Stage3Pending   │    operator unpause action only.
-              └─────────────────┘
+              │ Stage3Eligible  │── (7c) Stage 3 fires:
+              └────────┬────────┘    enter_paused(now) writes
+                       ▼               HealthState::Paused atomically
+              ┌─────────────────┐    Terminal. `Paused` short-circuits
+              │ Stage3Pending   │    check_hang + maybe_decay; only an
+              │   { entered_at }│    operator unpause (future sub-task)
+              └─────────────────┘    leaves this state.
 ```
 
 Sub-task 7a (Stage 1) implemented:
@@ -93,8 +94,13 @@ Sub-task 7a (Stage 1) implemented:
 - `Stage2Eligible → Stage2Eligible` (channel-full retry — `try_send`
   failed, state stays for next-tick retry without counter increment)
 
-Sub-task 7c (Stage 3) follow-up adds `Stage3Eligible → Stage3Pending +
-HealthState::Paused` transition.
+**Sub-task 7c (Stage 3) implemented** (this PR):
+- `Stage3Eligible → Stage3Pending { entered_at }` (Stage 3 fire — only
+  via `HealthTracker::enter_paused` per §F39.5; atomically writes
+  `state = Paused`, `recovery_stage_state = Stage3Pending`,
+  `last_stage3_fired_at = Some(now)`)
+- `Stage3Pending` is terminal — explicit no-op arm in dispatcher; only
+  a future operator-unpause sub-task transitions out.
 
 ## §RS.3 — Tick order & dispatcher placement
 
@@ -385,3 +391,154 @@ removal candidate.
 - Full PTY-backed integration test for the variant-split spawn —
   unit tests cover the state machine + counter discipline; full
   integration deferred unless shadow telemetry surfaces edge cases.
+
+## §RS.10 — Stage 3 specifics (sub-task 7c)
+
+Stage 3 is the terminal stage of the auto-recovery state machine.
+After Stage 1 ESC failed and Stage 2 auto-restart was attempted up to
+the cumulative cap (`recovery_restart_count >= STAGE2_MAX_RESTARTS`),
+the dispatcher escalates the agent to `HealthState::Paused` and
+notifies the operator that manual intervention is required.
+
+### 10.1 Stage 3 purpose
+
+Auto-recovery is exhausted; further unattended retries would just
+thrash the agent. Stage 3's job is to **stop trying**, lock the
+agent's `HealthState` into a non-acting terminal value, and surface
+the situation to the operator via an Error-level telegram. The
+escalation is **single-shot per Hung cycle** — once `Stage3Pending`,
+the dispatcher's `Stage3Pending` arm is an explicit no-op (see
+§10.5).
+
+### 10.2 `enter_paused` atomic invariants
+
+`src/health.rs::HealthTracker::enter_paused(&mut self, now: Instant)`
+is the **sole writer** of `HealthState::Paused` in the codebase
+(§F39.5 invariant — single grep target). The method writes three
+invariants under the caller's lock:
+
+1. `state = HealthState::Paused`
+2. `recovery_stage_state = RecoveryStageState::Stage3Pending { entered_at: now }`
+3. `last_stage3_fired_at = Some(now)`
+
+The `Stage3Pending` variant carries `entered_at` so the dispatcher's
+no-op debug log can report Paused-since duration without reaching back
+into `HealthTracker`. `last_stage3_fired_at` is reserved for the future
+operator-unpause sub-task (UX "Paused since N minutes") and carries
+`#[allow(dead_code)]` until that sub-task reads it.
+
+DI-friendly signature parallels `maybe_decay_at(now)`: production
+passes `Instant::now()`; tests pass a deterministic base for
+cross-platform-safe arithmetic (PR #775 v2 lesson — `Instant::add`
+saturates on all platforms; `Instant::now() - Duration` can underflow
+on low-uptime Windows CI VMs).
+
+### 10.3 `NotifySeverity::Error` + telegram format
+
+The `NotifySeverity` enum has three levels: `Info`, `Warn`, `Error`.
+Stage 2 uses `Warn`; crash notifications use `Error`. Stage 3 = "auto-
+recovery exhausted, operator must act", so its severity must be ≥ the
+crash level → `Error`. `silent=false` so the operator's channel
+surfaces it alongside crash notifications.
+
+Telegram body (built by `format_stage3_body(name, count)` so unit
+tests pin the operator-facing wording):
+
+```
+[recovery ESCALATION] {name}: PAUSED — manual intervention required.
+  Stage 2 auto-restart fired {count} time(s), all exhausted.
+  Final state: Paused (no further auto-recovery).
+  Action: investigate root cause + manual unpause (CLI command pending sub-task).
+```
+
+Telegram fires in **both** shadow and active modes so operators see
+the escalation pattern before flipping the gate. Pre-emitted before
+the state write so a crash between telegram and `enter_paused` still
+surfaces the decision.
+
+### 10.4 `recovery_restart_count` NOT reset on `enter_paused`
+
+The counter is **preserved** across Stage 3 entry. Rationale: Paused
+means "automated retry is exhausted; root cause must be addressed".
+If a future operator-unpause sub-task brings the agent back to
+`Healthy` and the agent Hungs again without the root cause being
+fixed, the dispatcher's cap check immediately escalates to
+`Stage3Eligible` again rather than burning further auto-restart
+budget. The operator semantics is: pause is sticky; counter reset is
+the unpause sub-task's design space.
+
+### 10.5 `Stage3Pending` idempotent no-op
+
+The dispatcher's `Stage3Pending` arm is an explicit no-op:
+
+```rust
+RecoveryStageState::Stage3Pending { entered_at } => {
+    tracing::debug!(
+        target: "recovery_shadow",
+        agent = %name,
+        paused_for_ms = entered_at.elapsed().as_millis() as u64,
+        "stage3_pending: awaiting operator unpause"
+    );
+}
+```
+
+No state mutation, no telegram re-fire, no timeout escalation. Double
+protection against any subtle re-entry path comes from the top-level
+`HealthState::Paused` early-`continue` in `run()` (§RS.7 7a guard).
+Together: dispatcher cannot escalate out of Paused, cannot re-fire
+Stage 3 telegrams on subsequent ticks, and `maybe_decay_at` honours
+the Paused short-circuit so the counter the operator sees stays
+faithful to the moment Paused entered.
+
+### 10.6 Promotion criteria (`AGEND_AUTO_RECOVERY_STAGE3=1`)
+
+Hybrid template (round 2 convergence):
+
+1. Operator runs daemon with `AGEND_AUTO_RECOVERY_STAGE3` unset
+   (shadow) for ≥2 weeks across the agent fleet.
+2. Operator reviews `recovery_shadow` tracing target output, focusing
+   on **trigger rate per week** rather than FP-per-trigger. FP
+   semantics are undefined for a terminal stage — Stage 3 only fires
+   after Stage 2 retries are demonstrably exhausted, so the risk of
+   inappropriate action is structurally near-zero. The observation
+   target is "how often is the fleet hitting auto-recovery exhaustion
+   at all?".
+3. Once trigger-rate baseline is stable and operator is confident
+   that paused agents are genuinely stuck (rather than e.g. mis-tuned
+   thresholds), flip `AGEND_AUTO_RECOVERY_STAGE3=1`.
+
+Anti-dead-infra clause carries over from Stage 1 / Stage 2: 6 weeks
+without measurement → Stage 3 promotion infrastructure becomes a
+removal candidate.
+
+### 10.7 Paused 解除 limitations (Phase 1)
+
+Once `enter_paused` writes, the agent stays in `Paused` until one of
+the following:
+
+- **Operator manual restart** via the existing CLI agent-restart
+  surface — fully resets the agent (fresh `HealthTracker`), which
+  also resets `recovery_restart_count`. This is the Phase 1 operator
+  workflow.
+- **Future operator-unpause sub-task** will provide a dedicated
+  `unpause` CLI / MCP command that transitions `Paused → Healthy`
+  without a full restart. Its scope includes the design space of
+  whether to reset `recovery_restart_count` on unpause; 7c does
+  **not** make that decision in advance.
+
+No automatic exit from `Paused` exists. `maybe_decay_at` honours the
+short-circuit at line 1 of its body (7a guard) — the counter the
+operator sees is faithful to the Paused-entry moment.
+
+### Out of scope (sub-task 7c)
+
+- Operator unpause command (separate sub-task)
+- Per-backend Stage 3 customization (Phase 3)
+- Multiple-Pause aggregation (single Paused tracking only)
+- `recovery_restart_count` reset on unpause (defer to unpause sub-task)
+- `last_stage3_fired_at` consumer code (reserved for unpause sub-task;
+  `#[allow(dead_code)]` carries the field through 7c)
+- Full PTY-backed integration test for `enter_paused` via a registered
+  agent — unit tests pin the atomic invariants + idempotency at the
+  `HealthTracker` boundary; integration deferred unless shadow
+  telemetry surfaces edge cases.

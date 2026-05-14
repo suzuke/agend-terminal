@@ -117,11 +117,15 @@ pub enum RecoveryStageState {
     /// stub — emitted by 7b when Stage 2 ships.)
     Stage2Pending { entered_at: Instant },
     /// Stage 2 timed out. Dispatcher will fire Stage 3 on next tick.
-    /// (Phase 1 stub.)
     Stage3Eligible,
     /// Stage 3 dispatched (HealthState transitioned to Paused).
-    /// Awaiting operator unpause action. (Phase 1 stub.)
-    Stage3Pending,
+    /// Awaiting operator unpause action. `entered_at` is the
+    /// `Instant` passed to [`HealthTracker::enter_paused`] and is the
+    /// same value stamped into [`HealthTracker::last_stage3_fired_at`]
+    /// — kept on the variant so dispatcher tick-time debug logs can
+    /// report Paused-since duration without reaching back into
+    /// `HealthTracker` (parallel `Stage1Pending` / `Stage2Pending`).
+    Stage3Pending { entered_at: Instant },
 }
 
 /// Stage 1 default timeout — ESC dispatched, dispatcher waits this long
@@ -243,6 +247,15 @@ pub struct HealthTracker {
     /// decrement the recovery counter. `None` means Stage 2 has never
     /// fired for this agent in the current daemon run.
     pub last_stage2_fired_at: Option<Instant>,
+    /// `#685` sub-task 7c: timestamp of last Stage 3 escalation (the
+    /// transition into `HealthState::Paused`). Reserved for the future
+    /// operator-unpause sub-task — it will read this to display "Paused
+    /// since {duration}" in the unpause UI and may extend
+    /// [`Self::maybe_decay_at`] to honour a Paused decay window. Stage 3
+    /// is terminal in Phase 2, so nothing in 7c reads the field; carry
+    /// `#[allow(dead_code)]` until the unpause sub-task lands.
+    #[allow(dead_code)]
+    pub(crate) last_stage3_fired_at: Option<Instant>,
 }
 
 impl HealthTracker {
@@ -260,7 +273,43 @@ impl HealthTracker {
             last_stage1_fired_at: None,
             recovery_restart_count: 0,
             last_stage2_fired_at: None,
+            last_stage3_fired_at: None,
         }
+    }
+
+    /// `#685` sub-task 7c: atomic transition into `HealthState::Paused`
+    /// for Stage 3 escalation. Encapsulates the three invariants that
+    /// the dispatcher's Stage 3 arm must apply together so the §F39.5
+    /// rule "Paused entered ONLY via Stage 3 dispatcher" has a single
+    /// grep target — `enter_paused` is the sole writer of
+    /// `HealthState::Paused` in the codebase.
+    ///
+    /// Invariants written in one logical step (caller holds the per-
+    /// agent lock for the duration):
+    /// 1. `state` → `HealthState::Paused` (terminal — no further
+    ///    auto-recovery; check_hang short-circuits and maybe_decay
+    ///    no-touches Paused per 7a guards).
+    /// 2. `recovery_stage_state` → `Stage3Pending { entered_at: now }`
+    ///    so the dispatcher's next tick lands on the idempotent no-op
+    ///    arm rather than re-firing Stage 3.
+    /// 3. `last_stage3_fired_at` → `Some(now)` for the future operator-
+    ///    unpause sub-task's UX (Paused-since-{duration}).
+    ///
+    /// **`recovery_restart_count` is NOT reset** — preserves the
+    /// operator-must-fix-root-cause signal across a future manual
+    /// unpause. If the post-unpause agent Hungs again without the root
+    /// cause being addressed, the cap check in
+    /// [`crate::daemon::per_tick::recovery_dispatcher`] immediately
+    /// re-escalates to Stage3Eligible rather than burning further
+    /// auto-restart budget.
+    ///
+    /// DI-friendly signature (parallels [`Self::maybe_decay_at`]) so
+    /// tests can supply a deterministic `now`. Production callers
+    /// always pass `Instant::now()`.
+    pub fn enter_paused(&mut self, now: Instant) {
+        self.state = HealthState::Paused;
+        self.recovery_stage_state = RecoveryStageState::Stage3Pending { entered_at: now };
+        self.last_stage3_fired_at = Some(now);
     }
 
     /// Record a crash event. Returns (should_respawn, respawn_delay, should_notify).
