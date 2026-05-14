@@ -55,8 +55,7 @@ fn bridge_unwraps_daemon_response_for_tools_call() {
 /// literal in either one.
 #[test]
 fn five_tool_sample_all_routed_through_handle_tool() {
-    let mod_src =
-        std::fs::read_to_string("src/mcp/handlers/mod.rs").expect("read handlers mod.rs");
+    let mod_src = std::fs::read_to_string("src/mcp/handlers/mod.rs").expect("read handlers mod.rs");
     let dispatch_src =
         std::fs::read_to_string("src/mcp/handlers/dispatch.rs").expect("read dispatch.rs");
     let tools = [
