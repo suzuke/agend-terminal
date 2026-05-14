@@ -28,23 +28,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # #772: force toolchain bootstrap before any cargo command. Without
-      # this, `cargo fmt` on macos-latest sometimes resolves to
-      # `rustup-init` (the bootstrap binary) instead of the rustup proxy,
-      # because the proxy is on PATH before the toolchain finished
-      # installing (signature: `error: unexpected argument 'fmt' found
-      # Usage: rustup-init[EXE] [OPTIONS]`). `rustup show` triggers
-      # install; `rustc --version` + `cargo --version` hard-assert the
-      # proxy is verifiably-backed end-to-end. Cheap on cache-hit
-      # (ubuntu/windows); pays ~30-60s on cold macOS bootstrap where
-      # the bug fires. Runs in all 3 matrix platforms via this single
-      # insertion. DO NOT remove without addressing #772 root cause.
+      - uses: Swatinem/rust-cache@v2
+      # #772: force toolchain bootstrap AFTER rust-cache restore.
+      # Symptom: `cargo fmt` on macos-latest resolves to `rustup-init`
+      # (signature: `error: unexpected argument 'fmt' found / Usage:
+      # rustup-init[EXE] [OPTIONS]`).
+      # Root cause: `Swatinem/rust-cache@v2` caches `~/.cargo/bin/`. A
+      # prior failed bootstrap can leave a stale rustup-init binary
+      # there; cache restore on a subsequent run **overwrites** the
+      # freshly-installed rustup proxy with that stale binary. r0 of
+      # this fix placed the bootstrap step BEFORE rust-cache and got
+      # immediately undone by the cache restore (#796 r1).
+      # Mitigation: run bootstrap AFTER cache restore so any stale
+      # binaries get overwritten by the freshly-bootstrapped ones.
+      # `rustup show` triggers install; `rustc --version` +
+      # `cargo --version` hard-assert the proxy is verifiably-backed
+      # end-to-end before any cargo invocation runs. Cheap on
+      # ubuntu/windows; pays ~30-60s on cold macOS bootstrap where
+      # the bug fires. Single insertion covers all 3 matrix platforms.
+      # DO NOT remove or move before rust-cache without addressing
+      # #772 root cause (cache-overwrite of toolchain binaries).
       - name: Force toolchain bootstrap (mitigates macOS rustup-init transient #772)
         run: |
           rustup show
           rustc --version
           cargo --version
-      - uses: Swatinem/rust-cache@v2
 
       # tray-icon / tao on Linux link against GTK3 + the ayatana app-
       # indicator — these come from `libgtk-3-dev` (provides glib-2.0.pc,
