@@ -37,7 +37,7 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{binding_state, ci, comms, force_release, instance, schedule, task, worktree};
+use super::{binding_state, channel, ci, comms, force_release, instance, schedule, task, worktree};
 
 /// Shared per-call context — every common parameter `handle_tool`
 /// would otherwise pass into the match arms, bundled together so each
@@ -450,6 +450,45 @@ static TEAM_ACTIONS: &[(&str, HandlerFn)] = &[
     ("update", dispatch_team_update),
 ];
 
+// ---------------------------------------------------------------------
+// Channel-heavy cohort (T-B10) — `download_attachment` / `inbox` /
+// `reply`. Selection is by arg presence (not by `args["action"]`), so
+// every tool here uses `actions: None` and the dispatching branch lives
+// inside the base adapter, exactly mirroring the pre-migration inline
+// match arm. Side effects (telegram channel writes, filesystem media
+// download, inbox storage RMW) are unchanged — adapters are pure
+// forwards.
+
+fn dispatch_download_attachment(ctx: &HandlerCtx<'_>) -> Value {
+    channel::handle_download_attachment(ctx.home, ctx.args, ctx.instance_name)
+}
+
+// `inbox` — three-way branch on arg presence (NOT `args["action"]`):
+//   - `message_id` present → `comms::handle_describe_message`
+//   - else `thread_id` present → `comms::handle_describe_thread`
+//   - else → `comms::handle_inbox` (drain pending)
+// Order matters: the original inline match arm preferred message_id
+// over thread_id, so this `if / else if / else` chain preserves byte-
+// identical routing for callers that (incorrectly) pass both.
+fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
+    if ctx
+        .args
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        comms::handle_describe_message(ctx.home, ctx.args, ctx.instance_name)
+    } else if ctx.args.get("thread_id").and_then(|v| v.as_str()).is_some() {
+        comms::handle_describe_thread(ctx.home, ctx.args)
+    } else {
+        comms::handle_inbox(ctx.home, ctx.instance_name)
+    }
+}
+
+fn dispatch_reply(ctx: &HandlerCtx<'_>) -> Value {
+    channel::handle_reply(ctx.home, ctx.args, ctx.instance_name)
+}
+
 /// Registered tool dispatchers. **Adding a tool**: write its adapter
 /// above, append a [`HandlerEntry`] here. **Removing**: delete both
 /// halves. Order doesn't affect correctness (linear-scan match by
@@ -591,6 +630,25 @@ static REGISTERED: &[HandlerEntry] = &[
         handler: dispatch_team,
         actions: Some(TEAM_ACTIONS),
     },
+    // Channel-heavy cohort (T-B10): download_attachment / inbox / reply.
+    // Flat dispatch (no `args["action"]` sub-routing) — the conceptual
+    // "actions" for `inbox` (drain / describe / thread) are selected by
+    // arg presence inside `dispatch_inbox`, not by an `action` field.
+    HandlerEntry {
+        name: "download_attachment",
+        handler: dispatch_download_attachment,
+        actions: None,
+    },
+    HandlerEntry {
+        name: "inbox",
+        handler: dispatch_inbox,
+        actions: None,
+    },
+    HandlerEntry {
+        name: "reply",
+        handler: dispatch_reply,
+        actions: None,
+    },
 ];
 
 pub(super) fn registered_handlers() -> &'static [HandlerEntry] {
@@ -666,9 +724,12 @@ mod tests {
                 "repo",
                 "schedule",
                 "team",
+                "download_attachment",
+                "inbox",
+                "reply",
             ]
         );
-        assert_eq!(registered_handlers().len(), 23);
+        assert_eq!(registered_handlers().len(), 26);
     }
 
     /// Coverage test: every tool name advertised by

@@ -108,20 +108,15 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 
     match tool {
         // --- Channel ---
-        "reply" => channel::handle_reply(&home, args, instance_name),
-        "download_attachment" => channel::handle_download_attachment(&home, args, instance_name),
+        // NOTE: `reply` / `download_attachment` migrated to dispatch table
+        // (#694 BLOCK 2 T-B10). See `dispatch::dispatch_reply` /
+        // `dispatch::dispatch_download_attachment`.
 
         // --- Cross-instance communication ---
         // NOTE: `send` migrated to dispatch table (#694 BLOCK 2 T-B8).
-        "inbox" => {
-            if args.get("message_id").and_then(|v| v.as_str()).is_some() {
-                comms::handle_describe_message(&home, args, instance_name)
-            } else if args.get("thread_id").and_then(|v| v.as_str()).is_some() {
-                comms::handle_describe_thread(&home, args)
-            } else {
-                comms::handle_inbox(&home, instance_name)
-            }
-        }
+        // NOTE: `inbox` migrated to dispatch table (#694 BLOCK 2 T-B10).
+        // The three-way branch on `message_id` / `thread_id` / drain
+        // moved verbatim into `dispatch::dispatch_inbox`.
 
         // --- Instance management ---
         // NOTE: 8 instance-lifecycle arms migrated to dispatch table
