@@ -34,10 +34,10 @@
 //! names.
 
 use crate::identity::Sender;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::Path;
 
-use super::{binding_state, comms, force_release, instance, task, worktree};
+use super::{binding_state, ci, comms, force_release, instance, schedule, task, worktree};
 
 /// Shared per-call context — every common parameter `handle_tool`
 /// would otherwise pass into the match arms, bundled together so each
@@ -224,6 +224,114 @@ static TASK_ACTIONS: &[(&str, HandlerFn)] = &[
     ("done", dispatch_task_done),
 ];
 
+// ---------------------------------------------------------------------
+// Cohort migration (T-B9) — 7 action-based tools with N sub-handlers
+// each. Pattern (per T-B8 spot-check ACK + T-B9 dispatch):
+//
+//   - `dispatch_<tool>` base handler relocates the inline `match` from
+//     `mod.rs`. Recognized arms point to the same per-action fns the
+//     inline match used; the `other` arm produces the same error JSON.
+//   - Per-action sub-handlers (`dispatch_<tool>_<action>`) forward
+//     directly to the per-action fns. The dispatch table catches
+//     recognized actions and routes through these.
+//   - `<TOOL>_ACTIONS` static lists the (action_name, sub_handler)
+//     pairs.
+//
+// Runtime path: recognized action → dispatch table actions[…] hit →
+// sub-handler → per-action fn. Unknown / missing action → fall through
+// to `dispatch_<tool>` base → its `match` → `other` arm → unknown-
+// action error JSON. The base handler's recognized-action arms are
+// unreachable at runtime (dispatch table catches them first); they're
+// retained because they mirror the pre-migration inline match exactly,
+// which is the double-match safety net the dispatch contract requires.
+
+// `ci` — actions: watch / unwatch / status.
+
+fn dispatch_ci(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "watch" => ci::handle_watch_ci(ctx.home, ctx.args, ctx.instance_name),
+        "unwatch" => ci::handle_unwatch_ci(ctx.home, ctx.args),
+        "status" => ci::handle_status_ci(ctx.home, ctx.args, ctx.instance_name),
+        other => json!({"error": format!("unknown ci action: {other}")}),
+    }
+}
+
+fn dispatch_ci_watch(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_watch_ci(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_ci_unwatch(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_unwatch_ci(ctx.home, ctx.args)
+}
+
+fn dispatch_ci_status(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_status_ci(ctx.home, ctx.args, ctx.instance_name)
+}
+
+static CI_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("watch", dispatch_ci_watch),
+    ("unwatch", dispatch_ci_unwatch),
+    ("status", dispatch_ci_status),
+];
+
+// `decision` — actions: post / list / update.
+
+fn dispatch_decision(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "post" => task::handle_post_decision(ctx.home, ctx.args, ctx.instance_name, ctx.sender),
+        "list" => task::handle_list_decisions(ctx.home, ctx.args),
+        "update" => task::handle_update_decision(ctx.home, ctx.args, ctx.instance_name),
+        other => json!({"error": format!("unknown decision action: {other}")}),
+    }
+}
+
+fn dispatch_decision_post(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_post_decision(ctx.home, ctx.args, ctx.instance_name, ctx.sender)
+}
+
+fn dispatch_decision_list(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_list_decisions(ctx.home, ctx.args)
+}
+
+fn dispatch_decision_update(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_update_decision(ctx.home, ctx.args, ctx.instance_name)
+}
+
+static DECISION_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("post", dispatch_decision_post),
+    ("list", dispatch_decision_list),
+    ("update", dispatch_decision_update),
+];
+
+// `deployment` — actions: deploy / teardown / list.
+
+fn dispatch_deployment(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "deploy" => schedule::handle_deploy_template(ctx.home, ctx.args, ctx.instance_name),
+        "teardown" => schedule::handle_teardown_deployment(ctx.home, ctx.args),
+        "list" => schedule::handle_list_deployments(ctx.home),
+        other => json!({"error": format!("unknown deployment action: {other}")}),
+    }
+}
+
+fn dispatch_deployment_deploy(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_deploy_template(ctx.home, ctx.args, ctx.instance_name)
+}
+
+fn dispatch_deployment_teardown(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_teardown_deployment(ctx.home, ctx.args)
+}
+
+fn dispatch_deployment_list(ctx: &HandlerCtx<'_>) -> Value {
+    schedule::handle_list_deployments(ctx.home)
+}
+
+static DEPLOYMENT_ACTIONS: &[(&str, HandlerFn)] = &[
+    ("deploy", dispatch_deployment_deploy),
+    ("teardown", dispatch_deployment_teardown),
+    ("list", dispatch_deployment_list),
+];
+
 /// Registered tool dispatchers. **Adding a tool**: write its adapter
 /// above, append a [`HandlerEntry`] here. **Removing**: delete both
 /// halves. Order doesn't affect correctness (linear-scan match by
@@ -321,12 +429,27 @@ static REGISTERED: &[HandlerEntry] = &[
         handler: dispatch_gc_dry_run,
         actions: None,
     },
-    // Action sub-routing validation case (T-B8) — only "list"
-    // wired for early-report spot-check. T-B9 wires the rest.
+    // Action sub-routing (T-B8) — all 5 actions wired (`task`).
     HandlerEntry {
         name: "task",
         handler: dispatch_task,
         actions: Some(TASK_ACTIONS),
+    },
+    // Action-based cohort (T-B9): ci / decision / deployment.
+    HandlerEntry {
+        name: "ci",
+        handler: dispatch_ci,
+        actions: Some(CI_ACTIONS),
+    },
+    HandlerEntry {
+        name: "decision",
+        handler: dispatch_decision,
+        actions: Some(DECISION_ACTIONS),
+    },
+    HandlerEntry {
+        name: "deployment",
+        handler: dispatch_deployment,
+        actions: Some(DEPLOYMENT_ACTIONS),
     },
 ];
 
@@ -396,9 +519,12 @@ mod tests {
                 "force_release_worktree",
                 "gc_dry_run",
                 "task",
+                "ci",
+                "decision",
+                "deployment",
             ]
         );
-        assert_eq!(registered_handlers().len(), 16);
+        assert_eq!(registered_handlers().len(), 19);
     }
 
     /// Coverage test: every tool name advertised by

@@ -139,13 +139,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             other => json!({"error": format!("unknown health action: {other}")}),
         },
 
-        // --- Decisions (consolidated: decision action=post/list/update) ---
-        "decision" => match args["action"].as_str().unwrap_or("") {
-            "post" => task::handle_post_decision(&home, args, instance_name, &sender),
-            "list" => task::handle_list_decisions(&home, args),
-            "update" => task::handle_update_decision(&home, args, instance_name),
-            other => json!({"error": format!("unknown decision action: {other}")}),
-        },
+        // NOTE: `decision` migrated to dispatch table (#694 BLOCK 2 T-B9).
 
         // --- Task board ---
         // NOTE: `task` migrated to dispatch table (#694 BLOCK 2 T-B8),
@@ -176,13 +170,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             other => json!({"error": format!("unknown schedule action: {other}")}),
         },
 
-        // --- Deployments (consolidated: deployment action=deploy/teardown/list) ---
-        "deployment" => match args["action"].as_str().unwrap_or("") {
-            "deploy" => schedule::handle_deploy_template(&home, args, instance_name),
-            "teardown" => schedule::handle_teardown_deployment(&home, args),
-            "list" => schedule::handle_list_deployments(&home),
-            other => json!({"error": format!("unknown deployment action: {other}")}),
-        },
+        // NOTE: `deployment` migrated to dispatch table (#694 BLOCK 2 T-B9).
 
         // --- Repo access (consolidated: repo action=checkout/release) ---
         "repo" => match args["action"].as_str().unwrap_or("") {
@@ -191,14 +179,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
             other => json!({"error": format!("unknown repo action: {other}")}),
         },
 
-        // --- CI watch (consolidated: ci action=watch/unwatch) ---
-        "ci" => match args["action"].as_str().unwrap_or("") {
-            "watch" => ci::handle_watch_ci(&home, args, instance_name),
-            "unwatch" => ci::handle_unwatch_ci(&home, args),
-            // Sprint 54 P0-5 (sub-scope C): aggregate health snapshot.
-            "status" => ci::handle_status_ci(&home, args, instance_name),
-            other => json!({"error": format!("unknown ci action: {other}")}),
-        },
+        // NOTE: `ci` migrated to dispatch table (#694 BLOCK 2 T-B9),
+        // including the Sprint 54 P0-5 `status` action for aggregate
+        // health snapshot.
 
         // NOTE: bind_self / release_worktree / force_release_worktree /
         // binding_state / gc_dry_run migrated to dispatch table (#694
