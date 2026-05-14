@@ -456,7 +456,12 @@ reset mechanic.
   sub-task.
 - **Stage-1 / Stage-2 / Stage-3 recovery design** — Phase 2 of #685,
   gated behind feature flags and operator default of "warn-only" per
-  the issue.
+  the issue. **Update (sub-task 7a ship)**: Stage 1 ESC interrupt
+  infrastructure shipped — `src/daemon/per_tick/recovery_dispatcher.rs`
+  + `RecoveryStageState` state machine + `HealthState::Paused` variant
+  + env-var-gated shadow-mode default. Stages 2 and 3 follow-up
+  sub-tasks reuse the same dispatcher tick + state machine. See
+  `docs/RECOVERY-STAGES.md` for full lifecycle + promotion criteria.
 
 ## Consumer audit
 

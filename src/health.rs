@@ -54,6 +54,19 @@ pub enum HealthState {
     /// Closes the operator 04:00 UTC false-alarm pattern where impl-1's
     /// 30-min idle-waiting was mis-classified as `Hung`.
     IdleLong,
+    /// `#685` sub-task 7a Stage 1 recovery (decision
+    /// `d-20260514030404021793-1`): agent escalated through Stage 3 of
+    /// the auto-recovery dispatcher — Stage 1 ESC failed, Stage 2
+    /// auto-restart failed N times. Operator action required to
+    /// unpause (separate sub-task). Distinct from `Failed` (which =
+    /// crash counter exhausted): same "operator must intervene"
+    /// terminal status but different trigger.
+    ///
+    /// Guards: `check_hang` short-circuits on `Paused` (returns
+    /// `false` — no auto-recovery dispatcher work); `maybe_decay` does
+    /// NOT touch `Paused`; entered ONLY via Stage 3 dispatcher.
+    /// See `docs/RECOVERY-STAGES.md` §RS for the lifecycle.
+    Paused,
 }
 
 impl HealthState {
@@ -66,7 +79,78 @@ impl HealthState {
             Self::Hung => "hung",
             Self::ErrorLoop => "error_loop",
             Self::IdleLong => "idle_long",
+            Self::Paused => "paused",
         }
+    }
+}
+
+/// `#685` sub-task 7a: per-agent recovery dispatcher state machine for
+/// the auto-recovery ladder. Carried inside `HealthTracker` so the
+/// dispatcher can read both `HealthState` and stage progression in one
+/// per-tick lock acquisition. Compile-time exhaustive match in the
+/// dispatcher catches missing-state bugs.
+///
+/// **Spontaneous recovery reset** (decision §5 Refinement): when
+/// `health.state` transitions back to `Healthy` (either Stage success
+/// or external recovery), the dispatcher resets `recovery_stage_state`
+/// to `None`. Subsequent `Hung` re-entry begins a fresh sequence —
+/// linear escalation rule restarts from Stage 1.
+///
+/// **Future variant**: a 7th `Disabling { until_operator_unpauses }`
+/// variant is intentionally NOT added in Phase 1 — Stage 3 + Paused
+/// HealthState already covers the operator-action-required terminal
+/// case. Recorded here as a comment-only note for future sub-tasks
+/// that add operator-unpause command surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Stage2Pending / Stage3Eligible / Stage3Pending: emitted by sub-tasks 7b / 7c
+pub enum RecoveryStageState {
+    /// No recovery in progress. Default.
+    None,
+    /// Stage 1 ESC dispatched (or shadow-logged); monitoring for recovery.
+    /// `entered_at` drives the Stage 1 timeout window.
+    Stage1Pending { entered_at: Instant },
+    /// Stage 1 timed out (or skipped via dead-likely branch). Dispatcher
+    /// will fire Stage 2 on the next tick once 7b ships. Phase 1 logs
+    /// the eligibility transition and stops here.
+    Stage2Eligible,
+    /// Stage 2 restart in progress; monitoring for recovery. (Phase 1
+    /// stub — emitted by 7b when Stage 2 ships.)
+    Stage2Pending { entered_at: Instant },
+    /// Stage 2 timed out. Dispatcher will fire Stage 3 on next tick.
+    /// (Phase 1 stub.)
+    Stage3Eligible,
+    /// Stage 3 dispatched (HealthState transitioned to Paused).
+    /// Awaiting operator unpause action. (Phase 1 stub.)
+    Stage3Pending,
+}
+
+/// Stage 1 default timeout — ESC dispatched, dispatcher waits this long
+/// before declaring failure and transitioning to `Stage2Eligible`.
+/// Decision §1.4 Delta 1: 10s default (reviewer recommendation: ESC
+/// delivery latency = PTY write + agent process scheduling + Ink TUI
+/// state reset; under load, 5s false-positives Stage 2 escalation).
+/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE1_TIMEOUT_MS`.
+pub const STAGE1_TIMEOUT_DEFAULT_MS: u64 = 10_000;
+
+/// Stage 1 default cooldown — if agent re-enters Hung within this window
+/// after a recent Stage 1 fire, dispatcher skips Stage 1 (goes directly
+/// to `Stage2Eligible`). Prevents rapid-fire ESC sending that masks
+/// underlying issues. Decision §1.4 Refinement B.
+/// Operator override via env var `AGEND_AUTO_RECOVERY_STAGE1_COOLDOWN_MS`.
+pub const STAGE1_COOLDOWN_DEFAULT_MS: u64 = 60_000;
+
+/// Returns `true` when `silent_productive` (silence since last productive
+/// output) exceeds the per-`AgentState` threshold. Mirrors the
+/// `silence_exceeds_threshold` pattern at the top of `check_hang`.
+/// Extracted per decision §1.4 Delta 2 (Option a: DRY, single source of
+/// truth — recovery dispatcher reads this directly without
+/// re-implementing the threshold mapping).
+pub fn productive_silence_exceeds(agent_state: AgentState, silent_productive: Duration) -> bool {
+    match agent_state {
+        AgentState::Idle => false,
+        AgentState::Starting => silent_productive > Duration::from_secs(120),
+        AgentState::Thinking | AgentState::ToolUse => silent_productive > Duration::from_secs(600),
+        _ => silent_productive > Duration::from_secs(120),
     }
 }
 
@@ -98,6 +182,18 @@ pub struct HealthTracker {
     error_events: VecDeque<(Instant, AgentState)>,
     pub last_output: Instant,
     pub current_reason: Option<BlockedReason>,
+    /// `#685` sub-task 7a: per-agent recovery dispatcher state machine.
+    /// Mutated only by `src/daemon/per_tick/recovery_dispatcher.rs`;
+    /// `health.rs` ships it as a field to keep all per-agent state in
+    /// one struct (single lock acquisition for dispatcher tick).
+    pub recovery_stage_state: RecoveryStageState,
+    /// `#685` sub-task 7a: timestamp of last Stage 1 ESC fire (or
+    /// shadow-log emission). Used by the cooldown guard — if agent
+    /// re-enters `Hung` within `STAGE1_COOLDOWN_DEFAULT_MS` of this
+    /// timestamp, dispatcher skips Stage 1 and escalates directly to
+    /// `Stage2Eligible`. `None` means Stage 1 has never fired for this
+    /// agent in the current daemon run.
+    pub last_stage1_fired_at: Option<Instant>,
 }
 
 impl HealthTracker {
@@ -111,6 +207,8 @@ impl HealthTracker {
             error_events: VecDeque::new(),
             last_output: Instant::now(),
             current_reason: None,
+            recovery_stage_state: RecoveryStageState::None,
+            last_stage1_fired_at: None,
         }
     }
 
@@ -232,6 +330,17 @@ impl HealthTracker {
         last_input_at_ms: u64,
         last_heartbeat_at_ms: u64,
     ) -> bool {
+        // `#685` sub-task 7a guard: `Paused` is operator-action-required
+        // terminal state — auto-recovery dispatcher already escalated
+        // through Stage 3 and stopped. `check_hang` must NOT mutate state
+        // back to `Hung` or trigger further dispatcher work. Return false
+        // immediately so the upstream `tracing::warn!` at the hang-detection
+        // tick site is suppressed too (operator already alerted via Stage 3
+        // telegram notify; further warns would be noise).
+        if self.state == HealthState::Paused {
+            return false;
+        }
+
         // Race mutex: skip hang check when agent is blocked for a known
         // reason that legitimately suppresses output.
         if let Some(ref reason) = self.current_reason {
@@ -456,7 +565,15 @@ impl HealthTracker {
 
     /// Decay total_crashes if stable for STABILITY_WINDOW.
     /// Call periodically from daemon main loop.
+    ///
+    /// `#685` sub-task 7a guard: `Paused` is operator-action-required —
+    /// crash decay must NOT exit `Paused` (only operator unpause can).
+    /// `Paused` is reachable only via Stage 3 dispatcher, never via
+    /// crash counter or decay paths.
     pub fn maybe_decay(&mut self) {
+        if self.state == HealthState::Paused {
+            return;
+        }
         if self.total_crashes == 0 {
             return;
         }

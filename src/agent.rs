@@ -264,6 +264,16 @@ pub enum AgentExitEvent {
     Crash(String),
     /// Agent exited cleanly (exit code 0, e.g. `/exit` or `/quit`) — no respawn.
     CleanExit(String),
+    /// `#685` sub-task 7a: emitted by the recovery dispatcher when Stage 2
+    /// auto-restart fires after Stage 1 ESC fails to clear `Hung` within
+    /// the timeout window. Semantically distinct from `Crash` so the
+    /// respawn worker can skip the crash-counter increment (Stage 2
+    /// is recovery-initiated, not a process crash). Phase 1 (sub-task
+    /// 7a / Stage 1) ships the variant definition only — emission and
+    /// handler logic land in sub-task 7b (Stage 2 PR). Until then this
+    /// variant is constructed only by tests pinning the channel shape.
+    #[allow(dead_code)]
+    Stage2Restart(String),
 }
 
 /// Channel for exit events from reaper to daemon.

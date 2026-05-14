@@ -39,6 +39,7 @@ pub(crate) mod external_liveness;
 pub(crate) mod hang_detection;
 pub(crate) mod inbox_maintenance;
 pub(crate) mod poll_reminder;
+pub(crate) mod recovery_dispatcher;
 pub(crate) mod snapshot;
 pub(crate) mod watchdog;
 
@@ -48,6 +49,7 @@ pub(crate) use external_liveness::ExternalLivenessHandler;
 pub(crate) use hang_detection::HangDetectionHandler;
 pub(crate) use inbox_maintenance::InboxMaintenanceHandler;
 pub(crate) use poll_reminder::PollReminderHandler;
+pub(crate) use recovery_dispatcher::RecoveryDispatcherHandler;
 pub(crate) use snapshot::SnapshotRotationHandler;
 pub(crate) use watchdog::WatchdogHandler;
 

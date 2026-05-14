@@ -219,3 +219,8 @@ for removal — dead shadow infra is worse than no infra.
   `log_productivity_telemetry`. Parallel to `BehavioralSignal` /
   `BehavioralConfig` / `infer_from_silence` / `log_shadow_telemetry`
   (Sprint 27 PR-A — silence-side equivalents).
+- `docs/RECOVERY-STAGES.md` — `#685` Phase 2 staged auto-recovery
+  dispatcher reads `productive_silence_exceeds` helper (extracted
+  from `check_hang`) directly to decide Stage 1 alive-stuck vs
+  dead-likely branch. Recovery treats all `Hung` sources the same
+  regardless of F9 promotion state — see §RS.4.

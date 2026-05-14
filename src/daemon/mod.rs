@@ -536,6 +536,14 @@ fn run_core(
     // that ordering is the zero-behavior-change guarantee.
     let handlers: Vec<Box<dyn per_tick::PerTickHandler>> = vec![
         Box::new(per_tick::HangDetectionHandler::new()),
+        // `#685` sub-task 7a Stage 1: recovery dispatcher MUST run after
+        // `HangDetectionHandler` in the same tick so it reads the
+        // freshly-updated `HealthState` (sub-task 1 §Invariants 5b means
+        // `check_hang` returns true only on transition-into-Hung;
+        // dispatcher reads state directly to handle the "still Hung"
+        // case). Shadow-mode by default — gated on
+        // `AGEND_AUTO_RECOVERY_STAGE1=1`. See `docs/RECOVERY-STAGES.md`.
+        Box::new(per_tick::RecoveryDispatcherHandler::new()),
         Box::new(per_tick::WatchdogHandler::new(watchdog_dry_run)),
         Box::new(per_tick::ExternalLivenessHandler::new()),
         Box::new(per_tick::SnapshotRotationHandler::new()),
