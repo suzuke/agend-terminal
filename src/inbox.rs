@@ -2143,13 +2143,101 @@ mod tests {
         };
         let header = format_header(&msg);
         assert!(header.contains("[AGEND-MSG]"));
-        assert!(header.contains("from=from:dev-lead"));
+        // #761: `from=` field strips the redundant `from:` prefix that
+        // the agent producer adds at Source::Agent display impl.
+        assert!(header.contains("from=dev-lead"));
+        assert!(!header.contains("from=from:"));
         assert!(header.contains("id=m-42"));
         assert!(header.contains("kind=task"));
         assert!(header.contains("thread=t-100"));
         assert!(header.contains("parent=m-41"));
         assert!(header.contains("size=500"));
         assert!(!header.contains('\n'), "header must be single line");
+    }
+
+    /// #761: agent-source `from:NAME` (sole producer at the
+    /// `Source::Agent` Display impl in inbox.rs:144) gets its redundant
+    /// `from:` prefix stripped at PTY-header rendering. Pre-fix the
+    /// header read `from=from:dev-fast-1`; the double prefix confused
+    /// agents that parsed the field as identity.
+    #[test]
+    fn test_header_format_strips_from_prefix_for_agent_sources() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "from:dev-fast-1".into(),
+            text: "ping".into(),
+            kind: Some("task".into()),
+            timestamp: "2026-05-14T19:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
+        };
+        let header = format_header(&msg);
+        assert!(
+            header.contains("from=dev-fast-1"),
+            "agent from= should drop the `from:` producer prefix: {header}"
+        );
+        assert!(
+            !header.contains("from=from:"),
+            "header must NOT carry the doubled `from=from:` form: {header}"
+        );
+    }
+
+    /// #761: non-agent sources (system events, telegram users) carry
+    /// their own namespace prefix (`system:`, `user:`) and must
+    /// survive the strip pass untouched. Only the literal `from:`
+    /// prefix from `Source::Agent` is dropped.
+    #[test]
+    fn test_header_format_preserves_system_namespace() {
+        let msg = InboxMessage {
+            schema_version: 1,
+            id: Some("m-1".into()),
+            from: "system:fleet_idle_watchdog".into(),
+            text: "ping".into(),
+            kind: Some("watchdog".into()),
+            timestamp: "2026-05-14T19:00:00Z".into(),
+            channel: None,
+            delivery_mode: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            read_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            attachments: vec![],
+            in_reply_to_msg_id: None,
+            in_reply_to_excerpt: None,
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
+        };
+        let header = format_header(&msg);
+        assert!(
+            header.contains("from=system:fleet_idle_watchdog"),
+            "system namespace must survive untouched: {header}"
+        );
     }
 
     #[test]
@@ -2182,7 +2270,9 @@ mod tests {
             worktree_binding_required: None,
         };
         let header = format_header(&msg);
-        assert!(header.contains("from=from:agent"));
+        // #761: agent-source prefix stripped.
+        assert!(header.contains("from=agent"));
+        assert!(!header.contains("from=from:"));
         assert!(header.contains("id=m-1"));
         assert!(!header.contains("kind="));
         assert!(!header.contains("thread="));
@@ -2708,7 +2798,10 @@ mod tests {
             !header.contains('\r'),
             "header must not contain CR: {header:?}"
         );
-        assert!(header.contains("from=from:evil agent"));
+        // #761: `from:` agent prefix is stripped BEFORE sanitize, so the
+        // newline-escaped tail `evil agent` is what surfaces in the field.
+        assert!(header.contains("from=evil agent"));
+        assert!(!header.contains("from=from:"));
         assert!(header.contains("kind=task  injection"));
     }
 
