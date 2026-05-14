@@ -21,6 +21,7 @@ mod daemon_config;
 mod decisions;
 mod deployments;
 mod dispatch_tracking;
+mod display_time;
 mod error;
 mod event_log;
 mod fleet;

@@ -38,6 +38,13 @@ pub struct FleetConfig {
     /// Template definitions for batch deployment.
     #[serde(default)]
     pub templates: Option<HashMap<String, serde_yaml_ng::Value>>,
+    /// #790 Option 1: IANA timezone name (e.g. `Asia/Taipei`) used to
+    /// render UTC timestamps on human-facing surfaces (TUI overlays,
+    /// `[ci-watch-stalled]` notification bodies). `None` falls back to
+    /// `chrono::Local` (system tz), preserving the pre-#790 behaviour
+    /// from Sprint 54 P2-6. Storage timestamps stay UTC unconditionally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_timezone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
