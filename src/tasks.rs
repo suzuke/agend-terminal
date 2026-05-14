@@ -686,7 +686,28 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     }),
             };
             match crate::task_events::append(home, &emitter, event) {
-                Ok(_) => serde_json::json!({"id": id, "status": "done"}),
+                Ok(_) => {
+                    // #789: task-completion is a workflow boundary —
+                    // clean any empty `init` commits the backend has
+                    // accumulated in the agent's bound worktree since
+                    // the last cleanup at `dispatch_auto_bind_lease`.
+                    // Best-effort: failure is logged inside the helper
+                    // but never blocks the done response (the task
+                    // event already appended successfully — cleanup is
+                    // a polish step, not load-bearing).
+                    let owner = record
+                        .owner
+                        .as_ref()
+                        .map(|o| o.0.clone())
+                        .unwrap_or_else(|| caller.clone());
+                    if let Some(wt) = crate::binding::read(home, &owner)
+                        .and_then(|v| v["worktree"].as_str().map(std::path::PathBuf::from))
+                    {
+                        let _ =
+                            crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
+                    }
+                    serde_json::json!({"id": id, "status": "done"})
+                }
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
         }

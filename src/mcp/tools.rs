@@ -238,11 +238,12 @@ fn health_tools() -> Vec<Value> {
 
 fn repo_tools() -> Vec<Value> {
     vec![
-        json!({"name": "repo", "description": "Manage repo worktrees. Actions: checkout, release.",
+        json!({"name": "repo", "description": "Manage repo worktrees. Actions: checkout, release, cleanup_init_commits.",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["checkout", "release"]},
+                "action": {"type": "string", "enum": ["checkout", "release", "cleanup_init_commits"]},
                 "source": {"type": "string"}, "branch": {"type": "string"},
                 "path": {"type": "string"},
+                "agent": {"type": "string", "description": "#789: target agent for cleanup_init_commits (defaults to caller's instance_name). Cleans empty `init` commits accumulated in the agent's bound worktree by backend session-checkpoint heartbeats. Returns {cleaned_count, [skipped_reason]}. Idempotent — call before push to scrub PR history."},
                 "bind": {"type": "boolean", "description": "#778 Option 1: when true on checkout, atomically bind the caller to the just-provisioned worktree (writes binding.json + .agend-managed marker + arms ci_watches) and lands HEAD on the named branch instead of a detached commit. Default false preserves back-compat for inspection-only callers (review pool, operator triage)."}
             }, "required": ["action"]}}),
     ]

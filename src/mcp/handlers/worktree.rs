@@ -154,15 +154,21 @@ pub(crate) fn handle_release_worktree(
         return json!({"error": e});
     }
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    // #789: clean empty init commits before removal (best-effort).
+    if !dry_run {
+        if let Some(wt) = crate::binding::read(home, agent)
+            .and_then(|v| v["worktree"].as_str().map(std::path::PathBuf::from))
+        {
+            let _ = crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
+        }
+    }
     let outcome = crate::worktree_pool::release_full(home, agent, dry_run);
     serde_json::to_value(&outcome).unwrap_or_else(|_| json!({"error": "serialize failed"}))
 }
 
-/// MCP tool: `gc_dry_run` (Sprint 53 P1-4) — Phase 4 GC visibility wrapper
-/// over `worktree_pool::gc_dry_run`. Enriches candidates with marker
-/// metadata (branch / leased_at / released_at), formats as `"human"`
-/// (default) or `"json"`. Non-destructive — actual removal stays behind
-/// `AGEND_WORKTREE_GC=1`. Unknown `format` → graceful error.
+/// MCP tool: `gc_dry_run` (Sprint 53 P1-4) — Phase 4 GC visibility
+/// wrapping `worktree_pool::gc_dry_run`. Non-destructive (removal gated
+/// behind `AGEND_WORKTREE_GC=1`). Format: `"human"` (default) or `"json"`.
 pub(crate) fn handle_gc_dry_run(home: &Path, args: &Value, _sender: &Option<Sender>) -> Value {
     let format = args["format"].as_str().unwrap_or("human");
     if format != "human" && format != "json" {

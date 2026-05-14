@@ -263,6 +263,51 @@ fn validate_release_path(path_str: &str) -> Result<std::path::PathBuf, String> {
     Ok(canonical)
 }
 
+/// #789 — explicit MCP entry point for cleaning empty `init` commits
+/// from a bound worktree. Operators / agents call this before push to
+/// scrub backend session-checkpoint pollution that accumulated between
+/// `dispatch_auto_bind_lease` (bind-time cleanup) and now.
+///
+/// Args:
+/// - `agent` (optional, defaults to caller's `instance_name`): which
+///   agent's bound worktree to clean.
+///
+/// Response shape (idempotent, observable):
+/// - `{cleaned_count: N}` — N empty inits removed (0 = noop)
+/// - `{cleaned_count: 0, skipped_reason: "no binding"}` — agent has no
+///   active binding; explicit reason so callers don't mistake for noop
+/// - `{error: "...", code: "cleanup_failed"}` — git subprocess failure
+pub(super) fn handle_cleanup_init_commits(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let agent = args["agent"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(instance_name);
+    if agent.is_empty() {
+        return json!({
+            "error": "missing 'agent' (and no caller instance_name available)",
+            "code": "needs_agent"
+        });
+    }
+    let worktree = match crate::binding::read(home, agent)
+        .and_then(|v| v["worktree"].as_str().map(std::path::PathBuf::from))
+    {
+        Some(wt) => wt,
+        None => {
+            return json!({
+                "cleaned_count": 0,
+                "skipped_reason": format!("no binding for agent '{agent}'"),
+            });
+        }
+    };
+    match crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&worktree) {
+        Ok(count) => json!({"cleaned_count": count}),
+        Err(msg) => json!({
+            "error": msg,
+            "code": "cleanup_failed",
+        }),
+    }
+}
+
 pub(super) fn handle_release_repo(args: &Value) -> Value {
     let path = match args["path"].as_str() {
         Some(p) => p,

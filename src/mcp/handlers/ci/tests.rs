@@ -1579,3 +1579,256 @@ fn checkout_bind_true_no_failures_no_warnings_field() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&parent).ok();
 }
+
+// ----------------------------------------------------------------------
+// #789 — `repo action=cleanup_init_commits` MCP tool + signature contract
+// tests. Pairs with the §3.10 anchor in `tasks::tests` which verifies
+// `task action=done` triggers cleanup.
+//
+// Source of truth: decision d-20260514172825962581-5.
+// Cross-platform per reviewer C6 — pure git subprocess + fixture I/O;
+// happy-path tests `#[cfg(unix)]` to match #780/#781 fixture convention
+// for git-subprocess concurrency on CI.
+// ----------------------------------------------------------------------
+
+#[cfg(unix)]
+fn p789_setup_worktree_with_empty_inits(
+    home: &std::path::Path,
+    agent: &str,
+    n_empty: usize,
+) -> std::path::PathBuf {
+    let worktree = home.join("worktree");
+    std::fs::create_dir_all(&worktree).ok();
+    let bypass = ("AGEND_GIT_BYPASS", "1");
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&worktree)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ])
+        .current_dir(&worktree)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    let head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&worktree)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/main", &sha])
+        .current_dir(&worktree)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    for _ in 0..n_empty {
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ])
+            .current_dir(&worktree)
+            .env(bypass.0, bypass.1)
+            .output()
+            .unwrap();
+    }
+    let runtime = crate::paths::runtime_dir(home).join(agent);
+    std::fs::create_dir_all(&runtime).ok();
+    std::fs::write(
+        runtime.join("binding.json"),
+        serde_json::to_string(&serde_json::json!({
+            "version": 1,
+            "agent": agent,
+            "task_id": "T-1",
+            "branch": "feat/p789",
+            "worktree": worktree.display().to_string(),
+            "source_repo": worktree.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    worktree
+}
+
+#[cfg(unix)]
+fn p789_count_commits_origin_main_head(worktree: &std::path::Path) -> usize {
+    let out = std::process::Command::new("git")
+        .args(["log", "origin/main..HEAD", "--format=%H"])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().count()
+}
+
+#[test]
+#[cfg(unix)]
+fn cleanup_init_commits_mcp_removes_empty_inits_created_after_bind() {
+    // Test 2: explicit MCP entry. 3 empty inits → MCP cleans → 0.
+    let home = p778_tmp_home("789-mcp-removes");
+    let worktree = p789_setup_worktree_with_empty_inits(&home, "dev", 3);
+    assert_eq!(p789_count_commits_origin_main_head(&worktree), 3);
+
+    let resp =
+        super::handle_cleanup_init_commits(&home, &serde_json::json!({"agent": "dev"}), "operator");
+    assert!(resp.get("error").is_none(), "must succeed: {resp}");
+    assert_eq!(
+        resp["cleaned_count"].as_u64(),
+        Some(3),
+        "must report 3 cleaned: {resp}"
+    );
+    assert_eq!(
+        p789_count_commits_origin_main_head(&worktree),
+        0,
+        "post-MCP, no commits between origin/main..HEAD"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn cleanup_preserves_non_empty_commits_with_msg_init() {
+    // Test 3 (back-compat invariant): `init`-named commit with actual
+    // file changes (real impl work, just badly named) MUST NOT be
+    // touched. Defense-in-depth against unusual commit conventions.
+    let home = p778_tmp_home("789-preserves-nonempty");
+    let worktree = p789_setup_worktree_with_empty_inits(&home, "dev", 0);
+    let bypass = ("AGEND_GIT_BYPASS", "1");
+    std::fs::write(worktree.join("README.md"), "hello").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "README.md"])
+        .current_dir(&worktree)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(&worktree)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    assert_eq!(p789_count_commits_origin_main_head(&worktree), 1);
+
+    let resp =
+        super::handle_cleanup_init_commits(&home, &serde_json::json!({"agent": "dev"}), "operator");
+    assert_eq!(
+        resp["cleaned_count"].as_u64(),
+        Some(0),
+        "non-empty must NOT be cleaned: {resp}"
+    );
+    assert_eq!(
+        p789_count_commits_origin_main_head(&worktree),
+        1,
+        "non-empty `init` commit survives cleanup (back-compat invariant)"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn cleanup_handles_17_burst_pattern_from_pr_781() {
+    // Test 4 (stress, reviewer constraint 3): exact PR #781 scenario
+    // — 17 contiguous empty `init` commits → single soft-reset cleanly
+    // removes all 17.
+    let home = p778_tmp_home("789-17-burst");
+    let worktree = p789_setup_worktree_with_empty_inits(&home, "dev", 17);
+    assert_eq!(p789_count_commits_origin_main_head(&worktree), 17);
+
+    let resp =
+        super::handle_cleanup_init_commits(&home, &serde_json::json!({"agent": "dev"}), "operator");
+    assert_eq!(
+        resp["cleaned_count"].as_u64(),
+        Some(17),
+        "all 17 cleaned in single invocation: {resp}"
+    );
+    assert_eq!(p789_count_commits_origin_main_head(&worktree), 0);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn cleanup_with_invalid_worktree_returns_error_not_silent() {
+    // Test 5 (observable failure, reviewer constraint 4): when binding
+    // points to a non-existent worktree path, the helper's git log
+    // fails. The MCP response surfaces `error` + `code=cleanup_failed`
+    // rather than silently returning cleaned_count=0.
+    let home = std::env::temp_dir().join(format!("agend-p789-invalid-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let runtime = crate::paths::runtime_dir(&home).join("dev");
+    std::fs::create_dir_all(&runtime).ok();
+    std::fs::write(
+        runtime.join("binding.json"),
+        serde_json::to_string(&serde_json::json!({
+            "version": 1,
+            "agent": "dev",
+            "task_id": "T-1",
+            "branch": "feat/x",
+            "worktree": "/var/folders/non-existent-p789-worktree-path",
+            "source_repo": "/var/folders/non-existent-p789-worktree-path",
+            "issued_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let resp =
+        super::handle_cleanup_init_commits(&home, &serde_json::json!({"agent": "dev"}), "operator");
+    assert!(
+        resp.get("error").is_some(),
+        "invalid worktree path must surface error (NOT silent noop): {resp}"
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("cleanup_failed"),
+        "code must mark cleanup_failed class: {resp}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn cleanup_on_clean_worktree_is_noop_count_zero() {
+    // Test 6 (idempotent): no binding → MCP returns cleaned_count=0
+    // with explicit skipped_reason — distinguishes the no-binding case
+    // from "successfully cleaned 0 commits".
+    let home = std::env::temp_dir().join(format!("agend-p789-noop-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let resp = super::handle_cleanup_init_commits(
+        &home,
+        &serde_json::json!({"agent": "ghost-agent"}),
+        "operator",
+    );
+    assert_eq!(resp["cleaned_count"].as_u64(), Some(0));
+    let reason = resp["skipped_reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("no binding"),
+        "no-binding skip reason must be explicit: {resp}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
