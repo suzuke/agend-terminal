@@ -686,7 +686,28 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     }),
             };
             match crate::task_events::append(home, &emitter, event) {
-                Ok(_) => serde_json::json!({"id": id, "status": "done"}),
+                Ok(_) => {
+                    // #789: task-completion is a workflow boundary —
+                    // clean any empty `init` commits the backend has
+                    // accumulated in the agent's bound worktree since
+                    // the last cleanup at `dispatch_auto_bind_lease`.
+                    // Best-effort: failure is logged inside the helper
+                    // but never blocks the done response (the task
+                    // event already appended successfully — cleanup is
+                    // a polish step, not load-bearing).
+                    let owner = record
+                        .owner
+                        .as_ref()
+                        .map(|o| o.0.clone())
+                        .unwrap_or_else(|| caller.clone());
+                    if let Some(wt) = crate::binding::read(home, &owner)
+                        .and_then(|v| v["worktree"].as_str().map(std::path::PathBuf::from))
+                    {
+                        let _ =
+                            crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
+                    }
+                    serde_json::json!({"id": id, "status": "done"})
+                }
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
         }
@@ -2323,6 +2344,166 @@ mod tests {
             done["status"], "done",
             "system identity should bypass ACL: {done}"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ----------------------------------------------------------------------
+    // #789 anchor (§3.10 red→green) — task action=done triggers cleanup of
+    // empty init commits accumulated post-bind. Pre-C3: tasks::handle("done")
+    // does NOT invoke `clean_empty_init_commits`, so the backend-style
+    // empty inits ride along to push. Post-C3: handle("done") cleans up at
+    // the task-completion workflow boundary.
+    //
+    // Cross-platform: no `#[cfg(unix)]` per #785/#786 precedent + reviewer C6.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn task_done_cleans_post_lease_empty_init_commits() {
+        // Setup: bind agent to a temp worktree that has accumulated 3
+        // empty `init` commits between origin/main and HEAD (simulating
+        // backend session-checkpoint heartbeat bursts post-lease).
+        // Asserting that `task action=done` cleans them at the workflow
+        // boundary.
+        let home = tmp_home("789-task-done-cleanup");
+        let worktree = home.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let bypass = ("AGEND_GIT_BYPASS", "1");
+
+        // git init + initial commit (origin/main reference)
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&worktree)
+            .env(bypass.0, bypass.1)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&worktree)
+            .env(bypass.0, bypass.1)
+            .output()
+            .unwrap();
+        // Snapshot HEAD into refs/remotes/origin/main so the cleanup's
+        // `git log origin/main..HEAD` range resolves locally.
+        let initial_sha = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&worktree)
+                .env(bypass.0, bypass.1)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &initial_sha])
+            .current_dir(&worktree)
+            .env(bypass.0, bypass.1)
+            .output()
+            .unwrap();
+
+        // Accumulate 3 empty `init` commits on HEAD (post-lease pollution).
+        for _ in 0..3 {
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ])
+                .current_dir(&worktree)
+                .env(bypass.0, bypass.1)
+                .output()
+                .unwrap();
+        }
+
+        // Write binding so tasks::handle("done") can locate the worktree.
+        let runtime = crate::paths::runtime_dir(&home).join("dev");
+        std::fs::create_dir_all(&runtime).ok();
+        std::fs::write(
+            runtime.join("binding.json"),
+            serde_json::to_string(&serde_json::json!({
+                "version": 1,
+                "agent": "dev",
+                "task_id": "T-1",
+                "branch": "feat/p789",
+                "worktree": worktree.display().to_string(),
+                "source_repo": worktree.display().to_string(),
+                "issued_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Confirm 3 empty inits sit between origin/main..HEAD pre-call.
+        let pre_count = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["log", "origin/main..HEAD", "--format=%H"])
+                .current_dir(&worktree)
+                .env(bypass.0, bypass.1)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .lines()
+        .count();
+        assert_eq!(pre_count, 3, "fixture must have 3 empty inits pre-call");
+
+        // Task lifecycle: create + claim + done.
+        let created = handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "create", "title": "p789 anchor"}),
+        );
+        let id = created["id"].as_str().expect("task id");
+        handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        let done = handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": "done", "id": id}),
+        );
+        assert_eq!(done["status"], "done", "task done must succeed: {done}");
+
+        // §3.10 anchor assertion: post-done, the empty init commits are
+        // cleaned (HEAD back to origin/main).
+        let post_count = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["log", "origin/main..HEAD", "--format=%H"])
+                .current_dir(&worktree)
+                .env(bypass.0, bypass.1)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .lines()
+        .count();
+        assert_eq!(
+            post_count, 0,
+            "task action=done MUST trigger clean_empty_init_commits on bound worktree \
+             (pre-#789: handler does not call cleanup → 3 commits remain → test fails)"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 }
