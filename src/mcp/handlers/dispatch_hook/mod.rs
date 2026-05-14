@@ -287,38 +287,18 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
     //
     // `from_ref` is hard-coded to `"origin/main"` (mirror #784 default).
     //
-    // Fail-soft contract: errors from `ensure_branch_exists` fall through
-    // to `worktree_pool::lease` → `worktree::create -b` (which creates
-    // the branch from current HEAD). This preserves pre-#781 behavior
-    // for legacy callers / test fixtures where `source_repo` is a local
-    // repo with no `origin` remote (so the `git branch X origin/main` +
-    // fetch fallback paths both fail). Production canonicals have
-    // `origin/main` populated and hit the fast path. Validate-side
-    // failures (`InvalidFromRef`, e.g. option injection) DO surface as
-    // hard errors so a malicious caller can't slip past the boundary
-    // by triggering soft-fallback.
+    // Strict error contract (#781 Phase 3 r1, Path A — restored after
+    // initial fail-soft fix was found to weaken Piece 7's structured-
+    // error promise): all `ensure_branch_exists` errors propagate to
+    // the caller as `DispatchError` so they can programmatically
+    // dispatch on `code` / `stage` instead of receiving silent
+    // fallbacks that mask the original failure class. Legacy local-
+    // only test fixtures must register an origin URL + populate
+    // `refs/remotes/origin/main` (see `setup_test_repo` in
+    // `dispatch_hook/tests.rs` and `setup_git_repo_with_remote` in
+    // `p0b_tests.rs` for the canonical fixture pattern).
     let (auto_created_branch, fetch_attempted) =
-        match ensure_branch_exists(home, &source_repo, branch, "origin/main", target) {
-            Ok(tup) => tup,
-            Err(err)
-                if err.code == ErrorCode::InvalidFromRef && err.stage == Stage::ValidateFromRef =>
-            {
-                return Err(err);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target: "dispatch_hook",
-                    %target,
-                    %branch,
-                    code = ?err.code,
-                    stage = ?err.stage,
-                    message = %err.message,
-                    "ensure_branch_exists soft-fallback: legacy / origin-less source_repo \
-                     — falling through to worktree::create -b path"
-                );
-                (false, err.fetch_attempted)
-            }
-        };
+        ensure_branch_exists(home, &source_repo, branch, "origin/main", target)?;
 
     // Attempt lease (creates worktree + tags as daemon-managed).
     // Lease errors REJECT the dispatch (Q2 + §3.3).

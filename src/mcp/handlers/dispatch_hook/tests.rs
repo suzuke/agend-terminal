@@ -25,6 +25,44 @@ fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
         .env("AGEND_GIT_BYPASS", "1")
         .output()
         .ok();
+    // #781 Phase 3 r1 (Path A — strict mode): pre-#781 fixtures relied
+    // on `worktree::create -b` for missing-branch creation. With #781's
+    // strict `ensure_branch_exists`, dispatch_auto_bind_lease creates
+    // the branch from `origin/main` BEFORE lease. Legacy local-only
+    // fixtures must register an origin URL + populate
+    // `refs/remotes/origin/main` so the fast path resolves without
+    // network I/O. `file:///dev/null/agend-fixture` chosen so
+    // `parse_github_owner_repo` returns None — preserves the pre-#781
+    // assertion in `delegate_task_without_repo_no_ci_watch` that no
+    // ci-watch fires when repo is undeterminable. Tests that need
+    // github-style ci-watch arming (e.g. `…_preserves_p0b_tail_ops`)
+    // use a separate fixture with `https://github.com/...` URL.
+    let _ = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "file:///dev/null/agend-fixture-no-derive",
+        ])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let main_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !main_sha.is_empty() {
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+    }
     // Write fleet.yaml so resolve_instance works.
     std::fs::write(
         crate::fleet::fleet_yaml_path(home),
@@ -1073,13 +1111,33 @@ fn dispatch_auto_bind_lease_invalid_from_ref_returns_structured_error() {
 fn dispatch_auto_bind_lease_concurrent_different_targets_race_idempotent() {
     // Test 5: two concurrent dispatches on the SAME source_repo + SAME
     // branch + DIFFERENT targets (avoids per-target BindGuard rejection
-    // which fires for same-target collisions). Both probe branch
-    // missing → both attempt `git branch` → one wins, one hits "already
-    // exists" and falls through idempotently. Pins the race semantic:
-    // exactly one caller reports auto_created_branch=true; the loser
-    // either succeeds with auto_created_branch=false (no upstream
-    // worktree conflict for distinct instance_names) or fails at a
-    // later stage. Neither errors with code=BranchCreateFailed.
+    // which fires for same-target collisions).
+    //
+    // Race semantics being pinned (#781 Phase 3 r1, reviewer constraint #2
+    // — distinguish `CreateBranch` stage from `WorktreeLeaseConflict`
+    // stage in race-loser error path):
+    //
+    // - At least one caller succeeds (Ok). The other either also succeeds
+    //   (if it observed the branch already existing AND grabbed a distinct
+    //   worktree path) or errors. Worktree path is segmented per agent
+    //   (`<home>/worktrees/<agent>/<branch>/`) so technically both could
+    //   reuse the same branch — but `worktree::create`'s existing-branch
+    //   guard rejects a second `worktree add <branch>` since git's
+    //   per-branch single-checkout invariant holds.
+    // - The loser, if it errored, MUST surface `Stage::WorktreeLeaseConflict`
+    //   (the failure landed at the worktree-add step, after the race-
+    //   absorbed `git branch` already-exists fall-through). It must NOT
+    //   surface `Stage::CreateBranch` (= `git branch` non-`already-exists`
+    //   failure) and must NOT carry `ErrorCode::BranchCreateFailed`.
+    // - At most one Ok observes `auto_created_branch=true`. Branch
+    //   creation race winner is determined by `git branch` ordering; the
+    //   loser's `git branch` hits `already exists` stderr → fall-through
+    //   with `auto_created_branch=false`. We don't require exactly-one-
+    //   true: when the branch-create winner subsequently LOSES the
+    //   worktree-add race, its `DispatchError` does not carry
+    //   `auto_created_branch` (omitted from error shape per Piece 7
+    //   schema), so the signal is observable only from the Ok variant.
+    //   `at_most_one` is the strict invariant; `exactly_one` would flake.
     let parent = std::env::temp_dir().join(format!(
         "agend-p781-race-{}-{}",
         std::process::id(),
@@ -1108,24 +1166,42 @@ fn dispatch_auto_bind_lease_concurrent_different_targets_race_idempotent() {
             super::dispatch_auto_bind_lease(&home_c, &target, "T-1", "feat/p781-race", None)
         }));
     }
-    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    for r in &results {
-        if let Err(e) = r {
-            assert_ne!(
-                e.code,
-                super::ErrorCode::BranchCreateFailed,
-                "race must NOT surface BranchCreateFailed (must absorb via already-exists): {e:?}"
-            );
-        }
-    }
-    let winners = results
-        .iter()
-        .filter(|r| r.as_ref().map(|o| o.auto_created_branch).unwrap_or(false))
-        .count();
-    assert_eq!(
-        winners, 1,
-        "exactly one caller must observe auto_created_branch=true: {results:?}"
+    let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let ok_count = outcomes.iter().filter(|o| o.is_ok()).count();
+    assert!(
+        ok_count >= 1,
+        "at least one race winner must succeed (branch-create race must absorb the loser via stderr fall-through): {outcomes:?}"
     );
+
+    // Stage / code differentiation in error path (reviewer constraint #2):
+    // race losers MUST land on WorktreeLeaseConflict, NEVER on CreateBranch.
+    for err in outcomes.iter().filter_map(|o| o.as_ref().err()) {
+        assert_eq!(
+            err.stage,
+            super::Stage::WorktreeLeaseConflict,
+            "race loser must fail at WorktreeLeaseConflict stage (NOT CreateBranch — race must be absorbed at git-branch layer), got stage={:?}: {err:?}",
+            err.stage
+        );
+        assert_ne!(
+            err.code,
+            super::ErrorCode::BranchCreateFailed,
+            "race must NOT surface BranchCreateFailed — already-exists stderr is the fall-through signal: {err:?}"
+        );
+    }
+
+    // At most one Ok caller observes auto_created_branch=true. When the
+    // branch-create winner subsequently loses worktree-add, its
+    // DispatchError omits auto_created_branch (per Piece 7 shape).
+    let true_count = outcomes
+        .iter()
+        .filter(|r| matches!(r, Ok(o) if o.auto_created_branch))
+        .count();
+    assert!(
+        true_count <= 1,
+        "at most one Ok caller may report auto_created_branch=true: {outcomes:?}"
+    );
+
     std::fs::remove_dir_all(&parent).ok();
 }
 

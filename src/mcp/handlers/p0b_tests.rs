@@ -120,6 +120,32 @@ fn setup_git_repo(home: &Path, agent: &str) -> std::path::PathBuf {
     setup_git_repo_with_remote(home, agent, "https://github.com/o/r.git")
 }
 
+/// #781 Phase 3 r1: helper used by tests that inline a `git init`
+/// (instead of going through `setup_git_repo*`). Populates
+/// `refs/remotes/origin/main` so the strict
+/// `dispatch_hook::ensure_branch_exists` `git branch X origin/main`
+/// fast path resolves locally without a real fetch. Caller is
+/// responsible for any prior `git remote add origin <url>` — this
+/// helper just writes the ref.
+fn populate_origin_main_for_strict_ensure_branch(repo: &Path) {
+    let head_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !head_sha.is_empty() {
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &head_sha])
+            .current_dir(repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+    }
+}
+
 fn setup_git_repo_with_remote(home: &Path, agent: &str, origin_url: &str) -> std::path::PathBuf {
     let repo = crate::paths::workspace_dir(home).join(agent);
     std::fs::create_dir_all(&repo).ok();
@@ -150,6 +176,27 @@ fn setup_git_repo_with_remote(home: &Path, agent: &str, origin_url: &str) -> std
         .current_dir(&repo)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
+    // #781 Phase 3 r1 (Path A — strict mode): populate
+    // `refs/remotes/origin/main` so strict `ensure_branch_exists` in
+    // dispatch_auto_bind_lease resolves `origin/main` without network.
+    // Required because #781 moves branch provisioning from
+    // `worktree::create -b` (current-HEAD-based) to the dispatch layer.
+    let main_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !main_sha.is_empty() {
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+    }
     std::fs::write(
         crate::fleet::fleet_yaml_path(home),
         format!(
@@ -386,6 +433,7 @@ fn ec6_dispatch_uses_fleet_source_repo_tier_when_present() {
         .current_dir(&src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
+    populate_origin_main_for_strict_ensure_branch(&src);
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         format!(
@@ -422,7 +470,12 @@ fn ec4_fleet_repo_override_wins_over_derive() {
     let home = tmp_home("ec4-override");
     let src = home.join("src-noremote");
     std::fs::create_dir_all(&src).ok();
-    // git init but NO remote configured → derive returns None.
+    // git init but NO origin remote registered → derive returns None.
+    // #781 Phase 3 r1: populate `refs/remotes/origin/main` so strict
+    // `ensure_branch_exists` resolves locally; we intentionally skip
+    // `git remote add origin <url>` so `derive_repo_from_remote`
+    // returns None (this is the assertion under test — fleet.yaml
+    // `repo:` override wins over remote-URL derivation).
     let _ = std::process::Command::new("git")
         .args(["init", "-b", "main"])
         .current_dir(&src)
@@ -442,6 +495,22 @@ fn ec4_fleet_repo_override_wins_over_derive() {
         .current_dir(&src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
+    let head_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&src)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !head_sha.is_empty() {
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &head_sha])
+            .current_dir(&src)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+    }
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         format!(
@@ -507,6 +576,7 @@ fn dispatch_with_source_repo_override_wins_over_fleet() {
         .current_dir(&real_src)
         .env("AGEND_GIT_BYPASS", "1")
         .output();
+    populate_origin_main_for_strict_ensure_branch(&real_src);
     // fleet.yaml points to a different (stub) source_repo
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),

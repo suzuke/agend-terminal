@@ -11,29 +11,12 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// MCP tool: `bind_self` (Sprint 54 P1-7).
-///
-/// Lets any instance proactively bind itself to a worktree without going
-/// through the dispatch hook — use case is the lead orchestrator wanting
-/// to claim a worktree for a Path A IMPL escalation, or any agent that
-/// wants to pre-claim a branch before the task arrives.
-///
-/// Required args: `repo` (owner/name string), `branch` (string).
-/// Optional args: none.
-///
-/// Returns:
-/// - On success: `{"bound": true, "worktree_path": "...", "branch": "..."}`.
-/// - On failure: `{"error": "...", "code": "..."}` — `code` mirrors the
-///   underlying lease/bind error class (`E4.5`, `cross_agent_conflict`,
-///   `lease_failed`).
-///
-/// Implementation reuses [`crate::mcp::handlers::dispatch_hook::dispatch_auto_bind_lease`]
-/// with `task_id="self"` so every Sprint 53/54 invariant (Phase 1
-/// trailers, P0-1.5 cross-agent registry check, P0-1.6 actual-HEAD
-/// verification, P0-X release_worktree as sole exit point, source_repo
-/// persistence in binding.json, auto watch_ci subscription) applies
-/// uniformly. The handler is intentionally a thin shim — bug fixes in
-/// the dispatch path are inherited automatically.
+/// MCP tool: `bind_self` (Sprint 54 P1-7). Lets any instance proactively
+/// bind itself to a worktree without going through the dispatch hook.
+/// Required args: `repo` / `source_repo` (one of), `branch`. Returns
+/// `{bound, worktree_path, branch}` on success or `{error, code}` on
+/// failure. Thin shim over `dispatch_auto_bind_lease` — bug fixes in
+/// the dispatch path inherit automatically.
 pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
     let agent = match sender.as_ref().map(Sender::as_str) {
         Some(a) if !a.is_empty() => a,
@@ -366,6 +349,22 @@ mod tests {
             .env("AGEND_GIT_BYPASS", "1")
             .output()
             .ok();
+        // #781 Phase 3 r1 (Path A): populate `refs/remotes/origin/main`
+        // for strict `ensure_branch_exists`; file:/// URL so
+        // derive_repo returns None.
+        let git = |a: &[&str]| -> Option<std::process::Output> {
+            std::process::Command::new("git")
+                .args(a)
+                .current_dir(&repo)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .ok()
+        };
+        git(&["remote", "add", "origin", "file:///dev/null/agend-fix"]);
+        if let Some(o) = git(&["rev-parse", "HEAD"]).filter(|o| o.status.success()) {
+            let sha = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            git(&["update-ref", "refs/remotes/origin/main", &sha]);
+        }
         std::fs::write(
             crate::fleet::fleet_yaml_path(home),
             format!(
