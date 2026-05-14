@@ -1382,3 +1382,113 @@ fn checkout_bind_false_does_not_auto_create() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&parent).ok();
 }
+
+// ----------------------------------------------------------------------
+// #779 P2 (Option B) — partial-failure surfacing for handle_checkout_repo
+// bind:true tail-ops + handle_watch_ci self-error surface.
+//
+// Source of truth: decision d-20260514142300613621-0.
+//
+// Empirical anchor (§3.10): comment out the warnings-collection block
+// in handle_checkout_repo OR revert the handle_watch_ci hardening at
+// site A / B → both anchor tests below fail. C2 commits these tests
+// red; C3 makes them green.
+//
+// Cross-platform: all happy-path tests `#[cfg(unix)]` per §3.7.
+// ----------------------------------------------------------------------
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_bind_full_failure_surfaces_warning() {
+    // ANCHOR (§3.10 red→green) — C2 red, C3 green.
+    //
+    // Injection: pre-create `<home>/runtime/<agent>` as a regular FILE
+    // (not directory). `bind_full`'s `std::fs::create_dir_all(&dir)`
+    // fails with "not a directory" → `Err("create_dir_all ...")`.
+    // handle_checkout_repo's warning-collection logic (added in C3)
+    // captures the Err and pushes "bind_full: ..." onto the warnings
+    // vec. `bound: true` must still hold because lease succeeded —
+    // tail-op degradation does not poison main success.
+    let home = p778_tmp_home("779p2-bind-fail");
+    let parent = p778_tmp_home("779p2-bind-fail-src");
+    let source = p778_setup_source_repo(&parent, "feat/p779p2-bind");
+    let agent = "p779p2-agent-bind";
+
+    // Block bind_full by pre-creating runtime/<agent> as a regular file.
+    let runtime = crate::paths::runtime_dir(&home);
+    std::fs::create_dir_all(&runtime).ok();
+    std::fs::write(runtime.join(agent), "blocking file (not a dir)").unwrap();
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p779p2-bind",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(
+        resp["bound"].as_bool(),
+        Some(true),
+        "lease success → bound=true must hold even with tail-op partial failure: {resp}"
+    );
+    let warnings = resp["warnings"]
+        .as_array()
+        .expect("warnings array must be present when bind_full failed");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|s| s.starts_with("bind_full:"))),
+        "warnings must contain a `bind_full:` prefix entry: {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn handle_watch_ci_atomic_write_failure_returns_error_field() {
+    // ANCHOR (§3.10 red→green) — C2 red, C3 green.
+    //
+    // Direct test of handle_watch_ci's NEW error surface (Piece 3
+    // hardening sites A + B). Independent of handle_checkout_repo
+    // wrapper — pins the contract that ci_watches dir-create / atomic-
+    // write failures become observable in the Value response as
+    // `error` + `code`, not silently swallowed.
+    //
+    // Injection: pre-create `<home>/ci-watches` as a regular FILE.
+    // handle_watch_ci's `std::fs::create_dir_all(&ci_dir)` (site A)
+    // fails because the path is already a file. Post-C3 returns
+    // `{error, code: "ci_watches_dir_create_failed"}`. Pre-C3 swallows
+    // the error and returns success-shape — test FAILS.
+    let home = p778_tmp_home("779p2-watch-fail");
+    std::fs::create_dir_all(&home).ok();
+
+    // Block ci-watches dir create by pre-creating the path as a file.
+    let ci_watches = crate::daemon::ci_watch::ci_watches_dir(&home);
+    if let Some(parent) = ci_watches.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&ci_watches, "blocking file (not a dir)").unwrap();
+
+    let resp = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({"repo": "owner/repo", "branch": "feat/p779p2-watch"}),
+        "p779p2-agent-watch",
+    );
+
+    assert!(
+        resp.get("error").is_some(),
+        "handle_watch_ci must surface error when ci-watches dir create fails: {resp}"
+    );
+    let code = resp["code"].as_str().unwrap_or_default();
+    assert!(
+        code == "ci_watches_dir_create_failed" || code == "watch_write_failed",
+        "code must be one of the canonical Piece-3 hardening codes, got '{code}': {resp}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
