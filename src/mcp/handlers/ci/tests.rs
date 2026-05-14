@@ -862,3 +862,150 @@ fn checkout_bind_true_rejects_anonymous_caller() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ----------------------------------------------------------------------
+// #780 `from_ref` auto-create branch — lazy fetch-on-missing-ref. Closes
+// the single-step bypass-free workflow gap discovered post-#779: when
+// caller wants `bind:true` on a brand-new branch, `git worktree add
+// <path> <branch>` (no `-b`) fails with `fatal: invalid reference`. The
+// new design auto-creates `<branch>` from `from_ref` (default
+// `origin/main`) inside `handle_checkout_repo` so no manual `git fetch
+// && git branch` pre-step is required.
+//
+// Source of truth: decision d-20260514102305998399-0
+//
+// Empirical anchor (per §3.10): comment out the new auto-create block in
+// `handle_checkout_repo` → the first test below
+// (`checkout_bind_true_auto_creates_branch_from_origin_main_when_missing`)
+// fails because the worktree add hits `fatal: invalid reference`.
+//
+// All happy-path tests are `#[cfg(unix)]` (matching #778 fixture
+// convention — Windows subprocess concurrency unstable in CI). Cross-
+// platform stance is `unverified cross-backend claim` per §3.7; Windows
+// CI smoke test tracked separately (Backlog C).
+// ----------------------------------------------------------------------
+
+/// Fixture: like `p778_setup_source_repo` but does NOT pre-create the
+/// feature branch — that is the precondition that exercises the new
+/// auto-create path. `refs/remotes/origin/main` is populated via
+/// `git update-ref` so the default `from_ref="origin/main"` resolves
+/// without a network fetch (fixture simulates a previously-fetched
+/// canonical clone).
+#[cfg(unix)]
+fn p780_setup_source_no_feature_branch(parent: &Path) -> std::path::PathBuf {
+    let repo = parent.join("source-repo");
+    std::fs::create_dir_all(&repo).ok();
+    let bypass = ("AGEND_GIT_BYPASS", "1");
+    let _ = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    // Simulate fetched remote-tracking ref so `origin/main` resolves
+    // locally without a network round-trip.
+    let main_sha = std::process::Command::new("git")
+        .args(["rev-parse", "main"])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .expect("rev-parse main");
+    let _ = std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+        .current_dir(&repo)
+        .env(bypass.0, bypass.1)
+        .output();
+    repo
+}
+
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_auto_creates_branch_from_origin_main_when_missing() {
+    // ANCHOR (red→green). Pre-impl: `git worktree add <path> feat/p780-new`
+    // fails because the branch does not exist locally. Post-impl: handler
+    // auto-creates the branch from `from_ref` (default `origin/main`)
+    // before the worktree add, observable via `auto_created_branch=true`
+    // and `fetch_attempted=false` (simulated origin/main was already
+    // present locally — no fetch needed).
+    let home = p778_tmp_home("780-auto");
+    let parent = p778_tmp_home("780-auto-src");
+    let source = p780_setup_source_no_feature_branch(&parent);
+    let agent = "p780-agent-auto";
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "source": source.display().to_string(),
+            "branch": "feat/p780-new",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert!(
+        resp.get("error").is_none(),
+        "auto-create must succeed when branch missing + origin/main present: {resp}"
+    );
+    assert_eq!(
+        resp["bound"].as_bool(),
+        Some(true),
+        "bind=true must surface: {resp}"
+    );
+    assert_eq!(
+        resp["auto_created_branch"].as_bool(),
+        Some(true),
+        "auto_created_branch must signal the new-branch path: {resp}"
+    );
+    assert_eq!(
+        resp["fetch_attempted"].as_bool(),
+        Some(false),
+        "fetch must NOT fire when origin/main is already a valid local ref: {resp}"
+    );
+
+    // HEAD must land on the named branch (not detached) so subsequent
+    // commits write to the right ref. Same invariant as #778's
+    // checkout_bind_true_writes_binding_marker_and_arms_watch.
+    let wt_path = std::path::PathBuf::from(resp["path"].as_str().expect("path"));
+    let head_ref = std::fs::read_to_string(wt_path.join(".git"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
+                .map(std::path::PathBuf::from)
+        })
+        .and_then(|d| std::fs::read_to_string(d.join("HEAD")).ok())
+        .unwrap_or_default();
+    assert!(
+        head_ref.starts_with("ref: refs/heads/feat/p780-new"),
+        "HEAD must be on refs/heads/feat/p780-new, got: {head_ref:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
