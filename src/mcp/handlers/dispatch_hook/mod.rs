@@ -324,7 +324,10 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
     // Bind with worktree + source-repo paths. Bind file write error stays graceful (Q1).
     // source_repo persistence (P0-X r1): release_full uses it to run
     // `git worktree remove` from the owning repo's cwd.
-    crate::binding::bind_full(home, target, task_id, branch, &lease.path, &source_repo);
+    // #779 P2: bind_full now returns Result; this non-target caller preserves
+    // pre-#779-P2 silent semantic via `.ok()` — zero behavior change.
+    let _ =
+        crate::binding::bind_full(home, target, task_id, branch, &lease.path, &source_repo).ok();
     tracing::info!(
         %target, %branch, path = %lease.path.display(),
         "dispatch auto-bind + lease OK"

@@ -63,7 +63,9 @@ pub fn lease(
     // source_repo persistence (P0-X r1): release_full reads this back to run
     // `git worktree remove --force` from the owning repo's cwd, which
     // prevents stale registry entries that would block re-lease.
-    crate::binding::bind_full(home, agent, "", branch, &info.path, source_repo);
+    // #779 P2: bind_full now returns Result; this non-target caller preserves
+    // pre-#779-P2 silent semantic via `.ok()` — zero behavior change.
+    let _ = crate::binding::bind_full(home, agent, "", branch, &info.path, source_repo).ok();
 
     Ok(WorktreeLease {
         agent: agent.to_string(),

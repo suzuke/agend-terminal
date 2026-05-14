@@ -130,14 +130,19 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
                         chrono::Utc::now().to_rfc3339()
                     ),
                 );
-                crate::binding::bind_full(
+                // #779 P2 C1 mechanical: bind_full now returns Result;
+                // preserve pre-#779-P2 silent semantic here so the call
+                // site compiles. C3 substantive commit replaces with
+                // warning collection.
+                let _ = crate::binding::bind_full(
                     home,
                     instance_name,
                     "self",
                     branch,
                     &worktree_dir,
                     &source_canonical,
-                );
+                )
+                .ok();
                 if let Some(r) = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
                     &source_canonical,
                 ) {

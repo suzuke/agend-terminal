@@ -7,16 +7,21 @@ use serde_json::json;
 use std::path::Path;
 
 /// Write a binding for an agent (task assigned).
+///
+/// #779 P2: `bind_full` now returns `Result`; this thin wrapper preserves
+/// the pre-#779-P2 silent semantic via `.ok()` so existing callers (tests
+/// + dispatch path) keep unit-return.
 #[allow(dead_code)] // Used by tests + auto-watch dispatch path
 pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
-    bind_full(
+    let _ = bind_full(
         home,
         agent,
         task_id,
         branch,
         std::path::Path::new(""),
         std::path::Path::new(""),
-    );
+    )
+    .ok();
 }
 
 /// Write a full binding including worktree + source-repo paths.
@@ -27,6 +32,14 @@ pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
 /// the git registry leaves a stale prunable entry after a manual `remove_dir_all`
 /// fallback. Pass an empty path when unknown — `release_full` falls back to
 /// deriving the source from the worktree path's `.worktrees/<agent>` ancestor.
+/// #779 P2 (Option B): hard-break signature now returns `Result<(), String>`
+/// so callers can surface partial-failure diagnostics. The two pre-existing
+/// silent failure points (`create_dir_all` + `atomic_write`) become explicit
+/// `Err` cases. Two non-target callers (`worktree_pool::lease`,
+/// `dispatch_auto_bind_lease`) preserve their pre-#779-P2 silent semantic
+/// via `let _ = bind_full(...).ok();` — zero observable behavior change to
+/// the dispatch path. Only `ci::handle_checkout_repo` consumes the Result
+/// to populate its new `warnings` array.
 pub fn bind_full(
     home: &Path,
     agent: &str,
@@ -34,9 +47,9 @@ pub fn bind_full(
     branch: &str,
     worktree: &std::path::Path,
     source_repo: &std::path::Path,
-) {
+) -> Result<(), String> {
     let dir = crate::paths::runtime_dir(home).join(agent);
-    std::fs::create_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir_all {}: {e}", dir.display()))?;
     let path = dir.join("binding.json");
     let lock_path = dir.join(".binding.json.lock");
     let _lock = crate::store::acquire_file_lock(&lock_path);
@@ -56,7 +69,8 @@ pub fn bind_full(
         binding["source_repo"] = json!(src_str);
     }
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
-    let _ = crate::store::atomic_write(&path, body.as_bytes());
+    crate::store::atomic_write(&path, body.as_bytes())
+        .map_err(|e| format!("atomic_write {}: {e}", path.display()))
 }
 
 /// Clear a binding for an agent (task completed/released).
