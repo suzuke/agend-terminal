@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 /// auto-bind hook fired from `send kind=task`.
 ///
 /// Introduced in C1 as a types-only commit; first call site materializes
-/// in C2 (signature migration). `allow(dead_code)` until C2 wires it up.
-#[allow(dead_code)]
+/// in C2 (signature migration).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchOutcome {
     /// Which tier of [`resolve_source_repo`] fired — exposes the
@@ -33,7 +32,6 @@ pub struct DispatchOutcome {
 /// #781 Piece 7: structured error. The string-only `Result<_, String>`
 /// it supersedes (pre-#781) lost the `code` / `stage` / `raw` triple
 /// callers need to dispatch error handling programmatically.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchError {
     /// Human-readable summary. Safe to log verbatim.
@@ -64,6 +62,11 @@ impl std::error::Error for DispatchError {}
 /// Which tier of [`resolve_source_repo`] fired. Observable via
 /// [`DispatchOutcome::source_repo_tier`] so callers can audit
 /// configuration completeness without parsing logs.
+///
+/// Variants `Override`/`FleetSourceRepo`/`TeamSourceRepo`/`WorkingDirectory`
+/// are wired in C4 once `resolve_source_repo` reports tier. C2 only
+/// constructs `Stub` (placeholder); `allow(dead_code)` on unused variants
+/// until C4 removes the attribute.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +88,10 @@ pub enum SourceRepoTier {
 
 /// Pipeline stage that produced a [`DispatchError`]. Coarse enough to
 /// remain stable across refactors, fine enough to debug.
+///
+/// Variants `ValidateFromRef`/`CreateBranch`/`Fetch`/`RetryCreate` are
+/// constructed in C4 once `ensure_branch_exists` runs at the dispatch
+/// layer. `allow(dead_code)` on unused variants until C4.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -105,6 +112,10 @@ pub enum Stage {
 
 /// Canonical `code` enum — stable across releases. Callers MUST match
 /// on this rather than parsing `message` substrings.
+///
+/// Variants `InvalidFromRef`/`BranchCreateFailed`/`FetchFailed` are
+/// constructed in C4 once `ensure_branch_exists` runs. `allow(dead_code)`
+/// on unused variants until C4.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -207,7 +218,7 @@ pub(crate) fn dispatch_auto_bind_lease(
     task_id: &str,
     branch: &str,
     repo: Option<&str>,
-) -> Result<(), String> {
+) -> Result<DispatchOutcome, DispatchError> {
     dispatch_auto_bind_lease_with_source(home, target, task_id, branch, repo, None)
 }
 
@@ -215,6 +226,11 @@ pub(crate) fn dispatch_auto_bind_lease(
 /// `source_repo_override`. Used by `handle_bind_self(source_repo=...)`;
 /// existing callers go through [`dispatch_auto_bind_lease`] which passes
 /// `None` to preserve pre-Sprint-55 behavior.
+///
+/// #781 Piece 7: returns structured [`DispatchOutcome`] / [`DispatchError`].
+/// C2 commit performs the signature migration mechanically — `source_repo_tier`,
+/// `auto_created_branch`, `fetch_attempted` populated with placeholders here
+/// and wired to real observability sources in C4.
 pub(crate) fn dispatch_auto_bind_lease_with_source(
     home: &Path,
     target: &str,
@@ -222,8 +238,14 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
     branch: &str,
     repo: Option<&str>,
     source_repo_override: Option<&Path>,
-) -> Result<(), String> {
-    let _guard = BindGuard::try_acquire(home, target)?;
+) -> Result<DispatchOutcome, DispatchError> {
+    let _guard = BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
+        message: msg,
+        code: ErrorCode::BindInFlight,
+        stage: Stage::WorktreeLeaseConflict,
+        fetch_attempted: false,
+        raw: None,
+    })?;
 
     let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
@@ -232,9 +254,15 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
 
     // P0-1.5: central lease registry check — reject if another agent holds this branch.
     if let Some(other) = crate::binding::scan_existing_branch_binding(home, branch, target) {
-        return Err(format!(
-            "branch '{branch}' already leased by '{other}' — release first or use a different branch"
-        ));
+        return Err(DispatchError {
+            message: format!(
+                "branch '{branch}' already leased by '{other}' — release first or use a different branch"
+            ),
+            code: ErrorCode::LeaseConflict,
+            stage: Stage::WorktreeLeaseConflict,
+            fetch_attempted: false,
+            raw: None,
+        });
     }
 
     // Sprint 57 Wave 4 (#546 Item 4): same-agent different-branch
@@ -251,18 +279,37 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
     if let Some(existing) = crate::binding::read(home, target) {
         if let Some(existing_branch) = existing.get("branch").and_then(|v| v.as_str()) {
             if existing_branch != branch {
-                return Err(format!(
-                    "agent '{target}' already bound to branch '{existing_branch}' — \
-                     release_worktree first before re-binding to '{branch}' \
-                     (lease conflict per P0-1.6 semantic, preserved through Wave 4 #546 Item 4)"
-                ));
+                return Err(DispatchError {
+                    message: format!(
+                        "agent '{target}' already bound to branch '{existing_branch}' — \
+                         release_worktree first before re-binding to '{branch}' \
+                         (lease conflict per P0-1.6 semantic, preserved through Wave 4 #546 Item 4)"
+                    ),
+                    code: ErrorCode::LeaseConflict,
+                    stage: Stage::WorktreeLeaseConflict,
+                    fetch_attempted: false,
+                    raw: None,
+                });
             }
         }
     }
 
     // Attempt lease (creates worktree + tags as daemon-managed).
     // Lease errors REJECT the dispatch (Q2 + §3.3).
-    let lease = crate::worktree_pool::lease(home, &source_repo, target, branch)?;
+    let lease = crate::worktree_pool::lease(home, &source_repo, target, branch).map_err(|msg| {
+        let code = if msg.contains("E4.5") {
+            ErrorCode::ProtectedBranch
+        } else {
+            ErrorCode::LeaseConflict
+        };
+        DispatchError {
+            message: msg.clone(),
+            code,
+            stage: Stage::WorktreeLeaseConflict,
+            fetch_attempted: false,
+            raw: Some(msg),
+        }
+    })?;
 
     // Clean empty "init" commits left by kiro-cli session checkpoints.
     // Best-effort: failure here is non-fatal (worktree is still usable).
@@ -296,7 +343,17 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         crate::mcp::handlers::ci::handle_watch_ci(home, &watch_args, target);
         tracing::info!(%target, repo = %r, %branch, "dispatch auto-watch_ci");
     }
-    Ok(())
+
+    // C2 placeholder: `source_repo_tier` / `auto_created_branch` /
+    // `fetch_attempted` are wired to real observability sources in C4 once
+    // `resolve_source_repo` reports tier + `ensure_branch_exists` reports
+    // create/fetch outcomes. Placeholder values are safe defaults — no
+    // existing caller inspects these fields pre-C4.
+    Ok(DispatchOutcome {
+        source_repo_tier: SourceRepoTier::Stub,
+        auto_created_branch: false,
+        fetch_attempted: false,
+    })
 }
 
 /// Sprint 55 P0-B EC6 — 3-tier source_repo resolution with observability.

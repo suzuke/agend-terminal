@@ -105,10 +105,14 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
         repo_arg,
         source_repo_path.as_deref(),
     ) {
-        Ok(()) => {
+        Ok(_outcome) => {
             // Successful bind: read back the worktree path from the binding
             // file we just wrote so the response reflects authoritative
             // state, not a recomputation.
+            //
+            // C2: discards `DispatchOutcome` for back-compat; consumers that
+            // want `auto_created_branch` / `source_repo_tier` should be
+            // migrated as a follow-up.
             let binding_path = crate::paths::runtime_dir(home)
                 .join(agent)
                 .join("binding.json");
@@ -123,10 +127,14 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
                 "branch": branch,
             })
         }
-        Err(msg) => {
-            // Map dispatch_auto_bind_lease error strings to stable codes so
-            // agents can branch on machine-readable signals instead of
-            // grepping the human message.
+        Err(err) => {
+            // Map `DispatchError` to the pre-#781 string-code shape so
+            // existing callers (agent self-bind flow) keep parsing the
+            // same surface. C2 mechanical: preserves prior substring-grep
+            // semantics on `err.message` rather than dispatching on the
+            // new canonical `err.code` enum (that follow-up belongs with
+            // bind_self's MCP-tool consumer migration).
+            let msg = err.message;
             let code = if msg.contains("E4.5") {
                 "e4_5_protected_branch"
             } else if msg.contains("already leased") {

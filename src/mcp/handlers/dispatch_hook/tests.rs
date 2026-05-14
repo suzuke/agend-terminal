@@ -69,7 +69,10 @@ fn main_branch_rejects_dispatch() {
     let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "main", None);
     assert!(result.is_err(), "main branch must REJECT");
     let err = result.expect_err("must be error");
-    assert!(err.contains("E4.5"), "error must mention E4.5: {err}");
+    assert!(
+        err.message.contains("E4.5"),
+        "error must mention E4.5: {err:?}"
+    );
 
     // No binding should exist.
     let binding_path = crate::paths::runtime_dir(&home)
@@ -110,8 +113,8 @@ fn lease_conflict_rejects_dispatch() {
     );
     let err = r2.expect_err("must err");
     assert!(
-        err.contains("already leased by 'agent-a'"),
-        "error must name leasing agent: {err}"
+        err.message.contains("already leased by 'agent-a'"),
+        "error must name leasing agent: {err:?}"
     );
 
     // Agent-b binding must NOT exist (Q2: REJECT = no side effects).
@@ -677,8 +680,8 @@ fn dispatch_auto_bind_lease_rejects_same_agent_different_branch_post_wave_4() {
     // across the architectural shift.
     let err = r2.unwrap_err();
     assert!(
-        err.contains("agent-y") && err.contains("feat/A"),
-        "rejection error must mention the existing binding's agent + branch: {err}"
+        err.message.contains("agent-y") && err.message.contains("feat/A"),
+        "rejection error must mention the existing binding's agent + branch: {err:?}"
     );
 
     // Binding still reflects feat/A — the rejected dispatch must
