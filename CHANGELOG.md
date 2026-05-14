@@ -5,6 +5,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [Workflow validation 2 — 2026-05-14] post #779 partial-fix canary pass (1 manual git branch step)
+
 ## [0.6.1] - 2026-05-10
 
 ### Removed
