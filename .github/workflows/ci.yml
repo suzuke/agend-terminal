@@ -28,49 +28,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # #772 v3 (root-cause prevention): Swatinem/rust-cache@v2 by
+      # default caches `~/.cargo/bin/` along with the rest of cargo
+      # state. The cache write occasionally captures a stale
+      # `rustup-init` shim at proxy paths (cargo, rustc, rustfmt,
+      # clippy-driver); subsequent restores then overwrite the freshly-
+      # installed dtolnay rustup proxies with that stale shim. Symptom
+      # is `cargo fmt → unexpected argument 'fmt' found / Usage:
+      # rustup-init` (signature documented across PRs #796, #799, #800).
+      #
+      # v1 (PR #796): post-cache bootstrap step relying on exit codes —
+      # bypassed because `rustup-init --version` returns exit 0.
+      # v2 (PR #800 r0): content-validating detect+recover — detection
+      # confirmed staleness on all 3 platforms (universal cache pollution,
+      # not macos-specific!), but recovery failed (`rustup default` does
+      # not regenerate deleted proxies in ~/.cargo/bin/).
+      # v3 (this commit): don't enter the bad state in the first place.
+      # `cache-bin: false` tells Swatinem/rust-cache@v2 to exclude
+      # `~/.cargo/bin/` from the cache. dtolnay/rust-toolchain@stable
+      # then installs fresh proxies every run. Cost: ~1MB cache miss
+      # and ~5-10s install per run, negligible vs the detect+recover
+      # logic v2 attempted to maintain.
       - uses: Swatinem/rust-cache@v2
-      # #772 v2 (replaces v1 from PR #796): content-validating proxy check
-      # with auto-invalidation. v1 bootstrap step (`rustup show && rustc
-      # --version && cargo --version`) relied on EXIT CODES — but the
-      # stale `rustup-init` binary in `~/.cargo/bin/cargo` responds to
-      # `--version` with `rustup-init 1.29.0` exit-0, defeating the
-      # check. PR #799's macos saga (3 reruns over ~3hr) confirmed the
-      # detection gap.
-      #
-      # v2 validates output CONTENT (must start with the tool's own name)
-      # for ALL 4 proxies the workflow invokes (cargo + rustc + rustfmt +
-      # clippy-driver) and auto-invalidates stale cache binaries when
-      # mismatch detected. `LC_ALL=C` reduces locale-format risk.
-      # `shell: bash` required — for-loop syntax is bash-only and
-      # windows-latest defaults to PowerShell.
-      #
-      # On recovery: surgical 6-binary `rm` preserves `rustup` itself
-      # (so we can re-install). After `rustup default stable` + component
-      # add, `rustup show` forces proxy refresh. Final invariant loop
-      # hard-fails if any proxy is still broken.
-      #
-      # DO NOT remove or move before rust-cache without addressing #772
-      # root cause (cache-overwrite of toolchain binaries).
-      - name: Force toolchain bootstrap (mitigates macOS rustup-init transient #772 v2)
-        shell: bash
-        run: |
-          needs_recovery=0
-          for tool in cargo rustc rustfmt clippy-driver; do
-            if ! LC_ALL=C "$tool" --version 2>&1 | grep -qE "^${tool} [0-9]"; then
-              echo "::warning::Stale binary at ~/.cargo/bin/$tool ($(LC_ALL=C "$tool" --version 2>&1 | head -1)); will invalidate"
-              needs_recovery=1
-            fi
-          done
-          if [ "$needs_recovery" = "1" ]; then
-            rm -rf ~/.cargo/bin/cargo ~/.cargo/bin/rustc ~/.cargo/bin/rustfmt ~/.cargo/bin/clippy-driver ~/.cargo/bin/cargo-fmt ~/.cargo/bin/cargo-clippy
-            rustup default stable
-            rustup component add rustfmt clippy
-            rustup show
-          fi
-          for tool in cargo rustc rustfmt clippy-driver; do
-            LC_ALL=C "$tool" --version 2>&1 | grep -qE "^${tool} [0-9]" \
-              || { echo "::error::$tool proxy still broken after recovery: $(LC_ALL=C "$tool" --version 2>&1 | head -1)"; exit 1; }
-          done
+        with:
+          cache-bin: false
 
       # tray-icon / tao on Linux link against GTK3 + the ayatana app-
       # indicator — these come from `libgtk-3-dev` (provides glib-2.0.pc,
