@@ -232,6 +232,194 @@ pub fn divergence_report() -> Vec<(String, DivergenceStats)> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// F9: productive-output signal (#685 sub-task 4)
+//
+// Parallel to `BehavioralSignal` (silence-based, absence-of-output) — uses
+// presence-of-specific-output evidence. Shares this module + the
+// `behavioral_shadow` tracing target for telemetry infrastructure reuse.
+// See `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.2 for design rationale.
+// ---------------------------------------------------------------------------
+
+/// Productive-output inference result. Returned by `infer_productivity()`
+/// when MCP heartbeat is fresh OR a structural marker matches the rendered
+/// screen text. Used by `check_hang` as the dual-path supplement signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductivitySignal {
+    /// Productive evidence detected — agent is doing actual work.
+    Productive { source: ProductivitySource },
+    /// No productive signal — agent may be silently stuck.
+    NoSignal,
+}
+
+/// Source of a `Productive` signal — heartbeat (MCP tool call) or marker
+/// (text pattern). Carried through telemetry so corpus analysis can
+/// disaggregate which evidence type fires for which scenarios.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductivitySource {
+    /// MCP heartbeat refreshed recently — agent called a tool.
+    Heartbeat,
+    /// Structural marker pattern matched the screen text. The matched
+    /// pattern literal is carried for telemetry/debug visibility.
+    Marker(&'static str),
+}
+
+impl std::fmt::Display for ProductivitySignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Delta 1: "productive:" prefix in display ensures grep-equivalence
+        // to enum-namespaced telemetry search (`rg "productive:"`).
+        match self {
+            Self::Productive { source } => match source {
+                ProductivitySource::Heartbeat => write!(f, "productive:heartbeat"),
+                ProductivitySource::Marker(p) => write!(f, "productive:marker({p})"),
+            },
+            Self::NoSignal => write!(f, "productive:none"),
+        }
+    }
+}
+
+/// Per-backend productive-signal calibration. Phase 1 minimal markers ship
+/// the same across backends (heartbeat path universal); backend-specific
+/// extension is `#685` deliverable #4 follow-up.
+#[derive(Debug, Clone, Copy)]
+pub struct ProductivityConfig {
+    /// Structural marker patterns. Each must be anchored (line-start `^` or
+    /// equivalent) to avoid scrollback FP (per F39 Scenario A/B/C taxonomy
+    /// in `docs/HUNG-STATE-TRANSITIONS.md`).
+    pub markers: &'static [&'static str],
+    /// Whether MCP heartbeat refresh counts as productive evidence.
+    /// `false` for backends without MCP integration (Shell/Raw).
+    pub use_heartbeat: bool,
+    /// Heartbeat age window for the `Heartbeat` source classification.
+    /// A heartbeat older than this is treated as stale; the markers path
+    /// must independently fire.
+    pub heartbeat_fresh_window_ms: u64,
+}
+
+/// Phase 1 minimal generic markers — structural anchors, NOT bare keywords.
+/// Per-backend tuning extends this in `#685` deliverable #4.
+const GENERIC_PRODUCTIVE_MARKERS: &[&str] = &[
+    r"^Saved to \S+",
+    r"^Wrote \d+ bytes",
+    r"^Created file: \S+",
+    r"^\s*✓\s+(Read|Bash|Edit|Write|Grep)\b",
+];
+
+/// Cached compiled regexes for `GENERIC_PRODUCTIVE_MARKERS` — built once at
+/// first access via `LazyLock`. Mirrors the existing idiom in `src/state.rs`
+/// (`G1: cached regexes via LazyLock`). Without this cache, the replay-
+/// fixture test path (`state::tests::replay_manifest_regression`) compiled
+/// 4 regexes per `feed()` call across hundreds of chunks per fixture,
+/// pushing wall-clock latency past `min_hold` transition thresholds on
+/// slower CI runners (ubuntu/windows). Patterns are static — compile
+/// failure here is a code bug, exercised by every productivity test.
+static GENERIC_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        GENERIC_PRODUCTIVE_MARKERS
+            .iter()
+            .map(|p| {
+                regex::Regex::new(&format!("(?m){p}"))
+                    .unwrap_or_else(|e| panic!("F9 productive marker regex compile: {p}: {e}"))
+            })
+            .collect()
+    });
+
+/// Get productivity config for a backend.
+pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
+    match backend {
+        // Managed backends with MCP integration — heartbeat is reliable.
+        Backend::ClaudeCode
+        | Backend::KiroCli
+        | Backend::Codex
+        | Backend::OpenCode
+        | Backend::Gemini => ProductivityConfig {
+            markers: GENERIC_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+        },
+        // Shell / Raw — no MCP, markers only.
+        Backend::Shell | Backend::Raw(_) => ProductivityConfig {
+            markers: GENERIC_PRODUCTIVE_MARKERS,
+            use_heartbeat: false,
+            heartbeat_fresh_window_ms: 0,
+        },
+    }
+}
+
+/// Infer productive-output signal from screen text and heartbeat freshness.
+/// Pure function — no side effects, no state mutation. Parallels
+/// `infer_from_silence` shape so future signal types follow the same
+/// `(config, evidence) -> signal` pattern.
+pub fn infer_productivity(
+    config: &ProductivityConfig,
+    screen_text: &str,
+    heartbeat_age: Duration,
+) -> ProductivitySignal {
+    // Heartbeat path first — cheaper than regex scan.
+    if config.use_heartbeat && heartbeat_age.as_millis() <= config.heartbeat_fresh_window_ms as u128
+    {
+        return ProductivitySignal::Productive {
+            source: ProductivitySource::Heartbeat,
+        };
+    }
+    // Markers path — regex scan. Patterns are pre-compiled once via the
+    // `GENERIC_PRODUCTIVE_REGEXES` LazyLock; we look up via pointer-eq on
+    // the `&'static str` since `ProductivityConfig.markers` is also static.
+    // This avoids per-call regex compile (the original cause of CI flake on
+    // slower runners — see `GENERIC_PRODUCTIVE_REGEXES` doc).
+    if std::ptr::eq(
+        config.markers as *const [&'static str],
+        GENERIC_PRODUCTIVE_MARKERS as *const [&'static str],
+    ) {
+        for (i, pattern) in config.markers.iter().enumerate() {
+            if GENERIC_PRODUCTIVE_REGEXES[i].is_match(screen_text) {
+                return ProductivitySignal::Productive {
+                    source: ProductivitySource::Marker(pattern),
+                };
+            }
+        }
+    } else {
+        // Non-generic catalog (future per-backend tuning sub-task may
+        // override). Fall back to ad-hoc compile path. Once deliverable
+        // #4 lands per-backend marker tables, those should ship their
+        // own LazyLock caches too.
+        for pattern in config.markers {
+            let re = regex::Regex::new(&format!("(?m){pattern}")).ok();
+            if let Some(re) = re {
+                if re.is_match(screen_text) {
+                    return ProductivitySignal::Productive {
+                        source: ProductivitySource::Marker(pattern),
+                    };
+                }
+            }
+        }
+    }
+    ProductivitySignal::NoSignal
+}
+
+/// Shadow-mode telemetry for productive-output signals. Parallels
+/// `log_shadow_telemetry` (silence-side) — shares the `behavioral_shadow`
+/// tracing target so dashboards / log queries pick up both signal kinds.
+/// Per Delta 1 (decision `d-20260513235514013631-0`), Sprint 27 call sites
+/// untouched; this is an additive function not a refactor.
+pub fn log_productivity_telemetry(
+    instance: &str,
+    backend: &str,
+    regex_state: &str,
+    productivity: &ProductivitySignal,
+) {
+    if !matches!(productivity, ProductivitySignal::NoSignal) {
+        tracing::debug!(
+            target: "behavioral_shadow",
+            instance,
+            backend,
+            regex_state,
+            productivity = %productivity,
+            "productivity shadow: signal detected"
+        );
+    }
+}
+
 #[allow(dead_code)]
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
@@ -665,5 +853,85 @@ mod tests {
             entry.is_some(),
             "divergence report must contain claude after feed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // F9 productive-output signal tests (#685 sub-task 4, decision
+    // d-20260513235514013631-0). Tests pin the contract on semantic
+    // outcomes (Productive vs NoSignal + source) — not on regex literals,
+    // so future marker refinement (e.g. deliverable #4 backend tuning)
+    // does not break them.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn infer_productivity_matches_structural_marker() {
+        // Positive: a "Saved to <path>" banner is a structural marker —
+        // line-start anchor + specific format. Must classify Productive.
+        let config = config_for_productivity(&Backend::ClaudeCode);
+        let signal =
+            infer_productivity(&config, "Saved to /tmp/foo.txt\n", Duration::from_secs(99));
+        assert!(matches!(
+            signal,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn infer_productivity_rejects_bare_keyword_scrollback() {
+        // Negative: prose containing the bare keyword "Saved" without the
+        // line-start anchor + specific format must NOT classify Productive.
+        // Pins the F9 anti-FP contract from decision §4.
+        let config = config_for_productivity(&Backend::ClaudeCode);
+        let signal = infer_productivity(
+            &config,
+            "I have Saved your work for next time.\n",
+            Duration::from_secs(99),
+        );
+        assert_eq!(signal, ProductivitySignal::NoSignal);
+    }
+
+    #[test]
+    fn infer_productivity_uses_heartbeat_when_fresh() {
+        // Heartbeat path: fresh MCP heartbeat counts as Productive even
+        // when no marker is in screen text. Tool calls are productive
+        // evidence (this is what fired the path; agent is alive).
+        let config = config_for_productivity(&Backend::ClaudeCode);
+        assert!(config.use_heartbeat, "managed backend uses heartbeat");
+        let signal = infer_productivity(&config, "<no markers here>", Duration::from_millis(500));
+        assert!(matches!(
+            signal,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Heartbeat
+            }
+        ));
+    }
+
+    #[test]
+    fn infer_productivity_stale_heartbeat_no_marker_is_no_signal() {
+        // Stale heartbeat (older than config window) + no marker match →
+        // NoSignal. This is the F9 grey-failure case: agent produces
+        // unproductive output (spinner) but no real progress.
+        let config = config_for_productivity(&Backend::ClaudeCode);
+        // 10_000ms is the fresh window per config_for_productivity; use 30s
+        // to be unambiguously past the window.
+        let signal = infer_productivity(
+            &config,
+            "spinning... please wait\n",
+            Duration::from_secs(30),
+        );
+        assert_eq!(signal, ProductivitySignal::NoSignal);
+    }
+
+    #[test]
+    fn shell_backend_disables_heartbeat_path() {
+        // Shell / Raw backends have no MCP integration — heartbeat path
+        // disabled. Markers-only.
+        let config = config_for_productivity(&Backend::Shell);
+        assert!(!config.use_heartbeat);
+        // Fresh "heartbeat" (irrelevant for shell) + no marker → NoSignal.
+        let signal = infer_productivity(&config, "$ ls\n", Duration::from_millis(0));
+        assert_eq!(signal, ProductivitySignal::NoSignal);
     }
 }

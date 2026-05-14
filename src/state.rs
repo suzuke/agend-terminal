@@ -566,6 +566,13 @@ pub struct StateTracker {
     pub current: AgentState,
     pub(crate) since: Instant,
     pub last_output: Instant,
+    /// F9 (#685 sub-task 4): bumped only when `infer_productivity()` returns
+    /// a `Productive` signal (heartbeat refresh or structural marker match).
+    /// Bare screen change does NOT bump this — unlike `last_output`. Read by
+    /// the daemon supervisor and passed to `check_hang` as `silent_productive`
+    /// for the dual-path Hung detection. See `docs/F9-PRODUCTIVE-OUTPUT-GATE.md`
+    /// §F9.1 architecture and §F9.3 dual-path decision table.
+    pub last_productive_output: Instant,
     /// Hash of the last screen text fed to `feed()`. `None` before the first
     /// call. Used to skip re-detection when the screen hasn't changed —
     /// crucial for not resetting `last_output` on cursor-blink noise.
@@ -589,6 +596,11 @@ pub struct StateTracker {
     last_heartbeat: Option<Instant>,
     /// Sprint 27: behavioral probe config for shadow-mode telemetry.
     behavioral_config: Option<crate::behavioral::BehavioralConfig>,
+    /// F9 (#685 sub-task 4): productive-output config for the dual-path
+    /// supplement to silence-based Hung detection. Per-backend markers +
+    /// heartbeat-as-productive toggle. See
+    /// `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.2 productive-signal design.
+    productivity_config: Option<crate::behavioral::ProductivityConfig>,
     /// Instance name for telemetry logging.
     instance_name: String,
     /// Backend name for telemetry logging.
@@ -647,12 +659,14 @@ impl StateTracker {
             current: initial_state,
             since: Instant::now(),
             last_output: Instant::now(),
+            last_productive_output: Instant::now(),
             last_screen_hash: None,
             patterns: backend.map(StatePatterns::for_backend),
             interactive_prompt_pending_notice: false,
             interactive_recovery_pending_notice: false,
             last_heartbeat: None,
             behavioral_config: backend.map(crate::behavioral::config_for),
+            productivity_config: backend.map(crate::behavioral::config_for_productivity),
             instance_name: String::new(),
             backend_name: backend.map(|b| b.name().to_string()).unwrap_or_default(),
         }
@@ -795,6 +809,34 @@ impl StateTracker {
                 &self.backend_name,
                 signal,
                 self.current.display_name(),
+            );
+        }
+
+        // F9 (#685 sub-task 4): productive-output detection. Bumps
+        // `last_productive_output` only on a Productive signal. The bump
+        // affects nothing about Hung classification directly — the daemon
+        // supervisor reads `last_productive_output.elapsed()` and passes it
+        // to `check_hang` as the dual-path signal. Activation of the new
+        // classification branch is gated on `AGEND_PRODUCTIVE_GATE=1` in
+        // `check_hang` (shadow-mode default). See
+        // `docs/F9-PRODUCTIVE-OUTPUT-GATE.md` §F9.5.
+        if let Some(ref pconfig) = self.productivity_config {
+            let heartbeat_age = self
+                .last_heartbeat
+                .map(|t| t.elapsed())
+                .unwrap_or_else(|| Duration::from_secs(u32::MAX as u64));
+            let signal = crate::behavioral::infer_productivity(pconfig, screen_text, heartbeat_age);
+            if matches!(
+                signal,
+                crate::behavioral::ProductivitySignal::Productive { .. }
+            ) {
+                self.last_productive_output = Instant::now();
+            }
+            crate::behavioral::log_productivity_telemetry(
+                &self.instance_name,
+                &self.backend_name,
+                self.current.display_name(),
+                &signal,
             );
         }
     }
@@ -1385,22 +1427,52 @@ mod tests {
     #[test]
     fn starting_hang_120s() {
         let mut h = HealthTracker::new();
-        assert!(!h.check_hang(AgentState::Starting, Duration::from_secs(119), 1_000_000, 0));
-        assert!(h.check_hang(AgentState::Starting, Duration::from_secs(121), 1_000_000, 0));
+        assert!(!h.check_hang(
+            AgentState::Starting,
+            Duration::from_secs(119),
+            Duration::from_secs(0),
+            1_000_000,
+            0
+        ));
+        assert!(h.check_hang(
+            AgentState::Starting,
+            Duration::from_secs(121),
+            Duration::from_secs(0),
+            1_000_000,
+            0
+        ));
     }
 
     #[test]
     fn idle_never_hangs() {
         let mut h = HealthTracker::new();
         // Even with 10000s of silence, Idle should never be considered hung.
-        assert!(!h.check_hang(AgentState::Idle, Duration::from_secs(10_000), 1_000_000, 0));
+        assert!(!h.check_hang(
+            AgentState::Idle,
+            Duration::from_secs(10_000),
+            Duration::from_secs(0),
+            1_000_000,
+            0
+        ));
     }
 
     #[test]
     fn thinking_hang_600s() {
         let mut h = HealthTracker::new();
-        assert!(!h.check_hang(AgentState::Thinking, Duration::from_secs(599), 1_000_000, 0));
-        assert!(h.check_hang(AgentState::Thinking, Duration::from_secs(601), 1_000_000, 0));
+        assert!(!h.check_hang(
+            AgentState::Thinking,
+            Duration::from_secs(599),
+            Duration::from_secs(0),
+            1_000_000,
+            0
+        ));
+        assert!(h.check_hang(
+            AgentState::Thinking,
+            Duration::from_secs(601),
+            Duration::from_secs(0),
+            1_000_000,
+            0
+        ));
     }
 
     // ── P2: Pattern matching ────────────────────────────────────────────

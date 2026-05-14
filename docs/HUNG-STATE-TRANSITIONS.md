@@ -375,6 +375,16 @@ PR #763 (decision `d-20260513231713506833-1`). Reduces FPs from stale
 `esc to cancel` text in scrollback without requiring co-pattern gating.
 Re-evaluate the full (c) hypothesis when fixture corpus data is available.
 
+**F9 layer distinction**: this hypothesis lives at the `AgentState`
+layer (`Thinking` pattern stickiness in `src/state.rs`). The F9
+productive-output gate (sub-task 4, decision `d-20260513235514013631-0`,
+see `docs/F9-PRODUCTIVE-OUTPUT-GATE.md`) operates at the `HealthState`
+layer (`Hung` classification in `src/health.rs::check_hang`). The two
+do NOT overlap: F39 mitigations adjust *which `AgentState::Thinking`
+transitions fire*, while F9 adds a parallel `HealthState::Hung`
+classification path independent of `AgentState`. A fix at one layer
+does not subsume a fix at the other.
+
 **Rejected**: tick force-recheck on screen-hash change — `tick()` already
 calls `maybe_expire_latched_state` periodically (`rg "fn tick" src/state.rs`),
 and the underlying `since.elapsed() >= LATCHED_STATE_EXPIRY` check is

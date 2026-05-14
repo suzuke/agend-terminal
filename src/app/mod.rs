@@ -586,6 +586,8 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             core.state.tick();
                             let agent_state = core.state.current;
                             let silent = core.state.last_output.elapsed();
+                            let silent_productive =
+                                core.state.last_productive_output.elapsed();
                             // Sprint 24 P1: pair snapshot for input-aware
                             // hang discrimination (matches daemon/mod.rs
                             // pattern).
@@ -593,6 +595,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                             core.health.check_hang(
                                 agent_state,
                                 silent,
+                                silent_productive,
                                 pair.last_input_at_ms,
                                 pair.heartbeat_at_ms,
                             );

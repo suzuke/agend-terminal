@@ -42,10 +42,17 @@ impl PerTickHandler for HangDetectionHandler {
             core.health.maybe_decay();
             let agent_state = core.state.current;
             let silent = core.state.last_output.elapsed();
+            // F9 (#685 sub-task 4): productive-silence reads the new
+            // `last_productive_output` field which is bumped only when
+            // `infer_productivity` returns a Productive signal. Default
+            // shadow-mode in `check_hang` gates classification on
+            // `AGEND_PRODUCTIVE_GATE=1`.
+            let silent_productive = core.state.last_productive_output.elapsed();
             let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
             if core.health.check_hang(
                 agent_state,
                 silent,
+                silent_productive,
                 pair.last_input_at_ms,
                 pair.heartbeat_at_ms,
             ) {
