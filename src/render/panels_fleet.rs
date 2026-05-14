@@ -200,6 +200,7 @@ mod tests {
             description: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             source_repo: None,
+            stale_members: Vec::new(),
         }];
         let tasks = vec![crate::tasks::Task {
             id: "t-1".to_string(),

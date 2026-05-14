@@ -44,7 +44,27 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         let in_registry = reg.contains_key(target);
         drop(reg);
         if !in_registry && target_resolved.is_none() {
-            return json!({"ok": false, "error": format!("target instance '{target}' not found (not in registry or fleet.yaml)")});
+            // #785: when target is missing from BOTH registry and fleet.yaml
+            // instances, it may still be registered as a team member (team
+            // metadata persists in fleet.yaml `teams:` block independently
+            // of `instances:`). Surface the team-desync state so operators
+            // know which remediation paths apply — neutral wording, no
+            // causal claim about HOW the desync arose (multiple sub-cases
+            // possible: team-add without create_instance, manual yaml edit,
+            // etc.).
+            let msg = match crate::teams::find_team_for(ctx.home, target) {
+                Some(team) => format!(
+                    "target '{target}' is registered as a member of team '{team_name}' \
+                     but no running instance exists. Either respawn via \
+                     `create_instance(name={target}, ...)` or clean stale \
+                     membership via `team(action=update, name={team_name}, remove={target})`.",
+                    team_name = team.name
+                ),
+                None => {
+                    format!("target instance '{target}' not found (not in registry or fleet.yaml)")
+                }
+            };
+            return json!({"ok": false, "error": msg});
         }
     }
 
@@ -1148,6 +1168,59 @@ mod tests {
             let _ = h.child.lock().kill();
         }
         drop(reg);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn send_to_team_member_missing_from_registry_returns_team_desync_error() {
+        // #785 anchor: target is a team member (per fleet.yaml `teams:`
+        // block) but no instance exists (never in registry, never in
+        // `instances:` section). Error message must surface the team-
+        // desync state with BOTH remediation paths so operators can
+        // diagnose without code archaeology.
+        //
+        // Reviewer C5 fixture pattern: never call create_instance for
+        // the target name; team membership set up directly via
+        // `teams::create`. No mock plumbing.
+        let home = tmp_home("785-desync");
+        // Set up a team `dev` with member `ghost-member` — no instance.
+        let _ = crate::teams::create(
+            &home,
+            &json!({
+                "name": "dev",
+                "members": ["ghost-member"],
+                "orchestrator": "ghost-member",
+                "source_repo": "/tmp/p785-desync",
+            }),
+        );
+
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({"from": "sender", "target": "ghost-member", "text": "hi"}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], false);
+        let err = result["error"].as_str().unwrap_or("");
+        // Content invariants pin the operator-actionable contract
+        // (prevent silent wording drift in future PRs).
+        assert!(
+            err.contains("ghost-member"),
+            "error must name the target: {err}"
+        );
+        assert!(err.contains("dev"), "error must name the team: {err}");
+        assert!(
+            err.contains("create_instance"),
+            "error must surface create_instance remediation path: {err}"
+        );
+        assert!(
+            err.contains("team(action=update"),
+            "error must surface team(action=update) cleanup path: {err}"
+        );
+        // Neutral wording — must NOT claim a specific causal hypothesis.
+        assert!(
+            !err.contains("likely daemon refresh"),
+            "error must use neutral wording (no causal claim): {err}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
