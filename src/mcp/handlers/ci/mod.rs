@@ -11,10 +11,34 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
     if !validate_branch(branch) {
         return json!({"error": format!("invalid branch name '{branch}'")});
     }
+    // #778 Option 1: optional atomic provision + bind. When `bind:true`,
+    // tail-ops mirror `bind_self → dispatch_auto_bind_lease` (marker +
+    // binding.json + ci_watches arm) directly on the just-provisioned
+    // worktree. Default `false` preserves existing back-compat callers
+    // (review pool, operator triage) that materialize a detached-HEAD
+    // inspection worktree without claiming it.
+    let bind = args["bind"].as_bool().unwrap_or(false);
+    if bind && crate::agent_ops::is_protected_ref(branch) {
+        return json!({
+            "error": format!("E4.5 violation: bind=true rejects protected branch '{branch}'"),
+            "code": "e4_5_protected_branch"
+        });
+    }
+    if bind && instance_name.is_empty() {
+        return json!({
+            "error": "bind=true requires AGEND_INSTANCE_NAME — anonymous callers cannot claim a worktree",
+            "code": "needs_identity"
+        });
+    }
+    // Windows-safe path mangling: also collapse `\` (path separator) and
+    // `:` (drive letter) so a source like `C:\Users\runner\...` doesn't
+    // produce a worktree path with mid-name colons (rejected by NTFS).
+    // Pre-existing tests didn't exercise Windows-built happy-path until
+    // #778's new bind:true coverage.
     let worktree_dir = home.join("worktrees").join(format!(
         "{}-{}",
         instance_name,
-        source.replace('/', "_").replace('~', "")
+        source.replace(['/', '\\', ':'], "_").replace('~', "")
     ));
     std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
     let source_path = if source.starts_with('/') || source.starts_with('~') {
@@ -46,19 +70,59 @@ pub(super) fn handle_checkout_repo(home: &Path, args: &Value, instance_name: &st
     {
         return json!({"error": "source path rejected: system directory"});
     }
+    // When `bind:true`, omit `--detach` so HEAD lands on the named
+    // branch — subsequent commits write to the right ref without the
+    // extra `git switch` that triggered the #778 chicken-and-egg.
+    let worktree_path_str = worktree_dir.display().to_string();
+    let git_args: Vec<&str> = if bind {
+        vec!["worktree", "add", &worktree_path_str, branch]
+    } else {
+        vec!["worktree", "add", "--detach", &worktree_path_str, branch]
+    };
     match std::process::Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            "--detach",
-            &worktree_dir.display().to_string(),
-            branch,
-        ])
+        .args(&git_args)
         .current_dir(&source_path)
+        // Daemon-internal git spawn — bypass the shim so a test or agent
+        // invocation of `repo action=checkout` from inside an instance
+        // process (where AGEND_INSTANCE_NAME is set) doesn't trip the
+        // `git worktree` fleet-managed deny. Matches the convention used
+        // by `dispatch_hook::derive_repo_from_remote` and other
+        // daemon-side git callers.
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
     {
         Ok(o) if o.status.success() => {
-            json!({"path": worktree_dir.display().to_string(), "source": source_path, "branch": branch})
+            let mut resp =
+                json!({"path": worktree_path_str, "source": source_path, "branch": branch});
+            if bind {
+                let marker_path = worktree_dir.join(crate::worktree_pool::MANAGED_MARKER);
+                let _ = std::fs::write(
+                    &marker_path,
+                    format!(
+                        "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                        chrono::Utc::now().to_rfc3339()
+                    ),
+                );
+                crate::binding::bind_full(
+                    home,
+                    instance_name,
+                    "self",
+                    branch,
+                    &worktree_dir,
+                    &source_canonical,
+                );
+                if let Some(r) = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
+                    &source_canonical,
+                ) {
+                    let _ = handle_watch_ci(
+                        home,
+                        &json!({"repo": &r, "branch": branch}),
+                        instance_name,
+                    );
+                }
+                resp["bound"] = json!(true);
+            }
+            resp
         }
         Ok(o) => json!({"error": String::from_utf8_lossy(&o.stderr).to_string()}),
         Err(e) => json!({"error": format!("{e}")}),
