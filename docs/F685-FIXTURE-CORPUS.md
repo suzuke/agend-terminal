@@ -205,10 +205,13 @@ own unless code/harness changes are bundled).
   oscillation should script-capture the session and contribute a real
   fixture; synthetic-from-real-template (timeline-faithful byte sequence
   derived from an operator's incident report) is acceptable in interim.
-- **Per-backend marker calibration**: deliverable #4 will extend
-  `ProductivityConfig.markers` per backend. The corpus schema does not
-  need changes for this — additional fixtures with backend-specific
-  markers will join the same harness loop.
+- **Per-backend marker calibration**: deliverable #4 (sub-task 6,
+  decision `d-20260514022917793418-0`) shipped per-backend MARKERS for
+  5 managed backends — see `docs/F9-PRODUCTIVE-OUTPUT-GATE.md §F9.2`
+  for current listings. Codex and OpenCode markers remain
+  **synthetic-only** pending real PTY captures via this corpus growth
+  protocol; corpus-side fixtures for those backends will join the same
+  harness loop once captured.
 - **Cargo feature gate revisit**: Phase 1 ships always-on harness (zero
   cost when fixtures lack measurement labels). If corpus grows past
   N ≈ 100 fixtures and aggregate replay time approaches CI budget

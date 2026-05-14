@@ -59,22 +59,64 @@ A signal is **productive** if either:
    bare-keyword approach (`Saved` / `Wrote`) suffers from the same
    scrollback FP surface as the F39 audit's Scenario A/B/C taxonomy.
 
-Phase 1 minimal generic markers (per `GENERIC_PRODUCTIVE_MARKERS` —
-`rg "GENERIC_PRODUCTIVE_MARKERS" src/behavioral.rs`):
-
+Generic structural anchors shared by all backends (file save banners):
 - `^Saved to \S+` — file save banner
 - `^Wrote \d+ bytes` — explicit byte count
 - `^Created file: \S+` — structured creation
-- `^\s*✓\s+(Read|Bash|Edit|Write|Grep)\b` — tool success (mirrors Claude
-  pattern at `rg "Read|Bash|Edit|Write|Grep" src/state.rs`)
 
-**Forbidden in this PR**: bare keyword markers. Prose like "I saved your
-time" must not match. Pinned by `infer_productivity_rejects_bare_keyword_scrollback`
-test.
+Per-backend completion markers (shipped by `#685` sub-task 6 —
+deliverable #4, decision `d-20260514022917793418-0`). Each backend's
+`MARKERS` const lists the generic anchors above plus its own
+completion-glyph + tool-vocab regex. Look up each via
+`rg "<BACKEND>_PRODUCTIVE_MARKERS" src/behavioral.rs`:
 
-Per-backend marker extension (e.g. kiro `[fs_read]`, Gemini `✓ ReadFile`)
-is `#685` deliverable #4 — separate sub-task that extends
-`ProductivityConfig.markers` rather than modifying F9 mechanism.
+| Backend | Completion regex (added to generic anchors) | Source | Validation |
+|---|---|---|---|
+| Claude | `^[✓●⏺]\s+(Read\|Bash\|Edit\|Write\|Grep\|Glob\|Listing\|Reading\|Writing\|Searching\|Editing)\b` | `rg "Read\|Bash\|Edit\|Write\|Grep" src/state.rs` (state.rs:212 ToolUse vocab) | F685 fixture `f685-f9-positive-savedfile.raw` (synthetic). Real captures pending corpus growth. |
+| Kiro | `^●\s+(Read\|Write\|Edit\|Bash\|Grep\|Glob\|Task\|List\|Search)\b` PLUS `\[(fs_read\|fs_write\|execute_bash)\]` | `rg "●" src/state.rs` (state.rs:261 ToolUse vocab + bracket-form fs/exec tools) | Synthetic unit tests only — `kiro_markers_*` in `src/behavioral.rs::tests`. **Not validated against real captures** — corpus growth path per F685. |
+| Codex | `^•\s+(Explored\|Edited\|Ran)\b` PLUS `apply_patch` | `rg "Explored\|Edited\|Ran" src/state.rs` (state.rs:308 past-tense title vocab + `apply_patch` literal) | **Synthetic only — not validated against real captures.** Corpus growth path. |
+| Gemini | `^✓\s+(ReadFile\|WriteFile\|ReadManyFiles\|Edit\|Shell\|WebFetch\|Glob\|GoogleSearch\|MemoryTool\|ReadFolder)\b` | `rg "ReadFile\|WriteFile" src/state.rs` (state.rs:405 CamelCase ToolUse vocab) | F685 fixture `f685-silent-stuck-stub.raw` (synthetic_from_real_template). Real captures pending. |
+| OpenCode | `^→\s+(Read\|Write\|Edit\|Glob\|Grep\|Bash\|List\|Task)\b` | `rg "→" src/state.rs` (state.rs:357 completion arrow — distinct from in-flight `✱`) | **Synthetic only — not validated against real captures.** Corpus growth path. |
+
+**Excluded from F9 markers**:
+- All in-progress / spinner glyphs (Braille `[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]`, OpenCode `✱`, Codex `◦ Working`,
+  Gemini `⠦ Thinking`). F9 productivity = completion-only; these fire BEFORE work completes.
+- Gemini `tool.*call` / `MCP.*tool` literals — heartbeat path already covers MCP signals
+  (avoid double counting).
+- Bare keyword markers (e.g. `Saved` / `Wrote` without line-start anchor). Prose like
+  "I saved your time" must not match — pinned by
+  `infer_productivity_rejects_bare_keyword_scrollback` (legacy) and
+  `<backend>_markers_reject_*` per-backend tests.
+
+### Cache routing
+
+Per-backend markers are NOT routed via pointer-eq (would fall through
+to per-call `Regex::new()` compile — the bug that caused PR #766's
+ubuntu/windows CI failure). Sub-task 6 introduced the `MarkerCacheId`
+enum on `ProductivityConfig`:
+
+```rust
+pub enum MarkerCacheId { Generic, Claude, Kiro, Codex, Gemini, OpenCode }
+
+pub struct ProductivityConfig {
+    pub markers: &'static [&'static str],
+    pub use_heartbeat: bool,
+    pub heartbeat_fresh_window_ms: u64,
+    pub cache_id: Option<MarkerCacheId>,
+}
+```
+
+`infer_productivity` matches on `cache_id` to route to the
+corresponding per-backend `LazyLock<Vec<Regex>>` static
+(`CLAUDE_PRODUCTIVE_REGEXES`, etc.). Compile-time exhaustive match
+prevents missing-backend bugs. `None` is reserved for ad-hoc test
+configs and falls back to `Regex::new()` per call (Phase 1 production
+code never hits this path).
+
+Future per-backend `heartbeat_fresh_window_ms` tuning and per-backend
+silence threshold tuning are **out of scope for sub-task 6** — both
+require corpus measurement data (see §F9.5 promotion criteria) before
+calibration.
 
 ## §F9.3 — Dual-path decision table
 

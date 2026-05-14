@@ -278,9 +278,11 @@ impl std::fmt::Display for ProductivitySignal {
     }
 }
 
-/// Per-backend productive-signal calibration. Phase 1 minimal markers ship
-/// the same across backends (heartbeat path universal); backend-specific
-/// extension is `#685` deliverable #4 follow-up.
+/// Per-backend productive-signal calibration. Sub-task 6 (decision
+/// `d-20260514022917793418-0`) shipped per-backend markers across 5
+/// managed backends; the `cache_id` field gates fast routing to a
+/// pre-compiled regex set, mirroring the `LazyLock` idiom at
+/// `src/state.rs:479-483`.
 #[derive(Debug, Clone, Copy)]
 pub struct ProductivityConfig {
     /// Structural marker patterns. Each must be anchored (line-start `^` or
@@ -294,10 +296,57 @@ pub struct ProductivityConfig {
     /// A heartbeat older than this is treated as stale; the markers path
     /// must independently fire.
     pub heartbeat_fresh_window_ms: u64,
+    /// Identifier for the pre-compiled regex cache that matches `markers`.
+    /// `Some(...)` enables the fast path through cached `LazyLock` regexes
+    /// (see `infer_productivity`); `None` falls back to per-call
+    /// `Regex::new()` compile. All Phase 1 callers via
+    /// `config_for_productivity` set `Some(...)`; `None` is an
+    /// intentional future-proofing escape hatch for test / ad-hoc
+    /// configs that want to provide custom markers without registering
+    /// a cache.
+    pub cache_id: Option<MarkerCacheId>,
 }
 
-/// Phase 1 minimal generic markers — structural anchors, NOT bare keywords.
-/// Per-backend tuning extends this in `#685` deliverable #4.
+/// Identifies which pre-compiled regex cache to consult when matching
+/// `ProductivityConfig.markers`. Each variant maps to one of the per-
+/// backend `*_PRODUCTIVE_REGEXES` `LazyLock` statics below.
+///
+/// **CRITICAL**: without this routing, per-backend markers fall through
+/// the ad-hoc `Regex::new()` compile path on every `feed()` call — the
+/// exact bug that caused PR #766's ubuntu/windows CI failure (replay
+/// test cumulative latency exceeding `min_hold` thresholds). The match
+/// on this enum is compile-time exhaustive so adding a backend forces
+/// a cache static + match arm in lockstep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerCacheId {
+    /// Generic structural anchors only (file save banners + Claude tool
+    /// completion). Used by Shell/Raw backends and as a baseline subset
+    /// inside each per-backend MARKERS list.
+    Generic,
+    Claude,
+    Kiro,
+    Codex,
+    Gemini,
+    OpenCode,
+}
+
+// ---------------------------------------------------------------------------
+// Per-backend markers — explicit composition (generic anchors duplicated
+// into each list; no implicit overlay). Decision §1 lock-broke duplication
+// over overlay: clearer per-backend semantics, single regex cache per
+// backend. Maintenance cost (5-place edit for future common anchor) is
+// the accepted trade-off.
+//
+// Source for completion glyphs + tool vocab: src/state.rs:200-450
+// AgentState ToolUse pattern catalogs (per-backend). F9 productivity is
+// COMPLETION-ONLY — exclude in-progress spinner glyphs from the AgentState
+// regex (those fire before work completes, opposite of productivity
+// signal). Sub-task 6 decision §1.
+// ---------------------------------------------------------------------------
+
+/// Generic structural anchors. File save banners + Claude-shape tool
+/// completion (kept here for Shell/Raw fallback). Each per-backend MARKERS
+/// const includes these three save-banner anchors via explicit duplication.
 const GENERIC_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
@@ -305,43 +354,125 @@ const GENERIC_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^\s*✓\s+(Read|Bash|Edit|Write|Grep)\b",
 ];
 
-/// Cached compiled regexes for `GENERIC_PRODUCTIVE_MARKERS` — built once at
-/// first access via `LazyLock`. Mirrors the existing idiom in `src/state.rs`
-/// (`G1: cached regexes via LazyLock`). Without this cache, the replay-
-/// fixture test path (`state::tests::replay_manifest_regression`) compiled
-/// 4 regexes per `feed()` call across hundreds of chunks per fixture,
-/// pushing wall-clock latency past `min_hold` transition thresholds on
-/// slower CI runners (ubuntu/windows). Patterns are static — compile
-/// failure here is a code bug, exercised by every productivity test.
-static GENERIC_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
-    std::sync::LazyLock::new(|| {
-        GENERIC_PRODUCTIVE_MARKERS
-            .iter()
-            .map(|p| {
-                regex::Regex::new(&format!("(?m){p}"))
-                    .unwrap_or_else(|e| panic!("F9 productive marker regex compile: {p}: {e}"))
-            })
-            .collect()
-    });
+/// Claude: generic anchors + completion glyphs (`✓●⏺` — NOT the in-progress
+/// Braille spinner set `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) with Claude tool-name vocabulary.
+const CLAUDE_PRODUCTIVE_MARKERS: &[&str] = &[
+    r"^Saved to \S+",
+    r"^Wrote \d+ bytes",
+    r"^Created file: \S+",
+    r"^[✓●⏺]\s+(Read|Bash|Edit|Write|Grep|Glob|Listing|Reading|Writing|Searching|Editing)\b",
+];
 
-/// Get productivity config for a backend.
+/// Kiro: generic anchors + `●` completion glyph with Kiro tool-name
+/// vocabulary + bracketed tool-call literals (`[fs_read]`, `[fs_write]`,
+/// `[execute_bash]`). The bracket form fires for Kiro's structured tool
+/// trace output.
+const KIRO_PRODUCTIVE_MARKERS: &[&str] = &[
+    r"^Saved to \S+",
+    r"^Wrote \d+ bytes",
+    r"^Created file: \S+",
+    r"^●\s+(Read|Write|Edit|Bash|Grep|Glob|Task|List|Search)\b",
+    r"\[(fs_read|fs_write|execute_bash)\]",
+];
+
+/// Codex: generic anchors + `•` past-tense title vocabulary (`Explored`,
+/// `Edited`, `Ran`) + `apply_patch` literal completion banner.
+const CODEX_PRODUCTIVE_MARKERS: &[&str] = &[
+    r"^Saved to \S+",
+    r"^Wrote \d+ bytes",
+    r"^Created file: \S+",
+    r"^•\s+(Explored|Edited|Ran)\b",
+    r"apply_patch",
+];
+
+/// Gemini: generic anchors + `✓` completion glyph with Gemini CamelCase
+/// tool-name vocabulary. Excludes `tool.*call` / `MCP.*tool` literals
+/// (heartbeat path already covers MCP — avoid double-counting).
+const GEMINI_PRODUCTIVE_MARKERS: &[&str] = &[
+    r"^Saved to \S+",
+    r"^Wrote \d+ bytes",
+    r"^Created file: \S+",
+    r"^✓\s+(ReadFile|WriteFile|ReadManyFiles|Edit|Shell|WebFetch|Glob|GoogleSearch|MemoryTool|ReadFolder)\b",
+];
+
+/// OpenCode: generic anchors + `→` completion glyph (NOT the in-flight
+/// `✱` glyph) with OpenCode tool-name vocabulary. Synthetic-only —
+/// not validated against real PTY captures; corpus growth path per
+/// `docs/F685-FIXTURE-CORPUS.md §F685-CORPUS.6`.
+const OPENCODE_PRODUCTIVE_MARKERS: &[&str] = &[
+    r"^Saved to \S+",
+    r"^Wrote \d+ bytes",
+    r"^Created file: \S+",
+    r"^→\s+(Read|Write|Edit|Glob|Grep|Bash|List|Task)\b",
+];
+
+/// Build a `LazyLock<Vec<Regex>>` from a static markers slice. Each
+/// marker is compiled with the `(?m)` multiline flag so `^` anchors at
+/// line starts inside the rendered screen.
+fn compile_markers(markers: &'static [&'static str]) -> Vec<regex::Regex> {
+    markers
+        .iter()
+        .map(|p| {
+            regex::Regex::new(&format!("(?m){p}"))
+                .unwrap_or_else(|e| panic!("F9 productive marker regex compile: {p}: {e}"))
+        })
+        .collect()
+}
+
+static GENERIC_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| compile_markers(GENERIC_PRODUCTIVE_MARKERS));
+static CLAUDE_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| compile_markers(CLAUDE_PRODUCTIVE_MARKERS));
+static KIRO_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| compile_markers(KIRO_PRODUCTIVE_MARKERS));
+static CODEX_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| compile_markers(CODEX_PRODUCTIVE_MARKERS));
+static GEMINI_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| compile_markers(GEMINI_PRODUCTIVE_MARKERS));
+static OPENCODE_PRODUCTIVE_REGEXES: std::sync::LazyLock<Vec<regex::Regex>> =
+    std::sync::LazyLock::new(|| compile_markers(OPENCODE_PRODUCTIVE_MARKERS));
+
+/// Get productivity config for a backend. Each managed backend uses its
+/// own per-backend MARKERS list + cache id; Shell/Raw fall back to the
+/// generic anchor set (no MCP heartbeat).
 pub fn config_for_productivity(backend: &Backend) -> ProductivityConfig {
     match backend {
-        // Managed backends with MCP integration — heartbeat is reliable.
-        Backend::ClaudeCode
-        | Backend::KiroCli
-        | Backend::Codex
-        | Backend::OpenCode
-        | Backend::Gemini => ProductivityConfig {
-            markers: GENERIC_PRODUCTIVE_MARKERS,
+        Backend::ClaudeCode => ProductivityConfig {
+            markers: CLAUDE_PRODUCTIVE_MARKERS,
             use_heartbeat: true,
             heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Claude),
         },
-        // Shell / Raw — no MCP, markers only.
+        Backend::KiroCli => ProductivityConfig {
+            markers: KIRO_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Kiro),
+        },
+        Backend::Codex => ProductivityConfig {
+            markers: CODEX_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Codex),
+        },
+        Backend::Gemini => ProductivityConfig {
+            markers: GEMINI_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::Gemini),
+        },
+        Backend::OpenCode => ProductivityConfig {
+            markers: OPENCODE_PRODUCTIVE_MARKERS,
+            use_heartbeat: true,
+            heartbeat_fresh_window_ms: 10_000,
+            cache_id: Some(MarkerCacheId::OpenCode),
+        },
+        // Shell / Raw — no MCP, generic markers only.
         Backend::Shell | Backend::Raw(_) => ProductivityConfig {
             markers: GENERIC_PRODUCTIVE_MARKERS,
             use_heartbeat: false,
             heartbeat_fresh_window_ms: 0,
+            cache_id: Some(MarkerCacheId::Generic),
         },
     }
 }
@@ -362,34 +493,43 @@ pub fn infer_productivity(
             source: ProductivitySource::Heartbeat,
         };
     }
-    // Markers path — regex scan. Patterns are pre-compiled once via the
-    // `GENERIC_PRODUCTIVE_REGEXES` LazyLock; we look up via pointer-eq on
-    // the `&'static str` since `ProductivityConfig.markers` is also static.
-    // This avoids per-call regex compile (the original cause of CI flake on
-    // slower runners — see `GENERIC_PRODUCTIVE_REGEXES` doc).
-    if std::ptr::eq(
-        config.markers as *const [&'static str],
-        GENERIC_PRODUCTIVE_MARKERS as *const [&'static str],
-    ) {
-        for (i, pattern) in config.markers.iter().enumerate() {
-            if GENERIC_PRODUCTIVE_REGEXES[i].is_match(screen_text) {
-                return ProductivitySignal::Productive {
-                    source: ProductivitySource::Marker(pattern),
-                };
-            }
-        }
-    } else {
-        // Non-generic catalog (future per-backend tuning sub-task may
-        // override). Fall back to ad-hoc compile path. Once deliverable
-        // #4 lands per-backend marker tables, those should ship their
-        // own LazyLock caches too.
-        for pattern in config.markers {
-            let re = regex::Regex::new(&format!("(?m){pattern}")).ok();
-            if let Some(re) = re {
-                if re.is_match(screen_text) {
+    // Markers path — route to pre-compiled `LazyLock` cache via cache_id.
+    // Compile-time exhaustive match catches missing-backend bugs. The
+    // `None` arm exists for future custom configs (test code, ad-hoc
+    // markers) that opt out of the cache; Phase 1 production code never
+    // hits it.
+    let cached_regexes: Option<&[regex::Regex]> = match config.cache_id {
+        Some(MarkerCacheId::Generic) => Some(&GENERIC_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Claude) => Some(&CLAUDE_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Kiro) => Some(&KIRO_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Codex) => Some(&CODEX_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::Gemini) => Some(&GEMINI_PRODUCTIVE_REGEXES),
+        Some(MarkerCacheId::OpenCode) => Some(&OPENCODE_PRODUCTIVE_REGEXES),
+        None => None,
+    };
+    match cached_regexes {
+        Some(regexes) => {
+            for (i, pattern) in config.markers.iter().enumerate() {
+                if regexes[i].is_match(screen_text) {
                     return ProductivitySignal::Productive {
                         source: ProductivitySource::Marker(pattern),
                     };
+                }
+            }
+        }
+        None => {
+            // Ad-hoc compile fallback — Phase 1 dead code path; reserved
+            // for future ProductivityConfig callers that supply custom
+            // markers without registering a cache id. Compile latency
+            // limited to non-production paths (test code or one-off
+            // tooling).
+            for pattern in config.markers {
+                if let Ok(re) = regex::Regex::new(&format!("(?m){pattern}")) {
+                    if re.is_match(screen_text) {
+                        return ProductivitySignal::Productive {
+                            source: ProductivitySource::Marker(pattern),
+                        };
+                    }
                 }
             }
         }
@@ -933,5 +1073,208 @@ mod tests {
         // Fresh "heartbeat" (irrelevant for shell) + no marker → NoSignal.
         let signal = infer_productivity(&config, "$ ls\n", Duration::from_millis(0));
         assert_eq!(signal, ProductivitySignal::NoSignal);
+    }
+
+    // -------------------------------------------------------------------
+    // Sub-task 6 (#685 deliverable #4): per-backend productive markers
+    // (decision d-20260514022917793418-0). 10 tests pin the per-backend
+    // marker contract: completion-glyph + tool-vocab fires positive on
+    // each backend's expected output shape; bare prose missing the
+    // line-start anchor fires NoSignal (anti-FP). Stale heartbeat used
+    // throughout to force the markers path.
+    // -------------------------------------------------------------------
+
+    /// Duration that exceeds `heartbeat_fresh_window_ms` for any backend
+    /// — forces inference through the markers path so positive/negative
+    /// tests verify the per-backend regex, not the heartbeat shortcut.
+    fn stale_heartbeat() -> Duration {
+        Duration::from_secs(u32::MAX as u64)
+    }
+
+    #[test]
+    fn claude_markers_match_completion_glyph_and_tool() {
+        let config = config_for_productivity(&Backend::ClaudeCode);
+        assert_eq!(config.cache_id, Some(MarkerCacheId::Claude));
+        // `✓ Read foo.toml` — completion glyph + Claude tool vocab.
+        let signal = infer_productivity(&config, "✓ Read foo.toml\n", stale_heartbeat());
+        assert!(matches!(
+            signal,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn claude_markers_reject_in_progress_spinner_and_prose() {
+        let config = config_for_productivity(&Backend::ClaudeCode);
+        // `⠦ Read foo.toml` — in-progress spinner glyph (NOT completion);
+        // bare prose without anchor. Neither should fire productive.
+        let in_progress = infer_productivity(&config, "⠦ Read foo.toml\n", stale_heartbeat());
+        assert_eq!(in_progress, ProductivitySignal::NoSignal);
+        let prose = infer_productivity(
+            &config,
+            "I have saved your time previously\n",
+            stale_heartbeat(),
+        );
+        assert_eq!(prose, ProductivitySignal::NoSignal);
+    }
+
+    #[test]
+    fn kiro_markers_match_glyph_or_bracketed_tool() {
+        let config = config_for_productivity(&Backend::KiroCli);
+        assert_eq!(config.cache_id, Some(MarkerCacheId::Kiro));
+        // `● Read foo.toml` — Kiro completion glyph.
+        let glyph = infer_productivity(&config, "● Read foo.toml\n", stale_heartbeat());
+        assert!(matches!(
+            glyph,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+        // `[fs_read]` bracketed tool literal (not line-anchored).
+        let bracketed = infer_productivity(
+            &config,
+            "Running tool [fs_read] on file\n",
+            stale_heartbeat(),
+        );
+        assert!(matches!(
+            bracketed,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn kiro_markers_reject_bare_tool_name_prose() {
+        let config = config_for_productivity(&Backend::KiroCli);
+        // `Read foo.toml` without `●` prefix — chat prose mentioning tool name.
+        let prose = infer_productivity(
+            &config,
+            "Will Read foo.toml when ready\n",
+            stale_heartbeat(),
+        );
+        assert_eq!(prose, ProductivitySignal::NoSignal);
+    }
+
+    #[test]
+    fn codex_markers_match_dot_title_or_apply_patch() {
+        let config = config_for_productivity(&Backend::Codex);
+        assert_eq!(config.cache_id, Some(MarkerCacheId::Codex));
+        // `• Edited` — Codex past-tense title glyph.
+        let title = infer_productivity(&config, "• Edited\n", stale_heartbeat());
+        assert!(matches!(
+            title,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+        // `apply_patch` literal in Codex tool log line.
+        let patch =
+            infer_productivity(&config, "└ Ran apply_patch (15 hunks)\n", stale_heartbeat());
+        assert!(matches!(
+            patch,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_markers_reject_in_flight_spinner_prose() {
+        let config = config_for_productivity(&Backend::Codex);
+        // `◦ Working` — Codex in-progress spinner; must NOT fire.
+        let spinner = infer_productivity(
+            &config,
+            "◦ Working (5s • esc to interrupt)\n",
+            stale_heartbeat(),
+        );
+        assert_eq!(spinner, ProductivitySignal::NoSignal);
+    }
+
+    #[test]
+    fn gemini_markers_match_check_glyph_and_camelcase_tool() {
+        let config = config_for_productivity(&Backend::Gemini);
+        assert_eq!(config.cache_id, Some(MarkerCacheId::Gemini));
+        // `✓ ReadFile` — Gemini completion glyph + CamelCase tool name.
+        let signal = infer_productivity(&config, "✓ ReadFile foo.toml\n", stale_heartbeat());
+        assert!(matches!(
+            signal,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn gemini_markers_reject_braille_spinner_and_mcp_prose() {
+        let config = config_for_productivity(&Backend::Gemini);
+        // `⠦ Thinking... (esc to cancel, 2s)` — Gemini in-progress spinner.
+        let spinner = infer_productivity(
+            &config,
+            "⠦ Thinking... (esc to cancel, 2s)\n",
+            stale_heartbeat(),
+        );
+        assert_eq!(spinner, ProductivitySignal::NoSignal);
+        // Bare prose with `MCP tool` mention — heartbeat path is the
+        // canonical MCP signal; marker path explicitly excludes the
+        // literal to avoid double-counting. Per decision §1 exclusion.
+        let mcp_prose = infer_productivity(
+            &config,
+            "About to call MCP tool method\n",
+            stale_heartbeat(),
+        );
+        assert_eq!(mcp_prose, ProductivitySignal::NoSignal);
+    }
+
+    #[test]
+    fn opencode_markers_match_arrow_glyph_completion() {
+        let config = config_for_productivity(&Backend::OpenCode);
+        assert_eq!(config.cache_id, Some(MarkerCacheId::OpenCode));
+        // `→ Read foo.toml` — OpenCode completion glyph.
+        let signal = infer_productivity(&config, "→ Read foo.toml\n", stale_heartbeat());
+        assert!(matches!(
+            signal,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn opencode_markers_reject_in_flight_asterisk_glyph() {
+        let config = config_for_productivity(&Backend::OpenCode);
+        // `✱ Glob "*.toml"` — OpenCode in-flight glyph (NOT completion).
+        let in_flight = infer_productivity(
+            &config,
+            "✱ Glob \"*.toml\" (2 matches)\n",
+            stale_heartbeat(),
+        );
+        assert_eq!(in_flight, ProductivitySignal::NoSignal);
+    }
+
+    #[test]
+    fn ad_hoc_fallback_path_compiles_and_matches() {
+        // Pin the `cache_id: None` fallback path — for callers (test
+        // code, future ad-hoc configs) that supply custom markers
+        // without registering a cache. Phase 1 production never hits
+        // this path; the test ensures it stays correct.
+        let custom = ProductivityConfig {
+            markers: &["^CUSTOM PRODUCTIVE SIGNAL \\d+"],
+            use_heartbeat: false,
+            heartbeat_fresh_window_ms: 0,
+            cache_id: None,
+        };
+        let signal =
+            infer_productivity(&custom, "CUSTOM PRODUCTIVE SIGNAL 42\n", stale_heartbeat());
+        assert!(matches!(
+            signal,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+        let negative = infer_productivity(&custom, "nothing matches\n", stale_heartbeat());
+        assert_eq!(negative, ProductivitySignal::NoSignal);
     }
 }
