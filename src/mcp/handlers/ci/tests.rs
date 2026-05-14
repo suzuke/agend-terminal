@@ -620,7 +620,6 @@ fn handle_watch_ci_accepts_non_protected_branch() {
 // anonymous-caller error-path tests below stay cross-platform.
 // ----------------------------------------------------------------------
 
-#[cfg(unix)]
 fn p778_tmp_home(suffix: &str) -> std::path::PathBuf {
     let h = std::env::temp_dir().join(format!(
         "agend-p778-bind-{}-{}-{}",
