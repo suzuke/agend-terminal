@@ -167,15 +167,96 @@ pub fn create(home: &Path, args: &Value) -> Value {
     }
 }
 
+/// #828: read the team's current member list from fleet.yaml. Used by
+/// `delete` to snapshot members before the cascade walks them through
+/// `full_delete_instance` (which itself removes each member from every
+/// team via `remove_member_from_all`, eventually auto-deleting the
+/// team being disbanded once its membership reaches zero).
+fn list_team_members(home: &Path, team_name: &str) -> Vec<String> {
+    load_fleet(home)
+        .teams
+        .get(team_name)
+        .map(|cfg| cfg.members.clone())
+        .unwrap_or_default()
+}
+
+/// #828: disband a team and cascade `full_delete_instance` per member
+/// so each member's ghost-owned tasks get orphaned via the existing
+/// `tasks::orphan_tasks_for_owner` hook (#808) and the rest of the
+/// per-instance teardown (PTY kill, telegram topic, working_dir,
+/// remove_member_from_all in any *other* teams the member belongs to)
+/// fires symmetrically.
+///
+/// Hard-cascade design (per dispatch + spike design call 1):
+/// `full_delete_instance` kills the instance entirely, so a member
+/// that's in multiple teams is removed from all of them. The
+/// `remove_member_from_all` step inside `full_delete_instance` emits
+/// the existing "Team 'X' needs new orchestrator" urgent-task signal
+/// when a multi-team member happened to be another team's
+/// orchestrator — operator gets immediate cross-team coupling
+/// surfaced at the moment it's actionable.
+///
+/// Error policy (per spike design call 2, mirrors
+/// `full_delete_instance`'s own per-step pattern): continue on
+/// per-member failure, collect into `cascade_warnings`. The
+/// final response carries:
+/// - `status: "deleted"` when the team was removed cleanly (either
+///   by the explicit `remove_team_from_yaml` below or by
+///   `remove_member_from_all`'s empty-team auto-delete during the
+///   cascade — both outcomes count as success)
+/// - `members_cleaned: N` (always emitted, even N=0)
+/// - `cascade_warnings: [..]` when any per-member cascade returned Err
 pub fn delete(home: &Path, args: &Value) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
+
+    // Snapshot existence + members BEFORE cascade. The cascade itself
+    // may auto-delete the team (when `remove_member_from_all` removes
+    // the last member), so we can't rely on post-cascade fleet.yaml
+    // state to tell "team was there" from "team was never there".
+    let entry_existed = load_fleet(home).teams.contains_key(&name);
+    if !entry_existed {
+        return serde_json::json!({
+            "error": format!("team '{name}' not found"),
+            "members_cleaned": 0,
+        });
+    }
+    let members = list_team_members(home, &name);
+    let members_count = members.len();
+    let mut cascade_warnings: Vec<String> = Vec::new();
+    for member in &members {
+        if let Err(e) = crate::mcp::handlers::instance_lifecycle::full_delete_instance(home, member)
+        {
+            cascade_warnings.push(format!("{member}: {e}"));
+            tracing::warn!(
+                team = %name,
+                %member,
+                error = %e,
+                "#828: full_delete_instance failed during team disband cascade"
+            );
+        }
+    }
+
+    // After cascade, the team may already be gone (auto-deleted by
+    // `remove_member_from_all`'s empty-team rule once the last member
+    // was removed). Treat Ok(true) AND Ok(false) as success here —
+    // both mean the team is no longer in fleet.yaml, which is exactly
+    // what disband requested.
     match crate::fleet::remove_team_from_yaml(home, &name) {
-        Ok(true) => serde_json::json!({"status": "deleted", "name": name}),
-        Ok(false) => serde_json::json!({"error": format!("team '{name}' not found")}),
-        Err(e) => serde_json::json!({"error": format!("{e}")}),
+        Ok(_) => {
+            let mut result = serde_json::json!({
+                "status": "deleted",
+                "name": name,
+                "members_cleaned": members_count,
+            });
+            if !cascade_warnings.is_empty() {
+                result["cascade_warnings"] = serde_json::json!(cascade_warnings);
+            }
+            result
+        }
+        Err(e) => serde_json::json!({"error": format!("{e}"), "members_cleaned": members_count}),
     }
 }
 
@@ -708,8 +789,7 @@ mod tests {
         );
 
         // Members are gone from fleet.yaml `instances:`.
-        let fleet =
-            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
         assert!(
             !fleet.instances.contains_key("alice828"),
             "alice828 must be removed from fleet.yaml instances, got: {:?}",
