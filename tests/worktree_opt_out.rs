@@ -67,12 +67,14 @@ instances:
 fn git_status_porcelain_detects_dirty() {
     let dir = std::env::temp_dir().join(format!("agend-wt-dirty-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["init", "-b", "main"])
         .current_dir(&dir)
         .output()
         .unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["commit", "--allow-empty", "-m", "init"])
@@ -81,6 +83,7 @@ fn git_status_porcelain_detects_dirty() {
         .unwrap();
     std::fs::write(dir.join("dirty.txt"), "uncommitted").unwrap();
 
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["status", "--porcelain"])
@@ -99,12 +102,14 @@ fn git_status_porcelain_detects_dirty() {
 fn git_status_porcelain_clean() {
     let dir = std::env::temp_dir().join(format!("agend-wt-clean-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["init", "-b", "main"])
         .current_dir(&dir)
         .output()
         .unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["commit", "--allow-empty", "-m", "init"])
@@ -112,6 +117,7 @@ fn git_status_porcelain_clean() {
         .output()
         .unwrap();
 
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["status", "--porcelain"])
@@ -133,12 +139,14 @@ fn e2e_clean_worktree_flip_prunes() {
     let dir = std::env::temp_dir().join(format!("agend-wt-e2e-prune-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // Init git repo
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["init", "-b", "main"])
         .current_dir(&dir)
         .output()
         .unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["commit", "--allow-empty", "-m", "init"])
@@ -149,12 +157,14 @@ fn e2e_clean_worktree_flip_prunes() {
     let wt_dir = dir.join(".worktrees").join("test-agent");
     std::fs::create_dir_all(&wt_dir).unwrap();
     // Init the worktree as a git repo too (so git status works)
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["init", "-b", "main"])
         .current_dir(&wt_dir)
         .output()
         .unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["commit", "--allow-empty", "-m", "init"])
@@ -163,6 +173,7 @@ fn e2e_clean_worktree_flip_prunes() {
         .unwrap();
 
     // Verify clean
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["status", "--porcelain"])
@@ -185,12 +196,14 @@ fn e2e_clean_worktree_flip_prunes() {
 fn e2e_dirty_worktree_flip_rejected() {
     let dir = std::env::temp_dir().join(format!("agend-wt-e2e-reject-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["init", "-b", "main"])
         .current_dir(&dir)
         .output()
         .unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["commit", "--allow-empty", "-m", "init"])
@@ -199,12 +212,14 @@ fn e2e_dirty_worktree_flip_rejected() {
         .unwrap();
     let wt_dir = dir.join(".worktrees").join("test-agent");
     std::fs::create_dir_all(&wt_dir).unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["init", "-b", "main"])
         .current_dir(&wt_dir)
         .output()
         .unwrap();
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["commit", "--allow-empty", "-m", "init"])
@@ -214,6 +229,7 @@ fn e2e_dirty_worktree_flip_rejected() {
     // Make dirty
     std::fs::write(wt_dir.join("dirty.txt"), "uncommitted work").unwrap();
 
+    // allow: raw-git-subprocess pre-#821 fixture; properly pins AGEND_GIT_BYPASS+current_dir
     let output = std::process::Command::new("git")
         .env("AGEND_GIT_BYPASS", "1")
         .args(["status", "--porcelain"])
