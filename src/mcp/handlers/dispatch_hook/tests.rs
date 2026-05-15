@@ -1346,3 +1346,156 @@ fn teams_json_migration_preserves_existing_fleet_yaml_source_repo() {
 
     std::fs::remove_dir_all(&parent).ok();
 }
+
+// ── #814 clean_empty_init_commits stale-rebase-merge recovery ──
+
+/// Spawn a temp git repo + worktree pair scoped to `tag`. The repo
+/// has an initial commit + `refs/remotes/origin/main` so the
+/// helper's `git log origin/main..HEAD` query has a baseline. The
+/// worktree branches off `main` so subsequent commits land in
+/// `origin/main..HEAD`. Returns `(repo_dir, worktree_dir)`.
+fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("agend-814-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&base).ok();
+    let repo = base.join("repo");
+    std::fs::create_dir_all(&repo).ok();
+    let git_run = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git ran")
+    };
+    git_run(&repo, &["init", "-b", "main"]);
+    git_run(&repo, &["commit", "--allow-empty", "-m", "main: initial"]);
+    let main_sha = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    git_run(
+        &repo,
+        &["update-ref", "refs/remotes/origin/main", &main_sha],
+    );
+    let worktree = base.join("wt");
+    git_run(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            &worktree.display().to_string(),
+        ],
+    );
+    (repo, worktree)
+}
+
+/// Interleave `n_inits` empty `init` commits with `n_real` commits
+/// that actually modify a file, advancing the branch HEAD inside
+/// `worktree`. Pattern alternates real / init / real / init ... so
+/// the helper exercises the mixed-cleanup rebase path (not the
+/// all-empty soft-reset shortcut).
+fn create_interleaved_commit_chain(worktree: &std::path::Path, n_inits: usize, n_real: usize) {
+    let git_run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(worktree)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git ran")
+    };
+    let total = n_inits + n_real;
+    let mut inits_remaining = n_inits;
+    let mut reals_remaining = n_real;
+    for i in 0..total {
+        // Alternate: even index → init, odd → real (when both still available).
+        let pick_init = if reals_remaining == 0 {
+            true
+        } else if inits_remaining == 0 {
+            false
+        } else {
+            i % 2 == 0
+        };
+        if pick_init {
+            git_run(&["commit", "--allow-empty", "-m", "init"]);
+            inits_remaining -= 1;
+        } else {
+            let path = worktree.join(format!("real-{i}.txt"));
+            std::fs::write(&path, format!("real commit {i}\n")).expect("write");
+            git_run(&["add", &format!("real-{i}.txt")]);
+            git_run(&["commit", "-m", &format!("real commit {i}")]);
+            reals_remaining -= 1;
+        }
+    }
+}
+
+/// Read the worktree's actual `.git` dir (a worktree's `.git` is a
+/// file pointing to `<repo>/.git/worktrees/<name>`).
+fn worktree_gitdir(worktree: &std::path::Path) -> std::path::PathBuf {
+    let dotgit = worktree.join(".git");
+    if dotgit.is_dir() {
+        return dotgit;
+    }
+    let content = std::fs::read_to_string(&dotgit).expect("read .git");
+    let gitdir = content
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir: "))
+        .expect("gitdir prefix");
+    std::path::PathBuf::from(gitdir.trim())
+}
+
+/// Synthesize a malformed `.git/.../rebase-merge/` dir as if a
+/// prior `git rebase -i` failed and `--abort` failed to recover
+/// it. This is the exact stale-state that triggered #807's 3
+/// consecutive `cleanup_init_commits` failures.
+fn pre_poison_stale_rebase_merge(worktree: &std::path::Path) {
+    let gitdir = worktree_gitdir(worktree);
+    let rebase_merge = gitdir.join("rebase-merge");
+    std::fs::create_dir_all(&rebase_merge).expect("create rebase-merge");
+    // Minimal content git looks for to refuse a new rebase.
+    std::fs::write(rebase_merge.join("head-name"), "refs/heads/feature").expect("write head-name");
+    std::fs::write(rebase_merge.join("onto"), "deadbeef").expect("write onto");
+    std::fs::write(rebase_merge.join("interactive"), "").expect("write interactive");
+}
+
+#[test]
+fn clean_empty_init_commits_recovers_from_stale_rebase_merge_dir() {
+    // #814 RED test: synthesize the exact failure state #807 hit —
+    // 32 interleaved empty inits + 3 real commits + a leftover
+    // `.git/.../rebase-merge/` dir from a prior failed cleanup.
+    // Pre-fix: `git rebase -i` immediately errors with "rebase in
+    // progress" → helper returns Err("...status 256"). Post-fix:
+    // `clear_stale_rebase_state` removes the stale dir at entry,
+    // letting the rebase proceed normally.
+    let (_repo, worktree) = setup_repo_and_worktree("recover");
+    create_interleaved_commit_chain(&worktree, 32, 3);
+    pre_poison_stale_rebase_merge(&worktree);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(
+        result.is_ok(),
+        "helper must auto-recover from stale rebase-merge dir, got: {result:?}"
+    );
+    let cleaned = result.unwrap();
+    assert_eq!(
+        cleaned, 32,
+        "all 32 empty inits should be dropped, cleaned: {cleaned}"
+    );
+    // Post-condition: stale dir is gone (cleared by the helper +
+    // by the successful rebase that followed).
+    let gitdir = worktree_gitdir(&worktree);
+    assert!(
+        !gitdir.join("rebase-merge").exists(),
+        "rebase-merge dir should be gone post-cleanup"
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
