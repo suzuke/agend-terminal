@@ -174,6 +174,16 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
+    # rustsec/audit-check@v2 POSTs results to /repos/.../check-runs to surface
+    # advisories on the PR/commit UI. Repo default `default_workflow_permissions:
+    # read` denied that POST with "Resource not accessible by integration" on
+    # every push-to-main since 2026-05-15 (audit was effectively running but its
+    # last reporting step failed, making main CI red). `contents: read` keeps
+    # actions/checkout working after the grant narrows the default scope.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
