@@ -2506,4 +2506,86 @@ mod tests {
 
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #808 ghost-owner ACL deadlock: auto-orphan + force flag tests ──
+
+    #[test]
+    fn test_ghost_owner_update_without_force_errors_with_acl() {
+        // Baseline regression: today operator cannot cancel a task
+        // whose owner is no longer in the fleet (ghost-owner ACL
+        // deadlock the issue describes). The #808 force flag must NOT
+        // change this behavior when force=false / absent — the ACL
+        // gate stays load-bearing so accidental cancels still require
+        // an explicit force opt-in.
+        let home = tmp_home("ghost_acl_baseline");
+        write_fleet_yaml(&home, &["operator"]);
+        let r = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "create",
+                "title": "stuck",
+                "assignee": "ghost-instance",
+            }),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        let r = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "cancelled",
+            }),
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .map(|e| e.contains("not authorized"))
+                .unwrap_or(false),
+            "ghost-owned task cancel without force must surface ACL error, got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_force_update_true_without_force_reason_rejected() {
+        // Force-flag contract (mirrors comms.rs:200-218): force=true
+        // without a non-empty force_reason must surface a validator
+        // error, NOT fall through to ACL or succeed silently. The
+        // grammar match is "force_reason" (the validator message names
+        // the missing field) — pre-fix the handler ignores force and
+        // returns the regular ACL error, so this test is RED until C2
+        // ships.
+        let home = tmp_home("force_no_reason");
+        write_fleet_yaml(&home, &["operator"]);
+        let r = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "create",
+                "title": "stuck",
+                "assignee": "ghost-instance",
+            }),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        let r = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "cancelled",
+                "force": true,
+            }),
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .map(|e| e.contains("force_reason"))
+                .unwrap_or(false),
+            "force=true without force_reason must surface validator error, got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
