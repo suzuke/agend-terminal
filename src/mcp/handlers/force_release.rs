@@ -17,7 +17,7 @@
 
 use crate::identity::Sender;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// MCP tool: `force_release_worktree`.
 ///
@@ -86,15 +86,312 @@ pub(crate) fn handle_force_release_worktree(
         });
     }
 
+    // #826: optional operator-supplied `source_repo` arg. When
+    // present, L2 skips enumeration and goes straight to the named
+    // repo. When absent, L2 enumerates daemon-managed candidates.
+    let source_repo_hint = args["source_repo"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
     match rebase_clean_self(home, agent, branch) {
-        Ok(o) => json!({
-            "released": true,
-            "dir_existed": o.dir_existed,
-            "dir_removed": o.dir_removed,
-            "binding_outcome": o.binding_outcome,
-        }),
+        Ok(o) => {
+            // #826 L2 GC: when the binding-clear path short-circuited
+            // on "no binding" (the post-disband state), the
+            // `git worktree remove --force` step inside `release_full`
+            // never ran. Run it now against any source repos that
+            // still hold `.git/worktrees/<meta-dir>/` metadata for
+            // our target worktree path.
+            let gc = prune_git_metadata_for_agent(home, agent, branch, source_repo_hint.as_deref());
+            json!({
+                "released": true,
+                "dir_existed": o.dir_existed,
+                "dir_removed": o.dir_removed,
+                "binding_outcome": o.binding_outcome,
+                "git_metadata_pruned": gc.pruned_count,
+                "git_metadata_repos": gc.repos_touched,
+            })
+        }
         Err(e) => json!({"error": e, "code": "path_outside_pool"}),
     }
+}
+
+/// #826 L2 GC outcome: count + list of source repos where the
+/// `git worktree remove --force` (and `git worktree prune` fallback)
+/// step actually pruned a metadata entry for the target agent's
+/// worktree path.
+#[derive(Debug, Default)]
+struct GcOutcome {
+    pruned_count: usize,
+    repos_touched: Vec<String>,
+}
+
+/// #826 L2: enumerate source repos that may still hold
+/// `.git/worktrees/<meta-dir>/` metadata pointing at the daemon-
+/// managed worktree path `<home>/worktrees/<agent>/<branch>/`, and
+/// run `git worktree remove --force` per matching entry. Idempotent
+/// — re-running on already-pruned metadata is a no-op (returns
+/// `GcOutcome::default()` with `pruned_count: 0`).
+///
+/// Source-repo discovery:
+/// 1. If `source_repo_hint` is supplied (operator's fast path) →
+///    use it as the single candidate.
+/// 2. Else → enumerate via two sources:
+///    - Walk `<home>/worktrees/*/<...>/.git` pointer files from
+///      sibling agents (the daemon's worktree convention writes a
+///      `.git` file containing `gitdir: <source>/.git/worktrees/<name>`).
+///    - Read `crate::teams::list_all(home)` and collect each
+///      team's `source_repo` field.
+///
+/// For each candidate source repo, run `git worktree list
+/// --porcelain` (via `crate::worktree_cleanup::list_worktrees`)
+/// to find entries whose path matches the target. For each match,
+/// run `git worktree remove --force <path>` against the source
+/// repo's cwd. AGEND_GIT_BYPASS=1 is set on every git invocation
+/// to bypass the daemon shim per the operator-confirmed manual
+/// recovery command.
+fn prune_git_metadata_for_agent(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    source_repo_hint: Option<&Path>,
+) -> GcOutcome {
+    let target_path = home.join("worktrees").join(agent).join(branch);
+    let candidates: Vec<PathBuf> = match source_repo_hint {
+        Some(p) => vec![p.to_path_buf()],
+        None => discover_source_repo_candidates(home),
+    };
+
+    let mut outcome = GcOutcome::default();
+    let mut seen = std::collections::HashSet::new();
+    for repo in candidates {
+        // Dedupe candidates (sibling enumeration may report the
+        // same repo via multiple agents).
+        if !seen.insert(repo.clone()) {
+            continue;
+        }
+        if !repo.exists() {
+            continue;
+        }
+        let entries = list_worktrees_bypass_shim(&repo);
+        for entry in entries {
+            if !paths_match(&entry.path, &target_path) {
+                continue;
+            }
+            // Found a matching metadata entry — prune it.
+            let removed = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(["worktree", "remove", "--force", &entry.path])
+                .env("AGEND_GIT_BYPASS", "1")
+                .output();
+            let pruned = match removed {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    // Fallback: when the worktree dir is already
+                    // gone but `git worktree remove` errors (e.g.,
+                    // "not a worktree"), run `git worktree prune`
+                    // to clean stale metadata.
+                    tracing::warn!(
+                        agent = %agent,
+                        branch = %branch,
+                        repo = %repo.display(),
+                        stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                        "#826 L2: git worktree remove failed; falling back to prune"
+                    );
+                    let prune = std::process::Command::new("git")
+                        .current_dir(&repo)
+                        .args(["worktree", "prune"])
+                        .env("AGEND_GIT_BYPASS", "1")
+                        .output();
+                    matches!(prune, Ok(p) if p.status.success())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        agent = %agent,
+                        branch = %branch,
+                        repo = %repo.display(),
+                        error = %e,
+                        "#826 L2: git worktree remove spawn failed"
+                    );
+                    false
+                }
+            };
+            if pruned {
+                outcome.pruned_count += 1;
+                let repo_str = repo.display().to_string();
+                if !outcome.repos_touched.contains(&repo_str) {
+                    outcome.repos_touched.push(repo_str);
+                }
+                tracing::info!(
+                    agent = %agent,
+                    branch = %branch,
+                    repo = %repo.display(),
+                    path = %entry.path,
+                    "#826 L2: pruned stale .git/worktrees/ metadata"
+                );
+            }
+        }
+    }
+    outcome
+}
+
+/// #826 L2 fork of `crate::worktree_cleanup::list_worktrees`. The
+/// shared helper omits `AGEND_GIT_BYPASS=1`, which means the daemon
+/// `agend-git` shim may intercept the call when an instance binding
+/// is active in the calling context — list_worktrees would then
+/// return Vec::new() instead of the real entries. Daemon-internal
+/// L2 GC always wants the raw `git worktree list --porcelain` output
+/// from the source repo, so we run it with the shim bypass set
+/// (mirrors the `release_full` precedent at src/worktree_pool.rs:311).
+fn list_worktrees_bypass_shim(repo_root: &Path) -> Vec<crate::worktree_cleanup::WorktreeEntry> {
+    let output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_root)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    let mut current_path = None;
+    let mut current_branch = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current_path = Some(p.to_string());
+        } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(b.to_string());
+        } else if line.is_empty() {
+            if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take()) {
+                if branch != "main" && branch != "master" {
+                    entries.push(crate::worktree_cleanup::WorktreeEntry { path, branch });
+                }
+            }
+            current_path = None;
+            current_branch = None;
+        }
+    }
+    entries
+}
+
+/// #826 L2: best-effort source-repo enumeration when the operator
+/// didn't supply a `source_repo` arg. Two sources, deduped by caller:
+/// 1. Sibling daemon-managed worktrees' `.git` pointer files
+///    (`gitdir: <source>/.git/worktrees/<name>`).
+/// 2. `crate::teams::list_all` team `source_repo` fields.
+fn discover_source_repo_candidates(home: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // Source 1: walk sibling daemon worktrees' .git pointers.
+    let worktrees_root = home.join("worktrees");
+    if let Ok(agents) = std::fs::read_dir(&worktrees_root) {
+        for agent_entry in agents.flatten() {
+            let agent_dir = agent_entry.path();
+            if !agent_dir.is_dir() {
+                continue;
+            }
+            collect_source_repos_from_worktree_tree(&agent_dir, &mut out);
+        }
+    }
+    // Source 2: team-level source_repo from fleet.yaml.
+    for team in crate::teams::list_all(home) {
+        if let Some(repo) = team.source_repo {
+            out.push(repo);
+        }
+    }
+    out
+}
+
+/// Recursively walk a daemon-managed worktree subtree looking for
+/// `.git` pointer files. For each found, parse the
+/// `gitdir: <source>/.git/worktrees/<name>` line and derive the
+/// source repo (strip `.git/worktrees/<name>` suffix).
+fn collect_source_repos_from_worktree_tree(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_source_repos_from_worktree_tree(&p, out);
+            continue;
+        }
+        if p.file_name().and_then(|n| n.to_str()) != Some(".git") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Some(gitdir) = content
+            .lines()
+            .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
+        else {
+            continue;
+        };
+        // `gitdir` points at `<source>/.git/worktrees/<name>` — walk
+        // up two parents to reach `<source>`.
+        let path = PathBuf::from(gitdir);
+        if let Some(source) = path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            out.push(source.to_path_buf());
+        }
+    }
+}
+
+/// Compare a `git worktree list --porcelain` path string against the
+/// target daemon-managed worktree path. Both paths may reference a
+/// non-existent location (the working tree dir was removed by
+/// `remove_dir_all` before this call), so direct `canonicalize` may
+/// fail on either side. Strategy:
+///
+/// 1. Walk up each path until the parent EXISTS, canonicalize that
+///    parent, then re-append the missing remainder.
+/// 2. macOS-specific quirk: `/var/...` and `/private/var/...` resolve
+///    to the same fs node via the `/var → /private/var` symlink.
+///    `git worktree list --porcelain` always emits the
+///    `/private/var/...` form (canonicalized at `git worktree add`
+///    time), while our test fixture and runtime `home` paths arrive
+///    as `/var/...`. Equality after canonicalize-of-parent handles
+///    this when parents exist; when neither parent canonicalizes,
+///    fall back to the macOS prefix normalization.
+fn paths_match(entry_path: &str, target: &Path) -> bool {
+    let entry = PathBuf::from(entry_path);
+    let entry_norm = canonicalize_via_parent(&entry);
+    let target_norm = canonicalize_via_parent(target);
+    entry_norm == target_norm
+}
+
+/// Walk up `path` until a parent exists, canonicalize that parent,
+/// then re-append the missing remainder. Falls back to the input
+/// path on root-level failures.
+fn canonicalize_via_parent(path: &Path) -> PathBuf {
+    if let Ok(p) = path.canonicalize() {
+        return p;
+    }
+    // Collect trailing components that don't exist; walk up until
+    // an ancestor canonicalizes; re-attach.
+    let mut trail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cursor: &Path = path;
+    while let Some(parent) = cursor.parent() {
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        if let Some(name) = cursor.file_name() {
+            trail.push(name);
+        }
+        if let Ok(p) = parent.canonicalize() {
+            let mut rebuilt = p;
+            for segment in trail.iter().rev() {
+                rebuilt.push(segment);
+            }
+            return rebuilt;
+        }
+        cursor = parent;
+    }
+    path.to_path_buf()
 }
 
 /// Outcome of a rebase-clean operation.
