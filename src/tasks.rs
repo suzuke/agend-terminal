@@ -2842,4 +2842,179 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #806 list default filter (Part A) — RED test + scaffolding ──
+
+    #[test]
+    fn test_list_default_returns_only_actionable_statuses() {
+        // #806 RED test 1: pre-fix `task action=list` with no filter
+        // returns every status including `done` / `cancelled`,
+        // producing the 504KB / 3847-line dump the issue documents.
+        // Post-fix: default trim → {open,claimed,in_progress,blocked}.
+        // A `filtered_default` flag on the response signals callers
+        // that the trim fired so audit/forensic consumers can re-call
+        // with `include_history=true` if needed.
+        let home = tmp_home("list_default_actionable");
+        write_fleet_yaml(&home, &["agent-a"]);
+        let create_with_status = |title: &str, target_status: &str| {
+            let r = handle(
+                &home,
+                "agent-a",
+                &serde_json::json!({"action": "create", "title": title, "assignee": "agent-a"}),
+            );
+            let id = r["id"].as_str().expect("id").to_string();
+            if target_status != "open" {
+                let r = handle(
+                    &home,
+                    "agent-a",
+                    &serde_json::json!({"action": "update", "id": id, "status": target_status}),
+                );
+                assert_eq!(r["status"], "updated", "seed transition failed: {r}");
+            }
+            id
+        };
+        let open_id = create_with_status("open task", "open");
+        let in_progress_id = create_with_status("active task", "in_progress");
+        let cancelled_id = create_with_status("stale cancel", "cancelled");
+        let done_id = create_with_status("stale done", "done");
+
+        // include_history=true must surface everything (existing audit
+        // consumers opt in this way).
+        let r_history = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "list", "include_history": true}),
+        );
+        let history_ids: std::collections::HashSet<_> = r_history["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .filter_map(|t| t["id"].as_str().map(String::from))
+            .collect();
+        for id in [&open_id, &in_progress_id, &cancelled_id, &done_id] {
+            assert!(
+                history_ids.contains(id),
+                "include_history=true must surface {id}, got {history_ids:?}"
+            );
+        }
+        assert_eq!(
+            r_history["filtered_default"], false,
+            "include_history=true must report filtered_default=false"
+        );
+
+        // Default (no filter) — only actionable statuses.
+        let r = handle(&home, "agent-a", &serde_json::json!({"action": "list"}));
+        let tasks = r["tasks"].as_array().expect("tasks");
+        let ids: std::collections::HashSet<_> = tasks
+            .iter()
+            .filter_map(|t| t["id"].as_str().map(String::from))
+            .collect();
+        assert!(
+            ids.contains(&open_id),
+            "open task must surface in default list, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&in_progress_id),
+            "in_progress task must surface in default list, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&cancelled_id),
+            "cancelled task must NOT surface in default list, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&done_id),
+            "done task must NOT surface in default list, got {ids:?}"
+        );
+        assert_eq!(
+            r["filtered_default"], true,
+            "default list must report filtered_default=true"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_list_explicit_filter_status_overrides_default() {
+        // GREEN 1b: an explicit `filter_status=cancelled` must still
+        // return cancelled entries; the default trim only fires when
+        // neither filter_status nor include_history is supplied.
+        let home = tmp_home("list_explicit_filter");
+        write_fleet_yaml(&home, &["a"]);
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "to-cancel", "assignee": "a"}),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "update", "id": id, "status": "cancelled"}),
+        );
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "list", "filter_status": "cancelled"}),
+        );
+        let tasks = r["tasks"].as_array().expect("tasks");
+        assert!(
+            tasks.iter().any(|t| t["id"] == id),
+            "explicit filter_status=cancelled must surface cancelled task: {tasks:?}"
+        );
+        assert!(
+            tasks.iter().all(|t| t["status"] == "cancelled"),
+            "filter_status=cancelled must restrict to cancelled only"
+        );
+        assert_eq!(
+            r["filtered_default"], false,
+            "explicit filter_status must report filtered_default=false"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_list_limit_truncates_newest_first() {
+        // GREEN 1c: `limit=N` caps response newest-first by updated_at
+        // for caller-visible pagination without cursors.
+        let home = tmp_home("list_limit");
+        write_fleet_yaml(&home, &["a"]);
+        let mut ids = Vec::new();
+        for title in ["oldest", "middle", "newest"] {
+            let r = handle(
+                &home,
+                "a",
+                &serde_json::json!({"action": "create", "title": title, "assignee": "a"}),
+            );
+            ids.push(r["id"].as_str().expect("id").to_string());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "list", "limit": 2}),
+        );
+        let tasks = r["tasks"].as_array().expect("tasks");
+        assert_eq!(
+            tasks.len(),
+            2,
+            "limit=2 must cap response, got {}",
+            tasks.len()
+        );
+        let returned: std::collections::HashSet<_> = tasks
+            .iter()
+            .filter_map(|t| t["id"].as_str().map(String::from))
+            .collect();
+        assert!(
+            returned.contains(&ids[2]),
+            "newest task (idx 2) must be in newest-first cap"
+        );
+        assert!(
+            returned.contains(&ids[1]),
+            "second-newest (idx 1) must be in newest-first cap"
+        );
+        assert!(
+            !returned.contains(&ids[0]),
+            "oldest task (idx 0) must NOT be in newest-first cap"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
