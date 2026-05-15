@@ -641,7 +641,22 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 eta_secs: args["eta_secs"].as_i64(),
             };
             match crate::task_events::append(home, &emitter, event) {
-                Ok(_) => serde_json::json!({"id": id, "status": "created"}),
+                Ok(_) => {
+                    // #807 Item 1: response shape consistency. `event`
+                    // names the action verb; `task` carries the full
+                    // Task object so callers can read lifecycle status
+                    // (`task.status == "open"` after create, NOT the
+                    // event name "created"). Legacy `status` field
+                    // kept as back-compat alias.
+                    let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+                    serde_json::json!({
+                        "id": id,
+                        "event": "created",
+                        "task": task,
+                        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                        "status": "created",
+                    })
+                }
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
         }
@@ -730,7 +745,20 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {
-                    serde_json::json!({"id": id, "status": "claimed", "assignee": instance_name})
+                    // #807 Item 1: see create arm note. claim's
+                    // legacy `status` happens to match lifecycle
+                    // ("claimed"), but the field is still the action
+                    // event name semantically — kept as alias for
+                    // shape consistency.
+                    let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+                    serde_json::json!({
+                        "id": id,
+                        "event": "claimed",
+                        "task": task,
+                        "assignee": instance_name,
+                        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                        "status": "claimed",
+                    })
                 }
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
@@ -833,7 +861,15 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         let _ =
                             crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
                     }
-                    serde_json::json!({"id": id, "status": "done"})
+                    // #807 Item 1: see create arm note.
+                    let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+                    serde_json::json!({
+                        "id": id,
+                        "event": "done",
+                        "task": task,
+                        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                        "status": "done",
+                    })
                 }
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
@@ -1047,7 +1083,15 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     });
                 }
             }
-            serde_json::json!({"id": id, "status": "updated"})
+            // #807 Item 1: see create arm note.
+            let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+            serde_json::json!({
+                "id": id,
+                "event": "updated",
+                "task": task,
+                // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                "status": "updated",
+            })
         }
         "sweep" => {
             // #806 manual board-hygiene sweep — distinct from the
