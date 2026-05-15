@@ -151,16 +151,126 @@ fn extract_fn_names(s: &str) -> Vec<String> {
     names
 }
 
-/// #812 stub — real implementation lands in C2. Pre-fix this returns
-/// an empty Vec so the C1 RED tests fail at runtime (asserting
-/// non-empty output) rather than failing to compile. The C2 commit
-/// replaces this body with the real `cargo test` invocation extractor
-/// that walks code-fence-aware text and pulls trailing `::test_name`
-/// segments. `dead_code` allow lifts at C3 when comms.rs wires the
-/// validator gate.
+/// Cargo-test flags that consume the next positional token as their
+/// value (so the extractor must skip the following token rather than
+/// treat it as a test path). Hard-coded to the common subset because
+/// `cargo test --help` is a moving target across rustc versions and
+/// the dispatcher only sees these in practice. Dead-code allow lifts
+/// at C3 when comms.rs wires the validator.
 #[allow(dead_code)]
-pub fn extract_test_invocations(_s: &str) -> Vec<String> {
-    Vec::new()
+const CARGO_TEST_FLAGS_WITH_VALUE: &[&str] = &[
+    "--bin",
+    "--bins",
+    "--test",
+    "--example",
+    "--package",
+    "-p",
+    "--features",
+    "--manifest-path",
+    "--target",
+    "--profile",
+    "--config",
+    "-Z",
+];
+
+/// #812: extract `cargo test ...` test-name invocations out of free
+/// text (dispatch task bodies). Captures the trailing `::test_name`
+/// segment of each positional path argument. Skips:
+/// - flag tokens (start with `-`)
+/// - values of value-taking flags (per `CARGO_TEST_FLAGS_WITH_VALUE`)
+/// - markdown code-fenced regions (illustrative examples, not actual
+///   invocations the reviewer is supposed to run)
+/// - everything after `--` (those are runner args, not test paths)
+///
+/// Returns deduplicated bare test fn names (sorted for determinism).
+/// Mirrors the §4.3 `extract_fn_names` precedent — same predicate
+/// family ("names mentioned in claim text must exist in the repo"),
+/// different surface (test-invocation grammar vs `fn name(` grammar).
+/// Dead-code allow lifts at C3 when comms.rs wires the validator.
+#[allow(dead_code)]
+pub fn extract_test_invocations(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let Some(after_cargo_test) = find_cargo_test_payload(line) else {
+            continue;
+        };
+        // Trim everything after `--` — those are runtime args, not
+        // test paths (e.g. `-- --exact`, `-- --nocapture`).
+        let payload = after_cargo_test
+            .split(" -- ")
+            .next()
+            .unwrap_or(after_cargo_test);
+        let tokens: Vec<&str> = payload.split_whitespace().collect();
+        let mut skip_next = false;
+        for token in tokens {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if token.starts_with('-') {
+                // `--features=tray` form: value attached, no skip
+                if !token.contains('=') && CARGO_TEST_FLAGS_WITH_VALUE.contains(&token) {
+                    skip_next = true;
+                }
+                continue;
+            }
+            // Positional — should be a test path. Extract the last
+            // `::`-segment as the bare fn name.
+            let bare = token.rsplit("::").next().unwrap_or(token);
+            if is_valid_test_ident(bare) {
+                names.push(bare.to_string());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Returns the substring AFTER the first `cargo test ` occurrence on
+/// a line, or `None` if the line doesn't invoke cargo test. Tolerates
+/// leading shell prefixes (`$ cargo test`, `> cargo test`, `Run:
+/// cargo test`). Dead-code allow lifts at C3 when comms.rs wires the
+/// validator.
+#[allow(dead_code)]
+fn find_cargo_test_payload(line: &str) -> Option<&str> {
+    let idx = line.find("cargo test")?;
+    let after = &line[idx + "cargo test".len()..];
+    // Must be followed by whitespace OR end of line to count as a
+    // real invocation (avoid matching `cargo testing` etc.).
+    let next_char = after.chars().next();
+    if matches!(next_char, Some(c) if c.is_whitespace()) || next_char.is_none() {
+        Some(after.trim_start())
+    } else {
+        None
+    }
+}
+
+/// A token qualifies as a test-fn ident when it starts with a letter
+/// or underscore and only contains alphanumeric / underscore characters.
+/// Filters out things like `0.6.1` (version numbers) and `--features`
+/// fragments that the flag-value skip might miss. Dead-code allow
+/// lifts at C3 when comms.rs wires the validator.
+#[allow(dead_code)]
+fn is_valid_test_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// #812 stub — real implementation lands in C3. Pre-fix returns Ok
@@ -542,14 +652,21 @@ fn check_fn_exists(repo_dir: &Path, fn_names: &[String]) -> ClaimResult {
     }
 }
 
-/// Walk all .rs files under repo_dir/src/ and extract fn names via syn AST.
+/// Walk all .rs files under repo_dir/{src,tests}/ and extract fn names
+/// via syn AST. #812: extended to walk `tests/` so integration-test
+/// names are discoverable by the dispatch-time validator (the
+/// reviewer's `cargo test --test ...` invocations target this dir).
 fn collect_fn_names_from_repo(repo_dir: &Path) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    let src_dir = repo_dir.join("src");
-    if !src_dir.exists() {
-        return names;
+    for sub in ["src", "tests"] {
+        let scan_dir = repo_dir.join(sub);
+        if scan_dir.exists() {
+            walk_dir_collecting_fn_names(&scan_dir, &mut names);
+        }
     }
-    fn walk_dir(dir: &Path, names: &mut std::collections::HashSet<String>) {
+    return names;
+
+    fn walk_dir_collecting_fn_names(dir: &Path, names: &mut std::collections::HashSet<String>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -557,7 +674,7 @@ fn collect_fn_names_from_repo(repo_dir: &Path) -> std::collections::HashSet<Stri
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                walk_dir(&path, names);
+                walk_dir_collecting_fn_names(&path, names);
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(file) = syn::parse_file(&content) {
@@ -567,8 +684,6 @@ fn collect_fn_names_from_repo(repo_dir: &Path) -> std::collections::HashSet<Stri
             }
         }
     }
-    walk_dir(&src_dir, &mut names);
-    names
 }
 
 /// Extract fn names from a parsed syn File.
