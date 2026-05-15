@@ -874,6 +874,31 @@ fn write_to_focused(home: &Path, layout: &mut Layout, registry: &AgentRegistry, 
     }
 }
 
+/// #783: write bytes to a SPECIFIC pane by id, bypassing focus. Used by
+/// the mouse-forward path so the SGR report reaches the pane under the
+/// cursor (e.g. opencode in a non-focused split) instead of the focused
+/// pane. Shares the same submit-detection bookkeeping as
+/// `write_to_focused` since the byte stream eventually lands at the
+/// same `Pane::write_input` sink.
+fn write_to_pane(
+    home: &Path,
+    layout: &mut Layout,
+    registry: &AgentRegistry,
+    pane_id: usize,
+    bytes: &[u8],
+) {
+    if let Some(pane) = layout
+        .active_tab_mut()
+        .and_then(|t| t.root_mut().find_pane_mut(pane_id))
+    {
+        notification_queue::record_input_activity(home, &pane.agent_name);
+        if pane_input_contains_submit(pane.backend.as_ref(), bytes) {
+            notification_queue::record_submit_activity(home, &pane.agent_name);
+        }
+        pane.write_input(registry, bytes);
+    }
+}
+
 /// Sprint 54 P2-3: backend-aware submit detection. Returns true iff
 /// the backend is on the submit-detection allowlist AND the keystroke
 /// buffer contains its submit key. Hard-coded claude-only first round

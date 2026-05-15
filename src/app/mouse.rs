@@ -54,12 +54,14 @@ pub(super) fn handle(
     // held, forward the event as SGR mouse report to the PTY instead of local
     // handling. The routing decision lives in `pane_for_mouse_forward` so it
     // can be unit-tested without the PTY write side-effect.
-    // §3.10 RED: `pane_id` is destructured for the C2 GREEN refactor where
-    // it routes writes to the cursor-target pane. Until then, the write
-    // still goes through `write_to_focused`.
-    if let Some((_pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
+    // #783: route the SGR write to the cursor-target pane (which is not
+    // necessarily the focused pane). `pane_for_mouse_forward` returns the
+    // pane id under the cursor that wants mouse + SGR; we then call
+    // `write_to_pane` (sibling of `write_to_focused`) to deliver bytes to
+    // that specific pane's PTY.
+    if let Some((pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
         if let Some(encoded) = crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y) {
-            super::write_to_focused(&crate::home_dir(), layout, registry, &encoded);
+            super::write_to_pane(&crate::home_dir(), layout, registry, pane_id, &encoded);
             return out;
         }
     }
@@ -478,9 +480,10 @@ fn pane_for_mouse_forward(layout: &Layout, mouse: &MouseEvent) -> Option<(usize,
         return None;
     }
     let tab = layout.active_tab()?;
-    // §3.10 RED: still focus-only. §3.10 GREEN replaces with
-    // `tab.pane_at(mouse.column, mouse.row)`.
-    let pane_id = tab.focus_id;
+    // #783: look up the pane UNDER THE CURSOR, not the focused one.
+    // Pre-fix used `tab.focus_id`, which broke multi-pane scenarios where
+    // the wants_mouse pane (opencode) was not focused.
+    let pane_id = tab.pane_at(mouse.column, mouse.row)?;
     let pane = tab.root().find_pane(pane_id)?;
     if !pane.vterm.wants_mouse() || !pane.vterm.mouse_sgr() {
         return None;
