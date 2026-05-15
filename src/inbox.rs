@@ -483,6 +483,17 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                     continue;
                 }
                 msg.read_at = Some(now.clone());
+                // #836: signal post-consume so the notification-dedup
+                // ledger can suppress redundant re-inject attempts
+                // from the rate-limit retry path. The ledger only has
+                // a record when notify_agent earlier called
+                // `record_inject(agent, msg_id)`; for messages whose
+                // delivery never went through the PTY-inject path
+                // (inbox-only or pre-#836 flight), `mark_consumed` is
+                // a no-op.
+                if let Some(ref id) = msg.id {
+                    crate::daemon::notification_dedup::global().mark_consumed(name, id);
+                }
                 unread.push(msg.clone());
             }
             all_messages.push(msg);
@@ -1064,6 +1075,18 @@ pub fn notify_agent_with_attachments(
     let notification =
         format_notification_for_inject(pointer_only_inject(), source, text, attachments);
     compose_aware_inject(home, agent_name, &notification);
+    // #836: record the (agent, msg_id) tuple in the dedup ledger so a
+    // subsequent post-consume retry tick can suppress redundant
+    // re-inject attempts. We parse the msg_id back out of the
+    // formatted header (single source of truth — `format_header`
+    // already includes `id=<msg_id>` when set). Headers without an
+    // id field (event-style notifications, free-form acks) skip the
+    // record cleanly per the parser's `Option<String>` contract.
+    if let Some(msg_id) =
+        crate::daemon::notification_dedup::extract_msg_id_from_header(&notification)
+    {
+        crate::daemon::notification_dedup::global().record_inject(agent_name, &msg_id);
+    }
     // Store raw body AFTER inject — overwrites any formatted text the inject
     // handler may have stored. Ensures retry re-injects raw body, not header.
     crate::daemon::heartbeat_pair::update_with(agent_name, |p| {
