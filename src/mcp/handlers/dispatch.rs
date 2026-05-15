@@ -373,6 +373,9 @@ fn dispatch_repo(ctx: &HandlerCtx<'_>) -> Value {
         "cleanup_init_commits" => {
             ci::handle_cleanup_init_commits(ctx.home, ctx.args, ctx.instance_name)
         }
+        "cleanup_merged_branches" => {
+            ci::handle_cleanup_merged_branches(ctx.home, ctx.args, ctx.instance_name)
+        }
         other => json!({"error": format!("unknown repo action: {other}")}),
     }
 }
@@ -389,10 +392,18 @@ fn dispatch_repo_cleanup_init_commits(ctx: &HandlerCtx<'_>) -> Value {
     ci::handle_cleanup_init_commits(ctx.home, ctx.args, ctx.instance_name)
 }
 
+fn dispatch_repo_cleanup_merged_branches(ctx: &HandlerCtx<'_>) -> Value {
+    ci::handle_cleanup_merged_branches(ctx.home, ctx.args, ctx.instance_name)
+}
+
 static REPO_ACTIONS: &[(&str, HandlerFn)] = &[
     ("checkout", dispatch_repo_checkout),
     ("release", dispatch_repo_release),
     ("cleanup_init_commits", dispatch_repo_cleanup_init_commits),
+    (
+        "cleanup_merged_branches",
+        dispatch_repo_cleanup_merged_branches,
+    ),
 ];
 
 // `schedule` — actions: create / list / update / delete.
@@ -857,7 +868,15 @@ mod tests {
             ("decision", &["post", "list", "update"]),
             ("deployment", &["deploy", "teardown", "list"]),
             ("health", &["report", "clear"]),
-            ("repo", &["checkout", "release", "cleanup_init_commits"]),
+            (
+                "repo",
+                &[
+                    "checkout",
+                    "release",
+                    "cleanup_init_commits",
+                    "cleanup_merged_branches",
+                ],
+            ),
             ("schedule", &["create", "list", "update", "delete"]),
             ("team", &["create", "delete", "list", "update"]),
         ];

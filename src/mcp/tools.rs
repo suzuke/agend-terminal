@@ -246,13 +246,18 @@ fn health_tools() -> Vec<Value> {
 
 fn repo_tools() -> Vec<Value> {
     vec![
-        json!({"name": "repo", "description": "Manage repo worktrees. Actions: checkout, release, cleanup_init_commits.",
+        json!({"name": "repo", "description": "Manage repo worktrees. Actions: checkout, release, cleanup_init_commits, cleanup_merged_branches. #817: cleanup_merged_branches is operator-triggered local-branch hygiene (4 categories: clean_merged/squash_merged/stale_idle/active_unknown; dry-run by default + confirm_ids + audit_reason required for apply).",
             "inputSchema": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["checkout", "release", "cleanup_init_commits"]},
+                "action": {"type": "string", "enum": ["checkout", "release", "cleanup_init_commits", "cleanup_merged_branches"]},
                 "source": {"type": "string"}, "branch": {"type": "string"},
                 "path": {"type": "string"},
                 "agent": {"type": "string", "description": "#789: target agent for cleanup_init_commits (defaults to caller's instance_name). Cleans empty `init` commits accumulated in the agent's bound worktree by backend session-checkpoint heartbeats. Returns {cleaned_count, [skipped_reason]}. Idempotent — call before push to scrub PR history."},
-                "bind": {"type": "boolean", "description": "#778 Option 1: when true on checkout, atomically bind the caller to the just-provisioned worktree (writes binding.json + .agend-managed marker + arms ci_watches) and lands HEAD on the named branch instead of a detached commit. Default false preserves back-compat for inspection-only callers (review pool, operator triage)."}
+                "bind": {"type": "boolean", "description": "#778 Option 1: when true on checkout, atomically bind the caller to the just-provisioned worktree (writes binding.json + .agend-managed marker + arms ci_watches) and lands HEAD on the named branch instead of a detached commit. Default false preserves back-compat for inspection-only callers (review pool, operator triage)."},
+                "base": {"type": "string", "description": "#817 cleanup_merged_branches: branch to compare against for clean/squash merge detection (default 'main')."},
+                "min_age_days": {"type": "integer", "description": "#817 cleanup_merged_branches: stale_idle threshold in days (default 90)."},
+                "apply": {"type": "boolean", "description": "#817 cleanup_merged_branches: when false (default), returns dry-run plan; when true, deletes confirm_ids subset."},
+                "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#817 cleanup_merged_branches apply=true: subset of candidate_ids from prior dry-run to actually delete via `git branch -D`."},
+                "audit_reason": {"type": "string", "description": "#817 cleanup_merged_branches apply=true: required audit text recorded in event-log.jsonl per deleted branch with source SHA for restore."}
             }, "required": ["action"]}}),
     ]
 }

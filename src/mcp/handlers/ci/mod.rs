@@ -796,6 +796,122 @@ fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch:
     provider
 }
 
+/// #817: handle `repo action=cleanup_merged_branches`. Dry-run by
+/// default; apply requires explicit `apply=true` + `confirm_ids`
+/// subset + non-empty `audit_reason`. Mirrors #806 sweep's
+/// double-opt-in contract.
+///
+/// Args:
+/// - `agent` (optional, defaults to caller's `instance_name`) —
+///   used to resolve the operator's bound source_repo via
+///   `binding.json`.
+/// - `base` (optional, default "main") — branch to compare against
+///   for clean_merged / squash_merged detection.
+/// - `min_age_days` (optional, default 90) — stale_idle threshold.
+/// - `apply` (bool, default false) — when false, returns dry-run.
+/// - `confirm_ids` (array<string>) — required when apply=true.
+///   Subset of dry-run's all_ids.
+/// - `audit_reason` (string) — required when apply=true. Logged
+///   to event-log.jsonl per deleted branch.
+pub(crate) fn handle_cleanup_merged_branches(
+    home: &Path,
+    args: &Value,
+    instance_name: &str,
+) -> Value {
+    let agent = args["agent"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(instance_name);
+    let source_repo = match crate::binding::read(home, agent)
+        .and_then(|v| v["source_repo"].as_str().map(std::path::PathBuf::from))
+    {
+        Some(p) => p,
+        None => {
+            return json!({
+                "error": format!("no binding source_repo for agent '{agent}'"),
+                "code": "no_binding_source_repo",
+            });
+        }
+    };
+    let base = args["base"].as_str().unwrap_or("main");
+    let min_age_days = args["min_age_days"]
+        .as_i64()
+        .unwrap_or(crate::branch_sweep::STALE_IDLE_DEFAULT_DAYS);
+    let apply = args["apply"].as_bool().unwrap_or(false);
+    let now = chrono::Utc::now();
+    let categories = match crate::branch_sweep::scan(&source_repo, base, min_age_days, now) {
+        Ok(c) => c,
+        Err(e) => {
+            return json!({
+                "error": format!("branch sweep scan failed: {e}"),
+                "code": "scan_failed",
+            });
+        }
+    };
+    if !apply {
+        return json!({
+            "dry_run": true,
+            "categories": &categories,
+            "candidate_ids": categories.deletable_ids(),
+            "total_candidates": categories.total(),
+            "to_apply_hint": "repo action=cleanup_merged_branches apply=true confirm_ids=<subset> audit_reason=<...>",
+            "active_unknown_note": "active_unknown bucket is NOT in candidate_ids by default — include those names explicitly in confirm_ids if you really want to delete them",
+        });
+    }
+    let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if confirm_ids.is_empty() {
+        return json!({
+            "error": "apply=true requires non-empty 'confirm_ids' (subset of candidate_ids from prior dry-run)",
+            "code": "missing_confirm_ids",
+        });
+    }
+    let audit_reason = args["audit_reason"].as_str().unwrap_or("");
+    if audit_reason.is_empty() {
+        return json!({
+            "error": "apply=true requires non-empty 'audit_reason' for the event-log entry",
+            "code": "missing_audit_reason",
+        });
+    }
+    // Validate confirm_ids ⊆ all_ids (including active_unknown for
+    // explicit opt-in). Mismatch ⇒ reject loudly — operator must
+    // re-run dry-run to refresh the candidate list.
+    let candidate_set: std::collections::HashSet<String> =
+        categories.all_ids().into_iter().collect();
+    let unknown: Vec<String> = confirm_ids.difference(&candidate_set).cloned().collect();
+    if !unknown.is_empty() {
+        return json!({
+            "error": "confirm_ids contained entries not in current sweep candidates",
+            "unknown": unknown,
+            "hint": "re-run dry-run; candidates may have changed since last scan",
+            "code": "stale_confirm_ids",
+        });
+    }
+    match crate::branch_sweep::emit_delete_batch(
+        home,
+        &source_repo,
+        &categories,
+        &confirm_ids,
+        audit_reason,
+    ) {
+        Ok(count) => json!({
+            "applied": count,
+            "audit_reason": audit_reason,
+            "restore_hint": "see event-log.jsonl `branch_sweep_apply` entries for source SHAs (git branch <name> <sha>)",
+        }),
+        Err(e) => json!({
+            "error": format!("branch sweep apply failed: {e}"),
+            "code": "apply_failed",
+        }),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

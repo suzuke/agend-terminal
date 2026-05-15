@@ -494,6 +494,7 @@ fn read_task_record(home: &Path, id: &str) -> Option<crate::task_events::TaskRec
 const SYSTEM_IDENTITIES: &[&str] = &[
     "system:auto_close",
     "system:auto_orphan",
+    "system:branch_sweep",
     "system:overdue_sweep",
     "system:task_sweep",
 ];
