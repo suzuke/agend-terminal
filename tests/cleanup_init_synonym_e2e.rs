@@ -58,13 +58,43 @@ use std::path::Path;
 /// rather than silent drift). The hardcoded list is the contract.
 const HEARTBEAT_NAMES: &[&str] = &["init", "initial"];
 
+/// #833 mirror of production's trailer-whitelist (
+/// `src/mcp/handlers/dispatch_hook/mod.rs::KNOWN_TRAILER_KEYS`).
+/// Drift between the two surfaces would silently break the dogfood
+/// — explicit replication makes the contract visible.
+const KNOWN_TRAILER_KEYS: &[&str] = &[
+    "Agend-Agent",
+    "Agend-Task",
+    "Agend-Branch",
+    "Agend-Issued-At",
+];
+
 fn is_heartbeat_subject(msg: &str) -> bool {
     HEARTBEAT_NAMES.contains(&msg)
 }
 
+/// #833 mirror of production's `strip_known_trailers`. Pure replication
+/// to keep the integration smoke independent of crate-private fns.
+fn strip_known_trailers(body: &str) -> String {
+    body.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !KNOWN_TRAILER_KEYS
+                .iter()
+                .any(|k| trimmed.starts_with(k) && trimmed[k.len()..].starts_with(':'))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn commit_body_is_empty(worktree: &Path, hash: &str) -> bool {
     let out = git_isolated::git(worktree, &["log", "-1", "--format=%b", hash]);
-    out.status.success() && String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    if !out.status.success() {
+        return false;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    // #833: strip daemon-known trailers before the empty check.
+    strip_known_trailers(&body).trim().is_empty()
 }
 
 fn diff_is_empty(worktree: &Path, hash: &str) -> bool {
@@ -175,6 +205,36 @@ fn cleanup_init_synonym_e2e_classifies_via_helper() {
     assert_eq!(
         total, 6,
         "expected 6 commits on feature branch, got {total}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #833 integration smoke (dogfood #821 `git_isolated::git()`):
+/// reproduce the production heartbeat shape — `init` subject with
+/// ONLY daemon `Agend-*:` trailers in the body — and assert the
+/// classification picks it up post-strip.
+#[test]
+fn cleanup_init_synonym_e2e_drops_init_with_trailer_only_body() {
+    let repo = setup_repo_with_main_ref("833_e2e_trailer");
+    let trailer_block = "Agend-Agent: dev833\n\
+                         Agend-Task: t-20260515150751256952-0\n\
+                         Agend-Branch: fix/833-cleanup-init-trailer-whitelist\n\
+                         Agend-Issued-At: 2026-05-15T18:24:45+00:00";
+    empty_commit(&repo, "init", Some(trailer_block)); // → drop post-strip
+    empty_commit(&repo, "init", Some("operator real notes")); // → keep (real body)
+    empty_commit(
+        &repo,
+        "init",
+        Some("Agend-Custom: future-trailer-not-yet-in-whitelist"),
+    ); // → keep (unknown trailer key)
+
+    let droppable = collect_droppable_hashes(&repo);
+    assert_eq!(
+        droppable.len(),
+        1,
+        "exactly 1 commit should be dropped — the trailer-only `init`. \
+         Real-body and unknown-trailer commits must be kept. droppable={droppable:?}"
     );
 
     std::fs::remove_dir_all(&repo).ok();

@@ -1711,6 +1711,78 @@ fn clean_empty_init_commits_still_handles_canonical_init_empty() {
 
 // ── #833 cleanup_init_commits trailer-whitelist body gate ──
 
+/// #833 C3 regression-proof: the strip respects the
+/// trailer-key-followed-by-colon contract. `Agend-Agent-Token: x`
+/// must NOT be stripped (it's an operator-extended trailer key,
+/// not the daemon's `Agend-Agent`). Locks the partial-prefix
+/// guard against future scanner refactors.
+#[test]
+fn strip_known_trailers_does_not_match_partial_prefix_keys() {
+    let body = "Agend-Agent-Token: secret\n\
+                Agent-Agent-Plus: other\n\
+                Real operator note line";
+    let stripped = super::strip_known_trailers(body);
+    // None of the lines look like `Agend-Agent:` (with colon directly
+    // after the key) — all must survive.
+    assert_eq!(
+        stripped, body,
+        "partial-prefix trailers must not be stripped, got: {stripped:?}"
+    );
+}
+
+/// #833 C3 regression-proof: a heartbeat-style commit whose body
+/// has DAEMON TRAILERS + REAL OPERATOR NOTES must be KEPT. The
+/// strip removes only the whitelist lines; the surviving operator
+/// content keeps the gate's "is empty" check from returning true.
+/// This is the load-bearing safety case — operator-added content
+/// stays intact even when daemon trailers are mixed in.
+#[test]
+fn clean_empty_init_commits_keeps_init_with_real_body_after_trailers() {
+    let (_repo, worktree) = setup_repo_and_worktree("833_mixed_body");
+    let mixed = "Operator commit notes here.\n\
+                 More context paragraphs.\n\
+                 \n\
+                 Agend-Agent: dev833\n\
+                 Agend-Task: t-...";
+    empty_commit(&worktree, "init", Some(mixed));
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(result.is_ok(), "helper must succeed, got: {result:?}");
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "`init` with real operator body must be KEPT even when daemon \
+         trailers are present — strip removes only the trailer block",
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+/// #833 C3 regression-proof: unknown daemon-style trailer keys
+/// (e.g., a future `Agend-Sprint:` that hasn't been added to
+/// `KNOWN_TRAILER_KEYS` yet) must NOT be stripped. Conservative
+/// default — extending the whitelist requires an explicit code
+/// change (and ideally the synced-with-hook invariant that
+/// lead's post-batch backlog tracks).
+#[test]
+fn clean_empty_init_commits_keeps_init_with_unknown_trailer_keys() {
+    let (_repo, worktree) = setup_repo_and_worktree("833_unknown_trailer");
+    // `Agend-Custom` is NOT in KNOWN_TRAILER_KEYS — must survive strip.
+    let unknown = "Agend-Custom: something operator added";
+    empty_commit(&worktree, "init", Some(unknown));
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(result.is_ok(), "helper must succeed, got: {result:?}");
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "`init` with non-whitelisted trailer key must be KEPT — conservative default \
+         until KNOWN_TRAILER_KEYS is explicitly extended",
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
 /// #833 C1 RED: a heartbeat-style commit with ONLY daemon-injected
 /// `Agend-*:` trailers in its body (the actual production state every
 /// bound-worktree commit lands in post-hook) must be DROPPED by
