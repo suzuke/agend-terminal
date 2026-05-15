@@ -151,6 +151,27 @@ fn extract_fn_names(s: &str) -> Vec<String> {
     names
 }
 
+/// #812 stub — real implementation lands in C2. Pre-fix this returns
+/// an empty Vec so the C1 RED tests fail at runtime (asserting
+/// non-empty output) rather than failing to compile. The C2 commit
+/// replaces this body with the real `cargo test` invocation extractor
+/// that walks code-fence-aware text and pulls trailing `::test_name`
+/// segments. `dead_code` allow lifts at C3 when comms.rs wires the
+/// validator gate.
+#[allow(dead_code)]
+pub fn extract_test_invocations(_s: &str) -> Vec<String> {
+    Vec::new()
+}
+
+/// #812 stub — real implementation lands in C3. Pre-fix returns Ok
+/// so the C1 RED test (which asserts Err) fails at runtime. The C3
+/// commit wires this into `comms.rs::handle_delegate_task` as the
+/// dispatch-time validation gate.
+#[allow(dead_code)]
+pub fn validate_dispatch_test_names(_body: &str, _tree_dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Verifier — run mechanical checks against git diff
 // ---------------------------------------------------------------------------
@@ -1181,6 +1202,131 @@ mod tests {
         assert!(!r.ok, "one missing fn should reject: {:?}", r.results);
         assert!(r.results[0].detail.contains("missing_fn"));
         assert!(!r.results[0].detail.contains("exists_fn"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #812 dispatch test-name validation — RED tests ──
+
+    #[test]
+    fn test_extract_test_invocations_picks_up_module_path() {
+        // RED: pre-C2 stub returns Vec::new(); post-C2 captures the
+        // trailing `::test_name` segment from a `cargo test ... <path>`
+        // invocation. Module-path forms are the dominant dispatch
+        // shape ("tasks::tests::test_force_update").
+        let body =
+            "Run: cargo test --bin agend-terminal tasks::tests::test_force_update_with_reason";
+        let names = extract_test_invocations(body);
+        assert_eq!(
+            names,
+            vec!["test_force_update_with_reason".to_string()],
+            "extractor must capture trailing :: segment, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_test_invocations_handles_multiple_lines() {
+        // RED: dispatch task bodies often run multiple cargo-test
+        // invocations across separate lines. Extractor must
+        // de-dup AND preserve all distinct names.
+        let body = "\
+            First run cargo test --bin agend-terminal tasks::tests::test_alpha
+            Then run cargo test --bin agend-terminal worktree_pool::tests::test_beta
+            Optionally cargo test --bin agend-terminal tasks::tests::test_alpha
+        ";
+        let mut names = extract_test_invocations(body);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["test_alpha".to_string(), "test_beta".to_string()],
+            "extractor must deduplicate and capture multi-line invocations, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_test_invocations_skips_non_cargo_test_text() {
+        // RED + false-positive guard: a body that mentions test names
+        // in prose but never invokes `cargo test` must NOT trigger
+        // extraction (otherwise spike-report quotes would pollute).
+        let body = "\
+            The reviewer should run tests, but I haven't written the
+            cargo invocation yet. See module tasks::tests for the
+            existing patterns (e.g. test_already_exists).
+        ";
+        let names = extract_test_invocations(body);
+        assert!(
+            names.is_empty(),
+            "prose without `cargo test ...` invocation must surface zero names, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_test_invocations_ignores_flags_and_features() {
+        // RED: real dispatch commonly carries `--features tray`,
+        // `--bin agend-terminal`, `--no-fail-fast`, etc. before the
+        // test name. Extractor must skip flag tokens and capture
+        // only the positional test path.
+        let body = "cargo test --features tray --bin agend-terminal --no-fail-fast tasks::tests::test_force_update_with_reason";
+        let names = extract_test_invocations(body);
+        assert_eq!(
+            names,
+            vec!["test_force_update_with_reason".to_string()],
+            "extractor must skip --flag tokens, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_test_invocations_respects_code_fences() {
+        // RED + false-positive guard: dispatch task bodies frequently
+        // include ```bash code blocks with `cargo test ...` examples.
+        // Markdown code fences carry illustrative text, NOT a literal
+        // dispatch invocation — extractor must skip fenced content
+        // so quoted examples don't trigger spurious rejection.
+        let body = "\
+            See the dispatch example below:
+            ```bash
+            cargo test --bin agend-terminal tasks::tests::test_quoted_example
+            ```
+            Actual invocation: cargo test --bin agend-terminal tasks::tests::test_real
+        ";
+        let names = extract_test_invocations(body);
+        assert_eq!(
+            names,
+            vec!["test_real".to_string()],
+            "extractor must skip code-fenced examples, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_validator_rejects_missing_test_name() {
+        // RED: pre-C3 there is no validator hook in handle_delegate_task,
+        // so a dispatch carrying a hallucinated test name reaches the
+        // recipient with no rejection. Post-C3 the validator runs
+        // dispatch-time, catches the missing name against the PR
+        // tree, and returns an error JSON with code=test_name_not_found.
+        //
+        // This test invokes the validator helper directly (not the
+        // full MCP send path) — the integration test in C3 covers
+        // the end-to-end. Helper signature (post-C3): pub fn
+        // validate_dispatch_test_names(body, tree_dir) -> Result<(), String>.
+        let dir = setup_git_repo("dispatch_validator_red");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[cfg(test)] mod tests { #[test] fn test_real_one() {} }",
+        )
+        .unwrap();
+        let body = "Run: cargo test --bin x tests::test_hallucinated_name";
+        let result = validate_dispatch_test_names(body, &dir);
+        let err = result.expect_err("missing test name must reject");
+        assert!(
+            err.contains("test_hallucinated_name"),
+            "error must name the missing test, got: {err}"
+        );
+        assert!(
+            err.contains("test_name_not_found"),
+            "error must carry the test_name_not_found code, got: {err}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
