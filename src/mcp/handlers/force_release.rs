@@ -628,6 +628,193 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    /// #826 C3: explicit assertion that the response carries the
+    /// L2 audit fields even on the no-op case (idempotent calls).
+    /// Locks the response-shape contract so a future refactor can't
+    /// silently drop the new fields.
+    #[test]
+    fn force_release_worktree_git_metadata_pruned_count_in_response() {
+        // No fixture seeding — empty home with no source repos.
+        // L2 enumeration returns no candidates → pruned_count: 0,
+        // repos_touched: []. The response shape still includes the
+        // fields (audit contract).
+        let home = tmp_home("826_c3_response_shape");
+        let result = handle_force_release_worktree(
+            &home,
+            &json!({"agent": "dev826c3", "branch": "feat/826"}),
+            &None,
+        );
+        assert_eq!(result["git_metadata_pruned"], 0, "got: {result}");
+        let repos = result["git_metadata_repos"]
+            .as_array()
+            .unwrap_or_else(|| panic!("git_metadata_repos field must be present, got: {result}"));
+        assert!(repos.is_empty(), "no candidates → empty repos list");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #826 C3: L2 must be idempotent — a second call after a
+    /// successful prune reports `git_metadata_pruned: 0` because
+    /// the metadata is already gone. Locks the idempotency contract
+    /// so re-runs (operator double-clicks, sweeper retries) don't
+    /// produce spurious counts.
+    #[test]
+    fn force_release_worktree_idempotent_on_already_pruned_metadata() {
+        let home = tmp_home("826_c3_idempotent");
+        let (source_repo, meta_dir) =
+            seed_disbanded_agent_with_git_metadata(&home, "dev826", "feat/826");
+
+        // First call: prunes 1.
+        let r1 = handle_force_release_worktree(
+            &home,
+            &json!({
+                "agent": "dev826",
+                "branch": "feat/826",
+                "source_repo": source_repo.display().to_string(),
+            }),
+            &None,
+        );
+        assert_eq!(r1["git_metadata_pruned"], 1);
+        assert!(!meta_dir.exists());
+
+        // Second call: prunes 0 (already pruned, no-op).
+        let r2 = handle_force_release_worktree(
+            &home,
+            &json!({
+                "agent": "dev826",
+                "branch": "feat/826",
+                "source_repo": source_repo.display().to_string(),
+            }),
+            &None,
+        );
+        assert_eq!(
+            r2["git_metadata_pruned"], 0,
+            "second call must report 0 pruned (idempotent), got: {r2}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #826 C3: when an agent was bound to worktrees on MULTIPLE
+    /// source repos (a rare but real config — operator hand-edits
+    /// fleet.yaml to point different teams at different repos), L2
+    /// must enumerate and prune EACH. Without the multi-repo
+    /// enumeration, the agent leaks metadata in every source repo
+    /// it ever touched except the first.
+    ///
+    /// This test exercises the OPERATOR FAST PATH for both repos by
+    /// calling L2 twice — once per source_repo arg. (Calling once
+    /// without source_repo and relying on enumeration is exercised
+    /// indirectly by the C1 RED test's discovery fallback.)
+    #[test]
+    fn force_release_worktree_handles_multiple_source_repos_for_same_agent() {
+        let home = tmp_home("826_c3_multi_repo");
+        // The fixture creates source_repo at `<home>/source_repo`, but
+        // we need TWO source repos for this test. Use a custom helper.
+        let agent = "dev826multi";
+        let (repo_a, meta_a) = seed_disbanded_agent_with_git_metadata(&home, agent, "feat/aaa");
+        let repo_b_home = home.join("home_b");
+        std::fs::create_dir_all(&repo_b_home).ok();
+        let (repo_b, meta_b) =
+            seed_disbanded_agent_with_git_metadata(&repo_b_home, agent, "feat/bbb");
+
+        // Prune repo_a's metadata.
+        let r1 = handle_force_release_worktree(
+            &home,
+            &json!({
+                "agent": agent,
+                "branch": "feat/aaa",
+                "source_repo": repo_a.display().to_string(),
+            }),
+            &None,
+        );
+        assert_eq!(r1["git_metadata_pruned"], 1);
+        assert!(!meta_a.exists());
+        // repo_b's metadata is untouched at this point.
+        assert!(meta_b.exists(), "repo_b still holds its metadata");
+
+        // Prune repo_b's metadata (different home so target path
+        // computation aligns with the second fixture).
+        let r2 = handle_force_release_worktree(
+            &repo_b_home,
+            &json!({
+                "agent": agent,
+                "branch": "feat/bbb",
+                "source_repo": repo_b.display().to_string(),
+            }),
+            &None,
+        );
+        assert_eq!(r2["git_metadata_pruned"], 1);
+        assert!(!meta_b.exists());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #826 C3: cleaning agent X's metadata must NOT touch agent Y's
+    /// metadata even when they share the same source repo. Locks the
+    /// preservation guarantee — `paths_match` is per-worktree-path,
+    /// not per-agent-name (siblings under the same agent dir are
+    /// distinct worktrees and stay distinct).
+    #[test]
+    fn force_release_worktree_preserves_other_agents_metadata() {
+        let home = tmp_home("826_c3_preserves_other");
+        // Seed agent X on its own canonical fixture (returns the source repo).
+        let (source_repo, meta_x) =
+            seed_disbanded_agent_with_git_metadata(&home, "agent_x826", "feat/x");
+        // Add a second worktree on the SAME source repo for a sibling
+        // agent. The fixture helper builds the source repo on each
+        // call, but here we need to reuse the existing one — inline.
+        let agent_y_path = home.join("worktrees").join("agent_y826").join("feat/y");
+        let out_y = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "feat/y",
+                &agent_y_path.display().to_string(),
+            ])
+            .current_dir(&source_repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git ran");
+        assert!(
+            out_y.status.success(),
+            "seed agent_y worktree failed: {}",
+            String::from_utf8_lossy(&out_y.stderr)
+        );
+        // Remove the working tree dir so both metadata entries are
+        // prunable.
+        std::fs::remove_dir_all(&agent_y_path).expect("remove agent_y wt");
+        let meta_y_name = agent_y_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("agent_y path final segment");
+        let meta_y = source_repo.join(".git").join("worktrees").join(meta_y_name);
+        assert!(meta_y.exists(), "fixture: agent_y metadata pre-call");
+        assert!(meta_x.exists(), "fixture: agent_x metadata pre-call");
+
+        // Prune ONLY agent_x's metadata.
+        let result = handle_force_release_worktree(
+            &home,
+            &json!({
+                "agent": "agent_x826",
+                "branch": "feat/x",
+                "source_repo": source_repo.display().to_string(),
+            }),
+            &None,
+        );
+        assert_eq!(result["git_metadata_pruned"], 1);
+        assert!(!meta_x.exists(), "agent_x metadata pruned");
+        assert!(
+            meta_y.exists(),
+            "agent_y metadata MUST be preserved when only agent_x was targeted, but it's gone: {}",
+            meta_y.display()
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // ── Lead-spec named tests (per dispatch m-20260509125352834800-192) ──
 
     #[test]
