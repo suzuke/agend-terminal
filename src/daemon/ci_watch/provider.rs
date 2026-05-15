@@ -144,6 +144,49 @@ pub enum PrState {
     Unknown,
 }
 
+/// #813: PR mergeable-state result. GitHub returns `mergeable_state`
+/// as one of: clean / dirty / unstable / blocked / behind / unknown.
+/// We collapse to the operator-actionable subset:
+/// - `Mergeable` — clean / unstable (CI failures are a separate signal)
+/// - `Conflicting` — dirty (merge conflict with base)
+/// - `Unstable` — blocked / behind (review-policy / branch-behind, not
+///   a conflict per se but worth surfacing)
+/// - `Unknown` — query failed, fail-open path (no alert, no block)
+///
+/// Dead-code allow lifts at C2/C3/C4 when watcher + poller wire the
+/// enum into production paths.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeableState {
+    Mergeable,
+    Conflicting,
+    Unstable,
+    Unknown,
+}
+
+#[allow(dead_code)]
+impl MergeableState {
+    /// Stable string representation written to watch JSON + status
+    /// response. Pair with `from_str` for round-trip.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Mergeable => "MERGEABLE",
+            Self::Conflicting => "CONFLICTING",
+            Self::Unstable => "UNSTABLE",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "MERGEABLE" => Self::Mergeable,
+            "CONFLICTING" => Self::Conflicting,
+            "UNSTABLE" => Self::Unstable,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// Abstraction over a CI server's REST API.
 /// Each method corresponds to one provider-specific HTTP call.
 /// Return types are provider-neutral — all schema parsing happens
@@ -155,6 +198,42 @@ pub trait CiProvider: Send + Sync {
 
     /// Check whether the PR/MR for `branch` has reached a terminal state.
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState;
+
+    /// #813: Check the PR/MR's mergeable state. Returns `Unknown` on
+    /// any query failure (rate-limit, auth, network, no PR found) so
+    /// callers fail-open without alerting.
+    ///
+    /// Cross-backend stance §3.7: GitHub provider does the real query;
+    /// GitLab / Bitbucket return `Unknown` (unverified — no operator
+    /// has exercised the path) and the caller's fail-open guard
+    /// suppresses the alert. Promotion blocked behind a fleet
+    /// running on that backend.
+    ///
+    /// Dead-code allow lifts at C3/C4 when watcher + poller wire it.
+    #[allow(dead_code)]
+    async fn check_pr_mergeable(&self, repo: &str, branch: &str) -> MergeableState {
+        let _ = (repo, branch);
+        MergeableState::Unknown
+    }
+
+    /// #813: synchronous variant for non-async callers (handler-layer
+    /// MCP entry points that need a blocking answer on watch-start).
+    /// Wraps the async via the current tokio runtime — both daemon
+    /// and MCP handler tasks live inside a runtime, so the `block_on`
+    /// always finds a context. Returns `Unknown` if no runtime is
+    /// available (test harness without `#[tokio::test]`).
+    #[allow(dead_code)]
+    fn check_pr_mergeable_blocking(&self, repo: &str, branch: &str) -> MergeableState {
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => return MergeableState::Unknown,
+        };
+        // Bridge to async via `block_in_place` so we don't deadlock on
+        // single-threaded runtimes. `tokio::task::block_in_place`
+        // requires multi-thread runtime; fall back to `Handle::block_on`
+        // when not available.
+        tokio::task::block_in_place(|| handle.block_on(self.check_pr_mergeable(repo, branch)))
+    }
 
     /// Fetch a human-readable summary of the first failed job/step.
     async fn fetch_failure_summary(&self, repo: &str, run_id: u64) -> String;

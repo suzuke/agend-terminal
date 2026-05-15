@@ -23,10 +23,12 @@ pub const WATCH_TTL_HOURS: i64 = 72;
 // The re-exports preserve that path even when the only in-tree use of
 // some items is via the trait object inside `watcher::check_ci_watches`.
 #[allow(unused_imports)]
+pub use poller::{emit_ci_conflict_alert, watch_start_check_mergeable};
+#[allow(unused_imports)]
 pub use provider::{
     detect_provider_from_remote, github_token_warning, github_token_warning_from_env,
     BitbucketCiProvider, CiPollResult, CiProvider, CiRun, GitHubCiProvider, GitLabCiProvider,
-    PrState,
+    MergeableState, PrState,
 };
 #[allow(unused_imports)]
 pub use registry::{ci_watches_dir, remove_watch, watch_filename};

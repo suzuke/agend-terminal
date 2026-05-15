@@ -2,6 +2,8 @@ use crate::agent::{self, AgentRegistry};
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(test)]
+use super::provider::MergeableState;
 use super::provider::{CiPollResult, CiProvider, CiRun, PrState};
 use super::registry::{
     ci_watches_dir, parse_subscribers, remove_watch, update_watch_state,
@@ -116,6 +118,43 @@ fn watch_is_due(last_polled_at: Option<i64>, interval_secs: u64, now_ms: i64) ->
         None => true,
         Some(ts) => now_ms.saturating_sub(ts) >= (interval_secs as i64) * 1000,
     }
+}
+
+// ── #813 stubs — real impl lands in C2/C3/C4 ─────────────────────────
+
+/// #813: emit a `[ci-conflict-detected]` headline to every subscriber.
+/// Mirrors the existing terminal-run fan-out at the ci_check_repo
+/// `for sub in subscribers` loop — in-band inject + inbox enqueue
+/// for persistence. Stub returns a no-op pre-C2; real impl lands in
+/// C2 with the production fan-out code.
+#[allow(dead_code)]
+pub fn emit_ci_conflict_alert(
+    _home: &Path,
+    _repo: &str,
+    _branch: &str,
+    _subscribers: &[String],
+    _source: &str,
+) {
+    // Stub — see doc comment. Real impl lands in C2.
+}
+
+/// #813: on-watch-start mergeable check. Queries the provider for
+/// the PR's mergeable state and emits a `[ci-conflict-detected]`
+/// alert if CONFLICTING (DIRTY). Updates the watch JSON with the
+/// observed state + check timestamp so the periodic re-check in
+/// Part B (`ci_check_repo`) can de-dupe transitions. Fail-open on
+/// any query error (Unknown → no alert, no block). Stub returns
+/// without side-effect pre-C3.
+#[allow(dead_code)]
+pub fn watch_start_check_mergeable(
+    _home: &Path,
+    _watch_path: &Path,
+    _repo: &str,
+    _branch: &str,
+    _subscribers: &[String],
+    _provider: &dyn CiProvider,
+) {
+    // Stub — see doc comment. Real impl lands in C3.
 }
 
 /// Inner implementation that accepts a provider factory for testability.
@@ -1745,6 +1784,11 @@ mod tests {
         poll_result: Mutex<Option<CiPollResult>>,
         pr_state: Mutex<PrState>,
         failure_summary: Mutex<String>,
+        /// #813: pre-seeded mergeable response. Defaults to
+        /// `Unknown` (fail-open) so existing tests aren't affected
+        /// by the new check. Tests targeting #813 set this via
+        /// `with_mergeable`.
+        mergeable: Mutex<MergeableState>,
     }
 
     impl MockCiProvider {
@@ -1757,6 +1801,7 @@ mod tests {
                 })),
                 pr_state: Mutex::new(PrState::Open),
                 failure_summary: Mutex::new("Build / Test".to_string()),
+                mergeable: Mutex::new(MergeableState::Unknown),
             }
         }
 
@@ -1777,6 +1822,7 @@ mod tests {
                 })),
                 pr_state: Mutex::new(PrState::Open),
                 failure_summary: Mutex::new("Build / Test".to_string()),
+                mergeable: Mutex::new(MergeableState::Unknown),
             }
         }
 
@@ -1789,12 +1835,32 @@ mod tests {
                 })),
                 pr_state: Mutex::new(PrState::Open),
                 failure_summary: Mutex::new("Build / Test".to_string()),
+                mergeable: Mutex::new(MergeableState::Unknown),
             }
         }
 
         fn with_pr_terminal(self) -> Self {
             *self.pr_state.lock() = PrState::Terminal { merged: true };
             self
+        }
+
+        /// #813: pre-seed the mergeable response so tests can exercise
+        /// CONFLICTING / MERGEABLE / UNSTABLE / UNKNOWN paths without
+        /// hitting GitHub. The seed is sticky (not consumed on read)
+        /// so a multi-poll test sees the same state across cycles
+        /// unless explicitly transitioned via `set_mergeable`.
+        #[allow(dead_code)]
+        fn with_mergeable(self, state: MergeableState) -> Self {
+            *self.mergeable.lock() = state;
+            self
+        }
+
+        /// #813: transition the mock's mergeable response between
+        /// poll cycles (lets a test exercise the "transition INTO
+        /// CONFLICTING" alert path without spinning up two providers).
+        #[allow(dead_code)]
+        fn set_mergeable(&self, state: MergeableState) {
+            *self.mergeable.lock() = state;
         }
     }
 
@@ -1806,6 +1872,9 @@ mod tests {
         async fn check_pr_terminal(&self, _repo: &str, _branch: &str) -> PrState {
             let mut guard = self.pr_state.lock();
             std::mem::replace(&mut *guard, PrState::Open)
+        }
+        async fn check_pr_mergeable(&self, _repo: &str, _branch: &str) -> MergeableState {
+            self.mergeable.lock().clone()
         }
         async fn fetch_failure_summary(&self, _repo: &str, _run_id: u64) -> String {
             self.failure_summary.lock().clone()
@@ -2140,6 +2209,7 @@ mod tests {
             })),
             pr_state: Mutex::new(PrState::Open),
             failure_summary: Mutex::new(String::new()),
+            mergeable: Mutex::new(MergeableState::Unknown),
         };
         let result = run_ci_check(&dir, &base_watch(), &provider);
         assert!(result.is_err(), "rate-limit must propagate as error");
@@ -4341,6 +4411,109 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #813 ci_watch CONFLICTING PR detection — RED tests ──
+
+    #[test]
+    fn test_watch_start_on_conflicting_emits_alert() {
+        // RED: pre-C3, `watch_start_check_mergeable` is a no-op stub
+        // so the subscriber inbox stays empty even when the provider
+        // reports CONFLICTING. Post-C3 the hook emits a
+        // `[ci-conflict-detected]` headline + inbox entry so the
+        // operator gets the signal before GH webhook silence kicks in.
+        let dir = tmp_dir("watch_start_conflict");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "test/repo",
+            "branch": "fix/x",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-15T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("test/repo", "fix/x"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        let provider =
+            MockCiProvider::with_runs(Vec::new()).with_mergeable(MergeableState::Conflicting);
+
+        super::watch_start_check_mergeable(
+            &dir,
+            &watch_path,
+            "test/repo",
+            "fix/x",
+            &["lead".to_string()],
+            &provider,
+        );
+
+        let inbox_path = dir.join("inbox").join("lead.jsonl");
+        let body = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+        assert!(
+            body.contains("[ci-conflict-detected]"),
+            "subscriber inbox must carry the conflict alert, got: {body}"
+        );
+        assert!(
+            body.contains("test/repo@fix/x"),
+            "alert must identify the repo + branch, got: {body}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_ci_status_response_includes_pr_mergeable_state() {
+        // RED: pre-C4 the `ci action=status` response shape doesn't
+        // carry a `pr_mergeable_state` field; status callers can't
+        // distinguish "CI running" silence from "CONFLICTING blocked
+        // forever" silence. Post-C4 the field surfaces the cached
+        // mergeable state from the watch JSON (null when no check has
+        // run yet).
+        let dir = tmp_dir("status_mergeable_field");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "test/repo",
+            "branch": "fix/x",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-15T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+            // Pre-seed the new field as if a prior poll cycle stamped it.
+            "last_mergeable_state": "CONFLICTING",
+            "last_mergeable_check_at": "2026-05-15T00:00:00Z",
+        });
+        let watch_path = ci_dir.join(watch_filename("test/repo", "fix/x"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        let r = crate::mcp::handlers::ci::handle_status_ci(
+            &dir,
+            &serde_json::json!({"repo": "test/repo"}),
+            "lead",
+        );
+        let entry = r["watches"][0]
+            .as_object()
+            .expect("watches[0] is an object");
+        assert!(
+            entry.contains_key("pr_mergeable_state"),
+            "status response must carry pr_mergeable_state field (#813), got keys: {:?}",
+            entry.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            entry["pr_mergeable_state"], "CONFLICTING",
+            "field must reflect the watch JSON's last_mergeable_state value"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -669,7 +669,7 @@ pub(super) fn handle_unwatch_ci(home: &Path, args: &Value) -> Value {
 /// Caller filtering: agents only see watches they're subscribed to —
 /// avoids leaking lead's polling targets to every dev. The empty
 /// instance name (anonymous CLI) sees all watches.
-pub(super) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
+pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
     let filter_repo = args["repo"].as_str();
     let filter_branch = args["branch"].as_str();
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
