@@ -4081,4 +4081,238 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ── #762: dedup [ci-pass] for subscribers who are also action_target ─────
+    //
+    // Pre-fix: the fan-out loop at poller.rs:836 enqueues [ci-pass] to EVERY
+    // subscriber, then the [ci-ready-for-action] dispatch at 889-908 separately
+    // injects to next_after_ci. When the same agent is in both lists, it
+    // received both notifications for the same CI pass. Issue #762 example:
+    // PR #756 lead `claude-f54bf9` got [ci-pass] AND [ci-ready-for-action].
+    //
+    // Fix: load `next_after_ci` once into `action_target_on_success`, skip the
+    // [ci-pass] enqueue for that exact subscriber on success, fan out to
+    // everyone else. Failure path leaves the option as None so all subscribers
+    // (including the action_target) get [ci-fail].
+
+    /// #762 §3.10 anchor — subscribers `[a, b]` with `next_after_ci: a` and
+    /// a successful run must drop the `[ci-pass]` for `a` (the action target),
+    /// while `b` still receives `[ci-pass]`. Pre-fix the fan-out loop
+    /// unconditionally enqueued for every subscriber, so `a` got both
+    /// `[ci-pass]` and `[ci-ready-for-action]`.
+    #[test]
+    fn pass_dedupe_drops_ci_pass_for_subscriber_who_is_action_target() {
+        let dir = tmp_dir("dedup-success");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [
+                {"instance": "a", "subscribed_at": "2026-05-15T00:00:00Z"},
+                {"instance": "b", "subscribed_at": "2026-05-15T00:00:01Z"}
+            ],
+            "next_after_ci": "a",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 100,
+            conclusion: Some("success".to_string()),
+            head_sha: "abc".to_string(),
+            url: "https://example/run/100".to_string(),
+        }]);
+
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["a".to_string(), "b".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+
+        // `a` is the action_target on success → MUST NOT receive [ci-pass].
+        let a_inbox = dir.join("inbox").join("a.jsonl");
+        let a_body = std::fs::read_to_string(&a_inbox).unwrap_or_default();
+        assert!(
+            !a_body.contains("[ci-pass]"),
+            "action_target `a` must NOT receive [ci-pass] (will get [ci-ready-for-action] instead); inbox body:\n{a_body}"
+        );
+
+        // `b` is not the action_target → MUST still receive [ci-pass].
+        let b_inbox = dir.join("inbox").join("b.jsonl");
+        let b_body = std::fs::read_to_string(&b_inbox).unwrap_or_else(|_| {
+            panic!("subscriber `b` inbox missing — fan-out regression: {b_inbox:?}")
+        });
+        assert!(
+            b_body.contains("[ci-pass]") && b_body.contains("o/r@feat"),
+            "subscriber `b` must receive [ci-pass]; inbox body:\n{b_body}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #762 invariant — failure conclusion must NOT dedupe. Both subscribers
+    /// (including the action_target) need to know the CI failed; the
+    /// [ci-ready-for-action] dispatch only fires on success per issue #650,
+    /// so a failure-path drop would leave the action_target uninformed.
+    #[test]
+    fn pass_dedupe_failure_does_not_drop_ci_fail_for_action_target() {
+        let dir = tmp_dir("dedup-failure");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [
+                {"instance": "a", "subscribed_at": "2026-05-15T00:00:00Z"},
+                {"instance": "b", "subscribed_at": "2026-05-15T00:00:01Z"}
+            ],
+            "next_after_ci": "a",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 200,
+            conclusion: Some("failure".to_string()),
+            head_sha: "def".to_string(),
+            url: "https://example/run/200".to_string(),
+        }]);
+
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["a".to_string(), "b".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+
+        // Both subscribers (including action_target `a`) must receive [ci-fail].
+        for sub in ["a", "b"] {
+            let inbox_path = dir.join("inbox").join(format!("{sub}.jsonl"));
+            let body = std::fs::read_to_string(&inbox_path)
+                .unwrap_or_else(|_| panic!("{sub} inbox missing on failure-path: {inbox_path:?}"));
+            assert!(
+                body.contains("[ci-fail]") && body.contains("o/r@feat"),
+                "{sub} must receive [ci-fail] (failure path must NOT dedupe); inbox body:\n{body}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #762 invariant — subscribers disjoint from `next_after_ci` all receive
+    /// `[ci-pass]` on success. The dedupe filter must be exact-match only;
+    /// it must not drop notifications for non-action-target subscribers.
+    #[test]
+    fn pass_dedupe_non_action_target_subscribers_receive_ci_pass() {
+        let dir = tmp_dir("dedup-non-overlap");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "o/r",
+            "branch": "feat",
+            "subscribers": [
+                {"instance": "a", "subscribed_at": "2026-05-15T00:00:00Z"},
+                {"instance": "b", "subscribed_at": "2026-05-15T00:00:01Z"},
+                {"instance": "c", "subscribed_at": "2026-05-15T00:00:02Z"}
+            ],
+            // next_after_ci points to an agent NOT in subscribers list.
+            "next_after_ci": "d",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        let provider = MockCiProvider::with_runs(vec![CiRun {
+            id: 300,
+            conclusion: Some("success".to_string()),
+            head_sha: "fed".to_string(),
+            url: "https://example/run/300".to_string(),
+        }]);
+
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(ci_check_repo(
+            &dir,
+            &watch_path,
+            "o/r",
+            "feat",
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            &provider,
+        ))
+        .unwrap();
+
+        // All 3 subscribers must receive [ci-pass]; `d` is not subscribed
+        // and would receive [ci-ready-for-action] via inject (silent in
+        // tests with empty registry).
+        for sub in ["a", "b", "c"] {
+            let inbox_path = dir.join("inbox").join(format!("{sub}.jsonl"));
+            let body = std::fs::read_to_string(&inbox_path)
+                .unwrap_or_else(|_| panic!("subscriber `{sub}` inbox missing: {inbox_path:?}"));
+            assert!(
+                body.contains("[ci-pass]") && body.contains("o/r@feat"),
+                "subscriber `{sub}` must receive [ci-pass] (next_after_ci=d ≠ {sub}); inbox body:\n{body}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
