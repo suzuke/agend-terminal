@@ -648,14 +648,32 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         "list" => {
             let filter_assignee = args["filter_assignee"].as_str();
             let filter_status = args["filter_status"].as_str();
+            // #806: default trim to actionable statuses unless caller
+            // opts in to history. `filtered_default=true` on the
+            // response signals callers (audit / forensics) that the
+            // trim fired so they can re-call with include_history=true.
+            let include_history = args["include_history"].as_bool().unwrap_or(false);
+            let limit = args["limit"].as_u64();
+            let filtered_default = !include_history && filter_status.is_none();
+            const ACTIONABLE: &[&str] = &["open", "claimed", "in_progress", "blocked"];
             let now = chrono::Utc::now();
             let done_ttl = chrono::Duration::days(14);
             let tasks = list_all(home);
-            let filtered: Vec<_> = tasks
+            let mut filtered: Vec<Task> = tasks
                 .iter()
                 .filter(|t| filter_assignee.is_none_or(|a| t.assignee.as_deref() == Some(a)))
                 .filter(|t| filter_status.is_none_or(|s| t.status == s))
+                // #806 default-actionable-only filter — only fires
+                // when neither include_history nor filter_status is
+                // set. Preserves zero impact on filter_status callers.
                 .filter(|t| {
+                    include_history
+                        || filter_status.is_some()
+                        || ACTIONABLE.contains(&t.status.as_str())
+                })
+                .filter(|t| {
+                    // 14d done-ttl preserved for include_history=true
+                    // path (default trim already drops done entries).
                     if filter_status.is_some() || t.status != "done" {
                         return true;
                     }
@@ -665,8 +683,17 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         })
                         .unwrap_or(true)
                 })
+                .cloned()
                 .collect();
-            serde_json::json!({"tasks": filtered})
+            // #806 `limit`: newest-first cap by `updated_at` desc.
+            if let Some(n) = limit {
+                filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                filtered.truncate(n as usize);
+            }
+            serde_json::json!({
+                "tasks": filtered,
+                "filtered_default": filtered_default,
+            })
         }
         "claim" => {
             let id = match args["id"].as_str() {

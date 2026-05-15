@@ -141,7 +141,7 @@ fn decision_tools() -> Vec<Value> {
 
 fn task_tools() -> Vec<Value> {
     vec![
-        json!({"name": "task", "description": "Manage task board. Actions: create, list, claim, done, update.",
+        json!({"name": "task", "description": "Manage task board. Actions: create, list, claim, done, update. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["create", "list", "claim", "done", "update"]},
                 "title": {"type": "string"}, "description": {"type": "string"},
@@ -150,6 +150,8 @@ fn task_tools() -> Vec<Value> {
                 "id": {"type": "string"}, "result": {"type": "string"},
                 "status": {"type": "string", "enum": ["open", "claimed", "in_progress", "blocked", "verified", "done", "cancelled"]},
                 "filter_assignee": {"type": "string"}, "filter_status": {"type": "string"},
+                "include_history": {"type": "boolean", "description": "#806: opt in to done/cancelled in `list` response (default trims to actionable)."},
+                "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
                 "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
                 "duration": {"type": "string", "description": "Human duration until deadline (e.g. 30m, 1h, 2d)"},
                 "branch": {"type": "string", "description": "Git branch the implementer should work on"},
