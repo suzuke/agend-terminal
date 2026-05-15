@@ -88,6 +88,15 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     }
     crate::teams::remove_member_from_all(home, name);
 
+    // #808: orphan tasks whose owner is the deleted instance so the
+    // ACL gate (`tasks::can_mutate_record`) doesn't lock survivors
+    // out. Best-effort like the other cleanup steps — a failure
+    // feeds the residual audit but doesn't abort the teardown.
+    if let Err(e) = crate::tasks::orphan_tasks_for_owner(home, name) {
+        step_errors.push(format!("task orphan: {e}"));
+        tracing::error!(name, error = %e, "full_delete_instance: task orphan failed");
+    }
+
     // Sprint 54 P1-B Bug 1 audit: enumerate every store that still holds
     // the name. If any do, surface a loud error instead of returning
     // success — `auto_start_fleet` revival of a half-deleted instance is
@@ -338,6 +347,57 @@ mod tests {
         assert!(
             result.is_ok(),
             "clean home + clean post-audit must return Ok, got: {result:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn full_delete_instance_orphans_owned_tasks() {
+        // #808 GREEN test 2: deleting an instance must orphan the
+        // tasks it owns so the ACL gate (`tasks::can_mutate_record`)
+        // doesn't lock survivors out. Pre-fix: tasks keep ghost
+        // owner → operator gets "not authorized" on cancel.
+        // Post-fix: orphan_tasks_for_owner clears assignee before
+        // the residual audit so the survivor can mutate.
+        let home = tmp_home("orphan_on_delete");
+        // Create a task owned by the doomed instance via the public
+        // handle entry — this exercises the same event-log flow the
+        // MCP `task` tool uses in production.
+        let r = crate::tasks::handle(
+            &home,
+            "doomed",
+            &serde_json::json!({"action": "create", "title": "owned task", "assignee": "doomed"}),
+        );
+        let task_id = r["id"].as_str().expect("task id").to_string();
+        // Sanity: pre-delete ownership recorded.
+        let pre_tasks = crate::tasks::list_all(&home);
+        let pre = pre_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("task exists");
+        assert_eq!(
+            pre.assignee.as_deref(),
+            Some("doomed"),
+            "pre-delete sanity: task owner must be 'doomed'"
+        );
+        // Run the full teardown. `api::call` is unreachable in test
+        // context (harmless) and there's no fleet.yaml / metadata so
+        // the residual audit returns clean.
+        let result = super::full_delete_instance(&home, "doomed");
+        assert!(
+            result.is_ok(),
+            "delete on clean home must return Ok, got: {result:?}"
+        );
+        // Orphan side-effect: assignee cleared.
+        let post_tasks = crate::tasks::list_all(&home);
+        let post = post_tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .expect("task still exists post-delete");
+        assert!(
+            post.assignee.is_none(),
+            "owned task must be orphaned after full_delete_instance, got assignee={:?}",
+            post.assignee
         );
         std::fs::remove_dir_all(home).ok();
     }

@@ -484,6 +484,7 @@ fn read_task_record(home: &Path, id: &str) -> Option<crate::task_events::TaskRec
 /// These are internal daemon modules that emit events on behalf of the system.
 const SYSTEM_IDENTITIES: &[&str] = &[
     "system:auto_close",
+    "system:auto_orphan",
     "system:overdue_sweep",
     "system:task_sweep",
 ];
@@ -491,6 +492,66 @@ const SYSTEM_IDENTITIES: &[&str] = &[
 /// Check if a caller is a recognized system identity.
 pub fn is_system_identity(caller: &str) -> bool {
     SYSTEM_IDENTITIES.contains(&caller)
+}
+
+/// #808: clear ownership on tasks owned by a deleted instance so the
+/// ACL gate (`can_mutate_record`) doesn't lock survivors out. Called
+/// from `full_delete_instance` after fleet-yaml membership cleanup.
+///
+/// Replays the event log, enumerates tasks where `owner == owner_name`
+/// AND status is still "live" (Open/Claimed/InProgress/Blocked), and
+/// emits one `OwnerAssigned { owner: None }` per affected task via
+/// `append_batch` so the entire orphan transition lands under one
+/// fsync. Done/Cancelled tasks are skipped — their terminal state
+/// already disables ACL writes, so re-orphaning them would only churn
+/// the event log.
+///
+/// Concurrency: the caller (`full_delete_instance`) issues
+/// `api::method::DELETE` BEFORE invoking this helper, so the doomed
+/// instance is already dead and cannot claim new tasks mid-flight.
+/// The TOCTOU window between `replay()` and `append_batch()` is
+/// acceptable — a sweeper or operator race that lands later still
+/// wins at replay (later seq overrides).
+///
+/// Returns the count of orphaned tasks on success (0 when nothing
+/// matched), or an `Err` carrying the underlying replay / append
+/// failure detail for the caller to surface into its audit chain.
+pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, String> {
+    use crate::task_events::{InstanceName, TaskEvent, TaskStatus};
+
+    let state = crate::task_events::replay(home).map_err(|e| e.to_string())?;
+    let affected: Vec<crate::task_events::TaskId> = state
+        .tasks
+        .values()
+        .filter(|r| r.owner.as_ref().map(|o| o.0 == owner_name).unwrap_or(false))
+        .filter(|r| {
+            matches!(
+                r.status,
+                TaskStatus::Open
+                    | TaskStatus::Claimed
+                    | TaskStatus::InProgress
+                    | TaskStatus::Blocked
+            )
+        })
+        .map(|r| r.id.clone())
+        .collect();
+    if affected.is_empty() {
+        return Ok(0);
+    }
+    let count = affected.len();
+    let emitter = InstanceName::from("system:auto_orphan");
+    let events: Vec<TaskEvent> = affected
+        .into_iter()
+        .map(|id| TaskEvent::OwnerAssigned {
+            task_id: id,
+            by: emitter.clone(),
+            owner: None,
+            routed_to: None,
+        })
+        .collect();
+    crate::task_events::append_batch(home, &emitter, events)
+        .map(|_| count)
+        .map_err(|e| e.to_string())
 }
 
 fn can_mutate_record(home: &Path, caller: &str, record: &crate::task_events::TaskRecord) -> bool {
