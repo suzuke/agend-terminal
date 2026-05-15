@@ -1209,4 +1209,106 @@ mod tests {
             buf[(1, 0)].symbol()
         );
     }
+
+    #[test]
+    fn test_wide_char_spacer_preserves_wide_char_at_col_minus_one() {
+        // #819 adjacency lock: clearing the SPACER cell at (x+1, y)
+        // must NOT clobber the WIDE_CHAR cell at (x, y). Test
+        // pre-poisons NEITHER position; renders; asserts the wide
+        // char is intact at col 0 + the spacer position is blank at
+        // col 1. Without this lock a refactor that swapped the order
+        // (clearing spacer BEFORE writing wide char) would silently
+        // overwrite the wide char.
+        let mut vt = VTerm::new(10, 1);
+        vt.process("中".as_bytes());
+        let area = ratatui::layout::Rect::new(0, 0, 10, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "中",
+            "wide char must be at col 0, got: {:?}",
+            buf[(0, 0)].symbol()
+        );
+        assert_eq!(
+            buf[(1, 0)].symbol(),
+            " ",
+            "spacer position at col 1 must be blank, got: {:?}",
+            buf[(1, 0)].symbol()
+        );
+    }
+
+    #[test]
+    fn test_text_construction_paths_still_skip_spacers() {
+        // #819 regression-proof for sites 2-5 (lines 331/365/415/492).
+        // These are text/ANSI construction paths — they build fresh
+        // String/Vec<u8> per call and their WIDE_CHAR_SPACER `continue`
+        // is the CORRECT behavior (avoids inserting a placeholder space
+        // into text representations consumers expect to be
+        // WIDE_CHAR-collapsed). Locks the contract that the #819 fix
+        // ONLY touched Site 1 (ratatui rendering); sites 2-5 unchanged.
+        //
+        // If a future refactor "extrapolates" the Site 1 fix to all 5
+        // sites, the asserts below will fail (text output will gain
+        // spurious spaces after wide chars), making the regression
+        // visible. Per general's directive on the #819 dispatch.
+        let mut vt = VTerm::new(20, 2);
+        // Input: wide char + plain char + newline + plain text.
+        // Expected text shape: "中A" (no space between 中 and A —
+        // the wide char's SPACER position must NOT contribute to text).
+        vt.process("中A\r\nB".as_bytes());
+
+        // Site 4 (line 445) — tail_lines() (visible-rows text builder)
+        let tail_text = vt.tail_lines(5);
+        assert!(
+            tail_text.contains("中A"),
+            "tail_lines() must NOT insert space between wide char and next char, got: {tail_text:?}"
+        );
+        assert!(
+            !tail_text.contains("中 A"),
+            "tail_lines() must NOT insert SPACER as space, got: {tail_text:?}"
+        );
+
+        // Site 3 (line 395) — read_scrollback() (scrollback + visible)
+        let scrollback = vt.read_scrollback(10);
+        assert!(
+            scrollback.contains("中A"),
+            "read_scrollback() must NOT insert SPACER as space, got: {scrollback:?}"
+        );
+        assert!(
+            !scrollback.contains("中 A"),
+            "read_scrollback() leaked SPACER as space, got: {scrollback:?}"
+        );
+
+        // Site 2 (line 361) — extract_text() (selection text)
+        let selected = vt.extract_text((0, 0), (0, 5), 0);
+        assert!(
+            selected.contains("中A"),
+            "extract_text() must NOT insert SPACER as space, got: {selected:?}"
+        );
+        assert!(
+            !selected.contains("中 A"),
+            "extract_text() leaked SPACER as space, got: {selected:?}"
+        );
+
+        // Site 5 (line 522) — dump_screen() (ANSI escape sequence builder).
+        // ANSI codes interleave between cells, so we don't assert
+        // verbatim "中A" sequence — instead verify the SPACER never
+        // contributes a literal space between the wide char and the
+        // following char (the actual regression we're proofing).
+        let ansi = vt.dump_screen();
+        let ansi_str = String::from_utf8_lossy(&ansi);
+        assert!(
+            ansi_str.contains("中"),
+            "dump_screen() must emit the wide char, got: {ansi_str:?}"
+        );
+        assert!(
+            ansi_str.contains('A'),
+            "dump_screen() must emit the following char, got: {ansi_str:?}"
+        );
+        assert!(
+            !ansi_str.contains("中 A"),
+            "dump_screen() leaked SPACER as literal space, got: {ansi_str:?}"
+        );
+    }
 }
