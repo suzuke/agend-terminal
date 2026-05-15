@@ -9,6 +9,7 @@ mod backend_harness;
 mod behavioral;
 mod binding;
 mod bootstrap;
+mod branch_sweep;
 mod bridge_client;
 mod bugreport;
 mod capture;
