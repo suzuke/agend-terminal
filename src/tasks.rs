@@ -629,15 +629,31 @@ pub struct OrphanScanResult {
 /// configuration-time set. Caller responsibility to populate both;
 /// this fn is pure so it's testable without a daemon.
 ///
-/// C1 stub: returns `OrphanScanResult::default()` (both buckets
-/// empty) so the RED test fails on assertions about populated
-/// `strict` / `soft`. C2 fills the body.
 pub fn scan_orphan_candidates(
-    _state: &crate::task_events::TaskBoardState,
-    _live: &std::collections::HashSet<String>,
-    _fleet_instances: &std::collections::HashSet<String>,
+    state: &crate::task_events::TaskBoardState,
+    live: &std::collections::HashSet<String>,
+    fleet_instances: &std::collections::HashSet<String>,
 ) -> OrphanScanResult {
-    OrphanScanResult::default()
+    use crate::task_events::TaskStatus;
+    let mut result = OrphanScanResult::default();
+    for record in state.tasks.values() {
+        if matches!(record.status, TaskStatus::Done | TaskStatus::Cancelled) {
+            continue;
+        }
+        let Some(owner) = record.owner.as_ref() else {
+            continue;
+        };
+        let bucket = match classify_owner(owner.0.as_str(), live, fleet_instances) {
+            OwnerClassification::Strict => &mut result.strict,
+            OwnerClassification::Soft => &mut result.soft,
+            OwnerClassification::Live => continue,
+        };
+        bucket
+            .entry(owner.0.clone())
+            .or_default()
+            .push(record.id.clone());
+    }
+    result
 }
 
 fn can_mutate_record(home: &Path, caller: &str, record: &crate::task_events::TaskRecord) -> bool {
