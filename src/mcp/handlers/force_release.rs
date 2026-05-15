@@ -205,6 +205,132 @@ mod tests {
         dir
     }
 
+    // ── #826 L2 disbanded-agent .git/worktrees/ metadata GC ──
+
+    /// Build a fully-initialized source-repo with a daemon-managed
+    /// worktree registered against it, then `remove_dir_all` the
+    /// worktree dir to simulate the post-disband half-cleanup state
+    /// (working tree gone, `.git/worktrees/<agent>/` metadata persists).
+    /// Returns `(source_repo, agent_meta_dir)`. Pins per-repo gitconfig
+    /// per the #814 r1 lesson so CI runners without global gitconfig
+    /// can run `git worktree add` cleanly.
+    fn seed_disbanded_agent_with_git_metadata(
+        home: &Path,
+        agent: &str,
+        branch: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let source_repo = home.join("source_repo");
+        std::fs::create_dir_all(&source_repo).unwrap();
+        let git_run = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git ran")
+        };
+        let out = git_run(&source_repo, &["init", "-b", "main"]);
+        assert!(out.status.success(), "git init failed: {out:?}");
+        git_run(&source_repo, &["config", "user.name", "test"]);
+        git_run(&source_repo, &["config", "user.email", "t@t"]);
+        let out = git_run(&source_repo, &["commit", "--allow-empty", "-m", "init"]);
+        assert!(out.status.success(), "seed commit failed: {out:?}");
+
+        // Add the daemon-managed worktree onto a unique branch.
+        let worktree_dir = home.join("worktrees").join(agent).join(branch);
+        let out = git_run(
+            &source_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                &worktree_dir.display().to_string(),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // git names the metadata dir after the LAST PATH SEGMENT of
+        // the worktree path (e.g. `feat/826` → `826`), NOT the agent
+        // name. Capture before `remove_dir_all` for post-condition
+        // assertions.
+        let meta_dir_name = worktree_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(String::from)
+            .expect("worktree path must have a final segment");
+
+        // Now `remove_dir_all` the working tree dir but leave the
+        // `.git/worktrees/<name>/` metadata behind — exactly the
+        // half-cleanup state #826 fixes.
+        std::fs::remove_dir_all(&worktree_dir).expect("remove worktree dir");
+        let meta_dir = source_repo
+            .join(".git")
+            .join("worktrees")
+            .join(&meta_dir_name);
+        assert!(
+            meta_dir.exists(),
+            "fixture invariant: .git/worktrees/{meta_dir_name}/ metadata must persist after remove_dir_all (got: {})",
+            meta_dir.display()
+        );
+        (source_repo, meta_dir)
+    }
+
+    /// #826 C1 RED: post-disband state — no daemon binding, working
+    /// tree dir already gone, but `.git/worktrees/<agent>/` metadata
+    /// still lives on the source repo. Pre-fix `force_release_worktree`
+    /// reports `released:true` but the metadata persists. Post-fix
+    /// (L2) the GC enumerates the source repo + runs
+    /// `git worktree remove --force` to prune.
+    ///
+    /// Asserts the post-fix contract:
+    /// - response carries `git_metadata_pruned: 1`
+    /// - response carries `git_metadata_repos` array of length 1
+    /// - the source repo's `.git/worktrees/<agent>/` dir is gone
+    #[test]
+    fn force_release_worktree_prunes_stale_git_metadata_when_no_binding() {
+        let home = tmp_home("826_l2_prune");
+        let (source_repo, agent_meta_dir) =
+            seed_disbanded_agent_with_git_metadata(&home, "dev826", "feat/826");
+
+        let result = handle_force_release_worktree(
+            &home,
+            &json!({
+                "agent": "dev826",
+                "branch": "feat/826",
+                "source_repo": source_repo.display().to_string(),
+            }),
+            &None,
+        );
+
+        assert_eq!(
+            result["git_metadata_pruned"], 1,
+            "L2 must report 1 metadata entry pruned (the disbanded agent's), got: {result}"
+        );
+        let repos = result["git_metadata_repos"]
+            .as_array()
+            .unwrap_or_else(|| panic!("git_metadata_repos must be array, got: {result}"));
+        assert_eq!(
+            repos.len(),
+            1,
+            "git_metadata_repos must list the touched source repo"
+        );
+        assert!(
+            !agent_meta_dir.exists(),
+            "L2 must prune .git/worktrees/dev826/ from source repo, still present: {}",
+            agent_meta_dir.display()
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // ── Lead-spec named tests (per dispatch m-20260509125352834800-192) ──
 
     #[test]
