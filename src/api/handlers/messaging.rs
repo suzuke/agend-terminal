@@ -177,26 +177,37 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if let Some(ch) = crate::channel::active_channel() {
-            if let Err(e) = ch.send_from_agent(
-                target,
-                crate::channel::AgentOutboundOp::InjectProvenance {
-                    from: prov_from,
-                    task: prov_task,
-                },
-            ) {
-                tracing::warn!(
-                    %e, target, from,
-                    "provenance injection failed — routing may be broken"
-                );
-            }
-        } else {
-            tracing::warn!(
-                target,
-                from,
-                "provenance injection failed — no active channel"
-            );
-        }
+        let target_clone = target.to_string();
+        let from_clone = from.to_string();
+
+        // H1 fix: background the provenance injection. Slow network IO to
+        // Telegram/Discord can exceed the 5s API timeout, triggering
+        // double-injection fallbacks in the client.
+        std::thread::Builder::new()
+            .name(format!("provenance_{}", target_clone))
+            .spawn(move || {
+                if let Some(ch) = crate::channel::active_channel() {
+                    if let Err(e) = ch.send_from_agent(
+                        &target_clone,
+                        crate::channel::AgentOutboundOp::InjectProvenance {
+                            from: prov_from,
+                            task: prov_task,
+                        },
+                    ) {
+                        tracing::warn!(
+                            %e, target = %target_clone, from = %from_clone,
+                            "provenance injection failed — routing may be broken"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        target = %target_clone,
+                        from = %from_clone,
+                        "provenance injection failed — no active channel"
+                    );
+                }
+            })
+            .ok();
     }
 
     // B2 boundary: worktree-checkout side-effect pushed from MCP comms to

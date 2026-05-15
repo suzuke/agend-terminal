@@ -26,6 +26,7 @@ pub struct AgentCore {
 
 /// Handle to interact with an agent.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct AgentHandle {
     pub id: crate::types::InstanceId,
     pub name: String,

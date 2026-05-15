@@ -19,26 +19,32 @@ pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
             if is_restarting {
                 json!({"ok": false, "error": format!("agent '{name}' is restarting, retry later")})
             } else {
-                let result = if raw {
-                    agent::write_to_agent(handle, data.as_bytes())
-                } else {
-                    agent::inject_to_agent(handle, data.as_bytes())
-                };
-                // Record for ServerRateLimit auto-retry.
-                if result.is_ok() && !data.is_empty() {
-                    drop(reg);
-                    crate::daemon::heartbeat_pair::update_with(name, |p| {
-                        p.last_input_text = Some(data.to_string());
+                let handle_clone = handle.clone();
+                let data_clone = data.to_string();
+                let name_clone = name.to_string();
+
+                // Record for ServerRateLimit auto-retry (best-effort, before spawn).
+                if !data_clone.is_empty() {
+                    crate::daemon::heartbeat_pair::update_with(&name_clone, |p| {
+                        p.last_input_text = Some(data_clone.clone());
                     });
-                    return match result {
-                        Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
-                        Err(e) => json!({"ok": false, "error": format!("{e}")}),
-                    };
                 }
-                match result {
-                    Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
-                    Err(e) => json!({"ok": false, "error": format!("{e}")}),
-                }
+
+                // H1 fix: background the actual PTY write. Large messages with
+                // typed_inject pacing (2ms/byte) can exceed the 5s API timeout,
+                // triggering double-injection fallbacks in the client.
+                std::thread::Builder::new()
+                    .name(format!("inject_{}", name_clone))
+                    .spawn(move || {
+                        if raw {
+                            let _ = agent::write_to_agent(&handle_clone, data_clone.as_bytes());
+                        } else {
+                            let _ = agent::inject_to_agent(&handle_clone, data_clone.as_bytes());
+                        }
+                    })
+                    .ok();
+
+                json!({"ok": true, "result": {"queued": true}})
             }
         }
         None => {
@@ -372,7 +378,6 @@ mod tests {
     use parking_lot::Mutex;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     fn test_ctx_with_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
         let home = Box::new(std::env::temp_dir().join(format!(
