@@ -900,11 +900,10 @@ const INIT_COUNT_WARN_THRESHOLD: usize = 30;
 /// is forward-compatible insurance against expanding the whitelist
 /// in v1.5.
 ///
-/// C1 stub value: `["init"]` only — keeps the production-equivalent
-/// behavior so the existing fixture tests stay green while the new
-/// RED test for `"initial"` flips at C2 when this expands to
-/// `["init", "initial"]`.
-const HEARTBEAT_NAMES: &[&str] = &["init"];
+/// v1 value: `["init", "initial"]` — covers the two empirically
+/// observed offenders. `wip`/`tmp`/`temp`/`checkpoint`/`draft` are
+/// deferred to v1.5 if/when observed in real heartbeat traffic.
+const HEARTBEAT_NAMES: &[&str] = &["init", "initial"];
 
 /// #822: exact-match check against [`HEARTBEAT_NAMES`].
 ///
@@ -921,17 +920,25 @@ fn is_heartbeat_subject(msg: &str) -> bool {
 /// from dropping commits with legitimate body notes that happen to
 /// share a heartbeat subject.
 ///
-/// C1 stub: returns `true` unconditionally so the gate is a no-op
-/// and C1 behavior matches pre-#822 production exactly (the diff-
-/// tree gate immediately below remains the only emptiness check).
-/// C2 fills in the real `git log -1 --format=%b <hash>` impl.
+/// Reads the commit's body via `git log -1 --format=%b <hash>` and
+/// trims. `%b` yields the body only (no subject, no trailing
+/// newline-pad — git always emits a trailing newline that `.trim()`
+/// strips).
 ///
 /// Fail-soft: any git-log error returns `true` (treat as empty body)
 /// rather than `false`. This preserves the existing "drop if diff is
 /// empty" behavior when body-detection fails — neutral fallback that
 /// does not block legitimate cleanups on transient git failures.
-fn commit_body_is_empty(_worktree: &Path, _hash: &str) -> bool {
-    true
+fn commit_body_is_empty(worktree: &Path, hash: &str) -> bool {
+    let out = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%b", hash])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        _ => true,
+    }
 }
 
 /// #814: clear `.git/.../rebase-merge` AND `rebase-apply` dirs that
