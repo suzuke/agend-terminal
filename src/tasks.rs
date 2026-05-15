@@ -719,7 +719,19 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 Some(r) => r,
                 None => return serde_json::json!({"error": format!("task '{id}' not found")}),
             };
-            if !can_mutate_record(home, &caller, &record) {
+            // #808: force flag bypasses the ACL gate for historical
+            // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
+            let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+            let force_reason = args
+                .get("force_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if force && force_reason.is_empty() {
+                return serde_json::json!({
+                    "error": "force=true requires a non-empty 'force_reason'"
+                });
+            }
+            if !force && !can_mutate_record(home, &caller, &record) {
                 return serde_json::json!({
                     "error": format!(
                         "task '{id}' owned by '{}', caller '{caller}' not authorized",
@@ -727,11 +739,38 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     )
                 });
             }
+            if force {
+                crate::event_log::log(
+                    home,
+                    "task_force_done",
+                    &caller,
+                    &format!(
+                        "task={id} owner={} reason={force_reason}",
+                        record
+                            .owner
+                            .as_ref()
+                            .map(|o| o.0.as_str())
+                            .unwrap_or("none")
+                    ),
+                );
+            }
             let by = record
                 .owner
                 .as_ref()
                 .map(|o| o.0.clone())
                 .unwrap_or_else(|| caller.clone());
+            // #808: when force is set, prefix the result with an
+            // audit marker so the persisted event itself names the
+            // caller + reason (event_log carries the same record for
+            // cross-board audit).
+            let result_text = if force {
+                Some(format!(
+                    "[forced by '{caller}': {force_reason}] {}",
+                    result_text.unwrap_or_default()
+                ))
+            } else {
+                result_text
+            };
             let event = crate::task_events::TaskEvent::Done {
                 task_id: crate::task_events::TaskId(id.clone()),
                 by: crate::task_events::InstanceName(by),
@@ -794,7 +833,19 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 Some(r) => r,
                 None => return serde_json::json!({"error": format!("task '{id}' not found")}),
             };
-            if !can_mutate_record(home, &caller, &record) {
+            // #808: force flag bypasses the ACL gate for historical
+            // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
+            let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+            let force_reason = args
+                .get("force_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if force && force_reason.is_empty() {
+                return serde_json::json!({
+                    "error": "force=true requires a non-empty 'force_reason'"
+                });
+            }
+            if !force && !can_mutate_record(home, &caller, &record) {
                 return serde_json::json!({
                     "error": format!(
                         "task '{id}' owned by '{}', caller '{caller}' not authorized",
@@ -802,6 +853,32 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     )
                 });
             }
+            if force {
+                crate::event_log::log(
+                    home,
+                    "task_force_update",
+                    &caller,
+                    &format!(
+                        "task={id} owner={} reason={force_reason}",
+                        record
+                            .owner
+                            .as_ref()
+                            .map(|o| o.0.as_str())
+                            .unwrap_or("none")
+                    ),
+                );
+            }
+            // #808: when force is set, embed the caller + reason
+            // directly in the emitted event's `reason` field so the
+            // per-task replay trail also carries the audit (in
+            // addition to the event_log entry above).
+            let reason_text = |base: &str| -> String {
+                if force {
+                    format!("{base} [forced by '{caller}': {force_reason}]")
+                } else {
+                    base.to_string()
+                }
+            };
             // PR4 F1 — collect transitions into a Vec then emit via
             // single `append_batch` so updates are atomic at the F7 batch
             // level (all-or-nothing fsync window).
@@ -867,11 +944,11 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         (_, "cancelled") => Some(crate::task_events::TaskEvent::Cancelled {
                             task_id: crate::task_events::TaskId(id.clone()),
                             by: crate::task_events::InstanceName::from(caller.as_str()),
-                            reason: "operator update".to_string(),
+                            reason: reason_text("operator update"),
                         }),
                         (_, "blocked") => Some(crate::task_events::TaskEvent::Blocked {
                             task_id: crate::task_events::TaskId(id.clone()),
-                            reason: "operator update".to_string(),
+                            reason: reason_text("operator update"),
                         }),
                         (crate::task_events::TaskStatus::Blocked, "open") => {
                             Some(crate::task_events::TaskEvent::Unblocked {
@@ -887,12 +964,12 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         | (crate::task_events::TaskStatus::InProgress, "open") => {
                             Some(crate::task_events::TaskEvent::Released {
                                 task_id: crate::task_events::TaskId(id.clone()),
-                                reason: "operator update (status → open)".to_string(),
+                                reason: reason_text("operator update (status → open)"),
                             })
                         }
                         (_, "open") => Some(crate::task_events::TaskEvent::Reopened {
                             task_id: crate::task_events::TaskId(id.clone()),
-                            reason: "operator update".to_string(),
+                            reason: reason_text("operator update"),
                             source_evidence: format!(
                                 "status {} → open",
                                 status_to_legacy_str(prev_status)
@@ -2646,6 +2723,122 @@ mod tests {
                 .map(|e| e.contains("force_reason"))
                 .unwrap_or(false),
             "force=true without force_reason must surface validator error, got: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_force_update_with_reason_cancels_ghost_and_logs_audit() {
+        // GREEN test 1: force=true + non-empty force_reason on
+        // `action=update status=cancelled` bypasses the ACL gate AND
+        // pushes a `task_force_update` entry into event-log.jsonl
+        // (cross-board audit) AND embeds the force_reason into the
+        // per-task event's reason field (per-task replay audit).
+        let home = tmp_home("force_cancel_ghost");
+        write_fleet_yaml(&home, &["operator"]);
+        let r = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "create",
+                "title": "stuck-by-ghost",
+                "assignee": "ghost-instance",
+            }),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        let r = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "update",
+                "id": id,
+                "status": "cancelled",
+                "force": true,
+                "force_reason": "post-#808 board hygiene 2026-05-15",
+            }),
+        );
+        assert_eq!(
+            r["status"], "updated",
+            "force=true + force_reason must succeed despite ghost owner, got: {r}"
+        );
+        let tasks = list_all(&home);
+        let t = tasks
+            .iter()
+            .find(|t| t.id == id)
+            .expect("task still present");
+        assert_eq!(t.status, "cancelled", "task must be cancelled");
+        // Cross-board audit: event-log.jsonl records the force action.
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("task_force_update"),
+            "event-log.jsonl must record task_force_update entry, got: {log}"
+        );
+        assert!(
+            log.contains("post-#808 board hygiene"),
+            "event-log.jsonl must capture the force_reason, got: {log}"
+        );
+        // Per-task replay audit: the Cancelled event's reason field
+        // carries the forced marker.
+        let task_log = std::fs::read_to_string(home.join("task_events.jsonl")).unwrap_or_default();
+        assert!(
+            task_log.contains("forced by 'operator'"),
+            "Cancelled event reason must carry forced marker, got: {task_log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_force_done_with_reason_succeeds_on_done_arm() {
+        // BONUS test (mandatory per dispatch spec): force flag must
+        // also gate the `action=done` arm — operators sometimes close
+        // ghost-owned tasks as Done rather than Cancelled when the
+        // work was effectively completed before the owner disbanded.
+        let home = tmp_home("force_done_ghost");
+        write_fleet_yaml(&home, &["operator"]);
+        let r = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "create",
+                "title": "ghost-done",
+                "assignee": "ghost-instance",
+            }),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        // Without force, the done arm rejects (mirrors RED1 behavior).
+        let r_blocked = handle(
+            &home,
+            "operator",
+            &serde_json::json!({"action": "done", "id": id}),
+        );
+        assert!(
+            r_blocked["error"]
+                .as_str()
+                .map(|e| e.contains("not authorized"))
+                .unwrap_or(false),
+            "done arm without force must reject ghost-owned task, got: {r_blocked}"
+        );
+        // With force + reason, the done arm proceeds and event-log
+        // records the cross-board audit (task_force_done).
+        let r = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "done",
+                "id": id,
+                "result": "completed before owner disband",
+                "force": true,
+                "force_reason": "post-#808 done-arm hygiene",
+            }),
+        );
+        assert_eq!(
+            r["status"], "done",
+            "force=true done must succeed, got: {r}"
+        );
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("task_force_done"),
+            "event-log.jsonl must record task_force_done entry, got: {log}"
         );
         std::fs::remove_dir_all(&home).ok();
     }

@@ -152,7 +152,9 @@ fn task_tools() -> Vec<Value> {
                 "filter_assignee": {"type": "string"}, "filter_status": {"type": "string"},
                 "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
                 "duration": {"type": "string", "description": "Human duration until deadline (e.g. 30m, 1h, 2d)"},
-                "branch": {"type": "string", "description": "Git branch the implementer should work on"}
+                "branch": {"type": "string", "description": "Git branch the implementer should work on"},
+                "force": {"type": "boolean", "description": "#808: bypass ownership ACL on done/update for historical ghost-owned cleanup. Requires non-empty force_reason."},
+                "force_reason": {"type": "string", "description": "#808: required when force=true. Logged to event-log.jsonl and embedded in the per-task event's reason field for audit."}
             }, "required": ["action"]}}),
         json!({"name": "task_sweep_config",
         "description": "Configure GitHub-PR auto-close sweep daemon. Sweep polls merged PRs and emits Done events for `Closes t-XXX-N` markers (validated by 5-must-have pipeline).",
