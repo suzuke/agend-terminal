@@ -466,7 +466,7 @@ mod tests {
             updated_at: String::new(),
             due_at: None,
             branch: None,
-            dispatched_at: None,
+            started_at: None,
             eta_secs: None,
         }
     }
@@ -522,7 +522,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             due_at: None,
             branch: None,
-            dispatched_at: None,
+            started_at: None,
             eta_secs: None,
         }];
         terminal

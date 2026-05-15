@@ -26,14 +26,23 @@ pub struct Task {
     /// dispatch; reviewer uses this to scope `checkout_repo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — RFC3339
-    /// timestamp captured the first time `status` transitions to
-    /// `in_progress` via `TaskEvent::InProgress`. Used by the
-    /// daemon-side anti-stall scanner to compute elapsed time
-    /// against `eta_secs`. `None` for tasks that never reached
-    /// in_progress OR pre-existed Sprint 59 schema migration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatched_at: Option<String>,
+    /// RFC3339 timestamp captured the first time `status`
+    /// transitions to `in_progress` via `TaskEvent::InProgress`.
+    /// Used by the daemon-side anti-stall scanner to compute
+    /// elapsed time against `eta_secs`. `None` for tasks that
+    /// never reached in_progress OR pre-existed Sprint 59 schema
+    /// migration.
+    ///
+    /// #807 Item 3: renamed `dispatched_at` → `started_at`. The
+    /// value is stamped on first InProgress (post-claim), not at
+    /// `send()` dispatch — old name was misleading. `serde(alias)`
+    /// preserves replay of legacy persisted JSON.
+    #[serde(
+        default,
+        alias = "dispatched_at",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub started_at: Option<String>,
     /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — operator-
     /// supplied estimate of seconds to completion. The anti-stall
     /// scanner emits a `task_stalled` inbox event when elapsed time
@@ -193,7 +202,7 @@ fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         updated_at: r.updated_at.clone(),
         due_at: r.due_at.clone(),
         branch: r.branch.clone(),
-        dispatched_at: r.dispatched_at.clone(),
+        started_at: r.started_at.clone(),
         eta_secs: r.eta_secs,
     }
 }
@@ -1500,7 +1509,7 @@ mod tests {
             updated_at: "2026-04-27T00:00:00Z".into(),
             due_at: None,
             branch: None,
-            dispatched_at: None,
+            started_at: None,
             eta_secs: None,
         }
     }
@@ -2713,7 +2722,7 @@ mod tests {
                     updated_at: chrono::Utc::now().to_rfc3339(),
                     due_at: None,
                     branch: None,
-                    dispatched_at: None,
+                    started_at: None,
                     eta_secs: None,
                 });
             }
@@ -2777,7 +2786,7 @@ mod tests {
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 due_at: None,
                 branch: None,
-                dispatched_at: None,
+                started_at: None,
                 eta_secs: None,
             });
             Ok(())
@@ -3771,8 +3780,32 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    // NOTE: `test_task_deserialize_dispatched_at_alias_preserves_back_compat`
-    // is added in C4 (Item 3) — depends on the `started_at` struct
-    // field existing post-rename. Pre-C4 it cannot compile, so it
-    // lands with the rename.
+    #[test]
+    fn test_task_deserialize_dispatched_at_alias_preserves_back_compat() {
+        // #807 Item 3: persisted JSON carrying the old `dispatched_at`
+        // field name MUST still deserialize into the renamed
+        // `started_at` field via `#[serde(alias = "dispatched_at")]`.
+        // Locks the contract that pre-rename task_events.jsonl files
+        // and external test fixtures keep working post-migration.
+        let raw_old = serde_json::json!({
+            "id": "t-test-back-compat",
+            "title": "old",
+            "description": "",
+            "status": "open",
+            "priority": "normal",
+            "assignee": null,
+            "created_by": "test",
+            "depends_on": [],
+            "result": null,
+            "created_at": "2026-04-01T00:00:00Z",
+            "updated_at": "2026-04-01T00:00:00Z",
+            "dispatched_at": "2026-04-02T00:00:00Z",
+        });
+        let t: Task = serde_json::from_value(raw_old).expect("deserialize old shape");
+        assert_eq!(
+            t.started_at.as_deref(),
+            Some("2026-04-02T00:00:00Z"),
+            "serde alias must map legacy `dispatched_at` → new `started_at`"
+        );
+    }
 }
