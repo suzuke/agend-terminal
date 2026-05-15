@@ -231,6 +231,20 @@ impl VTerm {
                     .get(idx)
                     .unwrap_or_else(|| DEFAULT_CELL.get_or_init(Cell::default));
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    // Defensive: the WIDE_CHAR branch below skips col+1
+                    // by advancing `col += 2`, so this arm is normally
+                    // unreachable when iterating from a WIDE_CHAR's
+                    // sibling position. Kept as a guard for
+                    // partial-render edge cases (e.g. col 0 starts on
+                    // a SPACER because the WIDE_CHAR fell off the left
+                    // edge during a resize).
+                    let x = area.x + col;
+                    let y = area.y + row;
+                    if x < buf.area().x + buf.area().width && y < buf.area().y + buf.area().height {
+                        let style = cell_to_ratatui_style(cell.fg, cell.bg, cell.flags);
+                        let buf_cell = &mut buf[(x, y)];
+                        buf_cell.set_char(' ').set_style(style);
+                    }
                     col += 1;
                     continue;
                 }
@@ -245,6 +259,22 @@ impl VTerm {
                 let buf_cell = &mut buf[(x, y)];
                 buf_cell.set_char(ch).set_style(style);
                 if cell.flags.contains(Flags::WIDE_CHAR) {
+                    // #819: when writing a wide char at (x, y), the
+                    // adjacent cell at (x+1, y) is the WIDE_CHAR_SPACER
+                    // position. The outer loop `col += 2` skips it
+                    // entirely, so without an explicit blank-write here
+                    // the staging buffer retains the previous frame's
+                    // char at (x+1, y) — root cause of the "scattered
+                    // chars" operator observation (fixup-lead's CJK
+                    // prompt). Mirror the style from the wide char so
+                    // background continuity is preserved.
+                    let spacer_x = x + 1;
+                    if spacer_x < buf.area().x + buf.area().width
+                        && y < buf.area().y + buf.area().height
+                    {
+                        let spacer_cell = &mut buf[(spacer_x, y)];
+                        spacer_cell.set_char(' ').set_style(style);
+                    }
                     col += 2;
                 } else {
                     col += 1;
