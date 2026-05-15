@@ -130,10 +130,8 @@ fn watch_is_due(last_polled_at: Option<i64>, interval_secs: u64, now_ms: i64) ->
 ///
 /// `source` is recorded in the alert body so the operator can
 /// distinguish on-watch-start triggers ("watch-start") from periodic
-/// re-check triggers ("poll-transition"). Dead-code allow lifts at
-/// C3 (handle_watch_ci wires the on-start path) + C4 (poller wires
-/// the periodic re-check).
-#[allow(dead_code)]
+/// re-check triggers ("poll-transition"). C3 wires watch-start path;
+/// C4 wires the periodic-poll re-check call site.
 pub fn emit_ci_conflict_alert(
     home: &Path,
     repo: &str,
@@ -187,9 +185,7 @@ pub fn emit_ci_conflict_alert(
 /// caches the observed state into the watch JSON, and emits a
 /// `[ci-conflict-detected]` alert when CONFLICTING. Fail-open on
 /// Unknown (no alert, no block — preserves behavior under transient
-/// GH outages). Dead-code allow lifts at C3 when handle_watch_ci
-/// wires the call site.
-#[allow(dead_code)]
+/// GH outages).
 pub fn watch_start_check_mergeable(
     home: &Path,
     watch_path: &Path,
@@ -4574,6 +4570,61 @@ mod tests {
         assert_eq!(
             entry["pr_mergeable_state"], "CONFLICTING",
             "field must reflect the watch JSON's last_mergeable_state value"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_mergeable_check_fail_open_on_provider_error() {
+        // GREEN coverage: when the provider returns Unknown (rate-limit,
+        // network failure, no PR found) the helper must NOT emit an
+        // alert AND must cache UNKNOWN to the watch JSON (so the
+        // periodic re-check loop has a baseline). Fail-open contract
+        // — block legit work only on confirmed CONFLICTING signal.
+        let dir = tmp_dir("watch_start_unknown");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "test/repo",
+            "branch": "fix/x",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-15T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+        });
+        let watch_path = ci_dir.join(watch_filename("test/repo", "fix/x"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        // Default Mock returns Unknown (no `.with_mergeable(...)`).
+        let provider = MockCiProvider::with_runs(Vec::new());
+
+        super::watch_start_check_mergeable(
+            &dir,
+            &watch_path,
+            "test/repo",
+            "fix/x",
+            &["lead".to_string()],
+            &provider,
+        );
+
+        let inbox_path = dir.join("inbox").join("lead.jsonl");
+        let body = std::fs::read_to_string(&inbox_path).unwrap_or_default();
+        assert!(
+            !body.contains("[ci-conflict-detected]"),
+            "fail-open: Unknown provider result must NOT emit alert, got: {body}"
+        );
+        // Watch JSON now carries UNKNOWN for baseline.
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(
+            after["last_mergeable_state"].as_str(),
+            Some("UNKNOWN"),
+            "Unknown state must still be cached to watch JSON as a baseline"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

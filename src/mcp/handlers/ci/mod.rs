@@ -533,6 +533,22 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             "code": "watch_write_failed",
         });
     }
+    // #813: on-watch-start mergeable check. Builds a default provider
+    // for the repo (GitHub-only impl; GitLab/Bitbucket inherit the
+    // Unknown stub per §3.7), queries mergeable_state synchronously,
+    // and emits `[ci-conflict-detected]` to every subscriber if the
+    // PR is in DIRTY state. Fail-open on any provider error.
+    let subscribers_for_alert: Vec<String> = crate::daemon::ci_watch::parse_subscribers(&watch);
+    if let Some(provider) = build_default_provider(repo) {
+        crate::daemon::ci_watch::watch_start_check_mergeable(
+            home,
+            &watch_path,
+            repo,
+            branch,
+            &subscribers_for_alert,
+            provider.as_ref(),
+        );
+    }
     // Sprint 54 P0-5 (sub-scope A): response enrichment — agents see
     // CI health without polling the watch file. Read state freshly
     // from `watch` JSON we just composed; populate diagnostic fields
@@ -743,6 +759,35 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
         resp["setup_warning"] = json!(w);
     }
     resp
+}
+
+/// #813: build the default `CiProvider` for a repo URL. Mirrors
+/// `watcher.rs::check_ci_watches`'s factory but with the canonical
+/// host URLs (no per-watch URL override) — sufficient for the
+/// on-watch-start mergeable check at dispatch time. GitHub fully
+/// implemented; GitLab/Bitbucket return Unknown via the trait
+/// default (§3.7 cross-backend stance — promotion blocked behind
+/// real operator usage).
+fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch::CiProvider>> {
+    use crate::daemon::ci_watch::{
+        detect_provider_from_remote, BitbucketCiProvider, CiProvider, GitHubCiProvider,
+        GitLabCiProvider,
+    };
+    let (kind, _is_custom) = detect_provider_from_remote(repo);
+    let provider: Option<Box<dyn CiProvider>> = match kind {
+        "gitlab" => GitLabCiProvider::with_base_url("https://gitlab.com".to_string())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn CiProvider>),
+        "bitbucket_cloud" => {
+            BitbucketCiProvider::with_base_url("https://api.bitbucket.org".to_string())
+                .ok()
+                .map(|p| Box::new(p) as Box<dyn CiProvider>)
+        }
+        _ => GitHubCiProvider::with_base_url("https://api.github.com".to_string())
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn CiProvider>),
+    };
+    provider
 }
 
 #[cfg(test)]

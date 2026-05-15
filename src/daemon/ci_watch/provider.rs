@@ -222,7 +222,6 @@ pub trait CiProvider: Send + Sync {
     /// already inside a tokio runtime (avoids the multi-thread vs
     /// current-thread runtime-flavor branch). Dead-code allow lifts
     /// at C3 when handle_watch_ci wires the call site.
-    #[allow(dead_code)]
     fn check_pr_mergeable_blocking(&self, repo: &str, branch: &str) -> MergeableState {
         std::thread::scope(|s| {
             let handle = s.spawn(|| {
