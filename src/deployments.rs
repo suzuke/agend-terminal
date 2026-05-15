@@ -139,9 +139,15 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             );
             continue;
         }
-        let command = inst_val
-            .get("command")
-            .or_else(|| inst_val.get("backend"))
+        // #787: read `backend:` only — DO NOT fall back to `command:`.
+        // The pre-fix fallback let a template's `command:` value (e.g. a
+        // wrapper-script path) overwrite the durable `backend:` label
+        // field at write time below, conflating the spawn-time
+        // invocation path with the categorical preset label. The
+        // `template_command` passthrough below separately captures the
+        // `command:` value into its own YAML field.
+        let backend_label = inst_val
+            .get("backend")
             .and_then(|v| v.as_str())
             .unwrap_or("claude");
         // Accept `role:` (preferred) and `description:` (alias, mirrors
@@ -257,7 +263,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         yaml_entries.push((
             inst_name.clone(),
             crate::fleet::InstanceYamlEntry {
-                backend: Some(command.to_string()),
+                backend: Some(backend_label.to_string()),
                 working_directory: Some(work_dir),
                 role,
                 instructions,
