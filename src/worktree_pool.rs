@@ -109,7 +109,13 @@ pub struct ReleaseOutcome {
     pub worktree_removed: bool,
     pub binding_removed: bool,
     pub branch_deleted: bool,
+    // #807 Item 2: drop optional keys on success so clients
+    // don't render `"error": null` as an `<error>` envelope.
+    // Real failures still emit `error` (skip_serializing_if
+    // drops `None` only, never `Some`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_cleanup_skipped_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
