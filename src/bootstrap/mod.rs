@@ -186,6 +186,12 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     crate::binding::symlink_shim(home);
     crate::binding::reconcile_orphans(home);
     crate::worktree_pool::reconcile_orphan_leases(home);
+    // #829: boot-time orphan-owner sweep. Auto-applies for owners
+    // verifiably gone (∉ fleet.yaml ∧ ∉ live registry); dry-run +
+    // tracing::warn for the softer "∈ fleet.yaml ∧ ∉ live" case.
+    // Best-effort with tracing audit; skips entirely if
+    // `api::call(LIST)` fails (e.g. socket bind race during boot).
+    crate::tasks::reconcile_orphan_owners(home);
 
     Ok(BootstrapOutcome::Owned(Box::new(OwnedFleet {
         home: home.to_path_buf(),

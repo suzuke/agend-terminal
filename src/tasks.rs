@@ -629,6 +629,111 @@ pub struct OrphanScanResult {
 /// configuration-time set. Caller responsibility to populate both;
 /// this fn is pure so it's testable without a daemon.
 ///
+/// #829: fetch the daemon's live runtime agent registry via
+/// `api::call(LIST)`. Returns `Some(set)` on success and `None` when
+/// the API call fails — boot-sweep skips entirely on `None` per
+/// design call 3, defending against the boot-time window where the
+/// daemon binds its API socket DURING bootstrap and a call from
+/// inside bootstrap could race the socket bind.
+///
+/// Duplicate of the same shape used in `src/teams.rs:200-212` and
+/// `src/render/panels.rs::fetch_live_agents` (#827). Three consumers
+/// now — a follow-up after #830 ships will promote a single shared
+/// helper to a common module (probably `src/runtime.rs`).
+fn fetch_live_agents(home: &Path) -> Option<std::collections::HashSet<String>> {
+    crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::LIST}),
+    )
+    .ok()
+    .and_then(|r| {
+        r["result"]["agents"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|a| a["name"].as_str().map(String::from))
+                .collect()
+        })
+    })
+}
+
+/// #829: boot-time orphan-owner sweeper. Sibling to
+/// `crate::binding::reconcile_orphans` + `crate::worktree_pool::
+/// reconcile_orphan_leases` in `src/bootstrap/mod.rs`. Best-effort,
+/// tracing-audited, no return value.
+///
+/// Strict-case auto-apply (owner ∉ fleet.yaml ∧ ∉ live registry):
+/// emits one `system:auto_orphan` batched event per ghost owner via
+/// `orphan_tasks_for_owner`. Idempotent — re-running on an already-
+/// orphaned task is a no-op at the event-log replay layer.
+///
+/// Soft-case dry-run (owner ∈ fleet.yaml ∧ ∉ live registry): emits a
+/// `tracing::warn!` listing the candidates. NO mutation — preserves
+/// operator judgment for the "agent hasn't booted yet" race that
+/// `auto_start_fleet` will resolve seconds after bootstrap returns.
+///
+/// Skip-on-api-fail: if `api::call(LIST)` returns `None`, the
+/// orchestrator early-returns BEFORE touching any state. Better to
+/// leave residue for next boot than to over-orphan during a daemon
+/// startup race.
+pub fn reconcile_orphan_owners(home: &Path) {
+    let Some(live) = fetch_live_agents(home) else {
+        tracing::info!("#829: api::call(LIST) unavailable at boot — skipping orphan-owner sweep");
+        return;
+    };
+    let fleet_instances: std::collections::HashSet<String> =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .map(|c| c.instances.keys().cloned().collect())
+            .unwrap_or_default();
+    let state = match crate::task_events::replay(home) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "#829: task_events replay failed at boot — skipping orphan-owner sweep"
+            );
+            return;
+        }
+    };
+
+    let result = scan_orphan_candidates(&state, &live, &fleet_instances);
+    if result.strict.is_empty() && result.soft.is_empty() {
+        tracing::debug!("#829: boot orphan-owner sweep clean — no ghost owners detected");
+        return;
+    }
+
+    // Strict bucket → auto-apply via orphan_tasks_for_owner.
+    for (owner, task_ids) in &result.strict {
+        match orphan_tasks_for_owner(home, owner) {
+            Ok(n) => tracing::info!(
+                owner = %owner,
+                tasks = task_ids.len(),
+                orphaned = n,
+                "#829: boot orphan-owner sweep applied (strict — owner fully gone)"
+            ),
+            Err(e) => tracing::warn!(
+                owner = %owner,
+                error = %e,
+                "#829: boot orphan-owner sweep failed for strict candidate"
+            ),
+        }
+    }
+
+    // Soft bucket → dry-run + warn (no mutation).
+    if !result.soft.is_empty() {
+        let soft_summary: Vec<(String, usize)> = result
+            .soft
+            .iter()
+            .map(|(owner, ids)| (owner.clone(), ids.len()))
+            .collect();
+        tracing::warn!(
+            ?soft_summary,
+            "#829: boot detected tasks owned by configured-but-not-live agents \
+             (in fleet.yaml ∧ ∉ live registry); operator may run `task action=sweep` \
+             to apply orphan cleanup"
+        );
+    }
+}
+
 pub fn scan_orphan_candidates(
     state: &crate::task_events::TaskBoardState,
     live: &std::collections::HashSet<String>,
@@ -1658,6 +1763,70 @@ mod tests {
 
     fn make_set(names: &[&str]) -> std::collections::HashSet<String> {
         names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// #829 C3 GREEN: pure-fn classifier test. Three sets cover the
+    /// full state space: in-live, in-fleet-only, in-neither.
+    #[test]
+    fn classify_owner_categorizes_three_states() {
+        let live = make_set(&["charlie829"]);
+        let fleet = make_set(&["bob829", "charlie829"]);
+        assert_eq!(
+            classify_owner("charlie829", &live, &fleet),
+            OwnerClassification::Live,
+            "charlie829 ∈ live must classify Live (live wins over fleet membership)"
+        );
+        assert_eq!(
+            classify_owner("bob829", &live, &fleet),
+            OwnerClassification::Soft,
+            "bob829 ∈ fleet but ∉ live must classify Soft"
+        );
+        assert_eq!(
+            classify_owner("alice829", &live, &fleet),
+            OwnerClassification::Strict,
+            "alice829 ∈ neither must classify Strict"
+        );
+    }
+
+    /// #829 C3 GREEN: cold start case — empty event log → empty result.
+    /// Locks the no-op contract for fresh daemons. C1 RED test already
+    /// implicitly covers this through the assertion on alice829's
+    /// presence, but explicit coverage hardens the contract surface.
+    #[test]
+    fn scan_orphan_candidates_handles_empty_state() {
+        let state = make_state(vec![]);
+        let live = make_set(&["alpha"]);
+        let fleet = make_set(&["alpha", "beta"]);
+        let result = scan_orphan_candidates(&state, &live, &fleet);
+        assert!(result.strict.is_empty(), "empty state → empty strict");
+        assert!(result.soft.is_empty(), "empty state → empty soft");
+    }
+
+    /// #829 C3 GREEN: terminal-status tasks (Done / Cancelled) are
+    /// excluded even when their owner is a ghost. The ACL is already
+    /// disabled at the event-log layer for terminal records, so
+    /// re-orphaning is noise. Locks the skip behavior.
+    #[test]
+    fn scan_orphan_candidates_excludes_terminal_status() {
+        use crate::task_events::TaskStatus;
+        // ghost-829 owns four tasks across the four terminal-vs-live
+        // statuses. Only Open + Claimed should land in `strict`.
+        let state = make_state(vec![
+            make_record("t-open", TaskStatus::Open, Some("ghost829")),
+            make_record("t-claimed", TaskStatus::Claimed, Some("ghost829")),
+            make_record("t-done", TaskStatus::Done, Some("ghost829")),
+            make_record("t-cancel", TaskStatus::Cancelled, Some("ghost829")),
+        ]);
+        let live = make_set(&[]);
+        let fleet = make_set(&[]);
+        let result = scan_orphan_candidates(&state, &live, &fleet);
+        let ghost_strict = result.strict.get("ghost829").cloned().unwrap_or_default();
+        let ids: Vec<String> = ghost_strict.iter().map(|t| t.0.clone()).collect();
+        assert_eq!(
+            ids,
+            vec!["t-claimed".to_string(), "t-open".to_string()],
+            "Done + Cancelled must be excluded; non-terminal must surface (BTreeMap order is by TaskId)"
+        );
     }
 
     /// #829 C1 RED: classify three tasks across the strict / soft /
