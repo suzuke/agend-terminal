@@ -235,6 +235,10 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         helper_staleness_tracker.maybe_scan(&home);
         mcp_registry_tracker.maybe_scan(&home);
         waiting_on_stale_tracker.maybe_scan(&home);
+        // #836: reclaim expired (10-min TTL) entries from the
+        // notification-dedup ledger so memory pressure stays bounded
+        // on long-lived daemons.
+        crate::daemon::notification_dedup::global().sweep_expired();
     }
 }
 
@@ -753,6 +757,33 @@ pub(crate) fn process_server_rate_limit_retries(
             // that gave up.
             crate::daemon::dedup_state::save(home, name, retry);
             continue;
+        }
+
+        // #836: post-consume suppression gate. If the input_text is
+        // a previously-injected `[AGEND-MSG]` header AND the
+        // corresponding msg has already been drained by the agent,
+        // the notification-dedup ledger says "skip this re-inject".
+        // Headers without an extractable msg_id (event-style, free-form
+        // acks) fall through to the existing retry path unchanged.
+        if let Some(msg_id) =
+            crate::daemon::notification_dedup::extract_msg_id_from_header(&retry.input_text)
+        {
+            if crate::daemon::notification_dedup::global().should_suppress_reinject(name, &msg_id) {
+                tracing::info!(
+                    agent = %name,
+                    msg_id = %msg_id,
+                    "#836: ServerRateLimit retry suppressed — msg already consumed"
+                );
+                crate::event_log::log(
+                    home,
+                    "server_rate_limit_retry_suppressed",
+                    name,
+                    &format!("msg_id={msg_id} consumed_post_inject"),
+                );
+                retry.dedup_count = NOTIFICATION_DEDUP_CAP;
+                crate::daemon::dedup_state::save(home, name, retry);
+                continue;
+            }
         }
 
         // Re-inject last input directly to PTY (no daemon API self-call).

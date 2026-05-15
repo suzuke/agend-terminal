@@ -12,6 +12,7 @@ pub(crate) mod idle_watchdog;
 pub(crate) mod legacy_backfill;
 pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
+pub(crate) mod notification_dedup;
 pub(crate) mod per_tick;
 pub(crate) mod poll_reminder;
 pub(crate) mod router;
