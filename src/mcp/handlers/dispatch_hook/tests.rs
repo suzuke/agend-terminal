@@ -1642,3 +1642,69 @@ fn clean_empty_init_commits_drops_initial_subject_with_empty_body() {
 
     std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
 }
+
+/// #822 C3 regression-proof: the body-emptiness gate must guard
+/// `initial`-subject commits that carry real commit-body notes. This
+/// is the load-bearing FP-class case for v1.5 (the gate also guards
+/// future `wip`/`tmp` synonyms). Body present → KEEP, even with
+/// empty diff and whitelisted subject.
+#[test]
+fn clean_empty_init_commits_keeps_initial_subject_with_body_notes() {
+    let (_repo, worktree) = setup_repo_and_worktree("initial_body");
+    empty_commit(&worktree, "initial", Some("real body notes — do not drop"));
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(result.is_ok(), "helper must succeed, got: {result:?}");
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "`initial` with non-empty body must be kept (body gate guards FP class)",
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+/// #822 C3 behavior-change documentation: an `init`-subject empty-
+/// diff commit with a non-empty commit body was DROPPED pre-#822
+/// (the body was ignored), and is now KEPT (body gate added). This
+/// is theoretical-only — zero historical occurrences in 64+ daemon-
+/// generated `init` commits, all of which use
+/// `commit --allow-empty -m "init"` with no `-m <body>`. This test
+/// locks the new behavior so future helper edits can't quietly
+/// reintroduce the body-ignore regression.
+#[test]
+fn clean_empty_init_commits_keeps_init_subject_with_body_notes() {
+    let (_repo, worktree) = setup_repo_and_worktree("init_body");
+    empty_commit(&worktree, "init", Some("operator-added body — do not drop"));
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(result.is_ok(), "helper must succeed, got: {result:?}");
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "`init` with non-empty body must be kept post-#822 (behavior change)",
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+/// #822 C3 regression-proof: the canonical daemon-heartbeat case —
+/// `init` subject with empty body AND empty diff — is still DROPPED
+/// post-#822. Locks the existing behavior so the body-gate addition
+/// can't break the production heartbeat-cleanup path that this
+/// helper exists for in the first place.
+#[test]
+fn clean_empty_init_commits_still_handles_canonical_init_empty() {
+    let (_repo, worktree) = setup_repo_and_worktree("init_canonical");
+    empty_commit(&worktree, "init", None);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(result.is_ok(), "helper must succeed, got: {result:?}");
+    assert_eq!(
+        result.unwrap(),
+        1,
+        "canonical empty `init` heartbeat must still be dropped (existing behavior)",
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
