@@ -6,7 +6,7 @@
 
 Single-user fleet manager for AI coding agents (Claude Code / kiro-cli / codex / gemini / opencode). Spawns each agent in its own PTY, exposes them in a Ratatui TUI, mirrors traffic to Telegram, and lets agents talk to each other via an MCP server.
 
-Threat model: **localhost-only, single operator**. Cookie file `~/.agend-terminal/run/<pid>/api.cookie` (mode 0600) gates the API; anyone who can read it already owns the user account. Defenses past that point are intentionally minimal (KISS, see §0 of `FLEET-DEV-PROTOCOL-v1.md`).
+Threat model: **localhost-only, single operator**. Cookie file `~/.agend-terminal/run/<pid>/api.cookie` (mode 0600) gates the API; anyone who can read it already owns the user account. Defenses past that point are intentionally minimal (KISS, see §0 of `FLEET-DEV-PROTOCOL.md`).
 
 ## Two binaries
 
@@ -51,7 +51,7 @@ PTY children are children of the daemon. Daemon dies → PTY dies → all agents
 
 ## Process disciplines
 
-`docs/FLEET-DEV-PROTOCOL-v1.md` is the contract:
+`docs/FLEET-DEV-PROTOCOL.md` is the contract:
 
 - **§0 KISS** — every PR must answer "what real problem does this solve?"
 - **§3.5.10** wire-format external fixture — never test mock-against-mock

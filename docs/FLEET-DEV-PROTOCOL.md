@@ -108,6 +108,37 @@ Must include e2e integration test exercising the production hook path.
 ### 3.15 Daemon-core Cushion Rule
 PRs touching daemon core / channel / supervisor / state.rs must include stress test + lock-ordering analysis before dispatch. "不急 ship" principle — correctness over velocity for infrastructure changes.
 
+### 3.16 Phase 1 Discussion Discipline (Sprint 62)
+**Pre-impl source-code spike is mandatory.** Lead's initial proposal MUST be challenged by dev's 5-10min source-code spike before Phase 2 dispatch. Rationale: lead's "from-code-structure" inference consistently misses scope holes (8/12 PRs in 2026-05-14 retrospective). Spike outputs:
+- Confirm or refute lead's initial site count
+- Surface bonus emission sites lead missed
+- Distinguish "near-bug" from "asserts-on-bug-signature" (issue body counts often conflate)
+- Identify pre-existing helpers / deps that change scope estimate
+
+**Three-party substantive consensus required**: reviewer must offer at least one design challenge AND dev must offer at least one impl concern before consensus is recorded. Triple ACK without substance = rubber-stamp = `RUBBER-STAMP — UNVERIFIED`.
+
+**Issue body counts are estimates, not contracts.** When issue body says "N sites / N tests need updating," dev spike re-counts. Actual surface may be narrower OR wider than the initial estimate.
+
+### 3.17 Static-Review Limits + Runtime Validation Required
+Static / structural review is INSUFFICIENT for the following surfaces:
+
+- **CI workflow YAML** (cache layer interactions, runtime PATH/env)
+- **Shell script** (variable interpolation, locale-dependent behavior)
+- **Daemon refresh / lifecycle behavior** (in-memory state vs persisted state divergence)
+- **Cross-platform binary semantics** (e.g., rustup-init `--version` exits 0 for any binary at the proxy path)
+
+For these surfaces, a `VERIFIED` verdict requires runtime evidence — typically the PR's own CI run on multiple platforms. Pure code-diff inspection does not suffice. Reviewer must explicitly note "runtime-validated via PR-CI run X" in their verdict report. If the PR's own CI doesn't exercise the affected path, request an empirical reproduction step.
+
+**Generalizable invariant**: exit code 0 is not a strong identity contract for tool checks. Output shape is. `<tool> --version | grep -qE "^<tool> [0-9]"` is the correct content-validating idiom.
+
+### 3.18 Reviewer Audit Conflict Resolution
+When reviewer's claim contradicts dev's claim (e.g. reviewer "stale wording remains" vs dev "wording updated"), lead MUST do **independent verification** before accepting either side:
+- `git show <SHA>:<file>` at the exact reviewed_head SHA
+- `git diff <prev>..<reviewed_head>` for the disputed lines
+- Run the relevant test or grep command independently
+
+Lead replies to both with the empirical evidence. Reviewer/dev should self-correct rather than escalate to operator.
+
 ## §4. Daemon Enforcement Gates
 
 ### 4.1 Push-time Semantic Gate (Sprint 44)
@@ -136,6 +167,13 @@ Impl pushes PR then immediately starts next task. Reviewer issues verdict then i
 - Impl push must include scope statement (follows spec / deviated because)
 - Orchestrator pre-dispatch verification: cross-check dev's claim against actual artifact before forwarding to reviewer
 - dev-lead uses `schedule(action: create)` for auto-poll (30min fallback)
+- **Post-dispatch verification (Sprint 62)**: after `send(kind: task)` returns success (no error), if receiver does not reply within ~5min, dispatcher MUST verify via fallback path:
+  - `inbox(instance: <receiver>)` — confirms unread queued message (offline agents only; active agents receive PTY direct injection and inbox stays empty)
+  - `describe_instance(name: <receiver>)` — confirms agent_state active (PTY delivery already arrived)
+  - `binding_state(agent: <receiver>)` — confirms task lifecycle started (binding metadata present)
+  - If all three show no progress, suspect lease conflict / stale binding / dispatch path block — investigate (`force_release_worktree` if needed) before re-dispatching
+- **Pane-claim is not delivery**: agent writing a response in its own pane is NOT a `send`. Every reply / verdict / report must be triggered via the MCP `send` tool. Receivers do not see pane content. Verify via §6 channel discipline.
+- **Post-PR-merge close-loop reporting**: each PR `kind=report` MUST include a "lessons learned" section noting process wins, scope shifts, unexpected discoveries. Captures process-maturity signals for protocol evolution.
 - Takeover requires 4 criteria independently verified (heartbeat stale ≥1h, last_input frozen, idle state, zero activity)
 - Merge must atomically include `git worktree remove` + `git branch -D`
 - Post-merge: orchestrator verifies main CI green before reporting task completion upstream. Failed main CI = immediate P0 (revert or hotfix).
@@ -166,6 +204,7 @@ Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher 
 - Pure ack → do not reply (ACK absorption §4 handles this automatically)
 - Response channel must match source channel
 - **Router-layer channel discipline (Sprint 52)**: daemon auto-mirrors agent direct text to the corresponding channel. Agent does not need to force `reply` tool — infrastructure handles routing.
+- **Inbox vs PTY delivery (Sprint 62)**: active agents receive messages via PTY direct injection (not queued in `inbox`). `inbox(instance: X)` returning empty does NOT mean X received nothing — only means X has no unread queue. Verify delivery via `describe_instance` (active state = PTY received) or `pane_snapshot` rather than inbox alone. Inbox queue only fills for offline agents or undeliverable messages.
 
 ## §7. CI
 
@@ -224,6 +263,31 @@ poll afterward. Both events go to every subscriber via the P0-1 fan-out
 contract — no last-write-wins. Surface stalled events promptly; resumed
 events confirm recovery and may be acknowledged silently.
 
+### 7.1 CI Tool Identity & Cache Hygiene (Sprint 62)
+
+**Tool identity check via output shape, not exit code.** When a CI step verifies a binary's identity (e.g. `cargo`, `rustc`, `rustfmt`):
+
+```yaml
+# WRONG — rustup-init binary at proxy path also exits 0 for --version
+cargo --version
+
+# RIGHT — content-validating grep ensures shape matches
+cargo --version | grep -qE "^cargo [0-9]"
+```
+
+Stale `rustup-init` binaries can masquerade as `cargo` / `rustc` / `rustfmt` when cache restores them to the proxy path. Exit-0 alone does NOT prove identity. Pattern caught 2026-05-14 PR #772 v1 → v3 evolution; v1's `cargo --version` exit check missed pollution; v2 detection-recover failed; v3 `cache-bin: false` prevention shipped.
+
+**Cache pollution requires prevention OR validated cleanup.** Detection alone is insufficient if recovery surface is harder than prevention. KISS: prefer "don't cache the polluted directory" (`Swatinem/rust-cache@v2 with cache-bin: false`) over "detect stale state and rm + reset". Recovery code itself becomes maintenance burden + new failure surface.
+
+### 7.2 Cross-Platform Test Idioms
+
+Cross-platform test failures observed multiple times in 2026-05-13/14 sessions. Mandatory idioms:
+
+- **Time arithmetic**: never `Instant::now() - Duration` (Windows monotonic clock anchors to system uptime → underflow on fresh VM). Use `Instant::add` (saturating) or DI inject `now: Instant` for tests.
+- **Regex hot-path**: never per-call `Regex::new` in fed loop. Use `LazyLock<Vec<Regex>>` (or `OnceLock`). Performance ratio: ~100× speedup, prevents Windows runner test timeout from cumulative `min_hold` budget.
+- **PTY EOF semantics**: never assume EOF behavior matches across cmd.exe/bash/ConPTY. Shell-backend tests need `#[cfg_attr(windows, ignore = "tracking #N")]` if EOF semantic divergence is the bug not the SUT.
+- **Path mangling**: sanitize both `/` (Unix path) AND `\` + `:` (Windows drive letter) when constructing worktree paths from source paths.
+
 ## §8. Progress Visibility
 
 Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml origin) broadcast with `origin` field. `create_instance` defaults to isolated workspace (`~/.agend-terminal/workspace/<name>`).
@@ -266,6 +330,34 @@ Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/Aut
 
 User-checkout branches, operator-created worktrees without `.agend-managed` marker, and any branch where the marker cannot be verified are NEVER deleted.
 
+### release_worktree parameter form
+
+Use `release_worktree(agent: <self>)`. The `path: ...` form is NOT a recognized schema — daemon silently no-ops on unknown params. Verify cleanup with `binding_state(agent: <self>)` returning `bound: false`.
+
+### 10.6 Lead Pre-Dispatch Release (Sprint 62)
+
+Every `send(kind: task, branch: <X>)` triggers daemon auto-bind for the **dispatcher** (lead) to branch X, then dispatches the task to the assignee. If lead is already bound to a previous dispatch branch, the new dispatch may fail with `lease_failed` OR succeed but leave the previous binding stale.
+
+Normalize: lead MUST `release_worktree(agent: <self>)` BEFORE every `send(kind: task)`. This:
+1. Clears stale lead bindings from prior dispatches
+2. Ensures the new auto-bind doesn't conflict
+3. Prevents dev's subsequent claim from hitting "branch already checked out" errors
+
+Lead role does not need a worktree for orchestration work — release immediately after each dispatch is correct hygiene.
+
+### 10.7 Daemon Empty Heartbeat Commits (Sprint 62)
+
+Daemon writes empty `init` commits to bound branches at certain lifecycle events (bind start, task issue, periodic heartbeat). These commits:
+- Have no file diff (empty commits)
+- Carry trailers `Agend-Agent: <name>` / `Agend-Task: <id>` / `Agend-Issued-At: <timestamp>`
+- Share the SAME `Agend-Issued-At` (task-issue time, not commit creation time) when generated by repeated bind events
+
+**Acceptance**: empty heartbeat commits are NOT to be amend-rewritten or force-pushed away (per §10 hard rule). They land in branch history; squash-merge collapses them to clean main. Reviewers must look past them to find the substantive commits via `git log --no-merges --grep` or commit-message filter.
+
+**§3.10 verifiability impact**: anchor RED commit may be sandwiched between heartbeat commits and impl GREEN commit. Verify §3.10 by `git checkout <anchor-sha>` (cargo test fails) → `git checkout <impl-sha>` (cargo test passes), ignoring intermediate heartbeat noise.
+
+If pollution becomes excessive (>30 heartbeats per PR), file as daemon ergonomic flag for cleanup tool extension (currently #789-class).
+
 ## §11. Tool Quick Reference
 
 | Need | Use | NOT this |
@@ -290,6 +382,19 @@ Agents seeing this prefix should surface the message as-is to the
 user (it's operator-actionable: restart daemon / check socket) rather
 than retry blindly. Stateless tools (`inbox`, `task`, `send`, etc.)
 still fall back gracefully for offline workflows.
+
+### 11.1 State Persistence Across Daemon Refresh (Sprint 62)
+
+Daemon binary refresh (recompile + restart, or hot-reload via `mcp_registry_watcher`) invalidates several in-memory state stores. **After every `mcp_registry_watcher` notification fired**, the following state should be re-verified:
+
+- **CI watch state** — fixed by #786, but pre-#786 watches may be missing
+- **Instance registry vs team metadata sync** — fixed by #785 (better-error surfaces desync); team membership outlives instance restart, may reference wiped instances
+- **Source_repo on team** — historically wiped by `teams.json` migration on refresh (was #781 root cause); persisted as of #781 but verify with `grep source_repo fleet.yaml` if behavior unexpected
+- **Active bindings** — in-memory `bind_in_flight` flag may be lost; check `binding_state(agent)` and `force_release_worktree` if dangling
+
+**Operator workflow**: `mcp_registry_watcher` notification = restart-needed signal. Run `agend-terminal stop && cargo build --release && agend-terminal start` to pick up new binary. Subsequent agent dispatches benefit from fresh code.
+
+**Agent workflow**: do NOT assume state survives daemon refresh. Re-verify via `team list`, `ci action=status`, `binding_state` after any refresh notification.
 
 ## §12. Workflow Efficiency
 
@@ -372,6 +477,21 @@ These are not catastrophic individually. They erode the invariants the shim was 
 4. If the remediation is something else (e.g., "use the task board to get a worktree assignment"), follow it.
 
 `AGEND_GIT_BYPASS_UNTIL=<epoch>` exists for time-windowed bypass during multi-step operator interventions; per-command env is preferred for normal use.
+
+### 13.5 Bug-Blocks-Its-Own-Fix Exception (Sprint 62)
+
+When fixing a daemon binding bug (or any bug whose existence prevents the bypass-free workflow itself), the fix PR may legitimately require one-shot `AGEND_GIT_BYPASS=1` for `git add` / `git commit` / `git push` of THIS PR — because the very bug being fixed blocks the bypass-free path.
+
+**Acceptance criteria for this exception**:
+1. PR body MUST include a `## Bypass scope rationale` section explicitly framing the loop:
+   - The bug being fixed
+   - Why fix removes the future need for bypass
+   - One-shot scope limited to this single PR
+2. Bypass commits land in branch history (per §10.7); squash-merge cleans final main
+3. After this PR merges + daemon binary updates, all subsequent PRs revert to ZERO BYPASS workflow
+4. Operator authorization required if scope expands beyond commit/push (e.g. into worktree manipulation)
+
+Reference: PR #779 (Sprint 61) Option 1 + Option 3 daemon binding fix shipped under this exception. PR #781 + #800 followed standard ZERO BYPASS workflow.
 
 ---
 

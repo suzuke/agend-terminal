@@ -944,9 +944,9 @@ mod tests {
 
     #[test]
     fn instructions_include_protocol_path() {
-        let body = build_instructions_body(None, Some("/tmp/protocol/FLEET-DEV-PROTOCOL-v1.md"));
+        let body = build_instructions_body(None, Some("/tmp/protocol/FLEET-DEV-PROTOCOL.md"));
         assert!(
-            body.contains("/tmp/protocol/FLEET-DEV-PROTOCOL-v1.md"),
+            body.contains("/tmp/protocol/FLEET-DEV-PROTOCOL.md"),
             "instructions must include protocol path: {body}"
         );
         assert!(

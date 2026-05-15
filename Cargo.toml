@@ -18,7 +18,7 @@ include = [
     "assets/windows/*",
     # `src/binding.rs` does `include_str!("../assets/hooks/prepare-commit-msg")`
     # + `.../prepare-commit-msg.ps1` (Sprint 53 #446 Phase 1 trailer hook).
-    # Same lesson as the `docs/FLEET-DEV-PROTOCOL-v1.md` entry below: the
+    # Same lesson as the `docs/FLEET-DEV-PROTOCOL.md` entry below: the
     # `cargo publish` verify step builds from the packaged tarball, so
     # every `include_str!` target must appear here. v0.6.0 publish-blocker
     # hotfix (silent-drop class 5th instance — human comment alone didn't
@@ -31,12 +31,12 @@ include = [
     # Without these the `cargo publish` verify build fails on a
     # silent-drop-class missing-asset error.
     "assets/service/*",
-    # `src/protocol.rs` does `include_str!("../docs/FLEET-DEV-PROTOCOL-v1.md")`
+    # `src/protocol.rs` does `include_str!("../docs/FLEET-DEV-PROTOCOL.md")`
     # at compile time. Without this entry, `cargo publish`'s verification
     # build (which works on the packaged tarball, not the source tree)
     # fails with "No such file or directory" — caught the hard way during
     # the v0.4.0 publish attempt. Add any future bundled docs here too.
-    "docs/FLEET-DEV-PROTOCOL-v1.md",
+    "docs/FLEET-DEV-PROTOCOL.md",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
