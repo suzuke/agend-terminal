@@ -219,6 +219,10 @@ fn dispatch_task_sweep(ctx: &HandlerCtx<'_>) -> Value {
     task::handle_task(ctx.home, ctx.args, ctx.instance_name)
 }
 
+fn dispatch_task_health(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+}
+
 /// Static sub-handler table for `task` action routing. Lifted out of
 /// the entry literal so the table address can be `'static`-borrowed.
 /// Action set matches `tasks::handle`'s internal `match` arms.
@@ -229,6 +233,7 @@ static TASK_ACTIONS: &[(&str, HandlerFn)] = &[
     ("update", dispatch_task_update),
     ("done", dispatch_task_done),
     ("sweep", dispatch_task_sweep),
+    ("health", dispatch_task_health),
 ];
 
 // ---------------------------------------------------------------------

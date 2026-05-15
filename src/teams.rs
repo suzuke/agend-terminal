@@ -278,19 +278,11 @@ pub fn list(home: &Path) -> Value {
     // M members) HashSet lookups, no repeated locking. If the API call
     // fails (daemon offline / unreachable), stale_members stays empty
     // — best-effort staleness reporting, never blocks `list` itself.
-    let live_agents: std::collections::HashSet<String> = crate::api::call(
-        home,
-        &serde_json::json!({"method": crate::api::method::LIST}),
-    )
-    .ok()
-    .and_then(|r| {
-        r["result"]["agents"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|a| a["name"].as_str().map(String::from))
-                .collect()
-        })
-    })
-    .unwrap_or_default();
+    //
+    // #830: routed through the canonical `runtime::list_live_agents`
+    // helper that #827/#829/#830 share (the original copy lived here).
+    let live_agents: std::collections::HashSet<String> =
+        crate::runtime::list_live_agents(home).unwrap_or_default();
 
     let teams: Vec<Value> = list_all(home)
         .iter_mut()

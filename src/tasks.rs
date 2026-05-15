@@ -629,32 +629,6 @@ pub struct OrphanScanResult {
 /// configuration-time set. Caller responsibility to populate both;
 /// this fn is pure so it's testable without a daemon.
 ///
-/// #829: fetch the daemon's live runtime agent registry via
-/// `api::call(LIST)`. Returns `Some(set)` on success and `None` when
-/// the API call fails — boot-sweep skips entirely on `None` per
-/// design call 3, defending against the boot-time window where the
-/// daemon binds its API socket DURING bootstrap and a call from
-/// inside bootstrap could race the socket bind.
-///
-/// Duplicate of the same shape used in `src/teams.rs:200-212` and
-/// `src/render/panels.rs::fetch_live_agents` (#827). Three consumers
-/// now — a follow-up after #830 ships will promote a single shared
-/// helper to a common module (probably `src/runtime.rs`).
-fn fetch_live_agents(home: &Path) -> Option<std::collections::HashSet<String>> {
-    crate::api::call(
-        home,
-        &serde_json::json!({"method": crate::api::method::LIST}),
-    )
-    .ok()
-    .and_then(|r| {
-        r["result"]["agents"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|a| a["name"].as_str().map(String::from))
-                .collect()
-        })
-    })
-}
-
 /// #829: boot-time orphan-owner sweeper. Sibling to
 /// `crate::binding::reconcile_orphans` + `crate::worktree_pool::
 /// reconcile_orphan_leases` in `src/bootstrap/mod.rs`. Best-effort,
@@ -675,7 +649,7 @@ fn fetch_live_agents(home: &Path) -> Option<std::collections::HashSet<String>> {
 /// leave residue for next boot than to over-orphan during a daemon
 /// startup race.
 pub fn reconcile_orphan_owners(home: &Path) {
-    let Some(live) = fetch_live_agents(home) else {
+    let Some(live) = crate::runtime::list_live_agents(home) else {
         tracing::info!("#829: api::call(LIST) unavailable at boot — skipping orphan-owner sweep");
         return;
     };
@@ -759,6 +733,250 @@ pub fn scan_orphan_candidates(
             .push(record.id.clone());
     }
     result
+}
+
+/// #830 hardcoded severity thresholds. Defaults are tuned for the
+/// current operator's fleet shape (10s of agents, low-100s of
+/// tasks); revisit if v1.5 brings demand for config-ability.
+const OVER_30D_WARN_THRESHOLD: usize = 5;
+const STALE_BLOCKED_WARN_THRESHOLD: usize = 10;
+
+/// #830: structured-recommendations health response. Pure pub fn so
+/// tests can drive it with synthesized inputs (no daemon spawn).
+///
+/// `state` — `crate::task_events::replay(home)` output
+/// `live` — `crate::runtime::list_live_agents(home)` — `None` when
+///   the daemon is unreachable (surfaced as a degraded-mode hint in
+///   the response).
+/// `fleet_instances` — keys from `crate::fleet::FleetConfig::load
+///   (...).instances` — the configured set (vs `live` runtime set).
+///
+/// Reuses `scan_orphan_candidates` (#829) for the ghost_owners
+/// section so the boot sweeper and the health surface share one
+/// classification pass. Sorted output where feasible
+/// (`BTreeMap`/`sort_unstable`) for stable test pinning.
+pub fn build_health_response(
+    state: &crate::task_events::TaskBoardState,
+    live: Option<&std::collections::HashSet<String>>,
+    fleet_instances: &std::collections::HashSet<String>,
+) -> Value {
+    use crate::task_events::TaskStatus;
+    use chrono::DateTime;
+    let now = chrono::Utc::now();
+
+    // ── Status counts + non-terminal collector ──
+    let mut by_status: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    let mut non_terminal_ages_days: Vec<i64> = Vec::new();
+    for record in state.tasks.values() {
+        let key = match record.status {
+            TaskStatus::Open => "open",
+            TaskStatus::Claimed => "claimed",
+            TaskStatus::InProgress => "in_progress",
+            TaskStatus::Blocked => "blocked",
+            TaskStatus::Done => "done",
+            TaskStatus::Cancelled => "cancelled",
+            TaskStatus::Verified => "verified",
+        };
+        *by_status.entry(key).or_insert(0) += 1;
+        if !matches!(record.status, TaskStatus::Done | TaskStatus::Cancelled) {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&record.created_at) {
+                let age = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
+                non_terminal_ages_days.push(age.num_days());
+            }
+        }
+    }
+    let total_all: usize = by_status.values().copied().sum();
+    let total_terminal = by_status.get("done").copied().unwrap_or(0)
+        + by_status.get("cancelled").copied().unwrap_or(0);
+    let total_non_terminal = total_all.saturating_sub(total_terminal);
+
+    // ── Ghost owners (reuse #829 scan_orphan_candidates) ──
+    let empty_live = std::collections::HashSet::new();
+    let live_set = live.unwrap_or(&empty_live);
+    let scan = scan_orphan_candidates(state, live_set, fleet_instances);
+    let strict_count: usize = scan.strict.values().map(|v| v.len()).sum();
+    let soft_count: usize = scan.soft.values().map(|v| v.len()).sum();
+    let strict_owners: Vec<&String> = scan.strict.keys().collect();
+    let soft_owners: Vec<&String> = scan.soft.keys().collect();
+
+    // ── Stale claims (replicates sweep_overdue_claimed's predicate,
+    //    read-only — no mutation) ──
+    let mut stale_claim_ids: Vec<String> = Vec::new();
+    for record in state.tasks.values() {
+        if record.status != TaskStatus::Claimed {
+            continue;
+        }
+        let Some(due) = &record.due_at else {
+            continue;
+        };
+        let Ok(due_utc) = DateTime::parse_from_rfc3339(due) else {
+            continue;
+        };
+        if now > due_utc.with_timezone(&chrono::Utc) {
+            stale_claim_ids.push(record.id.0.clone());
+        }
+    }
+    stale_claim_ids.sort_unstable();
+
+    // ── Age aggregates ──
+    non_terminal_ages_days.sort_unstable();
+    let oldest_days = non_terminal_ages_days.last().copied().unwrap_or(0);
+    let median_days = if non_terminal_ages_days.is_empty() {
+        0
+    } else {
+        non_terminal_ages_days[non_terminal_ages_days.len() / 2]
+    };
+    let over_30d_count = non_terminal_ages_days.iter().filter(|d| **d > 30).count();
+    let over_90d_count = non_terminal_ages_days.iter().filter(|d| **d > 90).count();
+
+    // ── Recommendations ──
+    let blocked_count = by_status.get("blocked").copied().unwrap_or(0);
+    let mut recommendations: Vec<Value> = Vec::new();
+    if let Some(rec) = rec_ghost_owners_strict(&scan, strict_count) {
+        recommendations.push(rec);
+    }
+    if let Some(rec) = rec_ghost_owners_soft(&scan, soft_count) {
+        recommendations.push(rec);
+    }
+    if let Some(rec) = rec_stale_claims(&stale_claim_ids) {
+        recommendations.push(rec);
+    }
+    if let Some(rec) = rec_over_30d(over_30d_count) {
+        recommendations.push(rec);
+    }
+    if let Some(rec) = rec_blocked_overflow(blocked_count) {
+        recommendations.push(rec);
+    }
+
+    serde_json::json!({
+        "as_of": now.to_rfc3339(),
+        "live_agents_available": live.is_some(),
+        "totals": {
+            "all": total_all,
+            "non_terminal": total_non_terminal,
+            "terminal": total_terminal,
+        },
+        "by_status": by_status,
+        "ghost_owners": {
+            "strict_count": strict_count,
+            "strict_owners": strict_owners,
+            "soft_count": soft_count,
+            "soft_owners": soft_owners,
+        },
+        "stale_claims": {
+            "overdue_count": stale_claim_ids.len(),
+            "overdue_ids": stale_claim_ids,
+        },
+        "age": {
+            "oldest_non_terminal_days": oldest_days,
+            "median_non_terminal_days": median_days,
+            "over_30d_count": over_30d_count,
+            "over_90d_count": over_90d_count,
+        },
+        "recommendations": recommendations,
+    })
+}
+
+/// Trigger: any `scan.strict` entries — owners verifiably gone
+/// (∉ fleet.yaml ∧ ∉ live). Next-action hint mentions #829 auto-orphan
+/// on next daemon boot (the same scan that produced these candidates
+/// will fire automatically) so operator can either wait or run
+/// `task action=sweep` to apply now.
+fn rec_ghost_owners_strict(scan: &OrphanScanResult, count: usize) -> Option<Value> {
+    if scan.strict.is_empty() {
+        return None;
+    }
+    let candidate_ids: Vec<String> = scan
+        .strict
+        .values()
+        .flat_map(|ids| ids.iter().map(|t| t.0.clone()))
+        .collect();
+    Some(serde_json::json!({
+        "code": "ghost_owners_strict",
+        "severity": "warn",
+        "hint": format!(
+            "{count} task(s) owned by fully-gone agents (∉ fleet.yaml ∧ ∉ live); \
+             next daemon boot will auto-orphan via #829 — or run `task action=sweep` now"
+        ),
+        "candidate_ids": candidate_ids,
+    }))
+}
+
+/// Trigger: any `scan.soft` entries — owners in fleet.yaml but not
+/// in the live runtime registry. Could be transient (agent
+/// restarting) or a real misconfig; operator decides.
+fn rec_ghost_owners_soft(scan: &OrphanScanResult, count: usize) -> Option<Value> {
+    if scan.soft.is_empty() {
+        return None;
+    }
+    let candidate_ids: Vec<String> = scan
+        .soft
+        .values()
+        .flat_map(|ids| ids.iter().map(|t| t.0.clone()))
+        .collect();
+    Some(serde_json::json!({
+        "code": "ghost_owners_soft",
+        "severity": "info",
+        "hint": format!(
+            "{count} task(s) owned by configured-but-not-live agents \
+             (∈ fleet.yaml ∧ ∉ live); could be transient — check `binding_state` \
+             or run `task action=sweep` if persistent"
+        ),
+        "candidate_ids": candidate_ids,
+    }))
+}
+
+/// Trigger: any tasks past their `due_at`. Daemon's
+/// `sweep_overdue_claimed` already auto-releases these on its tick,
+/// so this is info-level (operator just sees the in-flight state).
+fn rec_stale_claims(ids: &[String]) -> Option<Value> {
+    if ids.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "code": "stale_claims",
+        "severity": "info",
+        "hint": format!(
+            "{} claim(s) past due_at; daemon's overdue sweep will release on next tick",
+            ids.len()
+        ),
+        "candidate_ids": ids.to_vec(),
+    }))
+}
+
+/// Trigger: more than `OVER_30D_WARN_THRESHOLD` non-terminal tasks
+/// older than 30 days. Suggests `task action=sweep` for board
+/// hygiene.
+fn rec_over_30d(count: usize) -> Option<Value> {
+    if count <= OVER_30D_WARN_THRESHOLD {
+        return None;
+    }
+    Some(serde_json::json!({
+        "code": "over_30d",
+        "severity": "warn",
+        "hint": format!(
+            "{count} non-terminal task(s) older than 30 days; \
+             consider `task action=sweep` for stale-task review"
+        ),
+    }))
+}
+
+/// Trigger: more than `STALE_BLOCKED_WARN_THRESHOLD` tasks in the
+/// blocked state. Indicates accumulating dependency backlog or
+/// unattended `block_reason` causes.
+fn rec_blocked_overflow(count: usize) -> Option<Value> {
+    if count <= STALE_BLOCKED_WARN_THRESHOLD {
+        return None;
+    }
+    Some(serde_json::json!({
+        "code": "blocked_overflow",
+        "severity": "warn",
+        "hint": format!(
+            "{count} task(s) currently in `blocked` state; \
+             check `block_reason` per task and unblock or cancel"
+        ),
+    }))
 }
 
 fn can_mutate_record(home: &Path, caller: &str, record: &crate::task_events::TaskRecord) -> bool {
@@ -1384,6 +1602,27 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 Err(e) => serde_json::json!({"error": format!("sweep apply failed: {e}")}),
             }
         }
+        "health" => {
+            // #830 one-shot board hygiene snapshot. Operator self-serve
+            // diagnosis: "is the board clean?" + recommended next
+            // actions surfaced as a structured `recommendations` array.
+            let live = crate::runtime::list_live_agents(home);
+            let fleet_instances: std::collections::HashSet<String> =
+                crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                    .ok()
+                    .map(|c| c.instances.keys().cloned().collect())
+                    .unwrap_or_default();
+            let state = match crate::task_events::replay(home) {
+                Ok(s) => s,
+                Err(e) => {
+                    return serde_json::json!({
+                        "error": format!("task_events replay failed: {e}"),
+                        "code": "replay_failed",
+                    });
+                }
+            };
+            build_health_response(&state, live.as_ref(), &fleet_instances)
+        }
         _ => serde_json::json!({"error": format!("unknown action: {action}")}),
     }
 }
@@ -1827,6 +2066,157 @@ mod tests {
             vec!["t-claimed".to_string(), "t-open".to_string()],
             "Done + Cancelled must be excluded; non-terminal must surface (BTreeMap order is by TaskId)"
         );
+    }
+
+    // ── #830 task action=health build_health_response ──
+
+    fn make_record_with_age_days(
+        id: &str,
+        status: crate::task_events::TaskStatus,
+        owner: Option<&str>,
+        age_days: i64,
+    ) -> crate::task_events::TaskRecord {
+        let created_at = (chrono::Utc::now() - chrono::Duration::days(age_days)).to_rfc3339();
+        let mut r = make_record(id, status, owner);
+        r.created_at = created_at;
+        r
+    }
+
+    /// #830: status counts roll up across all 4 active states +
+    /// Done/Cancelled terminals. Totals stay consistent
+    /// (`all = non_terminal + terminal`).
+    #[test]
+    fn build_health_response_reports_status_counts_correctly() {
+        use crate::task_events::TaskStatus;
+        let state = make_state(vec![
+            make_record("t-1", TaskStatus::Open, None),
+            make_record("t-2", TaskStatus::Open, None),
+            make_record("t-3", TaskStatus::Claimed, Some("alpha")),
+            make_record("t-4", TaskStatus::InProgress, Some("alpha")),
+            make_record("t-5", TaskStatus::Blocked, None),
+            make_record("t-6", TaskStatus::Done, Some("alpha")),
+            make_record("t-7", TaskStatus::Cancelled, None),
+        ]);
+        let live = make_set(&["alpha"]);
+        let fleet = make_set(&["alpha"]);
+
+        let resp = build_health_response(&state, Some(&live), &fleet);
+
+        assert_eq!(resp["totals"]["all"], 7);
+        assert_eq!(resp["totals"]["non_terminal"], 5);
+        assert_eq!(resp["totals"]["terminal"], 2);
+        assert_eq!(resp["by_status"]["open"], 2);
+        assert_eq!(resp["by_status"]["claimed"], 1);
+        assert_eq!(resp["by_status"]["in_progress"], 1);
+        assert_eq!(resp["by_status"]["blocked"], 1);
+        assert_eq!(resp["by_status"]["done"], 1);
+        assert_eq!(resp["by_status"]["cancelled"], 1);
+    }
+
+    /// #830: a clean board (no ghosts, no stale claims, low age,
+    /// blocked count under threshold) must produce an EMPTY
+    /// `recommendations` array. Positive signal for operators —
+    /// "everything's fine, nothing to do".
+    #[test]
+    fn build_health_response_clean_board_emits_empty_recommendations() {
+        use crate::task_events::TaskStatus;
+        let state = make_state(vec![
+            make_record_with_age_days("t-1", TaskStatus::Open, None, 1),
+            make_record_with_age_days("t-2", TaskStatus::InProgress, Some("alpha"), 1),
+        ]);
+        let live = make_set(&["alpha"]);
+        let fleet = make_set(&["alpha"]);
+
+        let resp = build_health_response(&state, Some(&live), &fleet);
+        let recs = resp["recommendations"]
+            .as_array()
+            .expect("recommendations must be array");
+        assert!(
+            recs.is_empty(),
+            "clean board → empty recommendations, got: {recs:?}"
+        );
+    }
+
+    /// #830: ghost-owner candidates from `scan_orphan_candidates` (#829)
+    /// must surface in BOTH the `ghost_owners` section AND a
+    /// `ghost_owners_strict` / `ghost_owners_soft` recommendation entry
+    /// with structured `{code, severity, hint, candidate_ids}`.
+    #[test]
+    fn build_health_response_includes_ghost_owners_from_scan() {
+        use crate::task_events::TaskStatus;
+        let state = make_state(vec![
+            // alice is ∉ live ∧ ∉ fleet → strict
+            make_record("t-1", TaskStatus::Claimed, Some("alice830")),
+            // bob is ∈ fleet ∧ ∉ live → soft
+            make_record("t-2", TaskStatus::Open, Some("bob830")),
+        ]);
+        let live = make_set(&[]);
+        let fleet = make_set(&["bob830"]);
+
+        let resp = build_health_response(&state, Some(&live), &fleet);
+
+        assert_eq!(resp["ghost_owners"]["strict_count"], 1);
+        assert_eq!(resp["ghost_owners"]["soft_count"], 1);
+        let recs = resp["recommendations"]
+            .as_array()
+            .expect("recommendations array");
+        let codes: Vec<&str> = recs.iter().filter_map(|r| r["code"].as_str()).collect();
+        assert!(
+            codes.contains(&"ghost_owners_strict"),
+            "ghost_owners_strict recommendation must fire, got codes: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"ghost_owners_soft"),
+            "ghost_owners_soft recommendation must fire, got codes: {codes:?}"
+        );
+    }
+
+    /// #830: claims past `due_at` surface as `stale_claims` entry +
+    /// `stale_claims` recommendation. Locks the read-only replication
+    /// of `sweep_overdue_claimed`'s predicate.
+    #[test]
+    fn build_health_response_includes_stale_claims_via_due_at() {
+        use crate::task_events::TaskStatus;
+        let past = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        let mut overdue = make_record("t-overdue", TaskStatus::Claimed, Some("alpha"));
+        overdue.due_at = Some(past);
+        let state = make_state(vec![overdue]);
+        let live = make_set(&["alpha"]);
+        let fleet = make_set(&["alpha"]);
+
+        let resp = build_health_response(&state, Some(&live), &fleet);
+
+        assert_eq!(resp["stale_claims"]["overdue_count"], 1);
+        let ids = resp["stale_claims"]["overdue_ids"]
+            .as_array()
+            .expect("overdue_ids must be array");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], "t-overdue");
+        let recs = resp["recommendations"]
+            .as_array()
+            .expect("recommendations array");
+        let codes: Vec<&str> = recs.iter().filter_map(|r| r["code"].as_str()).collect();
+        assert!(
+            codes.contains(&"stale_claims"),
+            "stale_claims recommendation must fire, got codes: {codes:?}"
+        );
+    }
+
+    /// #830: daemon-offline degrades gracefully. `live = None` flows
+    /// through (`live_agents_available: false` in the response) — the
+    /// ghost_owners scan effectively treats all owners as ghosts (live
+    /// set is empty), which is the worst case but at least operator
+    /// can see the snapshot.
+    #[test]
+    fn build_health_response_handles_daemon_offline_gracefully() {
+        use crate::task_events::TaskStatus;
+        let state = make_state(vec![make_record("t-1", TaskStatus::Open, None)]);
+        let fleet = make_set(&[]);
+
+        let resp = build_health_response(&state, None, &fleet);
+
+        assert_eq!(resp["live_agents_available"], false);
+        assert_eq!(resp["totals"]["all"], 1);
     }
 
     /// #829 C1 RED: classify three tasks across the strict / soft /
