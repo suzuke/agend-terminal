@@ -215,6 +215,10 @@ fn dispatch_task_done(ctx: &HandlerCtx<'_>) -> Value {
     task::handle_task(ctx.home, ctx.args, ctx.instance_name)
 }
 
+fn dispatch_task_sweep(ctx: &HandlerCtx<'_>) -> Value {
+    task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+}
+
 /// Static sub-handler table for `task` action routing. Lifted out of
 /// the entry literal so the table address can be `'static`-borrowed.
 /// Action set matches `tasks::handle`'s internal `match` arms.
@@ -224,6 +228,7 @@ static TASK_ACTIONS: &[(&str, HandlerFn)] = &[
     ("claim", dispatch_task_claim),
     ("update", dispatch_task_update),
     ("done", dispatch_task_done),
+    ("sweep", dispatch_task_sweep),
 ];
 
 // ---------------------------------------------------------------------
@@ -844,7 +849,10 @@ mod tests {
     fn try_dispatch_routes_known_action_through_sub_handler() {
         let home = std::env::temp_dir();
         let cases: &[(&str, &[&str])] = &[
-            ("task", &["create", "list", "claim", "update", "done"]),
+            (
+                "task",
+                &["create", "list", "claim", "update", "done", "sweep"],
+            ),
             ("ci", &["watch", "unwatch", "status"]),
             ("decision", &["post", "list", "update"]),
             ("deployment", &["deploy", "teardown", "list"]),
