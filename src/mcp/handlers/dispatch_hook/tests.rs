@@ -1372,6 +1372,13 @@ fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
             .expect("git ran")
     };
     git_run(&repo, &["init", "-b", "main"]);
+    // #814 r1: pin per-repo gitconfig so subprocesses spawned by the
+    // SUT (which don't inherit our test env vars) still find an
+    // identity. Without this, CI runners with no global gitconfig
+    // abort `git rebase` at exit 128 "unable to auto-detect email
+    // address" — the actual cause of the first CI fail post-#814.
+    git_run(&repo, &["config", "user.name", "test"]);
+    git_run(&repo, &["config", "user.email", "t@t"]);
     git_run(&repo, &["commit", "--allow-empty", "-m", "main: initial"]);
     let main_sha = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
         .trim()
@@ -1391,6 +1398,14 @@ fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
             &worktree.display().to_string(),
         ],
     );
+    // #814 r1: pin worktree-level gitconfig too. The SUT's
+    // `git rebase -i` runs inside the worktree and reads worktree
+    // config FIRST — without this we get exit 128 even when the
+    // repo dir has user.name set, because the worktree inherits
+    // the bare repo `.git/worktrees/wt/config` which is empty by
+    // default.
+    git_run(&worktree, &["config", "user.name", "test"]);
+    git_run(&worktree, &["config", "user.email", "t@t"]);
     (repo, worktree)
 }
 
@@ -1466,6 +1481,18 @@ fn pre_poison_stale_rebase_merge(worktree: &std::path::Path) {
     std::fs::write(rebase_merge.join("interactive"), "").expect("write interactive");
 }
 
+/// #814 r1 — CI root-cause analysis:
+/// `clean_empty_init_commits` shells out to git without setting
+/// `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL`. The local dev
+/// machine inherits the developer's global `~/.gitconfig` so
+/// rebase succeeds. CI runners have no global gitconfig → rebase
+/// aborts with exit 128 ("unable to auto-detect email address").
+/// Same root cause across linux/macos/windows in the first CI run.
+///
+/// Fix: fixture pins per-repo AND per-worktree `user.name` +
+/// `user.email` via `git config` so the SUT's subprocess reads
+/// them from the worktree's `.git/config` regardless of env vars
+/// or global config.
 #[test]
 fn clean_empty_init_commits_recovers_from_stale_rebase_merge_dir() {
     // #814 RED test: synthesize the exact failure state #807 hit —
