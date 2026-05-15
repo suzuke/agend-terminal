@@ -1591,3 +1591,54 @@ fn clean_empty_init_commits_clears_stale_dir_even_when_no_inits_to_drop() {
 
     std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
 }
+
+// ── #822 cleanup_init_commits heartbeat synonym whitelist ──
+
+/// Commit an empty-diff commit on `worktree`'s HEAD with `subject` as
+/// the subject line and optional `body` as the commit body. Pinned
+/// per-#814 r1 pattern (per-process author/committer env so CI runners
+/// without a global gitconfig can still commit).
+fn empty_commit(worktree: &std::path::Path, subject: &str, body: Option<&str>) {
+    let mut args: Vec<&str> = vec!["commit", "--allow-empty", "-m", subject];
+    if let Some(b) = body {
+        args.push("-m");
+        args.push(b);
+    }
+    let status = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
+        .status()
+        .expect("git commit ran");
+    assert!(status.success(), "empty_commit `{subject}` failed");
+}
+
+/// #822 C1 RED: synthesize an empty-body, empty-diff commit with
+/// subject "initial" — the exact #820 stray case. Pre-fix the helper
+/// only matches `"init"` so the commit is NOT dropped (returns 0).
+/// Post-fix (C2) the whitelist expands to include `"initial"` and
+/// the commit IS dropped (returns 1). Asserts the post-fix behavior;
+/// fails RED at C1, flips GREEN at C2.
+#[test]
+fn clean_empty_init_commits_drops_initial_subject_with_empty_body() {
+    let (_repo, worktree) = setup_repo_and_worktree("initial_red");
+    empty_commit(&worktree, "initial", None);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(
+        result.is_ok(),
+        "helper must run cleanly on `initial`-named commit, got: {result:?}"
+    );
+    let cleaned = result.unwrap();
+    assert_eq!(
+        cleaned, 1,
+        "empty-body empty-diff `initial` commit must be dropped \
+         (the #820 stray case); cleaned={cleaned}"
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}

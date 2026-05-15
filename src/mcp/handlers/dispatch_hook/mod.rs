@@ -732,14 +732,25 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
         return Ok(0);
     }
 
-    // Identify empty "init" commits.
+    // Identify empty heartbeat commits.
+    //
+    // #822 C1 scaffolding: introduces `HEARTBEAT_NAMES` whitelist +
+    // `is_heartbeat_subject` + `commit_body_is_empty` API surface but
+    // keeps the whitelist at the production-equivalent value
+    // (`["init"]`). The body-emptiness gate stub returns `true` so the
+    // diff-tree gate immediately below remains the load-bearing
+    // emptiness check. C2 fills in the synonym (`"initial"`) and
+    // wires up the real body-gate impl.
     let mut empty_inits: Vec<&str> = Vec::new();
     for line in log.lines() {
         let (hash, msg) = match line.split_once(' ') {
             Some(pair) => pair,
             None => continue,
         };
-        if msg != "init" {
+        if !is_heartbeat_subject(msg) {
+            continue;
+        }
+        if !commit_body_is_empty(worktree, hash) {
             continue;
         }
         // Check if commit has no file changes.
@@ -868,6 +879,60 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
 /// adds no operator value. Matches the observed #807 incident
 /// count (32 inits > 30 threshold → warns).
 const INIT_COUNT_WARN_THRESHOLD: usize = 30;
+
+/// #822: subjects accepted as "heartbeat commit" candidates. The
+/// daemon-side heartbeat producers (worktree.rs / bootstrap/
+/// agent_resolve.rs) hardcode `"init"`, but a separate code path
+/// or external session checkpoint can land an `"initial"` commit
+/// (the #820 stray `9f619c2 initial` was the observed offender).
+///
+/// Empirical census across all 65 heartbeat commits in repo history
+/// at the time of #822: 64 × `init` + 1 × `initial`. Zero `wip`,
+/// `tmp`, `temp`, `checkpoint`, `draft` occurrences — those are
+/// deferred to v1.5 if/when observed.
+///
+/// Hardcoded (KISS); case-sensitive exact match. Body-emptiness
+/// gate (`commit_body_is_empty`) guards against the rare-but-real
+/// case where a user has an empty-diff commit named `init` or
+/// `initial` with real commit-body notes (e.g. an intentional
+/// `--allow-empty` marker commit). That case is theoretical for
+/// today's daemon producers (they never set a body) but the gate
+/// is forward-compatible insurance against expanding the whitelist
+/// in v1.5.
+///
+/// C1 stub value: `["init"]` only — keeps the production-equivalent
+/// behavior so the existing fixture tests stay green while the new
+/// RED test for `"initial"` flips at C2 when this expands to
+/// `["init", "initial"]`.
+const HEARTBEAT_NAMES: &[&str] = &["init"];
+
+/// #822: exact-match check against [`HEARTBEAT_NAMES`].
+///
+/// Lives as a function (not inline `.contains`) so the call site at
+/// the match loop reads at the abstraction level of the contract
+/// (`is_heartbeat_subject`) rather than the implementation
+/// (`HEARTBEAT_NAMES.contains(&msg)`).
+fn is_heartbeat_subject(msg: &str) -> bool {
+    HEARTBEAT_NAMES.contains(&msg)
+}
+
+/// #822: returns true iff the commit's body (the part after the
+/// subject line) is empty or whitespace-only. Guards the whitelist
+/// from dropping commits with legitimate body notes that happen to
+/// share a heartbeat subject.
+///
+/// C1 stub: returns `true` unconditionally so the gate is a no-op
+/// and C1 behavior matches pre-#822 production exactly (the diff-
+/// tree gate immediately below remains the only emptiness check).
+/// C2 fills in the real `git log -1 --format=%b <hash>` impl.
+///
+/// Fail-soft: any git-log error returns `true` (treat as empty body)
+/// rather than `false`. This preserves the existing "drop if diff is
+/// empty" behavior when body-detection fails — neutral fallback that
+/// does not block legitimate cleanups on transient git failures.
+fn commit_body_is_empty(_worktree: &Path, _hash: &str) -> bool {
+    true
+}
 
 /// #814: clear `.git/.../rebase-merge` AND `rebase-apply` dirs that
 /// survived a prior failed cleanup attempt. Called at the top of
