@@ -3614,4 +3614,121 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // ── #807 response shape consistency bundle — RED tests ──
+
+    #[test]
+    fn test_action_responses_carry_event_and_task_fields_with_lifecycle_status() {
+        // #807 Item 1 RED: create/claim/update/done responses today
+        // overload `status` with action-event names ("created" /
+        // "updated") that don't match the task's lifecycle status
+        // (which is "open" / unchanged). Post-fix: every action
+        // response gains an `event` field (the action verb) AND a
+        // `task` field (full Task object with the correct lifecycle
+        // `status`). The legacy `status` field stays as a back-compat
+        // alias per the dispatch spec (NOT removed).
+        let home = tmp_home("action_response_shape");
+        write_fleet_yaml(&home, &["agent-a"]);
+
+        // create
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t1", "assignee": "agent-a"}),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        assert_eq!(
+            r["event"], "created",
+            "create must carry event=created: {r}"
+        );
+        assert_eq!(
+            r["task"]["status"], "open",
+            "create task object must carry lifecycle status=open: {r}"
+        );
+        assert_eq!(
+            r["status"], "created",
+            "back-compat status alias preserved (status=event for create): {r}"
+        );
+
+        // claim
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        assert_eq!(r["event"], "claimed", "claim must carry event=claimed: {r}");
+        assert_eq!(
+            r["task"]["status"], "claimed",
+            "claim task object must carry lifecycle status=claimed: {r}"
+        );
+
+        // update → in_progress
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert_eq!(
+            r["event"], "updated",
+            "update must carry event=updated: {r}"
+        );
+        assert_eq!(
+            r["task"]["status"], "in_progress",
+            "update task object must carry lifecycle status=in_progress (NOT 'updated'): {r}"
+        );
+
+        // done
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "done", "id": id, "result": "shipped"}),
+        );
+        assert_eq!(r["event"], "done", "done must carry event=done: {r}");
+        assert_eq!(
+            r["task"]["status"], "done",
+            "done task object must carry lifecycle status=done: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_task_started_at_replaces_dispatched_at_in_serialized_output() {
+        // #807 Item 3 RED: today the Task struct field is named
+        // `dispatched_at` but the value is stamped on first transition
+        // to InProgress — so the operator's "when was this dispatched
+        // from send()?" reading is misleading. Rename to `started_at`
+        // (matches `claimed_at` naming, mental model honest). serde
+        // alias `dispatched_at` preserves replay of old persisted logs.
+        let home = tmp_home("started_at_rename");
+        write_fleet_yaml(&home, &["a"]);
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "t", "assignee": "a"}),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
+        let task = listed["tasks"][0].as_object().expect("task object in list");
+        assert!(
+            task.contains_key("started_at"),
+            "task must serialize `started_at` (not `dispatched_at`), got keys: {:?}",
+            task.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            task["started_at"].is_string(),
+            "started_at must be an RFC3339 string, got: {:?}",
+            task["started_at"]
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // NOTE: `test_task_deserialize_dispatched_at_alias_preserves_back_compat`
+    // is added in C4 (Item 3) — depends on the `started_at` struct
+    // field existing post-rename. Pre-C4 it cannot compile, so it
+    // lands with the rename.
 }
