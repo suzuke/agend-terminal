@@ -829,11 +829,39 @@ async fn ci_check_repo(
             // request per cycle); only the notification side-effects loop.
             let repo_branch_key = format!("{repo}@{branch}");
             let supersede_token = format!("ci-{}-{}", run_id, sha);
+            // #762: load `next_after_ci` once and only when this notification
+            // is for a successful run. The same agent appearing as both a
+            // subscriber and the action target produced a [ci-pass] +
+            // [ci-ready-for-action] duplicate pre-fix; skipping the
+            // [ci-pass] enqueue for that one subscriber preserves notify
+            // semantics for everyone else (and for the failure path, where
+            // the action target still needs to know about the fail).
+            let action_target_on_success: Option<String> = if conclusion == Some("success") {
+                std::fs::read_to_string(watch_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                    .and_then(|w| {
+                        w["next_after_ci"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                    })
+            } else {
+                None
+            };
             // EMPIRICAL REGRESSION-PROOF FLIP: replace `subscribers` below
             // with `&subscribers[..1]` to simulate the pre-r0 single-recipient
             // bug. The `subscriber_fan_out_notifies_every_member` test
             // immediately fails with the dev-inbox-missing assertion.
             for sub in subscribers {
+                // #762: skip [ci-pass] enqueue for the action target on
+                // success; it receives [ci-ready-for-action] via inject
+                // below. Match is exact-string equality so a partial-prefix
+                // collision (e.g. "lead" vs "lead-2") doesn't accidentally
+                // drop the notification.
+                if action_target_on_success.as_deref() == Some(sub.as_str()) {
+                    continue;
+                }
                 let reg = agent::lock_registry(registry);
                 if let Some(handle) = reg.get(sub) {
                     let _ = agent::inject_to_agent(handle, headline.as_bytes());
