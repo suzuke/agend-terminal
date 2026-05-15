@@ -581,7 +581,7 @@ mod tests {
             updated_at: "2026-04-26T00:00:00Z".into(),
             due_at: None,
             branch: None,
-            dispatched_at: None,
+            started_at: None,
             eta_secs: None,
         }
     }

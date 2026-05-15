@@ -26,14 +26,23 @@ pub struct Task {
     /// dispatch; reviewer uses this to scope `checkout_repo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — RFC3339
-    /// timestamp captured the first time `status` transitions to
-    /// `in_progress` via `TaskEvent::InProgress`. Used by the
-    /// daemon-side anti-stall scanner to compute elapsed time
-    /// against `eta_secs`. `None` for tasks that never reached
-    /// in_progress OR pre-existed Sprint 59 schema migration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatched_at: Option<String>,
+    /// RFC3339 timestamp captured the first time `status`
+    /// transitions to `in_progress` via `TaskEvent::InProgress`.
+    /// Used by the daemon-side anti-stall scanner to compute
+    /// elapsed time against `eta_secs`. `None` for tasks that
+    /// never reached in_progress OR pre-existed Sprint 59 schema
+    /// migration.
+    ///
+    /// #807 Item 3: renamed `dispatched_at` → `started_at`. The
+    /// value is stamped on first InProgress (post-claim), not at
+    /// `send()` dispatch — old name was misleading. `serde(alias)`
+    /// preserves replay of legacy persisted JSON.
+    #[serde(
+        default,
+        alias = "dispatched_at",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub started_at: Option<String>,
     /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — operator-
     /// supplied estimate of seconds to completion. The anti-stall
     /// scanner emits a `task_stalled` inbox event when elapsed time
@@ -193,7 +202,7 @@ fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         updated_at: r.updated_at.clone(),
         due_at: r.due_at.clone(),
         branch: r.branch.clone(),
-        dispatched_at: r.dispatched_at.clone(),
+        started_at: r.started_at.clone(),
         eta_secs: r.eta_secs,
     }
 }
@@ -641,7 +650,22 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                 eta_secs: args["eta_secs"].as_i64(),
             };
             match crate::task_events::append(home, &emitter, event) {
-                Ok(_) => serde_json::json!({"id": id, "status": "created"}),
+                Ok(_) => {
+                    // #807 Item 1: response shape consistency. `event`
+                    // names the action verb; `task` carries the full
+                    // Task object so callers can read lifecycle status
+                    // (`task.status == "open"` after create, NOT the
+                    // event name "created"). Legacy `status` field
+                    // kept as back-compat alias.
+                    let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+                    serde_json::json!({
+                        "id": id,
+                        "event": "created",
+                        "task": task,
+                        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                        "status": "created",
+                    })
+                }
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
         }
@@ -730,7 +754,20 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {
-                    serde_json::json!({"id": id, "status": "claimed", "assignee": instance_name})
+                    // #807 Item 1: see create arm note. claim's
+                    // legacy `status` happens to match lifecycle
+                    // ("claimed"), but the field is still the action
+                    // event name semantically — kept as alias for
+                    // shape consistency.
+                    let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+                    serde_json::json!({
+                        "id": id,
+                        "event": "claimed",
+                        "task": task,
+                        "assignee": instance_name,
+                        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                        "status": "claimed",
+                    })
                 }
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
@@ -833,7 +870,15 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         let _ =
                             crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
                     }
-                    serde_json::json!({"id": id, "status": "done"})
+                    // #807 Item 1: see create arm note.
+                    let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+                    serde_json::json!({
+                        "id": id,
+                        "event": "done",
+                        "task": task,
+                        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                        "status": "done",
+                    })
                 }
                 Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
             }
@@ -1047,7 +1092,15 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                     });
                 }
             }
-            serde_json::json!({"id": id, "status": "updated"})
+            // #807 Item 1: see create arm note.
+            let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+            serde_json::json!({
+                "id": id,
+                "event": "updated",
+                "task": task,
+                // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                "status": "updated",
+            })
         }
         "sweep" => {
             // #806 manual board-hygiene sweep — distinct from the
@@ -1456,7 +1509,7 @@ mod tests {
             updated_at: "2026-04-27T00:00:00Z".into(),
             due_at: None,
             branch: None,
-            dispatched_at: None,
+            started_at: None,
             eta_secs: None,
         }
     }
@@ -2669,7 +2722,7 @@ mod tests {
                     updated_at: chrono::Utc::now().to_rfc3339(),
                     due_at: None,
                     branch: None,
-                    dispatched_at: None,
+                    started_at: None,
                     eta_secs: None,
                 });
             }
@@ -2733,7 +2786,7 @@ mod tests {
                 updated_at: chrono::Utc::now().to_rfc3339(),
                 due_at: None,
                 branch: None,
-                dispatched_at: None,
+                started_at: None,
                 eta_secs: None,
             });
             Ok(())
@@ -3613,5 +3666,146 @@ mod tests {
             "event-log.jsonl must carry the audit_reason"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #807 response shape consistency bundle — RED tests ──
+
+    #[test]
+    fn test_action_responses_carry_event_and_task_fields_with_lifecycle_status() {
+        // #807 Item 1 RED: create/claim/update/done responses today
+        // overload `status` with action-event names ("created" /
+        // "updated") that don't match the task's lifecycle status
+        // (which is "open" / unchanged). Post-fix: every action
+        // response gains an `event` field (the action verb) AND a
+        // `task` field (full Task object with the correct lifecycle
+        // `status`). The legacy `status` field stays as a back-compat
+        // alias per the dispatch spec (NOT removed).
+        let home = tmp_home("action_response_shape");
+        write_fleet_yaml(&home, &["agent-a"]);
+
+        // create
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "t1", "assignee": "agent-a"}),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        assert_eq!(
+            r["event"], "created",
+            "create must carry event=created: {r}"
+        );
+        assert_eq!(
+            r["task"]["status"], "open",
+            "create task object must carry lifecycle status=open: {r}"
+        );
+        assert_eq!(
+            r["status"], "created",
+            "back-compat status alias preserved (status=event for create): {r}"
+        );
+
+        // claim
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "claim", "id": id}),
+        );
+        assert_eq!(r["event"], "claimed", "claim must carry event=claimed: {r}");
+        assert_eq!(
+            r["task"]["status"], "claimed",
+            "claim task object must carry lifecycle status=claimed: {r}"
+        );
+
+        // update → in_progress
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        assert_eq!(
+            r["event"], "updated",
+            "update must carry event=updated: {r}"
+        );
+        assert_eq!(
+            r["task"]["status"], "in_progress",
+            "update task object must carry lifecycle status=in_progress (NOT 'updated'): {r}"
+        );
+
+        // done
+        let r = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "done", "id": id, "result": "shipped"}),
+        );
+        assert_eq!(r["event"], "done", "done must carry event=done: {r}");
+        assert_eq!(
+            r["task"]["status"], "done",
+            "done task object must carry lifecycle status=done: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_task_started_at_replaces_dispatched_at_in_serialized_output() {
+        // #807 Item 3 RED: today the Task struct field is named
+        // `dispatched_at` but the value is stamped on first transition
+        // to InProgress — so the operator's "when was this dispatched
+        // from send()?" reading is misleading. Rename to `started_at`
+        // (matches `claimed_at` naming, mental model honest). serde
+        // alias `dispatched_at` preserves replay of old persisted logs.
+        let home = tmp_home("started_at_rename");
+        write_fleet_yaml(&home, &["a"]);
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "t", "assignee": "a"}),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "update", "id": id, "status": "in_progress"}),
+        );
+        let listed = handle(&home, "a", &serde_json::json!({"action": "list"}));
+        let task = listed["tasks"][0].as_object().expect("task object in list");
+        assert!(
+            task.contains_key("started_at"),
+            "task must serialize `started_at` (not `dispatched_at`), got keys: {:?}",
+            task.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            task["started_at"].is_string(),
+            "started_at must be an RFC3339 string, got: {:?}",
+            task["started_at"]
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_task_deserialize_dispatched_at_alias_preserves_back_compat() {
+        // #807 Item 3: persisted JSON carrying the old `dispatched_at`
+        // field name MUST still deserialize into the renamed
+        // `started_at` field via `#[serde(alias = "dispatched_at")]`.
+        // Locks the contract that pre-rename task_events.jsonl files
+        // and external test fixtures keep working post-migration.
+        let raw_old = serde_json::json!({
+            "id": "t-test-back-compat",
+            "title": "old",
+            "description": "",
+            "status": "open",
+            "priority": "normal",
+            "assignee": null,
+            "created_by": "test",
+            "depends_on": [],
+            "result": null,
+            "created_at": "2026-04-01T00:00:00Z",
+            "updated_at": "2026-04-01T00:00:00Z",
+            "dispatched_at": "2026-04-02T00:00:00Z",
+        });
+        let t: Task = serde_json::from_value(raw_old).expect("deserialize old shape");
+        assert_eq!(
+            t.started_at.as_deref(),
+            Some("2026-04-02T00:00:00Z"),
+            "serde alias must map legacy `dispatched_at` → new `started_at`"
+        );
     }
 }

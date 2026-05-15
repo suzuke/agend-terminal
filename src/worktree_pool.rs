@@ -109,7 +109,13 @@ pub struct ReleaseOutcome {
     pub worktree_removed: bool,
     pub binding_removed: bool,
     pub branch_deleted: bool,
+    // #807 Item 2: drop optional keys on success so clients
+    // don't render `"error": null` as an `<error>` envelope.
+    // Real failures still emit `error` (skip_serializing_if
+    // drops `None` only, never `Some`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_cleanup_skipped_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -1611,5 +1617,60 @@ mod tests {
             "new-layout released worktree past grace should be GC candidate"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #807 Item 2 — ReleaseOutcome serialization shape ──
+
+    #[test]
+    fn test_release_outcome_success_omits_error_key() {
+        // #807 Item 2 RED: pre-fix `ReleaseOutcome` always serializes
+        // `error: None` → `"error": null`, which client renderers
+        // (Claude Code, etc.) interpret as an `<error>` envelope on
+        // what is actually a successful release. Fix: add
+        // `#[serde(skip_serializing_if = "Option::is_none")]` so the
+        // `error` key is absent on success.
+        let outcome = ReleaseOutcome {
+            released: true,
+            worktree_removed: true,
+            binding_removed: true,
+            branch_deleted: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&outcome).expect("serialize");
+        let obj = json.as_object().expect("object shape");
+        assert!(
+            !obj.contains_key("error"),
+            "success response must NOT carry `error` key (#807 cosmetic fix), got keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !obj.contains_key("branch_cleanup_skipped_reason"),
+            "success response must NOT carry `branch_cleanup_skipped_reason` when None, got keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_release_outcome_real_failure_emits_error_key() {
+        // #807 Item 2 contract guarantee: actual failures STILL emit
+        // the `error` field. Only the `None`-on-success case is
+        // omitted — `skip_serializing_if` only drops `None`, never
+        // `Some`.
+        let outcome = ReleaseOutcome {
+            released: false,
+            error: Some("test failure".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&outcome).expect("serialize");
+        let obj = json.as_object().expect("object shape");
+        assert!(
+            obj.contains_key("error"),
+            "real failure must surface `error` key, got keys: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            obj["error"], "test failure",
+            "error message must round-trip unchanged"
+        );
     }
 }

@@ -429,13 +429,17 @@ pub struct TaskRecord {
     /// `Some(false)` means RCA/audit/design class; auto-bind was skipped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind: Option<bool>,
-    /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — RFC3339
-    /// timestamp captured when the task first transitions to
-    /// `in_progress`. Set in the `TaskEvent::InProgress` arm of
+    /// RFC3339 timestamp captured when the task first transitions
+    /// to `in_progress`. Set in the `TaskEvent::InProgress` arm of
     /// [`TaskBoardState::apply`]; idempotent (only first transition
     /// records the timestamp).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatched_at: Option<String>,
+    ///
+    /// #807 Item 3: renamed `dispatched_at` → `started_at`. The
+    /// stamp lands on InProgress (post-claim), not at `send()`
+    /// dispatch. `serde(alias)` preserves replay of legacy
+    /// task_events.jsonl carrying the prior field name.
+    #[serde(alias = "dispatched_at", skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
     /// Sprint 59 Wave 1 PR-1 (#9 task stall watchdog) — operator-
     /// supplied estimate of seconds to completion, sourced from the
     /// `eta_secs` field on `TaskEvent::Created` (or a future
@@ -537,7 +541,7 @@ impl TaskBoardState {
                         result: None,
                         branch: branch.clone(),
                         bind: *bind,
-                        dispatched_at: None,
+                        started_at: None,
                         eta_secs: *eta_secs,
                     });
             }
@@ -555,15 +559,13 @@ impl TaskBoardState {
                     t.status = TaskStatus::InProgress;
                     t.owner = Some(by.clone());
                     t.updated_at = touch_at.clone();
-                    // Sprint 59 Wave 1 PR-1: set dispatched_at on FIRST
-                    // transition to InProgress. Subsequent re-entries
-                    // (e.g. after a Released → Claimed → InProgress
-                    // cycle) leave the original dispatched_at intact —
-                    // the anti-stall scanner cares about "when did the
-                    // task start being worked on", not the latest
-                    // checkpoint.
-                    if t.dispatched_at.is_none() {
-                        t.dispatched_at = Some(touch_at);
+                    // #807 Item 3: stamp started_at on FIRST transition
+                    // to InProgress (renamed from dispatched_at — the
+                    // value lands here post-claim, not at send()).
+                    // Subsequent re-entries (Released → Claimed →
+                    // InProgress cycle) preserve the original stamp.
+                    if t.started_at.is_none() {
+                        t.started_at = Some(touch_at);
                     }
                 }
             }
@@ -1950,7 +1952,7 @@ mod tests {
         // Pre-claim: dispatched_at is None.
         let pre = replay(&home).unwrap();
         let pre_t = pre.tasks.get(&tid).unwrap();
-        assert!(pre_t.dispatched_at.is_none(), "pre-claim: no dispatched_at");
+        assert!(pre_t.started_at.is_none(), "pre-claim: no dispatched_at");
 
         append(
             &home,
@@ -1963,7 +1965,7 @@ mod tests {
         .unwrap();
         // Post-claim, pre-in_progress: still None.
         let mid = replay(&home).unwrap();
-        assert!(mid.tasks.get(&tid).unwrap().dispatched_at.is_none());
+        assert!(mid.tasks.get(&tid).unwrap().started_at.is_none());
 
         append(
             &home,
@@ -1978,7 +1980,7 @@ mod tests {
         let post = replay(&home).unwrap();
         let post_t = post.tasks.get(&tid).unwrap();
         assert!(
-            post_t.dispatched_at.is_some(),
+            post_t.started_at.is_some(),
             "in_progress must set dispatched_at: {post_t:?}"
         );
         std::fs::remove_dir_all(&home).ok();
@@ -2034,7 +2036,7 @@ mod tests {
             .tasks
             .get(&tid)
             .unwrap()
-            .dispatched_at
+            .started_at
             .clone();
         assert!(first_dispatched.is_some());
 
@@ -2075,7 +2077,7 @@ mod tests {
             .tasks
             .get(&tid)
             .unwrap()
-            .dispatched_at
+            .started_at
             .clone();
         assert_eq!(
             first_dispatched, second_dispatched,

@@ -122,7 +122,7 @@ pub(crate) fn check_stalled(
     // sidecar timestamp if present, else dispatched_at. No anchor →
     // skip stall detection (can't compute elapsed without one).
     let last_alive = crate::daemon::task_progress::read_last_progress_at(home, &task.id)
-        .or_else(|| task.dispatched_at.as_deref().and_then(parse_rfc3339))?;
+        .or_else(|| task.started_at.as_deref().and_then(parse_rfc3339))?;
     let elapsed_secs = now.signed_duration_since(last_alive).num_seconds();
     let stall_threshold = (eta_secs as f64 * STALL_MULTIPLIER) as i64;
     if elapsed_secs > stall_threshold {
@@ -162,13 +162,13 @@ fn stall_recipients() -> Vec<String> {
 fn emit_stall(home: &Path, task: &Task, reason: &str) {
     let text = format!(
         "[task_stalled] {tid} '{title}' stalled — {reason}. \
-         dispatched_at={dispatched_at}, eta_secs={eta_secs}, assignee={assignee}. \
+         started_at={started_at}, eta_secs={eta_secs}, assignee={assignee}. \
          Consider: lead re-dispatch / dev unblock-ping / task action=update with \
          status=blocked + reason if dependency.",
         tid = task.id,
         title = task.title,
         reason = reason,
-        dispatched_at = task.dispatched_at.as_deref().unwrap_or("?"),
+        started_at = task.started_at.as_deref().unwrap_or("?"),
         eta_secs = task
             .eta_secs
             .map(|e| e.to_string())
@@ -240,12 +240,7 @@ mod tests {
         dir
     }
 
-    fn make_task(
-        id: &str,
-        status: &str,
-        eta_secs: Option<i64>,
-        dispatched_at: Option<&str>,
-    ) -> Task {
+    fn make_task(id: &str, status: &str, eta_secs: Option<i64>, started_at: Option<&str>) -> Task {
         Task {
             id: id.to_string(),
             title: format!("test task {id}"),
@@ -261,7 +256,7 @@ mod tests {
             updated_at: chrono::Utc::now().to_rfc3339(),
             due_at: None,
             branch: None,
-            dispatched_at: dispatched_at.map(String::from),
+            started_at: started_at.map(String::from),
             eta_secs,
         }
     }
