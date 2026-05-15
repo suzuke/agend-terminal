@@ -2,9 +2,7 @@ use crate::agent::{self, AgentRegistry};
 use std::path::Path;
 use std::sync::Arc;
 
-#[cfg(test)]
-use super::provider::MergeableState;
-use super::provider::{CiPollResult, CiProvider, CiRun, PrState};
+use super::provider::{CiPollResult, CiProvider, CiRun, MergeableState, PrState};
 use super::registry::{
     ci_watches_dir, parse_subscribers, remove_watch, update_watch_state,
     update_watch_state_with_notify,
@@ -120,41 +118,104 @@ fn watch_is_due(last_polled_at: Option<i64>, interval_secs: u64, now_ms: i64) ->
     }
 }
 
-// ── #813 stubs — real impl lands in C2/C3/C4 ─────────────────────────
+// ── #813 ci_watch CONFLICTING PR detection ──
 
-/// #813: emit a `[ci-conflict-detected]` headline to every subscriber.
-/// Mirrors the existing terminal-run fan-out at the ci_check_repo
-/// `for sub in subscribers` loop — in-band inject + inbox enqueue
-/// for persistence. Stub returns a no-op pre-C2; real impl lands in
-/// C2 with the production fan-out code.
+/// #813: emit a `[ci-conflict-detected]` headline to every subscriber's
+/// inbox. Persists to JSONL via `crate::inbox::enqueue` so the
+/// operator sees the alert on the next inbox read. NO in-band PTY
+/// inject here (unlike the terminal-run fan-out) because the
+/// `handle_watch_ci` caller doesn't carry an `&AgentRegistry`; the
+/// inbox enqueue alone provides the durable signal and the next
+/// inbox poll surfaces it within seconds.
+///
+/// `source` is recorded in the alert body so the operator can
+/// distinguish on-watch-start triggers ("watch-start") from periodic
+/// re-check triggers ("poll-transition"). Dead-code allow lifts at
+/// C3 (handle_watch_ci wires the on-start path) + C4 (poller wires
+/// the periodic re-check).
 #[allow(dead_code)]
 pub fn emit_ci_conflict_alert(
-    _home: &Path,
-    _repo: &str,
-    _branch: &str,
-    _subscribers: &[String],
-    _source: &str,
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    subscribers: &[String],
+    source: &str,
 ) {
-    // Stub — see doc comment. Real impl lands in C2.
+    let body = format!(
+        "[ci-conflict-detected] {repo}@{branch}: PR is CONFLICTING with base. \
+         CI workflow trigger blocked until rebase. \
+         URL: https://github.com/{repo}/pulls?q=is%3Apr+head%3A{branch} \
+         (source: {source})"
+    );
+    for sub in subscribers {
+        let _ = crate::inbox::enqueue(
+            home,
+            sub,
+            crate::inbox::InboxMessage {
+                schema_version: 0,
+                id: None,
+                read_at: None,
+                thread_id: None,
+                parent_id: None,
+                task_id: None,
+                force_meta: None,
+                correlation_id: None,
+                reviewed_head: None,
+                from: "system:ci".to_string(),
+                text: body.clone(),
+                kind: Some("ci-watch".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                channel: None,
+                delivery_mode: None,
+                attachments: vec![],
+                in_reply_to_msg_id: None,
+                in_reply_to_excerpt: None,
+                superseded_by: None,
+                from_id: None,
+                broadcast_context: None,
+                sequencing: None,
+                eta_minutes: None,
+                reporting_cadence: None,
+                worktree_binding_required: None,
+            },
+        );
+    }
 }
 
-/// #813: on-watch-start mergeable check. Queries the provider for
-/// the PR's mergeable state and emits a `[ci-conflict-detected]`
-/// alert if CONFLICTING (DIRTY). Updates the watch JSON with the
-/// observed state + check timestamp so the periodic re-check in
-/// Part B (`ci_check_repo`) can de-dupe transitions. Fail-open on
-/// any query error (Unknown → no alert, no block). Stub returns
-/// without side-effect pre-C3.
+/// #813: on-watch-start mergeable check. Queries the provider via
+/// the blocking variant (sync caller — `handle_watch_ci` is non-async),
+/// caches the observed state into the watch JSON, and emits a
+/// `[ci-conflict-detected]` alert when CONFLICTING. Fail-open on
+/// Unknown (no alert, no block — preserves behavior under transient
+/// GH outages). Dead-code allow lifts at C3 when handle_watch_ci
+/// wires the call site.
 #[allow(dead_code)]
 pub fn watch_start_check_mergeable(
-    _home: &Path,
-    _watch_path: &Path,
-    _repo: &str,
-    _branch: &str,
-    _subscribers: &[String],
-    _provider: &dyn CiProvider,
+    home: &Path,
+    watch_path: &Path,
+    repo: &str,
+    branch: &str,
+    subscribers: &[String],
+    provider: &dyn CiProvider,
 ) {
-    // Stub — see doc comment. Real impl lands in C3.
+    let state = provider.check_pr_mergeable_blocking(repo, branch);
+    // Cache the observed state regardless of variant so the poll
+    // cycle's transition detector has a baseline. UNKNOWN is cached
+    // too — distinguishes "never checked" (field absent) from
+    // "checked but uncertain" (field present, value UNKNOWN).
+    let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+    if let Ok(content) = std::fs::read_to_string(watch_path) {
+        if let Ok(mut w) = serde_json::from_str::<serde_json::Value>(&content) {
+            w["last_mergeable_state"] = serde_json::json!(state.as_str());
+            w["last_mergeable_check_at"] = serde_json::json!(now_rfc3339);
+            if let Ok(out) = serde_json::to_string_pretty(&w) {
+                let _ = std::fs::write(watch_path, out);
+            }
+        }
+    }
+    if matches!(state, MergeableState::Conflicting) {
+        emit_ci_conflict_alert(home, repo, branch, subscribers, "watch-start");
+    }
 }
 
 /// Inner implementation that accepts a provider factory for testability.

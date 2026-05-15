@@ -207,9 +207,8 @@ pub trait CiProvider: Send + Sync {
     /// GitLab / Bitbucket return `Unknown` (unverified — no operator
     /// has exercised the path) and the caller's fail-open guard
     /// suppresses the alert. Promotion blocked behind a fleet
-    /// running on that backend.
-    ///
-    /// Dead-code allow lifts at C3/C4 when watcher + poller wire it.
+    /// running on that backend. Dead-code allow lifts at C4 when the
+    /// periodic re-check call site lands in `ci_check_repo`.
     #[allow(dead_code)]
     async fn check_pr_mergeable(&self, repo: &str, branch: &str) -> MergeableState {
         let _ = (repo, branch);
@@ -218,21 +217,26 @@ pub trait CiProvider: Send + Sync {
 
     /// #813: synchronous variant for non-async callers (handler-layer
     /// MCP entry points that need a blocking answer on watch-start).
-    /// Wraps the async via the current tokio runtime — both daemon
-    /// and MCP handler tasks live inside a runtime, so the `block_on`
-    /// always finds a context. Returns `Unknown` if no runtime is
-    /// available (test harness without `#[tokio::test]`).
+    /// Always runs the async future on a fresh current-thread runtime
+    /// in a scoped thread — works regardless of whether the caller is
+    /// already inside a tokio runtime (avoids the multi-thread vs
+    /// current-thread runtime-flavor branch). Dead-code allow lifts
+    /// at C3 when handle_watch_ci wires the call site.
     #[allow(dead_code)]
     fn check_pr_mergeable_blocking(&self, repo: &str, branch: &str) -> MergeableState {
-        let handle = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return MergeableState::Unknown,
-        };
-        // Bridge to async via `block_in_place` so we don't deadlock on
-        // single-threaded runtimes. `tokio::task::block_in_place`
-        // requires multi-thread runtime; fall back to `Handle::block_on`
-        // when not available.
-        tokio::task::block_in_place(|| handle.block_on(self.check_pr_mergeable(repo, branch)))
+        std::thread::scope(|s| {
+            let handle = s.spawn(|| {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return MergeableState::Unknown,
+                };
+                rt.block_on(self.check_pr_mergeable(repo, branch))
+            });
+            handle.join().unwrap_or(MergeableState::Unknown)
+        })
     }
 
     /// Fetch a human-readable summary of the first failed job/step.
@@ -420,6 +424,62 @@ impl CiProvider for GitHubCiProvider {
                 }
             }
             None => PrState::Unknown,
+        }
+    }
+
+    /// #813: Query the PR's `mergeable_state` field. Requires two
+    /// GETs because the list endpoint doesn't compute `mergeable` —
+    /// only the per-PR detail endpoint does. Per GitHub docs:
+    /// https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    ///
+    /// Fail-open on any error (network, auth, parse, missing) so the
+    /// caller's guard suppresses the alert under transient issues.
+    async fn check_pr_mergeable(&self, repo: &str, branch: &str) -> MergeableState {
+        let owner = repo.split('/').next().unwrap_or("");
+        // (1) List endpoint to resolve PR number from branch.
+        let list: serde_json::Value = match self
+            .http
+            .get(&format!(
+                "repos/{repo}/pulls?head={owner}:{branch}&state=open&per_page=1"
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return MergeableState::Unknown,
+            },
+            Err(_) => return MergeableState::Unknown,
+        };
+        let pr_number = match list
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|pr| pr["number"].as_u64())
+        {
+            Some(n) => n,
+            None => return MergeableState::Unknown,
+        };
+        // (2) Detail endpoint reads `mergeable_state` (computed
+        // asynchronously by GitHub post-push — value may be "unknown"
+        // for ~seconds after a push, which we surface as Unknown).
+        let detail: serde_json::Value = match self
+            .http
+            .get(&format!("repos/{repo}/pulls/{pr_number}"))
+            .send()
+            .await
+        {
+            Ok(r) => match r.json().await {
+                Ok(v) => v,
+                Err(_) => return MergeableState::Unknown,
+            },
+            Err(_) => return MergeableState::Unknown,
+        };
+        match detail["mergeable_state"].as_str() {
+            Some("dirty") => MergeableState::Conflicting,
+            Some("clean") => MergeableState::Mergeable,
+            Some("blocked") | Some("behind") => MergeableState::Unstable,
+            Some("unstable") => MergeableState::Mergeable,
+            _ => MergeableState::Unknown,
         }
     }
 
