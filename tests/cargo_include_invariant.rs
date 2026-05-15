@@ -7,7 +7,7 @@
 //! pointing at a path NOT in `[package].include` fails verbatim with
 //! `couldn't read src/../assets/hooks/...` during publish. Caught the
 //! hard way at:
-//! - **v0.4.0** — `docs/FLEET-DEV-PROTOCOL-v1.md` missing from include
+//! - **v0.4.0** — `docs/FLEET-DEV-PROTOCOL.md` missing from include
 //! - **v0.6.0** — `assets/hooks/*` missing (publish-blocker hotfix #505)
 //!
 //! Per #505 commit `2c124c0`: "Phase 2 invariant test (grep `include_str!`
@@ -325,15 +325,15 @@ fn mock_invariant_fires_when_protocol_doc_removed_from_include() {
     // v0.4.0 publish-blocker repro: drop the protocol doc include.
     let mock_patterns: Vec<String> = read_cargo_include()
         .into_iter()
-        .filter(|p| p != "docs/FLEET-DEV-PROTOCOL-v1.md")
+        .filter(|p| p != "docs/FLEET-DEV-PROTOCOL.md")
         .collect();
     let globs = compile_globs(&mock_patterns);
     let violations = scan_production_violations(&globs);
     assert!(
         violations
             .iter()
-            .any(|v| v.contains("docs/FLEET-DEV-PROTOCOL-v1.md")),
-        "mock-mutate dropping `docs/FLEET-DEV-PROTOCOL-v1.md` must surface \
+            .any(|v| v.contains("docs/FLEET-DEV-PROTOCOL.md")),
+        "mock-mutate dropping `docs/FLEET-DEV-PROTOCOL.md` must surface \
          the protocol.rs include — v0.4.0 publish-blocker repro. \
          Got violations:\n{}",
         violations.join("\n")

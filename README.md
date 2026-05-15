@@ -60,7 +60,7 @@ Skipping the shim skips the safety net (trailer, deny matrix, registry). Use it 
 
 ### Where to read more
 
-- [`docs/FLEET-DEV-PROTOCOL-v1.md`](docs/FLEET-DEV-PROTOCOL-v1.md) §13 — full bypass guideline
+- [`docs/FLEET-DEV-PROTOCOL.md`](docs/FLEET-DEV-PROTOCOL.md) §13 — full bypass guideline
 - [`docs/proposals/agend-git-shim.md`](docs/proposals/agend-git-shim.md) — design doc covering Phases 1-5
 - PRs [#446](https://github.com/suzuke/agend-terminal/pull/446) (Phase 1 trailer) · [#447](https://github.com/suzuke/agend-terminal/pull/447) (Phase 2 deny matrix) · [#449](https://github.com/suzuke/agend-terminal/pull/449) (Phase 3 lease) · [#454](https://github.com/suzuke/agend-terminal/pull/454) (Phase 4 GC dry-run) · [#455](https://github.com/suzuke/agend-terminal/pull/455) (Phase 5 hotspot)
 

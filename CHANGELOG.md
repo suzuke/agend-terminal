@@ -5,6 +5,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Changed
+
+- **`docs/FLEET-DEV-PROTOCOL-v1.md` → `docs/FLEET-DEV-PROTOCOL.md`** — drop the `-v1` from the filename. The document is internally versioned (header `v1.2 — 2026-05-15`) and the protocol has no v2 in flight; the `-v1` in the path was a 2025-era misnomer that suggested a parallel v2 file existed. Compile-time `include_str!` in `src/protocol.rs`, `Cargo.toml` `[package].include` whitelist, `tests/cargo_include_invariant.rs` test mock-pattern filter, README link, `docs/ARCHITECTURE-QUICK-START.md`, and `docs/LINT-DISCIPLINE.md` updated to track the new name. Operators with a hand-written override at `$AGEND_HOME/protocol/FLEET-DEV-PROTOCOL-v1.md` need to rename it to the new path; daemon does not auto-migrate (the override mechanism is rarely used in practice). Historical `CHANGELOG.md` v0.4.0 entry, archived sprint plans, and proposal docs keep the old name as accurate snapshots.
+- **Protocol §3.16–§3.18, §5, §6, §7.1–§7.2, §10.6–§10.7, §11.1, §13.5 added** — 12 new sections capturing this session's retrospective lessons: Phase 1 discussion discipline, static-review limits + runtime validation, reviewer audit conflict resolution, post-dispatch verification, pane-claim ≠ delivery, post-PR-merge close-loop reporting, inbox vs PTY delivery contract, CI tool identity + cache hygiene, cross-platform test idioms, lead pre-dispatch release, daemon empty-heartbeat commits, state persistence across daemon refresh, bug-blocks-its-own-fix BYPASS exception. Plus `release_worktree` parameter form clarification.
+
 ## [Workflow validation 2 — 2026-05-14] post #779 partial-fix canary pass (1 manual git branch step)
 
 ## [0.6.1] - 2026-05-10

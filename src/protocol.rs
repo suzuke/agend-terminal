@@ -6,10 +6,10 @@
 
 use std::path::{Path, PathBuf};
 
-const FILENAME: &str = "FLEET-DEV-PROTOCOL-v1.md";
+const FILENAME: &str = "FLEET-DEV-PROTOCOL.md";
 
 /// Embedded default protocol (compile-time).
-const DEFAULT_PROTOCOL: &str = include_str!("../docs/FLEET-DEV-PROTOCOL-v1.md");
+const DEFAULT_PROTOCOL: &str = include_str!("../docs/FLEET-DEV-PROTOCOL.md");
 
 /// Extract embedded protocol to `AGEND_HOME/protocol/.default/`.
 /// Always overwrites — `.default/` is daemon-owned.

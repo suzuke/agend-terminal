@@ -78,7 +78,7 @@ tokio::spawn(async move {
 });
 ```
 
-**Reference**: `FLEET-DEV-PROTOCOL-v1.md` §10.5. Tests are exempt
+**Reference**: `FLEET-DEV-PROTOCOL.md` §10.5. Tests are exempt
 (test helpers may spawn ad-hoc); trait methods inherit the caller's
 rationale.
 
