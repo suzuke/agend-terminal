@@ -1708,3 +1708,37 @@ fn clean_empty_init_commits_still_handles_canonical_init_empty() {
 
     std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
 }
+
+// ── #833 cleanup_init_commits trailer-whitelist body gate ──
+
+/// #833 C1 RED: a heartbeat-style commit with ONLY daemon-injected
+/// `Agend-*:` trailers in its body (the actual production state every
+/// bound-worktree commit lands in post-hook) must be DROPPED by
+/// `cleanup_init_commits`. Pre-#833 the body-emptiness gate (#822)
+/// saw the trailer block as non-empty and kept the commit —
+/// `repo cleanup_init_commits` was effectively a no-op on real
+/// daemon-managed worktrees. The same FP class I surfaced during
+/// #827 push prep.
+///
+/// Asserts the post-fix contract:
+/// - 1 commit cleaned (the canonical heartbeat shape)
+#[test]
+fn clean_empty_init_commits_drops_init_with_only_daemon_trailers() {
+    let (_repo, worktree) = setup_repo_and_worktree("833_trailer_only");
+    let trailer_block = "Agend-Agent: dev833\n\
+                         Agend-Task: t-20260515150751256952-0\n\
+                         Agend-Branch: fix/833-cleanup-init-trailer-whitelist\n\
+                         Agend-Issued-At: 2026-05-15T18:24:45+00:00";
+    empty_commit(&worktree, "init", Some(trailer_block));
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(result.is_ok(), "helper must succeed, got: {result:?}");
+    assert_eq!(
+        result.unwrap(),
+        1,
+        "`init` with only Agend-* trailers in body must be dropped \
+         (the operational case that motivated #833)",
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}

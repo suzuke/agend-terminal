@@ -915,6 +915,42 @@ fn is_heartbeat_subject(msg: &str) -> bool {
     HEARTBEAT_NAMES.contains(&msg)
 }
 
+/// #833: trailer keys the daemon's `prepare-commit-msg` hook injects
+/// into every bound-worktree commit (including the `commit
+/// --allow-empty -m "init"` heartbeats). The body-emptiness gate
+/// (`commit_body_is_empty`) must treat these as "empty for the gate's
+/// purpose" so `cleanup_init_commits` can actually remove the
+/// daemon-injected heartbeats — pre-#833 the gate kept them
+/// indefinitely because the trailer block isn't whitespace.
+///
+/// Sourced verbatim from `assets/hooks/prepare-commit-msg` lines 44-47
+/// (and the matching `.ps1` Windows variant). Exact-key match —
+/// partial-key trailers like `Agend-Agent-Token` are NOT stripped,
+/// preserving operator-extended trailer keys.
+///
+/// New daemon-injected trailers must extend this list. A follow-up
+/// invariant test (lead's post-batch backlog) will grep the hook
+/// script and pin the constants in sync.
+const KNOWN_TRAILER_KEYS: &[&str] = &[
+    "Agend-Agent",
+    "Agend-Task",
+    "Agend-Branch",
+    "Agend-Issued-At",
+];
+
+/// #833: strip lines that look like `<KEY>: <value>` where KEY is in
+/// [`KNOWN_TRAILER_KEYS`]. Leading whitespace tolerated (the hook
+/// emits unindented but `.trim_start()` is defensive). The
+/// `starts_with(k) && trimmed[k.len()..].starts_with(':')` two-step
+/// ensures `Agend-Agent` matches only `Agend-Agent:`, NOT
+/// `Agend-Agent-Token:` (partial-prefix regression-proof).
+///
+/// C1 stub: returns the input unchanged so the RED acceptance test
+/// fails (trailer body still flags non-empty). C2 fills the body.
+fn strip_known_trailers(body: &str) -> String {
+    body.to_string()
+}
+
 /// #822: returns true iff the commit's body (the part after the
 /// subject line) is empty or whitespace-only. Guards the whitelist
 /// from dropping commits with legitimate body notes that happen to
@@ -936,7 +972,15 @@ fn commit_body_is_empty(worktree: &Path, hash: &str) -> bool {
         .env("AGEND_GIT_BYPASS", "1")
         .output();
     match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Ok(o) if o.status.success() => {
+            // #833: strip daemon-injected trailers before the empty
+            // check. The hook injects `Agend-*:` trailers into every
+            // bound-worktree commit, so a heartbeat's "body" is never
+            // literally empty post-hook — but it IS empty in the
+            // operator-content sense.
+            let body = String::from_utf8_lossy(&o.stdout);
+            strip_known_trailers(&body).trim().is_empty()
+        }
         _ => true,
     }
 }
