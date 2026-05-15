@@ -517,4 +517,222 @@ mod tests {
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
+
+    // ── #817 apply-path tests ──
+
+    #[test]
+    fn test_branch_sweep_apply_deletes_confirmed_subset() {
+        // GREEN: emit_delete_batch runs `git branch -D <name>` for
+        // each confirm_id and writes a `branch_sweep_apply` event-log
+        // entry per success. Confirms double-opt-in actually deletes
+        // the named branches AND records source SHA for restore.
+        let repo = setup_repo("apply_subset");
+        let home = repo.parent().unwrap().to_path_buf();
+        // Create two clean-merged branches; only delete the first.
+        create_branch_with_commit(&repo, "feat-keep", "feat: keep");
+        git_run(
+            &repo,
+            &["merge", "--no-ff", "-m", "merge feat-keep", "feat-keep"],
+        );
+        create_branch_with_commit(&repo, "feat-delete", "feat: delete");
+        git_run(
+            &repo,
+            &["merge", "--no-ff", "-m", "merge feat-delete", "feat-delete"],
+        );
+
+        let now = chrono::Utc::now();
+        let cats = scan(&repo, "main", STALE_IDLE_DEFAULT_DAYS, now).expect("scan");
+        assert_eq!(
+            cats.clean_merged.len(),
+            2,
+            "two branches expected: {cats:?}"
+        );
+
+        let mut confirm = std::collections::HashSet::new();
+        confirm.insert("feat-delete".to_string());
+
+        let applied =
+            emit_delete_batch(&home, &repo, &cats, &confirm, "post-#817 test apply").expect("emit");
+        assert_eq!(applied, 1, "exactly 1 deletion expected");
+
+        // feat-delete is gone; feat-keep still exists.
+        let post = enumerate_branches(&repo).expect("enumerate");
+        let names: Vec<&str> = post.iter().map(|b| b.name.as_str()).collect();
+        assert!(!names.contains(&"feat-delete"), "feat-delete must be gone");
+        assert!(names.contains(&"feat-keep"), "feat-keep must remain");
+
+        // Event-log entry per success.
+        let log_path = home.join("event-log.jsonl");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log.contains("branch_sweep_apply"),
+            "event-log must record branch_sweep_apply, got: {log}"
+        );
+        assert!(
+            log.contains("feat-delete"),
+            "event-log must name the deleted branch"
+        );
+        assert!(
+            log.contains("post-#817 test apply"),
+            "event-log must carry the audit_reason"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_branch_sweep_apply_skips_unknown_confirm_id() {
+        // GREEN: emit_delete_batch tolerates confirm_ids that aren't
+        // in any category (e.g. operator typo). Skips silently (the
+        // handler-level validator rejects these BEFORE calling this
+        // function, so emit_delete_batch's contract is "do best-effort
+        // for the candidates it recognizes"). Returns 0 deletions.
+        let repo = setup_repo("apply_skip_unknown");
+        let home = repo.parent().unwrap().to_path_buf();
+        let cats = Categories::default(); // empty
+        let mut confirm = std::collections::HashSet::new();
+        confirm.insert("nonexistent-branch".to_string());
+        let applied =
+            emit_delete_batch(&home, &repo, &cats, &confirm, "unknown probe").expect("emit");
+        assert_eq!(
+            applied, 0,
+            "unknown confirm_ids yield 0 deletions, not errors"
+        );
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_branch_sweep_handler_apply_requires_audit_reason_and_confirm_ids() {
+        // GREEN: handler validator rejects apply=true with missing
+        // confirm_ids OR missing audit_reason. Sets up a minimal
+        // binding so the handler can resolve source_repo.
+        let repo = setup_repo("handler_validators");
+        let home = repo.parent().unwrap().to_path_buf();
+        let agent = "test-agent";
+        let binding_dir = home.join("runtime").join(agent);
+        std::fs::create_dir_all(&binding_dir).expect("mkdir");
+        std::fs::write(
+            binding_dir.join("binding.json"),
+            serde_json::json!({
+                "source_repo": repo.display().to_string(),
+                "branch": "feature",
+                "worktree": repo.display().to_string(),
+            })
+            .to_string(),
+        )
+        .expect("write binding");
+
+        // apply=true without confirm_ids → reject.
+        let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            &home,
+            &serde_json::json!({"agent": agent, "apply": true}),
+            agent,
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .map(|e| e.contains("confirm_ids"))
+                .unwrap_or(false),
+            "missing confirm_ids must reject: {r}"
+        );
+        assert_eq!(r["code"], "missing_confirm_ids");
+
+        // apply=true with confirm_ids but no audit_reason → reject.
+        let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            &home,
+            &serde_json::json!({
+                "agent": agent,
+                "apply": true,
+                "confirm_ids": ["some-branch"],
+            }),
+            agent,
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .map(|e| e.contains("audit_reason"))
+                .unwrap_or(false),
+            "missing audit_reason must reject: {r}"
+        );
+        assert_eq!(r["code"], "missing_audit_reason");
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_branch_sweep_handler_active_unknown_requires_explicit_opt_in() {
+        // GREEN: a branch in `active_unknown` (recent, unmerged, not
+        // squash-applied) is NOT in `candidate_ids` (deletable_ids
+        // excludes active_unknown). Handler's dry-run surfaces it
+        // separately so the operator can SEE it. Operator can still
+        // delete it by passing its name in confirm_ids — handler's
+        // subset check uses all_ids (which DOES include
+        // active_unknown). Locks the explicit-opt-in contract.
+        let repo = setup_repo("active_unknown_opt_in");
+        let home = repo.parent().unwrap().to_path_buf();
+        let agent = "test-agent";
+        let binding_dir = home.join("runtime").join(agent);
+        std::fs::create_dir_all(&binding_dir).expect("mkdir");
+        std::fs::write(
+            binding_dir.join("binding.json"),
+            serde_json::json!({
+                "source_repo": repo.display().to_string(),
+                "branch": "feature",
+                "worktree": repo.display().to_string(),
+            })
+            .to_string(),
+        )
+        .expect("write binding");
+
+        // Create a recent unmerged branch → active_unknown.
+        create_branch_with_commit(&repo, "wip-active", "feat: active wip");
+
+        // Dry-run: candidate_ids should be empty for wip-active
+        // (only deletable buckets); active_unknown is in categories
+        // but not in candidate_ids.
+        let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            &home,
+            &serde_json::json!({"agent": agent}),
+            agent,
+        );
+        let candidate_ids: Vec<&str> = r["candidate_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !candidate_ids.contains(&"wip-active"),
+            "wip-active must NOT be in candidate_ids (active_unknown opt-in), got: {candidate_ids:?}"
+        );
+        let active_unknown: Vec<&str> = r["categories"]["active_unknown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert!(
+            active_unknown.contains(&"wip-active"),
+            "wip-active must appear in active_unknown bucket for visibility, got: {active_unknown:?}"
+        );
+
+        // Apply with wip-active in confirm_ids → handler accepts
+        // (subset check uses all_ids, NOT deletable_ids).
+        let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            &home,
+            &serde_json::json!({
+                "agent": agent,
+                "apply": true,
+                "confirm_ids": ["wip-active"],
+                "audit_reason": "explicit opt-in for active_unknown",
+            }),
+            agent,
+        );
+        assert_eq!(
+            r["applied"], 1,
+            "explicit confirm_ids opt-in must delete active_unknown branch: {r}"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
 }
