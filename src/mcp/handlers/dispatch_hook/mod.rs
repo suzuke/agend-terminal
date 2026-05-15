@@ -788,6 +788,21 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
         }
     }
 
+    // #814: high-count diagnostic. Emit a tracing warn when the
+    // empty-init count exceeds the threshold so post-incident
+    // analysis can identify "slow rebase" cases. KISS hardcoded
+    // constant — the warning is a "slow op may follow" signal,
+    // not a hard cap. Operators seeing this regularly should
+    // investigate upstream (why are session-checkpoint heartbeats
+    // accumulating over 30 inits before the next push?).
+    if empty_inits.len() > INIT_COUNT_WARN_THRESHOLD {
+        tracing::warn!(
+            count = empty_inits.len(),
+            threshold = INIT_COUNT_WARN_THRESHOLD,
+            "#814: high empty-init count — cleanup may be slow"
+        );
+    }
+
     // Mixed: use interactive rebase to drop empty inits.
     // Build a sed script that changes "pick <hash>" to "drop <hash>" for each empty init.
     // Use `sed -i.bak` for cross-platform compat (macOS requires suffix, Linux accepts it).
@@ -810,11 +825,33 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
         }
         Ok(_) | Err(_) => {
             // Abort failed rebase to leave worktree in clean state.
-            let _ = std::process::Command::new("git")
+            // #814: capture the abort status + warn on failure. Pre-fix
+            // the abort was silently swallowed via `let _ = ...`, which
+            // hid the very signal that becomes the next call's stale-
+            // state issue. With this surfaced, post-incident audit can
+            // confirm whether abort itself failed (the upstream cause
+            // of the rebase-merge dir persisting across attempts).
+            let abort = std::process::Command::new("git")
                 .args(["rebase", "--abort"])
                 .current_dir(worktree)
                 .env("AGEND_GIT_BYPASS", "1")
                 .status();
+            match &abort {
+                Ok(s) if !s.success() => {
+                    tracing::warn!(
+                        abort_status = ?s,
+                        "#814: git rebase --abort failed — rebase-merge dir may persist; \
+                         next clean_empty_init_commits call auto-clears via clear_stale_rebase_state"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "#814: git rebase --abort spawn failed — rebase-merge dir may persist"
+                    );
+                }
+                _ => {}
+            }
             tracing::warn!("failed to rebase-drop empty init commits");
             Err(match status {
                 Ok(s) => format!("git rebase -i exited with status {s:?}"),
@@ -823,6 +860,14 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
         }
     }
 }
+
+/// #814: threshold for the high-init-count tracing warn. Empty-init
+/// counts above this signal a slow `git rebase -i` ahead and an
+/// upstream issue worth investigating (why are heartbeats
+/// accumulating?). Hardcoded — not a hard cap, so config-ability
+/// adds no operator value. Matches the observed #807 incident
+/// count (32 inits > 30 threshold → warns).
+const INIT_COUNT_WARN_THRESHOLD: usize = 30;
 
 /// #814: clear `.git/.../rebase-merge` AND `rebase-apply` dirs that
 /// survived a prior failed cleanup attempt. Called at the top of

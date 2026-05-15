@@ -1499,3 +1499,68 @@ fn clean_empty_init_commits_recovers_from_stale_rebase_merge_dir() {
 
     std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
 }
+
+#[test]
+fn clean_empty_init_commits_handles_50_interleaved_inits() {
+    // #814 perf coverage: 50 inits + 4 real commits + threshold
+    // warn fires (50 > 30). Must complete within a generous bound
+    // (30s on slow CI machines) so the helper isn't accidentally
+    // unbounded. Validates Cause 2 (30+ ceiling) is NOT a hard
+    // ceiling — just a tracing warn signal.
+    let (_repo, worktree) = setup_repo_and_worktree("high_count");
+    create_interleaved_commit_chain(&worktree, 50, 4);
+
+    let start = std::time::Instant::now();
+    let result = super::clean_empty_init_commits(&worktree);
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "50-init case must succeed (Cause 2 not a hard ceiling), got: {result:?}"
+    );
+    assert_eq!(result.unwrap(), 50, "all 50 inits should be dropped",);
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "high-count must complete in < 30s, took {elapsed:?}"
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+#[test]
+fn clean_empty_init_commits_clears_stale_dir_even_when_no_inits_to_drop() {
+    // #814 edge case: stale rebase-merge dir survives a prior
+    // failed attempt, but the branch has since been fully cleaned
+    // (or the operator pushed and there are no inits to drop).
+    // The helper should still clear the stale dir defensively so
+    // subsequent calls aren't blocked, even when there's no work
+    // to do this cycle.
+    let (_repo, worktree) = setup_repo_and_worktree("no_inits_stale");
+    // No commits added beyond the worktree-creation point — but
+    // worktree branched off main so origin/main..HEAD is empty.
+    pre_poison_stale_rebase_merge(&worktree);
+    let gitdir_before = worktree_gitdir(&worktree);
+    assert!(
+        gitdir_before.join("rebase-merge").exists(),
+        "pre-condition: stale dir exists"
+    );
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(
+        result.is_ok(),
+        "no-inits-with-stale-dir case must succeed, got: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "zero inits to drop, but call must not error",
+    );
+    // Stale dir was cleared at entry even though nothing else ran.
+    let gitdir = worktree_gitdir(&worktree);
+    assert!(
+        !gitdir.join("rebase-merge").exists(),
+        "stale rebase-merge dir must be cleared even in no-op case"
+    );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
