@@ -1147,4 +1147,36 @@ mod tests {
         assert!(!vt.wants_mouse());
         assert!(!vt.mouse_sgr());
     }
+
+    // ── #819 WIDE_CHAR_SPACER stale-char bug ──
+
+    #[test]
+    fn test_wide_char_spacer_clears_stale_buf_cell() {
+        // #819 RED test: at Site 1 (`render_to_buffer_inner`), the
+        // WIDE_CHAR_SPACER `continue` skips writing buf[(x, y)]. The
+        // ratatui Buffer is stateful across frames — previous frame's
+        // content at the spacer position survives. This test
+        // pre-poisons the spacer cell with a sentinel char, then
+        // renders. Pre-fix: sentinel survives (BUG). Post-fix:
+        // sentinel replaced with blank (SUT writes the spacer cell).
+        let mut vt = VTerm::new(10, 1);
+        // A CJK char has display width 2 — alacritty marks col 0 as
+        // WIDE_CHAR and col 1 as WIDE_CHAR_SPACER.
+        vt.process("中".as_bytes());
+        let area = ratatui::layout::Rect::new(0, 0, 10, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        // Pre-poison col=1 (the SPACER position) with a stale sentinel
+        // simulating a previous frame's char at that position.
+        buf[(1, 0)].set_char('X');
+        // Render the current frame.
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        // SPACER position must be blanked, NOT carry the previous
+        // frame's 'X'. This is the #819 fix's invariant.
+        assert_eq!(
+            buf[(1, 0)].symbol(),
+            " ",
+            "WIDE_CHAR_SPACER position must be blanked, got: {:?}",
+            buf[(1, 0)].symbol()
+        );
+    }
 }
