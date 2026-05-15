@@ -245,6 +245,32 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         }
     }
 
+    // #812: dispatch-time test-name validation. Extends §4.3
+    // hallucinated-fn check to the dispatch path so `cargo test`
+    // invocations naming a test that doesn't exist in the PR tree
+    // are rejected BEFORE the reviewer wastes a cycle on
+    // `no test matched`. Tree resolution priority: sender's bound
+    // worktree → recipient's daemon-managed path. None → fail-open
+    // with warn-log (don't block when only operator has the tree).
+    let branch = args["branch"].as_str();
+    if let Some(tree) =
+        crate::claim_verifier::resolve_dispatch_tree(home, sender.as_str(), Some(target), branch)
+    {
+        if let Err(detail) = crate::claim_verifier::validate_dispatch_test_names(task, &tree) {
+            return json!({
+                "error": detail,
+                "code": "test_name_not_found",
+            });
+        }
+    } else {
+        tracing::warn!(
+            sender = %sender.as_str(),
+            target = %target,
+            branch = ?branch,
+            "#812 dispatch test-name check skipped — no resolvable PR tree (sender unbound + no daemon worktree)"
+        );
+    }
+
     let mut msg = format!("[delegate_task] {task}");
     if force {
         if let Some(r) = force_reason {
