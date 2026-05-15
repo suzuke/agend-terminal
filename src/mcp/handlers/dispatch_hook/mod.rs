@@ -945,10 +945,16 @@ const KNOWN_TRAILER_KEYS: &[&str] = &[
 /// ensures `Agend-Agent` matches only `Agend-Agent:`, NOT
 /// `Agend-Agent-Token:` (partial-prefix regression-proof).
 ///
-/// C1 stub: returns the input unchanged so the RED acceptance test
-/// fails (trailer body still flags non-empty). C2 fills the body.
 fn strip_known_trailers(body: &str) -> String {
-    body.to_string()
+    body.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !KNOWN_TRAILER_KEYS
+                .iter()
+                .any(|k| trimmed.starts_with(k) && trimmed[k.len()..].starts_with(':'))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// #822: returns true iff the commit's body (the part after the
