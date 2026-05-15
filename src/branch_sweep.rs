@@ -107,30 +107,243 @@ impl Categories {
     }
 }
 
-/// #817 stub — real implementation lands in C2. Pre-fix returns
-/// empty Categories so the C1 RED tests fail at runtime (asserting
-/// non-empty buckets) rather than failing to compile.
+/// Enumerate local branches via `git for-each-ref`, parsing name +
+/// tip SHA + ISO-8601 committerdate per line.
 #[allow(dead_code)]
-pub(crate) fn scan(
-    _repo: &Path,
-    _base: &str,
-    _min_age_days: i64,
-    _now: chrono::DateTime<chrono::Utc>,
-) -> Result<Categories, String> {
-    Ok(Categories::default())
+fn enumerate_branches(repo: &Path) -> Result<Vec<BranchInfo>, String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)|%(objectname)|%(committerdate:iso8601-strict)",
+            "refs/heads/",
+        ])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .map_err(|e| format!("git for-each-ref spawn failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let branches: Vec<BranchInfo> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '|');
+            let name = parts.next()?.trim().to_string();
+            let tip_sha = parts.next()?.trim().to_string();
+            let committer_date = parts.next()?.trim().to_string();
+            if name.is_empty() || tip_sha.is_empty() {
+                return None;
+            }
+            Some(BranchInfo {
+                name,
+                tip_sha,
+                committer_date,
+            })
+        })
+        .collect();
+    Ok(branches)
 }
 
-/// #817 stub — real implementation lands in C2. Pre-fix returns 0
-/// (no deletions) so the C4 GREEN tests fail at runtime.
+/// Returns true if `branch` is reachable from `base` via a merge
+/// commit (`git branch --merged base` includes it). Used to detect
+/// the `clean_merged` category.
+#[allow(dead_code)]
+fn is_clean_merged(repo: &Path, base: &str, branch: &str) -> bool {
+    let output = std::process::Command::new("git")
+        .args(["branch", "--merged", base])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let Ok(o) = output else { return false };
+    if !o.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    stdout
+        .lines()
+        .map(|l| l.trim_start_matches('*').trim())
+        .any(|line| line == branch)
+}
+
+/// Returns true if every commit on `branch` is already applied to
+/// `base` as an equivalent patch (squash-merged). `git cherry base
+/// branch` output prefix per commit: `-` means present in base, `+`
+/// means missing. All-`-` (and at least one line) ⇒ squash-merged.
+#[allow(dead_code)]
+fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
+    let output = std::process::Command::new("git")
+        .args(["cherry", base, branch])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let Ok(o) = output else { return false };
+    if !o.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let mut had_any = false;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        had_any = true;
+        if !trimmed.starts_with('-') {
+            return false;
+        }
+    }
+    had_any
+}
+
+/// #817 scan local branches and categorize into the 4 buckets.
+/// `now` parameterized so `stale_idle` threshold testing isn't
+/// flaky around day boundaries. Dead-code allow lifts at C3 when
+/// the MCP handler wires the call site.
+#[allow(dead_code)]
+pub(crate) fn scan(
+    repo: &Path,
+    base: &str,
+    min_age_days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Categories, String> {
+    let branches = enumerate_branches(repo)?;
+    let mut cats = Categories::default();
+    for b in &branches {
+        if b.name == base {
+            continue;
+        }
+        // 1. clean_merged — reachable from base via merge commit.
+        if is_clean_merged(repo, base, &b.name) {
+            cats.clean_merged.push(Candidate {
+                name: b.name.clone(),
+                tip_sha: b.tip_sha.clone(),
+                reason: format!("merged into {base}"),
+            });
+            continue;
+        }
+        // 2. squash_merged — all commits already in base by patch-id.
+        if is_squash_merged(repo, base, &b.name) {
+            cats.squash_merged.push(Candidate {
+                name: b.name.clone(),
+                tip_sha: b.tip_sha.clone(),
+                reason: format!("all commits squash-applied to {base}"),
+            });
+            continue;
+        }
+        // 3. stale_idle — committer date older than threshold.
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&b.committer_date) {
+            let age = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
+            if age > chrono::Duration::days(min_age_days) {
+                cats.stale_idle.push(Candidate {
+                    name: b.name.clone(),
+                    tip_sha: b.tip_sha.clone(),
+                    reason: format!("idle {}d (>{min_age_days}d threshold)", age.num_days()),
+                });
+                continue;
+            }
+        }
+        // 4. active_unknown — residual.
+        cats.active_unknown.push(Candidate {
+            name: b.name.clone(),
+            tip_sha: b.tip_sha.clone(),
+            reason: "unmerged + not squash-applied + within freshness window".to_string(),
+        });
+    }
+    Ok(cats)
+}
+
+/// Apply phase — `git branch -D <name>` for each confirm_id under
+/// the `system:branch_sweep` identity. Each deletion records a
+/// `branch_sweep_apply` entry to `event-log.jsonl` with the source
+/// SHA so an operator can `git branch <name> <sha>` to restore.
+///
+/// Returns the count of successfully deleted branches. A per-branch
+/// failure logs the error but does not abort the batch — partial
+/// success is observable in the event log.
+///
+/// Dead-code allow lifts at C3 when the MCP handler wires the call.
 #[allow(dead_code)]
 pub(crate) fn emit_delete_batch(
-    _home: &Path,
-    _repo: &Path,
-    _categories: &Categories,
-    _confirm_ids: &std::collections::HashSet<String>,
-    _audit_reason: &str,
+    home: &Path,
+    repo: &Path,
+    categories: &Categories,
+    confirm_ids: &std::collections::HashSet<String>,
+    audit_reason: &str,
 ) -> Result<usize, String> {
-    Ok(0)
+    let mut name_to_candidate: std::collections::HashMap<&str, &Candidate> =
+        std::collections::HashMap::new();
+    for cand in categories
+        .clean_merged
+        .iter()
+        .chain(categories.squash_merged.iter())
+        .chain(categories.stale_idle.iter())
+        .chain(categories.active_unknown.iter())
+    {
+        name_to_candidate.insert(cand.name.as_str(), cand);
+    }
+    let category_of = |name: &str| -> &'static str {
+        if categories.clean_merged.iter().any(|c| c.name == name) {
+            "clean_merged"
+        } else if categories.squash_merged.iter().any(|c| c.name == name) {
+            "squash_merged"
+        } else if categories.stale_idle.iter().any(|c| c.name == name) {
+            "stale_idle"
+        } else {
+            "active_unknown"
+        }
+    };
+    let mut deleted = 0usize;
+    for name in confirm_ids {
+        let Some(cand) = name_to_candidate.get(name.as_str()) else {
+            continue;
+        };
+        let output = std::process::Command::new("git")
+            .args(["branch", "-D", name])
+            .current_dir(repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                deleted += 1;
+                let category = category_of(name);
+                crate::event_log::log(
+                    home,
+                    "branch_sweep_apply",
+                    "system:branch_sweep",
+                    &format!(
+                        "branch={name} category={category} sha={tip} reason={audit_reason} \
+                         restore_hint=`git branch {name} {tip}`",
+                        tip = cand.tip_sha
+                    ),
+                );
+            }
+            Ok(o) => {
+                crate::event_log::log(
+                    home,
+                    "branch_sweep_apply_failed",
+                    "system:branch_sweep",
+                    &format!(
+                        "branch={name} stderr={}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ),
+                );
+            }
+            Err(e) => {
+                crate::event_log::log(
+                    home,
+                    "branch_sweep_apply_failed",
+                    "system:branch_sweep",
+                    &format!("branch={name} spawn_error={e}"),
+                );
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -241,15 +454,25 @@ mod tests {
     #[test]
     fn test_branch_sweep_scan_categorizes_squash_merged() {
         // #817 RED 2: branch "feat-b" whose commit was squash-applied
-        // to main (cherry-pick or `git commit --amend -m` after merge)
-        // — `git cherry main feat-b` returns lines all prefixed `-`.
-        // Stub returns empty → assertion fails. C2 lands cherry
-        // detection.
+        // to main as a NEW commit with same patch-id but DIFFERENT
+        // SHA (mirrors GitHub's "Squash and merge" semantics). The
+        // detector must use `git cherry main feat-b` (patch-id based)
+        // — `git branch --merged` would miss this case because the
+        // feat-b SHA isn't reachable from main HEAD.
+        //
+        // To simulate the SHA-divergence: main advances by an
+        // unrelated commit FIRST, then we cherry-pick feat-b with
+        // `--no-commit` + commit with a different message. The
+        // resulting main HEAD has feat-b's patch but a fresh SHA.
         let repo = setup_repo("squash_merged");
         create_branch_with_commit(&repo, "feat-b", "feat: b body");
-        // Apply the same patch to main without merge (squash style).
-        git_run(&repo, &["cherry-pick", "feat-b"]);
-        // Branch still exists; HEAD on main has equivalent patch.
+        // Make main diverge first so cherry-pick doesn't fast-forward.
+        std::fs::write(repo.join("unrelated.txt"), "main moves\n").expect("write");
+        git_run(&repo, &["add", "unrelated.txt"]);
+        git_run(&repo, &["commit", "-m", "main: unrelated work"]);
+        // Squash-apply feat-b's diff to main as a separate commit.
+        git_run(&repo, &["cherry-pick", "--no-commit", "feat-b"]);
+        git_run(&repo, &["commit", "-m", "squash: feat-b body"]);
 
         let now = chrono::Utc::now();
         let cats = scan(&repo, "main", STALE_IDLE_DEFAULT_DAYS, now).expect("scan");
@@ -257,6 +480,9 @@ mod tests {
             cats.squash_merged.iter().any(|c| c.name == "feat-b"),
             "squash_merged must include feat-b, got: {cats:?}"
         );
+        // Not in clean_merged — feat-b's SHA is NOT in main's
+        // ancestry post-squash (main has a different SHA with same
+        // patch-id).
         assert!(!cats.clean_merged.iter().any(|c| c.name == "feat-b"));
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
