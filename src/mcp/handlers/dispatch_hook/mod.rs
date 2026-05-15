@@ -701,6 +701,17 @@ mod tests;
 ///   `repo action=cleanup_init_commits` consume the Result so operator-
 ///   facing surfaces can report the cleaned count + surface failures.
 pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String> {
+    // #814: auto-recover from prior failed-cleanup state. The
+    // `.git/.../rebase-merge` dir survives when a previous
+    // `git rebase -i` failed AND its companion `git rebase --abort`
+    // also failed (or was skipped). Subsequent `git rebase -i`
+    // refuses to start with "previous rebase in progress", returning
+    // exit code 256 — exactly the failure mode that hit #807 prep
+    // 3 consecutive times. Pre-clear the stale dir so retry can
+    // proceed. Best-effort: a remove failure here doesn't abort the
+    // helper — worst case we get the same status 256 we had before.
+    clear_stale_rebase_state(worktree);
+
     let output = std::process::Command::new("git")
         .args(["log", "origin/main..HEAD", "--format=%H %s"])
         .current_dir(worktree)
@@ -811,4 +822,84 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
             })
         }
     }
+}
+
+/// #814: clear `.git/.../rebase-merge` AND `rebase-apply` dirs that
+/// survived a prior failed cleanup attempt. Called at the top of
+/// `clean_empty_init_commits` so the next `git rebase -i` doesn't
+/// trip over "previous rebase in progress" state inherited from a
+/// previous run's failed `--abort`.
+///
+/// Safety: the daemon-managed worktree this helper operates on is
+/// not shared with operator-driven rebases (operator runs from
+/// canonical checkout or their own clones), so clearing the rebase
+/// state here cannot clobber an operator's in-progress work. The
+/// `tracing::warn!` documents the clear so post-incident audit can
+/// confirm it fired and correlate with the prior failed call.
+///
+/// Fail-soft: any error (missing .git pointer, permission, etc.) is
+/// logged but doesn't abort the helper. Worst case the subsequent
+/// `git rebase -i` returns the same status 256 the operator saw
+/// before — no regression beyond pre-#814 behavior.
+fn clear_stale_rebase_state(worktree: &Path) {
+    let git_dir = match resolve_worktree_gitdir(worktree) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "#814: could not resolve .git dir; skipping stale rebase-state clear"
+            );
+            return;
+        }
+    };
+    for sub in ["rebase-merge", "rebase-apply"] {
+        let path = git_dir.join(sub);
+        if !path.exists() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::warn!(
+                    ?path,
+                    "#814: removed stale {} dir from prior failed cleanup attempt",
+                    sub
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    ?path,
+                    error = %e,
+                    "#814: failed to clear stale {} dir — cleanup may still fail",
+                    sub
+                );
+            }
+        }
+    }
+}
+
+/// #814: resolve the worktree's actual `.git` directory.
+///
+/// In a primary checkout `.git` is a directory. In a daemon-managed
+/// `git worktree`-provisioned worktree, `.git` is a FILE containing
+/// a `gitdir: <path>` line pointing at
+/// `<repo>/.git/worktrees/<name>`. This helper handles both forms.
+fn resolve_worktree_gitdir(worktree: &Path) -> Result<std::path::PathBuf, String> {
+    let dotgit = worktree.join(".git");
+    if dotgit.is_dir() {
+        return Ok(dotgit);
+    }
+    if !dotgit.is_file() {
+        return Err(format!(
+            ".git missing at {}; not a directory or file",
+            dotgit.display()
+        ));
+    }
+    let content = std::fs::read_to_string(&dotgit)
+        .map_err(|e| format!("read .git file at {}: {e}", dotgit.display()))?;
+    let gitdir = content
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir: "))
+        .ok_or_else(|| format!(".git file at {} missing 'gitdir:' prefix", dotgit.display()))?
+        .trim();
+    Ok(std::path::PathBuf::from(gitdir))
 }
