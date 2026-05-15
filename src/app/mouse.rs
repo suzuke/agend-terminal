@@ -50,42 +50,17 @@ pub(super) fn handle(
 ) -> MouseOutcome {
     let mut out = MouseOutcome::default();
 
-    // #700: If focused pane's terminal wants mouse events AND shift is not held,
-    // forward the event as SGR mouse report to the PTY instead of local handling.
-    if !mouse
-        .modifiers
-        .contains(crossterm::event::KeyModifiers::SHIFT)
-    {
-        if let Some(tab) = layout.active_tab() {
-            if let Some(pane) = tab.focused_pane() {
-                if pane.vterm.wants_mouse() && pane.vterm.mouse_sgr() {
-                    let pane_id = tab.focus_id;
-                    if let Some(&(px, py, pw, ph)) = tab.pane_rects.get(&pane_id) {
-                        let inner_x = px + 1;
-                        let inner_y = py + 1;
-                        let inner_w = pw.saturating_sub(2);
-                        let inner_h = ph.saturating_sub(2);
-                        // Only forward if cursor is inside pane content area
-                        if mouse.column >= inner_x
-                            && mouse.column < inner_x + inner_w
-                            && mouse.row >= inner_y
-                            && mouse.row < inner_y + inner_h
-                        {
-                            if let Some(encoded) =
-                                crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y)
-                            {
-                                super::write_to_focused(
-                                    &crate::home_dir(),
-                                    layout,
-                                    registry,
-                                    &encoded,
-                                );
-                                return out;
-                            }
-                        }
-                    }
-                }
-            }
+    // #700 + #783: If a pane's terminal wants mouse events AND shift is not
+    // held, forward the event as SGR mouse report to the PTY instead of local
+    // handling. The routing decision lives in `pane_for_mouse_forward` so it
+    // can be unit-tested without the PTY write side-effect.
+    // §3.10 RED: `pane_id` is destructured for the C2 GREEN refactor where
+    // it routes writes to the cursor-target pane. Until then, the write
+    // still goes through `write_to_focused`.
+    if let Some((_pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
+        if let Some(encoded) = crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y) {
+            super::write_to_focused(&crate::home_dir(), layout, registry, &encoded);
+            return out;
         }
     }
 
@@ -485,6 +460,47 @@ pub(super) fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// #783: pick the pane that should receive an SGR mouse-forward for this
+/// event, returning the pane id plus the inner top-left of that pane in
+/// terminal coordinates. Returns `None` when the event should fall
+/// through to local TUI handling (shift held, no pane under cursor, the
+/// pane's terminal does not want mouse, or cursor sits on the border).
+///
+/// Pre-fix (#700) consulted only the focused pane, which broke #783's
+/// multi-pane case (opencode in a non-focused split). The §3.10 GREEN
+/// commit switches the lookup to `tab.pane_at(col, row)` so the pane
+/// UNDER the cursor handles its own mouse events regardless of focus.
+fn pane_for_mouse_forward(layout: &Layout, mouse: &MouseEvent) -> Option<(usize, u16, u16)> {
+    if mouse
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::SHIFT)
+    {
+        return None;
+    }
+    let tab = layout.active_tab()?;
+    // §3.10 RED: still focus-only. §3.10 GREEN replaces with
+    // `tab.pane_at(mouse.column, mouse.row)`.
+    let pane_id = tab.focus_id;
+    let pane = tab.root().find_pane(pane_id)?;
+    if !pane.vterm.wants_mouse() || !pane.vterm.mouse_sgr() {
+        return None;
+    }
+    let &(px, py, pw, ph) = tab.pane_rects.get(&pane_id)?;
+    let inner_x = px + 1;
+    let inner_y = py + 1;
+    let inner_w = pw.saturating_sub(2);
+    let inner_h = ph.saturating_sub(2);
+    if mouse.column >= inner_x
+        && mouse.column < inner_x + inner_w
+        && mouse.row >= inner_y
+        && mouse.row < inner_y + inner_h
+    {
+        Some((pane_id, inner_x, inner_y))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -510,6 +526,107 @@ mod tests {
             selection: None,
             source: PaneSource::Local,
         }
+    }
+
+    fn scroll_up_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// Opencode mouse-on startup: 1000h + 1002h + 1003h enable a tracking
+    /// mode (`wants_mouse`); 1006h selects SGR encoding (`mouse_sgr`).
+    /// Matches the sequence pinned in `vterm::tests::wants_mouse_matches_opencode_startup_sequence`.
+    fn enable_opencode_mouse(pane: &mut Pane) {
+        pane.vterm
+            .process(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+    }
+
+    /// #783 §3.10 anchor — in a multi-pane tab, mouse-forwarding must
+    /// target the pane UNDER the cursor, not the focused pane. The
+    /// pre-fix `tab.focused_pane()` lookup skipped SGR forwarding when
+    /// the wants_mouse pane (opencode in right split) was not focused;
+    /// the operator's scroll then fell through to the local TUI scroll
+    /// handler. This test pins the contract by asserting the routing
+    /// decision itself.
+    ///
+    /// RED on the §3.10 RED commit: `pane_for_mouse_forward` still uses
+    /// `tab.focus_id`, so the focused (no-mouse) pane gets the lookup
+    /// and returns `None`. Asserting `Some(2, _, _)` fails.
+    /// GREEN after the cursor-lookup refactor.
+    #[test]
+    fn pane_for_mouse_forward_targets_pane_under_cursor_not_focused() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("multi".to_string(), leaf(1, "left")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "opencode"));
+        layout.active = 0;
+        // Focus the LEFT pane (id=1); opencode lives in RIGHT pane (id=2).
+        layout.tabs[0].focus_id = 1;
+
+        // Layout rects: Pane 1 at (0,1)-(10,11), Pane 2 at (10,1)-(20,11).
+        layout.tabs[0].pane_rects.insert(1, (0, 1, 10, 10));
+        layout.tabs[0].pane_rects.insert(2, (10, 1, 10, 10));
+
+        // Pane 2 (right, NOT focused) is the opencode pane wanting mouse.
+        enable_opencode_mouse(layout.tabs[0].root_mut().find_pane_mut(2).unwrap());
+
+        // Mouse scroll over the RIGHT pane interior (column 15, row 5).
+        let mouse = scroll_up_at(15, 5);
+
+        let routed = super::pane_for_mouse_forward(&layout, &mouse);
+        assert_eq!(
+            routed.map(|(id, _, _)| id),
+            Some(2),
+            "mouse over right opencode pane must route there regardless of focus; got {routed:?}"
+        );
+    }
+
+    /// #783 invariant — when no pane under the cursor wants mouse,
+    /// `pane_for_mouse_forward` returns `None` so the event falls through
+    /// to local TUI handling. Pins that the cursor-lookup refactor does
+    /// not change behavior for non-opencode panes.
+    #[test]
+    fn pane_for_mouse_forward_returns_none_when_target_pane_lacks_mouse() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("multi".to_string(), leaf(1, "left")));
+        layout.tabs[0].split_focused(SplitDir::Vertical, leaf(2, "right"));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 1;
+        layout.tabs[0].pane_rects.insert(1, (0, 1, 10, 10));
+        layout.tabs[0].pane_rects.insert(2, (10, 1, 10, 10));
+        // No `enable_opencode_mouse` — neither pane wants mouse.
+
+        let mouse = scroll_up_at(15, 5);
+        assert!(
+            super::pane_for_mouse_forward(&layout, &mouse).is_none(),
+            "no pane wants mouse → fall through to local scroll handling"
+        );
+    }
+
+    /// #783 regression-guard — single-pane case must keep working
+    /// (post-#700/#739/#741/#744 wants_mouse path). The cursor-lookup
+    /// refactor must not regress the single-pane scenario where focused
+    /// == under-cursor.
+    #[test]
+    fn pane_for_mouse_forward_single_pane_with_mouse_still_routes() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("single".to_string(), leaf(1, "opencode")));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 1;
+        layout.tabs[0].pane_rects.insert(1, (0, 1, 20, 10));
+
+        enable_opencode_mouse(layout.tabs[0].root_mut().find_pane_mut(1).unwrap());
+
+        let mouse = scroll_up_at(10, 5);
+        let routed = super::pane_for_mouse_forward(&layout, &mouse);
+        assert_eq!(
+            routed.map(|(id, _, _)| id),
+            Some(1),
+            "single-pane opencode tab must still route mouse to that pane"
+        );
     }
 
     fn up_event() -> MouseEvent {
