@@ -626,6 +626,119 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // ── #828 teams::delete cascade full_delete_instance per member ──
+
+    /// #828 C1 RED: disbanding a team must cascade `full_delete_instance`
+    /// to each member so their owned tasks get orphaned via the existing
+    /// `tasks::orphan_tasks_for_owner` hook (#808) inside
+    /// `full_delete_instance`. Pre-fix `teams::delete` only removes the
+    /// fleet.yaml entry — members' tasks stay ghost-owned indefinitely,
+    /// the exact symptom the operator surfaced in the residual cleanup
+    /// hygiene work after #821/#822.
+    ///
+    /// Asserts the post-fix contract:
+    /// - response carries `members_cleaned` = number of cascaded members
+    /// - members are gone from fleet.yaml `instances:`
+    /// - tasks previously owned by members are now `owner = None`
+    #[test]
+    fn delete_team_cascades_full_delete_instance_per_member() {
+        let home = tmp_home("828_cascade");
+        // Seed two members so we can verify per-member cascade.
+        create(
+            &home,
+            &serde_json::json!({"name": "ops", "members": ["alice828", "bob828"], "orchestrator": "alice828"}),
+        );
+        // Also seed the instances themselves so fleet.yaml has full
+        // `instances:` entries — without those, `full_delete_instance`'s
+        // residual audit short-circuits on already-missing names.
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        let yaml = std::fs::read_to_string(&fleet_path).unwrap();
+        let yaml = format!(
+            "instances:\n  alice828:\n    backend: claude\n  bob828:\n    backend: claude\n{}",
+            yaml,
+        );
+        std::fs::write(&fleet_path, yaml).unwrap();
+
+        // Create 3 tasks claimed by alice828 (2) + bob828 (1).
+        let t1 = crate::tasks::handle(
+            &home,
+            "alice828",
+            &serde_json::json!({"action": "create", "title": "task-1"}),
+        );
+        let id1 = t1["id"].as_str().unwrap().to_string();
+        crate::tasks::handle(
+            &home,
+            "alice828",
+            &serde_json::json!({"action": "claim", "id": id1}),
+        );
+        let t2 = crate::tasks::handle(
+            &home,
+            "bob828",
+            &serde_json::json!({"action": "create", "title": "task-2"}),
+        );
+        let id2 = t2["id"].as_str().unwrap().to_string();
+        crate::tasks::handle(
+            &home,
+            "bob828",
+            &serde_json::json!({"action": "claim", "id": id2}),
+        );
+        let t3 = crate::tasks::handle(
+            &home,
+            "alice828",
+            &serde_json::json!({"action": "create", "title": "task-3"}),
+        );
+        let id3 = t3["id"].as_str().unwrap().to_string();
+        crate::tasks::handle(
+            &home,
+            "alice828",
+            &serde_json::json!({"action": "claim", "id": id3}),
+        );
+
+        // Disband.
+        let result = delete(&home, &serde_json::json!({"name": "ops"}));
+
+        // Status + audit fields.
+        assert_eq!(
+            result["status"], "deleted",
+            "team deletion must succeed, got: {result}"
+        );
+        assert_eq!(
+            result["members_cleaned"], 2,
+            "members_cleaned must report 2 cascaded members, got: {result}"
+        );
+
+        // Members are gone from fleet.yaml `instances:`.
+        let fleet =
+            crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        assert!(
+            !fleet.instances.contains_key("alice828"),
+            "alice828 must be removed from fleet.yaml instances, got: {:?}",
+            fleet.instances.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !fleet.instances.contains_key("bob828"),
+            "bob828 must be removed from fleet.yaml instances"
+        );
+
+        // All 3 previously-owned tasks are orphaned (owner = None).
+        let state = crate::task_events::replay(&home).unwrap();
+        for id in &[id1.as_str(), id2.as_str(), id3.as_str()] {
+            let task = state
+                .tasks
+                .values()
+                .find(|t| t.id.0 == *id)
+                .unwrap_or_else(|| panic!("task {id} must exist post-cascade"));
+            assert!(
+                task.owner.is_none(),
+                "task {} must be orphaned post-cascade, has owner={:?}",
+                task.id.0,
+                task.owner
+            );
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// Sprint 54 fleet-yaml unification: operator hand-editing fleet.yaml
     /// `teams:` block must surface immediately on next read — no separate
     /// reconcile step required. Locks the contract between fleet.rs
