@@ -25,10 +25,27 @@ use super::panels_fleet::{render_fleet_view, render_monitor_view};
 /// if the board overlay's render frequency makes this a hotspot, a
 /// TTL cache can be slotted in here without changing the call site.
 ///
-/// C1 stub: returns `None` so the C2 RED→GREEN flip is the helper-
-/// body fill, not a stub-vs-real wiring change.
-fn fetch_live_agents(_home: &std::path::Path) -> Option<HashSet<String>> {
-    None
+/// Failure path emits a `tracing::warn` so the regression is
+/// observable when CI / operators see ghost agents reappearing in
+/// the indicator.
+fn fetch_live_agents(home: &std::path::Path) -> Option<HashSet<String>> {
+    match crate::api::call(
+        home,
+        &serde_json::json!({"method": crate::api::method::LIST}),
+    ) {
+        Ok(resp) => resp["result"]["agents"].as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|a| a["name"].as_str().map(String::from))
+                .collect()
+        }),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "#827: api::call(LIST) failed — active-indicator ghost filter degrading to identity"
+            );
+            None
+        }
+    }
 }
 
 /// #827: drop assignees that aren't in the live runtime registry.
@@ -39,14 +56,14 @@ fn fetch_live_agents(_home: &std::path::Path) -> Option<HashSet<String>> {
 /// Pure function — kept extracted from the render-site call so unit
 /// tests can pin the contract without spinning up a ratatui frame.
 ///
-/// C1 stub: identity (no filtering) so the two RED tests fail (cases
-/// where dropping ghosts is the desired outcome) and the two graceful-
-/// fallback / edge-case tests pass naturally at C1.
 fn filter_live_assignees<'a>(
     assignees: impl Iterator<Item = &'a str>,
-    _live: Option<&HashSet<String>>,
+    live: Option<&HashSet<String>>,
 ) -> HashSet<&'a str> {
-    assignees.collect()
+    match live {
+        Some(set) => assignees.filter(|name| set.contains(*name)).collect(),
+        None => assignees.collect(),
+    }
 }
 
 pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision], scroll: usize) {
