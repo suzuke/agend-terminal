@@ -5,9 +5,49 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use std::collections::HashSet;
 
 use super::overlay::render_overlay_frame;
 use super::panels_fleet::{render_fleet_view, render_monitor_view};
+
+/// #827: fetch the daemon's live runtime agent registry via
+/// `api::call(LIST)`. Returns `Some(set)` when the call succeeds (the
+/// set may legitimately be empty when no agents are running) and
+/// `None` when the daemon is offline / unreachable.
+///
+/// The `None`-vs-`Some(empty)` distinction matters at the filter site:
+/// `None` falls back to current (unfiltered) behavior so a degraded
+/// daemon doesn't make the indicator misleadingly report "all idle".
+///
+/// Mirrors the precedent at `src/teams.rs:200-212` (the original
+/// liveness-cross-ref pattern shipped with #785 stale-member
+/// detection). Per-render call cost is one localhost TCP round-trip;
+/// if the board overlay's render frequency makes this a hotspot, a
+/// TTL cache can be slotted in here without changing the call site.
+///
+/// C1 stub: returns `None` so the C2 RED→GREEN flip is the helper-
+/// body fill, not a stub-vs-real wiring change.
+fn fetch_live_agents(_home: &std::path::Path) -> Option<HashSet<String>> {
+    None
+}
+
+/// #827: drop assignees that aren't in the live runtime registry.
+/// When `live` is `Some(set)`, retain only assignees in the set; when
+/// `None` (api::call failed), keep all assignees so the indicator
+/// degrades gracefully rather than reporting incorrect idleness.
+///
+/// Pure function — kept extracted from the render-site call so unit
+/// tests can pin the contract without spinning up a ratatui frame.
+///
+/// C1 stub: identity (no filtering) so the two RED tests fail (cases
+/// where dropping ghosts is the desired outcome) and the two graceful-
+/// fallback / edge-case tests pass naturally at C1.
+fn filter_live_assignees<'a>(
+    assignees: impl Iterator<Item = &'a str>,
+    _live: Option<&HashSet<String>>,
+) -> HashSet<&'a str> {
+    assignees.collect()
+}
 
 pub fn render_decisions(frame: &mut Frame, items: &[crate::decisions::Decision], scroll: usize) {
     let count = items.len();
@@ -241,10 +281,18 @@ pub fn render_tasks(
     }
 
     if inner.height > 2 && inner.width > 10 {
-        let active_agents: std::collections::HashSet<&str> = columns[2]
-            .iter()
-            .filter_map(|t| t.assignee.as_deref())
-            .collect();
+        // #827: cross-ref assignees against the daemon's live runtime
+        // registry so ghost agents from disbanded teams (or any other
+        // path that leaves a task owner string referencing a
+        // no-longer-running instance) don't show up in the "active:"
+        // indicator. `fetch_live_agents` returns `None` when the
+        // daemon is offline; the filter degrades to the pre-#827
+        // identity behavior in that case.
+        let live = fetch_live_agents(home);
+        let active_agents = filter_live_assignees(
+            columns[2].iter().filter_map(|t| t.assignee.as_deref()),
+            live.as_ref(),
+        );
         let status_text = if active_agents.is_empty() {
             "all idle".to_string()
         } else {
@@ -469,6 +517,62 @@ mod tests {
             started_at: None,
             eta_secs: None,
         }
+    }
+
+    // ── #827 active-indicator ghost filter ──
+
+    fn make_live(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// C1 RED: live registry known + one ghost name in assignees →
+    /// ghost dropped, live names retained.
+    #[test]
+    fn filter_drops_ghost_when_live_known() {
+        let live = make_live(&["alpha", "beta"]);
+        let assignees = ["alpha", "beta", "ghost"];
+        let kept = filter_live_assignees(assignees.iter().copied(), Some(&live));
+        assert_eq!(
+            kept,
+            HashSet::from(["alpha", "beta"]),
+            "ghost-agent must be filtered out when live registry is known"
+        );
+    }
+
+    /// C1 RED: every assignee is a ghost → caller renders "all idle".
+    #[test]
+    fn filter_returns_empty_when_all_ghosts() {
+        let live = make_live(&["xenon"]);
+        let assignees = ["alpha", "beta"];
+        let kept = filter_live_assignees(assignees.iter().copied(), Some(&live));
+        assert!(
+            kept.is_empty(),
+            "all-ghost assignees must produce empty set (caller renders 'all idle'); got: {kept:?}"
+        );
+    }
+
+    /// C1 GREEN (also passes at C1 with identity stub): graceful
+    /// fallback when api::call(LIST) fails — keep all assignees
+    /// rather than misleadingly report "all idle".
+    #[test]
+    fn filter_keeps_all_when_live_is_none() {
+        let assignees = ["alpha", "ghost"];
+        let kept = filter_live_assignees(assignees.iter().copied(), None);
+        assert_eq!(
+            kept,
+            HashSet::from(["alpha", "ghost"]),
+            "daemon-offline (live=None) must preserve current behavior — show all assignees"
+        );
+    }
+
+    /// C1 GREEN: empty assignees → empty result regardless of `live`.
+    /// Edge case; locks the contract so a future filter refactor can't
+    /// accidentally inject something into the empty case.
+    #[test]
+    fn filter_handles_empty_assignees() {
+        let live = make_live(&["alpha"]);
+        let kept = filter_live_assignees(std::iter::empty::<&str>(), Some(&live));
+        assert!(kept.is_empty(), "empty input must produce empty output");
     }
 
     #[test]
