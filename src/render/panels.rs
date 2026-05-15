@@ -10,42 +10,28 @@ use std::collections::HashSet;
 use super::overlay::render_overlay_frame;
 use super::panels_fleet::{render_fleet_view, render_monitor_view};
 
-/// #827: fetch the daemon's live runtime agent registry via
-/// `api::call(LIST)`. Returns `Some(set)` when the call succeeds (the
-/// set may legitimately be empty when no agents are running) and
-/// `None` when the daemon is offline / unreachable.
+/// #827: fetch the daemon's live runtime agent registry. Returns
+/// `Some(set)` on success and `None` when `api::call(LIST)` fails.
 ///
 /// The `None`-vs-`Some(empty)` distinction matters at the filter site:
 /// `None` falls back to current (unfiltered) behavior so a degraded
 /// daemon doesn't make the indicator misleadingly report "all idle".
+/// Per-render call cost is one localhost TCP round-trip; if the
+/// overlay's render frequency makes this a hotspot, a TTL cache can
+/// be slotted in here without changing the call site.
 ///
-/// Mirrors the precedent at `src/teams.rs:200-212` (the original
-/// liveness-cross-ref pattern shipped with #785 stale-member
-/// detection). Per-render call cost is one localhost TCP round-trip;
-/// if the board overlay's render frequency makes this a hotspot, a
-/// TTL cache can be slotted in here without changing the call site.
-///
-/// Failure path emits a `tracing::warn` so the regression is
-/// observable when CI / operators see ghost agents reappearing in
-/// the indicator.
+/// #830: thin wrapper over `crate::runtime::list_live_agents` (the
+/// canonical helper consolidated when #830 became the fourth consumer
+/// of this pattern). The wrapper survives so the call site keeps the
+/// `tracing::warn!` observability hook that #827 added.
 fn fetch_live_agents(home: &std::path::Path) -> Option<HashSet<String>> {
-    match crate::api::call(
-        home,
-        &serde_json::json!({"method": crate::api::method::LIST}),
-    ) {
-        Ok(resp) => resp["result"]["agents"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|a| a["name"].as_str().map(String::from))
-                .collect()
-        }),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "#827: api::call(LIST) failed — active-indicator ghost filter degrading to identity"
-            );
-            None
-        }
+    let result = crate::runtime::list_live_agents(home);
+    if result.is_none() {
+        tracing::warn!(
+            "#827: api::call(LIST) failed — active-indicator ghost filter degrading to identity"
+        );
     }
+    result
 }
 
 /// #827: drop assignees that aren't in the live runtime registry.
