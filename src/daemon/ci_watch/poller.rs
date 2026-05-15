@@ -693,6 +693,57 @@ async fn ci_check_repo(
         }
     }
 
+    // #813: periodic mergeable re-check. Cached `last_mergeable_check_at`
+    // in watch JSON gates the frequency to once every
+    // MERGEABLE_RECHECK_INTERVAL_SECS (5 min). Alert emits ONLY on a
+    // transition INTO CONFLICTING — avoids alert spam while still
+    // conflicting and silently handles transitions OUT of CONFLICTING
+    // (back to Mergeable post-rebase). Fail-open on Unknown.
+    const MERGEABLE_RECHECK_INTERVAL_SECS: i64 = 300;
+    let (should_recheck, prev_mergeable) = match std::fs::read_to_string(watch_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+    {
+        Some(w) => {
+            let last = w["last_mergeable_check_at"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            let now = chrono::Utc::now();
+            let elapsed_ok = last
+                .map(|d| {
+                    now.signed_duration_since(d).num_seconds() >= MERGEABLE_RECHECK_INTERVAL_SECS
+                })
+                .unwrap_or(true);
+            (
+                elapsed_ok,
+                w["last_mergeable_state"].as_str().map(String::from),
+            )
+        }
+        None => (true, None),
+    };
+    if should_recheck {
+        let new_state = provider.check_pr_mergeable(repo, branch).await;
+        let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+        // Persist the new state regardless of variant.
+        if let Ok(content) = std::fs::read_to_string(watch_path) {
+            if let Ok(mut w) = serde_json::from_str::<serde_json::Value>(&content) {
+                w["last_mergeable_state"] = serde_json::json!(new_state.as_str());
+                w["last_mergeable_check_at"] = serde_json::json!(now_rfc3339);
+                if let Ok(out) = serde_json::to_string_pretty(&w) {
+                    let _ = std::fs::write(watch_path, out);
+                }
+            }
+        }
+        // Emit alert ONLY on transition INTO Conflicting (avoid spam
+        // when state stays Conflicting across cycles).
+        if matches!(new_state, MergeableState::Conflicting)
+            && prev_mergeable.as_deref() != Some("CONFLICTING")
+        {
+            emit_ci_conflict_alert(home, repo, branch, subscribers, "poll-transition");
+        }
+    }
+
     let poll_result = provider.poll_runs(repo, branch).await?;
     let runs = match poll_result {
         CiPollResult::ApiError {
@@ -4625,6 +4676,164 @@ mod tests {
             after["last_mergeable_state"].as_str(),
             Some("UNKNOWN"),
             "Unknown state must still be cached to watch JSON as a baseline"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Helper for C4 tests: run ci_check_repo with a provider, return after
+    /// one cycle. Builds the watch JSON at provided path + invokes
+    /// ci_check_repo via a current-thread runtime block_on.
+    fn run_one_poll_cycle(
+        dir: &Path,
+        watch: &serde_json::Value,
+        provider: &dyn CiProvider,
+    ) -> std::path::PathBuf {
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let repo = watch["repo"].as_str().unwrap();
+        let branch = watch["branch"].as_str().unwrap();
+        let subscribers = parse_subscribers(watch);
+        let watch_path = ci_dir.join(watch_filename(repo, branch));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(watch).unwrap()).unwrap();
+        let registry: AgentRegistry =
+            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = rt.block_on(ci_check_repo(
+            dir,
+            &watch_path,
+            repo,
+            branch,
+            &subscribers,
+            None,
+            None,
+            None,
+            None,
+            &registry,
+            provider,
+        ));
+        watch_path
+    }
+
+    #[test]
+    fn test_periodic_recheck_emits_alert_on_transition_into_conflicting() {
+        // GREEN: ci_check_repo periodic re-check fires when
+        // `last_mergeable_check_at` is older than 5min (or absent).
+        // Provider returns CONFLICTING; previous cached state was
+        // MERGEABLE → transition INTO Conflicting → alert emits.
+        let dir = tmp_dir("recheck_transition_into");
+        let watch = serde_json::json!({
+            "repo": "test/repo",
+            "branch": "fix/x",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-15T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+            // Cached state from a prior poll cycle, expired (>5min stale).
+            "last_mergeable_state": "MERGEABLE",
+            "last_mergeable_check_at":
+                (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+        });
+        let provider =
+            MockCiProvider::with_runs(Vec::new()).with_mergeable(MergeableState::Conflicting);
+        run_one_poll_cycle(&dir, &watch, &provider);
+
+        let inbox =
+            std::fs::read_to_string(dir.join("inbox").join("lead.jsonl")).unwrap_or_default();
+        assert!(
+            inbox.contains("[ci-conflict-detected]"),
+            "transition INTO CONFLICTING must emit alert, got inbox: {inbox}"
+        );
+        assert!(
+            inbox.contains("poll-transition"),
+            "alert source must be `poll-transition` (not `watch-start`), got: {inbox}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_periodic_recheck_does_not_re_alert_while_still_conflicting() {
+        // GREEN: prevent alert spam. Cached state already CONFLICTING +
+        // provider returns CONFLICTING again → NO new alert fired.
+        let dir = tmp_dir("recheck_no_spam");
+        let watch = serde_json::json!({
+            "repo": "test/repo",
+            "branch": "fix/x",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-15T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+            "last_mergeable_state": "CONFLICTING",
+            "last_mergeable_check_at":
+                (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+        });
+        let provider =
+            MockCiProvider::with_runs(Vec::new()).with_mergeable(MergeableState::Conflicting);
+        run_one_poll_cycle(&dir, &watch, &provider);
+
+        let inbox =
+            std::fs::read_to_string(dir.join("inbox").join("lead.jsonl")).unwrap_or_default();
+        assert!(
+            !inbox.contains("[ci-conflict-detected]"),
+            "still-CONFLICTING (no transition) must NOT spam alerts, got: {inbox}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_status_response_has_null_pr_mergeable_state_pre_first_check() {
+        // GREEN: a fresh watch without `last_mergeable_state` in its
+        // JSON surfaces `pr_mergeable_state: null` in the status
+        // response. Callers tolerating null are unaffected.
+        let dir = tmp_dir("status_null_pre_check");
+        let ci_dir = dir.join("ci-watches");
+        std::fs::create_dir_all(&ci_dir).ok();
+        let watch = serde_json::json!({
+            "repo": "test/repo",
+            "branch": "fix/x",
+            "subscribers": [{"instance": "lead", "subscribed_at": "2026-05-15T00:00:00Z"}],
+            "instance": "lead",
+            "interval_secs": 60,
+            "last_run_id": null,
+            "head_sha": null,
+            "last_polled_at": null,
+            "last_notified_head_sha": null,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+            "last_terminal_seen_at": null,
+            // No `last_mergeable_state` / `last_mergeable_check_at` —
+            // simulates a pre-#813 watch OR a fresh watch that hasn't
+            // run its first re-check yet.
+        });
+        let watch_path = ci_dir.join(watch_filename("test/repo", "fix/x"));
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&watch).unwrap()).unwrap();
+
+        let r = crate::mcp::handlers::ci::handle_status_ci(
+            &dir,
+            &serde_json::json!({"repo": "test/repo"}),
+            "lead",
+        );
+        let entry = r["watches"][0].as_object().expect("watches[0]");
+        assert!(
+            entry["pr_mergeable_state"].is_null(),
+            "pre-first-check watch must surface pr_mergeable_state=null, got {:?}",
+            entry["pr_mergeable_state"]
+        );
+        assert!(
+            entry["pr_mergeable_check_at"].is_null(),
+            "pre-first-check watch must surface pr_mergeable_check_at=null, got {:?}",
+            entry["pr_mergeable_check_at"]
         );
         std::fs::remove_dir_all(&dir).ok();
     }

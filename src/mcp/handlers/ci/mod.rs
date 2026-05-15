@@ -752,6 +752,12 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             "last_terminal_seen_at": watch["last_terminal_seen_at"].as_str(),
             "head_sha": watch["head_sha"].as_str(),
             "expires_at": watch["expires_at"].as_str(),
+            // #813: surface cached mergeable state so callers can
+            // distinguish "CI running" silence from "CONFLICTING
+            // blocked forever" silence. Field is `null` for watches
+            // that haven't run their first mergeable check yet.
+            "pr_mergeable_state": watch["last_mergeable_state"].as_str(),
+            "pr_mergeable_check_at": watch["last_mergeable_check_at"].as_str(),
         }));
     }
     let mut resp = json!({"watches": out});

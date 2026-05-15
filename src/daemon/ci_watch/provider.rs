@@ -152,10 +152,6 @@ pub enum PrState {
 /// - `Unstable` — blocked / behind (review-policy / branch-behind, not
 ///   a conflict per se but worth surfacing)
 /// - `Unknown` — query failed, fail-open path (no alert, no block)
-///
-/// Dead-code allow lifts at C2/C3/C4 when watcher + poller wire the
-/// enum into production paths.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeableState {
     Mergeable,
@@ -164,25 +160,17 @@ pub enum MergeableState {
     Unknown,
 }
 
-#[allow(dead_code)]
 impl MergeableState {
     /// Stable string representation written to watch JSON + status
-    /// response. Pair with `from_str` for round-trip.
+    /// response. Watch JSON is read back as `&str`; no `from_str`
+    /// helper is needed because the only consumer compares against
+    /// the literal `"CONFLICTING"`.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Mergeable => "MERGEABLE",
             Self::Conflicting => "CONFLICTING",
             Self::Unstable => "UNSTABLE",
             Self::Unknown => "UNKNOWN",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "MERGEABLE" => Self::Mergeable,
-            "CONFLICTING" => Self::Conflicting,
-            "UNSTABLE" => Self::Unstable,
-            _ => Self::Unknown,
         }
     }
 }
@@ -207,9 +195,7 @@ pub trait CiProvider: Send + Sync {
     /// GitLab / Bitbucket return `Unknown` (unverified — no operator
     /// has exercised the path) and the caller's fail-open guard
     /// suppresses the alert. Promotion blocked behind a fleet
-    /// running on that backend. Dead-code allow lifts at C4 when the
-    /// periodic re-check call site lands in `ci_check_repo`.
-    #[allow(dead_code)]
+    /// running on that backend.
     async fn check_pr_mergeable(&self, repo: &str, branch: &str) -> MergeableState {
         let _ = (repo, branch);
         MergeableState::Unknown
