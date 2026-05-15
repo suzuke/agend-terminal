@@ -51,30 +51,63 @@ use std::process::{Command, Output};
 /// Run git in `repo_dir` with cwd isolation + shim bypass + pinned
 /// author/committer. The canonical entry for test fixtures.
 ///
-/// #821 stub — real implementation lands in C2.
+/// allow: raw-git-subprocess  // canonical helper module — exempt
 #[allow(dead_code)]
 pub fn git(repo_dir: &Path, args: &[&str]) -> Output {
-    let _ = (repo_dir, args);
-    Command::new("true").output().expect("stub")
+    Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example")
+        .output()
+        .expect("git subprocess spawn")
 }
 
 /// Variant accepting an explicit committer date for back-dating
-/// commits (e.g. stale-detection tests per #817 fixture).
+/// commits (used by stale-detection tests per #817 + #814 r1 lesson —
+/// `chrono::now() - duration` arithmetic is flaky near day boundaries,
+/// so date-sensitive tests pin both author and committer dates).
 ///
-/// #821 stub — real implementation lands in C2.
+/// allow: raw-git-subprocess  // canonical helper module — exempt
 #[allow(dead_code)]
 pub fn git_dated(repo_dir: &Path, args: &[&str], date_rfc3339: &str) -> Output {
-    let _ = (repo_dir, args, date_rfc3339);
-    Command::new("true").output().expect("stub")
+    Command::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .env("AGEND_GIT_BYPASS", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example")
+        .env("GIT_AUTHOR_DATE", date_rfc3339)
+        .env("GIT_COMMITTER_DATE", date_rfc3339)
+        .output()
+        .expect("git subprocess spawn")
 }
 
 /// Create a temp git repo with `main` branch + initial commit +
 /// pinned per-repo gitconfig. Returns the repo PathBuf. Standard
-/// entry point for fixtures that need a fresh git repo.
-///
-/// #821 stub — real implementation lands in C2.
+/// entry point for fixtures that need a fresh git repo. The
+/// per-repo `user.name`/`user.email` config means CI runners
+/// without a global `~/.gitconfig` can still commit (per the #814
+/// r1 lesson — that PR's CI failed cross-platform with `unable to
+/// auto-detect email address`).
 #[allow(dead_code)]
 pub fn setup_temp_repo(tag: &str) -> PathBuf {
-    let _ = tag;
-    std::env::temp_dir()
+    let dir = std::env::temp_dir().join(format!(
+        "agend-test-{}-{}-{tag}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir test temp repo");
+    git(&dir, &["init", "-b", "main"]);
+    git(&dir, &["config", "user.name", "test"]);
+    git(&dir, &["config", "user.email", "test@example"]);
+    dir
 }

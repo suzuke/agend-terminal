@@ -128,11 +128,31 @@ pub struct Violation {
 /// (empty when clean). Public-for-tests so the RED/GREEN probes can
 /// call the SAME scanner the production invariant calls — no mock
 /// branches.
-///
-/// #821 stub — real implementation lands in C2.
-#[allow(dead_code)]
-pub fn scan_test_violations(_tests_dir: &Path) -> Vec<Violation> {
-    Vec::new()
+pub fn scan_test_violations(tests_dir: &Path) -> Vec<Violation> {
+    let mut violations = Vec::new();
+    for file in rs_files_under(tests_dir) {
+        if is_exempt_file(&file) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            if !line.contains(PATTERN) {
+                continue;
+            }
+            if has_allow_marker(&lines, idx) {
+                continue;
+            }
+            violations.push(Violation {
+                file: file.clone(),
+                line: idx + 1,
+                snippet: (*line).to_string(),
+            });
+        }
+    }
+    violations
 }
 
 #[test]
