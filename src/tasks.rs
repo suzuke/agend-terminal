@@ -564,6 +564,82 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
         .map_err(|e| e.to_string())
 }
 
+/// #829: classify a single owner string against the live runtime
+/// registry + the fleet.yaml `instances:` set. Two ghost classes are
+/// distinguished:
+///
+/// - **Strict**: owner is in NEITHER the live registry NOR fleet.yaml.
+///   The owning instance is fully gone (never came back, was deleted
+///   without cascading the orphan, or pre-existed before #828
+///   shipped). Safe to auto-orphan at boot — no operator decision
+///   needed because the owner is verifiably absent.
+/// - **Soft**: owner IS in fleet.yaml but not in the live registry.
+///   Could be a misconfigured agent, a transient binding lag during
+///   boot, or an agent that's about to spawn but hasn't yet. NOT safe
+///   to auto-orphan — dry-run + tracing::warn so the operator can
+///   surface the case via `task action=sweep` if they decide.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OwnerClassification {
+    Live,
+    Strict,
+    Soft,
+}
+
+pub fn classify_owner(
+    owner: &str,
+    live: &std::collections::HashSet<String>,
+    fleet_instances: &std::collections::HashSet<String>,
+) -> OwnerClassification {
+    if live.contains(owner) {
+        OwnerClassification::Live
+    } else if fleet_instances.contains(owner) {
+        OwnerClassification::Soft
+    } else {
+        OwnerClassification::Strict
+    }
+}
+
+/// #829: scan results, split into auto-apply (strict) vs dry-run
+/// (soft) buckets. Owners are kept as separate keys so the boot
+/// orchestrator can batch one `orphan_tasks_for_owner` call per
+/// strict owner — each call lands a single event-log fsync (mirrors
+/// #828's per-member cascade pattern).
+///
+/// Ordering: `BTreeMap` for deterministic iteration order — the tests
+/// pattern-match on the result so stable ordering matters more than
+/// the constant-factor `HashMap` win.
+///
+/// Reused by #830 `task action=health` (dispatch sequencing): same
+/// scan, same classification, just `apply=false` to feed the health
+/// metrics surface. The scan fn is therefore `pub`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OrphanScanResult {
+    pub strict: std::collections::BTreeMap<String, Vec<crate::task_events::TaskId>>,
+    pub soft: std::collections::BTreeMap<String, Vec<crate::task_events::TaskId>>,
+}
+
+/// #829 pure scan. Walks `state.tasks` and classifies each non-
+/// terminal task's owner via [`classify_owner`]. Terminal-status tasks
+/// (Done / Cancelled) are skipped — their ACL is already disabled at
+/// the event-log layer, so re-orphaning would be noise.
+///
+/// `live` MUST come from `crate::api::call(LIST)` — the canonical
+/// runtime registry. `fleet_instances` MUST come from
+/// `fleet::FleetConfig::load(...).instances.keys()` — the
+/// configuration-time set. Caller responsibility to populate both;
+/// this fn is pure so it's testable without a daemon.
+///
+/// C1 stub: returns `OrphanScanResult::default()` (both buckets
+/// empty) so the RED test fails on assertions about populated
+/// `strict` / `soft`. C2 fills the body.
+pub fn scan_orphan_candidates(
+    _state: &crate::task_events::TaskBoardState,
+    _live: &std::collections::HashSet<String>,
+    _fleet_instances: &std::collections::HashSet<String>,
+) -> OrphanScanResult {
+    OrphanScanResult::default()
+}
+
 fn can_mutate_record(home: &Path, caller: &str, record: &crate::task_events::TaskRecord) -> bool {
     // B1: system identities pass ACL via explicit allow-list
     if is_system_identity(caller) {
@@ -1522,6 +1598,99 @@ mod tests {
     // pub-promotion in Sprint 23 P0 with zero direct unit coverage —
     // closed here. Behavioural mirror of the Phase 2 D1 operator-pitfall
     // gate.
+
+    // ── #829 boot orphan-owner sweep ──
+
+    fn make_record(
+        id: &str,
+        status: crate::task_events::TaskStatus,
+        owner: Option<&str>,
+    ) -> crate::task_events::TaskRecord {
+        crate::task_events::TaskRecord {
+            id: crate::task_events::TaskId(id.to_string()),
+            title: format!("title-{id}"),
+            description: String::new(),
+            priority: "normal".into(),
+            status,
+            owner: owner.map(crate::task_events::InstanceName::from),
+            linked_prs: Vec::new(),
+            block_reason: None,
+            history: Vec::new(),
+            created_by: crate::task_events::InstanceName::from("test"),
+            created_at: "2026-05-15T00:00:00Z".into(),
+            updated_at: "2026-05-15T00:00:00Z".into(),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            result: None,
+            branch: None,
+            bind: None,
+            started_at: None,
+            eta_secs: None,
+        }
+    }
+
+    fn make_state(
+        records: Vec<crate::task_events::TaskRecord>,
+    ) -> crate::task_events::TaskBoardState {
+        let mut state = crate::task_events::TaskBoardState::default();
+        for r in records {
+            state.tasks.insert(r.id.clone(), r);
+        }
+        state
+    }
+
+    fn make_set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// #829 C1 RED: classify three tasks across the strict / soft /
+    /// live spectrum, plus one Done-status task (excluded). The pure
+    /// scan must surface `alice` as strict (not in fleet.yaml, not live),
+    /// `bob` as soft (in fleet.yaml, not live), and drop `charlie`
+    /// (live) + `done-owner` (terminal status).
+    #[test]
+    fn scan_orphan_candidates_splits_strict_and_soft() {
+        use crate::task_events::{TaskId, TaskStatus};
+        let state = make_state(vec![
+            make_record("t-1", TaskStatus::Claimed, Some("alice829")),
+            make_record("t-2", TaskStatus::InProgress, Some("alice829")),
+            make_record("t-3", TaskStatus::Open, Some("bob829")),
+            make_record("t-4", TaskStatus::InProgress, Some("charlie829")),
+            make_record("t-5", TaskStatus::Done, Some("alice829")),
+            make_record("t-6", TaskStatus::Open, None),
+        ]);
+        let live = make_set(&["charlie829"]);
+        let fleet = make_set(&["bob829", "charlie829"]);
+
+        let result = scan_orphan_candidates(&state, &live, &fleet);
+
+        // alice829 → strict (fully gone). 2 tasks (t-1 + t-2), Done t-5 excluded.
+        let alice_tasks: Vec<TaskId> = result.strict.get("alice829").cloned().unwrap_or_default();
+        assert_eq!(
+            alice_tasks,
+            vec![TaskId("t-1".into()), TaskId("t-2".into())],
+            "alice829 (not in fleet.yaml, not live) must be classified strict with 2 non-terminal tasks"
+        );
+
+        // bob829 → soft (in fleet.yaml but not live). 1 task.
+        let bob_tasks: Vec<TaskId> = result.soft.get("bob829").cloned().unwrap_or_default();
+        assert_eq!(
+            bob_tasks,
+            vec![TaskId("t-3".into())],
+            "bob829 (in fleet.yaml, not live) must be classified soft"
+        );
+
+        // charlie829 → live. Should appear in neither bucket.
+        assert!(
+            !result.strict.contains_key("charlie829"),
+            "live owner must not appear in strict"
+        );
+        assert!(
+            !result.soft.contains_key("charlie829"),
+            "live owner must not appear in soft"
+        );
+    }
 
     #[test]
     fn can_mutate_task_assignee_match() {
