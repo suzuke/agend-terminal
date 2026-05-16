@@ -112,27 +112,6 @@ impl AgentState {
         matches!(self, Self::AwaitingOperator | Self::InteractivePrompt)
     }
 
-    /// #841 trigger set for the rate-limit recovery nudge.
-    ///
-    /// Returns `true` for the **transient** error states the daemon
-    /// should try to auto-recover from with a `continue` prompt:
-    /// `ServerRateLimit` (Anthropic-side 5xx / temporary throttle),
-    /// `RateLimit` (generic 429 / throttling — observed on every
-    /// backend), and `ApiError` (provider-validation / transient
-    /// upstream errors observed on OpenCode and others).
-    ///
-    /// Returns `false` for **permanent** errors (`UsageLimit`,
-    /// `AuthError`) — a "continue" nudge cannot resolve a hard quota
-    /// or invalid credentials, and injecting one would just thrash the
-    /// PTY without progress. Fail-closed by exclusion.
-    ///
-    pub fn is_transient_error(self) -> bool {
-        matches!(
-            self,
-            Self::ServerRateLimit | Self::RateLimit | Self::ApiError
-        )
-    }
-
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Starting => "starting",
