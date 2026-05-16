@@ -377,3 +377,57 @@ fn extract_id(body: &str) -> String {
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #842: `proxy_request` must inject `request_id` exactly once and
+    /// reuse it across the (up-to-2) transport attempts. The retry IS
+    /// the same logical request, just re-transported — without a stable
+    /// id the daemon can't recognize it.
+    #[test]
+    fn envelope_with_request_id_injects_when_missing() {
+        let envelope = serde_json::json!({
+            "method": "send",
+            "params": {"target": "agent-a", "text": "hello"}
+        });
+        let with_id = envelope_with_request_id(&envelope);
+        let id = with_id
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .expect("request_id must be injected when missing");
+
+        // UUIDv4 string form is 36 chars with the canonical layout.
+        assert_eq!(id.len(), 36, "UUIDv4 string length");
+        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+
+        // Other fields must be preserved verbatim.
+        assert_eq!(with_id["method"], "send");
+        assert_eq!(with_id["params"]["target"], "agent-a");
+    }
+
+    /// Pre-supplied `request_id` must be preserved as-is. Callers that
+    /// already manage idempotency keys (e.g. test harnesses) win.
+    #[test]
+    fn envelope_with_request_id_preserves_caller_value() {
+        let envelope = serde_json::json!({
+            "method": "send",
+            "params": {"target": "agent-b"},
+            "request_id": "caller-supplied-deadbeef"
+        });
+        let with_id = envelope_with_request_id(&envelope);
+        assert_eq!(with_id["request_id"], "caller-supplied-deadbeef");
+    }
+
+    /// Repeated calls must mint distinct ids — each `proxy_request`
+    /// invocation is a separate logical request unless the caller
+    /// pinned a value. Guards against accidental id reuse.
+    #[test]
+    fn envelope_with_request_id_mints_distinct_ids_per_call() {
+        let envelope = serde_json::json!({"method": "list", "params": {}});
+        let a = envelope_with_request_id(&envelope);
+        let b = envelope_with_request_id(&envelope);
+        assert_ne!(a["request_id"], b["request_id"]);
+    }
+}
