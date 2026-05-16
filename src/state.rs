@@ -190,11 +190,58 @@ impl StatePatterns {
                 // daemon::supervisor::process_server_rate_limit_retries).
                 // `\b` after the 3-digit code rejects false positives
                 // like "API Error: 5000123" (timestamp / request id).
+                // #848: extend ServerRateLimit with Anthropic-docs verbatim
+                // `error.type` field values (`overloaded_error`, `api_error`,
+                // `timeout_error`) plus the canonical 529-overload CLI wording
+                // (`API Error: Repeated 529 Overloaded errors`). All four are
+                // the transient-upstream class the existing ServerRateLimit
+                // pattern already covers; the new alternations close gaps
+                // observed when the casual `overloaded` substring (which
+                // pre-#848 lived in the RateLimit alternation as a broad
+                // English-word match) is replaced by specific error phrases.
                 (
                     AgentState::ServerRateLimit,
-                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary",
+                    r"Server is temporarily limiting requests|temporarily limiting.*not your usage|API Error: 5\d{2}\b|server-side issue.*temporary|API Error: Repeated 529 Overloaded|overloaded_error|api_error|timeout_error",
                 ),
-                (AgentState::RateLimit, r"overloaded|rate.?limit|\b429\b"),
+                // #848: narrow Claude RateLimit to specific error phrases.
+                // The pre-#848 pattern `r"overloaded|rate.?limit|\b429\b"`
+                // matched the bare substring `rate_limit` / `rate-limit` /
+                // `rate limit` / `overloaded` anywhere in PTY scrollback,
+                // producing false-positive RateLimit classifications on
+                // discussion prose (recursive dogfood — fleet agents
+                // debugging the bug TRIGGERED the bug, see #841/#846 RCAs).
+                // New pattern keys on canonical Anthropic phrasing only:
+                // - `API Error: Request rejected (429) · this may be a
+                //   temporary capacity issue` — verbatim Claude Code CLI
+                //   wording for project-level 429 rejection.
+                // - `rate_limit_error` — Anthropic API `error.type` field
+                //   for HTTP 429 responses.
+                // - `hit a rate limit` — observed Claude Code CLI casual
+                //   wording from various SDK versions.
+                // The legacy `\b429\b` bare-token alternation is intentionally
+                // dropped — when a real 429 surfaces, the wrapping wording
+                // is `Request rejected (429)` which still matches the first
+                // alternation. False-positives from build numbers / request
+                // ids stay protected (they never carry the wrapping wording).
+                (
+                    AgentState::RateLimit,
+                    r"API Error: Request rejected \(429\)|rate_limit_error|hit a rate limit",
+                ),
+                // #848: Claude UsageLimit pattern (NEW — pre-#848 Claude
+                // had no UsageLimit pattern at all, so subscription quota
+                // errors fell through to whatever broader pattern matched).
+                // Anthropic docs distinguish subscription quota (session /
+                // weekly / Opus / credit balance — permanent until reset)
+                // from rate limit (transient throttle). The four phrases
+                // below are the verbatim Claude Code CLI subscription-quota
+                // wordings. A "continue" recovery nudge (#841) cannot
+                // resolve any of these — adding the explicit pattern
+                // routes them to the permanent-error band so the nudge
+                // gate excludes them via `AgentState::is_transient_error()`.
+                (
+                    AgentState::UsageLimit,
+                    r"You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low",
+                ),
                 // [docs] Auto-compaction on context limit
                 (
                     AgentState::ContextFull,
@@ -305,9 +352,23 @@ impl StatePatterns {
                 (AgentState::AuthError, r"OPENAI_API_KEY|api.?key"),
                 // [実測 v0.118.0] Quota exhausted message
                 (AgentState::UsageLimit, r"hit your usage limit|try again at"),
-                // [docs] HTTP 429 handling
-                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
-                (AgentState::RateLimit, r"rate.?limit|\b429\b"),
+                // #848: narrow Codex RateLimit to specific OpenAI SDK error
+                // wordings. The pre-#848 pattern matched the bare `rate_limit`
+                // substring anywhere — same false-positive class as Claude
+                // (recursive dogfood on agents discussing the issue itself).
+                // New pattern uses OpenAI SDK conventional phrases:
+                // - `rate_limit_exceeded` — OpenAI API error code field
+                // - `RateLimitError` — OpenAI Python SDK exception class
+                // - `hit your rate limit` — Codex CLI casual wording
+                // Sprint 31+ #4's `\b429\b` boundary was protecting against
+                // benign build numbers / request ids; the new pattern drops
+                // the bare `429` token entirely (false-positives no longer
+                // possible since the new alternations all carry distinctive
+                // wrapping context).
+                (
+                    AgentState::RateLimit,
+                    r"rate_limit_exceeded|RateLimitError|hit your rate limit",
+                ),
                 // [docs] Context overflow error
                 (AgentState::ContextFull, r"ContextOverflow"),
                 // [measured] Codex 0.120.0 renders approval dialogs with
@@ -1170,8 +1231,12 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     fn error_state_instant_transition() {
         let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-        // Feed a rate limit pattern — error state should transition instantly
-        t.feed("429 rate limit exceeded");
+        // #848: pre-#848 this fed `"429 rate limit exceeded"` which only
+        // matched because the OLD broad pattern keyed on `\b429\b` /
+        // `rate.?limit` substring. The narrowed pattern requires canonical
+        // Anthropic wording. The test's intent (error transitions instant,
+        // no hysteresis) is unchanged — only the feed string is canonicalized.
+        t.feed("API Error: Request rejected (429) · this may be a temporary capacity issue");
         assert_eq!(t.get_state(), AgentState::RateLimit);
     }
 
@@ -1831,10 +1896,12 @@ mod tests {
             st.get_state(),
             AgentState::Ready | AgentState::Idle
         ));
+        // #848: canonical Anthropic 429-rejection wording instead of the
+        // bare `429 rate limit exceeded` that the OLD broad pattern matched.
         drive(
             &mut vt,
             &mut st,
-            b"\r\n\x1b[31m429 rate limit exceeded\x1b[0m\r\n",
+            b"\r\n\x1b[31mAPI Error: Request rejected (429) - rate_limit_error\x1b[0m\r\n",
         );
         assert_eq!(st.get_state(), AgentState::RateLimit);
     }
@@ -2481,6 +2548,7 @@ mod tests {
             "permission" => AgentState::PermissionPrompt,
             "context_full" => AgentState::ContextFull,
             "rate_limit" => AgentState::RateLimit,
+            "server_rate_limit" => AgentState::ServerRateLimit,
             "usage_limit" => AgentState::UsageLimit,
             "auth_error" => AgentState::AuthError,
             "api_error" => AgentState::ApiError,
@@ -2992,12 +3060,20 @@ mod tests {
     #[test]
     fn generic_rate_limit_still_detected() {
         let patterns = StatePatterns::for_backend(&Backend::ClaudeCode);
-        // Generic "overloaded" should still be RateLimit (not ServerRateLimit)
-        let screen = "The API is overloaded, please try again";
+        // #848: the narrowed RateLimit pattern keys on Anthropic API
+        // `error.type` field values (`rate_limit_error` for HTTP 429)
+        // instead of the pre-#848 casual `overloaded` substring match —
+        // bare `overloaded` is too ambiguous (discussion prose,
+        // generic system-load messages, etc.) and previously caused
+        // false RateLimit classification on agents debugging the bug.
+        // The new pattern still distinguishes RateLimit (project-level
+        // 429) from ServerRateLimit (transient throttle) at the
+        // wire-format level.
+        let screen = "Anthropic API responded with rate_limit_error: too many requests";
         assert_eq!(
             patterns.detect(screen),
             Some(AgentState::RateLimit),
-            "generic overloaded must be RateLimit, not ServerRateLimit"
+            "rate_limit_error must trigger RateLimit (not ServerRateLimit)"
         );
     }
 
@@ -3097,44 +3173,19 @@ mod tests {
         );
     }
 
-    // ── #848 PR-A — classifier root cause unit tests + Tier 1 smoke ──
+    // ── #848 PR-A — classifier root cause unit tests ─────────────────
     //
-    // The smoke test sits here (not in tests/state_pattern_coverage.rs)
-    // because `StateTracker` / `AgentState` / `Backend` live in the binary
-    // crate, not `lib.rs`'s minimal re-export surface. Sprint 26 PR-A
-    // documented this pattern (see `tests/behavioral_shadow.rs` module
-    // doc): structural fixture checks in `tests/`, transition assertions
-    // in `src/state.rs::mod tests` where the binary-internal types are
-    // accessible.
-
-    /// Tier 1 smoke test: loads each of the 5 new #848 fixtures, runs
-    /// the bytes through `StateTracker::feed`, and asserts the observed
-    /// classification matches `MANIFEST.expected_final_state`. One
-    /// data-driven loop replaces five copy-paste assertions and gives
-    /// future-fixture-adders a single insertion point.
-    #[test]
-    fn classifier_matches_expected_state_per_fixture() {
-        let dir = std::path::Path::new("tests/fixtures/state-replay");
-        let cases: &[(&str, AgentState)] = &[
-            ("claude-rate-limit-429.raw", AgentState::RateLimit),
-            ("claude-server-throttle.raw", AgentState::ServerRateLimit),
-            ("claude-overloaded-529.raw", AgentState::ServerRateLimit),
-            ("claude-session-limit.raw", AgentState::UsageLimit),
-            ("claude-discussion-text.raw", AgentState::Idle),
-        ];
-        for (file, expected) in cases {
-            let bytes = std::fs::read(dir.join(file))
-                .unwrap_or_else(|e| panic!("read fixture {file}: {e}"));
-            let text = String::from_utf8_lossy(&bytes);
-            let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-            t.feed(&text);
-            assert_eq!(
-                t.get_state(),
-                *expected,
-                "fixture {file} expected {expected:?} (per MANIFEST.expected_final_state)"
-            );
-        }
-    }
+    // The data-driven "fixture → MANIFEST.expected_final_state" smoke
+    // test that the PR-A dispatch named `classifier_matches_expected_
+    // state_per_fixture` already exists in this module as
+    // `replay_manifest_regression` (line ~2573). That test parses
+    // MANIFEST.yaml, drives every fixture through the full
+    // VTerm + StateTracker pipeline, and asserts both
+    // `expected_transitions` AND `expected_final_state`. The 5 new
+    // #848 fixtures land directly in its coverage via MANIFEST.yaml.
+    // The 6 individual unit tests below provide focused regression
+    // signal for the specific narrowed-pattern alternations, on top
+    // of (not instead of) the broader replay_manifest_regression sweep.
 
     /// Individual: the canonical 429-rejection fixture must classify as
     /// RateLimit (new narrowed Claude pattern's first alternation).
