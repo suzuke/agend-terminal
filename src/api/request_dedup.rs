@@ -459,10 +459,43 @@ pub fn global() -> &'static DedupCache {
 /// [`crate::api::handlers::mcp_proxy::tool_timeout`] keyed on
 /// `params["tool"]` — shared source of truth across the dispatch budget
 /// and the dedup wait budget. Unmapped methods fall back to
-/// [`DEFAULT_WAIT_TIMEOUT`].
+/// [`DEFAULT_WAIT_TIMEOUT`] so adding a new API method without updating
+/// this map degrades to a longer-than-needed wait rather than a panic
+/// or hang.
 pub fn method_wait_timeout(method: &str, params: &Value) -> Duration {
-    let _ = (method, params);
-    unimplemented!("method_wait_timeout — C5 RED stub, C6 GREEN fills in")
+    use crate::api::method as m;
+    match method {
+        // Fast read-only / atomic-flip operations.
+        m::LIST
+        | m::STATUS
+        | m::PANE_SNAPSHOT
+        | m::MCP_TOOLS_LIST
+        | m::SHUTDOWN
+        | m::SET_BLOCKED_REASON
+        | m::CLEAR_BLOCKED_REASON
+        | m::REGISTER_EXTERNAL
+        | m::DEREGISTER_EXTERNAL
+        | m::MOVE_PANE => Duration::from_secs(5),
+
+        // Slow operations that spawn processes / write a lot of state.
+        m::SPAWN | m::CREATE_TEAM | m::UPDATE_TEAM => Duration::from_secs(60),
+
+        // `mcp_tool` dispatches the actual tool inside the daemon with
+        // its OWN per-tool budget (see `mcp_proxy::tool_timeout`).
+        // Mirror that map exactly so the dedup wait can never outrun
+        // the handler's own deadline.
+        m::MCP_TOOL => {
+            let tool = params.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+            crate::api::handlers::mcp_proxy::tool_timeout(tool)
+        }
+
+        // Middle band — covers `send`, `inject`, `kill`, `delete`,
+        // `verify_push`, and any future method not yet classified.
+        m::SEND | m::INJECT | m::KILL | m::DELETE | m::VERIFY_PUSH => Duration::from_secs(30),
+
+        // Unknown / unmapped — fall back to the conservative default.
+        _ => DEFAULT_WAIT_TIMEOUT,
+    }
 }
 
 /// Construct the over-cap `in_progress` error envelope. Exposed so the
