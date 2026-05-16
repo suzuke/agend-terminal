@@ -295,6 +295,58 @@ pub(crate) fn decide_nudge(
     NudgeDecision::Fire
 }
 
+/// Pure helper: apply one tick's worth of state observation to a
+/// per-agent `RecoveryNudgeTrack`. Extracted from
+/// `process_rate_limit_recovery_nudges` so the state-machine
+/// transitions are directly unit-testable without spinning up a
+/// supervisor + registry harness (mirror of the `decide_nudge` /
+/// `dedup_decision` patterns elsewhere in this module).
+///
+/// Three branches:
+///
+/// - **Transient error observed** (`is_transient_error()` true): start
+///   a fresh recovery cycle — stamp `last_error_at = now`, clear the
+///   `recovered_at` anchor, clear the `fired_this_cycle` latch.
+/// - **Agent in Ready/Idle**: stamp `recovered_at` on the first
+///   observation after an error (keep the anchor on subsequent ticks
+///   so `recovery_after_secs` can actually elapse).
+/// - **Agent in any other active state** (Thinking / ToolUse /
+///   InteractivePrompt / etc.): the agent left the recovery window.
+///   Clear `recovered_at` so the recovery-window clock restarts on
+///   the NEXT idle re-entry. **`fired_this_cycle` is NOT touched here**
+///   — once a nudge has fired in this cycle, it stays latched until
+///   a NEW transient error opens the next cycle. (This is the #846
+///   regression fix: prior to the fix, leaving Ready/Idle reset the
+///   latch, so any subsequent idle period past the cooldown could
+///   re-fire — operators saw the nudge re-injecting every ~5–6 min on
+///   normal idle-after-work moments.)
+pub(crate) fn update_track_for_state(
+    track: &mut RecoveryNudgeTrack,
+    state: crate::state::AgentState,
+    now: Instant,
+) {
+    if state.is_transient_error() {
+        track.last_error_at = Some(now);
+        track.recovered_at = None;
+        track.fired_this_cycle = false;
+    } else if matches!(
+        state,
+        crate::state::AgentState::Ready | crate::state::AgentState::Idle
+    ) {
+        if track.last_error_at.is_some() && track.recovered_at.is_none() {
+            track.recovered_at = Some(now);
+        }
+    } else {
+        // Agent left Ready/Idle (responding to nudge, operator typed, …).
+        // Reset the recovery-window anchor only; the `fired_this_cycle`
+        // latch persists until a new transient error opens the next cycle.
+        track.recovered_at = None;
+        // C1 RED: keep the regression here so the new test reproduces.
+        // C2 GREEN removes this line.
+        track.fired_this_cycle = false;
+    }
+}
+
 /// #841 per-tick integration for the recovery-nudge path.
 ///
 /// Phase 1 (registry lock held): observe per-agent state and update
@@ -328,32 +380,7 @@ pub(crate) fn process_rate_limit_recovery_nudges(
         for (name, handle) in reg.iter() {
             let state = handle.core.lock().state.current;
             let track = nudge_tracks.entry(name.clone()).or_default();
-            if state.is_transient_error() {
-                // Restart the cycle — a fresh transient error invalidates any
-                // in-flight recovery wait and any prior `fired_this_cycle` latch.
-                track.last_error_at = Some(now);
-                track.recovered_at = None;
-                track.fired_this_cycle = false;
-            } else if matches!(
-                state,
-                crate::state::AgentState::Ready | crate::state::AgentState::Idle
-            ) {
-                // Only stamp `recovered_at` on the FIRST observation of the
-                // Ready/Idle transition — subsequent ticks keep the same
-                // recovery anchor so the `recovery_after_secs` window can
-                // actually elapse.
-                if track.last_error_at.is_some() && track.recovered_at.is_none() {
-                    track.recovered_at = Some(now);
-                }
-            } else {
-                // Agent transitioned out of Ready/Idle (handler picked up the
-                // nudge, operator typed something, or any other active state).
-                // Reset cycle bookkeeping so the NEXT error→recovery sequence
-                // starts a clean cycle. `last_error_at` is preserved so a
-                // rapid re-error within the stale cap is still recognized.
-                track.recovered_at = None;
-                track.fired_this_cycle = false;
-            }
+            update_track_for_state(track, state, now);
             observed.push((name.clone(), state));
         }
     }
@@ -1651,6 +1678,43 @@ mod tests {
             "no per-instance override → daemon default kicks in (enabled=true)"
         );
         assert_eq!(resolved.observe_after_secs, default_cfg.observe_after_secs);
+    }
+
+    /// #846 regression repro: once a nudge has fired in this cycle,
+    /// the `fired_this_cycle` latch MUST persist when the agent leaves
+    /// and re-enters Ready/Idle (e.g. responds to the nudge, the
+    /// operator types something, an unrelated tool call runs). Prior
+    /// to the fix, the integration fn reset the latch on any "left
+    /// Ready/Idle" tick — so any subsequent idle period past
+    /// `cooldown_secs` (default 300s) could re-fire indefinitely.
+    /// Operators saw the nudge re-injecting every ~5–6 min on routine
+    /// idle moments after a stale rate-limit error sat in the track.
+    ///
+    /// The latch should only reset when a NEW transient error opens
+    /// the next cycle.
+    #[test]
+    fn fired_this_cycle_persists_across_idle_round_trips() {
+        let now = Instant::now();
+        let mut track = RecoveryNudgeTrack {
+            last_error_at: Some(now - Duration::from_secs(100)),
+            recovered_at: Some(now - Duration::from_secs(70)),
+            last_inject_at: Some(now - Duration::from_secs(5)),
+            fired_this_cycle: true,
+        };
+
+        // Tick 1: agent transitions out of Idle (e.g. ToolUse during
+        // its response to the nudge).
+        update_track_for_state(&mut track, AgentState::ToolUse, now);
+        // Tick 2: agent settles back into Idle a few seconds later.
+        let later = now + Duration::from_secs(5);
+        update_track_for_state(&mut track, AgentState::Idle, later);
+
+        assert!(
+            track.fired_this_cycle,
+            "fired_this_cycle must persist across idle round-trips — \
+             single-shot guarantee is broken if this flips back to false \
+             before a new transient error opens the next cycle"
+        );
     }
 
     /// (f) permanent errors excluded: `UsageLimit` and `AuthError` are
