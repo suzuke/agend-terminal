@@ -270,16 +270,25 @@ impl StatePatterns {
                     AgentState::AuthError,
                     r"Not authenticated|AccessDenied|denied access",
                 ),
-                // [docs] AWS quota errors
+                // #848 PR-B: extend AWS quota errors with the casual
+                // `you have reached the limit` wording observed in Kiro #5876.
+                // Additive — existing `ServiceQuotaExceeded` /
+                // `InsufficientModelCapacity` alternations preserved.
                 (
                     AgentState::UsageLimit,
-                    r"ServiceQuotaExceeded|InsufficientModelCapacity",
+                    r"ServiceQuotaExceeded|InsufficientModelCapacity|you have reached the limit",
                 ),
                 // [docs] HTTP 429 handling
                 // Sprint 31+ #4: word-boundary `429` per Claude pattern.
+                // #848 PR-B: add AWS Bedrock `ThrottlingException` and
+                // generic `Rate exceeded` wording. Additive — Kiro's
+                // pre-#848 pattern was already specific (no broad-substring
+                // false-positive class to fix), so this commit only widens
+                // coverage to more error wordings without reintroducing
+                // the pre-#848 broadness seen on Claude/Codex/OpenCode.
                 (
                     AgentState::RateLimit,
-                    r"Too Many Requests|ThrottlingError|\b429\b",
+                    r"Too Many Requests|ThrottlingError|ThrottlingException|Rate exceeded|\b429\b",
                 ),
                 // [docs] Context overflow triggers compaction
                 // `/compact` was previously included but matches the slash-
@@ -394,9 +403,28 @@ impl StatePatterns {
             ],
             // OpenCode v1.4.0
             Backend::OpenCode => vec![
-                // [docs] HTTP error handling
-                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
-                (AgentState::RateLimit, r"rate.?limit|\b429\b"),
+                // #848 PR-B: narrow OpenCode RateLimit to specific
+                // sst→anomalyco fork CLI wordings. The pre-#848 pattern
+                // `r"rate.?limit|\b429\b"` matched bare `rate_limit` /
+                // `rate-limit` / `rate limit` substrings anywhere — same
+                // false-positive class as Claude/Codex pre-PR-A. New
+                // pattern keys on:
+                // - `API rate limited (429)` — observed in sst#8203 / #3525
+                // - `Rate limited. Quick retry` — observed in sst#9091
+                // - `API rate limit exceeded` — observed in sst#1491
+                // The bare `\b429\b` token is dropped; real 429s carry
+                // the wrapping `API rate limited (429)` wording which
+                // still matches the first alternation.
+                (
+                    AgentState::RateLimit,
+                    r"API rate limited \(429\)|Rate limited\. Quick retry|API rate limit exceeded",
+                ),
+                // #848 PR-B: NEW OpenCode UsageLimit pattern (pre-#848
+                // OpenCode had no UsageLimit pattern at all, so
+                // subscription-quota strings fell through to whatever
+                // broader pattern matched — frequently RateLimit via
+                // the `rate.?limit` substring).
+                (AgentState::UsageLimit, r"Quota Limit Exceeded"),
                 // [measured] Provider-side validation errors (e.g. MiniMax
                 // M2.5 rejecting eager_input_streaming in tool spec).
                 (
@@ -448,9 +476,24 @@ impl StatePatterns {
                     AgentState::UsageLimit,
                     r"Usage limit reached|Access resets at",
                 ),
-                // [docs] API resource exhaustion
-                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
-                (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|\b429\b"),
+                // #848 PR-B: narrow Gemini RateLimit to specific
+                // google-gemini/gemini-cli verbatim wordings (issues
+                // #10722/#8437/#22545/#2305/#1502). The pre-#848 pattern
+                // `r"RESOURCE_EXHAUSTED|\b429\b"` matched bare `429`
+                // tokens anywhere — the same false-positive class as
+                // Claude/Codex pre-PR-A (any prose discussing HTTP 429
+                // status codes triggered RateLimit). New pattern keys
+                // on full HTTP-context wording — `429 RESOURCE_EXHAUSTED`,
+                // `rateLimitExceeded` (gRPC error code field),
+                // `got status: 429`, `429 Too Many Requests`, and
+                // `rate limit exceeded` (CLI casual wording). The bare
+                // `\b429\b` token is dropped; the wrapping context in
+                // the new alternations is what distinguishes a real
+                // 429 from discussion prose.
+                (
+                    AgentState::RateLimit,
+                    r"429 RESOURCE_EXHAUSTED|rateLimitExceeded|got status: 429|429 Too Many Requests|rate limit exceeded",
+                ),
                 // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
                 // [docs] Permission select options

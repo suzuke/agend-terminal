@@ -527,9 +527,16 @@ fixtures:
       `ThrottlingError` / `\b429\b`), so this fixture passes even on
       OLD patterns — locked here as a contract that future Kiro pattern
       additions (such as PR-B's `ThrottlingException|Rate exceeded`)
-      do NOT reintroduce a broad-substring false-positive.
-    expected_transitions: [starting, idle]
-    expected_final_state: idle
-    expected_final_detect: idle
+      do NOT reintroduce a broad-substring false-positive. The fixture
+      lacks a Kiro Idle anchor (no `\d+%` percent prompt or `ask a
+      question` text), so the classifier stays in Starting — the
+      regression-proof contract is "discussion prose must NOT trigger
+      RateLimit"; Starting is also NOT RateLimit, which is what we want.
+    expected_transitions: [starting]
+    expected_final_state: starting
+    # detect() returns Option<AgentState> and yields None when no
+    # pattern matches (Starting is the tracker's initial state, not a
+    # pattern-match outcome). Omitting `expected_final_detect`
+    # asserts None — what we want here.
     capture_kind: synthetic
-    provenance: "#848 PR-B regression-proof — prose containing rate-limit substrings, expected Idle"
+    provenance: "#848 PR-B regression-proof — prose containing rate-limit substrings, expected Starting (NOT RateLimit)"
