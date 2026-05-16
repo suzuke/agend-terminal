@@ -47,7 +47,21 @@ fn main() {
     // without a real filesystem fixture.
     let canonical_cwd = cwd_is_canonical_worktree();
 
-    match classify(subcommand, &args, &binding, parent_is_gh, canonical_cwd) {
+    // #852: resolve agent-vs-operator caller identity once. Agents are
+    // daemon-spawned subprocesses (AGEND_INSTANCE_NAME set); operators
+    // are interactive shells with no such env. Used by classify's
+    // canonical-checkout gate to prevent reviewer-style PR-inspection
+    // from polluting canonical worktrees with stale refs.
+    let is_agent_caller = env::var_os("AGEND_INSTANCE_NAME").is_some();
+
+    match classify(
+        subcommand,
+        &args,
+        &binding,
+        parent_is_gh,
+        canonical_cwd,
+        is_agent_caller,
+    ) {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) => exec_real_git(&args, Some(&worktree)),
         Action::SilentExempt {
@@ -229,6 +243,7 @@ fn classify(
     binding: &Binding,
     parent_is_gh: bool,
     canonical_cwd: bool,
+    is_agent_caller: bool,
 ) -> Action {
     let bound = is_bound(binding);
 
@@ -261,6 +276,32 @@ fn classify(
         "checkout" | "switch" => {
             let target_branch = args.get(1).map(|s| s.as_str()).unwrap_or("");
             if !bound {
+                // #852: agent callers must NOT use the #778 Option-3
+                // leniency below. The leniency was designed for the
+                // operator-typed validation-canary flow (operator runs
+                // `repo action=checkout` to provision a worktree in
+                // detached-HEAD, then `git switch <branch>` to land on
+                // the branch; that follow-up needs to pass without a
+                // BYPASS). But the gate wasn't agent-aware, so
+                // reviewer agents whose binding lookup failed for the
+                // canonical-rooted cwd fell through to the same
+                // leniency — and the resulting `git checkout <sha>` /
+                // `git checkout -b tmp_review` calls polluted
+                // canonical's branch list with stale `pr*_head` /
+                // `tmp*` / `review/*` refs. Operator surfaced the
+                // recurrence on PR #805 morning + PR #850 afternoon.
+                // Fix: route agents to either `repo action=checkout
+                // bind=true` (gives them a properly-bound worktree)
+                // or `gh pr diff/view` (read-only). Operator path
+                // unchanged.
+                if is_agent_caller && canonical_cwd {
+                    return Action::Deny(
+                        "agent callers must not checkout in canonical \
+                         (use `repo action=checkout` for PR inspection or \
+                         `gh pr diff/view` for read-only). #852."
+                            .into(),
+                    );
+                }
                 // #778 Option 3: shim leniency for canonical-rooted
                 // unbound worktrees. When cwd is inside a worktree whose
                 // `.git` pointer resolves to a source repo carrying a
@@ -594,6 +635,8 @@ mod tests {
             &binding,
             true, // parent_is_gh = true
             false,
+            false, // is_agent_caller — operator default; the gh-exemption
+                   // is independent of #852's agent-vs-operator gate
         );
         match action {
             Action::SilentExempt {
@@ -622,6 +665,7 @@ mod tests {
             &binding,
             true,
             false,
+            false, // is_agent_caller — operator default
         );
         assert!(
             matches!(action, Action::SilentExempt { .. }),
@@ -642,6 +686,7 @@ mod tests {
             &binding,
             false, // parent_is_gh = false (interactive shell)
             false,
+            false, // is_agent_caller — operator default
         );
         match action {
             Action::Deny(reason) => {
@@ -671,6 +716,7 @@ mod tests {
             &binding,
             true,
             false,
+            false, // is_agent_caller — operator default
         );
         assert!(matches!(action_gh, Action::SilentExempt { .. }));
         // interactive path → deny
@@ -680,6 +726,7 @@ mod tests {
             &binding,
             false,
             false,
+            false, // is_agent_caller — operator default
         );
         match action_interactive {
             Action::Deny(_) => {}
@@ -702,6 +749,7 @@ mod tests {
             &binding,
             true, // parent_is_gh — but target isn't protected.
             false,
+            false, // is_agent_caller — operator default
         );
         match action {
             Action::Deny(reason) => {
@@ -850,6 +898,9 @@ mod tests {
             &Binding::default(), // unbound
             false,               // parent_is_gh = no
             true,                // canonical_cwd = yes
+            false,               // is_agent_caller — operator default; the
+                                 // #778 leniency must still fire for the
+                                 // operator-driven validation-canary flow
         );
         assert!(
             matches!(action, Action::Passthrough),
@@ -869,6 +920,7 @@ mod tests {
             &Binding::default(),
             false,
             true,
+            false, // is_agent_caller — operator default
         );
         assert!(
             matches!(action, Action::Passthrough),
@@ -888,6 +940,7 @@ mod tests {
             &Binding::default(),
             false,
             false, // canonical_cwd = no
+            false, // is_agent_caller — operator default
         );
         match action {
             Action::Deny(reason) => assert!(
@@ -910,7 +963,8 @@ mod tests {
             &["checkout".into(), "-b".into(), "evil".into()],
             &Binding::default(),
             false,
-            true, // canonical_cwd = yes, but arg is a flag
+            true,  // canonical_cwd = yes, but arg is a flag
+            false, // is_agent_caller — operator default
         );
         match action {
             Action::Deny(reason) => assert!(
@@ -932,6 +986,7 @@ mod tests {
             &Binding::default(),
             false,
             true,
+            false, // is_agent_caller — operator default
         );
         match action {
             Action::Deny(reason) => assert!(reason.contains("unbound"), "got {reason}"),
@@ -951,11 +1006,131 @@ mod tests {
             &["checkout".into(), "feat/p778".into()],
             &binding,
             false,
-            true, // canonical_cwd — should NOT route through leniency
+            true,  // canonical_cwd — should NOT route through leniency
+            false, // is_agent_caller — operator default
         );
         match action {
             Action::ChdirPass(ref wt) => assert_eq!(wt, "/tmp/.worktrees/dev"),
             other => panic!("bound same-branch must ChdirPass, got {other:?}"),
+        }
+    }
+
+    // ----- #852 PR-B — agent caller + canonical cwd → Deny -----
+    //
+    // The pre-#852 `!bound + canonical_cwd + positional non-flag arg →
+    // Passthrough` leniency was designed for the operator-typed
+    // validation-canary flow (`repo action=checkout` provisions a
+    // worktree in detached-HEAD; operator's natural `git switch
+    // <branch>` follow-up needed to pass). It accidentally also
+    // covered agent callers whose binding lookup failed for the
+    // current cwd — reviewers especially, who inspect PRs via
+    // canonical-rooted worktrees and end up creating `pr*_head` /
+    // `tmp*` / `review/*` refs that pollute the canonical's branch
+    // list. PR-B gates the leniency on agent-vs-operator identity:
+    // operators keep the leniency, agents are routed to the
+    // `repo action=checkout bind=true` MCP tool (which gives them a
+    // properly-bound worktree) or `gh pr diff/view` (read-only).
+
+    /// #852 PR-B core: when caller is an agent (AGEND_INSTANCE_NAME
+    /// set) AND cwd is a canonical-rooted worktree, the leniency must
+    /// NOT fire — checkout is denied with an actionable hint pointing
+    /// to the supported alternatives.
+    #[test]
+    fn shim_denies_agent_checkout_in_canonical() {
+        let action = classify(
+            "checkout",
+            &["checkout".into(), "abc1234".into()], // SHA — reviewer's
+            // "let me see this
+            // PR's tree" workflow
+            &Binding::default(), // unbound (binding lookup failed for
+            // canonical cwd)
+            false, // parent_is_gh = no
+            true,  // canonical_cwd = yes
+            true,  // is_agent_caller = yes
+        );
+        match action {
+            Action::Deny(reason) => {
+                assert!(
+                    reason.contains("agent"),
+                    "deny reason must explicitly call out the agent-caller \
+                     identity so reviewers see WHY their workflow is rejected: \
+                     {reason}"
+                );
+                assert!(
+                    reason.contains("repo action=checkout") || reason.contains("gh pr diff"),
+                    "deny reason must surface the supported alternative \
+                     (repo action=checkout MCP or gh pr diff): {reason}"
+                );
+                assert!(
+                    reason.contains("#852"),
+                    "deny reason should reference the issue for operator \
+                     traceability: {reason}"
+                );
+            }
+            other => panic!(
+                "agent caller in canonical worktree must Deny, not {other:?} \
+                 — that's the reviewer-pollution bug fix"
+            ),
+        }
+    }
+
+    /// #852 PR-B operator preservation: when caller is NOT an agent
+    /// (operator's interactive shell, no AGEND_INSTANCE_NAME), the
+    /// existing #778 leniency must continue to fire — the validation-
+    /// canary flow must not regress.
+    #[test]
+    fn shim_allows_operator_checkout_in_canonical() {
+        let action = classify(
+            "checkout",
+            &["checkout".into(), "feat/canary".into()],
+            &Binding::default(),
+            false, // parent_is_gh = no
+            true,  // canonical_cwd = yes
+            false, // is_agent_caller = no (operator shell)
+        );
+        assert!(
+            matches!(action, Action::Passthrough),
+            "operator in canonical worktree must keep the #778 leniency, \
+             got {action:?}"
+        );
+    }
+
+    /// #852 PR-B narrowness check: when the agent IS a caller but cwd
+    /// is NOT canonical (e.g. agent invoked git from a non-worktree
+    /// path), the gate must NOT fire — only the canonical-pollution
+    /// surface is targeted. Operator's `unbound + non-canonical →
+    /// Deny` outcome is preserved (different code path).
+    #[test]
+    fn shim_agent_outside_canonical_unchanged() {
+        let action = classify(
+            "checkout",
+            &["checkout".into(), "feat/x".into()],
+            &Binding::default(),
+            false, // parent_is_gh = no
+            false, // canonical_cwd = NO — gate must NOT fire
+            true,  // is_agent_caller = yes
+        );
+        // Falls through to the existing `unbound — no active task
+        // assignment` Deny (different from the new #852 Deny). The
+        // pre-existing safety net stays intact.
+        match action {
+            Action::Deny(reason) => {
+                assert!(
+                    reason.contains("unbound"),
+                    "non-canonical agent path must keep the original \
+                     unbound deny (not the new #852 agent-canonical deny): \
+                     {reason}"
+                );
+                assert!(
+                    !reason.contains("#852"),
+                    "non-canonical agent path must NOT trigger the #852 \
+                     gate (gate is narrow by design): {reason}"
+                );
+            }
+            other => panic!(
+                "non-canonical unbound must keep the pre-existing deny, \
+                 got {other:?}"
+            ),
         }
     }
 }
