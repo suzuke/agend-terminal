@@ -230,6 +230,13 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // spawn site — supervisor's per-tick loop hosts the scan.
     let mut conflict_notify_tracker =
         crate::daemon::conflict_notify::ConflictNotifyTracker::default();
+    // #852 residual PR-B: per-tick canonical-drift scan. Sibling to
+    // waiting_on_stale + conflict_notify (same TICKS_PER_SCAN cadence,
+    // same supervisor-hosted no-new-spawn-site pattern). Catches
+    // detached-HEAD residue accrued AFTER daemon boot for long-lived
+    // daemons; reuses the boot-time canonical_hygiene helper.
+    let mut canonical_drift_tracker =
+        crate::daemon::canonical_drift::CanonicalDriftTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -242,6 +249,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         mcp_registry_tracker.maybe_scan(&home);
         waiting_on_stale_tracker.maybe_scan(&home);
         conflict_notify_tracker.maybe_scan(&home, &registry);
+        canonical_drift_tracker.maybe_scan(&home);
         // #836: reclaim expired (10-min TTL) entries from the
         // notification-dedup ledger so memory pressure stays bounded
         // on long-lived daemons.

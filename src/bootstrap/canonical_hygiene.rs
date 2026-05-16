@@ -1,12 +1,18 @@
-//! #852 PR-C: boot-time canonical-repo hygiene.
+//! #852 canonical-repo hygiene (boot-time + #852-residual runtime).
 //!
-//! When the daemon comes up, the canonical source repo might have
-//! been left in an unhealthy state by a previous fleet session
-//! (e.g. reviewer agent's `git checkout <sha>` left HEAD detached;
-//! see PR-A §3.19 protocol + PR-B shim enforcement). This module
-//! decides whether to auto-switch the canonical's HEAD back to the
-//! default branch ("main") so subsequent operator commands aren't
-//! surprised.
+//! When the canonical source repo is left in an unhealthy state
+//! — e.g. a reviewer agent's `git checkout <sha>` left HEAD detached
+//! (see §3.19 + the L2 shim deny matrix) — this module decides
+//! whether to auto-switch the canonical's HEAD back to the default
+//! branch ("main") so subsequent operator commands aren't surprised.
+//!
+//! Two call sites share the same helper:
+//!
+//! - **Boot path** (`bootstrap/mod.rs`): one-shot scan at daemon
+//!   startup — catches state inherited from the prior session.
+//! - **Runtime path** (`daemon/canonical_drift.rs`): per-tick
+//!   throttled scan (5-min cadence) — catches drift accrued AFTER
+//!   boot for long-lived daemons. #852 residual PR-B.
 //!
 //! Decision matrix (pure helper [`decide_canonical_action`]):
 //!
@@ -45,12 +51,15 @@ pub enum CanonicalAction {
     WarnDirtyDetached,
 }
 
-/// Boot-time hygiene entry — discover distinct canonical repos from
+/// Hygiene entry — discover distinct canonical repos from
 /// `config.instances[*].source_repo` and apply [`apply_to_canonical`]
 /// to each. Best-effort: any per-canonical failure is logged and
-/// skipped (boot must never fail because hygiene couldn't shell out
-/// to git).
-pub(crate) fn run_at_boot(config: &crate::fleet::FleetConfig) {
+/// skipped (the caller — boot or per-tick runtime — must never fail
+/// because hygiene couldn't shell out to git).
+///
+/// Called from two sites: `bootstrap/mod.rs` at daemon startup and
+/// `daemon/canonical_drift.rs` per-tick (5-min throttled cadence).
+pub(crate) fn run_hygiene(config: &crate::fleet::FleetConfig) {
     let mut seen = std::collections::HashSet::<std::path::PathBuf>::new();
     for (name, instance) in &config.instances {
         let Some(source_repo) = instance.source_repo.as_ref() else {

@@ -193,7 +193,7 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     // warn-log if dirty (operator WIP protection). Pure observation
     // beyond the single `git switch main` mutation when conditions
     // are right. Best-effort — boot continues regardless.
-    canonical_hygiene::run_at_boot(&config);
+    canonical_hygiene::run_hygiene(&config);
     // #829: boot-time orphan-owner sweep. Auto-applies for owners
     // verifiably gone (∉ fleet.yaml ∧ ∉ live registry); dry-run +
     // tracing::warn for the softer "∈ fleet.yaml ∧ ∉ live" case.

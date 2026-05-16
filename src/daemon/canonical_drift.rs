@@ -30,12 +30,14 @@ impl CanonicalDriftTracker {
     /// Per-tick entry. Increments the tick counter; on the throttled
     /// boundary, fires a drift scan and returns `true`. Returns `false`
     /// otherwise (pre-throttle tick OR post-fire reset).
-    pub(crate) fn maybe_scan(&mut self, _home: &Path) -> bool {
+    pub(crate) fn maybe_scan(&mut self, home: &Path) -> bool {
         self.tick_count = self.tick_count.saturating_add(1);
-        // C1 RED stub: counter is incremented but throttle gate is not
-        // yet implemented; throttle test will fail at the 30th tick
-        // until C2 GREEN lands the real logic.
-        false
+        if self.tick_count < TICKS_PER_SCAN {
+            return false;
+        }
+        self.tick_count = 0;
+        run_drift_scan(home);
+        true
     }
 }
 
@@ -43,9 +45,16 @@ impl CanonicalDriftTracker {
 /// Best-effort: a missing or unparseable fleet.yaml is logged at debug
 /// and skipped (per boot-time semantics — daemon must never crash
 /// because hygiene couldn't read config).
-fn run_drift_scan(_home: &Path) {
-    // C1 RED stub: no-op. C2 GREEN will load FleetConfig + dispatch to
-    // canonical_hygiene::run_hygiene.
+fn run_drift_scan(home: &Path) {
+    let path = crate::fleet::fleet_yaml_path(home);
+    match crate::fleet::FleetConfig::load(&path) {
+        Ok(config) => crate::bootstrap::canonical_hygiene::run_hygiene(&config),
+        Err(e) => tracing::debug!(
+            error = %e,
+            path = %path.display(),
+            "#852 canonical_drift: fleet.yaml load failed; skipping scan"
+        ),
+    }
 }
 
 #[cfg(test)]
