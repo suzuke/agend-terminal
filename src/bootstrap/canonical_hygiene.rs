@@ -48,7 +48,19 @@ pub enum CanonicalAction {
     /// HEAD is detached BUT the working tree has uncommitted changes.
     /// Operator might be mid-bisect / mid-cherry-pick / have
     /// legitimate WIP. Log a warning and leave alone.
+    ///
+    /// Reachable only as a fall-back from [`Self::StashAndSwitchToDefault`]
+    /// after #852 residual PR-C (stash failure path); the pure-
+    /// decision table no longer maps detached+dirty to this variant.
     WarnDirtyDetached,
+    /// HEAD is detached AND the working tree is dirty: stash the WIP
+    /// with a timestamped marker, switch to the default branch, and
+    /// notify the operator about the stash ref so they can recover
+    /// via `git stash pop`. Reversible by definition — safer than
+    /// letting reviewer pollution land with no recovery path. On
+    /// stash failure, falls back to [`Self::WarnDirtyDetached`]
+    /// behaviour (warn log, no mutation).
+    StashAndSwitchToDefault,
 }
 
 /// Hygiene entry — discover distinct canonical repos from
@@ -142,6 +154,17 @@ pub(crate) fn apply_to_canonical(canonical: &std::path::Path) {
                  {DEFAULT_BRANCH}` manually after committing/stashing changes."
             );
         }
+        // C1 RED stub: route the new variant through the existing
+        // WarnDirtyDetached fall-back so the match stays exhaustive
+        // and apply_to_canonical compiles. C2 GREEN will land the
+        // real stash + switch + notify flow.
+        CanonicalAction::StashAndSwitchToDefault => {
+            tracing::warn!(
+                canonical = %canonical.display(),
+                "#852 canonical hygiene (C1 stub): StashAndSwitchToDefault \
+                 not yet implemented; falling through to warn-only"
+            );
+        }
     }
 }
 
@@ -203,6 +226,7 @@ pub fn decide_canonical_action(head_state: &str, working_tree_clean: bool) -> Ca
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -283,5 +307,108 @@ mod tests {
             CanonicalAction::WarnDirtyDetached,
             "empty rev-parse + dirty → warn (defensive)"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // #852 residual PR-C: dirty-detached stash-recovery tests.
+    // ----------------------------------------------------------------
+
+    /// PR-C contract: detached HEAD with dirty working tree must
+    /// resolve to [`CanonicalAction::StashAndSwitchToDefault`] (reversible
+    /// auto-recovery), not the obsolete `WarnDirtyDetached` (which
+    /// left the canonical permanently polluted for the operator).
+    ///
+    /// In C1 RED, [`decide_canonical_action`] still returns the old
+    /// `WarnDirtyDetached`, so this assertion fails. C2 GREEN updates
+    /// the decision table and this passes.
+    #[test]
+    fn stash_and_switch_on_dirty_detached() {
+        assert_eq!(
+            decide_canonical_action("HEAD", false),
+            CanonicalAction::StashAndSwitchToDefault,
+            "detached HEAD + dirty tree → StashAndSwitchToDefault \
+             (reversible auto-recovery; #852 residual PR-C)"
+        );
+    }
+
+    /// PR-C contract: when `git stash push` fails at the syscall /
+    /// repo-state level (here simulated by planting `.git/index.lock`
+    /// before invoking [`apply_to_canonical`]), the integration fn
+    /// must fall back to the warn-only branch — no panic, no half-
+    /// switch, and HEAD must remain in its detached state so the
+    /// operator can still recover manually.
+    ///
+    /// The fixture builds a real micro-repo so `rev-parse` and
+    /// `status --porcelain` both succeed (otherwise apply exits
+    /// before reaching the stash branch). C1 RED reaches this branch
+    /// via the stub arm; C2 GREEN will actually attempt the stash,
+    /// observe the index-lock failure, and route through the same
+    /// fall-back. The invariants asserted hold in both phases —
+    /// this test is the smoke that proves the new variant's
+    /// dispatch never panics + never loses the operator's WIP.
+    #[test]
+    fn apply_to_canonical_falls_back_to_warn_on_stash_failure() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let canonical = std::env::temp_dir().join(format!(
+            "agend-test-canonical-stash-fallback-{}-{id}",
+            std::process::id(),
+        ));
+        // Best-effort cleanup from any prior run.
+        let _ = std::fs::remove_dir_all(&canonical);
+        std::fs::create_dir_all(&canonical).unwrap();
+
+        // Build a minimal repo: init + initial commit on main, then
+        // detach + dirty the tree so decide_canonical_action observes
+        // the StashAndSwitchToDefault path in C2.
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&canonical)
+                .args(args)
+                .env("AGEND_GIT_BYPASS", "1")
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command spawn")
+        };
+        assert!(run(&["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(canonical.join("file.txt"), "initial\n").unwrap();
+        assert!(run(&["add", "file.txt"]).status.success());
+        assert!(run(&["commit", "-q", "-m", "initial"]).status.success());
+        let initial_sha = String::from_utf8(run(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(run(&["checkout", "-q", &initial_sha]).status.success(),
+            "detach HEAD via checkout SHA");
+        std::fs::write(canonical.join("file.txt"), "modified-wip\n").unwrap();
+        // Plant the index lock so `git stash push` cannot complete.
+        std::fs::write(canonical.join(".git").join("index.lock"), "").unwrap();
+
+        // Drive apply. Must not panic; HEAD must remain detached.
+        apply_to_canonical(&canonical);
+
+        let head_state = String::from_utf8(run(&["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(
+            head_state, "HEAD",
+            "post-fall-back HEAD must remain detached — operator WIP \
+             must not be silently moved when stash recovery fails"
+        );
+
+        // No stash refs should exist on the failure path.
+        let stash_ref = canonical.join(".git").join("refs").join("stash");
+        assert!(
+            !stash_ref.exists(),
+            "stash ref must not exist when git stash push failed"
+        );
+
+        let _ = std::fs::remove_dir_all(&canonical);
     }
 }
