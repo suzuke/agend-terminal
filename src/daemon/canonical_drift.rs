@@ -15,7 +15,8 @@
 //! arg through the supervisor loop signature. The boot-time path stays
 //! authoritative for the helper API; this module is a thin adapter.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Scan throttle: 30 ticks × 10s = 5 min cadence (matches
 /// `waiting_on_stale` + `conflict_notify`).
@@ -24,6 +25,15 @@ const TICKS_PER_SCAN: u64 = 30;
 #[derive(Debug, Default)]
 pub(crate) struct CanonicalDriftTracker {
     tick_count: u64,
+    /// Per-canonical-path last-action timestamp. Reserved for future
+    /// per-path dedup / re-alert suppression (mirror of
+    /// `waiting_on_stale::WaitingOnStaleTracker::last_alerted_at`).
+    /// Not read in this PR — the boot-time helper handles all log
+    /// suppression today; the field is wired through so a future PR
+    /// can add per-path throttling without re-flexing the struct
+    /// shape.
+    #[allow(dead_code)]
+    last_action_at: HashMap<PathBuf, chrono::DateTime<chrono::Utc>>,
 }
 
 impl CanonicalDriftTracker {
@@ -42,14 +52,16 @@ impl CanonicalDriftTracker {
 }
 
 /// Reload `FleetConfig` + dispatch to the canonical-hygiene helper.
-/// Best-effort: a missing or unparseable fleet.yaml is logged at debug
+/// Best-effort: a missing or unparseable fleet.yaml is logged at warn
 /// and skipped (per boot-time semantics — daemon must never crash
-/// because hygiene couldn't read config).
+/// because hygiene couldn't read config). Warn (not debug) because
+/// a runtime fleet.yaml load failure indicates an actual operator-
+/// visible config regression and should not be silenced.
 fn run_drift_scan(home: &Path) {
     let path = crate::fleet::fleet_yaml_path(home);
     match crate::fleet::FleetConfig::load(&path) {
         Ok(config) => crate::bootstrap::canonical_hygiene::run_hygiene(&config),
-        Err(e) => tracing::debug!(
+        Err(e) => tracing::warn!(
             error = %e,
             path = %path.display(),
             "#852 canonical_drift: fleet.yaml load failed; skipping scan"
