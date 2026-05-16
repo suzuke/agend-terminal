@@ -246,13 +246,6 @@ fn classify(
     is_agent_caller: bool,
 ) -> Action {
     let bound = is_bound(binding);
-    // C1 RED stub: `is_agent_caller` is threaded through here but the
-    // actual gate inside the checkout-arm `!bound` branch isn't wired
-    // yet — the existing #778 Option-3 leniency still allows agent
-    // checkout in canonical-rooted worktrees. C2 GREEN inserts the
-    // `is_agent_caller && canonical_cwd → Deny` gate before that
-    // leniency, closing #852's reviewer-pollution surface.
-    let _ = is_agent_caller;
 
     match subcmd {
         // Read-only commands: passthrough when unbound, chdir when bound.
@@ -283,6 +276,32 @@ fn classify(
         "checkout" | "switch" => {
             let target_branch = args.get(1).map(|s| s.as_str()).unwrap_or("");
             if !bound {
+                // #852: agent callers must NOT use the #778 Option-3
+                // leniency below. The leniency was designed for the
+                // operator-typed validation-canary flow (operator runs
+                // `repo action=checkout` to provision a worktree in
+                // detached-HEAD, then `git switch <branch>` to land on
+                // the branch; that follow-up needs to pass without a
+                // BYPASS). But the gate wasn't agent-aware, so
+                // reviewer agents whose binding lookup failed for the
+                // canonical-rooted cwd fell through to the same
+                // leniency — and the resulting `git checkout <sha>` /
+                // `git checkout -b tmp_review` calls polluted
+                // canonical's branch list with stale `pr*_head` /
+                // `tmp*` / `review/*` refs. Operator surfaced the
+                // recurrence on PR #805 morning + PR #850 afternoon.
+                // Fix: route agents to either `repo action=checkout
+                // bind=true` (gives them a properly-bound worktree)
+                // or `gh pr diff/view` (read-only). Operator path
+                // unchanged.
+                if is_agent_caller && canonical_cwd {
+                    return Action::Deny(
+                        "agent callers must not checkout in canonical \
+                         (use `repo action=checkout` for PR inspection or \
+                         `gh pr diff/view` for read-only). #852."
+                            .into(),
+                    );
+                }
                 // #778 Option 3: shim leniency for canonical-rooted
                 // unbound worktrees. When cwd is inside a worktree whose
                 // `.git` pointer resolves to a source repo carrying a
@@ -944,7 +963,7 @@ mod tests {
             &["checkout".into(), "-b".into(), "evil".into()],
             &Binding::default(),
             false,
-            true, // canonical_cwd = yes, but arg is a flag
+            true,  // canonical_cwd = yes, but arg is a flag
             false, // is_agent_caller — operator default
         );
         match action {
@@ -987,7 +1006,7 @@ mod tests {
             &["checkout".into(), "feat/p778".into()],
             &binding,
             false,
-            true, // canonical_cwd — should NOT route through leniency
+            true,  // canonical_cwd — should NOT route through leniency
             false, // is_agent_caller — operator default
         );
         match action {
@@ -1021,13 +1040,13 @@ mod tests {
         let action = classify(
             "checkout",
             &["checkout".into(), "abc1234".into()], // SHA — reviewer's
-                                                    // "let me see this
-                                                    // PR's tree" workflow
+            // "let me see this
+            // PR's tree" workflow
             &Binding::default(), // unbound (binding lookup failed for
-                                 // canonical cwd)
-            false,               // parent_is_gh = no
-            true,                // canonical_cwd = yes
-            true,                // is_agent_caller = yes
+            // canonical cwd)
+            false, // parent_is_gh = no
+            true,  // canonical_cwd = yes
+            true,  // is_agent_caller = yes
         );
         match action {
             Action::Deny(reason) => {
@@ -1038,8 +1057,7 @@ mod tests {
                      {reason}"
                 );
                 assert!(
-                    reason.contains("repo action=checkout")
-                        || reason.contains("gh pr diff"),
+                    reason.contains("repo action=checkout") || reason.contains("gh pr diff"),
                     "deny reason must surface the supported alternative \
                      (repo action=checkout MCP or gh pr diff): {reason}"
                 );
