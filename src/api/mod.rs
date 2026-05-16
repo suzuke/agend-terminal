@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 mod handlers;
+pub mod request_dedup;
 
 pub type ConfigRegistry = Arc<Mutex<HashMap<String, crate::daemon::AgentConfig>>>;
 
