@@ -30,6 +30,17 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "claude-overloaded-529.raw",
     "claude-session-limit.raw",
     "claude-discussion-text.raw",
+    // #848 PR-B — OpenCode + Gemini + Kiro classifier fixtures (same
+    // synthetic-from-docs provenance, same in-process replay coverage
+    // via `replay_manifest_regression`).
+    "opencode-rate-limit-typical.raw",
+    "opencode-usage-limit-typical.raw",
+    "opencode-discussion-text.raw",
+    "gemini-rate-limit-typical.raw",
+    "gemini-discussion-text.raw",
+    "kiro-rate-limit-typical.raw",
+    "kiro-usage-limit-typical.raw",
+    "kiro-discussion-text.raw",
 ];
 
 #[test]

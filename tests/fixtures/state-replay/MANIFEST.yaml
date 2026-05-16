@@ -399,3 +399,137 @@ fixtures:
     expected_final_detect: idle
     capture_kind: synthetic
     provenance: "#848 regression-proof — prose containing the bug's trigger substrings, expected Idle (NOT RateLimit)"
+
+  # #848 PR-B — OpenCode + Gemini + Kiro classifier root cause fixtures.
+  # Synthetic from issue-tracker verbatim error strings + AWS docs +
+  # OpenAI/Google SDK convention. Same precedent as PR-A's claude-*
+  # fixtures (capture_kind: synthetic_from_docs).
+
+  - file: opencode-rate-limit-typical.raw
+    backend: opencode
+    cli_version: "1.4.0"
+    recorded_on: "2026-05-16"
+    scenario: |
+      OpenCode pane shows the canonical 429-rejection wording observed
+      in sst→anomalyco fork issues #8203/#3525/#9091/#1491. The new
+      OpenCode RateLimit pattern keys on `API rate limited (429)` /
+      `Rate limited. Quick retry` / `API rate limit exceeded`.
+    expected_transitions: [starting, rate_limit]
+    expected_final_state: rate_limit
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 PR-B — synthetic from sst→anomalyco fork issue strings"
+
+  - file: opencode-usage-limit-typical.raw
+    backend: opencode
+    cli_version: "1.4.0"
+    recorded_on: "2026-05-16"
+    scenario: |
+      OpenCode pane shows `Quota Limit Exceeded` — the subscription-quota
+      wording observed in the sst issue tracker. PR-B adds the NEW
+      OpenCode UsageLimit pattern (pre-#848 OpenCode had no UsageLimit
+      pattern, so these strings fell through).
+    expected_transitions: [starting, usage_limit]
+    expected_final_state: usage_limit
+    expected_final_detect: usage_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 PR-B — synthetic from sst→anomalyco fork issue strings"
+
+  - file: opencode-discussion-text.raw
+    backend: opencode
+    cli_version: "1.4.0"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Regression-proof fixture for #848 PR-B OpenCode side. Pane contains
+      `rate_limit` / `rate-limit` / `rate limit` substrings in prose
+      context. Under the OLD broad `rate.?limit` pattern this triggered
+      a false RateLimit classification. Under the post-#848 narrowed
+      pattern the classifier stays Idle.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "#848 PR-B regression-proof — prose containing OpenCode old-pattern trigger substrings"
+
+  - file: gemini-rate-limit-typical.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Gemini pane shows the canonical 429 / RESOURCE_EXHAUSTED /
+      rateLimitExceeded wordings observed in google-gemini/gemini-cli
+      issues #10722/#8437/#22545/#2305/#1502. The new Gemini RateLimit
+      pattern matches `429 RESOURCE_EXHAUSTED` / `rateLimitExceeded` /
+      `got status: 429` / `429 Too Many Requests` / `rate limit
+      exceeded` — full HTTP-context wording, not bare `\b429\b`.
+    expected_transitions: [starting, rate_limit]
+    expected_final_state: rate_limit
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 PR-B — synthetic from google-gemini/gemini-cli issue strings"
+
+  - file: gemini-discussion-text.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Regression-proof fixture for #848 PR-B Gemini side. Pane contains
+      bare `429` substring (without specific HTTP wrapping) plus
+      `rate_limit` / `rate-limit` / `rate limit` prose. Under the OLD
+      Gemini pattern `r"RESOURCE_EXHAUSTED|\b429\b"` the bare `429`
+      triggered a false RateLimit on every tick. Under the post-#848
+      narrowed pattern (which keys on specific wrapping context like
+      `429 RESOURCE_EXHAUSTED` / `got status: 429`) the classifier
+      stays Idle.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "#848 PR-B regression-proof — prose containing Gemini old-pattern trigger substrings"
+
+  - file: kiro-rate-limit-typical.raw
+    backend: kiro-cli
+    cli_version: "2.0.1"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Kiro pane shows the AWS Bedrock throttling wording — `Throttling
+      Exception: Rate exceeded`. The new Kiro RateLimit pattern adds
+      `ThrottlingException|Rate exceeded` to the existing alternation
+      (preserving `Too Many Requests|ThrottlingError|\b429\b`).
+    expected_transitions: [starting, rate_limit]
+    expected_final_state: rate_limit
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 PR-B — synthetic from AWS Bedrock throttling docs"
+
+  - file: kiro-usage-limit-typical.raw
+    backend: kiro-cli
+    cli_version: "2.0.1"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Kiro pane shows the casual `you have reached the limit` wording
+      observed in Kiro #5876. The new Kiro UsageLimit pattern adds this
+      alternation to the existing `ServiceQuotaExceeded|InsufficientModelCapacity`.
+    expected_transitions: [starting, usage_limit]
+    expected_final_state: usage_limit
+    expected_final_detect: usage_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 PR-B — synthetic from Kiro #5876 user-facing wording"
+
+  - file: kiro-discussion-text.raw
+    backend: kiro-cli
+    cli_version: "2.0.1"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Regression-proof fixture for #848 PR-B Kiro side. Pane contains
+      `rate_limit` / `rate-limit` prose in non-error context. Pre-#848
+      the Kiro pattern was already specific (`Too Many Requests` /
+      `ThrottlingError` / `\b429\b`), so this fixture passes even on
+      OLD patterns — locked here as a contract that future Kiro pattern
+      additions (such as PR-B's `ThrottlingException|Rate exceeded`)
+      do NOT reintroduce a broad-substring false-positive.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "#848 PR-B regression-proof — prose containing rate-limit substrings, expected Idle"
