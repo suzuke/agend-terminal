@@ -13,7 +13,11 @@ use super::HandlerCtx;
 
 /// Per-tool timeout in milliseconds. Fast read-only tools get a short
 /// timeout; slow spawn/deploy tools get a longer one.
-fn tool_timeout(tool: &str) -> Duration {
+///
+/// Made `pub(crate)` for `request_dedup::method_wait_timeout` to reuse
+/// the same mapping when the API method is `mcp_tool` — shared source
+/// of truth keeps the dispatch budget and the dedup wait budget in lock-step.
+pub(crate) fn tool_timeout(tool: &str) -> Duration {
     match tool {
         // Fast read-only tools (~5s)
         "inbox" | "describe_message" | "describe_thread" | "list_instances"

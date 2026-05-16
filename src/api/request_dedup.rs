@@ -452,6 +452,19 @@ pub fn global() -> &'static DedupCache {
     CACHE.get_or_init(DedupCache::default)
 }
 
+/// Per-API-method dedup wait budget. Aligned to the handler's own time
+/// budget (the spike Q3 contract: "timeout = method's tool_timeout") so
+/// a waiter never sleeps past the point where the in-flight handler
+/// would itself time out. For `mcp_tool`, defers to
+/// [`crate::api::handlers::mcp_proxy::tool_timeout`] keyed on
+/// `params["tool"]` — shared source of truth across the dispatch budget
+/// and the dedup wait budget. Unmapped methods fall back to
+/// [`DEFAULT_WAIT_TIMEOUT`].
+pub fn method_wait_timeout(method: &str, params: &Value) -> Duration {
+    let _ = (method, params);
+    unimplemented!("method_wait_timeout — C5 RED stub, C6 GREEN fills in")
+}
+
 /// Construct the over-cap `in_progress` error envelope. Exposed so the
 /// daemon dispatch hook and the over-cap path stay in sync.
 pub(crate) fn in_progress_error() -> Value {
@@ -786,6 +799,59 @@ mod tests {
         assert!(
             !inner.entries.contains_key("e1") || inner.entries.contains_key("e2"),
             "if e1 still present, e2 must also be present (oldest-first eviction)"
+        );
+    }
+
+    /// Per-method wait budget MUST differentiate by method (spike Q3
+    /// contract): fast read-only methods get 5s, slow spawn-class methods
+    /// get 60s, and `mcp_tool` defers to `mcp_proxy::tool_timeout` keyed
+    /// on `params["tool"]`. A single global constant violates the spike
+    /// design.
+    #[test]
+    fn method_wait_timeout_differs_per_method() {
+        use crate::api::method;
+        let empty = json!({});
+        // Fast read-only → 5s
+        assert_eq!(
+            method_wait_timeout(method::LIST, &empty),
+            Duration::from_secs(5),
+            "list (read-only) → 5s"
+        );
+        assert_eq!(
+            method_wait_timeout(method::PANE_SNAPSHOT, &empty),
+            Duration::from_secs(5),
+            "pane_snapshot (read-only) → 5s"
+        );
+        // Slow spawn-class → 60s
+        assert_eq!(
+            method_wait_timeout(method::SPAWN, &empty),
+            Duration::from_secs(60),
+            "spawn → 60s"
+        );
+        // Default middle band → 30s
+        assert_eq!(
+            method_wait_timeout(method::SEND, &empty),
+            Duration::from_secs(30),
+            "send (middle) → 30s"
+        );
+        // mcp_tool defers to mcp_proxy::tool_timeout keyed on params["tool"]
+        let create = json!({"tool": "create_instance"});
+        assert_eq!(
+            method_wait_timeout(method::MCP_TOOL, &create),
+            Duration::from_secs(60),
+            "mcp_tool(create_instance) → 60s via tool_timeout"
+        );
+        let inbox = json!({"tool": "inbox"});
+        assert_eq!(
+            method_wait_timeout(method::MCP_TOOL, &inbox),
+            Duration::from_secs(5),
+            "mcp_tool(inbox) → 5s via tool_timeout"
+        );
+        // Unknown method → DEFAULT_WAIT_TIMEOUT fallback
+        assert_eq!(
+            method_wait_timeout("not-a-real-method", &empty),
+            DEFAULT_WAIT_TIMEOUT,
+            "unknown method falls back to DEFAULT_WAIT_TIMEOUT"
         );
     }
 }

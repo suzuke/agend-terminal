@@ -383,7 +383,7 @@ fn handle_session(
 
         let response = request_dedup::global().dispatch(
             request_id,
-            request_dedup::DEFAULT_WAIT_TIMEOUT,
+            request_dedup::method_wait_timeout(method, params),
             || match method {
                 method::LIST => handlers::query::handle_list(params, &ctx),
                 method::INJECT => handlers::instance::handle_inject(params, &ctx),
