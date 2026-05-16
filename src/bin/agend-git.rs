@@ -42,10 +42,12 @@ fn main() {
     // fence. See `invocation_is_gh_post_merge` for the rationale.
     let parent_is_gh = invocation_is_gh_post_merge();
 
-    // #778 Option 3: resolve cwd-is-canonical-worktree once, pass into
-    // classify as a pure bool so the leniency rule is unit-testable
-    // without a real filesystem fixture.
-    let canonical_cwd = cwd_is_canonical_worktree();
+    // #778 Option 3 + #852 residual PR-A: resolve cwd-is-canonical-
+    // rooted once, pass into classify as a pure bool so the leniency
+    // rule is unit-testable without a real filesystem fixture. Detects
+    // BOTH daemon-provisioned worktrees AND the canonical source repo
+    // (post-#852-residual; pre-fix only matched worktrees).
+    let canonical_cwd = cwd_is_canonical_rooted();
 
     // #852: resolve agent-vs-operator caller identity once. Agents are
     // daemon-spawned subprocesses (AGEND_INSTANCE_NAME set); operators
@@ -191,15 +193,29 @@ fn is_protected_ref(branch: &str) -> bool {
     matches!(branch, "main" | "master")
 }
 
-/// #778 Option 3: detect that cwd is inside a worktree whose `.git`
-/// pointer resolves to a source repo carrying `[remote "origin"]`.
-/// The `origin` remote is what distinguishes a canonical worktree
-/// (daemon-provisioned off a real upstream repo) from an orphan
-/// workspace-placeholder repo (daemon startup creates these before
-/// fleet config resolves; they have no remote and no project files).
-/// Returns `true` only for canonical worktrees — the criterion the
-/// shim uses to grant unbound checkout/switch leniency.
-fn cwd_is_canonical_worktree() -> bool {
+/// #778 Option 3 (originally) + #852 residual PR-A: detect that cwd
+/// is rooted inside a canonical-origin git repo — either a
+/// daemon-provisioned worktree (`.git` file with `gitdir:` pointer)
+/// OR the canonical source repo itself (`.git` directory with
+/// `[remote "origin"]` in config). The `origin` remote is what
+/// distinguishes a canonical-rooted cwd from an orphan workspace-
+/// placeholder repo (daemon startup creates these before fleet
+/// config resolves; they have no remote and no project files).
+///
+/// **#852 residual fix**: the pre-PR-A logic required `.git` to be a
+/// FILE (worktree marker shape only), which returned FALSE when the
+/// caller was inside the canonical SOURCE REPO (`.git` is a
+/// directory there). That gap let reviewer agents who `cd
+/// canonical && git checkout <sha>` slip past the `is_agent_caller
+/// && canonical_cwd` deny at line ~297-303, producing the
+/// detached-HEAD pollution operator observed at 21:46 + 22:24 today
+/// (`checkout: moving from main to <sha>` reflog entries post-21:23
+/// daemon restart). The broadened detection covers BOTH shapes.
+///
+/// Renamed from `cwd_is_canonical_worktree` to `cwd_is_canonical_rooted`
+/// — the previous name's "worktree" suffix was misleading after
+/// broadening since the canonical source repo isn't a worktree.
+fn cwd_is_canonical_rooted() -> bool {
     let cwd = match env::current_dir() {
         Ok(c) => c,
         Err(_) => return false,
@@ -209,32 +225,48 @@ fn cwd_is_canonical_worktree() -> bool {
         Ok(m) => m,
         Err(_) => return false,
     };
-    if !meta.is_file() {
-        return false;
+
+    if meta.is_file() {
+        // Worktree case (pre-#852-residual logic, unchanged).
+        // `.git` file carries a `gitdir:` pointer to
+        // `<source>/.git/worktrees/<entry>`; grandparent is
+        // `<source>/.git` which carries the source repo's config.
+        let content = match std::fs::read_to_string(&dot_git) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let gitdir_str = match content
+            .lines()
+            .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
+        {
+            Some(s) => s,
+            None => return false,
+        };
+        let gitdir = PathBuf::from(gitdir_str);
+        let source_git_dir = match gitdir.parent().and_then(|p| p.parent()) {
+            Some(p) => p.to_path_buf(),
+            None => return false,
+        };
+        let config = match std::fs::read_to_string(source_git_dir.join("config")) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        config.contains("[remote \"origin\"]")
+    } else if meta.is_dir() {
+        // Canonical source repo case (#852 residual broadening).
+        // `.git` is a directory; read `.git/config` directly to check
+        // for `[remote "origin"]`. Same defense against orphan
+        // workspace-placeholder repos that have no remote.
+        let config = match std::fs::read_to_string(dot_git.join("config")) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        config.contains("[remote \"origin\"]")
+    } else {
+        // Unknown `.git` shape (symlink to neither file nor dir,
+        // etc.) — fail closed.
+        false
     }
-    let content = match std::fs::read_to_string(&dot_git) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let gitdir_str = match content
-        .lines()
-        .find_map(|l| l.strip_prefix("gitdir:").map(str::trim))
-    {
-        Some(s) => s,
-        None => return false,
-    };
-    let gitdir = PathBuf::from(gitdir_str);
-    // gitdir layout: <source>/.git/worktrees/<entry>. Grandparent is
-    // <source>/.git which carries the source repo's config.
-    let source_git_dir = match gitdir.parent().and_then(|p| p.parent()) {
-        Some(p) => p.to_path_buf(),
-        None => return false,
-    };
-    let config = match std::fs::read_to_string(source_git_dir.join("config")) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    config.contains("[remote \"origin\"]")
 }
 
 fn classify(
@@ -1132,5 +1164,157 @@ mod tests {
                  got {other:?}"
             ),
         }
+    }
+
+    // ----- #852 residual PR-A — cwd_is_canonical_rooted detection -----
+    //
+    // Pre-#852-residual, the detection helper required `.git` to be a
+    // FILE (worktree marker). This excluded canonical source repos
+    // where `.git` is a DIRECTORY — reviewers `cd`'ing into source
+    // sailed past the `is_agent_caller && canonical_cwd` deny because
+    // canonical_cwd was always false for source. Operator's reflog
+    // evidenced two such checkouts (21:46 + 22:24 today) AFTER
+    // #858+#859 shipped. PR-A broadens the helper to cover BOTH
+    // shapes.
+    //
+    // Tests use `std::env::set_current_dir` to position cwd inside
+    // the synthetic fixtures. Mutex-serialized so parallel test
+    // threads don't race the process-global cwd.
+
+    fn with_cwd<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
+        use std::sync::{Mutex, OnceLock};
+        static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = CWD_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::current_dir().expect("snapshot cwd");
+        std::env::set_current_dir(dir).expect("set test cwd");
+        let result = f();
+        std::env::set_current_dir(&prior).expect("restore cwd");
+        result
+    }
+
+    fn make_source_repo_with_origin(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "agend-852-pr-a-source-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir source-base");
+        let repo = base.join("repo");
+        let git_dir = repo.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir .git");
+        // Synthetic config: matches the canonical-detection criterion
+        // (contains `[remote "origin"]`).
+        std::fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\
+             [remote \"origin\"]\n\turl = https://example.test/foo.git\n",
+        )
+        .expect("write .git/config");
+        repo
+    }
+
+    fn make_source_repo_without_origin(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "agend-852-pr-a-no-origin-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir no-origin-base");
+        let repo = base.join("repo");
+        let git_dir = repo.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("mkdir .git");
+        // Orphan workspace-placeholder shape: `.git` directory but
+        // no `[remote "origin"]`. Daemon startup creates these
+        // before fleet config resolves; they must NOT trigger the
+        // canonical-rooted gate.
+        std::fs::write(
+            git_dir.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .expect("write .git/config");
+        repo
+    }
+
+    fn make_canonical_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        // Two-step: build a source repo with origin, then a synthetic
+        // worktree pointing into it via the gitdir: marker. Mirrors
+        // git's real worktree layout at <source>/.git/worktrees/<name>.
+        let base =
+            std::env::temp_dir().join(format!("agend-852-pr-a-wt-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir wt-base");
+        let source = base.join("source");
+        let source_git = source.join(".git");
+        let worktrees_dir = source_git.join("worktrees").join("agent-1");
+        std::fs::create_dir_all(&worktrees_dir).expect("mkdir worktree entry");
+        std::fs::write(
+            source_git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\
+             [remote \"origin\"]\n\turl = https://example.test/foo.git\n",
+        )
+        .expect("write source .git/config");
+        // Worktree dir with `.git` FILE pointing at the worktrees entry.
+        let wt = base.join("worktree-cwd");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree dir");
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", worktrees_dir.display()),
+        )
+        .expect("write worktree .git pointer");
+        (wt, base)
+    }
+
+    fn cleanup_base(repo: &std::path::Path) {
+        if let Some(base) = repo.parent() {
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    /// #852 residual core: canonical source repo (`.git` directory +
+    /// `[remote "origin"]`) must classify as canonical-rooted. This
+    /// is the path that pre-#852-residual missed entirely.
+    #[test]
+    fn cwd_is_canonical_rooted_returns_true_for_source_repo_with_origin() {
+        let repo = make_source_repo_with_origin("with-origin");
+        let result = with_cwd(&repo, cwd_is_canonical_rooted);
+        cleanup_base(&repo);
+        assert!(
+            result,
+            "canonical source repo with `[remote \"origin\"]` must classify \
+             as canonical-rooted (this is the #852 residual fix)"
+        );
+    }
+
+    /// Defense against orphan workspace-placeholder repos: `.git`
+    /// directory present but no remote configured. Daemon startup
+    /// creates these before fleet config resolves; the canonical-
+    /// rooted gate must NOT fire on them.
+    #[test]
+    fn cwd_is_canonical_rooted_returns_false_for_source_repo_without_origin() {
+        let repo = make_source_repo_without_origin("no-origin");
+        let result = with_cwd(&repo, cwd_is_canonical_rooted);
+        cleanup_base(&repo);
+        assert!(
+            !result,
+            "orphan workspace-placeholder (`.git` directory but no \
+             `[remote \"origin\"]`) must NOT classify as canonical-rooted"
+        );
+    }
+
+    /// Preserves the #858 contract: canonical-rooted worktree
+    /// (`.git` FILE with `gitdir:` pointer to source carrying origin)
+    /// still classifies. This is the pre-PR-A path; the broadening
+    /// must NOT regress it.
+    #[test]
+    fn cwd_is_canonical_rooted_returns_true_for_canonical_worktree() {
+        let (wt, _base) = make_canonical_worktree("worktree");
+        let result = with_cwd(&wt, cwd_is_canonical_rooted);
+        cleanup_base(&wt);
+        assert!(
+            result,
+            "canonical worktree (`.git` FILE + gitdir: pointer to source \
+             with origin) must still classify (pre-#852-residual contract)"
+        );
     }
 }
