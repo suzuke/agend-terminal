@@ -1814,3 +1814,191 @@ fn clean_empty_init_commits_drops_init_with_only_daemon_trailers() {
 
     std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
 }
+
+// ── #869 ensure_branch_exists branch-exists path sync tests ────────
+
+/// #869 fix: when `refs/heads/<branch>` already exists locally and
+/// `refs/remotes/origin/<branch>` exists at a DIFFERENT SHA, the
+/// branch-exists path must refresh the local ref to track the remote
+/// before returning. Pre-fix this early-returned without syncing, so
+/// the downstream `worktree::create` landed the bound worktree at the
+/// stale local SHA (observed 3× in PR-B/PR-C/etc reviewer cycles).
+#[test]
+fn ensure_branch_exists_syncs_stale_local_to_origin() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-869-sync-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "dev-869");
+    let branch = "fix/869-sync-fixture";
+
+    let bypass = |args: &[&str]| -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn")
+    };
+    // Create the local branch at the initial commit (the "stale" SHA).
+    let stale_sha = String::from_utf8(bypass(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(bypass(&["branch", branch]).status.success());
+
+    // Advance HEAD on main, then point refs/remotes/origin/<branch>
+    // at the NEW SHA. This simulates "remote PR head moved forward but
+    // local <branch> ref is pinned at the prior cycle's SHA".
+    std::fs::write(repo.join("file.txt"), "advance").ok();
+    assert!(bypass(&["add", "file.txt"]).status.success());
+    assert!(bypass(&[
+        "-c",
+        "user.name=test",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "advance"
+    ])
+    .status
+    .success());
+    let fresh_sha = String::from_utf8(bypass(&["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(stale_sha, fresh_sha, "fixture must produce divergent SHAs");
+    let remote_ref = format!("refs/remotes/origin/{branch}");
+    assert!(bypass(&["update-ref", &remote_ref, &fresh_sha])
+        .status
+        .success());
+
+    // Sanity: pre-call local ref is still at stale_sha.
+    let pre_local =
+        String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+    assert_eq!(pre_local, stale_sha);
+
+    // Drive the production function.
+    let result = super::ensure_branch_exists(&home, &repo, branch, "origin/main", "dev-869");
+    assert!(result.is_ok(), "must succeed: {result:?}");
+    let (auto_created, _fetch_attempted) = result.unwrap();
+    assert!(
+        !auto_created,
+        "branch existed pre-call — auto_created must be false"
+    );
+
+    // Post-call assertion: local ref now matches origin/<branch> (the
+    // PR-head SHA). This is the load-bearing invariant the bug fix
+    // restores.
+    let post_local =
+        String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+    assert_eq!(
+        post_local, fresh_sha,
+        "#869 contract: local refs/heads/{branch} must be fast-forwarded to refs/remotes/origin/{branch} when both exist"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #869 edge case: branch exists locally but `refs/remotes/origin/
+/// <branch>` does NOT exist (e.g. branch was created locally and never
+/// pushed). The function must leave the local ref unchanged — there's
+/// no remote ref to sync against — and return `(false, fetched_ok)`
+/// without raising an error.
+#[test]
+fn ensure_branch_exists_leaves_local_untouched_when_no_remote_ref() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-869-noremote-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "dev-869-nr");
+    let branch = "fix/869-noremote-fixture";
+
+    let bypass = |args: &[&str]| -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git spawn")
+    };
+    // Create the local branch; deliberately do NOT populate any
+    // refs/remotes/origin/<branch> ref.
+    assert!(bypass(&["branch", branch]).status.success());
+    let pre_local =
+        String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+    let result = super::ensure_branch_exists(&home, &repo, branch, "origin/main", "dev-869-nr");
+    assert!(result.is_ok(), "must succeed: {result:?}");
+    let (auto_created, _fetch_attempted) = result.unwrap();
+    assert!(!auto_created);
+
+    // Post-call: local ref unchanged because no remote ref existed to
+    // sync against. (The fetch itself may have spawned and either
+    // succeeded with no work to do or failed against the fake remote;
+    // the load-bearing invariant is "no silent ref mutation").
+    let post_local =
+        String::from_utf8(bypass(&["rev-parse", &format!("refs/heads/{branch}")]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+    assert_eq!(
+        pre_local, post_local,
+        "#869: local ref must be untouched when origin/<branch> is absent"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #869 protection: the new sync path must not interfere with the
+/// existing "branch doesn't exist locally → create from origin/main"
+/// flow. After the fix, dispatching a brand-new branch must still
+/// auto-create from origin/main with the existing (auto_created=true,
+/// fetch_attempted=false) shape on the fast path.
+#[test]
+fn ensure_branch_exists_auto_create_from_main_path_unchanged() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-869-new-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "dev-869-new");
+    let branch = "fix/869-new-fixture";
+
+    let result = super::ensure_branch_exists(&home, &repo, branch, "origin/main", "dev-869-new");
+    assert!(result.is_ok(), "must succeed: {result:?}");
+    let (auto_created, fetch_attempted) = result.unwrap();
+    assert!(
+        auto_created,
+        "#869: new branch must still auto-create from origin/main"
+    );
+    assert!(
+        !fetch_attempted,
+        "fast path: origin/main is a valid local ref so no fetch needed"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}

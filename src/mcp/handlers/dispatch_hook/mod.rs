@@ -425,8 +425,17 @@ fn resolve_source_repo(
 /// and the lazy fetch fallback live in one place.
 ///
 /// Behavior (mirror #784 / decision d-20260514102305998399-0):
-/// 1. `rev-parse --verify refs/heads/<branch>` — if exists, return
-///    `(auto_created=false, fetch_attempted=false)`.
+/// 1. `rev-parse --verify refs/heads/<branch>` — if exists, **fetch
+///    `origin <branch>` + `update-ref refs/heads/<branch>
+///    refs/remotes/origin/<branch>`** so the (about-to-be-bound)
+///    local ref tracks the remote PR HEAD (#869 fix — stale local
+///    refs from prior cycles were landing the bound worktree at the
+///    wrong SHA). Returns `(auto_created=false, fetch_attempted=N)`
+///    where N reflects whether the fetch actually succeeded.
+///    `update-ref` is no-op when `origin/<branch>` doesn't exist
+///    (newly-pushed branches not yet observed locally) or when the
+///    fetch fails (network outage); in both cases the local ref is
+///    left unchanged and the caller still gets a usable lease.
 /// 2. Else `git branch <branch> <from_ref>`:
 ///    - success → `(true, false)`
 ///    - stderr `"already exists"` (concurrent race) → `(false, false)`
@@ -464,7 +473,43 @@ pub(crate) fn ensure_branch_exists(
             .map(|o| o.status.success())
             .unwrap_or(false);
     if branch_exists {
-        return Ok((false, false));
+        // #869: the local ref may be stale from a prior dispatch cycle
+        // (r0 push → reviewer bind → r1 push observed this 3× across
+        // PR-B/PR-C/etc; local ref pinned at the r0 SHA, downstream
+        // `worktree::create` then lands the bound worktree at that
+        // stale SHA instead of the remote PR HEAD).
+        //
+        // Refresh `origin/<branch>` + fast-forward the local ref via
+        // `update-ref` BEFORE the lease so `worktree::create` reads
+        // the now-current ref. `update-ref` is an atomic ref write
+        // (no working-tree mutation, no checkout side-effects), safe
+        // even when the branch is checked out elsewhere — about to
+        // be replaced by this very lease anyway.
+        //
+        // Best-effort: `fetch` failure (network outage / fake-remote
+        // fixture) leaves `origin/<branch>` at its prior value; the
+        // update-ref still runs against whatever `refs/remotes/origin/
+        // <branch>` is present (defensible because at-least-as-fresh-as-
+        // local is the invariant we want). If `origin/<branch>` doesn't
+        // exist at all (branch never pushed), update-ref is skipped
+        // and the local ref is left untouched — dispatch then falls
+        // through to lease with the existing local SHA, matching the
+        // pre-fix behaviour for that edge case.
+        let fetch_out =
+            crate::git_helpers::git_bypass(source, &["fetch", "origin", branch, "--quiet"]);
+        let fetched_ok = matches!(&fetch_out, Ok(o) if o.status.success());
+        let remote_branch_ref = format!("refs/remotes/origin/{branch}");
+        let remote_exists =
+            crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", &remote_branch_ref])
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+        if remote_exists {
+            let _ = crate::git_helpers::git_bypass(
+                source,
+                &["update-ref", &branch_ref, &remote_branch_ref],
+            );
+        }
+        return Ok((false, fetched_ok));
     }
     // Step 2: try create from `from_ref` (no fetch yet — zero network
     // on the fast path where origin/main is already a valid local ref).
