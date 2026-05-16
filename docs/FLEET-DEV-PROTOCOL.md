@@ -139,6 +139,16 @@ When reviewer's claim contradicts dev's claim (e.g. reviewer "stale wording rema
 
 Lead replies to both with the empirical evidence. Reviewer/dev should self-correct rather than escalate to operator.
 
+### 3.19 Reviewer Workspace Discipline
+Reviewers MUST inspect PRs from their own daemon-bound worktree. Specifically:
+
+- **Never `cd` into the canonical source repo** to inspect a PR. The canonical is the operator's working tree; reviewer activity must not leave detached HEAD or stale refs there.
+- **Never create refs in canonical** (`git checkout -b tmp_pr_review`, `git checkout <sha>`, `git fetch origin pr/N/head:pr_head`, etc.). These leave `pr*_head` / `tmp*` / `review/*` branches behind that pollute `git branch --list` and confuse later operator commands.
+- **Use `gh pr diff <N>` or `gh pr view <N> --json files`** to read PR contents without checkout. If a full tree inspection is needed, `repo action=checkout` MCP tool provisions a fresh daemon-managed worktree at the PR's HEAD; releasing it (`release_worktree`) does not touch canonical.
+- **If canonical state is observed dirty post-review** (detached HEAD, stale `tmp*` / `pr*_head` branches), the reviewer's verdict is REJECTED until the canonical is cleaned (operator action OR `repo action=cleanup_merged_branches` with the `reviewer_checkout` category once L3 lands).
+
+Enforcement: L2 `agend-git` shim refuses `checkout -b` and `checkout <sha>` from agent callers when cwd=canonical (PR-B). L3 sweeper cleans the residue and auto-switches detached canonical HEAD back to main at daemon boot (PR-C).
+
 ## §4. Daemon Enforcement Gates
 
 ### 4.1 Push-time Semantic Gate (Sprint 44)
