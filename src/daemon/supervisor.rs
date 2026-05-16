@@ -203,6 +203,32 @@ pub(crate) enum NudgeDecision {
     Fire,
 }
 
+/// Resolve the effective per-agent recovery config from a fleet load
+/// outcome plus an instance name.
+///
+/// **Fail-closed on load error** (`Err(_)`): returns a config with
+/// `enabled = false` (other knobs preserved from `default_cfg`) so a
+/// corrupt or missing fleet.yaml never silently auto-enables the nudge
+/// — the operator sees the warn log at the call site and fixes the
+/// config. Without this gate, a parse error during fleet.yaml edits
+/// would leave the daemon happily injecting `continue your prior work`
+/// into every transient-error recovery, which violates the spike Q3
+/// "Config parse error → enabled=false" contract.
+///
+/// On `Ok`: look up the per-instance override; fall back to
+/// `default_cfg` when the instance isn't in fleet.yaml OR the instance
+/// entry omits the `rate_limit_recovery` field.
+///
+/// C3 RED stub — C4 GREEN fills in.
+pub(crate) fn resolve_recovery_config(
+    fleet: Result<&crate::fleet::FleetConfig, ()>,
+    name: &str,
+    default_cfg: &crate::fleet::RateLimitRecoveryConfig,
+) -> crate::fleet::RateLimitRecoveryConfig {
+    let _ = (fleet, name, default_cfg);
+    unimplemented!("resolve_recovery_config — C3 RED stub, C4 GREEN fills in")
+}
+
 /// Pure helper: classify the recovery-nudge tick against the track,
 /// the current agent state, the fast-retry path's activity, and the
 /// per-agent config. Mutation of `RecoveryNudgeTrack` is left to the
@@ -1531,6 +1557,79 @@ mod tests {
             decide_nudge(&track, AgentState::Idle, false, &cfg, now),
             NudgeDecision::Skip(NudgeSkipReason::NoRecentError)
         );
+    }
+
+    /// r1 fix: when fleet.yaml load FAILS (parse error, missing file,
+    /// corrupted yaml), `resolve_recovery_config` must return a config
+    /// with `enabled = false` so the daemon fails closed — a broken
+    /// config never silently enables auto-inject. Spike Q3 contract.
+    #[test]
+    fn resolve_recovery_config_fails_closed_on_load_error() {
+        let default_cfg = RateLimitRecoveryConfig::default();
+        assert!(
+            default_cfg.enabled,
+            "sanity: per-instance/parsed default IS enabled=true; only the load-error \
+             fallback flips to disabled"
+        );
+
+        let resolved = resolve_recovery_config(Err(()), "agent-x", &default_cfg);
+        assert!(
+            !resolved.enabled,
+            "load error must fail-closed: enabled=false"
+        );
+        // Other knobs preserved so an operator who later restores the
+        // config doesn't get a surprise mismatch in window sizes.
+        assert_eq!(resolved.observe_after_secs, default_cfg.observe_after_secs);
+        assert_eq!(resolved.recovery_after_secs, default_cfg.recovery_after_secs);
+        assert_eq!(resolved.cooldown_secs, default_cfg.cooldown_secs);
+        assert_eq!(resolved.prompt, default_cfg.prompt);
+    }
+
+    /// Per-instance override path: fleet.yaml loaded, instance entry
+    /// present with `rate_limit_recovery: { enabled: false, ... }` →
+    /// the override flows through verbatim (operator opt-out works).
+    #[test]
+    fn resolve_recovery_config_uses_instance_override_when_present() {
+        use std::collections::HashMap;
+        let mut instances = HashMap::new();
+        instances.insert(
+            "opt-out-agent".to_string(),
+            crate::fleet::InstanceConfig {
+                rate_limit_recovery: Some(RateLimitRecoveryConfig {
+                    enabled: false,
+                    observe_after_secs: 999,
+                    recovery_after_secs: 999,
+                    prompt: "should-not-fire".into(),
+                    cooldown_secs: 999,
+                }),
+                ..Default::default()
+            },
+        );
+        let fleet = crate::fleet::FleetConfig {
+            instances,
+            ..Default::default()
+        };
+        let default_cfg = RateLimitRecoveryConfig::default();
+        let resolved = resolve_recovery_config(Ok(&fleet), "opt-out-agent", &default_cfg);
+        assert!(!resolved.enabled, "per-instance opt-out must propagate");
+        assert_eq!(resolved.observe_after_secs, 999);
+        assert_eq!(resolved.prompt, "should-not-fire");
+    }
+
+    /// Fallback path: fleet.yaml loaded successfully but the instance
+    /// is absent (e.g. a runtime-only agent not yet persisted) OR the
+    /// instance entry omits `rate_limit_recovery` → use `default_cfg`
+    /// (the daemon-wide default), which has `enabled=true`.
+    #[test]
+    fn resolve_recovery_config_falls_back_to_default_when_instance_absent() {
+        let fleet = crate::fleet::FleetConfig::default();
+        let default_cfg = RateLimitRecoveryConfig::default();
+        let resolved = resolve_recovery_config(Ok(&fleet), "never-heard-of-this-agent", &default_cfg);
+        assert!(
+            resolved.enabled,
+            "no per-instance override → daemon default kicks in (enabled=true)"
+        );
+        assert_eq!(resolved.observe_after_secs, default_cfg.observe_after_secs);
     }
 
     /// (f) permanent errors excluded: `UsageLimit` and `AuthError` are
