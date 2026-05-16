@@ -126,9 +126,11 @@ impl AgentState {
     /// or invalid credentials, and injecting one would just thrash the
     /// PTY without progress. Fail-closed by exclusion.
     ///
-    /// C1 RED stub — C2 GREEN fills in the actual classification.
     pub fn is_transient_error(self) -> bool {
-        unimplemented!("AgentState::is_transient_error — C1 RED stub, C2 GREEN fills in")
+        matches!(
+            self,
+            Self::ServerRateLimit | Self::RateLimit | Self::ApiError
+        )
     }
 
     pub fn display_name(self) -> &'static str {
