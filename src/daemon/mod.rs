@@ -14,6 +14,7 @@ pub(crate) mod lifecycle;
 pub(crate) mod mcp_registry_watcher;
 pub(crate) mod notification_dedup;
 pub(crate) mod per_tick;
+pub(crate) mod restart;
 pub(crate) mod poll_reminder;
 pub(crate) mod router;
 pub(crate) mod supervisor;
