@@ -225,11 +225,20 @@ fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
 /// - `review/.*` — explicit `review/<n>` namespace
 ///
 /// First-match wins. Conservative — empty / `main` / `master` /
-/// genuine branch prefixes never match. C1 RED stub returns false
-/// unconditionally; C2 GREEN wires the regex.
+/// genuine branch prefixes never match. Uses an inline anchored
+/// regex (`^` anchor explicit, full-string `is_match` semantics on
+/// the regex crate) so prefix-match-only is the contract.
 pub(crate) fn is_reviewer_checkout(name: &str) -> bool {
-    let _ = name;
-    false
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    // SAFETY: regex literal is compile-time-validated by the test
+    // suite (the pattern's anchor + alternations are exercised by
+    // the four `reviewer_checkout_pattern_*` unit tests). `.unwrap`
+    // here is the established crate convention for build-time
+    // patterns (see `state.rs::StatePatterns::for_backend`).
+    #[allow(clippy::unwrap_used)]
+    let re = RE.get_or_init(|| regex::Regex::new(r"^(tmp.*|pr\d+_head|review/.*)$").unwrap());
+    re.is_match(name)
 }
 
 pub(crate) fn scan(

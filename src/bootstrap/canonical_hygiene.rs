@@ -45,27 +45,152 @@ pub enum CanonicalAction {
     WarnDirtyDetached,
 }
 
-/// Pure helper: classify the canonical's HEAD state from
-/// `git rev-parse --abbrev-ref HEAD` output + a working-tree-clean
-/// boolean. Caller is responsible for shelling out to git and
-/// passing the trimmed outputs.
+/// Boot-time hygiene entry — discover distinct canonical repos from
+/// `config.instances[*].source_repo` and apply [`apply_to_canonical`]
+/// to each. Best-effort: any per-canonical failure is logged and
+/// skipped (boot must never fail because hygiene couldn't shell out
+/// to git).
+pub(crate) fn run_at_boot(config: &crate::fleet::FleetConfig) {
+    let mut seen = std::collections::HashSet::<std::path::PathBuf>::new();
+    for (name, instance) in &config.instances {
+        let Some(source_repo) = instance.source_repo.as_ref() else {
+            continue;
+        };
+        let path = std::path::PathBuf::from(source_repo);
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if !path.is_dir() {
+            tracing::debug!(
+                instance = %name,
+                source_repo = %path.display(),
+                "#852 canonical hygiene: source_repo not a directory, skipping"
+            );
+            continue;
+        }
+        apply_to_canonical(&path);
+    }
+}
+
+/// Run the canonical-hygiene decision against a single canonical
+/// repo path. Shells out to git twice (rev-parse and status), calls
+/// [`decide_canonical_action`], and dispatches by variant: NoOp is
+/// silent, SwitchToDefault runs `git switch main` plus info log,
+/// WarnDirtyDetached emits a warn log only (no git mutation).
 ///
-/// `head_state`:
-/// - `"HEAD"` (literal) → detached
-/// - `"main"` / `"master"` → on default branch
-/// - any other non-empty string → on some other normal branch
-/// - empty string → treat as detached (defensive — `rev-parse`
-///   should never emit empty stdout but guard fail-closed)
+/// Best-effort: subprocess failures log a debug line and return; the
+/// daemon boot continues regardless.
+pub(crate) fn apply_to_canonical(canonical: &std::path::Path) {
+    let head_state = match git_capture(canonical, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Some(s) => s,
+        None => return,
+    };
+    let status = match git_capture(canonical, &["status", "--porcelain"]) {
+        Some(s) => s,
+        None => return,
+    };
+    let working_tree_clean = status.is_empty();
+    match decide_canonical_action(&head_state, working_tree_clean) {
+        CanonicalAction::NoOp => {}
+        CanonicalAction::SwitchToDefault => {
+            let switch_result = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    &canonical.display().to_string(),
+                    "switch",
+                    DEFAULT_BRANCH,
+                ])
+                .env("AGEND_GIT_BYPASS", "1")
+                .output();
+            match switch_result {
+                Ok(out) if out.status.success() => {
+                    tracing::info!(
+                        canonical = %canonical.display(),
+                        "#852 canonical hygiene: detached HEAD on clean tree, auto-switched to {DEFAULT_BRANCH}"
+                    );
+                }
+                Ok(out) => {
+                    tracing::warn!(
+                        canonical = %canonical.display(),
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "#852 canonical hygiene: git switch {DEFAULT_BRANCH} failed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        canonical = %canonical.display(),
+                        error = %e,
+                        "#852 canonical hygiene: git switch spawn failed"
+                    );
+                }
+            }
+        }
+        CanonicalAction::WarnDirtyDetached => {
+            tracing::warn!(
+                canonical = %canonical.display(),
+                "#852 canonical hygiene: detached HEAD with dirty working tree — \
+                 NOT auto-switching (operator WIP protection). Run `git switch \
+                 {DEFAULT_BRANCH}` manually after committing/stashing changes."
+            );
+        }
+    }
+}
+
+/// Pure helper: shell out to git with `AGEND_GIT_BYPASS=1` (so we
+/// bypass the shim's restrictions on boot), capture trimmed stdout
+/// on success. Returns `None` on spawn failure or non-zero exit.
+fn git_capture(repo: &std::path::Path, args: &[&str]) -> Option<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(repo).args(args);
+    cmd.env("AGEND_GIT_BYPASS", "1");
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!(
+                repo = %repo.display(),
+                error = %e,
+                "#852 canonical hygiene: git spawn failed"
+            );
+            return None;
+        }
+    };
+    if !out.status.success() {
+        tracing::debug!(
+            repo = %repo.display(),
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "#852 canonical hygiene: git command failed"
+        );
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Classification table:
 ///
-/// `working_tree_clean`: true iff `git status --porcelain` produced
-/// no output. The caller is expected to compute this once at boot.
+/// | head_state | working_tree_clean | action               |
+/// | ---------- | ------------------ | -------------------- |
+/// | `"HEAD"`   | true               | `SwitchToDefault`    |
+/// | `"HEAD"`   | false              | `WarnDirtyDetached`  |
+/// | `""`       | true               | `SwitchToDefault`    |
+/// | `""`       | false              | `WarnDirtyDetached`  |
+/// | anything   | any                | `NoOp`               |
+///   else                            |                      |
 ///
-/// C1 RED stub — returns `NoOp` unconditionally so the new tests
-/// asserting `SwitchToDefault` / `WarnDirtyDetached` fail. C2 GREEN
-/// fills in the actual classification table.
+/// Empty `head_state` is treated as detached defensively — `git
+/// rev-parse --abbrev-ref HEAD` should never produce empty stdout
+/// but if it does, fail-closed by routing through the detached
+/// branches (with the dirty-tree warn protecting against any
+/// silent state change on weird repo states).
 pub fn decide_canonical_action(head_state: &str, working_tree_clean: bool) -> CanonicalAction {
-    let _ = (head_state, working_tree_clean);
-    CanonicalAction::NoOp
+    let detached = head_state == "HEAD" || head_state.is_empty();
+    if !detached {
+        return CanonicalAction::NoOp;
+    }
+    if working_tree_clean {
+        CanonicalAction::SwitchToDefault
+    } else {
+        CanonicalAction::WarnDirtyDetached
+    }
 }
 
 #[cfg(test)]

@@ -187,6 +187,13 @@ pub fn prepare(home: &Path, fleet_path: &Path, opts: PrepareOptions) -> Result<B
     crate::binding::symlink_shim(home);
     crate::binding::reconcile_orphans(home);
     crate::worktree_pool::reconcile_orphan_leases(home);
+    // #852 PR-C: canonical-repo hygiene. Scan distinct source_repo
+    // values from fleet.yaml; for each canonical, auto-switch
+    // detached HEAD back to main if the working tree is clean, or
+    // warn-log if dirty (operator WIP protection). Pure observation
+    // beyond the single `git switch main` mutation when conditions
+    // are right. Best-effort — boot continues regardless.
+    canonical_hygiene::run_at_boot(&config);
     // #829: boot-time orphan-owner sweep. Auto-applies for owners
     // verifiably gone (∉ fleet.yaml ∧ ∉ live registry); dry-run +
     // tracing::warn for the softer "∈ fleet.yaml ∧ ∉ live" case.
