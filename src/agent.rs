@@ -357,6 +357,31 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     cmd.env("FORCE_COLOR", "1");
     cmd.env("AGEND_INSTANCE_NAME", name);
 
+    // Phase A Piece-3: GIT_EDITOR + friends = `true` (Unix no-op
+    // binary that exits 0 without producing output). Prevents git
+    // editor-needing operations from dropping the agent's PTY into
+    // a Vim/editor lockup when the agent runs `git rebase --continue`
+    // / `git commit` (without `-m`) / `git rebase -i` etc. The
+    // empirical experiment (5-backend × 4-scenario) hit this on
+    // opencode + DeepSeek when `rebase --continue` opened the
+    // commit-message editor.
+    //
+    // Cover the full git editor-resolution chain (per `man git-var`:
+    // GIT_EDITOR → core.editor → VISUAL → EDITOR → vi). Setting only
+    // GIT_EDITOR is insufficient if a child script does
+    // `git -c core.editor=` (unsets), so VISUAL/EDITOR are defensive
+    // fallbacks. GIT_SEQUENCE_EDITOR covers `rebase -i`'s todo file
+    // editor specifically.
+    //
+    // Operator override path preserved: these are set BEFORE the
+    // fleet.yaml user-env loop below, so an operator setting
+    // `instances.<name>.env.GIT_EDITOR: vim` (or any other value)
+    // will override the daemon default in the same loop.
+    cmd.env("GIT_EDITOR", "true");
+    cmd.env("GIT_SEQUENCE_EDITOR", "true");
+    cmd.env("EDITOR", "true");
+    cmd.env("VISUAL", "true");
+
     if std::env::var("LANG").is_err() {
         cmd.env("LANG", "en_US.UTF-8");
     }
@@ -2477,5 +2502,49 @@ Allow Trust All Tools mode?
         // The env_remove in build_command is the authoritative guard.
         let _ = cmd;
         std::env::remove_var("AGEND_GIT_BYPASS");
+    }
+
+    /// Phase A Piece-3: GIT_EDITOR + friends must all be set to
+    /// `"true"` (no-op editor binary) in the daemon-spawned agent
+    /// process env so `git rebase --continue` / `git commit`
+    /// (without -m) / `git rebase -i` don't drop the PTY into a
+    /// Vim/editor lockup. Empirical experiment surfaced this on
+    /// opencode + DeepSeek backends; the daemon-side default closes
+    /// the lockup surface across all backends + scenarios.
+    ///
+    /// Operator override is preserved by ordering — these env vars
+    /// are set BEFORE the fleet.yaml user-env loop, so an operator's
+    /// `instances.<name>.env.GIT_EDITOR: vim` would override the
+    /// daemon default. This test pins the default; the override path
+    /// is covered structurally by `build_command`'s existing
+    /// fleet.yaml env-merge logic (no separate test needed for the
+    /// override since the env loop is single-call `cmd.env(k, v)`).
+    #[test]
+    fn build_command_sets_git_editor_defaults() {
+        let config = SpawnConfig {
+            name: "git-editor-test",
+            backend_command: "echo",
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        let (cmd, _) = build_command(&config).expect("build_command");
+        for key in &["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL"] {
+            let value = cmd
+                .get_env(key)
+                .unwrap_or_else(|| panic!("{key} must be set in agent env"));
+            assert_eq!(
+                value.to_string_lossy(),
+                "true",
+                "{key} must default to `true` (no-op editor binary), got {value:?}"
+            );
+        }
     }
 }
