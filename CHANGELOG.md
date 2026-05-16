@@ -5,10 +5,137 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-16
+
+150+ commits since `0.6.1` over Sprint 55–65 (May 7 → May 16, 2026). Three themes dominate:
+**(1) Task board reliability** — ghost-owner class root-caused and prevented (`teams::delete` cascade, boot orphan sweep, `force` flag) + new sweepers + operator-visible health snapshot; **(2) Bridge ↔ daemon idempotent retry** — eliminates the double-execution class for side-effect MCP calls under transient transport failures (UUID request_id + DedupCache + Condvar block-wait); **(3) MCP handler refactor #694 complete** — all 30+ tool dispatch arms migrated from inline `match` to a dispatch table, paving the way for tool registry hot-reload (#776). Plus Hung detection shadow-mode foundations (F9 Stage 1–3), rate-limit recovery auto-prompt, and ~50 smaller bug fixes / hardening PRs.
+
+### Added
+
+- **Bridge ↔ daemon idempotent retry (#842, PR #843)** — bridge generates UUID v4 `request_id` per JSON envelope; retry on transport failure reuses the same id. New `src/api/request_dedup.rs` `DedupCache` (TTL 10min, 64KB/entry, 64MB ceiling, Condvar block-wait aligned to per-method timeout 5/30/60s, waiter_cap=8, RAII panic guard) caches completed responses + blocks in-flight duplicates. Caller-side retries are now safe by construction for any side-effect MCP call. Backward-compatible: missing `request_id` skips dedup (legacy clients).
+- **`task action=health` (#830, PR #838)** — operator self-serve board hygiene snapshot. Returns totals + by_status + ghost_owners (strict + soft) + stale_claims + age distribution (over_30d / over_90d / median) + recommendations array. Single-call alternative to scanning the full task list when checking "is the board healthy?". Cross-references `scan_orphan_candidates` (#829) for accuracy.
+- **`task action=sweep` (#806, PR #810)** — operator-triggered stale-task cleanup. 4 categories (`shipped` / `superseded` / `team_disbanded` / `validation_leftovers`) with dry-run by default + `confirm_ids` + `audit_reason` required for apply. Dual-channel audit (per-task event + event_log.jsonl `task_sweep_apply`). System identity `system:task_sweep`.
+- **`repo action=cleanup_merged_branches` (#817, PR #820)** — operator-triggered local branch cleanup. 4 categories (`clean_merged` / `squash_merged` / `stale_idle` / `active_unknown`) with `apply=false` default, `confirm_ids` subset, `audit_reason` required. `min_age_days` configurable (default 90 for stale_idle). Local-only delete v1 (remote out of scope).
+- **`force_release_worktree` GC mode (#826, PR #837)** — when invoked for a disbanded agent, additionally scans canonical `.git/worktrees/` for orphan git-level metadata and runs `git worktree remove --force` to clean. Closes the gap where binding cleared but git-level worktree persisted. Layered as new `src/mcp/handlers/force_release/gc.rs` module (force_release.rs split for §file-size invariant compliance).
+- **Daemon boot orphan-owner sweep (#829, PR #835)** — on `start()`, daemon scans all tasks whose assignee is not in the current fleet registry. Strict mode auto-orphans (assignee=null, status preserved) + writes event_log entry. Soft mode logs only. Pubs `scan_orphan_candidates` for reuse by `task action=health` (#830).
+- **`teams::delete` cascade (#828, PR #834)** — disband path now iterates team members + calls `full_delete_instance` per member, which cascades to `orphan_tasks_for_owner` (existed but never invoked on disband). Single missing wire-up that produced the ghost-owner class — fix prevents recurrence systemically. (Today's session manually cleaned 13 historical ghost-owners via the #808 force flag before this fix landed.)
+- **`task force=true` flag (#808, PR #809)** — `task action=update` / `done` ACL bypass for cleanup of historical ghost-owned tasks. Requires non-empty `force_reason` (logged to event_log + per-task event). Companion to `teams::delete` cascade — `force` cleans existing pile, cascade prevents new.
+- **`cleanup_init_commits` trailer-aware body gate (#833, PR #839)** — `KNOWN_TRAILER_KEYS` whitelist (`Agend-Agent` / `Agend-Task` / `Agend-Branch` / `Agend-Issued-At`) stripped before commit-body emptiness check. Production heartbeats (which carry daemon trailers via the §10.5 prepare-commit-msg hook) now correctly classified as empty + eligible for cleanup. Restores the helper from no-op state observed in pre-#833 fixup PRs.
+- **`cleanup_init_commits` heartbeat synonym + body gate (#822, PR #825)** — whitelist now matches `init` + `initial`; commit must ALSO have empty body to be dropped (forward-compatible for future `wip` / `tmp` synonyms once observed).
+- **`cleanup_init_commits` 5 lifecycle hooks (#789, PR #795)** — helper auto-fires on `bind_self` / `release_worktree` / `force_release_worktree` / `dispatch_auto_bind_lease` / `repo action=checkout` so callers don't need to invoke explicitly. New explicit `repo action=cleanup_init_commits` MCP for manual triggers.
+- **Daemon rate-limit recovery auto-prompt (#841, PR #844)** — sibling to existing `process_server_rate_limit_retries` (which fast-retries 3×30s = 50s then exhausts). Detects `{ServerRateLimit, RateLimit, ApiError}` state after `observe_after_secs` (30s default) of idle, waits `recovery_after_secs` (60s default), then injects single-shot recovery prompt via `compose_aware_send` raw PTY (avoids `[AGEND-MSG]` header pollution + `last_input_text` clobber). `fleet.yaml` per-instance opt-out via `rate_limit_recovery: { enabled, observe_after_secs, recovery_after_secs, cooldown_secs, prompt }`. Fail-closed on config parse error.
+- **`ci_watch` CONFLICTING PR detection (#813, PR #816)** — daemon now queries PR `mergeable` state on watch start; if `CONFLICTING` / `DIRTY`, emits `[ci-conflict-detected]` alert to subscribers immediately instead of polling indefinitely (GH Actions silently doesn't fire CI on conflicting PRs). Re-checks every 5min during poll (anti-spam transition logic).
+- **Dispatch test-name validation (#812, PR #815)** — extends §4.3 hallucinated-fn check to reviewer-dispatch text. Daemon validates `cargo test ... <test_name>` invocations in send body against PR HEAD tree; rejects dispatch if test name doesn't exist. Eliminates the "copy-paste from previous dispatch" churn observed during the fixup batch.
+- **`cleanup_init_commits` auto-recovery + threshold warn (#814, PR #818)** — helper auto-removes stale `.git/rebase-merge/` dir on retry (previous failure no longer poisons next attempt) + warns on >30 inits (complexity ceiling observation). Captures `git rebase --abort` failure for visibility.
+- **Notification dedup race (#836, PR #840)** — `msg_id`-based suppression of post-consume retry re-inject. Previous behavior fired the same `[AGEND-MSG]` notification up to 3 times when the recipient hit an API rate limit mid-`inbox` call (1st send + retry-on-error + spurious 3rd). New `notification_dedup` cache (10min TTL) marks delivered notifications + filters retries.
+- **Test isolation invariant (#821, PR #824)** — `tests/common/git_isolated::git()` helper enforces `current_dir(temp_dir)` + `GIT_DIR=temp_dir/.git` on every subprocess `git` call. Repo-wide grep-based invariant fails CI if any test file uses naked `Command::new("git")` without isolation. Prevents the "fixture polluted host worktree" class (observed during PR #820 prep).
+- **`repo action=cleanup_init_commits` MCP tool (#789, PR #795)** — explicit operator-triggered variant of the per-lifecycle helper; useful for manual recovery when an agent's worktree has accumulated stale heartbeats outside the normal dispatch lifecycle.
+- **MCP dispatch table refactor — #694 closeout** — 8-PR Block 1 (per-tick handlers extracted into `PerTickHandler` trait + Vec aggregation, #757–#760, #764) + 5-cut Block 2 (30+ tool arms migrated from inline `match` to dispatch table with action sub-routing, #765 #767 #768 #771 #777). #694 closed in PR #777. Refactor enables future tool registry hot-reload (#776) without touching dispatch sites.
+- **Hung detection F9 shadow-mode foundations (#685 sub-tasks 4-7)** — productive-output gate (#766), fixture corpus + measurement harness (#769), per-backend productive markers + cache routing refactor (#770), Stage 1 auto-recovery dispatcher (#774), Stage 2 auto-restart dispatcher (#775), Stage 3 escalate + pause (#776). Shadow-mode only — no production enforcement yet. Architecture audits at #750 / #752.
+- **Timezone display config (#790, PR #797)** — operator-configurable display tz via `fleet.yaml` (default Asia/Taipei). All TUI status/log surfaces use the configured tz. Resolves operator's earlier UTC vs UTC+8 mismatch confusion.
+- **§4.5 cross-team ACK absorption exception (PR #638)** — protocol clarification — cross-team messages bypass the ACK absorption skip optimization. Companion fix #612 (PR #630).
+- **§3.10 empirical reproduction test requirement (PR #747)** — protocol amendment: fix PRs MUST include a failing test that reproduces the bug + passes after the fix. RED→GREEN cadence enforced.
+- **§3.16 Phase 1 discussion discipline, §3.17 static-review limits, §3.18 reviewer audit conflict resolution, §5 post-dispatch verification + pane-claim ≠ delivery + post-PR-merge close-loop, §6 inbox vs PTY delivery contract, §7.1 CI tool identity + cache hygiene, §7.2 cross-platform test idioms, §10.6 lead pre-dispatch release, §10.7 daemon empty-heartbeat commits, §11.1 state persistence across daemon refresh, §13.5 bug-blocks-its-own-fix BYPASS exception** (PR #805) — 12 new protocol sections distilled from session retrospectives. Plus `release_worktree` parameter form clarification.
+- **§12.6 multi-PR wave sequential merge enforcement (#652, PR #663)** — protocol gate for wave-style refactors.
+- **Telegram channel supervisor with auto-restart (#695, PR #734)** — long-running Telegram poll loop now resurrected on transport failure / process exit.
+- **3-agent clean-shutdown smoke test (#703, PR #733)** — verifies daemon stops all agents gracefully on `SIGTERM`; pins the no-zombie invariant.
+- **Bridge invariant tests (#714, PR #736)** — pins the daemon-error surfacing contract from #531 removal.
+- **Top-5 MCP tools smoke tests (#699, PR #735)** — bare-minimum CRUD coverage for the most-called MCP tools.
+- **`task_sweep` compliance scanner (#664, PR #676)** — Sprint 64 Wave 1 closeout. Scans tasks against config policy.
+- **L4b worktree marker check (#664, PR #678)** — high-risk MCP ops require `.agend-managed` marker present.
+- **Schema-enforced dispatch templates Phase 1 (#649, PR #654)** — typed shape for send/delegate envelopes.
+- **CI pass auto-route to `next_after_ci` (#650, PR #657)** — `ci action=watch` accepts target agent for handoff on green.
+- **`waiting_on` stale detection (#651, PR #660)** — 15min threshold alert when an agent's `waiting_on` field hasn't been cleared.
+- **Safe daemon restart via `exit(42)` + wrapper script (PR #648)** — operator can `agend-terminal stop --restart` (or equivalent) for graceful restart cycle.
+- **Cargo audit CI job + Dependabot config (#696, PR #718)** — security advisory tracking. Audit job permissions hardened (#831, see Fixed).
+- **`docs/SKILLS.md` user guide (PR #667)** — Skills System docs.
+- **Discord channel adapter docs (PR #647)** — `architecture.md` Source Layout table updated to reflect Discord adapter shipped earlier.
+
 ### Changed
 
-- **`docs/FLEET-DEV-PROTOCOL-v1.md` → `docs/FLEET-DEV-PROTOCOL.md`** — drop the `-v1` from the filename. The document is internally versioned (header `v1.2 — 2026-05-15`) and the protocol has no v2 in flight; the `-v1` in the path was a 2025-era misnomer that suggested a parallel v2 file existed. Compile-time `include_str!` in `src/protocol.rs`, `Cargo.toml` `[package].include` whitelist, `tests/cargo_include_invariant.rs` test mock-pattern filter, README link, `docs/ARCHITECTURE-QUICK-START.md`, and `docs/LINT-DISCIPLINE.md` updated to track the new name. Operators with a hand-written override at `$AGEND_HOME/protocol/FLEET-DEV-PROTOCOL-v1.md` need to rename it to the new path; daemon does not auto-migrate (the override mechanism is rarely used in practice). Historical `CHANGELOG.md` v0.4.0 entry, archived sprint plans, and proposal docs keep the old name as accurate snapshots.
-- **Protocol §3.16–§3.18, §5, §6, §7.1–§7.2, §10.6–§10.7, §11.1, §13.5 added** — 12 new sections capturing this session's retrospective lessons: Phase 1 discussion discipline, static-review limits + runtime validation, reviewer audit conflict resolution, post-dispatch verification, pane-claim ≠ delivery, post-PR-merge close-loop reporting, inbox vs PTY delivery contract, CI tool identity + cache hygiene, cross-platform test idioms, lead pre-dispatch release, daemon empty-heartbeat commits, state persistence across daemon refresh, bug-blocks-its-own-fix BYPASS exception. Plus `release_worktree` parameter form clarification.
+- **Default fixup batch self-merge (operator-authorized SOP)** — `impl team` / `fixup team` with three-tier composition (lead + dev + reviewer) can squash-merge after CI 5 platforms green + reviewer VERIFIED + verdict mirrored to PR comment (§3.12). No operator merge button required. Established 2026-05-13 for `agend-terminal` repo; scope is per-repo (other repos confirm separately).
+- **`task action=list` default filter (#806)** — pre-#806 returned the full board (all statuses, 500KB+ in production). Now defaults to actionable statuses (`open` / `claimed` / `in_progress` / `blocked`); pass `include_history=true` to surface `done` / `cancelled`. Adds `limit` (newest-first cap) and `filtered_default: bool` response field for transparency.
+- **`task action=create` response shape (#807, PR #811)** — returns full task object instead of just `{id, status: "created"}` so caller sees the same `status` field semantics across create/list/get.
+- **`task.dispatched_at` → `started_at` (#807)** — field rename to reflect actual semantic (set when daemon dispatches metadata to agent, NOT when caller's `send` returned). The pre-#807 name implied caller-side dispatch ordering, which mismatched the lifecycle observed by `task action=list`.
+- **`release_worktree` response shape (#807)** — `ReleaseOutcome` now serializes flat (`released` / `binding_removed` / `branch_deleted` / `worktree_removed` / `error: Option<String>`) instead of wrapped in an `<error>` envelope. Functionally equivalent but no longer looks like a failure at a glance.
+- **`active:` task board indicator filters ghost agents (#827, PR #832)** — TUI bottom-status `active:` line now `filter(|name| registry.contains(name))` against the live agent list before rendering. Disbanded agents no longer flicker in the indicator even when they still own claimed tasks.
+- **`docs/FLEET-DEV-PROTOCOL-v1.md` → `docs/FLEET-DEV-PROTOCOL.md`** — drop the `-v1` suffix. The document is internally versioned in its header (`v1.2`) and no v2 is in flight; the path-level `-v1` was a 2025-era misnomer suggesting a parallel v2. Compile-time `include_str!` in `src/protocol.rs`, `Cargo.toml` `[package].include` whitelist, `tests/cargo_include_invariant.rs` test mock-pattern filter, README link, `docs/ARCHITECTURE-QUICK-START.md`, and `docs/LINT-DISCIPLINE.md` updated. Operators with hand-edited overrides at the old path must rename manually (no auto-migration; mechanism rarely used).
+- **MCP tools slimmed 32 → 29 (PR #640)** — three redundant tools removed during MCP refactor consolidation.
+- **`replace_instance` backend from `fleet.yaml` (#662, PR #669)** — respawn now reads backend label from yaml instead of legacy in-memory cache. Companion: explicit SPAWN after DELETE step (PR #662).
+- **PTY inject 2-tier format + atomic header write (#658, PR #665)** — `[AGEND-MSG]` headers and bodies now atomic per envelope; partial-write races eliminated.
+- **`MCP-TOOLS.md` rewrite (#637)** — all 32 tools (now 29) catalogued with current names, actions, and schemas.
+- **`source_repo` path traversal validation (#689, PR #710)** — rejects `..` segments in caller-supplied source_repo args.
+- **`working_directory` canonicalize + allowed-roots (#707, PR #732)** — rejects paths outside the home / explicitly-allowed list.
+- **Codex `ServerRateLimit` classifier extended (#668, PR #670)** — generic 5xx + server-side issue now classified as ServerRateLimit (triggers existing fast-retry path).
+- **Audit job `permissions: checks: write + issues: write` (PR #831)** — `rustsec/audit-check@v2` POSTs check-runs to the GitHub API; the repo's `default_workflow_permissions: read` was denying the POST on every push-to-main with `Resource not accessible by integration`. Surgical permission grant scoped to the audit job. Other jobs remain read-only.
+- **CI watch `[ci-pass]` dedup at action_target (#762, PR #803)** — eliminates duplicate notifications when CI completes for an action_target on success.
+- **CI watch conclusion-change dedup (#786, PR #794)** — Sites 1 + 2 now share a dedup key so the same conclusion isn't surfaced twice on rerun.
+- **CI watch drops stale notifications (#745, PR #746)** — when a newer commit lands on the branch, the queue clears the older watch's notification slot. Stale CI surface lifted to observable `ci-stale` inbox kind (PR #754).
+- **`from:` prefix stripped from PTY header (#761, PR #798)** — `[AGEND-MSG] from=NAME` header on PTY inject no longer carries the `from:` adapter prefix that channel-aware sources used to leak.
+- **Cursor-position lookup for mouse forwarding (#783, PR #801)** — mouse coordinates now resolved against actual cursor cell instead of stale cached offset.
+- **Deploy preserves backend label separately from command path (#787, PR #802)** — `deployment` action no longer conflates the two on respawn.
+- **Registry / team-metadata desync better-error + `Team.stale_members` field (#785, PR #793)** — `team action=list` now exposes which fleet.yaml members are missing from the runtime registry, surfacing the "binary refresh wipes registry but not team yaml" class. Daemon binding `bind_full` / `handle_watch_ci` errors hardened to no longer silently swallow partial failures.
+- **Gemini submit_key `\n\r` → `\r` (#607, PR #627)** — fixes Gemini-specific stuck-on-newline injection symptom.
+- **Skip PTY inject for Codex on update/report messages (#603, PR #629)** — Codex prefers stdin-only delivery for non-task messages.
+- **Deployment spawn passes model + args from template (#605, PR #626)** — was previously ignored.
+
+### Fixed
+
+- **WIDE_CHAR_SPACER ratatui buffer cell leak (#819, PR #823)** — Site 1 in `src/vterm.rs::Widget::render` leaked stale chars across frames when the alacritty grid transitioned from `[WIDE_CHAR][SPACER]` to `[NarrowChar][SPACER]`. Fix relocated to the WIDE_CHAR write site (writes blank to (x+1, y) alongside the narrow char). Sites 2-5 (text/ANSI builder paths with fresh allocation) confirmed correct + explicitly regression-proofed. Surfaced as "TUI prompt-line scattered chars that disappear on selection".
+- **Bridge ↔ daemon double-execution under transient transport failure (PR #804 RCA → PR #843)** — `agend-mcp-bridge::is_retriable_io` classified `io::ErrorKind::TimedOut` as retriable. Daemon-side slow handlers (telegram channel inject > 30s) tripped the bridge's `read_timeout` → retry → double execution. Fix is the L1 idempotent retry architecture (see Added). Original PR #804 (cheerc) RCA confirmed correct; closed with credit.
+- **`teams::delete` did not cleanup member tasks (#828)** — single missing wire-up to `full_delete_instance` caused all ghost-owner accumulation. See Added.
+- **`force_release_worktree` returned `released: true` but did not clean git-level metadata (#826)** — when binding was already removed (e.g., agent disbanded), only the daemon worktree pool was checked. Added GC mode for orphan git-level worktrees.
+- **`process_server_rate_limit_retries` re-injected `last_input_text` (#841 followup)** — known semantic bug: forces task restart instead of resume. Filed as backlog post-#841 (cfg.prompt switch when bandwidth available). #841 added a complementary recovery nudge that uses `cfg.prompt`.
+- **`task action=list` returned 500KB+ in production (#806)** — see Changed (`task action=list` default filter).
+- **`cleanup_init_commits` was no-op for daemon-produced heartbeats (#833)** — see Added (trailer-aware body gate).
+- **`cleanup_init_commits` retry corruption (#814)** — see Added (auto-recovery from stale rebase-merge dir).
+- **CI audit job red on main since 2026-05-15 (PR #831)** — see Changed (audit job permissions).
+- **Notification triple-fire on consume + retry (#836)** — see Added (notification dedup race).
+- **Test fixture polluted host worktree (#821 prep)** — fixture subprocess `git checkout -b feat-b` landed on the real worktree instead of temp dir. See Added (test isolation invariant).
+- **`active:` indicator showed disbanded agents (#827)** — see Changed (filter against runtime registry).
+- **WAF-stage / macOS rustup-init transient (#772 v3, PR #800)** — `cache-bin: false` prevents stale rustup-init pollution; v3 supersedes v1/v2 attempts.
+- **PTY write timeout prevents chain deadlock (#659, PR #679)** — `PTY_WRITE_TIMEOUT = 5s` saves the supervisor from livelock on a stuck channel.
+- **Crash-respawn flakiness (#743, PR #748)** — split `test_crash_respawn_health` predicate into spawn + health-flip phases; reduces test-time variance.
+- **`kill_process_tree` PID 0 guard (#681, PR #687)** — refuses to signal PID 0; defensive against accidental kill-all.
+- **`flock` protects ci-watch RMW race (#692, PR #731)** — prevents two daemon ticks from clobbering each other.
+- **CI lock audit + API connection limits (#711 / #680, PR #730)** — concurrent test-suite serialization + slow-loris connection caps.
+- **`fetch --prune` before branch-cleanup remote-gone detection (PR #634)** — `cleanup_merged_branches` could miss squash-merged branches if remote refs were stale.
+- **`release_worktree` scope boundary + invariant test (#633, PR #636)** — `release_full` is the single mutation point for binding + worktree cleanup; tests pin no callers bypass.
+- **`release_worktree` auto-cleanup merged branches (#611, PR #621)** — landed, then reverted (PR #621), then relanded (PR #621 reland). Final landed.
+- **GitHub token format validation (#709, PR #726)** — accepts both `ghp_*` and `gho_*` patterns; rejects malformed.
+- **Strip `AGEND_GIT_BYPASS` from child PTY env (#708, PR #725)** — operator's bypass env no longer leaks to agent subprocesses.
+- **Default branch + primary remote detection (#690, PR #716)** — handles repos with non-`main` default + non-`origin` primary.
+- **Mouse output / SGR / wants_mouse fixes (#700, PR #739 #741 #744)** — three companion PRs cleaning up the mouse forwarding path.
+- **Strip trailing `\r` from CI notifications (#719, PR #740)** — was leaking into agent inject.
+- **Test isolation — AGEND_GIT_BYPASS in admin + worktree_opt_out (#631, PR #635)** — claim_verifier git calls were rejected without bypass.
+- **Cross-team messages bypass ACK absorption (#612, PR #630)** — see §4.5 protocol amendment.
+- **GC + reconcile_hooks scan new worktree layout (#682, PR #691)** — post-Sprint-57-Wave-4 layout (worktrees outside repo under `$AGEND_HOME/worktrees/`) was invisible to GC sweep.
+- **Exempt orchestrator from ACK absorption skip (#656, PR #666)** — lead-style agents must see ACKs to track team readiness.
+- **`replace_instance` backend from fleet.yaml + explicit SPAWN after DELETE (#661 / #662, PR #662 #669)** — respawn race when backend label differed.
+- **Startup grace period for `replace_instance` (PR #673)** — newly-replaced instance not classified as `Hung` during boot.
+- **`deleted` flag prevents reaper shell fallback race (PR #675)** — `delete_instance` while the agent is mid-reap no longer triggers a fallback shell spawn.
+- **PTY inject 2-tier format + atomic header write (#658)** — see Changed.
+- **CI watch `ci-stale` lifted to inbox kind (#745, PR #754)** — see Changed.
+- **`test_crash_respawn_health` — increase timeout + remove hard sleep (PR #742)** — flaky CI test reliability improvement.
+- **Schedule firing race fixed (PR #555-class, via #694 BLOCK 1)** — schedule handler extracted into dedicated `CheckSchedulesHandler`.
+- **`fix(verify): remove stale unwrap_used allows (#706, PR #751)** — clippy lint cleanup.
+- **`docs(#704): release smoke-test checklist (PR #756)** — operator checklist for release verification.
+- **`feat(#704) sub-1: passive PTY capture helper (PR #755)** — sink + rotate + promote CLI for real-backend regression corpus.
+
+### Removed
+
+- **`requires_daemon_state` field (#672 / #674)** — dead field removed; stale CLI hint cleaned.
+
+### Build / dependencies
+
+- **`sysinfo` 0.32 → 0.39** — API migration (`ProcessRefreshKind::new()` → `nothing()`); companion adjustments in `agend-git` shim.
+- **`rustls-webpki` upgrade** — security advisory fix paired with audit-job-blocking fix (PR #729).
+- **`twilight-model` 0.16 → 0.17.1** (Discord channel dep).
+- **`libc` 0.2.184 → 0.2.186**, **`uuid` 1.23.0 → 1.23.1**, **`which` 6 → 8** — routine dependabot bumps.
+
+### Workflow validation snapshots
+
+- **2026-05-14 post-#779 partial-fix canary pass** — 1 manual git branch step before full bypass-free path. Captured in `/tmp/val-workflow-2026-05-14.md` (post-mortem reference).
 
 ## [Workflow validation 2 — 2026-05-14] post #779 partial-fix canary pass (1 manual git branch step)
 
