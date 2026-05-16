@@ -1053,14 +1053,19 @@ mod tests {
 
     #[test]
     fn rate_limit_regex_still_matches_real_429_token() {
-        // Regression guard: word-boundary fix must NOT break the canonical
-        // "Error: 429" detection. Same scenario as `error_state_instant_transition`.
+        // Regression guard: the narrowed #848 pattern must still classify
+        // the canonical Claude 429-rejection wording as RateLimit. Pre-#848
+        // this test fed the casual `"API error: 429 Too Many Requests"`
+        // form, which only passed because the OLD broad pattern matched
+        // `\b429\b` as a substring. The narrowed pattern keys on the
+        // verbatim Anthropic docs phrasing — `API Error: Request rejected
+        // (429)` — so the test now feeds the canonical form.
         let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
-        t.feed("API error: 429 Too Many Requests");
+        t.feed("API Error: Request rejected (429) · this may be a temporary capacity issue");
         assert_eq!(
             t.get_state(),
             AgentState::RateLimit,
-            "canonical `429` standalone token must still trigger RateLimit"
+            "canonical Anthropic 429-rejection wording must still trigger RateLimit"
         );
     }
 
@@ -3089,6 +3094,144 @@ mod tests {
             patterns.detect(screen),
             Some(AgentState::ServerRateLimit),
             "5-followed-by-many-digits must NOT trigger ServerRateLimit (#668)"
+        );
+    }
+
+    // ── #848 PR-A — classifier root cause unit tests + Tier 1 smoke ──
+    //
+    // The smoke test sits here (not in tests/state_pattern_coverage.rs)
+    // because `StateTracker` / `AgentState` / `Backend` live in the binary
+    // crate, not `lib.rs`'s minimal re-export surface. Sprint 26 PR-A
+    // documented this pattern (see `tests/behavioral_shadow.rs` module
+    // doc): structural fixture checks in `tests/`, transition assertions
+    // in `src/state.rs::mod tests` where the binary-internal types are
+    // accessible.
+
+    /// Tier 1 smoke test: loads each of the 5 new #848 fixtures, runs
+    /// the bytes through `StateTracker::feed`, and asserts the observed
+    /// classification matches `MANIFEST.expected_final_state`. One
+    /// data-driven loop replaces five copy-paste assertions and gives
+    /// future-fixture-adders a single insertion point.
+    #[test]
+    fn classifier_matches_expected_state_per_fixture() {
+        let dir = std::path::Path::new("tests/fixtures/state-replay");
+        let cases: &[(&str, AgentState)] = &[
+            ("claude-rate-limit-429.raw", AgentState::RateLimit),
+            ("claude-server-throttle.raw", AgentState::ServerRateLimit),
+            ("claude-overloaded-529.raw", AgentState::ServerRateLimit),
+            ("claude-session-limit.raw", AgentState::UsageLimit),
+            ("claude-discussion-text.raw", AgentState::Idle),
+        ];
+        for (file, expected) in cases {
+            let bytes = std::fs::read(dir.join(file))
+                .unwrap_or_else(|e| panic!("read fixture {file}: {e}"));
+            let text = String::from_utf8_lossy(&bytes);
+            let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+            t.feed(&text);
+            assert_eq!(
+                t.get_state(),
+                *expected,
+                "fixture {file} expected {expected:?} (per MANIFEST.expected_final_state)"
+            );
+        }
+    }
+
+    /// Individual: the canonical 429-rejection fixture must classify as
+    /// RateLimit (new narrowed Claude pattern's first alternation).
+    #[test]
+    fn claude_rate_limit_429_fixture_triggers_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/claude-rate-limit-429.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::RateLimit);
+    }
+
+    /// Individual: the existing server-throttle wording must keep
+    /// classifying as ServerRateLimit (regression-proof for the pattern
+    /// already in src/state.rs — #848 leaves the existing alternation
+    /// intact and only ADDS new alternations alongside it).
+    #[test]
+    fn claude_server_throttle_fixture_triggers_server_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/claude-server-throttle.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::ServerRateLimit);
+    }
+
+    /// Individual: the new 529 overload wording must classify as
+    /// ServerRateLimit (new alternation in the narrowed pattern).
+    /// Pre-#848 this fell through (`overloaded` lowercase didn't match
+    /// the capitalized `Overloaded`; the 5xx pattern required no
+    /// intervening text between `API Error: ` and the digits).
+    #[test]
+    fn claude_overloaded_529_fixture_triggers_server_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/claude-overloaded-529.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::ServerRateLimit);
+    }
+
+    /// Individual: the session-limit wording must classify as UsageLimit
+    /// (NEW pattern added by #848; Claude previously had no UsageLimit
+    /// pattern and these strings fell through to whatever happened to
+    /// match — frequently RateLimit via `rate.?limit` substring).
+    #[test]
+    fn claude_session_limit_fixture_triggers_usage_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/claude-session-limit.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::UsageLimit);
+    }
+
+    /// **CRITICAL** individual: discussion prose containing the literal
+    /// substrings `rate_limit` / `rate-limit` / `rate limit` /
+    /// `overloaded` must NOT classify as RateLimit. This is the root
+    /// cause of the #841 nudge spam — agents debugging the bug
+    /// triggered the bug. Pre-#848 the broad
+    /// `r"overloaded|rate.?limit|\b429\b"` pattern matched the prose;
+    /// post-#848 the narrowed pattern matches only specific error
+    /// phrases.
+    #[test]
+    fn claude_discussion_text_fixture_does_not_trigger_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/claude-discussion-text.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(
+            t.get_state(),
+            AgentState::Idle,
+            "discussion prose containing rate_limit / rate-limit / overloaded \
+             substrings must NOT trigger RateLimit (root cause of #841 nudge spam)"
+        );
+    }
+
+    /// Mirror of the Claude regression-proof gate for Codex — the same
+    /// `r"rate.?limit|\b429\b"` broadness existed at src/state.rs:310
+    /// pre-#848 (and shipped under the same dogfood failure mode in
+    /// fleet operations). Tightening the Codex pattern to specific
+    /// phrases must also kill the false-positive on discussion text.
+    #[test]
+    fn codex_discussion_text_does_not_trigger_rate_limit() {
+        let mut t = tracker_at(&Backend::Codex, AgentState::Idle, 0);
+        t.feed(
+            "We are debugging the rate_limit classification issue in src/state.rs. \
+             The current Codex regex matches rate-limit and rate_limit as substring \
+             matches anywhere in PTY scrollback.",
+        );
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "Codex discussion prose containing rate_limit / rate-limit substrings \
+             must NOT trigger RateLimit (same false-positive class as Claude pre-#848)"
         );
     }
 }

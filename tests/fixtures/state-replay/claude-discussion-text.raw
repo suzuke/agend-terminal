@@ -1,0 +1,9 @@
+[2J[H[0mWe are debugging the rate_limit classification issue in src/state.rs.
+The current regex matches rate-limit, rate_limit, rate limit, and
+overloaded as substring matches anywhere in PTY scrollback. This causes
+false positives when agents discuss the topic in normal prose.
+The fix in #848 narrows the patterns to specific error phrases only,
+so that bare references to the rate_limit problem no longer trigger
+the AgentState::RateLimit classification.
+
+❯ 

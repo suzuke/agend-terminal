@@ -20,6 +20,16 @@ const EXPECTED_FIXTURES: &[&str] = &[
     "kiro-tooluse.raw",
     "opencode-thinking.raw",
     "opencode-tooluse.raw",
+    // #848 PR-A — classifier root cause fixtures (synthetic from Anthropic
+    // docs verbatim strings). The behavior assertion that each fixture
+    // produces the right AgentState lives in `src/state.rs::mod tests`
+    // (binary-crate-internal types — Sprint 26 PR-A pattern, see
+    // `tests/behavioral_shadow.rs` module doc for the lib/bin split).
+    "claude-rate-limit-429.raw",
+    "claude-server-throttle.raw",
+    "claude-overloaded-529.raw",
+    "claude-session-limit.raw",
+    "claude-discussion-text.raw",
 ];
 
 #[test]
