@@ -315,3 +315,87 @@ fixtures:
     capture_kind: synthetic_from_real_template
     provenance: "f685 sub-task 5 synthetic — #659 silent-stuck template; real capture pending"
     schema_version: 2
+
+  # #848 — state classifier root cause fixtures (PR-A).
+  # Synthetic from Anthropic docs verbatim error strings + Claude Code CLI
+  # observed phrasing. The classifier patterns at src/state.rs:194-197 and
+  # the new Claude UsageLimit pattern are pinned by the assertions below.
+
+  - file: claude-rate-limit-429.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Claude pane shows the canonical 429-rejection error string verbatim
+      ("API Error: Request rejected (429) · this may be a temporary
+      capacity issue"). Classifier must transition Idle → RateLimit on
+      the first observation.
+    expected_transitions: [starting, rate_limit]
+    expected_final_state: rate_limit
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 sub-task — synthetic from Anthropic docs verbatim 429 error string"
+
+  - file: claude-server-throttle.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Claude pane shows the existing server-throttle string ("Server is
+      temporarily limiting requests"). Regression-proof for the
+      ServerRateLimit pattern currently in src/state.rs:194-196 —
+      defends against future broadening.
+    expected_transitions: [starting, server_rate_limit]
+    expected_final_state: server_rate_limit
+    expected_final_detect: server_rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 sub-task — synthetic from Claude Code CLI server-throttle phrasing"
+
+  - file: claude-overloaded-529.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Claude pane shows "API Error: Repeated 529 Overloaded errors · check
+      status.claude.com" — the 529 capacity overload that #848 adds to the
+      ServerRateLimit pattern's new alternation.
+    expected_transitions: [starting, server_rate_limit]
+    expected_final_state: server_rate_limit
+    expected_final_detect: server_rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 sub-task — synthetic from Anthropic docs verbatim 529 overloaded string"
+
+  - file: claude-session-limit.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-16"
+    scenario: |
+      Claude pane shows "You've hit your session limit · resets 3:45pm" —
+      the subscription-quota wording that should map to UsageLimit (NEW
+      Claude state added by #848; previously fell through with no match).
+      A "continue" nudge cannot help a hard quota, so this state must NOT
+      be classified as RateLimit / ServerRateLimit.
+    expected_transitions: [starting, usage_limit]
+    expected_final_state: usage_limit
+    expected_final_detect: usage_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#848 sub-task — synthetic from Claude Code CLI session-limit wording"
+
+  - file: claude-discussion-text.raw
+    backend: claude-code
+    cli_version: "2.1.98"
+    recorded_on: "2026-05-16"
+    scenario: |
+      CRITICAL regression-proof fixture for #848. Claude pane contains
+      prose discussing the rate_limit / rate-limit / rate limit /
+      overloaded substrings in non-error context (agent debugging the
+      issue itself, memory file references, task descriptions). Under
+      the OLD broad `rate.?limit|overloaded` Claude pattern, this triggered
+      a false RateLimit classification on every tick. Under the post-#848
+      narrowed patterns, the classifier stays Idle — the bug surface that
+      caused the #841 nudge spam is closed at the source.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "#848 regression-proof — prose containing the bug's trigger substrings, expected Idle (NOT RateLimit)"
