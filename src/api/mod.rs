@@ -368,6 +368,10 @@ fn handle_session(
 
         let method = req["method"].as_str().unwrap_or("");
         let params = &req["params"];
+        // #842: bridge-emitted `request_id` (UUIDv4) drives idempotent
+        // retry. Missing → skip dedup (legacy at-least-once for clients
+        // that don't emit the field; see `request_dedup::DedupCache::dispatch`).
+        let request_id = req["request_id"].as_str();
 
         let ctx = handlers::HandlerCtx {
             registry,
@@ -377,42 +381,50 @@ fn handle_session(
             home,
         };
 
-        let response = match method {
-            method::LIST => handlers::query::handle_list(params, &ctx),
-            method::INJECT => handlers::instance::handle_inject(params, &ctx),
-            method::KILL => handlers::instance::handle_kill(params, &ctx),
-            method::DELETE => handlers::instance::handle_delete(params, &ctx),
-            method::SPAWN => handlers::instance::handle_spawn(params, &ctx),
-            method::SEND => handlers::messaging::handle_send(params, &ctx),
-            method::STATUS => handlers::query::handle_status(params, &ctx),
-            method::REGISTER_EXTERNAL => handlers::external::handle_register_external(params, &ctx),
-            method::DEREGISTER_EXTERNAL => {
-                handlers::external::handle_deregister_external(params, &ctx)
-            }
-            method::CREATE_TEAM => handlers::team::handle_create_team(params, &ctx),
-            method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
-            method::MOVE_PANE => handlers::instance::handle_move_pane(params, &ctx),
-            method::PANE_SNAPSHOT => handlers::instance::handle_pane_snapshot(params, &ctx),
-            method::VERIFY_PUSH => handlers::verify_push::handle_verify_push(params),
-            method::SET_BLOCKED_REASON => {
-                handlers::instance::handle_set_blocked_reason(params, &ctx)
-            }
-            method::CLEAR_BLOCKED_REASON => {
-                handlers::instance::handle_clear_blocked_reason(params, &ctx)
-            }
-            method::MCP_TOOL => handlers::mcp_proxy::handle_mcp_tool(params, &ctx),
-            method::MCP_TOOLS_LIST => handlers::mcp_proxy::handle_mcp_tools_list(params, &ctx),
-            method::SHUTDOWN => {
-                tracing::info!("API shutdown requested");
-                // Sprint 57 Wave 3 PR-2 (#548 Q6): record API-shutdown
-                // reason BEFORE flipping the flag so the shutdown
-                // sequence sees the right taxonomy when it reads.
-                crate::daemon::record_shutdown_reason(crate::daemon::ShutdownReason::ApiShutdown);
-                shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-                json!({"ok": true})
-            }
-            _ => json!({"ok": false, "error": format!("unknown method: {method}")}),
-        };
+        let response = request_dedup::global().dispatch(
+            request_id,
+            request_dedup::DEFAULT_WAIT_TIMEOUT,
+            || match method {
+                method::LIST => handlers::query::handle_list(params, &ctx),
+                method::INJECT => handlers::instance::handle_inject(params, &ctx),
+                method::KILL => handlers::instance::handle_kill(params, &ctx),
+                method::DELETE => handlers::instance::handle_delete(params, &ctx),
+                method::SPAWN => handlers::instance::handle_spawn(params, &ctx),
+                method::SEND => handlers::messaging::handle_send(params, &ctx),
+                method::STATUS => handlers::query::handle_status(params, &ctx),
+                method::REGISTER_EXTERNAL => {
+                    handlers::external::handle_register_external(params, &ctx)
+                }
+                method::DEREGISTER_EXTERNAL => {
+                    handlers::external::handle_deregister_external(params, &ctx)
+                }
+                method::CREATE_TEAM => handlers::team::handle_create_team(params, &ctx),
+                method::UPDATE_TEAM => handlers::team::handle_update_team(params, &ctx),
+                method::MOVE_PANE => handlers::instance::handle_move_pane(params, &ctx),
+                method::PANE_SNAPSHOT => handlers::instance::handle_pane_snapshot(params, &ctx),
+                method::VERIFY_PUSH => handlers::verify_push::handle_verify_push(params),
+                method::SET_BLOCKED_REASON => {
+                    handlers::instance::handle_set_blocked_reason(params, &ctx)
+                }
+                method::CLEAR_BLOCKED_REASON => {
+                    handlers::instance::handle_clear_blocked_reason(params, &ctx)
+                }
+                method::MCP_TOOL => handlers::mcp_proxy::handle_mcp_tool(params, &ctx),
+                method::MCP_TOOLS_LIST => handlers::mcp_proxy::handle_mcp_tools_list(params, &ctx),
+                method::SHUTDOWN => {
+                    tracing::info!("API shutdown requested");
+                    // Sprint 57 Wave 3 PR-2 (#548 Q6): record API-shutdown
+                    // reason BEFORE flipping the flag so the shutdown
+                    // sequence sees the right taxonomy when it reads.
+                    crate::daemon::record_shutdown_reason(
+                        crate::daemon::ShutdownReason::ApiShutdown,
+                    );
+                    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                    json!({"ok": true})
+                }
+                _ => json!({"ok": false, "error": format!("unknown method: {method}")}),
+            },
+        );
 
         let _ = writeln!(writer, "{}", response);
         let _ = writer.flush();

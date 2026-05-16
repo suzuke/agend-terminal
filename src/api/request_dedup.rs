@@ -11,7 +11,7 @@
 //! original request but the response delivery failed (slow channel IO + the
 //! bridge's read timeout fires → TimedOut → retry → daemon re-executes).
 //!
-//! Phase 1 spike ([task t-20260516003843690911-2]) locked the design:
+//! Phase 1 spike (task t-20260516003843690911-2) locked the design:
 //!
 //! ## Wire-format change
 //!
@@ -52,8 +52,8 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::{Condvar, Mutex, OnceLock};
 use std::sync::Arc;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Time-to-live for completed entries before garbage collection.
@@ -105,7 +105,9 @@ enum EntryState {
 
 struct Entry {
     state: EntryState,
-    inserted_at: Instant,
+    /// `None` while the handler is still in flight; set to `Some(now)`
+    /// when the in-progress guard transitions the entry to a terminal
+    /// state. Drives both TTL eviction and overflow-policy ordering.
     completed_at: Option<Instant>,
     response_bytes: usize,
     waiter_count: usize,
@@ -160,27 +162,193 @@ impl DedupCache {
     ///   Condvar (up to `wait_timeout`) and observe the first thread's
     ///   response. Later duplicates within the TTL window return the
     ///   cached response without dispatching.
-    pub fn dispatch<F>(
-        &self,
-        request_id: Option<&str>,
-        wait_timeout: Duration,
-        handler: F,
-    ) -> Value
+    pub fn dispatch<F>(&self, request_id: Option<&str>, wait_timeout: Duration, handler: F) -> Value
     where
         F: FnOnce() -> Value,
     {
-        let _ = (
-            request_id,
-            wait_timeout,
-            &self.inner,
-            self.ttl,
-            self.per_entry_cap,
-            self.total_cap,
-            self.waiter_cap,
-        );
-        // Silence the unused-FnOnce drop without invoking.
-        drop(handler);
-        unimplemented!("DedupCache::dispatch — C1 RED stub, C2 GREEN fills in")
+        let id = match request_id.filter(|s| !s.is_empty()) {
+            Some(s) => s.to_string(),
+            None => return handler(),
+        };
+
+        // First lookup — either we register Fresh (and run the handler),
+        // or we observe a terminal state, or we attach as a waiter.
+        let action = self.check_or_register(&id);
+        match action {
+            CheckOutcome::Cached(v) => v,
+            CheckOutcome::Oversized => oversized_error(),
+            CheckOutcome::Errored(detail) => handler_errored(&detail),
+            CheckOutcome::OverCap => in_progress_error(),
+            CheckOutcome::Wait(handle) => self.wait_for(&id, handle, wait_timeout),
+            CheckOutcome::Fresh => {
+                let mut guard = InProgressGuard {
+                    cache: self,
+                    request_id: id,
+                    completed: false,
+                };
+                let response = handler();
+                guard.complete(response.clone());
+                response
+            }
+        }
+    }
+
+    fn check_or_register(&self, id: &str) -> CheckOutcome {
+        let mut inner = self.inner.lock().expect("dedup inner mutex");
+        match inner.entries.get_mut(id) {
+            None => {
+                let handle: NotifyHandle = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
+                inner.entries.insert(
+                    id.to_string(),
+                    Entry {
+                        state: EntryState::InProgress(handle),
+                        completed_at: None,
+                        response_bytes: 0,
+                        waiter_count: 0,
+                    },
+                );
+                CheckOutcome::Fresh
+            }
+            Some(entry) => match &entry.state {
+                EntryState::Cached(v) => CheckOutcome::Cached(v.clone()),
+                EntryState::Oversized => CheckOutcome::Oversized,
+                EntryState::Errored(detail) => CheckOutcome::Errored(detail.clone()),
+                EntryState::InProgress(handle) => {
+                    if entry.waiter_count >= self.waiter_cap {
+                        tracing::warn!(
+                            request_id = id,
+                            waiter_count = entry.waiter_count,
+                            cap = self.waiter_cap,
+                            "request_dedup waiter cap reached — returning in_progress error"
+                        );
+                        return CheckOutcome::OverCap;
+                    }
+                    entry.waiter_count += 1;
+                    CheckOutcome::Wait(Arc::clone(handle))
+                }
+            },
+        }
+    }
+
+    fn wait_for(&self, id: &str, handle: NotifyHandle, timeout: Duration) -> Value {
+        let (mutex, condvar) = (&handle.0, &handle.1);
+        let mut slot = mutex.lock().expect("notify slot mutex");
+        let deadline = Instant::now().checked_add(timeout);
+        while slot.result.is_none() {
+            let remaining = match deadline {
+                Some(d) => d.checked_duration_since(Instant::now()),
+                None => Some(timeout),
+            };
+            match remaining {
+                Some(dur) if !dur.is_zero() => {
+                    let (g, wt) = condvar
+                        .wait_timeout(slot, dur)
+                        .expect("condvar wait_timeout");
+                    slot = g;
+                    if wt.timed_out() && slot.result.is_none() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let result = slot.result.clone();
+        drop(slot);
+
+        // Decrement waiter count — entry may already be terminal but the
+        // counter is harmless once nobody is reading it.
+        {
+            let mut inner = self.inner.lock().expect("dedup inner mutex");
+            if let Some(entry) = inner.entries.get_mut(id) {
+                if entry.waiter_count > 0 {
+                    entry.waiter_count -= 1;
+                }
+            }
+        }
+
+        match result {
+            Some(SlotResult::Cached(v)) => v,
+            Some(SlotResult::Oversized) => oversized_error(),
+            Some(SlotResult::Errored(detail)) => handler_errored(&detail),
+            None => in_progress_error(),
+        }
+    }
+
+    /// Used by `InProgressGuard::complete` and its `Drop` to swap an
+    /// InProgress entry into a terminal state and notify waiters.
+    fn finalize(&self, id: &str, outcome: SlotResult) {
+        let handle_to_notify = {
+            let mut inner = self.inner.lock().expect("dedup inner mutex");
+            let mut bytes_delta: usize = 0;
+            let handle = {
+                let Some(entry) = inner.entries.get_mut(id) else {
+                    return;
+                };
+                let handle = match &entry.state {
+                    EntryState::InProgress(h) => Some(Arc::clone(h)),
+                    _ => None,
+                };
+                match &outcome {
+                    SlotResult::Cached(v) => {
+                        let bytes = estimated_bytes(v);
+                        entry.state = EntryState::Cached(v.clone());
+                        entry.response_bytes = bytes;
+                        bytes_delta = bytes;
+                    }
+                    SlotResult::Oversized => {
+                        entry.state = EntryState::Oversized;
+                        entry.response_bytes = 0;
+                    }
+                    SlotResult::Errored(detail) => {
+                        entry.state = EntryState::Errored(detail.clone());
+                        entry.response_bytes = 0;
+                    }
+                }
+                entry.completed_at = Some(Instant::now());
+                handle
+            };
+            if bytes_delta > 0 {
+                inner.total_bytes = inner.total_bytes.saturating_add(bytes_delta);
+            }
+            self.evict_to_fit(&mut inner);
+            handle
+        };
+
+        if let Some(handle) = handle_to_notify {
+            let mut slot = handle.0.lock().expect("notify slot mutex");
+            slot.result = Some(outcome);
+            drop(slot);
+            handle.1.notify_all();
+        }
+    }
+
+    fn evict_to_fit(&self, inner: &mut Inner) {
+        if inner.total_bytes <= self.total_cap {
+            return;
+        }
+        // Collect terminal entries ordered by completed_at ascending.
+        // InProgress entries (completed_at = None) are skipped — they're
+        // not "old" in any meaningful sense and can't be replayed safely.
+        let mut victims: Vec<(String, Instant, usize)> = inner
+            .entries
+            .iter()
+            .filter_map(|(k, e)| {
+                if e.response_bytes == 0 {
+                    return None;
+                }
+                let completed = e.completed_at?;
+                Some((k.clone(), completed, e.response_bytes))
+            })
+            .collect();
+        victims.sort_by_key(|(_, t, _)| *t);
+        for (id, _, bytes) in victims {
+            if inner.total_bytes <= self.total_cap {
+                break;
+            }
+            if inner.entries.remove(&id).is_some() {
+                inner.total_bytes = inner.total_bytes.saturating_sub(bytes);
+            }
+        }
     }
 
     /// Drop entries whose `completed_at` is older than `now - ttl`.
@@ -190,17 +358,92 @@ impl DedupCache {
         self.sweep_expired_at(Instant::now())
     }
 
-    pub fn sweep_expired_at(&self, _now: Instant) -> usize {
-        unimplemented!("DedupCache::sweep_expired_at — C1 RED stub")
+    pub fn sweep_expired_at(&self, now: Instant) -> usize {
+        let mut inner = self.inner.lock().expect("dedup inner mutex");
+        let ttl = self.ttl;
+        let mut reclaimed_bytes: usize = 0;
+        let mut dropped = 0usize;
+        inner.entries.retain(|_, entry| {
+            let keep = match entry.completed_at {
+                Some(t) => now
+                    .checked_duration_since(t)
+                    .map(|d| d < ttl)
+                    .unwrap_or(true),
+                None => true,
+            };
+            if !keep {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(entry.response_bytes);
+                dropped += 1;
+            }
+            keep
+        });
+        inner.total_bytes = inner.total_bytes.saturating_sub(reclaimed_bytes);
+        dropped
     }
 
+    #[allow(dead_code)] // introspection helper (used by tests + future operator endpoints)
     pub fn len(&self) -> usize {
         self.inner.lock().expect("dedup inner mutex").entries.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+enum CheckOutcome {
+    Fresh,
+    Wait(NotifyHandle),
+    Cached(Value),
+    Oversized,
+    Errored(String),
+    OverCap,
+}
+
+// ---------------------------------------------------------------------------
+// RAII completion guard
+// ---------------------------------------------------------------------------
+
+struct InProgressGuard<'a> {
+    cache: &'a DedupCache,
+    request_id: String,
+    completed: bool,
+}
+
+impl InProgressGuard<'_> {
+    fn complete(&mut self, response: Value) {
+        self.completed = true;
+        let outcome = if estimated_bytes(&response) > self.cache.per_entry_cap {
+            SlotResult::Oversized
+        } else {
+            SlotResult::Cached(response)
+        };
+        self.cache.finalize(&self.request_id, outcome);
+    }
+}
+
+impl Drop for InProgressGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // Handler panicked or returned without calling complete().
+        // Promote the entry to Errored so concurrent waiters wake with
+        // a deterministic error instead of stalling until wait_timeout.
+        self.cache.finalize(
+            &self.request_id,
+            SlotResult::Errored("handler aborted (panic or early return)".to_string()),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn estimated_bytes(v: &Value) -> usize {
+    serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
 }
 
 /// Process-global cache used by `src/api/mod.rs::handle_session`.
@@ -211,7 +454,6 @@ pub fn global() -> &'static DedupCache {
 
 /// Construct the over-cap `in_progress` error envelope. Exposed so the
 /// daemon dispatch hook and the over-cap path stay in sync.
-#[allow(dead_code)]
 pub(crate) fn in_progress_error() -> Value {
     json!({
         "ok": false,
@@ -219,7 +461,6 @@ pub(crate) fn in_progress_error() -> Value {
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn oversized_error() -> Value {
     json!({
         "ok": false,
@@ -227,7 +468,6 @@ pub(crate) fn oversized_error() -> Value {
     })
 }
 
-#[allow(dead_code)]
 pub(crate) fn handler_errored(detail: &str) -> Value {
     json!({
         "ok": false,
@@ -236,7 +476,7 @@ pub(crate) fn handler_errored(detail: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (C1 RED — all six fail against the `unimplemented!()` stubs above)
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -435,6 +675,117 @@ mod tests {
         assert!(
             cache.is_empty(),
             "missing request_id must not accumulate dedup state"
+        );
+    }
+
+    /// Sweep eviction — entries past TTL are reclaimed; in-flight entries
+    /// (no completed_at) are preserved.
+    #[test]
+    fn sweep_expired_drops_old_terminal_entries_only() {
+        let cache = DedupCache::with_caps(
+            Duration::from_secs(1),
+            PER_ENTRY_CAP_BYTES,
+            TOTAL_CAP_BYTES,
+            WAITER_CAP,
+        );
+        cache.dispatch(Some("old-1"), Duration::from_secs(5), || json!({"k": "v"}));
+        cache.dispatch(Some("old-2"), Duration::from_secs(5), || json!({"k": "v"}));
+        assert_eq!(cache.len(), 2);
+
+        // Move time forward past TTL.
+        let future = Instant::now() + Duration::from_secs(5);
+        let dropped = cache.sweep_expired_at(future);
+        assert_eq!(dropped, 2);
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// Over-cap waiters — once `waiter_cap` is reached, additional
+    /// callers fail fast with `in_progress` rather than blocking.
+    #[test]
+    fn over_cap_waiters_get_in_progress_error_fast() {
+        let cache = Arc::new(DedupCache::with_caps(
+            TTL,
+            PER_ENTRY_CAP_BYTES,
+            TOTAL_CAP_BYTES,
+            2,
+        ));
+
+        // T1 holds the entry InProgress for a while.
+        let c = Arc::clone(&cache);
+        let t1 = thread::spawn(move || {
+            c.dispatch(Some("req-cap"), Duration::from_secs(5), || {
+                thread::sleep(Duration::from_millis(300));
+                json!({"first": true})
+            })
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        // T2 + T3 fill the waiter slots.
+        let c2 = Arc::clone(&cache);
+        let t2 = thread::spawn(move || {
+            c2.dispatch(Some("req-cap"), Duration::from_secs(5), || json!({}))
+        });
+        let c3 = Arc::clone(&cache);
+        let t3 = thread::spawn(move || {
+            c3.dispatch(Some("req-cap"), Duration::from_secs(5), || json!({}))
+        });
+        thread::sleep(Duration::from_millis(50));
+
+        // T4 — over cap — should fail fast.
+        let started = Instant::now();
+        let resp4 = cache.dispatch(
+            Some("req-cap"),
+            Duration::from_secs(5),
+            || json!({"never": "ran"}),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "over-cap caller should not block (took {elapsed:?})"
+        );
+        assert_eq!(
+            resp4["error"].as_str().unwrap_or(""),
+            "in_progress (duplicate request_id still executing on another session)"
+        );
+
+        // Wait for the legitimate waiters to finish.
+        let _ = t1.join();
+        let r2 = t2.join().expect("t2");
+        let r3 = t3.join().expect("t3");
+        assert_eq!(r2, r3);
+        assert_eq!(r2["first"], true);
+    }
+
+    /// Total-cap eviction — oldest-by-completed_at terminal entry drops
+    /// when a fresh completion pushes us over the ceiling.
+    #[test]
+    fn total_cap_overflow_evicts_oldest_terminal_entry() {
+        // Set caps so two 50-byte responses fit but the third forces an
+        // eviction. Each json!({"k": "v"}) string-encodes to 9 bytes
+        // (`{"k":"v"}`), so a per-entry/total budget around 20 bytes is
+        // tight enough to trigger eviction on the third insert.
+        let cache = DedupCache::with_caps(TTL, 64 * 1024, 20, WAITER_CAP);
+        cache.dispatch(Some("e1"), Duration::from_secs(5), || json!({"k": "v"}));
+        thread::sleep(Duration::from_millis(2));
+        cache.dispatch(Some("e2"), Duration::from_secs(5), || json!({"k": "v"}));
+        thread::sleep(Duration::from_millis(2));
+        cache.dispatch(Some("e3"), Duration::from_secs(5), || json!({"k": "v"}));
+        // After eviction we expect at most 2 entries.
+        let len = cache.len();
+        assert!(
+            len <= 2,
+            "expected total-cap eviction to drop at least one entry, got len={len}"
+        );
+        // The oldest entry (e1) should be the one evicted; e3 must be
+        // present.
+        let inner = cache.inner.lock().expect("inner mutex");
+        assert!(
+            inner.entries.contains_key("e3"),
+            "newest entry must survive"
+        );
+        assert!(
+            !inner.entries.contains_key("e1") || inner.entries.contains_key("e2"),
+            "if e1 still present, e2 must also be present (oldest-first eviction)"
         );
     }
 }

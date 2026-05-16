@@ -156,14 +156,21 @@ fn proxy_tools_list(
 /// first attempt's transport failure is therefore not surfaced — the
 /// connection is dropped, reopened, and the request retried exactly once.
 /// A second failure propagates so genuine errors are not masked.
+///
+/// #842: a UUIDv4 `request_id` is injected into the envelope before the
+/// first attempt and **reused verbatim** on the retry — the retry IS the
+/// same logical request, just re-transported. The daemon dedups on
+/// `request_id` so a successful original execution whose response never
+/// reached us isn't replayed as a fresh side-effect call.
 fn proxy_request(
     home: &Path,
     conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
     envelope: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let envelope_with_id = envelope_with_request_id(envelope);
     let mut last_err: Option<Box<dyn std::error::Error>> = None;
     for attempt in 0..2 {
-        match try_proxy_once(home, conn, envelope) {
+        match try_proxy_once(home, conn, &envelope_with_id) {
             Ok(v) => return Ok(v),
             Err(e) if attempt == 0 && is_retriable_io(&*e) => {
                 *conn = None;
@@ -174,6 +181,28 @@ fn proxy_request(
         }
     }
     Err(last_err.unwrap_or_else(|| "proxy retry exhausted".into()))
+}
+
+/// Clone `envelope` with a freshly-minted `request_id` (UUIDv4) iff the
+/// caller didn't already set one. The whole point of the field is for
+/// the daemon to recognize the retry — generated once, sent twice on
+/// the retry path is exactly the right shape.
+fn envelope_with_request_id(envelope: &serde_json::Value) -> serde_json::Value {
+    if envelope
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        return envelope.clone();
+    }
+    let mut cloned = envelope.clone();
+    if let Some(obj) = cloned.as_object_mut() {
+        obj.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+    }
+    cloned
 }
 
 fn try_proxy_once(

@@ -239,6 +239,9 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         // notification-dedup ledger so memory pressure stays bounded
         // on long-lived daemons.
         crate::daemon::notification_dedup::global().sweep_expired();
+        // #842: same eviction cadence for the bridge↔daemon idempotent-
+        // retry dedup cache. Sibling sweep, same 10-min TTL window.
+        crate::api::request_dedup::global().sweep_expired();
     }
 }
 
