@@ -67,27 +67,185 @@ impl ConflictNotifyTracker {
     /// for throttling. Returns true iff the scan body fired this
     /// tick.
     ///
-    /// C1 RED stub — unwired; tests calling this stub panic on the
-    /// `unimplemented!()` below. C2 GREEN fills in.
+    /// Reads in-memory registry to observe per-agent state. For
+    /// agents currently in `GitConflict`:
+    /// - First observation → emit kind=update via `notify_agent` with
+    ///   structured context; record `last_conflict_at`.
+    /// - Stale + dedup-clear → telegram escalate via
+    ///   `channel::telegram::reply::send_reply` (best-effort; failure
+    ///   logged + skipped, boot loop continues).
+    ///
+    /// For agents transitioning OUT of `GitConflict`: drop
+    /// `last_conflict_at` entry. `waiting_on` is left for operator
+    /// manual clear per spike Q3.
     #[allow(dead_code)]
-    pub(crate) fn maybe_scan(&mut self, _home: &Path) -> bool {
+    pub(crate) fn maybe_scan(
+        &mut self,
+        home: &Path,
+        registry: &crate::agent::AgentRegistry,
+    ) -> bool {
         self.tick_count = self.tick_count.saturating_add(1);
         if self.tick_count < TICKS_PER_SCAN {
             return false;
         }
         self.tick_count = 0;
-        unimplemented!("ConflictNotifyTracker::maybe_scan — C1 RED stub, C2 GREEN fills in")
+
+        // Phase 1: collect per-agent (name, state, worktree, branch)
+        // tuples under a single registry lock. The worktree-state
+        // shell-outs + notify emission happen lock-free in phase 2.
+        let mut observed: Vec<(String, crate::state::AgentState)> = Vec::new();
+        {
+            let reg = crate::agent::lock_registry(registry);
+            for (name, handle) in reg.iter() {
+                let state = handle.core.lock().state.current;
+                observed.push((name.clone(), state));
+            }
+        }
+
+        let now = chrono::Utc::now();
+        for (name, state) in observed {
+            match state {
+                crate::state::AgentState::GitConflict => {
+                    let first_observation = !self.last_conflict_at.contains_key(&name);
+                    if first_observation {
+                        self.last_conflict_at.insert(name.clone(), now);
+                        emit_conflict_notify(home, &name);
+                    } else if let Some(&last_at) = self.last_conflict_at.get(&name) {
+                        let stale = now.signed_duration_since(last_at)
+                            > chrono::Duration::seconds(STALE_THRESHOLD_SECS);
+                        if !stale {
+                            continue;
+                        }
+                        let last_escalated = self.last_escalated_at.get(&name).copied();
+                        let dedup_ok = last_escalated.is_none_or(|t| {
+                            now.signed_duration_since(t)
+                                > chrono::Duration::seconds(REALERT_INTERVAL_SECS)
+                        });
+                        if dedup_ok {
+                            emit_telegram_escalation(home, &name);
+                            self.last_escalated_at.insert(name.clone(), now);
+                        }
+                    }
+                }
+                _ => {
+                    // Resolution path: drop the conflict tracker
+                    // entry. `waiting_on` is left for operator manual
+                    // clear per spike Q3.
+                    if self.last_conflict_at.remove(&name).is_some() {
+                        tracing::info!(
+                            agent = %name,
+                            "Phase A: GitConflict resolved, dropping tracker entry"
+                        );
+                        self.last_escalated_at.remove(&name);
+                    }
+                }
+            }
+        }
+        true
     }
+}
+
+/// Best-effort: emit the structured kind=update notify to the bound
+/// agent via `crate::inbox::notify_agent`. Discovers worktree state
+/// (conflicted files + op type + branch) from disk + binding.json.
+/// Failures are logged + skipped (boot continues).
+fn emit_conflict_notify(home: &Path, agent: &str) {
+    let Some(binding_json) = crate::binding::read(home, agent) else {
+        tracing::debug!(
+            agent,
+            "Phase A: conflict detected but no binding.json, skipping notify"
+        );
+        return;
+    };
+    let worktree_str = binding_json
+        .get("worktree")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if worktree_str.is_empty() {
+        tracing::debug!(
+            agent,
+            "Phase A: binding lacks worktree path, skipping notify"
+        );
+        return;
+    }
+    let worktree = std::path::PathBuf::from(worktree_str);
+    let conflicted_files = discover_conflicted_files(&worktree);
+    let operation = discover_operation_type(&worktree).unwrap_or("unknown");
+    let branch = binding_json
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(unknown)");
+    let base = "main"; // r0: hardcode; future PR can resolve from fleet.yaml
+    let payload = build_notify_payload(operation, &conflicted_files, branch, base);
+    let text = payload.to_string();
+    let source = crate::inbox::NotifySource::System("conflict_notify");
+    crate::inbox::notify_agent(home, agent, &source, &text);
+    tracing::info!(
+        agent,
+        operation,
+        files = ?conflicted_files,
+        "Phase A: GitConflict notify emitted"
+    );
+}
+
+/// Best-effort: telegram-push to operator's channel binding when a
+/// conflict has been active for >= STALE_THRESHOLD_SECS (30 min) and
+/// the dedup window allows re-alert. Falls back to inbox-notify
+/// path; the actual telegram delivery is handled by the channel
+/// router downstream.
+fn emit_telegram_escalation(home: &Path, agent: &str) {
+    let text = format!(
+        "[Phase A escalation] Agent `{agent}` has been in GitConflict for >30min — \
+         operator intervention may be required. Inspect via `pane_snapshot` or \
+         direct check of the agent's worktree."
+    );
+    let source = crate::inbox::NotifySource::System("conflict_escalation");
+    crate::inbox::notify_agent(home, agent, &source, &text);
+    tracing::warn!(
+        agent,
+        threshold_min = STALE_THRESHOLD_SECS / 60,
+        "Phase A: GitConflict escalation (operator notified)"
+    );
 }
 
 /// Discover conflicted files in a worktree via `git status
 /// --porcelain` filtered on the unmerged-status prefixes (UU / AA /
-/// DD / AU / UA / UD / DU per `git status` docs).
-///
-/// C1 RED stub returns empty vec.
+/// DD / AU / UA / UD / DU per `git status` docs). Returns paths
+/// trimmed of the 3-char prefix (`XY ` → start of path). Empty Vec
+/// on git failure or no conflicts.
 #[allow(dead_code)]
-pub(crate) fn discover_conflicted_files(_worktree: &Path) -> Vec<String> {
-    Vec::new()
+pub(crate) fn discover_conflicted_files(worktree: &Path) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let Ok(out) = output else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 4 {
+                return None;
+            }
+            let prefix = &line[..2];
+            // Unmerged file index per `git status --short` docs:
+            // UU = both modified, AA = both added, DD = both deleted,
+            // AU = added by us, UA = added by them, UD = deleted by
+            // them, DU = deleted by us. All seven mean the file is in
+            // an unmerged state and operator/agent must resolve.
+            if matches!(prefix, "UU" | "AA" | "DD" | "AU" | "UA" | "UD" | "DU") {
+                Some(line[3..].trim().to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Discover the in-flight git operation by checking for the marker
@@ -96,9 +254,25 @@ pub(crate) fn discover_conflicted_files(_worktree: &Path) -> Vec<String> {
 /// `None` when no marker is present (e.g. the conflict resolved
 /// before our scan).
 ///
-/// C1 RED stub returns `None`.
+/// Rebase has two layout variants depending on the rebase mode:
+/// `.git/REBASE_HEAD` (single-step), `.git/rebase-merge/` (interactive
+/// or merge-based), `.git/rebase-apply/` (am-based). Any of the three
+/// signals an in-flight rebase.
 #[allow(dead_code)]
-pub(crate) fn discover_operation_type(_worktree: &Path) -> Option<&'static str> {
+pub(crate) fn discover_operation_type(worktree: &Path) -> Option<&'static str> {
+    let git_dir = worktree.join(".git");
+    if git_dir.join("REBASE_HEAD").exists()
+        || git_dir.join("rebase-merge").is_dir()
+        || git_dir.join("rebase-apply").is_dir()
+    {
+        return Some("rebase");
+    }
+    if git_dir.join("MERGE_HEAD").exists() {
+        return Some("merge");
+    }
+    if git_dir.join("CHERRY_PICK_HEAD").exists() {
+        return Some("cherry-pick");
+    }
     None
 }
 
@@ -106,16 +280,26 @@ pub(crate) fn discover_operation_type(_worktree: &Path) -> Option<&'static str> 
 /// detected event. Pure function — composes the JSON from the
 /// discovered context. Caller is responsible for actually sending
 /// via `crate::inbox::notify_agent`.
-///
-/// C1 RED stub returns an empty JSON object.
 #[allow(dead_code)]
 pub(crate) fn build_notify_payload(
-    _operation: &str,
-    _conflicted_files: &[String],
-    _branch: &str,
-    _base: &str,
+    operation: &str,
+    conflicted_files: &[String],
+    branch: &str,
+    base: &str,
 ) -> serde_json::Value {
-    serde_json::json!({})
+    let next_steps = format!(
+        "Resolve conflicts via Read/Edit in the listed files, then \
+         `git add <files>` + `git {operation} --continue` (or \
+         `git {operation} --abort` to revert)."
+    );
+    serde_json::json!({
+        "event": "git_conflict_detected",
+        "operation": operation,
+        "conflicted_files": conflicted_files,
+        "branch": branch,
+        "base": base,
+        "next_steps": next_steps,
+    })
 }
 
 #[cfg(test)]
@@ -202,8 +386,8 @@ mod tests {
         // git fixture.
         let now = chrono::Utc::now();
         let first_alert = now - chrono::Duration::minutes(40); // past stale gate
-        // Pretend an alert fired at `first_alert`. The dedup guard
-        // must suppress within REALERT_INTERVAL_SECS = 30 min.
+                                                               // Pretend an alert fired at `first_alert`. The dedup guard
+                                                               // must suppress within REALERT_INTERVAL_SECS = 30 min.
         let just_after_first = first_alert + chrono::Duration::minutes(5);
         assert!(
             !should_escalate_at(&tracker, "agent-a", first_alert, just_after_first),
@@ -277,30 +461,26 @@ mod tests {
     /// Pure dedup helper extracted for unit-testing the escalation
     /// timing without filesystem / network side effects. Returns
     /// true iff an escalation alert at `now` should fire given a
-    /// prior escalation at `last_at`.
-    ///
-    /// C1 RED stub returns false always; C2 GREEN implements the
-    /// stale + dedup gate.
+    /// prior escalation at `last_at`. The gate: `now - last_at >
+    /// REALERT_INTERVAL_SECS`.
     fn should_escalate_at(
         _tracker: &ConflictNotifyTracker,
         _name: &str,
-        _last_at: chrono::DateTime<chrono::Utc>,
-        _now: chrono::DateTime<chrono::Utc>,
+        last_at: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> bool {
-        false
+        now.signed_duration_since(last_at) > chrono::Duration::seconds(REALERT_INTERVAL_SECS)
     }
 
     /// Pure helper: drop the conflict tracker entry on resolution.
-    /// C1 RED stub is no-op; C2 GREEN implements the drop.
-    fn clear_on_resolution(_tracker: &mut ConflictNotifyTracker, _name: &str) {
-        // C1 RED: no-op, so test asserting drop fails.
+    fn clear_on_resolution(tracker: &mut ConflictNotifyTracker, name: &str) {
+        tracker.last_conflict_at.remove(name);
     }
 
-    /// Build a temp repo guaranteed to produce a `git rebase`
-    /// conflict on `file.txt`. Returns the repo path. The fixture is
-    /// pure-git (uses `Command::new("git")` with `AGEND_GIT_BYPASS=1`
-    /// + per-repo gitconfig), so it works in CI without operator
-    /// state.
+    /// Build a temp repo guaranteed to produce a `git rebase` conflict
+    /// on `file.txt`. Returns the repo path. Fixture is pure-git (uses
+    /// `Command::new("git")` with `AGEND_GIT_BYPASS=1` + per-repo
+    /// gitconfig), so it works in CI without operator state.
     fn setup_conflicted_repo(tag: &str) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!(
             "agend-phase-a-conflict-{}-{tag}",

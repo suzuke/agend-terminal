@@ -258,6 +258,15 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Esc to cancel · Tab to amend|Do you want to |allow all edits during this session|Allow once|Allow always|approve",
                 ),
+                // Phase A Piece-1: git rebase/merge/cherry-pick conflict
+                // output is identical regardless of which CLI invoked git,
+                // so the same regex installs in every backend's pattern
+                // list. The 5 alternations cover the canonical conflict
+                // markers `git` emits to stdout/stderr.
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+                ),
                 // [estimated] Ink render during processing
                 // [measured] Claude spinner uses random verbs (Cogitating,
                 // Bloviating, Transmuting, etc.) — not "Thinking". The
@@ -320,6 +329,11 @@ impl StatePatterns {
                 ),
                 // [docs] Trust-based permission system
                 (AgentState::PermissionPrompt, r"Allow this action|y/n/t"),
+                // Phase A Piece-1: git conflict output (backend-independent).
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+                ),
                 // [measured] Kiro 2.0.1 renders tool banners as
                 // `● Read .`, `● Write <path>`, etc. — `●` (U+25CF BLACK
                 // CIRCLE) + space + capitalized tool verb. Observed in
@@ -394,6 +408,11 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Would you like to run the following command\?|Yes, proceed|No, and tell Codex|Press enter to confirm or esc to cancel|Request approval|approve|deny",
                 ),
+                // Phase A Piece-1: git conflict output (backend-independent).
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+                ),
                 // [measured] Codex 0.120.0 renders tool-call blocks as a
                 // two-line region — a `•` title line (`• Explored`,
                 // `• Edited`, `• Ran`) followed by a `└` continuation
@@ -455,6 +474,11 @@ impl StatePatterns {
                 (
                     AgentState::PermissionPrompt,
                     r"Permission required|Allow once|Allow always",
+                ),
+                // Phase A Piece-1: git conflict output (backend-independent).
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
                 // [measured] OpenCode 1.4.0 prefixes tool banners with
                 // `✱` (U+2731 HEAVY ASTERISK, in-flight) or `→` (U+2192,
@@ -518,6 +542,11 @@ impl StatePatterns {
                 (
                     AgentState::PermissionPrompt,
                     r"Allow once|Allow for this session|suggest changes",
+                ),
+                // Phase A Piece-1: git conflict output (backend-independent).
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
                 // [measured] Gemini 0.38.2 renders completed tool calls as
                 // `✓  ReadFile  Cargo.toml` — `✓` (U+2713 CHECK MARK) + a

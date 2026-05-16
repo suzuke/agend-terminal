@@ -224,6 +224,12 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         crate::daemon::mcp_registry_watcher::McpRegistryWatcherTracker::default();
     let mut waiting_on_stale_tracker =
         crate::daemon::waiting_on_stale::WaitingOnStaleTracker::default();
+    // Phase A Piece-1+2: per-tick git conflict observation + 30min
+    // escalation. Sibling to waiting_on_stale (same TICKS_PER_SCAN
+    // cadence, same REALERT_INTERVAL_SECS dedup window). No new
+    // spawn site — supervisor's per-tick loop hosts the scan.
+    let mut conflict_notify_tracker =
+        crate::daemon::conflict_notify::ConflictNotifyTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -235,6 +241,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         helper_staleness_tracker.maybe_scan(&home);
         mcp_registry_tracker.maybe_scan(&home);
         waiting_on_stale_tracker.maybe_scan(&home);
+        conflict_notify_tracker.maybe_scan(&home, &registry);
         // #836: reclaim expired (10-min TTL) entries from the
         // notification-dedup ledger so memory pressure stays bounded
         // on long-lived daemons.
