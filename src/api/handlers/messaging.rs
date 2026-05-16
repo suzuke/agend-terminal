@@ -303,6 +303,32 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         }
     }
 
+    // #870: enqueue an auto-release intent when this message is a
+    // reviewer VERIFIED verdict. The predicate is intentionally tight
+    // (kind=report + text starts "VERIFIED" + reviewed_head present +
+    // correlation_id present) so REJECTED / UNVERIFIED / non-verdict
+    // reports never trigger auto-release. The hook fires post-enqueue
+    // so verdict delivery completes regardless of queue write failure.
+    if crate::daemon::auto_release::is_verdict_message(&msg) {
+        // correlation_id presence already validated by is_verdict_message.
+        if let Some(task_id) = msg.correlation_id.as_ref() {
+            let intent = crate::daemon::auto_release::AutoReleaseIntent {
+                task_id: task_id.clone(),
+                reviewer: from.to_string(),
+                verdict_msg_id: msg.id.clone(),
+                reviewed_head: msg.reviewed_head.clone(),
+                enqueued_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = crate::daemon::auto_release::enqueue_intent(ctx.home, &intent) {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "#870 auto_release: enqueue failed (verdict delivery unaffected)"
+                );
+            }
+        }
+    }
+
     let mut resp = json!({"ok": true, "delivery_mode": delivery_mode});
     if let Some(branch) = branch_checked_out {
         resp["branch_checked_out"] = json!(branch);

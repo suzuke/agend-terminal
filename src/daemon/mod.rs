@@ -2,6 +2,7 @@
 //! schedule checking, health monitoring, Telegram notifications.
 
 pub(crate) mod anti_stall;
+pub(crate) mod auto_release;
 pub(crate) mod canonical_drift;
 pub(crate) mod ci_watch;
 pub(crate) mod conflict_notify;

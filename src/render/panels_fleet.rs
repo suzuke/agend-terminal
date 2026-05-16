@@ -219,6 +219,7 @@ mod tests {
             branch: None,
             started_at: None,
             eta_secs: None,
+            auto_release_on_verdict: None,
         }];
         let all_instances = vec![
             "dev-lead".to_string(),

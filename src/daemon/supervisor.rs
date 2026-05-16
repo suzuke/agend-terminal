@@ -237,6 +237,12 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
     // daemons; reuses the boot-time canonical_hygiene helper.
     let mut canonical_drift_tracker =
         crate::daemon::canonical_drift::CanonicalDriftTracker::default();
+    // #870: per-tick auto-release scan. Sibling pattern; faster
+    // cadence (TICKS_PER_SCAN=3 ≈ 30s) than the 30-tick siblings
+    // because release latency directly gates the next-cycle lease-
+    // conflict surface this module exists to eliminate. No new spawn
+    // site — supervisor's per-tick loop hosts the scan.
+    let mut auto_release_tracker = crate::daemon::auto_release::AutoReleaseTracker::default();
     loop {
         thread::sleep(TICK);
         tick(&home, &registry, &mut notify_tracks);
@@ -250,6 +256,7 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
         waiting_on_stale_tracker.maybe_scan(&home);
         conflict_notify_tracker.maybe_scan(&home, &registry);
         canonical_drift_tracker.maybe_scan(&home);
+        auto_release_tracker.maybe_scan(&home);
         // #836: reclaim expired (10-min TTL) entries from the
         // notification-dedup ledger so memory pressure stays bounded
         // on long-lived daemons.

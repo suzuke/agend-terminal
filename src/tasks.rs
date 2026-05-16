@@ -50,6 +50,19 @@ pub struct Task {
     /// means "no stall detection for this task" — emit suppressed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eta_secs: Option<i64>,
+    /// #870 — per-task opt-out for the daemon's
+    /// `auto_release_on_verdict` flow. When `Some(false)`, the
+    /// supervisor's `AutoReleaseTracker` skips this task even if a
+    /// VERIFIED verdict has been enqueued (operator workflows that
+    /// chain follow-up PRs on the same branch can disable the
+    /// auto-release so the binding survives until they manually
+    /// release). `None` (default) and `Some(true)` both enable
+    /// auto-release. r0 NOTE: the operator-write surface (MCP /
+    /// TaskEvent::Created) is deferred to a follow-up PR; the field
+    /// reads correctly via `record_to_task` but cannot yet be set
+    /// through any production code path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_release_on_verdict: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -204,6 +217,11 @@ fn record_to_task(r: &crate::task_events::TaskRecord) -> Task {
         branch: r.branch.clone(),
         started_at: r.started_at.clone(),
         eta_secs: r.eta_secs,
+        // #870 — TaskRecord does not yet carry this field; r0 always
+        // returns `None` (= auto-release enabled). Future PR adds an
+        // event variant + record field if/when an operator-write
+        // surface lands.
+        auto_release_on_verdict: None,
     }
 }
 
@@ -1948,6 +1966,7 @@ mod tests {
             branch: None,
             started_at: None,
             eta_secs: None,
+            auto_release_on_verdict: None,
         }
     }
 
@@ -3469,6 +3488,7 @@ mod tests {
                     branch: None,
                     started_at: None,
                     eta_secs: None,
+                    auto_release_on_verdict: None,
                 });
             }
             Ok(())
@@ -3533,6 +3553,7 @@ mod tests {
                 branch: None,
                 started_at: None,
                 eta_secs: None,
+                auto_release_on_verdict: None,
             });
             Ok(())
         })
