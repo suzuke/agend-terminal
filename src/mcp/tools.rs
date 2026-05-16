@@ -169,7 +169,7 @@ fn task_tools() -> Vec<Value> {
             "pause": {"type": "boolean", "description": "Pause/resume the sweep tick"},
             "dry_run": {"type": "boolean", "description": "Log decisions without emitting events"}
         }}}),
-        json!({"name": "restart_daemon", "description": "Request graceful daemon restart. Daemon exits with code 42 after shutdown; wrapper script restarts it. Idempotent.",
+        json!({"name": "restart_daemon", "description": "Request graceful daemon restart. Daemon exits with code 42 after shutdown; a supervisor (launchd/systemd/Task Scheduler from `agend-terminal service install`, or `scripts/agend-wrapper.sh` for manual mode) respawns it. Returns ok:false when no supervisor is detected (bare `agend-terminal start`) — operator must install a supervisor before retry. Idempotent.",
             "inputSchema": {"type": "object", "properties": {}}}),
     ]
 }

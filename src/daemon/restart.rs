@@ -47,9 +47,20 @@
 /// closed) when no supervisor is detected — `restart_daemon` should
 /// then refuse the request rather than silently killing the daemon.
 ///
-/// C1 RED stub — C2 GREEN fills in the composite env-var check.
+/// Composite env-var check covering all four supervised invocation
+/// paths. See module doc for the rationale + Windows fail-closed
+/// note. Pure helper — no globals, no side effects, safe to call from
+/// any thread.
 pub fn is_restart_supervised() -> bool {
-    unimplemented!("is_restart_supervised — C1 RED stub, C2 GREEN fills in")
+    has_env("AGEND_WRAPPED") || has_env("XPC_SERVICE_NAME") || has_env("INVOCATION_ID")
+}
+
+/// Returns true iff env var `name` is set (any value, including
+/// empty string — presence is the signal). Distinct from
+/// `std::env::var(name).is_ok()` because we don't care about UTF-8
+/// validity for the indicator role.
+fn has_env(name: &str) -> bool {
+    std::env::var_os(name).is_some()
 }
 
 #[cfg(test)]
@@ -120,12 +131,16 @@ mod tests {
     /// recognize the explicit marker.
     #[test]
     fn detect_returns_true_when_agend_wrapped_set() {
-        with_env(&[("AGEND_WRAPPED", "1")], &["XPC_SERVICE_NAME", "INVOCATION_ID"], || {
-            assert!(
-                is_restart_supervised(),
-                "AGEND_WRAPPED=1 must be recognized as a supervisor signal"
-            );
-        });
+        with_env(
+            &[("AGEND_WRAPPED", "1")],
+            &["XPC_SERVICE_NAME", "INVOCATION_ID"],
+            || {
+                assert!(
+                    is_restart_supervised(),
+                    "AGEND_WRAPPED=1 must be recognized as a supervisor signal"
+                );
+            },
+        );
     }
 
     /// macOS launchd sets `XPC_SERVICE_NAME` for every service it

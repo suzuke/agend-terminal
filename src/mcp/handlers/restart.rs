@@ -2,10 +2,23 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 pub(super) fn handle_restart_daemon(home: &Path) -> Value {
+    // #851 fail-closed: refuse the request when no supervisor will
+    // respawn the daemon. Without this check, `restart_daemon` on a
+    // bare `agend-terminal start` invocation would set
+    // `RESTART_PENDING`, the daemon would exit(42) on the next
+    // supervisor tick, and operators would see
+    // `Resource temporarily unavailable (os error 35)` on every
+    // subsequent MCP call until they manually restart.
+    if !crate::daemon::restart::is_restart_supervised() {
+        return json!({
+            "ok": false,
+            "error": "restart_daemon requires a supervisor (launchd / systemd / scripts/agend-wrapper.sh / Task Scheduler). Detected: bare daemon invocation. Run `agend-terminal service install` to enable safe restart, or launch via `scripts/agend-wrapper.sh` for manual operation."
+        });
+    }
     crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
     std::fs::write(home.join("restart-requested"), "").ok();
     let _ = crate::api::call(home, &json!({"method": crate::api::method::SHUTDOWN}));
-    json!({"ok": true, "restart": "pending", "note": "daemon will exit(42) after graceful shutdown; wrapper script restarts"})
+    json!({"ok": true, "restart": "pending", "note": "daemon will exit(42) after graceful shutdown; supervisor restarts"})
 }
 
 #[cfg(test)]
