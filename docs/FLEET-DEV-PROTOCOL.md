@@ -149,6 +149,40 @@ Reviewers MUST inspect PRs from their own daemon-bound worktree. Specifically:
 
 Enforcement: L2 `agend-git` shim refuses `checkout -b` and `checkout <sha>` from agent callers when cwd=canonical (PR-B). L3 sweeper cleans the residue and auto-switches detached canonical HEAD back to main at daemon boot (PR-C).
 
+### 3.19.1 Agent Git Anti-Patterns
+
+§3.19 names what reviewers must not do. This section names two failure modes — both surfaced empirically by the #863 reviewer incident — and the correct recovery path. Apply to every agent, not only reviewers.
+
+**Anti-pattern 1 — `AGEND_GIT_BYPASS=1` to escape a shim deny.**
+
+When the `agend-git` shim denies an agent action, the deny is a protocol signal, not a transient error. Re-running the same command with `AGEND_GIT_BYPASS=1` is forbidden.
+
+- **WRONG**: shim denies → set `AGEND_GIT_BYPASS=1` → retry. The bypass succeeds at the git level but skips the protocol gate that the deny was enforcing; whatever the gate was protecting (canonical hygiene, lease invariants, reviewer workspace boundary) is now violated silently.
+- **RIGHT**: abort the operation. Send `kind=query` to lead/orchestrator naming the denied command + the shim's reason string, and ask for the correct routing.
+
+Reasoning:
+
+- `AGEND_GIT_BYPASS=1` exists for **daemon-internal helpers** (`canonical_hygiene`, `branch_sweep`, `conflict_notify`) that read worktree state from canonical-rooted paths and would otherwise self-deny. It is not an escape hatch for agents.
+- The bypass typically surfaces hidden state on top of the original problem. In the #863 incident, bypassing a checkout deny materialized a phantom `.gitignore` conflict that did not exist on the target branch, leaving the reviewer stuck on a fabricated merge conflict.
+- "Ask, don't bypass" is the universal recovery: a deny means the daemon owns the routing answer, and asking is cheap.
+
+**Anti-pattern 2 — `git checkout <sha>` to materialize a PR review.**
+
+Even in the agent's own daemon-bound worktree, `git checkout <sha>` is the wrong primitive for PR review:
+
+- Leaves detached-HEAD residue — the class of pollution that #852 (canonical hygiene) and #858 (shim deny matrix) exist to prevent.
+- Conflicts with the daemon's branch lease on the worktree, producing later "branch already leased" errors that look unrelated.
+- Bypasses §3.19's shim-enforced workspace boundary even when run from a non-canonical cwd, because the shim's lease/lifecycle invariants assume branch-rooted HEADs.
+
+Right path, by inspection depth:
+
+- **Full tree** (`cargo test` replay, runtime validation, multi-file inspection): `repo action=checkout source=<canonical> branch=<PR-branch> bind=true`. The daemon provisions a fresh worktree at the named branch, binds it to the caller, and `release_worktree` returns cleanly with no residue.
+- **Read-only** (diff inspection, file listing): `gh pr diff <N>` or `gh pr view <N> --json files`. No working-tree mutation at all.
+
+If `repo action=checkout` fails (lease already held, branch unknown, worktree quota exhausted) → **ask, don't bypass**. Send `kind=query` to lead with the failure mode; lead routes via `force_release_worktree` or alternate provisioning. Falling back to `git checkout <sha>` after a `repo` failure recreates the exact class of pollution this section forbids.
+
+**Relationship to §3.19.** §3.19 says *what reviewers must not do in canonical*. §3.19.1 says *what every agent must do when the protocol gate fires* — abort and ask, not bypass and retry.
+
 ## §4. Daemon Enforcement Gates
 
 ### 4.1 Push-time Semantic Gate (Sprint 44)
