@@ -13,6 +13,7 @@
 //!   The current process is a client and should not touch run dir ownership.
 
 mod agent_resolve;
+pub(crate) mod canonical_hygiene;
 pub mod daemon_spawn;
 pub(crate) mod doctor;
 pub(crate) mod doctor_topics;

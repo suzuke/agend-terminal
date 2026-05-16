@@ -63,20 +63,32 @@ pub(crate) struct Categories {
     pub squash_merged: Vec<Candidate>,
     pub stale_idle: Vec<Candidate>,
     pub active_unknown: Vec<Candidate>,
+    /// #852 PR-C: reviewer-checkout residue. Naming patterns
+    /// `tmp.*` / `pr\d+_head` / `review/.*` that historically
+    /// accumulated when reviewer agents `cd canonical && git
+    /// checkout <sha>` (the bug PR-A documented and PR-B
+    /// enforced at the shim). These branches have no legitimate
+    /// purpose and land in the default delete list — but the
+    /// daemon boot sweep is dry-run-only for r0 so operator can
+    /// validate the regex against their real residue before any
+    /// destructive action.
+    pub reviewer_checkout: Vec<Candidate>,
 }
 
 #[allow(dead_code)]
 impl Categories {
     /// Concatenated sorted list of all candidate branch names across
-    /// the 3 deletable buckets (clean_merged + squash_merged +
-    /// stale_idle). `active_unknown` is NOT in this default list —
-    /// the operator must explicitly pick those IDs by their bucket.
+    /// the deletable buckets (clean_merged + squash_merged +
+    /// stale_idle + #852 PR-C reviewer_checkout). `active_unknown` is
+    /// NOT in this default list — the operator must explicitly pick
+    /// those IDs by their bucket.
     pub fn deletable_ids(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .clean_merged
             .iter()
             .chain(self.squash_merged.iter())
             .chain(self.stale_idle.iter())
+            .chain(self.reviewer_checkout.iter())
             .map(|c| c.name.clone())
             .collect();
         v.sort();
@@ -94,6 +106,7 @@ impl Categories {
             .iter()
             .chain(self.squash_merged.iter())
             .chain(self.stale_idle.iter())
+            .chain(self.reviewer_checkout.iter())
             .chain(self.active_unknown.iter())
             .map(|c| c.name.clone())
             .collect();
@@ -205,6 +218,20 @@ fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
 /// flaky around day boundaries. Dead-code allow lifts at C3 when
 /// the MCP handler wires the call site.
 #[allow(dead_code)]
+/// #852 PR-C: classify reviewer-checkout residue by name. Pattern
+/// covers the three observed pollution shapes:
+/// - `tmp.*` — operator's `tmp_pr_review` / `tmp/abc1234` style
+/// - `pr\d+_head` — `gh pr fetch`-style `pr123_head` refs
+/// - `review/.*` — explicit `review/<n>` namespace
+///
+/// First-match wins. Conservative — empty / `main` / `master` /
+/// genuine branch prefixes never match. C1 RED stub returns false
+/// unconditionally; C2 GREEN wires the regex.
+pub(crate) fn is_reviewer_checkout(name: &str) -> bool {
+    let _ = name;
+    false
+}
+
 pub(crate) fn scan(
     repo: &Path,
     base: &str,
@@ -215,6 +242,19 @@ pub(crate) fn scan(
     let mut cats = Categories::default();
     for b in &branches {
         if b.name == base {
+            continue;
+        }
+        // 0. reviewer_checkout (#852 PR-C) — naming-pattern residue.
+        // Checked FIRST so reviewer-pollution branches that happen to
+        // also satisfy clean_merged / squash_merged conditions still
+        // surface in the dedicated bucket (operator can audit them
+        // separately from the regular merge-based categories).
+        if is_reviewer_checkout(&b.name) {
+            cats.reviewer_checkout.push(Candidate {
+                name: b.name.clone(),
+                tip_sha: b.tip_sha.clone(),
+                reason: "reviewer-checkout residue (tmp.* / pr*_head / review/*)".to_string(),
+            });
             continue;
         }
         // 1. clean_merged — reachable from base via merge commit.
@@ -351,6 +391,94 @@ pub(crate) fn emit_delete_batch(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // ── #852 PR-C — reviewer_checkout pattern unit tests ──────────────
+
+    /// `tmp_pr_review` / `tmp/abc1234` / `tmp-merge` — the operator-
+    /// created scratch branches that show up after `cd canonical &&
+    /// git checkout -b tmp_<...>`. Must classify as reviewer_checkout.
+    #[test]
+    fn reviewer_checkout_pattern_matches_tmp_prefix() {
+        assert!(
+            is_reviewer_checkout("tmp_pr_review"),
+            "`tmp_pr_review` must match"
+        );
+        assert!(
+            is_reviewer_checkout("tmp/abc1234"),
+            "`tmp/abc1234` must match (slash-separated tmp branch)"
+        );
+        assert!(
+            is_reviewer_checkout("tmp-merge"),
+            "`tmp-merge` must match (hyphen variant)"
+        );
+        assert!(is_reviewer_checkout("tmp"), "bare `tmp` must match");
+    }
+
+    /// `pr<N>_head` — the `gh pr fetch` / manual `git fetch origin
+    /// refs/pull/<N>/head:pr<N>_head` style. Common operator-typed
+    /// pattern when inspecting a PR locally. Must classify as
+    /// reviewer_checkout.
+    #[test]
+    fn reviewer_checkout_pattern_matches_pr_head_suffix() {
+        assert!(
+            is_reviewer_checkout("pr123_head"),
+            "`pr123_head` must match"
+        );
+        assert!(
+            is_reviewer_checkout("pr850_head"),
+            "`pr850_head` must match (real example from operator's report)"
+        );
+        assert!(
+            is_reviewer_checkout("pr1_head"),
+            "single-digit pr1_head must match"
+        );
+    }
+
+    /// `review/.*` — explicit `review/<n>` namespace. Some workflows
+    /// adopt this prefix for inspection refs.
+    #[test]
+    fn reviewer_checkout_pattern_matches_review_prefix() {
+        assert!(
+            is_reviewer_checkout("review/123"),
+            "`review/123` must match"
+        );
+        assert!(
+            is_reviewer_checkout("review/feat-x"),
+            "`review/feat-x` must match"
+        );
+    }
+
+    /// **CRITICAL** negative: legitimate working branch names must NOT
+    /// match. The pattern is narrow by design — only the three
+    /// observed pollution shapes. A false-positive here would have
+    /// the boot sweeper auto-deleting legitimate work.
+    #[test]
+    fn reviewer_checkout_pattern_does_not_match_main_or_fix_branches() {
+        assert!(!is_reviewer_checkout("main"), "main must NOT match");
+        assert!(!is_reviewer_checkout("master"), "master must NOT match");
+        assert!(
+            !is_reviewer_checkout("fix/123-real-work"),
+            "fix/.* (legitimate fix branch) must NOT match"
+        );
+        assert!(
+            !is_reviewer_checkout("feat/some-feature"),
+            "feat/.* must NOT match"
+        );
+        assert!(
+            !is_reviewer_checkout("temporary-work"),
+            "`temporary-work` must NOT match — only `tmp.*` (3-letter \
+             prefix) qualifies, not arbitrary 'temp' variants"
+        );
+        assert!(
+            !is_reviewer_checkout("pr-merge-queue"),
+            "`pr-merge-queue` must NOT match — pattern requires \
+             `pr\\d+_head` shape specifically"
+        );
+        assert!(
+            !is_reviewer_checkout(""),
+            "empty string must NOT match (defensive)"
+        );
+    }
 
     /// Spawn a temp git repo scoped to `tag`. The repo has an initial
     /// commit on `main` + pinned per-repo gitconfig (`user.name`/
