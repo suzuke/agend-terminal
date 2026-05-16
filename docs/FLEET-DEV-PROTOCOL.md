@@ -332,6 +332,35 @@ Cross-platform test failures observed multiple times in 2026-05-13/14 sessions. 
 - **PTY EOF semantics**: never assume EOF behavior matches across cmd.exe/bash/ConPTY. Shell-backend tests need `#[cfg_attr(windows, ignore = "tracking #N")]` if EOF semantic divergence is the bug not the SUT.
 - **Path mangling**: sanitize both `/` (Unix path) AND `\` + `:` (Windows drive letter) when constructing worktree paths from source paths.
 
+### 7.3 Wedged-Run Recovery
+
+When a CI workflow run **wedges** — a job stays `in_progress` past 2× typical platform completion time and `gh run cancel <run-id>` returns success but the job status doesn't transition — push an **empty commit** to the PR branch to trigger a fresh workflow run. This is a sanctioned recovery technique, not a workaround.
+
+```
+repo action=checkout source=<canonical> branch=<PR-branch> bind=true
+cd <bound-worktree>
+git commit --allow-empty -m "ci: nudge wedged runner (PR #N wedged Nhr)"
+git push origin <PR-branch>
+```
+
+The fresh CI run fires on the new HEAD; the old wedged run becomes irrelevant (it eventually GH-Actions-times-out at 6 hours without affecting merge). Reviewer's prior VERIFIED verdict still applies — the SHA advance is byte-identical content, so `reviewed_head` SHA-staleness gate (§4.2) accepts a re-stamp once CI completes; merge gates on the fresh CI result.
+
+**When to apply** — all three conditions must hold:
+
+- CI job in_progress for >2× typical platform completion time (e.g. macOS jobs typically finish ~10–15 min; >30 min is wedge territory).
+- `gh run cancel <run-id>` reports success but the wedged job's status doesn't change within ~2 minutes.
+- Other platforms' jobs already completed (proves the issue is platform-specific, not a workflow / coordinator regression).
+
+**What this is NOT**:
+
+- **NOT force-push.** The empty commit advances HEAD via fast-forward; branch history is preserved. Squash-merge folds the nudge commit + the real work into the single PR commit on main, so the nudge leaves no trace in the merged history.
+- **NOT a workaround for legitimate test failures.** A failing test means a real bug. The nudge only addresses runners that genuinely wedged with no progress — same configuration that was working minutes ago would re-pass on a fresh runner.
+- **NOT for "tests are slow".** Slow-but-progressing CI is a different problem (cache miss, fixture cost). Wait for normal completion; if the slowness is systemic, file a separate issue.
+
+**Empirical motivation**: PR #863 (#852 residual PR-A) hit a `windows-latest` wedge on 2026-05-16. The job stayed `in_progress` for 9+ hours starting at 15:19 UTC; `gh run cancel` was accepted but the job never transitioned. Empty-commit nudge dispatched at 16:14 UTC → fresh CI fired → green within ~10 min → merge proceeded. Operator-authorized, ~5 min total recovery vs. the alternative (wait 6 hours for GH-Actions timeout + manual re-trigger).
+
+This recovery technique parallels [§3.19.1](#3191-agent-git-anti-patterns)'s framing for protocol-gate recovery: a deny / wedge is a signal, not a transient error. Document the sanctioned response so future operators don't reach for force-push or `gh run rerun --failed` (which re-runs the same wedged platform on the same SHA, often re-wedging on the same runner-pool resource).
+
 ## §8. Progress Visibility
 
 Task state changes emit to Telegram. Instance lifecycle events (non-fleet.yaml origin) broadcast with `origin` field. `create_instance` defaults to isolated workspace (`~/.agend-terminal/workspace/<name>`).
