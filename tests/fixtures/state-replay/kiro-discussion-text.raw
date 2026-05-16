@@ -1,0 +1,3 @@
+[2J[H[0mDebugging kiro classifier patterns. Test prose with rate_limit / rate-limit / rate limit substrings in a non-error context. The OLD Kiro pattern was already specific to canonical AWS tokens; PR-B adds more AWS-specific alternations to catch additional error classes. Discussion prose should NOT trigger the classifier.
+
+> 

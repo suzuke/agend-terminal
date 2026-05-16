@@ -270,16 +270,25 @@ impl StatePatterns {
                     AgentState::AuthError,
                     r"Not authenticated|AccessDenied|denied access",
                 ),
-                // [docs] AWS quota errors
+                // #848 PR-B: extend AWS quota errors with the casual
+                // `you have reached the limit` wording observed in Kiro #5876.
+                // Additive — existing `ServiceQuotaExceeded` /
+                // `InsufficientModelCapacity` alternations preserved.
                 (
                     AgentState::UsageLimit,
-                    r"ServiceQuotaExceeded|InsufficientModelCapacity",
+                    r"ServiceQuotaExceeded|InsufficientModelCapacity|you have reached the limit",
                 ),
                 // [docs] HTTP 429 handling
                 // Sprint 31+ #4: word-boundary `429` per Claude pattern.
+                // #848 PR-B: add AWS Bedrock `ThrottlingException` and
+                // generic `Rate exceeded` wording. Additive — Kiro's
+                // pre-#848 pattern was already specific (no broad-substring
+                // false-positive class to fix), so this commit only widens
+                // coverage to more error wordings without reintroducing
+                // the pre-#848 broadness seen on Claude/Codex/OpenCode.
                 (
                     AgentState::RateLimit,
-                    r"Too Many Requests|ThrottlingError|\b429\b",
+                    r"Too Many Requests|ThrottlingError|ThrottlingException|Rate exceeded|\b429\b",
                 ),
                 // [docs] Context overflow triggers compaction
                 // `/compact` was previously included but matches the slash-
@@ -394,9 +403,28 @@ impl StatePatterns {
             ],
             // OpenCode v1.4.0
             Backend::OpenCode => vec![
-                // [docs] HTTP error handling
-                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
-                (AgentState::RateLimit, r"rate.?limit|\b429\b"),
+                // #848 PR-B: narrow OpenCode RateLimit to specific
+                // sst→anomalyco fork CLI wordings. The pre-#848 pattern
+                // `r"rate.?limit|\b429\b"` matched bare `rate_limit` /
+                // `rate-limit` / `rate limit` substrings anywhere — same
+                // false-positive class as Claude/Codex pre-PR-A. New
+                // pattern keys on:
+                // - `API rate limited (429)` — observed in sst#8203 / #3525
+                // - `Rate limited. Quick retry` — observed in sst#9091
+                // - `API rate limit exceeded` — observed in sst#1491
+                // The bare `\b429\b` token is dropped; real 429s carry
+                // the wrapping `API rate limited (429)` wording which
+                // still matches the first alternation.
+                (
+                    AgentState::RateLimit,
+                    r"API rate limited \(429\)|Rate limited\. Quick retry|API rate limit exceeded",
+                ),
+                // #848 PR-B: NEW OpenCode UsageLimit pattern (pre-#848
+                // OpenCode had no UsageLimit pattern at all, so
+                // subscription-quota strings fell through to whatever
+                // broader pattern matched — frequently RateLimit via
+                // the `rate.?limit` substring).
+                (AgentState::UsageLimit, r"Quota Limit Exceeded"),
                 // [measured] Provider-side validation errors (e.g. MiniMax
                 // M2.5 rejecting eager_input_streaming in tool spec).
                 (
@@ -448,9 +476,24 @@ impl StatePatterns {
                     AgentState::UsageLimit,
                     r"Usage limit reached|Access resets at",
                 ),
-                // [docs] API resource exhaustion
-                // Sprint 31+ #4: word-boundary `429` per Claude pattern.
-                (AgentState::RateLimit, r"RESOURCE_EXHAUSTED|\b429\b"),
+                // #848 PR-B: narrow Gemini RateLimit to specific
+                // google-gemini/gemini-cli verbatim wordings (issues
+                // #10722/#8437/#22545/#2305/#1502). The pre-#848 pattern
+                // `r"RESOURCE_EXHAUSTED|\b429\b"` matched bare `429`
+                // tokens anywhere — the same false-positive class as
+                // Claude/Codex pre-PR-A (any prose discussing HTTP 429
+                // status codes triggered RateLimit). New pattern keys
+                // on full HTTP-context wording — `429 RESOURCE_EXHAUSTED`,
+                // `rateLimitExceeded` (gRPC error code field),
+                // `got status: 429`, `429 Too Many Requests`, and
+                // `rate limit exceeded` (CLI casual wording). The bare
+                // `\b429\b` token is dropped; the wrapping context in
+                // the new alternations is what distinguishes a real
+                // 429 from discussion prose.
+                (
+                    AgentState::RateLimit,
+                    r"429 RESOURCE_EXHAUSTED|rateLimitExceeded|got status: 429|429 Too Many Requests|rate limit exceeded",
+                ),
                 // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),
                 // [docs] Permission select options
@@ -3262,6 +3305,143 @@ mod tests {
             AgentState::RateLimit,
             "Codex discussion prose containing rate_limit / rate-limit substrings \
              must NOT trigger RateLimit (same false-positive class as Claude pre-#848)"
+        );
+    }
+
+    // ── #848 PR-B — OpenCode + Gemini + Kiro classifier unit tests ───
+    //
+    // Mirror of PR-A's pattern: per backend, fixture-based positive
+    // assertions for the new alternations + a `<backend>_discussion_
+    // text_does_not_trigger_rate_limit` regression-proof negative. The
+    // full fixture replay through VTerm + StateTracker is covered by
+    // `replay_manifest_regression` (which reads MANIFEST.yaml); the
+    // tests below provide focused per-pattern signal on top of that.
+
+    /// OpenCode: the canonical 429-rejection wording from sst→anomalyco
+    /// fork issues must classify as RateLimit under the new narrowed
+    /// pattern.
+    #[test]
+    fn opencode_rate_limit_typical_fixture_triggers_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/opencode-rate-limit-typical.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::OpenCode, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::RateLimit);
+    }
+
+    /// OpenCode: the `Quota Limit Exceeded` wording classifies as
+    /// UsageLimit (NEW pattern — pre-#848 OpenCode had no UsageLimit at
+    /// all, so this fell through).
+    #[test]
+    fn opencode_usage_limit_typical_fixture_triggers_usage_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/opencode-usage-limit-typical.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::OpenCode, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::UsageLimit);
+    }
+
+    /// OpenCode: regression-proof for the false-positive class — the
+    /// OLD `r"rate.?limit|\b429\b"` pattern matched bare `rate_limit` /
+    /// `rate-limit` / `rate limit` substrings in prose. Post-#848 the
+    /// narrowed pattern requires specific OpenCode-CLI wording.
+    #[test]
+    fn opencode_discussion_text_does_not_trigger_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/opencode-discussion-text.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::OpenCode, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "OpenCode discussion prose containing rate_limit / rate-limit \
+             substrings must NOT trigger RateLimit (same false-positive \
+             class as Claude/Codex pre-#848)"
+        );
+    }
+
+    /// Gemini: the canonical 429 / RESOURCE_EXHAUSTED / rateLimitExceeded
+    /// wordings from google-gemini/gemini-cli issues classify as
+    /// RateLimit under the new narrowed pattern.
+    #[test]
+    fn gemini_rate_limit_typical_fixture_triggers_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/gemini-rate-limit-typical.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::Gemini, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::RateLimit);
+    }
+
+    /// Gemini: regression-proof for the false-positive class — the OLD
+    /// `r"RESOURCE_EXHAUSTED|\b429\b"` matched bare `429` token in prose
+    /// (any discussion of HTTP 429 status codes). Post-#848 the narrowed
+    /// pattern requires full HTTP-context wording (`429 RESOURCE_EXHAUSTED`,
+    /// `got status: 429`, `429 Too Many Requests`, etc.).
+    #[test]
+    fn gemini_discussion_text_does_not_trigger_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/gemini-discussion-text.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::Gemini, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "Gemini discussion prose with bare 429 must NOT trigger RateLimit \
+             (post-#848 the bare `\\b429\\b` token is removed from the \
+             RateLimit pattern; only full HTTP-context wording triggers)"
+        );
+    }
+
+    /// Kiro: the AWS Bedrock `ThrottlingException: Rate exceeded` wording
+    /// classifies as RateLimit under the new ADDITION to the existing
+    /// alternation (Kiro pattern is additive, not replace).
+    #[test]
+    fn kiro_rate_limit_typical_fixture_triggers_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/kiro-rate-limit-typical.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::KiroCli, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::RateLimit);
+    }
+
+    /// Kiro: the casual `you have reached the limit` wording from #5876
+    /// classifies as UsageLimit under the new ADDITION to the existing
+    /// `ServiceQuotaExceeded|InsufficientModelCapacity` alternation.
+    #[test]
+    fn kiro_usage_limit_typical_fixture_triggers_usage_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/kiro-usage-limit-typical.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::KiroCli, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_eq!(t.get_state(), AgentState::UsageLimit);
+    }
+
+    /// Kiro: regression-proof — Kiro's pre-#848 pattern was already
+    /// specific (no false-positive on rate-limit prose). PR-B adds more
+    /// alternations; this test pins that the ADDITIONS do NOT
+    /// reintroduce broad-substring matching. Passes at both C1 RED and
+    /// C2 GREEN — its purpose is locking the contract for future Kiro
+    /// pattern changes.
+    #[test]
+    fn kiro_discussion_text_does_not_trigger_rate_limit() {
+        let bytes = std::fs::read("tests/fixtures/state-replay/kiro-discussion-text.raw")
+            .expect("read fixture");
+        let text = String::from_utf8_lossy(&bytes);
+        let mut t = tracker_at(&Backend::KiroCli, AgentState::Idle, 0);
+        t.feed(&text);
+        assert_ne!(
+            t.get_state(),
+            AgentState::RateLimit,
+            "Kiro discussion prose with rate_limit / rate-limit substrings \
+             must NOT trigger RateLimit (pre-#848 Kiro pattern was already \
+             specific; PR-B's additions must preserve this property)"
         );
     }
 }
