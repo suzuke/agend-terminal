@@ -5,10 +5,11 @@
 # #851: AGEND_WRAPPED=1 is the explicit supervisor-marker the daemon's
 # `is_restart_supervised()` check looks for. Without it, the MCP
 # `restart_daemon` tool fail-closes — the daemon refuses to exit(42)
-# because nothing would respawn it. Exporting the marker here is the
-# wrapper-side half of the contract.
-export AGEND_WRAPPED=1
+# because nothing would respawn it. Exporting the marker immediately
+# before each daemon invocation matches the dispatch literal — the
+# child process inherits it via the standard env propagation.
 while true; do
+    export AGEND_WRAPPED=1
     agend-terminal daemon "$@"
     EXIT_CODE=$?
     if [ $EXIT_CODE -ne 42 ]; then
