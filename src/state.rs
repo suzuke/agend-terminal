@@ -44,6 +44,17 @@ pub enum AgentState {
     /// authorization flows take precedence when both match.
     InteractivePrompt,
     PermissionPrompt,
+    /// Phase A Piece-1: git rebase/merge/cherry-pick produced a
+    /// conflict that blocks further work until the agent resolves it
+    /// (or the operator intervenes). Distinct from `PermissionPrompt`
+    /// because the resolution path is Read/Edit/Bash inside the
+    /// worktree, not a yes/no dialog. The daemon's
+    /// `conflict_notify` module observes the transition into this
+    /// state and emits a structured kind=update message to the bound
+    /// agent (op type + conflicted file paths + branch + base +
+    /// next_steps hint), plus a 30min escalation to operator if the
+    /// state persists.
+    GitConflict,
     ContextFull,
     RateLimit,
     /// Anthropic server-side temporary throttle — distinct from user usage
@@ -83,6 +94,12 @@ impl AgentState {
             Self::Thinking => 6,
             Self::InteractivePrompt => 7,
             Self::PermissionPrompt => 8,
+            // Phase A Piece-1: GitConflict shares priority 8 with
+            // PermissionPrompt — both block work and require external
+            // intervention (agent action for the conflict; operator
+            // for the permission). Priority is for display ordering;
+            // first-match wins in `detect()` is the actual gate.
+            Self::GitConflict => 8,
             Self::ContextFull => 9,
             Self::RateLimit => 10,
             Self::ServerRateLimit => 10,
@@ -123,6 +140,7 @@ impl AgentState {
             Self::Thinking => "thinking",
             Self::InteractivePrompt => "interactive_prompt",
             Self::PermissionPrompt => "permission",
+            Self::GitConflict => "git_conflict",
             Self::ContextFull => "context_full",
             Self::RateLimit => "rate_limit",
             Self::ServerRateLimit => "server_rate_limit",
@@ -2568,6 +2586,7 @@ mod tests {
             "thinking" => AgentState::Thinking,
             "interactive_prompt" => AgentState::InteractivePrompt,
             "permission" => AgentState::PermissionPrompt,
+            "git_conflict" => AgentState::GitConflict,
             "context_full" => AgentState::ContextFull,
             "rate_limit" => AgentState::RateLimit,
             "server_rate_limit" => AgentState::ServerRateLimit,

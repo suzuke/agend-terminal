@@ -3,6 +3,7 @@
 
 pub(crate) mod anti_stall;
 pub(crate) mod ci_watch;
+pub(crate) mod conflict_notify;
 pub(crate) mod cron_tick;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;

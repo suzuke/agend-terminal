@@ -37,6 +37,11 @@ pub fn state_color(state: AgentState) -> Color {
         AgentState::ToolUse => Color::Blue,
         AgentState::InteractivePrompt => Color::Indexed(214),
         AgentState::PermissionPrompt => Color::Magenta,
+        // Phase A Piece-1: GitConflict shares the magenta band with
+        // PermissionPrompt — both are work-blocked states needing
+        // external intervention, surfaced together in the TUI status
+        // band.
+        AgentState::GitConflict => Color::Magenta,
         AgentState::ContextFull | AgentState::RateLimit | AgentState::ServerRateLimit => {
             Color::Indexed(208)
         }
