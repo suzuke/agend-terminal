@@ -534,6 +534,22 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// #868 — spin-wait helper used by the in-progress / over-cap
+    /// coordination tests below. Replaces the old `thread::sleep(50ms)`
+    /// gating which flaked on slow macOS GH-runners (#856 + #866 + #867).
+    /// Observes the production `cache.inner` state directly — no
+    /// production code changes, no test hook injection. Panics with a
+    /// clear deadline message if the predicate never holds.
+    fn wait_until<F: FnMut() -> bool>(deadline: Duration, mut predicate: F) {
+        let started = Instant::now();
+        while !predicate() {
+            if started.elapsed() > deadline {
+                panic!("#868 wait_until: predicate did not hold within {deadline:?}");
+            }
+            thread::yield_now();
+        }
+    }
+
     /// (a) Same request_id submitted twice — handler must execute exactly
     /// once; the second caller must observe the first call's cached response.
     #[test]
@@ -602,8 +618,17 @@ mod tests {
             })
         });
 
-        // Give T1 enough head-start to install the InProgress entry.
-        thread::sleep(Duration::from_millis(50));
+        // #868 hardening — wait for T1 to install the InProgress entry
+        // by observing `cache.inner` directly instead of betting on
+        // 50ms scheduler latency. Mirror the over-cap test's pattern.
+        wait_until(Duration::from_secs(2), || {
+            cache
+                .inner
+                .lock()
+                .expect("inner mutex")
+                .entries
+                .contains_key("req-C")
+        });
 
         let c2 = Arc::clone(&cache);
         let cnt2 = Arc::clone(&count);
@@ -756,7 +781,9 @@ mod tests {
             2,
         ));
 
-        // T1 holds the entry InProgress for a while.
+        // T1 holds the entry InProgress for a while. The handler's
+        // 300ms sleep is intentional substantive work — it represents
+        // T1 holding InProgress while T4 dispatches, NOT coordination.
         let c = Arc::clone(&cache);
         let t1 = thread::spawn(move || {
             c.dispatch(Some("req-cap"), Duration::from_secs(5), || {
@@ -764,7 +791,17 @@ mod tests {
                 json!({"first": true})
             })
         });
-        thread::sleep(Duration::from_millis(50));
+        // #868 hardening — wait for T1 to install the InProgress entry
+        // by observing `cache.inner` directly. Old `thread::sleep(50ms)`
+        // flaked on slow macOS GH-runners (#856, #866, #867).
+        wait_until(Duration::from_secs(2), || {
+            cache
+                .inner
+                .lock()
+                .expect("inner mutex")
+                .entries
+                .contains_key("req-cap")
+        });
 
         // T2 + T3 fill the waiter slots.
         let c2 = Arc::clone(&cache);
@@ -775,7 +812,21 @@ mod tests {
         let t3 = thread::spawn(move || {
             c3.dispatch(Some("req-cap"), Duration::from_secs(5), || json!({}))
         });
-        thread::sleep(Duration::from_millis(50));
+        // #868 hardening — wait for T2 + T3 to attach as waiters
+        // (increment `waiter_count` to the cap) before dispatching T4.
+        // Old `thread::sleep(50ms)` flaked on slow macOS GH-runners;
+        // T4 would otherwise become a 3rd waiter and block 5s on the
+        // Condvar instead of fast-failing with `OverCap`.
+        wait_until(Duration::from_secs(2), || {
+            cache
+                .inner
+                .lock()
+                .expect("inner mutex")
+                .entries
+                .get("req-cap")
+                .map(|e| e.waiter_count >= 2)
+                .unwrap_or(false)
+        });
 
         // T4 — over cap — should fail fast.
         let started = Instant::now();
