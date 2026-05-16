@@ -339,11 +339,9 @@ pub(crate) fn update_track_for_state(
     } else {
         // Agent left Ready/Idle (responding to nudge, operator typed, …).
         // Reset the recovery-window anchor only; the `fired_this_cycle`
-        // latch persists until a new transient error opens the next cycle.
+        // latch persists until a new transient error opens the next cycle
+        // (the `is_transient_error()` branch above is the sole reset point).
         track.recovered_at = None;
-        // C1 RED: keep the regression here so the new test reproduces.
-        // C2 GREEN removes this line.
-        track.fired_this_cycle = false;
     }
 }
 
