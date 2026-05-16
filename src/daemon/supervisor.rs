@@ -218,15 +218,23 @@ pub(crate) enum NudgeDecision {
 /// On `Ok`: look up the per-instance override; fall back to
 /// `default_cfg` when the instance isn't in fleet.yaml OR the instance
 /// entry omits the `rate_limit_recovery` field.
-///
-/// C3 RED stub — C4 GREEN fills in.
 pub(crate) fn resolve_recovery_config(
     fleet: Result<&crate::fleet::FleetConfig, ()>,
     name: &str,
     default_cfg: &crate::fleet::RateLimitRecoveryConfig,
 ) -> crate::fleet::RateLimitRecoveryConfig {
-    let _ = (fleet, name, default_cfg);
-    unimplemented!("resolve_recovery_config — C3 RED stub, C4 GREEN fills in")
+    let Ok(fleet) = fleet else {
+        return crate::fleet::RateLimitRecoveryConfig {
+            enabled: false,
+            ..default_cfg.clone()
+        };
+    };
+    fleet
+        .instances
+        .get(name)
+        .and_then(|i| i.rate_limit_recovery.as_ref())
+        .cloned()
+        .unwrap_or_else(|| default_cfg.clone())
 }
 
 /// Pure helper: classify the recovery-nudge tick against the track,
@@ -352,7 +360,21 @@ pub(crate) fn process_rate_limit_recovery_nudges(
     // Registry lock released here.
 
     // Phase 2: fleet.yaml read + per-agent decision + fire (no locks held).
-    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
+    //
+    // r1 fail-closed fix: load failure (parse error / missing file)
+    // funnels through `resolve_recovery_config` with `Err(())`, which
+    // returns a config carrying `enabled = false` — preventing silent
+    // auto-inject when fleet.yaml is mid-edit or corrupted. The warn
+    // log surfaces *why* the nudge stopped firing so the operator can
+    // diagnose without staring at empty-prompt agents.
+    let fleet_result = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home));
+    if let Err(e) = &fleet_result {
+        tracing::warn!(
+            error = %e,
+            "#841 fleet.yaml load failed — rate-limit recovery nudges disabled until fixed (fail-closed)"
+        );
+    }
+    let fleet_ref: Result<&crate::fleet::FleetConfig, ()> = fleet_result.as_ref().map_err(|_| ());
     let default_cfg = crate::fleet::RateLimitRecoveryConfig::default();
 
     for (name, state) in &observed {
@@ -361,12 +383,7 @@ pub(crate) fn process_rate_limit_recovery_nudges(
         let track_snapshot = nudge_tracks.get(name).cloned().unwrap_or_default();
         let fast_active = fast_retry_tracks.contains_key(name);
 
-        let cfg = fleet
-            .as_ref()
-            .and_then(|f| f.instances.get(name))
-            .and_then(|i| i.rate_limit_recovery.as_ref())
-            .cloned()
-            .unwrap_or_else(|| default_cfg.clone());
+        let cfg = resolve_recovery_config(fleet_ref, name, &default_cfg);
 
         if matches!(
             decide_nudge(&track_snapshot, *state, fast_active, &cfg, now),
@@ -1580,7 +1597,10 @@ mod tests {
         // Other knobs preserved so an operator who later restores the
         // config doesn't get a surprise mismatch in window sizes.
         assert_eq!(resolved.observe_after_secs, default_cfg.observe_after_secs);
-        assert_eq!(resolved.recovery_after_secs, default_cfg.recovery_after_secs);
+        assert_eq!(
+            resolved.recovery_after_secs,
+            default_cfg.recovery_after_secs
+        );
         assert_eq!(resolved.cooldown_secs, default_cfg.cooldown_secs);
         assert_eq!(resolved.prompt, default_cfg.prompt);
     }
@@ -1624,7 +1644,8 @@ mod tests {
     fn resolve_recovery_config_falls_back_to_default_when_instance_absent() {
         let fleet = crate::fleet::FleetConfig::default();
         let default_cfg = RateLimitRecoveryConfig::default();
-        let resolved = resolve_recovery_config(Ok(&fleet), "never-heard-of-this-agent", &default_cfg);
+        let resolved =
+            resolve_recovery_config(Ok(&fleet), "never-heard-of-this-agent", &default_cfg);
         assert!(
             resolved.enabled,
             "no per-instance override → daemon default kicks in (enabled=true)"
