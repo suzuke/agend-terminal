@@ -231,6 +231,82 @@ pub struct InstanceConfig {
     /// all skills (no per-backend dirs are populated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<String>>,
+    /// Per-instance rate-limit recovery config. `None` → use the
+    /// daemon-wide default ([`RateLimitRecoveryConfig::default`]).
+    /// `Some(cfg)` lets operators override knobs (most commonly
+    /// `enabled: false` to opt an agent out of the auto-recovery nudge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_recovery: Option<RateLimitRecoveryConfig>,
+}
+
+/// Per-instance rate-limit recovery configuration.
+///
+/// When an agent transitions from a transient-error state (e.g.
+/// `ServerRateLimit`, `RateLimit`, `ApiError`) back to `Ready`/`Idle`
+/// but then sits silent for [`recovery_after_secs`] seconds, the
+/// daemon supervisor injects a single `prompt` over the PTY to nudge
+/// the agent into continuing. Single-shot per recovery cycle; a
+/// [`cooldown_secs`]-second cooldown prevents repeat firing across
+/// consecutive cycles.
+///
+/// Operator opts an instance out with `enabled: false`; field-level
+/// `#[serde(default)]` lets the operator override one knob without
+/// re-specifying the others.
+///
+/// Re-introduced after #848 narrowed the classifier — previously
+/// reverted via #849 due to classifier false-positives. The hourly cap
+/// (max 3 nudges/agent/1h rolling window) is a new belt-and-suspenders
+/// safety net independent of classifier correctness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitRecoveryConfig {
+    #[serde(default = "rate_limit_recovery_default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "rate_limit_recovery_default_observe_after_secs")]
+    pub observe_after_secs: u64,
+    #[serde(default = "rate_limit_recovery_default_recovery_after_secs")]
+    pub recovery_after_secs: u64,
+    #[serde(default = "rate_limit_recovery_default_prompt")]
+    pub prompt: String,
+    #[serde(default = "rate_limit_recovery_default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Hourly cap: maximum nudges per agent in a rolling 1-hour window.
+    /// Defaults to 3. Belt-and-suspenders defense against any future
+    /// classifier regression that could re-introduce false-positive
+    /// loops — caps recursive blast radius even when upstream is wrong.
+    #[serde(default = "rate_limit_recovery_default_hourly_cap")]
+    pub hourly_cap: u32,
+}
+
+fn rate_limit_recovery_default_enabled() -> bool {
+    true
+}
+fn rate_limit_recovery_default_observe_after_secs() -> u64 {
+    30
+}
+fn rate_limit_recovery_default_recovery_after_secs() -> u64 {
+    60
+}
+fn rate_limit_recovery_default_prompt() -> String {
+    "continue your prior work".to_string()
+}
+fn rate_limit_recovery_default_cooldown_secs() -> u64 {
+    300
+}
+fn rate_limit_recovery_default_hourly_cap() -> u32 {
+    3
+}
+
+impl Default for RateLimitRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: rate_limit_recovery_default_enabled(),
+            observe_after_secs: rate_limit_recovery_default_observe_after_secs(),
+            recovery_after_secs: rate_limit_recovery_default_recovery_after_secs(),
+            prompt: rate_limit_recovery_default_prompt(),
+            cooldown_secs: rate_limit_recovery_default_cooldown_secs(),
+            hourly_cap: rate_limit_recovery_default_hourly_cap(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

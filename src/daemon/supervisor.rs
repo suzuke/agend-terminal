@@ -149,6 +149,125 @@ pub(crate) fn dedup_decision(
     DedupDecision::Allow
 }
 
+// ---------------------------------------------------------------------------
+// Rate-limit recovery nudge — sibling fn to fast-retry path.
+// Salvaged from #841 squash 3209662 (reverted via #849) after #848 narrowed
+// the classifier so RateLimit/ApiError no longer false-positive. The new
+// `hourly_cap` field on `RecoveryNudgeTrack` + `HourlyCapHit` gate are
+// belt-and-suspenders against any future classifier regression.
+// ---------------------------------------------------------------------------
+
+/// Per-agent tracking for the recovery-nudge path.
+///
+/// Lifecycle (driven by `process_rate_limit_recovery_nudges`):
+///
+/// - **Error observed** (`is_transient_error()` true) — set
+///   `last_error_at = Some(now)`, clear `recovered_at` and
+///   `fired_this_cycle`.
+/// - **Agent recovers** (state becomes `Ready`/`Idle` while
+///   `last_error_at.is_some()` and `recovered_at.is_none()`) — set
+///   `recovered_at = Some(now)`.
+/// - **Recovery window elapses + cooldown clear + fast-retry inactive
+///   + hourly cap not hit** — `decide_nudge` returns `Fire`; the
+///   integration fn injects, sets `last_inject_at`, marks
+///   `fired_this_cycle`, increments hourly-cap counter.
+/// - **Agent leaves `Ready`/`Idle`** (handler picked up the nudge OR
+///   the operator typed something) — clear `recovered_at` and
+///   `fired_this_cycle` so a future error→recovery sequence starts
+///   a fresh cycle.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RecoveryNudgeTrack {
+    pub last_error_at: Option<Instant>,
+    pub recovered_at: Option<Instant>,
+    pub last_inject_at: Option<Instant>,
+    pub fired_this_cycle: bool,
+    /// Hourly-cap: start of the current rolling 1-hour window. `None`
+    /// when no nudge has ever fired (or the previous window expired
+    /// without rolling over).
+    pub hourly_window_start: Option<Instant>,
+    /// Hourly-cap: nudges fired within the current rolling window.
+    pub nudges_in_window: u32,
+}
+
+/// Reason the per-tick decision chose to skip the nudge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NudgeSkipReason {
+    Disabled,
+    NoRecentError,
+    NotIdle,
+    /// Used by the C2 GREEN `decide_nudge` body when an agent recovered
+    /// less than `recovery_after_secs` ago. Silenced for C1 RED while
+    /// `decide_nudge` is `unimplemented!()`.
+    #[allow(dead_code)]
+    StillInRecoveryWindow,
+    Cooldown,
+    DeferToFastRetry,
+    FiredThisCycle,
+    /// Hourly cap belt-and-suspenders: max N nudges/agent in a rolling
+    /// 1-hour window. Caps blast radius if a future classifier regression
+    /// re-introduces false-positive loops.
+    HourlyCapHit,
+}
+
+/// Per-tick verdict for one agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NudgeDecision {
+    Skip(NudgeSkipReason),
+    Fire,
+}
+
+/// Resolve the effective per-agent recovery config from a fleet load
+/// outcome plus an instance name. **Fail-closed on load error**:
+/// returns a config with `enabled = false` so a corrupt or missing
+/// fleet.yaml never silently auto-enables the nudge.
+pub(crate) fn resolve_recovery_config(
+    fleet: Result<&crate::fleet::FleetConfig, ()>,
+    name: &str,
+    default_cfg: &crate::fleet::RateLimitRecoveryConfig,
+) -> crate::fleet::RateLimitRecoveryConfig {
+    let Ok(fleet) = fleet else {
+        return crate::fleet::RateLimitRecoveryConfig {
+            enabled: false,
+            ..default_cfg.clone()
+        };
+    };
+    fleet
+        .instances
+        .get(name)
+        .and_then(|i| i.rate_limit_recovery.as_ref())
+        .cloned()
+        .unwrap_or_else(|| default_cfg.clone())
+}
+
+/// Pure helper: classify the recovery-nudge tick.
+///
+/// **C1 RED stub** — returns `unimplemented!()` so the 12 tests in this
+/// module fail. C2 GREEN fills the state-machine body (salvaged from
+/// #841 squash 3209662, with hourly-cap gate added).
+#[allow(unused_variables, clippy::diverging_sub_expression)]
+pub(crate) fn decide_nudge(
+    track: &RecoveryNudgeTrack,
+    current_state: crate::state::AgentState,
+    fast_retry_active: bool,
+    config: &crate::fleet::RateLimitRecoveryConfig,
+    now: Instant,
+) -> NudgeDecision {
+    unimplemented!("C1 RED — filled in C2 GREEN")
+}
+
+/// Per-tick integration for the recovery-nudge path.
+///
+/// **C1 RED stub** — fills the runtime hook in C2 GREEN.
+#[allow(unused_variables, dead_code)]
+pub(crate) fn process_rate_limit_recovery_nudges(
+    home: &std::path::Path,
+    registry: &AgentRegistry,
+    fast_retry_tracks: &HashMap<String, RateLimitRetry>,
+    nudge_tracks: &mut HashMap<String, RecoveryNudgeTrack>,
+) {
+    // C1 RED: stub. C2 GREEN fills phase-1 observation + phase-2 fire.
+}
+
 /// Parse unlock time from usage_limit pane output (e.g., "resets at 15:14 UTC").
 fn parse_unlock_at(pane_text: &str) -> Option<String> {
     // Common patterns: "resets at HH:MM", "try again after HH:MM", "limit resets HH:MM"
@@ -2007,5 +2126,244 @@ mod tests {
         );
         std::env::remove_var("AGEND_PANE_INPUT_THRESHOLD_SECS");
         std::fs::remove_dir_all(home).ok();
+    }
+
+    // ── Rate-limit recovery nudge tests (salvaged from #841 + #846 lesson
+    //    lock + Q3 hourly cap NEW) ──────────────────────────────────────
+
+    use crate::fleet::RateLimitRecoveryConfig;
+    use crate::state::AgentState;
+
+    fn fresh_nudge_track(
+        now: Instant,
+        error_offset: Duration,
+        recovery_offset: Duration,
+    ) -> RecoveryNudgeTrack {
+        RecoveryNudgeTrack {
+            last_error_at: Some(now - error_offset),
+            recovered_at: Some(now - recovery_offset),
+            last_inject_at: None,
+            fired_this_cycle: false,
+            hourly_window_start: None,
+            nudges_in_window: 0,
+        }
+    }
+
+    /// (1) Fires when all conditions met.
+    #[test]
+    fn nudge_fires_when_all_conditions_met() {
+        let cfg = RateLimitRecoveryConfig::default();
+        let now = Instant::now();
+        let track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        assert_eq!(
+            decide_nudge(&track, AgentState::Idle, false, &cfg, now),
+            NudgeDecision::Fire
+        );
+    }
+
+    /// (2) Per-instance / daemon-wide disabled gate.
+    #[test]
+    fn nudge_skipped_when_disabled_via_config() {
+        let cfg = RateLimitRecoveryConfig {
+            enabled: false,
+            ..RateLimitRecoveryConfig::default()
+        };
+        let now = Instant::now();
+        let track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        assert_eq!(
+            decide_nudge(&track, AgentState::Idle, false, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::Disabled)
+        );
+    }
+
+    /// (3) Cooldown gate — last_inject_at within cooldown_secs.
+    #[test]
+    fn nudge_does_not_re_fire_within_cooldown() {
+        let cfg = RateLimitRecoveryConfig::default();
+        let now = Instant::now();
+        let mut track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        track.last_inject_at = Some(now - Duration::from_secs(60)); // 60s ago, within 300s cooldown
+        assert_eq!(
+            decide_nudge(&track, AgentState::Idle, false, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::Cooldown)
+        );
+    }
+
+    /// (4) Sibling-not-replacement contract: defer to fast-retry path.
+    #[test]
+    fn nudge_skipped_when_fast_retry_active() {
+        let cfg = RateLimitRecoveryConfig::default();
+        let now = Instant::now();
+        let track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        assert_eq!(
+            decide_nudge(&track, AgentState::Idle, true, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::DeferToFastRetry)
+        );
+    }
+
+    /// (5) No-recent-error: agent idle but never observed a transient
+    /// error in the stale_cap window.
+    #[test]
+    fn nudge_skipped_when_no_recent_error() {
+        let cfg = RateLimitRecoveryConfig::default();
+        let now = Instant::now();
+        let track = RecoveryNudgeTrack {
+            last_error_at: None,
+            recovered_at: Some(now - Duration::from_secs(70)),
+            last_inject_at: None,
+            fired_this_cycle: false,
+            hourly_window_start: None,
+            nudges_in_window: 0,
+        };
+        assert_eq!(
+            decide_nudge(&track, AgentState::Idle, false, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::NoRecentError)
+        );
+    }
+
+    /// (6) LOAD-BEARING per #846 lesson: even when state returns to
+    /// Ready/Idle, if `fired_this_cycle` is true, the gate suppresses
+    /// re-fire. The original #841 fixed this; the #846/PR#847 hotfix
+    /// dropped the suppression and re-introduced the spam. Locked here.
+    #[test]
+    fn nudge_does_not_re_fire_when_fired_this_cycle_and_state_returns_to_ready() {
+        let cfg = RateLimitRecoveryConfig::default();
+        let now = Instant::now();
+        let mut track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        track.fired_this_cycle = true;
+        // Even with all other conditions met (Idle, no fast-retry, error fresh,
+        // no cooldown), fired_this_cycle alone must suppress.
+        assert_eq!(
+            decide_nudge(&track, AgentState::Idle, false, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::FiredThisCycle)
+        );
+        // Also assert: Ready state behaves the same (transition flap
+        // between Ready/Idle within one cycle must not re-fire).
+        assert_eq!(
+            decide_nudge(&track, AgentState::Ready, false, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::FiredThisCycle)
+        );
+    }
+
+    /// (7) Permanent-error states: decide_nudge must Skip(NotIdle)
+    /// (permanent states aren't Ready/Idle anyway) — explicit gate
+    /// test in addition to is_transient_error_excludes_permanent_states.
+    #[test]
+    fn nudge_skipped_when_in_permanent_error_state() {
+        let cfg = RateLimitRecoveryConfig::default();
+        let now = Instant::now();
+        let track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        assert_eq!(
+            decide_nudge(&track, AgentState::UsageLimit, false, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::NotIdle)
+        );
+        assert_eq!(
+            decide_nudge(&track, AgentState::AuthError, false, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::NotIdle)
+        );
+    }
+
+    /// (8) Q3 NEW hourly cap: 4th nudge in a 1-hour window is skipped
+    /// even if every other gate would let it fire.
+    #[test]
+    fn nudge_hourly_cap_skips_4th_nudge_in_1h_window() {
+        let cfg = RateLimitRecoveryConfig::default(); // hourly_cap=3
+        let now = Instant::now();
+        let mut track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        // Simulate 3 prior nudges within the current hour window.
+        track.hourly_window_start = Some(now - Duration::from_secs(1800)); // 30 min ago
+        track.nudges_in_window = 3;
+        // last_inject_at outside cooldown so cooldown gate wouldn't suppress.
+        track.last_inject_at = Some(now - Duration::from_secs(600));
+        // fired_this_cycle reset (new cycle starting).
+        track.fired_this_cycle = false;
+        // recovered_at fresh so cycle is ready.
+        track.recovered_at = Some(now - Duration::from_secs(70));
+        track.last_error_at = Some(now - Duration::from_secs(80));
+        assert_eq!(
+            decide_nudge(&track, AgentState::Idle, false, &cfg, now),
+            NudgeDecision::Skip(NudgeSkipReason::HourlyCapHit)
+        );
+    }
+
+    /// (9) Q3 NEW hourly cap: window expires after 1 hour; cap resets
+    /// and next nudge can fire.
+    #[test]
+    fn nudge_hourly_cap_resets_after_window_elapses() {
+        let cfg = RateLimitRecoveryConfig::default();
+        let now = Instant::now();
+        let mut track = fresh_nudge_track(now, Duration::from_secs(100), Duration::from_secs(70));
+        track.hourly_window_start = Some(now - Duration::from_secs(3700)); // 1h 1.7m ago
+        track.nudges_in_window = 3;
+        track.last_inject_at = Some(now - Duration::from_secs(3700));
+        // After window elapses, decide_nudge should NOT skip on cap —
+        // it can Fire (other gates clear).
+        assert_eq!(
+            decide_nudge(&track, AgentState::Idle, false, &cfg, now),
+            NudgeDecision::Fire
+        );
+    }
+
+    /// (10) fail-closed on fleet.yaml load error.
+    #[test]
+    fn resolve_recovery_config_fails_closed_on_load_error() {
+        let default_cfg = RateLimitRecoveryConfig::default();
+        assert!(default_cfg.enabled);
+        let resolved = resolve_recovery_config(Err(()), "agent-x", &default_cfg);
+        assert!(!resolved.enabled);
+        // Other knobs preserved so an operator who later restores the
+        // config doesn't get a surprise mismatch in window sizes.
+        assert_eq!(resolved.observe_after_secs, default_cfg.observe_after_secs);
+        assert_eq!(
+            resolved.recovery_after_secs,
+            default_cfg.recovery_after_secs
+        );
+        assert_eq!(resolved.cooldown_secs, default_cfg.cooldown_secs);
+        assert_eq!(resolved.hourly_cap, default_cfg.hourly_cap);
+    }
+
+    /// (11) Per-instance opt-out override propagates.
+    #[test]
+    fn resolve_recovery_config_uses_instance_override_when_present() {
+        let mut instances = HashMap::new();
+        instances.insert(
+            "opt-out-agent".to_string(),
+            crate::fleet::InstanceConfig {
+                rate_limit_recovery: Some(RateLimitRecoveryConfig {
+                    enabled: false,
+                    observe_after_secs: 999,
+                    recovery_after_secs: 60,
+                    prompt: "should-not-fire".to_string(),
+                    cooldown_secs: 300,
+                    hourly_cap: 3,
+                }),
+                ..crate::fleet::InstanceConfig::default()
+            },
+        );
+        let fleet = crate::fleet::FleetConfig {
+            instances,
+            ..crate::fleet::FleetConfig::default()
+        };
+        let default_cfg = RateLimitRecoveryConfig::default();
+        let resolved = resolve_recovery_config(Ok(&fleet), "opt-out-agent", &default_cfg);
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.observe_after_secs, 999);
+        assert_eq!(resolved.prompt, "should-not-fire");
+    }
+
+    /// (12) is_transient_error gate covers transient vs permanent split.
+    #[test]
+    fn is_transient_error_excludes_permanent_states() {
+        // Transient — recoverable with a nudge.
+        assert!(AgentState::ServerRateLimit.is_transient_error());
+        assert!(AgentState::RateLimit.is_transient_error());
+        assert!(AgentState::ApiError.is_transient_error());
+        // Permanent — nudge cannot help; would just spam the PTY.
+        assert!(!AgentState::UsageLimit.is_transient_error());
+        assert!(!AgentState::AuthError.is_transient_error());
+        // Non-error states.
+        assert!(!AgentState::Ready.is_transient_error());
+        assert!(!AgentState::Idle.is_transient_error());
+        assert!(!AgentState::Thinking.is_transient_error());
     }
 }
