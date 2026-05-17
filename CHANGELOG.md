@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Changed
+
+- **App mode never owns the daemon (#879)** — `agend-terminal` (no subcommand, the TUI entry) used to take over the daemon role when no daemon was already running; the in-process `api::serve`, supervisor, and Telegram polling all lived inside the TUI process. That made `Ctrl+B d` (tmux detach) tear down the daemon and every agent's LLM context along with the TUI. Post-#879 the TUI is always a client: when the bootstrap pre-flight would have returned `BootstrapOutcome::Owned`, the new `app::ensure_attached` helper drops the would-be ownership (releasing `.daemon.lock`), spawns a detached daemon via `bootstrap::daemon_spawn::spawn_detached`, and re-attaches as a client. `BootstrapOutcome::Owned` + `OwnedFleet` are preserved for the legitimate `agend-terminal start --foreground` path. **Operator-visible effect**: `Ctrl+B d` now preserves daemon + agents — re-launching `agend-terminal` re-attaches. Cold-start single-command still works (transient daemon, no supervisor); operators wanting respawn-on-exit should run `agend-terminal service install` (see #851 supervisor-requirement framing).
+
 ## [0.7.0] — 2026-05-16
 
 150+ commits since `0.6.1` over Sprint 55–65 (May 7 → May 16, 2026). Three themes dominate:

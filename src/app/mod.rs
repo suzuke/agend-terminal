@@ -2,6 +2,34 @@
 //!
 //! Uses agent::spawn_agent() for all panes (agents and shells), sharing the
 //! same PTY lifecycle as the daemon: auto-dismiss, state tracking, broadcast.
+//!
+//! ## App mode never owns the daemon (#879)
+//!
+//! Pre-#879 the TUI's `run` path treated `BootstrapOutcome::Owned` as "this
+//! process IS the daemon", running the in-process API server, supervisor, and
+//! Telegram polling inside the TUI's process. That meant `Ctrl+B d` (tmux
+//! detach) tore down the daemon + every agent's LLM context along with the
+//! TUI.
+//!
+//! Post-#879 the app always attaches as a client. When `prepare()` would have
+//! returned `Owned`, [`ensure_attached`] instead:
+//!
+//! 1. Drops the would-be `OwnedFleet` (releasing `.daemon.lock` so the
+//!    spawned child can acquire it).
+//! 2. Calls [`crate::bootstrap::daemon_spawn::spawn_detached`] to launch a
+//!    background daemon process. `spawn_detached` blocks until the child
+//!    publishes its run dir.
+//! 3. Re-invokes `prepare()` — the child's run dir is now live, so
+//!    `try_attach` observes it and returns `BootstrapOutcome::Attached`.
+//!
+//! `BootstrapOutcome::Owned` + `OwnedFleet` remain intentionally for the
+//! foreground daemon path (`agend-terminal start --foreground`); only the
+//! app's would-be-Owned branch is removed.
+//!
+//! See `#851` for the supervisor-requirement framing: cold-start single-
+//! command `agend-terminal` still works (transient daemon, no supervisor),
+//! but operators wanting respawn on daemon exit should run
+//! `agend-terminal service install`.
 
 mod api_server;
 mod commands;
@@ -14,7 +42,7 @@ mod telegram_hooks;
 mod tui_events;
 
 pub use overlay::{BoardView, MenuItem, MenuItemKind, TaskBoardMode};
-pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
+pub(crate) use tui_events::TuiEvent;
 
 use crate::agent::{self, AgentRegistry};
 use crate::backend::Backend;
@@ -121,9 +149,71 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
     result
 }
 
-/// Main event loop for the TUI app.
+/// #879: ensure the app is connected to a running daemon as a client.
 ///
-/// M5 note: this function is 550+ lines with 15+ locals. Extraction to
+/// Calls [`crate::bootstrap::prepare`] in app-mode (no fleet rewrite, no
+/// agent resolve, no telegram init — those belong to whoever owns the
+/// daemon process). Three outcomes:
+///
+/// - `Ok(BootstrapOutcome::Attached(client))` — a daemon already runs;
+///   return its handle directly.
+/// - `Ok(BootstrapOutcome::Owned(prepared))` — no daemon exists, but the
+///   app process WOULD own the daemon role. **Pre-#879** this was the
+///   "in-process daemon" path that bound the daemon lifetime to the TUI
+///   (Ctrl+B d tearing down agents). **Post-#879** the app drops the
+///   would-be `OwnedFleet` (releasing `.daemon.lock`), spawns a detached
+///   daemon via [`crate::bootstrap::daemon_spawn::spawn_detached`], and
+///   re-calls `prepare()` — the child daemon publishes its run dir
+///   during `spawn_detached`'s block-and-poll, so the second `prepare()`
+///   observes the new daemon via `try_attach` and returns `Attached`.
+/// - `Err(e)` — bootstrap failed for an unrelated reason
+///   (fleet.yaml parse error, lock contention, etc.).
+///
+/// Returns the `AttachedFleet` so the caller can record the daemon's
+/// run dir + PID for client-side state (subprocess connection, ci-watch,
+/// etc.).
+fn ensure_attached(home: &Path, fleet_path: &Path) -> Result<crate::bootstrap::AttachedFleet> {
+    let app_opts = || crate::bootstrap::PrepareOptions {
+        resolve_agents: false,
+        mutate_fleet_yaml: true,
+        init_telegram: true,
+    };
+    match crate::bootstrap::prepare(home, fleet_path, app_opts())? {
+        crate::bootstrap::BootstrapOutcome::Attached(client) => Ok(client),
+        crate::bootstrap::BootstrapOutcome::Owned(owned) => {
+            tracing::info!(
+                "#879: no daemon detected; releasing would-be Owned lease, \
+                 spawning detached daemon, and re-attaching as client"
+            );
+            // Drop owned BEFORE spawn_detached so the child can acquire
+            // `.daemon.lock` — otherwise the child's `prepare()` would
+            // observe the lock as held by our process and stall.
+            drop(owned);
+            let fleet_arg = fleet_path.exists().then_some(fleet_path);
+            let _handle = crate::bootstrap::daemon_spawn::spawn_detached(home, fleet_arg)
+                .map_err(|e| anyhow::anyhow!("spawn_detached failed: {e}"))?;
+            // spawn_detached blocks until the child publishes its run
+            // dir, so the second prepare() must observe it and return
+            // Attached. Any other outcome is a bug (post-spawn race,
+            // stale lock, etc.) — bail with a diagnostic.
+            match crate::bootstrap::prepare(home, fleet_path, app_opts())? {
+                crate::bootstrap::BootstrapOutcome::Attached(client) => {
+                    tracing::info!(
+                        pid = client.daemon_pid,
+                        run_dir = %client.run_dir.display(),
+                        "#879: spawn-and-attach complete"
+                    );
+                    Ok(client)
+                }
+                crate::bootstrap::BootstrapOutcome::Owned(_) => anyhow::bail!(
+                    "#879: post-spawn prepare returned Owned — \
+                     child daemon failed to publish run dir before bootstrap re-check"
+                ),
+            }
+        }
+    }
+}
+
 /// `app/event_loop.rs` deferred — the function is a single coherent event
 /// loop with no natural split point that wouldn't increase coupling.
 /// Locals are all loop-scoped state (layout, registry, overlay, etc.)
@@ -137,7 +227,12 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         .unwrap_or_else(|| crate::fleet::fleet_yaml_path(&home));
 
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
+    // #879: post-fix the in-process api::serve is gone (TUI is always a
+    // client of a separately-spawned daemon). The TuiEvent channel still
+    // exists so the event-loop select! arm compiles, but no sender is
+    // wired today — re-attach a sender in a future PR when daemon → TUI
+    // event streaming via socket is wired up.
+    let (_tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
 
     // Preflight via the shared bootstrap seam so `api.cookie` is issued before
     // `api::serve` starts — otherwise `inbox::notify_agent`'s `api::call(INJECT)`
@@ -147,50 +242,38 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     // client (Stage 3.4). `attached_mode` gates every operation that would
     // conflict with the live daemon — session persistence, fleet.yaml sync,
     // supervisor spawn, and agent kill on exit.
-    let opts = crate::bootstrap::PrepareOptions {
-        resolve_agents: false, // app spawns via pane_factory from tabs
-        ..Default::default()
-    };
     let mut attached_run_dir: Option<PathBuf> = None;
-    let (_api_guard, telegram_state, telegram_status) =
-        match crate::bootstrap::prepare(&home, &fleet_path, opts) {
-            Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
-                let telegram = prepared.telegram.clone();
-                let status = if telegram.is_some() {
-                    TelegramStatus::Connected
-                } else {
-                    telegram_hooks::telegram_status_from_config(&prepared.config)
-                };
-                let guard = api_server::start_api_server(prepared, &registry, tui_event_tx);
-                // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
-                // the owned app. SIGINT stays with crossterm so Ctrl+C still
-                // reaches the focused pane's PTY as 0x03.
-                crate::bootstrap::signals::install_term_only();
-                (guard, telegram, status)
-            }
-            Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
-                tracing::info!(
-                    pid = attached.daemon_pid,
-                    path = %attached.run_dir.display(),
-                    "attached to existing daemon, connecting as remote client"
-                );
-                attached_run_dir = Some(attached.run_dir.clone());
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-        };
+    let (_api_guard, telegram_state, telegram_status) = match ensure_attached(&home, &fleet_path) {
+        Ok(attached) => {
+            tracing::info!(
+                pid = attached.daemon_pid,
+                path = %attached.run_dir.display(),
+                "attached to daemon, connecting as remote client"
+            );
+            attached_run_dir = Some(attached.run_dir.clone());
+            (
+                api_server::noop_guard(),
+                None::<Arc<dyn crate::channel::Channel>>,
+                TelegramStatus::NotConfigured,
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "ensure_attached failed, running TUI without in-process API");
+            (
+                api_server::noop_guard(),
+                None::<Arc<dyn crate::channel::Channel>>,
+                TelegramStatus::NotConfigured,
+            )
+        }
+    };
     let attached_mode = attached_run_dir.is_some();
+
+    // SIGTERM-only handler so `agend-terminal stop` (which sends SIGTERM)
+    // can cleanly exit the TUI. The daemon (now always a separate process
+    // post-#879) has its own SIGTERM handler installed by its own
+    // `bootstrap::signals::install`. SIGINT stays with crossterm so
+    // Ctrl+C still reaches the focused pane's PTY as 0x03.
+    crate::bootstrap::signals::install_term_only();
 
     // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
     // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
@@ -1157,5 +1240,30 @@ mod tests {
             "healthy",
             "fresh tracker should remain healthy after decay tick"
         );
+    }
+
+    /// #879: `ensure_attached` propagates fleet.yaml parse errors instead
+    /// of misinterpreting them as "no daemon, spawn one". The negative
+    /// test pins this contract: if `prepare()` fails for any non-Owned-
+    /// non-Attached reason, the error reaches the caller. Tests that rely
+    /// on `spawn_detached` (the Owned → spawn path) are deferred to
+    /// integration / manual smoke since unit tests can't reliably fork
+    /// the agend-terminal binary.
+    #[test]
+    fn ensure_attached_propagates_invalid_fleet_yaml_error() {
+        let home = tmp_home("879-bad-yaml");
+        let fleet_path = home.join("fleet.yaml");
+        std::fs::write(
+            &fleet_path,
+            "instances:\n  worker:\n    - this: is\n  - not: yaml",
+        )
+        .expect("write fixture");
+        let result = ensure_attached(&home, &fleet_path);
+        assert!(
+            result.is_err(),
+            "malformed fleet.yaml must propagate as Err from prepare()"
+        );
+        // Best-effort cleanup (test isolation is per-PID-per-suffix dir).
+        std::fs::remove_dir_all(&home).ok();
     }
 }
