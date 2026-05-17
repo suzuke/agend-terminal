@@ -518,23 +518,41 @@ impl StatePatterns {
                     AgentState::UsageLimit,
                     r"Usage limit reached|Access resets at",
                 ),
-                // #848 PR-B: narrow Gemini RateLimit to specific
-                // google-gemini/gemini-cli verbatim wordings (issues
-                // #10722/#8437/#22545/#2305/#1502). The pre-#848 pattern
-                // `r"RESOURCE_EXHAUSTED|\b429\b"` matched bare `429`
-                // tokens anywhere — the same false-positive class as
-                // Claude/Codex pre-PR-A (any prose discussing HTTP 429
-                // status codes triggered RateLimit). New pattern keys
-                // on full HTTP-context wording — `429 RESOURCE_EXHAUSTED`,
-                // `rateLimitExceeded` (gRPC error code field),
-                // `got status: 429`, `429 Too Many Requests`, and
-                // `rate limit exceeded` (CLI casual wording). The bare
-                // `\b429\b` token is dropped; the wrapping context in
-                // the new alternations is what distinguishes a real
-                // 429 from discussion prose.
+                // #848 PR-B narrowed bare `\b429\b` to specific
+                // gemini-cli verbatim wordings (issues #10722/#8437/
+                // #22545/#2305/#1502). #854 follow-up further drops
+                // the residual bare `rate limit exceeded` alternation
+                // — it was added as defensive insurance against a
+                // "CLI casual wording" case that turned out to have
+                // no empirical anchor in any of the cited issues, and
+                // it false-positive-matched any prose / commit /
+                // discussion containing the 3-word phrase (same class
+                // as the pre-#848 bare `\b429\b` surface).
+                //
+                // All four remaining alternations are anchored on a
+                // `429` numeric or on the distinctive camelCase gRPC
+                // field `rateLimitExceeded`, so a real Gemini
+                // RateLimit display still matches via 4× coverage:
+                //
+                // - `429 RESOURCE_EXHAUSTED` — numeric + gRPC enum
+                // - `rateLimitExceeded` — single distinctive token
+                // - `got status: 429` — verb-anchored numeric
+                // - `429 Too Many Requests` — HTTP status-text numeric
+                //
+                // Negative regression fixture
+                // `gemini-rate-limit-prose-discussion.raw` exercises
+                // the false-positive class this drop closes; the
+                // existing positive fixture
+                // `gemini-rate-limit-typical.raw` exercises detection
+                // survival on the canonical wording (still matches
+                // 4× over after the drop). New positive fixture
+                // `gemini-rate-limit-canonical-429.raw` exercises
+                // detection on a minimal 429-anchored display that
+                // does NOT include the dropped bare phrase, locking
+                // in the post-#854 contract.
                 (
                     AgentState::RateLimit,
-                    r"429 RESOURCE_EXHAUSTED|rateLimitExceeded|got status: 429|429 Too Many Requests|rate limit exceeded",
+                    r"429 RESOURCE_EXHAUSTED|rateLimitExceeded|got status: 429|429 Too Many Requests",
                 ),
                 // [docs] Token/quota limit
                 (AgentState::ContextFull, r"quota.*exceeded|token.*limit"),

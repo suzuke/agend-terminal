@@ -487,6 +487,44 @@ fixtures:
     capture_kind: synthetic
     provenance: "#848 PR-B regression-proof — prose containing Gemini old-pattern trigger substrings"
 
+  - file: gemini-rate-limit-canonical-429.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-17"
+    scenario: |
+      Gemini pane shows a minimal 429-anchored RateLimit display that
+      does NOT include the bare `rate limit exceeded` phrase. #854
+      dropped that bare alternation from the Gemini RateLimit pattern;
+      this fixture locks in the detection survival contract — the four
+      remaining alternations (`429 RESOURCE_EXHAUSTED`,
+      `rateLimitExceeded`, `got status: 429`, `429 Too Many Requests`)
+      must still classify a real Gemini 429 as RateLimit even when the
+      casual-wording fallback is absent.
+    expected_transitions: [starting, rate_limit]
+    expected_final_state: rate_limit
+    expected_final_detect: rate_limit
+    capture_kind: synthetic_from_docs
+    provenance: "#854 — synthetic from gemini-cli 429-response anchors"
+
+  - file: gemini-rate-limit-prose-discussion.raw
+    backend: gemini
+    cli_version: "0.37.1"
+    recorded_on: "2026-05-17"
+    scenario: |
+      Regression-proof fixture for #854 — the LOAD-BEARING test of the
+      bare-`rate limit exceeded` alternation drop. Pane contains the
+      bare 3-word phrase in dev-prose context (no 429, no
+      `RESOURCE_EXHAUSTED`, no `rateLimitExceeded`). Under the pre-#854
+      pattern this prose triggered a false RateLimit via the
+      defensive-insurance bare alternation. Under the post-#854
+      narrowed pattern the classifier stays Idle — the false-positive
+      class is closed.
+    expected_transitions: [starting, idle]
+    expected_final_state: idle
+    expected_final_detect: idle
+    capture_kind: synthetic
+    provenance: "#854 regression-proof — prose containing dropped Gemini alternation substring"
+
   - file: kiro-rate-limit-typical.raw
     backend: kiro-cli
     cli_version: "2.0.1"
